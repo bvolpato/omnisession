@@ -49,6 +49,8 @@ const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+/// Codex appends this summary after the verified users retained by legacy compaction.
+pub const CODEX_POSITIONED_LEGACY_SUMMARY: &str = "compacted.legacy.summary";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -1736,7 +1738,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         timestamp: event.timestamp,
                         tool: None,
                     },
-                    is_compaction: true,
+                    is_compaction: !is_positioned_codex_summary(event),
                 },
                 truncated,
             ))
@@ -2835,6 +2837,7 @@ fn visible_import_events(
         && let Some(start) = events
             .iter()
             .rposition(|event| source_compaction_text(event).is_some())
+        && !is_positioned_codex_summary(events[start])
     {
         events.drain(..start);
     }
@@ -2920,6 +2923,12 @@ fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
         text
     };
     (!text.trim().is_empty()).then_some(text)
+}
+
+// A legacy Codex rebuild keeps selected users before the summary at its recorded position.
+fn is_positioned_codex_summary(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some(CODEX_POSITIONED_LEGACY_SUMMARY)
 }
 
 fn claude_compaction_body(text: &str) -> &str {
@@ -6638,6 +6647,28 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!text.contains("private-value"));
         assert!(!text.contains("contents of the referenced file"));
+    }
+
+    #[test]
+    fn a_positioned_codex_summary_keeps_retained_users_without_a_recovery_file() {
+        let mut summary = compaction(2, Provider::Codex, "Current state.");
+        summary.source.raw_record_type = Some(super::CODEX_POSITIONED_LEGACY_SUMMARY.to_owned());
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"Retained request."}),
+            ),
+            summary,
+        ]);
+        let trajectory = import_trajectory(&snapshot);
+        assert_eq!(trajectory.items.len(), 2);
+        assert_eq!(trajectory.items[0].text, "Retained request.");
+        assert!(trajectory.items[1].text.contains("Current state."));
+        assert!(!super::needs_recovery_handoff(
+            &snapshot,
+            trajectory.truncated
+        ));
     }
 
     fn codex_display_after_rollback() -> CanonicalSnapshot {

@@ -12,7 +12,51 @@ type Scope = Option<Key>;
 // A result belongs to the original call that produced it.
 type Body = (Key, Option<u64>);
 
-pub(super) fn payload_digest(item: &Value) -> Option<Key> {
+fn named_output(item: &Value) -> bool {
+    item["type"] == "function_call_output" && item["call_id"].is_null() && item["name"].is_string()
+}
+
+pub(super) fn receipt_digest(item: &Value) -> Option<Key> {
+    let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+    let name = item["name"].as_str()?;
+    let namespace = &item["namespace"];
+    let output = &item["output"];
+    if !(namespace.is_null() || namespace.is_string()) || !(output.is_string() || output.is_array())
+    {
+        return None;
+    }
+    Some(json_digest(&(id, name, namespace, output)))
+}
+
+pub(super) fn source_digest(record: &Value, repeated: bool) -> Option<Key> {
+    let item = &record["payload"];
+    if repeated && named_output(item) {
+        return None;
+    }
+    payload_digest(item, &record["metadata"])
+}
+
+fn payload_digest(item: &Value, metadata: &Value) -> Option<Key> {
+    if named_output(item) {
+        // Codex retains a standalone output only when its client marked it for retention.
+        if metadata["client_authored"] != true
+            || item.as_object()?.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type"
+                        | "id"
+                        | "call_id"
+                        | "name"
+                        | "namespace"
+                        | "output"
+                        | "internal_chat_message_metadata_passthrough"
+                )
+            })
+        {
+            return None;
+        }
+        return receipt_digest(item);
+    }
     let id = model_call_id(item).or_else(|| model_result_id(item))?;
     // Codex may assign another response item ID or omit its turn stamp when it saves a checkpoint.
     // The provider call ID and the complete tool payload still have to agree.
@@ -69,15 +113,46 @@ struct PendingCall {
 }
 
 impl PaginatedAnswers {
+    fn published_receipt(
+        &self,
+        seq: u64,
+        digest: Key,
+        turn: Scope,
+        aliases: &TurnAliases,
+    ) -> Option<u64> {
+        let source = self.tools.get(&seq)?;
+        let (public, displayed) = self.tool_displays.get(&seq)?;
+        let public_turn = public
+            .turn
+            .map(|turn| aliases.get(&turn).copied().unwrap_or(turn));
+        (source.call.is_none()
+            && source.digest == Some(digest)
+            && *displayed == Some(digest)
+            && (turn.is_none() || public_turn == turn))
+            .then_some(seq)
+    }
+
     pub(in super::super) fn checkpoint_tool_copies(
         &self,
         aliases: &TurnAliases,
         items: &[Value],
+        metadata: Option<&[Value]>,
         start: usize,
     ) -> Vec<(usize, u64, Option<usize>)> {
         let resolve = |turn: Key| aliases.get(&turn).copied().unwrap_or(turn);
         let mut original = OriginalCopies::default();
+        let mut output_ids = HashMap::new();
+        let includes_receipts = items[start..].iter().any(named_output);
         for (&seq, tool) in &self.tools {
+            if includes_receipts
+                && tool.output
+                && let Some(key) = tool.key
+            {
+                output_ids
+                    .entry(key.id)
+                    .and_modify(|seq| *seq = None)
+                    .or_insert(Some(seq));
+            }
             if let Some(digest) = tool.digest {
                 original.add(
                     (digest, tool.call),
@@ -88,17 +163,40 @@ impl PaginatedAnswers {
         }
         let mut copies = Vec::new();
         let mut pending = HashMap::new();
+        let mut receipts = HashMap::new();
         for (index, item) in items.iter().enumerate() {
             let call = model_call_id(item);
             let Some(id) = call.or_else(|| model_result_id(item)) else {
                 continue;
             };
-            // An open call in the skipped prefix can still compete for a later result.
-            let digest = (index >= start).then(|| payload_digest(item)).flatten();
+            let meta = metadata
+                .and_then(|entries| entries.get(index))
+                .unwrap_or(&Value::Null);
             let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"]
                 .as_str()
                 .filter(|turn| !turn.is_empty())
                 .map(|turn| resolve(Sha256::digest(turn.as_bytes()).into()));
+            if named_output(item) {
+                let native_id: Key = Sha256::digest(id.as_bytes()).into();
+                let Some(&Some(seq)) = output_ids.get(&native_id) else {
+                    continue;
+                };
+                let matched = (index >= start)
+                    .then(|| payload_digest(item, meta))
+                    .flatten()
+                    .and_then(|digest| self.published_receipt(seq, digest, turn, aliases))
+                    .map(|seq| (index, seq, None));
+                // Repeated item IDs in replacement history do not identify a unique occurrence.
+                receipts
+                    .entry(native_id)
+                    .and_modify(|copy| *copy = None)
+                    .or_insert(matched);
+                continue;
+            }
+            // An open call in the skipped prefix can still compete for a later result.
+            let digest = (index >= start)
+                .then(|| payload_digest(item, meta))
+                .flatten();
             if call.is_some() {
                 let matched = digest.and_then(|digest| original.find((digest, None), turn));
                 // Until every overlapping call with this ID has a result, its results have no unique owner.
@@ -127,6 +225,7 @@ impl PaginatedAnswers {
                 }
             }
         }
+        copies.extend(receipts.into_values().flatten());
         copies
     }
 }

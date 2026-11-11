@@ -7,15 +7,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod history;
+mod legacy;
 mod turns;
 use super::model_cut::{acceptance_order, input_order, removes_accepted};
 use super::paginated_rollback::model_instruction;
 use super::{CodexHistory, EventBuilder, MAX_CANONICAL_EVENTS, PaginatedRollback, Withdrawal};
 pub(super) use history::CheckpointHistory;
+pub(super) use legacy::{LegacyInput, LegacySource};
 pub(super) use turns::{CheckpointSelection, CheckpointTurns};
 
 type DigestKey = [u8; 32];
-type CompletedPositions = HashMap<(DigestKey, DigestKey), Option<u64>>;
+type CompletedPositions = HashMap<(super::CompletedKind, DigestKey, DigestKey), Option<u64>>;
 
 pub(super) struct EffectiveRollback {
     pub(super) input_count: usize,
@@ -47,6 +49,7 @@ pub(super) struct PaginatedCheckpoint {
     retained: usize,
     prefix_inputs: usize,
     users: Vec<(usize, Option<u64>)>,
+    legacy_users: Vec<(usize, LegacyInput)>,
     ordered_outputs: HashMap<usize, u64>,
     cutoff: Option<u64>,
     positions: HashMap<u64, Vec<Copy>>,
@@ -55,6 +58,10 @@ pub(super) struct PaginatedCheckpoint {
 
 impl PaginatedCheckpoint {
     pub(super) fn valid_metadata(payload: &Value) -> bool {
+        let replacement = &payload["replacement_history"];
+        if !(replacement.is_array() || replacement.is_null() && payload["message"].is_string()) {
+            return false;
+        }
         let metadata = &payload["replacement_history_metadata"];
         metadata.is_null()
             || metadata.as_array().is_some_and(|metadata| {
@@ -80,23 +87,7 @@ impl PaginatedCheckpoint {
         let items = payload["replacement_history"].as_array()?;
         let start = items.len().saturating_sub(MAX_CANONICAL_EVENTS);
         let metadata = payload["replacement_history_metadata"].as_array();
-        let mut checkpoint = Self {
-            ordinal: history.source_ordinal,
-            display_end: builder.checkpoint(),
-            discarded: false,
-            uncertain_selection: false,
-            linked_calls: HashMap::new(),
-            retained: items.len(),
-            prefix_inputs: items[..start]
-                .iter()
-                .filter(|item| model_instruction(item))
-                .count(),
-            users: Vec::new(),
-            ordered_outputs: HashMap::new(),
-            cutoff: None,
-            positions: HashMap::new(),
-            unverified_on_fallback: HashSet::new(),
-        };
+        let mut checkpoint = Self::new(history.source_ordinal, builder.checkpoint(), items, start);
         let aliases = history.paginated_inputs.resolved_turns();
         let input_copies = history
             .paginated_inputs
@@ -118,13 +109,7 @@ impl PaginatedCheckpoint {
             let metadata = metadata
                 .and_then(|entries| entries.get(index))
                 .unwrap_or(&Value::Null);
-            let instruction = model_instruction(item);
-            if instruction {
-                checkpoint.users.push((index, input_order(metadata)));
-            }
-            if let Some(order) = acceptance_order(item, metadata) {
-                checkpoint.ordered_outputs.insert(index, order);
-            }
+            let instruction = checkpoint.observe_input_order(index, item, metadata);
             if instruction && item["role"] == "assistant" {
                 continue;
             }
@@ -157,23 +142,84 @@ impl PaginatedCheckpoint {
                 .entry(seq)
                 .or_default()
                 .push(Copy { index, answer });
-            if instruction && item["role"] == "user" && !original.contains(&seq) {
-                checkpoint.unverified_on_fallback.insert(seq);
+            if instruction && item["role"] == "user" {
+                if history.paginated_inputs.display_is_plain_text(seq)
+                    && let Some((_, input)) = checkpoint.legacy_users.last_mut()
+                {
+                    input.source = Some(LegacySource::User(seq));
+                }
+                if !original.contains(&seq) {
+                    checkpoint.unverified_on_fallback.insert(seq);
+                }
             }
         }
-        for (index, seq, call) in history
-            .paginated_answers
-            .checkpoint_tool_copies(&aliases, items, start)
-        {
+        for (index, seq, call) in history.paginated_answers.checkpoint_tool_copies(
+            &aliases,
+            items,
+            metadata.map(Vec::as_slice),
+            start,
+        ) {
             checkpoint.positions.entry(seq).or_default().push(Copy {
                 index,
                 answer: None,
             });
+            if let Some((question, spelling)) = async_display_copy(
+                &items[index],
+                history.paginated_answers.call_turn(seq, &aliases),
+                builder,
+                &completed,
+            ) {
+                checkpoint
+                    .positions
+                    .entry(question)
+                    .or_default()
+                    .push(Copy {
+                        index,
+                        answer: Some(spelling),
+                    });
+            }
             if let Some(call) = call {
                 checkpoint.linked_calls.insert(index, call);
             }
         }
         Some(checkpoint)
+    }
+
+    fn new(ordinal: u64, display_end: u64, items: &[Value], start: usize) -> Self {
+        Self {
+            ordinal,
+            display_end,
+            discarded: false,
+            uncertain_selection: false,
+            linked_calls: HashMap::new(),
+            retained: items.len(),
+            prefix_inputs: items[..start]
+                .iter()
+                .filter(|item| model_instruction(item))
+                .count(),
+            users: Vec::new(),
+            legacy_users: Vec::new(),
+            ordered_outputs: HashMap::new(),
+            cutoff: None,
+            positions: HashMap::new(),
+            unverified_on_fallback: HashSet::new(),
+        }
+    }
+
+    fn observe_input_order(&mut self, index: usize, item: &Value, metadata: &Value) -> bool {
+        let instruction = model_instruction(item);
+        if instruction {
+            let order = input_order(metadata);
+            self.users.push((index, order));
+            if item["role"] == "user" {
+                self.legacy_users
+                    .push((index, LegacyInput::new(item, order, self.ordinal)));
+            }
+        }
+        if let Some(order) = acceptance_order(item, metadata) {
+            self.ordered_outputs.insert(index, order);
+        }
+        instruction
     }
 
     pub(super) fn rollback(
@@ -294,10 +340,18 @@ fn completed_positions(
     let mut completed = HashMap::new();
     for (turn, ids) in &history.completed {
         let turn = turn_key(turn);
-        for (id, &seq) in ids {
+        for ((kind, id), &seq) in ids {
+            if !matches!(
+                kind,
+                super::CompletedKind::User
+                    | super::CompletedKind::Assistant
+                    | super::CompletedKind::AsyncAssistant
+            ) {
+                continue;
+            }
             let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
             completed
-                .entry((turn, id))
+                .entry((*kind, turn, id))
                 .and_modify(|prior| {
                     if *prior != Some(seq) {
                         *prior = None;
@@ -317,12 +371,81 @@ fn exact_display_copy(
 ) -> Option<(u64, Option<DigestKey>)> {
     let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str()?;
     let id: DigestKey = Sha256::digest(item["id"].as_str()?.as_bytes()).into();
-    let seq = completed.get(&(turn_key(turn), id)).copied().flatten()?;
+    let kind = match item["role"].as_str()? {
+        "assistant" => super::CompletedKind::Assistant,
+        "user" => super::CompletedKind::User,
+        _ => return None,
+    };
+    let seq = completed
+        .get(&(kind, turn_key(turn), id))
+        .copied()
+        .flatten()?;
     let shown = builder.event_at_mut(seq)?;
     let text = matching_display_text(item, shown)?;
     let answer =
         (shown.kind == EventKind::MessageAssistant).then(|| Sha256::digest(text.as_bytes()).into());
     Some((seq, answer))
+}
+
+fn async_display_copy(
+    call: &Value,
+    turn: Option<DigestKey>,
+    builder: &mut EventBuilder,
+    completed: &CompletedPositions,
+) -> Option<(u64, DigestKey)> {
+    if call["type"] != "function_call"
+        || !matches!(call["namespace"].as_str(), None | Some("functions"))
+    {
+        return None;
+    }
+    let name = call["name"].as_str()?;
+    if !matches!(
+        name,
+        "request_user_input_async" | "send_message_to_user_async"
+    ) {
+        return None;
+    }
+    let id = Sha256::digest(super::model_call_id(call)?.as_bytes()).into();
+    let sequence = completed
+        .get(&(super::CompletedKind::AsyncAssistant, turn?, id))
+        .copied()
+        .flatten()?;
+    let text = builder.event_at_mut(sequence)?.payload["text"].as_str()?;
+    let args: Value = serde_json::from_str(call["arguments"].as_str()?).ok()?;
+    let matches = if name == "send_message_to_user_async" {
+        args["message"].as_str()?.trim() == text
+    } else {
+        matches_questions(&args["questions"], text)?
+    };
+    matches.then(|| (sequence, Sha256::digest(text.as_bytes()).into()))
+}
+
+fn matches_questions(questions: &Value, mut text: &str) -> Option<bool> {
+    let questions = questions.as_array()?.as_slice();
+    for (index, question) in questions.iter().enumerate() {
+        if index != 0 {
+            text = text.strip_prefix("\n\n")?;
+        }
+        let title = question["title"].as_str()?;
+        if title.trim().is_empty() {
+            return None;
+        }
+        text = text.strip_prefix(title)?;
+        if !question["options"].is_null() {
+            let options = question["options"].as_array()?;
+            if options.is_empty() {
+                return None;
+            }
+            for option in options {
+                let option = option.as_str()?;
+                if option.trim().is_empty() {
+                    return None;
+                }
+                text = text.strip_prefix("\n- ")?.strip_prefix(option)?;
+            }
+        }
+    }
+    Some(!questions.is_empty() && text.is_empty())
 }
 
 fn matching_display_text<'a>(item: &Value, shown: &'a omnis_ir::OmniEvent) -> Option<&'a str> {

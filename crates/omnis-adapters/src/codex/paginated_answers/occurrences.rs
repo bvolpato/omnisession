@@ -354,6 +354,8 @@ struct Ruling {
 #[derive(Default)]
 pub(super) struct AnswerOccurrences {
     model: VecDeque<(Raw, Position)>,
+    expected_plans: HashMap<u64, Hash>,
+    open_plans: HashMap<Hash, u64>,
     shown: BTreeMap<u64, Shown>,
     prior: VecDeque<(Shown, String)>,
     bytes: usize,
@@ -364,13 +366,45 @@ pub(super) struct AnswerOccurrences {
 }
 
 impl AnswerOccurrences {
-    pub(super) fn model(&mut self, record: &Value, ordinal: u64, plan_mode: bool) {
-        if self.model.len() == MAX_CANONICAL_EVENTS {
-            self.model.pop_front();
+    pub(super) fn model(
+        &mut self,
+        record: &Value,
+        ordinal: u64,
+        plan_mode: bool,
+        active_turn: Option<&str>,
+    ) {
+        if self.model.len() == MAX_CANONICAL_EVENTS
+            && let Some((raw, _)) = self.model.pop_front()
+            && let Some(turn) = self.expected_plans.remove(&raw.ordinal)
+            && self.open_plans.get(&turn) == Some(&raw.ordinal)
+        {
+            self.open_plans.remove(&turn);
         }
         let mut raw = Raw::new(&record["payload"], ordinal, plan_mode);
+        // Codex completes only the first Plan in each Responses API response.
+        if raw.plan.is_some()
+            && let Some(turn) = raw.turn.or_else(|| active_turn.map(hash))
+            && let std::collections::hash_map::Entry::Vacant(slot) = self.open_plans.entry(turn)
+        {
+            slot.insert(ordinal);
+            self.expected_plans.insert(ordinal, turn);
+        }
         raw.window = self.window;
         self.model.push_back((raw, Position::new(record, ordinal)));
+    }
+
+    pub(super) fn surviving_plans(&self) -> impl Iterator<Item = (Hash, Hash, u64)> + '_ {
+        self.model.iter().filter_map(|(raw, position)| {
+            let body = raw.plan.filter(|_| !position.removed)?;
+            let turn = *self.expected_plans.get(&raw.ordinal)?;
+            Some((turn, body, raw.ordinal))
+        })
+    }
+
+    pub(super) fn end_response(&mut self, turn: &str) {
+        if !self.open_plans.is_empty() {
+            self.open_plans.remove(&hash(turn));
+        }
     }
 
     pub(super) fn archive(&mut self, seq: u64, text: &str) {
@@ -497,6 +531,7 @@ impl AnswerOccurrences {
 
     pub(super) fn rollback(&mut self, ordinal: u64, order: Option<u64>) {
         self.rolled = true;
+        self.open_plans.clear();
         self.window = self.window.saturating_add(1);
         for (_, position) in &mut self.model {
             position.rollback(ordinal, order);

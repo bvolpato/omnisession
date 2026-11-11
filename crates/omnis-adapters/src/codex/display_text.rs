@@ -1,6 +1,9 @@
 //! Codex's visible assistant text in Plan mode.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use omnis_ir::{EventKind, ReplayPolicy};
 use serde_json::{Value, json};
@@ -98,6 +101,7 @@ struct PlanPresence {
 #[derive(Default)]
 pub(super) struct PlanReceipts {
     plans: HashMap<(Option<Key>, Key), PlanPresence>,
+    finished_turns: HashMap<Key, u64>,
     overflow: bool,
 }
 
@@ -138,12 +142,59 @@ impl PlanReceipts {
         });
     }
 
-    pub(super) fn report(&self, builder: &mut EventBuilder) {
-        let missing = self
+    pub(super) fn finish_turn(&mut self, turn: &str, ordinal: u64) {
+        let turn = Sha256::digest(turn.as_bytes()).into();
+        if self.finished_turns.len() < MAX_CANONICAL_EVENTS
+            || self.finished_turns.contains_key(&turn)
+        {
+            self.finished_turns.insert(turn, ordinal);
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    pub(super) fn missing_paginated(
+        &self,
+        proposals: impl Iterator<Item = (Key, Key, u64)>,
+        aliases: impl FnOnce() -> HashMap<Key, Key>,
+    ) -> usize {
+        let mut proposals = proposals.peekable();
+        if self.finished_turns.is_empty() || proposals.peek().is_none() {
+            return 0;
+        }
+        let aliases = aliases();
+        let resolve = |turn: Key| aliases.get(&turn).copied().unwrap_or(turn);
+        let mut finished = HashMap::<Key, u64>::new();
+        for (&turn, &ordinal) in &self.finished_turns {
+            let last = finished.entry(resolve(turn)).or_default();
+            *last = (*last).max(ordinal);
+        }
+        let shown: HashSet<_> = self
             .plans
-            .values()
-            .filter(|plan| plan.proposal.is_some() && plan.display.is_none())
-            .count();
+            .iter()
+            .filter_map(|(&(turn, body), receipts)| {
+                receipts.display?;
+                Some((resolve(turn?), body))
+            })
+            .collect();
+        proposals
+            .filter_map(|(turn, body, ordinal)| {
+                let turn = resolve(turn);
+                (finished.get(&turn).is_some_and(|end| ordinal <= *end)
+                    && !shown.contains(&(turn, body)))
+                .then_some((turn, body))
+            })
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    pub(super) fn report(&self, builder: &mut EventBuilder, paginated_missing: usize) {
+        let missing = paginated_missing
+            + self
+                .plans
+                .values()
+                .filter(|plan| plan.proposal.is_some() && plan.display.is_none())
+                .count();
         if missing > 0 || self.overflow {
             builder.push(EventKind::ProviderEvent, json!({"omitted_events":missing, "native_history_unverified":true,
                     "reason":"The retained Codex history could not confirm every proposed plan with a completed display."}),

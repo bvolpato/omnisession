@@ -356,3 +356,58 @@ fn legacy_private_model_inputs_stay_out_of_exports_and_have_their_own_rollback_p
         read_with_history_mode(vec![private, independently_published], false, None).unwrap();
     assert_eq!(visible_text(&public), [body.as_str()]);
 }
+
+#[test]
+fn an_unstamped_checkpoint_user_needs_one_exact_original_copy() {
+    let first = "01948226-0000-7001-8000-000000000001";
+    let second = "01948226-0000-7001-8000-000000000002";
+    let id = "msg_input_01948226-0000-7002-8000-000000000002";
+    let model = |turn: &str, text: &str| {
+        let mut input = message("user", text);
+        input["payload"]["id"] = id.into();
+        input["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+        input
+    };
+    let source = model(first, "original request");
+    let display = page_user(first, "item-1", "original request");
+    let mut unstamped = source["payload"].clone();
+    unstamped
+        .as_object_mut()
+        .unwrap()
+        .remove("internal_chat_message_metadata_passthrough");
+    let mut changed = unstamped.clone();
+    changed["content"][0]["text"] = "different request".into();
+    let wrong_turn = model(second, "original request")["payload"].clone();
+    let pair = vec![source, display.clone()];
+    let mut reused = pair.clone();
+    reused.extend([
+        model(second, "another request"),
+        page_user(second, "item-2", "another request"),
+    ]);
+    let mut extra_display = pair.clone();
+    extra_display.push(page_user(second, id, "another request"));
+    for (origin, retained, active) in [
+        (pair.clone(), vec![unstamped.clone()], true),
+        (pair.clone(), vec![changed], false),
+        (pair.clone(), vec![wrong_turn], false),
+        (pair, vec![unstamped.clone(), unstamped.clone()], false),
+        (reused, vec![unstamped.clone()], false),
+        (extra_display, vec![unstamped.clone()], false),
+        (vec![display], vec![unstamped], false),
+    ] {
+        let mut records = origin;
+        records.push(json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":retained}}));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            assert!(visible_text(&snapshot).contains(&"original request"));
+            assert_eq!(
+                omnis_core::import_conversation(&snapshot)
+                    .messages
+                    .iter()
+                    .any(|m| m.text == "original request"),
+                active
+            );
+        }
+    }
+}

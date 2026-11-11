@@ -4,6 +4,8 @@ use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
 use serde_json::{Value, json};
 
+#[path = "codex/async_questions.rs"]
+mod async_questions;
 #[path = "codex/display_text.rs"]
 mod display_text;
 #[path = "codex/early_assistants.rs"]

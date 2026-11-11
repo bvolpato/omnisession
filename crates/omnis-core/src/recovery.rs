@@ -4,10 +4,11 @@ use super::{
     CODEX_IMPORT_MARKER, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, MESSAGE_CHARACTER_LIMIT, OmniEvent,
     RECENT_MESSAGE_LIMIT, ReplayPolicy, VisibleHistory, bounded_text, codex_exclusion_receipt,
-    codex_rollback, has_recoverable_codex_rollback, is_documentary_tool_message, is_secret,
-    is_user_harness_envelope, latest_plan_action, markdown_tool_label, quote_untrusted,
-    redact_secrets, redacted_tool_payload, render_recorded_workspace, restored_codex_answer,
-    source_compaction_text, text_from_payload_ref, visible_events, visible_history,
+    codex_rollback, has_recoverable_codex_rollback, is_documentary_tool_message,
+    is_positioned_codex_summary, is_secret, is_user_harness_envelope, latest_plan_action,
+    markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
+    render_recorded_workspace, restored_codex_answer, source_compaction_text,
+    text_from_payload_ref, visible_events, visible_history,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -19,7 +20,9 @@ pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bo
     let latest_summary = snapshot
         .events
         .iter()
-        .filter(|event| source_compaction_text(event).is_some())
+        .filter(|event| {
+            source_compaction_text(event).is_some() && !is_positioned_codex_summary(event)
+        })
         .map(|event| (event.sequence, event.event_id))
         .max();
     latest_summary.is_some_and(|summary| {

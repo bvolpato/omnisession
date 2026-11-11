@@ -102,7 +102,7 @@ struct ModelTool {
 pub(super) struct PaginatedAnswers {
     answers: AnswerOccurrences,
     tools: BTreeMap<u64, ModelTool>,
-    tool_displays: BTreeMap<u64, ToolId>,
+    tool_displays: BTreeMap<u64, (ToolId, Option<[u8; 32]>)>,
     removed_calls: HashMap<ScopedMessageId, CallCopies>,
     call_scopes: HashMap<([u8; 32], Option<bool>), CallCopies>,
     aliases: TurnAliases,
@@ -122,8 +122,22 @@ impl PaginatedAnswers {
         self.aliases = aliases;
     }
 
-    pub(super) fn model(&mut self, record: &Value, ordinal: u64, plan_mode: bool) {
-        self.answers.model(record, ordinal, plan_mode);
+    pub(super) fn model(
+        &mut self,
+        record: &Value,
+        ordinal: u64,
+        plan_mode: bool,
+        active_turn: Option<&str>,
+    ) {
+        self.answers.model(record, ordinal, plan_mode, active_turn);
+    }
+
+    pub(super) fn end_response(&mut self, turn: &str) {
+        self.answers.end_response(turn);
+    }
+
+    pub(super) fn surviving_plans(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32], u64)> + '_ {
+        self.answers.surviving_plans()
     }
 
     pub(super) fn archive_changed_reply(
@@ -194,7 +208,7 @@ impl PaginatedAnswers {
             }
         }
         let tool = ModelTool {
-            digest: checkpoint_tools::payload_digest(&record["payload"]),
+            digest: checkpoint_tools::source_digest(record, stored.is_some()),
             position: Position::new(record, ordinal),
             call: call.or_else(|| stored?.call),
             key,
@@ -208,14 +222,26 @@ impl PaginatedAnswers {
         removed
     }
 
+    pub(super) fn call_turn(&self, sequence: u64, aliases: &TurnAliases) -> Option<[u8; 32]> {
+        self.tools
+            .get(&sequence)?
+            .key?
+            .scoped(aliases)
+            .map(|(_, turn, _)| turn)
+    }
+
     pub(super) fn display_tool(
         &mut self,
         sequence: u64,
         turn: &str,
         id: &str,
+        item: &Value,
     ) -> Option<Withdrawal> {
         let key = ToolId::new(Some(turn), id)?;
-        self.tool_displays.insert(sequence, key);
+        let receipt = (item["type"] == "FunctionCallOutput")
+            .then(|| checkpoint_tools::receipt_digest(item))
+            .flatten();
+        self.tool_displays.insert(sequence, (key, receipt));
         if self.tool_displays.len() > MAX_CANONICAL_EVENTS {
             self.tool_displays.pop_first();
         }
@@ -295,7 +321,7 @@ impl PaginatedAnswers {
         for (&sequence, tool) in &self.tools {
             marked.insert(sequence, self.tool_withdrawal(tool));
         }
-        for (&sequence, &key) in &self.tool_displays {
+        for (&sequence, &(key, _)) in &self.tool_displays {
             if let Some(withdrawal) = self.call_withdrawal(key) {
                 marked.entry(sequence).or_insert(Some(withdrawal));
             }

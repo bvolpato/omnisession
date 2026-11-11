@@ -371,3 +371,102 @@ fn a_mixed_checkpoint_keeps_both_public_items_and_restores_the_prior_plan() {
         }
     }
 }
+
+#[test]
+fn a_finished_paginated_turn_reports_only_surviving_undisplayed_plans() {
+    let t = "planning";
+    let end = event("task_complete", json!({"turn_id":t}));
+    let rollback = event("thread_rolled_back", json!({"num_turns":1}));
+    let plan = |text| turn_item(t, &json!({"type":"Plan","id":"planning-plan","text":text}));
+    let body = "model-only proposal";
+    let mut raw = plan_model(
+        t,
+        "reply",
+        "assistant",
+        &format!("Preface.\n<proposed_plan>\n{body}\n</proposed_plan>"),
+        1,
+    );
+    for stamped in [true, false] {
+        if !stamped {
+            raw["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("internal_chat_message_metadata_passthrough");
+        }
+        let rows = vec![
+            event(
+                "task_started",
+                json!({"turn_id":t,"collaboration_mode_kind":"plan"}),
+            ),
+            plan_model(t, "request", "user", "plan this", 1),
+            super::page_user(t, "request", "plan this"),
+            shown_assistant(t, "reply", "Preface.\n"),
+            raw.clone(),
+        ];
+        let second = plan_model(
+            t,
+            "second",
+            "assistant",
+            "<proposed_plan>
+second proposal
+</proposed_plan>",
+            1,
+        );
+        let usage = json!({"type":"token_usage_record","payload":{"turn_id":t,"response_id":"model-response"}});
+        for (tail, missing, displayed) in [
+            (vec![], false, false),
+            (
+                vec![
+                    plan(body),
+                    second.clone(),
+                    plan("published revision"),
+                    end.clone(),
+                ],
+                false,
+                true,
+            ),
+            (
+                vec![
+                    plan(body),
+                    usage,
+                    second,
+                    plan("published revision"),
+                    end.clone(),
+                ],
+                true,
+                true,
+            ),
+            (
+                vec![event("turn_aborted", json!({"turn_id":t}))],
+                false,
+                false,
+            ),
+            (vec![end.clone()], true, false),
+            (vec![end.clone(), rollback.clone()], false, false),
+            (
+                vec![plan(body), plan("published revision"), end.clone()],
+                false,
+                true,
+            ),
+        ] {
+            for preview in [false, true] {
+                let mut input = rows.clone();
+                input.extend(tail.iter().cloned());
+                let snap =
+                    super::read_with_history_mode(input, preview, Some("paginated")).unwrap();
+                let notice = snap.events.iter().find(|event| {
+                    event.source.raw_record_type.as_deref()
+                        == Some("omnisession.codex_plan_display_unverified")
+                });
+                assert_eq!(
+                    notice.and_then(|event| event.payload["omitted_events"].as_u64()),
+                    missing.then_some(1)
+                );
+                let search = omnis_core::trajectory_search_document(&snap);
+                assert_eq!(search.source_complete, !missing);
+                assert!(!search.text.contains(body));
+                assert_eq!(search.text.contains("published revision"), displayed);
+            }
+        }
+    }
+}

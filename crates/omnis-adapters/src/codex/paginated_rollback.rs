@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::{MAX_CANONICAL_EVENTS, failed_attachments, message_parts};
 
+mod legacy_inputs;
 mod migration_scopes;
 
 type Key = [u8; 32];
@@ -111,7 +112,7 @@ const SUMMARY_PREFIX: &str = concat!(
     "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n",
 );
 
-fn contextual_fragment(text: &str) -> bool {
+pub(super) fn contextual_fragment(text: &str) -> bool {
     if text.starts_with(SUMMARY_PREFIX) {
         return true;
     }
@@ -288,6 +289,7 @@ pub(super) fn json_digest(value: &impl serde::Serialize) -> Key {
 
 pub(super) struct ConfirmedInputCopies {
     by_id: HashMap<(Key, Key), (u64, Key)>,
+    unstamped: HashMap<Key, (u64, Key)>,
     original: HashSet<u64>,
 }
 
@@ -300,8 +302,13 @@ impl ConfirmedInputCopies {
         if item["type"] != "message" || item["role"] != "user" {
             return None;
         }
-        let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str()?;
-        self.by_id.get(&(key(turn), key(item["id"].as_str()?)))
+        let id = key(item["id"].as_str()?);
+        let metadata = &item["internal_chat_message_metadata_passthrough"];
+        match &metadata["turn_id"] {
+            Value::String(turn) => self.by_id.get(&(key(turn), id)),
+            Value::Null if metadata.is_null() || metadata.is_object() => self.unstamped.get(&id),
+            _ => None,
+        }
     }
 
     pub(super) fn has_witness(&self, item: &Value) -> bool {
@@ -345,6 +352,7 @@ struct Input {
     model_content: Option<Key>,
     media: Option<MediaShape>,
     ordinal: u64,
+    legacy_tokens: usize,
     // A migrated request can have a generated turn opening immediately before its display.
     display_start: u64,
     order: Option<u64>,
@@ -400,6 +408,7 @@ impl Input {
             model_content: (!display && turn.is_some() && id.is_some())
                 .then(|| content_digest(payload)),
             ordinal,
+            legacy_tokens: 0,
             display_start: ordinal,
             order: None,
             accepted_output: None,
@@ -547,7 +556,9 @@ impl PaginatedRollback {
         let user = !standalone && payload["type"] == "message" && payload["role"] == "user";
         let spelling = if user { payload } else { &Value::Null };
         let mut input = Input::new(turn, spelling, false, ordinal, self.segment);
-        if !user {
+        if user {
+            input.legacy_tokens = super::paginated_checkpoint::LegacyInput::tokens(payload);
+        } else {
             input.kind = IdKind::InterAgent;
             input.accepted_output =
                 super::model_cut::acceptance_order(payload, &record["metadata"]);
@@ -707,14 +718,78 @@ impl PaginatedRollback {
             }
         });
         copies.retain(|_, (seq, _)| marked.get(seq) == Some(&Withdrawal::Confirmed));
+        let unstamped = self.unstamped_copies(checkpoint, &copies);
         self.match_checkpoint_inputs(aliases, checkpoint, &mut copies);
         ConfirmedInputCopies {
             by_id: copies,
+            unstamped,
             original: marked
                 .into_iter()
                 .filter_map(|(seq, status)| (status == Withdrawal::Confirmed).then_some(seq))
                 .collect(),
         }
+    }
+
+    fn unstamped_copies(
+        &self,
+        checkpoint: &[Value],
+        originals: &HashMap<(Key, Key), (u64, Key)>,
+    ) -> HashMap<Key, (u64, Key)> {
+        if self.history_floor != 0
+            || checkpoint.len() > MAX_CANONICAL_EVENTS
+            || originals.is_empty()
+        {
+            return HashMap::new();
+        }
+        let users = checkpoint
+            .iter()
+            .filter(|item| item["type"] == "message" && item["role"] == "user");
+        let unstamped =
+            |item: &Value| item["internal_chat_message_metadata_passthrough"]["turn_id"].is_null();
+        if !users.clone().any(unstamped) {
+            return HashMap::new();
+        }
+
+        // An unscoped ID must identify one checkpoint input and one original model row.
+        let mut requested = HashMap::new();
+        for item in users {
+            if let Some(id) = item["id"].as_str() {
+                requested
+                    .entry(key(id))
+                    .and_modify(|unique| *unique = false)
+                    .or_insert_with(|| unstamped(item));
+            }
+        }
+        let mut copies = HashMap::new();
+        for input in &self.model {
+            let Some(id) = input.id.filter(|id| requested.get(id) == Some(&true)) else {
+                continue;
+            };
+            let original = input
+                .turn
+                .and_then(|turn| originals.get(&(turn, id)))
+                .copied();
+            copies
+                .entry(id)
+                .and_modify(|entry| *entry = None)
+                .or_insert(original);
+        }
+        // A second public item with this ID can belong to another turn without a model copy.
+        for (&seq, shown) in &self.displayed {
+            if let Some(id) = shown.id.filter(|_| shown.withdrawal.is_none())
+                && copies
+                    .get(&id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|(found, _)| seq != found)
+            {
+                copies.remove(&id);
+            }
+        }
+        copies
+            .into_iter()
+            .filter_map(|(id, witness)| Some((id, witness?)))
+            .collect()
     }
 
     fn match_model_inputs(

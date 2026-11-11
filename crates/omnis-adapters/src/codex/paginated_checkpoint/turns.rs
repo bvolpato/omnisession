@@ -19,9 +19,10 @@ enum Marker {
     Rollback(usize),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(in super::super) enum CheckpointSelection {
     Selected(u64),
+    #[default]
     Original,
     Unverified,
 }

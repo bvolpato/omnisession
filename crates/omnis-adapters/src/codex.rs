@@ -808,6 +808,27 @@ fn confirm_admission(turns: &mut [TurnCheckpoint], sequence: Option<u64>, positi
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum CompletedKind {
+    User,
+    Assistant,
+    AsyncAssistant,
+    Plan,
+    Tool,
+}
+
+impl CompletedKind {
+    fn for_item(payload: &Value) -> Self {
+        match payload["item"]["type"].as_str() {
+            Some("UserMessage") => Self::User,
+            Some("AgentMessage") if payload["item"]["delivery"] == "async" => Self::AsyncAssistant,
+            Some("AgentMessage") => Self::Assistant,
+            Some("Plan") => Self::Plan,
+            _ => Self::Tool,
+        }
+    }
+}
+
 struct CodexHistory {
     project_path: Option<PathBuf>,
     items: CodexItems,
@@ -829,7 +850,7 @@ struct CodexHistory {
     legacy_private: LegacyPrivateInputs,
     invalid_checkpoints: usize,
     // Codex updates a completed item in place using its turn and item IDs.
-    completed: HashMap<String, HashMap<String, u64>>,
+    completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
     named_turns: HashMap<String, u64>,
     plan_turns: HashSet<String>,
     plan_receipts: display_text::PlanReceipts,
@@ -1218,15 +1239,19 @@ impl CodexHistory {
         }
         self.checkpoint_turns.observe(record, self.source_ordinal);
         let payload = &record["payload"];
-        if record["type"] == "compacted" {
-            if paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload) {
-                let checkpoint =
-                    paginated_checkpoint::PaginatedCheckpoint::read(self, builder, payload);
-                self.paginated_checkpoint
-                    .record(checkpoint, self.checkpoint_turns.selected());
-            } else {
-                self.invalid_checkpoints += 1;
+        if let Some(turn) = payload["turn_id"].as_str() {
+            let finished = matches!(event_type, Some("task_complete" | "turn_complete"));
+            if finished && self.plan_turns.contains(self.aliases.resolve(turn)) {
+                self.plan_receipts.finish_turn(turn, self.source_ordinal);
             }
+            if finished
+                || (record["type"] == "token_usage_record" && payload["response_id"].is_string())
+            {
+                self.paginated_answers.end_response(turn);
+            }
+        }
+        if record["type"] == "compacted" {
+            self.record_paginated_checkpoint(record, builder);
             return Ok(true);
         }
         if record["type"] == "inter_agent_communication"
@@ -1240,8 +1265,12 @@ impl CodexHistory {
                 && payload["role"] == "assistant"
             {
                 let plan_mode = self.model_plan_mode(payload);
+                let active = self
+                    .active_turn_id
+                    .as_deref()
+                    .filter(|t| !is_implicit_turn(t));
                 self.paginated_answers
-                    .model(record, self.source_ordinal, plan_mode);
+                    .model(record, self.source_ordinal, plan_mode, active);
             }
             return Ok(true);
         }
@@ -1253,6 +1282,41 @@ impl CodexHistory {
             return Ok(true);
         }
         Ok(matches!(event_type, Some("user_message" | "agent_message")))
+    }
+
+    fn record_paginated_checkpoint(&mut self, record: &Value, builder: &mut EventBuilder) {
+        let payload = &record["payload"];
+        if !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload) {
+            self.invalid_checkpoints += 1;
+            return;
+        }
+        let selection = self.checkpoint_turns.selected();
+        if let Some(window) =
+            paginated_checkpoint::PaginatedCheckpoint::read(self, builder, payload)
+        {
+            self.paginated_checkpoint.record(Some(window), selection);
+        } else if let Some(message) = payload["message"].as_str() {
+            self.paginated_checkpoint.record_legacy(
+                self.source_ordinal,
+                builder.checkpoint(),
+                message,
+                &self.paginated_inputs,
+                selection,
+            );
+            let summary = if message.is_empty() {
+                "(no summary available)"
+            } else {
+                message
+            };
+            builder.push(
+                EventKind::CompactionCreated,
+                json!({"summary":summary,"ordinal":self.source_ordinal}),
+                parse_timestamp(record.get("timestamp")),
+                ReplayPolicy::Contextual,
+                Some(omnis_core::CODEX_POSITIONED_LEGACY_SUMMARY.to_owned()),
+                None,
+            );
+        }
     }
 
     fn withdraw_displayed_inputs(&mut self, builder: &EventBuilder, count: usize) {
@@ -1330,7 +1394,12 @@ impl CodexHistory {
     }
 
     fn finish(&mut self, builder: &mut EventBuilder) {
-        self.plan_receipts.report(builder);
+        let missing = self
+            .plan_receipts
+            .missing_paginated(self.paginated_answers.surviving_plans(), || {
+                self.paginated_inputs.resolved_turns()
+            });
+        self.plan_receipts.report(builder, missing);
         self.display_revisions.finish(builder);
         if self.uncertain_legacy_rollback {
             builder.push(
@@ -1345,7 +1414,7 @@ impl CodexHistory {
         if self.invalid_checkpoints > 0 {
             builder.push(
                 EventKind::ProviderEvent,
-                json!({"omitted_events": self.invalid_checkpoints, "native_history_unverified": true, "reason": "Codex recorded compaction metadata that does not match its replacement history."}),
+                json!({"omitted_events": self.invalid_checkpoints, "native_history_unverified": true, "reason": "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history."}),
                 None,
                 ReplayPolicy::HistoricalOnly,
                 Some("omnisession.codex_invalid_checkpoint".into()),
@@ -1361,6 +1430,15 @@ impl CodexHistory {
     fn annotate_model_window(&mut self, builder: &mut EventBuilder) {
         let answers = self.paginated_answers.finish_answers();
         let checkpoint = self.paginated_checkpoint.as_ref();
+        if self.paginated_checkpoint.saw_legacy() {
+            builder.retain_events(|event| {
+                event.source.raw_record_type.as_deref()
+                    != Some(omnis_core::CODEX_POSITIONED_LEGACY_SUMMARY)
+                    || event.payload["ordinal"].as_u64().is_some_and(|ordinal| {
+                        self.paginated_checkpoint.legacy_summary_active(ordinal)
+                    })
+            });
+        }
         builder.visit_events_mut(|event| {
             if !matches!(
                 event.kind,
@@ -1389,7 +1467,9 @@ impl CodexHistory {
                     .map(|index| self.turns[index].request_sequence);
                 self.paginated_checkpoint.status(seq, owner, baseline)
             };
-            let (status, prior) = if event.kind == EventKind::MessageAssistant {
+            let (status, prior) = if event.kind == EventKind::MessageAssistant
+                && !self.paginated_checkpoint.legacy_applies_to(seq)
+            {
                 self.paginated_answers
                     .project_answer(seq, checkpoint, status)
             } else {
@@ -1598,7 +1678,7 @@ impl CodexHistory {
                 let completed = self
                     .completed
                     .get(named)
-                    .is_some_and(|items| items.contains_key(id));
+                    .is_some_and(|items| items.contains_key(&(CompletedKind::Tool, id.to_owned())));
                 (self.turns.last()?.sequence == *owner && !completed).then_some(named)
             });
             let sequence = builder.checkpoint();
@@ -1705,10 +1785,12 @@ impl CodexHistory {
             push_codex_session_metadata(builder, payload, timestamp, true);
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
+        // An asynchronous assistant message and its tool receipt share the call ID.
+        let key = (CompletedKind::for_item(payload), id.to_owned());
         let original = self
             .completed
             .get(&native_turn)
-            .and_then(|items| items.get(id))
+            .and_then(|items| items.get(&key))
             .copied();
         let owner = self
             .named_turns
@@ -1789,7 +1871,7 @@ impl CodexHistory {
         self.completed
             .entry(self.aliases.resolve(turn).to_owned())
             .or_default()
-            .insert(id.to_owned(), sequence);
+            .insert(key, sequence);
         Some(sequence)
     }
 
@@ -1820,8 +1902,7 @@ impl CodexHistory {
         id: &str,
         item: &Value,
     ) {
-        if !self.paginated
-            && item["type"] == "Plan"
+        if item["type"] == "Plan"
             && let Some(text) = item["text"].as_str()
         {
             let turn = self.aliases.resolve(turn);
@@ -1854,7 +1935,9 @@ impl CodexHistory {
                     item["type"] == "Plan",
                 );
             }
-            return;
+            if item["delivery"] != "async" {
+                return;
+            }
         }
         if self.withdrawn.contains_key(&sequence) {
             return;
@@ -1865,7 +1948,9 @@ impl CodexHistory {
         } else {
             let withdrawal = match item["type"].as_str() {
                 None => None,
-                _ => self.paginated_answers.display_tool(sequence, turn, id),
+                _ => self
+                    .paginated_answers
+                    .display_tool(sequence, turn, id, item),
             };
             if let Some(status) = withdrawal {
                 self.withdrawn.insert(sequence, status);

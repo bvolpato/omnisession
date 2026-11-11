@@ -749,3 +749,148 @@ fn unnumbered_compaction_follows_its_native_turn_when_a_steer_rolls_back() {
         }
     }
 }
+
+#[test]
+fn message_only_compaction_rebuilds_users_from_the_selected_checkpoint_and_suffix() {
+    let first = exchange("first", "selected request", "previous reply", true);
+    let suffix = exchange("second", "subsequent request", "subsequent reply", true);
+    let only_displayed = exchange("typed", "display only", "displayed reply", false);
+    let selected = first
+        .iter()
+        .find(|row| row["payload"]["role"] == "user")
+        .unwrap();
+    let legacy = json!({"type":"compacted","payload":{"replacement_history":null,"message":"Surviving source summary."}});
+    for (replacement, keep_first) in [(json!([selected["payload"]]), true), (json!([]), false)] {
+        let mut rows = first.clone();
+        rows.push(json!({"type":"compacted","payload":{"window_number":1,"message":"","replacement_history":replacement}}));
+        rows.push(
+            json!({"type":"compacted","payload":{"message":"malformed","replacement_history":{}}}),
+        );
+        rows.extend(suffix.clone());
+        rows.extend(only_displayed.clone());
+        rows.push(message("user", "private model-only request"));
+        rows.push(legacy.clone());
+        rows.extend(exchange(
+            "after",
+            "next public request",
+            "next public answer",
+            false,
+        ));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let imported = omnis_core::import_conversation(&snapshot);
+            let active: Vec<_> = imported
+                .messages
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect();
+            assert_eq!(active.contains(&"selected request"), keep_first);
+            assert!(
+                active.contains(&"subsequent request") && active.contains(&"next public answer")
+            );
+            assert!(
+                active
+                    .iter()
+                    .any(|text| text.contains("Surviving source summary."))
+            );
+            for absent in [
+                "previous reply",
+                "subsequent reply",
+                "display only",
+                "private model-only request",
+                "malformed",
+            ] {
+                assert!(!active.contains(&absent), "{absent} was active");
+            }
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            assert!(recovery.contains("previous reply") && recovery.contains("display only"));
+            assert!(!recovery.contains("private model-only request"));
+        }
+    }
+}
+
+#[test]
+fn consecutive_message_only_compactions_keep_a_retained_summary_in_its_source_role() {
+    use omnis_core::HandoffRole::{Assistant, User};
+
+    let compaction = |text: &str| json!({"type":"compacted","payload":{"message":text}});
+    let mut rows = exchange("first", "current request", "previous answer", true);
+    rows.push(compaction("First summary."));
+    rows.extend(exchange(
+        "second",
+        "follow-up request",
+        "earlier follow-up reply",
+        true,
+    ));
+    rows.push(compaction("Latest summary."));
+    for rolled in [false, true] {
+        let mut records = rows.clone();
+        if rolled {
+            records.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+        let snapshot = read_with_history_mode(records, false, Some("paginated")).unwrap();
+        let imported = omnis_core::import_conversation(&snapshot);
+        let texts: Vec<_> = imported
+            .messages
+            .iter()
+            .filter(|item| !item.text.contains("Codex replaced"))
+            .map(|item| (item.role, item.text.lines().last().unwrap()))
+            .collect();
+        let mut expected = vec![
+            (User, "current request"),
+            (Assistant, "First summary."),
+            (User, "follow-up request"),
+        ];
+        if !rolled {
+            expected.push((Assistant, "Latest summary."));
+        }
+        assert_eq!(texts, expected);
+    }
+}
+
+#[test]
+fn a_reselected_original_keeps_only_surviving_legacy_summaries() {
+    let original = exchange("first", "original request", "older answer", true);
+    for (first_summary, retained) in [
+        ("First source summary.", true),
+        (
+            "<environment_context>First source summary.</environment_context>",
+            false,
+        ),
+    ] {
+        let mut records = original.clone();
+        records.push(json!({"type":"compacted","payload":{"window_number":1,"message":"","replacement_history":[]}}));
+        for summary in [first_summary, "Latest summary."] {
+            records.push(json!({"type":"compacted","payload":{"message":summary}}));
+        }
+        for count in 1..=3 {
+            records.push(event("thread_rolled_back", json!({"num_turns":1})));
+            let snapshot =
+                read_with_history_mode(records.clone(), false, Some("paginated")).unwrap();
+            let imported = omnis_core::import_conversation(&snapshot);
+            let active: Vec<_> = imported
+                .messages
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect();
+            assert_eq!(
+                active.contains(&"original request"),
+                count <= if retained { 2 } else { 1 }
+            );
+            assert_eq!(
+                active
+                    .iter()
+                    .any(|text| text.contains("First source summary.")),
+                retained && count == 1
+            );
+            assert!(
+                !active
+                    .iter()
+                    .any(|text| text.contains("older answer") || text.contains("Latest summary."))
+            );
+        }
+    }
+}

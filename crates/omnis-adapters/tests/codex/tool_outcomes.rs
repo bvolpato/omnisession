@@ -661,3 +661,86 @@ fn checkpoint_tool_results_with_a_reused_call_id_follow_the_scoped_call() {
         assert_eq!(active, expected, "checkpoint has turn stamp: {stamp}");
     }
 }
+
+#[test]
+fn checkpoint_retains_only_a_published_client_authored_standalone_receipt() {
+    let item = json!({"type":"function_call_output", "id":"fco_observation", "name":"observation", "namespace":"fixture", "output":"published receipt"});
+    let author = json!({"client_authored":true});
+    let model = |item: &Value, metadata: &Value| json!({"type":"response_item", "payload":item, "metadata":metadata});
+    let public = |item: &Value| {
+        let mut typed = item.clone();
+        typed["type"] = "FunctionCallOutput".into();
+        turn_item("source", &typed)
+    };
+    let raw = model(&item, &author);
+    let shown = public(&item);
+    let published = vec![raw.clone(), shown.clone()];
+    let retained = vec![item.clone()];
+    let metadata = vec![author.clone()];
+    let mut cases = vec![
+        (published.clone(), retained.clone(), metadata.clone(), true),
+        (
+            vec![shown.clone()],
+            retained.clone(),
+            metadata.clone(),
+            false,
+        ),
+        (vec![raw.clone()], retained.clone(), metadata.clone(), false),
+        (
+            vec![model(&item, &Value::Null), shown.clone()],
+            retained.clone(),
+            metadata.clone(),
+            false,
+        ),
+        (published.clone(), retained.clone(), vec![json!({})], false),
+        (
+            vec![raw.clone(), raw.clone(), shown.clone()],
+            retained.clone(),
+            metadata.clone(),
+            false,
+        ),
+        (
+            published.clone(),
+            vec![item.clone(), item.clone()],
+            vec![author.clone(); 2],
+            false,
+        ),
+    ];
+    for (field, value) in [
+        ("id", "fco_other"),
+        ("name", "changed"),
+        ("namespace", "different"),
+        ("output", "private replacement"),
+    ] {
+        let mut other = item.clone();
+        other[field] = value.into();
+        cases.push((
+            published.clone(),
+            vec![other.clone()],
+            metadata.clone(),
+            false,
+        ));
+        cases.push((
+            vec![raw.clone(), public(&other)],
+            retained.clone(),
+            metadata.clone(),
+            false,
+        ));
+    }
+    for (original, copies, metadata, expected) in cases {
+        let mut rows = vec![event("task_started", json!({"turn_id":"source"}))];
+        rows.extend(original);
+        rows.push(json!({"type":"compacted", "payload":{"window_number":1, "message":"", "replacement_history":copies, "replacement_history_metadata":metadata}}));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            assert_eq!(trajectory.tool_events, usize::from(expected), "{rows:?}");
+            assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+            let markdown = omnis_core::render_markdown_export(&snapshot);
+            let active = markdown.split("## Previous Codex display").next().unwrap();
+            assert_eq!(active.contains("published receipt"), expected);
+            assert!(!active.contains("private replacement"));
+        }
+    }
+}
