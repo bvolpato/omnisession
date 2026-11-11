@@ -462,50 +462,61 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
-    let mut statement = snapshot
+    // Look at sizes first so a skipped step does not read its blob or displace a smaller one.
+    let mut statement = snapshot.connection.prepare(
+        "SELECT idx, CASE WHEN typeof(step_payload) = 'blob' THEN length(step_payload) END \
+         FROM steps ORDER BY idx DESC LIMIT ?1",
+    )?;
+    let mut payload_by_index = snapshot
         .connection
-        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;
-    let mut rows = statement.query(rusqlite::params![
-        i64::try_from(limits.row_bytes)?,
-        i64::try_from(limits.records)?,
-    ])?;
+        .prepare("SELECT step_payload FROM steps WHERE idx = ?1")?;
+    let mut rows = statement.query([i64::try_from(limits.records)?])?;
+    let mut retained = Vec::new();
     let mut decoded = 0;
-    let mut visited = 0;
     let mut remaining_wire = limits.wire_bytes;
     let mut remaining_history = limits.history_bytes;
-    let mut omitted = stored.saturating_sub(limits.records);
     let mut unsupported = 0;
+    let mut damaged = 0;
     while let Some(row) = rows.next()? {
-        let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
-        visited += 1;
-        if bytes > limits.row_bytes {
-            omitted += 1;
+        let Some(length) = row.get::<_, Option<i64>>(1)? else {
+            damaged += 1;
+            continue;
+        };
+        let bytes = usize::try_from(length)?;
+        if bytes > limits.row_bytes || bytes > remaining_wire {
             continue;
         }
-        if bytes > remaining_wire {
-            omitted = omitted.saturating_add(stored.min(limits.records) - visited + 1);
-            break;
-        }
         remaining_wire -= bytes;
-        let payload = row.get::<_, Vec<u8>>(1)?;
-        let step = ProtoStep::decode(payload.as_slice())?;
+        let index: i64 = row.get(0)?;
+        let payload: Vec<u8> = payload_by_index.query_row([index], |record| record.get(0))?;
+        let Ok(step) = ProtoStep::decode(payload.as_slice()) else {
+            damaged += 1;
+            continue;
+        };
         decoded += 1;
         let event = database_step_event(step, &payload);
         unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
         let bytes = estimated_event_bytes(&event.payload);
-        if bytes > remaining_history {
-            omitted += 1;
-        } else {
+        if bytes <= remaining_history {
             remaining_history -= bytes;
-            builder.push(
-                event.kind,
-                event.payload,
-                event.timestamp,
-                event.replay_policy,
-                Some(event.record_type),
-                None,
-            );
+            retained.push(event);
         }
+    }
+    if decoded == 0 && damaged > 0 {
+        return Err(anyhow!(
+            "no Antigravity steps could be decoded ({damaged} selected step payloads were missing or invalid)"
+        ));
+    }
+    let omitted = stored - retained.len();
+    for event in retained.into_iter().rev() {
+        builder.push(
+            event.kind,
+            event.payload,
+            event.timestamp,
+            event.replay_policy,
+            Some(event.record_type),
+            None,
+        );
     }
     if omitted > 0 || unsupported > 0 {
         builder.push(
@@ -799,15 +810,18 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let database = temporary.path().join("conversation.db");
-        let step = synthetic_step(
-            14,
-            Some(proto_step::Step::UserInput(ProtoUserInput {
-                query: "Synthetic visible history".to_owned(),
-                ..ProtoUserInput::default()
-            })),
-        );
-        let wire_bytes = step.encoded_len();
-        write_steps_database(&database, &[step.clone(), step]);
+        let text = ["First visible request", "Final visible request"];
+        let steps = text.map(|query| {
+            synthetic_step(
+                14,
+                Some(proto_step::Step::UserInput(ProtoUserInput {
+                    query: query.to_owned(),
+                    ..ProtoUserInput::default()
+                })),
+            )
+        });
+        let wire_bytes = steps[1].encoded_len();
+        write_steps_database(&database, &steps);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
@@ -817,44 +831,55 @@ mod tests {
             .unwrap();
         drop(connection);
         let before = std::fs::read(&database).unwrap();
-        let visible_bytes = crate::support::estimated_event_bytes(
-            &serde_json::json!({"text":"Synthetic visible history"}),
+        let visible_bytes =
+            crate::support::estimated_event_bytes(&serde_json::json!({"text": text[1]}));
+        let row_limit = super::DatabaseReadLimits {
+            row_bytes: wire_bytes,
+            ..super::DatabaseReadLimits::default()
+        };
+        let session = SessionRef::new(
+            Provider::Antigravity,
+            "11111111-1111-4111-8111-111111111111",
         );
-        for (limits, omitted) in [
+        for (limits, expected) in [
+            (row_limit, &text[..]),
             (
                 super::DatabaseReadLimits {
-                    row_bytes: wire_bytes,
-                    ..super::DatabaseReadLimits::default()
-                },
-                1,
-            ),
-            (
-                super::DatabaseReadLimits {
-                    row_bytes: 1024,
                     history_bytes: visible_bytes,
-                    ..super::DatabaseReadLimits::default()
+                    ..row_limit
                 },
-                2,
+                &text[1..],
             ),
             (
                 super::DatabaseReadLimits {
-                    records: 1,
+                    records: 2,
+                    ..row_limit
+                },
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    wire_bytes: steps.iter().map(Message::encoded_len).sum(),
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[..],
             ),
             (
                 super::DatabaseReadLimits {
                     wire_bytes,
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    records: 1,
+                    ..row_limit
+                },
+                &text[..0],
             ),
         ] {
-            let mut builder = EventBuilder::new(
-                Provider::Antigravity,
-                "11111111-1111-4111-8111-111111111111",
-            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
             let decoded = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
@@ -862,27 +887,58 @@ mod tests {
                 limits,
             )
             .unwrap();
-            assert!(decoded > 0);
-            let snapshot = builder.snapshot(
-                SessionRef::new(
-                    Provider::Antigravity,
-                    "11111111-1111-4111-8111-111111111111",
-                ),
-                None,
-                None,
-                None,
-                Utc::now(),
-            );
-            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
-            assert_eq!(
-                snapshot.events[0].payload["text"],
-                "Synthetic visible history"
-            );
-            let notice = snapshot.events.last().unwrap();
-            assert_eq!(notice.payload["omitted_events"], omitted);
+            assert!(decoded >= expected.len());
+            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
+            let (notice, messages) = snapshot.events.split_last().unwrap();
+            let actual = messages
+                .iter()
+                .map(|message| message.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            assert_eq!(notice.payload["omitted_events"], 3 - expected.len());
             assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
         }
         assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn damaged_database_steps_do_not_hide_a_readable_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        let id = "11111111-1111-4111-8111-111111111111";
+        let request = synthetic_step(
+            14,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "Latest readable request".into(),
+                ..ProtoUserInput::default()
+            })),
+        );
+        write_steps_database(&database, &[request]);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO steps (idx, step_payload) VALUES (1, NULL), (2, x'80'), (3, 'invalid')",
+        )
+        .unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        assert_eq!(
+            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            1
+        );
+        let snapshot = builder.snapshot(
+            SessionRef::new(Provider::Antigravity, id),
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(
+            snapshot.events[0].payload["text"],
+            "Latest readable request"
+        );
+        assert_eq!(snapshot.events[1].payload["omitted_events"], 3);
+        conn.execute("DELETE FROM steps WHERE idx = 0", []).unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        assert!(push_database_steps(temporary.path(), &database, &mut builder).is_err());
     }
 
     #[test]
