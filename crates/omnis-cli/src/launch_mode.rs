@@ -332,7 +332,7 @@ impl InstalledModes {
             && let Some(cached) = cache.get(key)
             && cached["stamp"] == *stamp
             && cached["specification"] == specification
-            && let Some(kinds) = cached["supported"].as_array()
+            && let Some(kinds) = cached["verified_modes"].as_array()
         {
             return Self {
                 supported: kinds
@@ -363,7 +363,7 @@ impl InstalledModes {
             let kinds = supported.iter().map(|kind| kind.id()).collect::<Vec<_>>();
             entries.insert(
                 key,
-                json!({ "stamp": stamp, "specification": specification, "supported": kinds }),
+                json!({ "stamp": stamp, "specification": specification, "verified_modes": kinds }),
             );
             // Best effort: a missing cache only costs the next launch another probe.
             let _ = write_cache(path, &cache);
@@ -429,8 +429,11 @@ fn help_output(binary: &Path) -> Result<String> {
         .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    if wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)?.is_none() {
+    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)? else {
         bail!("`--help` timed out");
+    };
+    if !status.success() {
+        bail!("`--help` exited with {status}");
     }
     if output.as_file().metadata()?.len() > MAX_HELP_BYTES {
         bail!("`--help` output exceeds safe limit");
@@ -571,6 +574,31 @@ mod tests {
             yolo
         ));
         assert!(!help_lists("      --autoupdate    update on start", yolo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_help_probe_retries_on_the_next_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex");
+        let cache = directory.path().join("launch-modes.json");
+        fs::write(
+            &binary,
+            "#!/bin/sh\n[ \"$1\" = --help ] || exit 0\n[ -f \"$0.ready\" ] || exit 1\necho '  --approve-for-me'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::output_after_write(
+            std::process::Command::new(&binary).arg("--version"),
+        );
+
+        let probe = || InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
+        let auto = find_mode(Provider::Codex, ModeKind::Auto).unwrap();
+        assert!(!probe().has(auto));
+        fs::write(binary.with_extension("ready"), "").unwrap();
+        assert!(probe().has(auto));
     }
 
     #[cfg(unix)]

@@ -31,12 +31,12 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    session_preview, workspace_paths_match,
 };
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin,
-    SessionTrajectorySearchPage, Store,
+    HandoffRecord, IndexedSession, IndexedTrajectoryTitle, SessionTrajectoryMatch,
+    SessionTrajectorySearchPage, Store, TrajectorySelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -140,10 +140,27 @@ pub enum PickerOutcome {
 struct PickerEntry {
     key: String,
     session: NativeSession,
-    current_workspace: bool,
     has_provider_title: bool,
+    current_workspace: bool,
     fields: SearchFields,
     cached: bool,
+}
+
+impl PickerEntry {
+    fn source_revision(&self) -> Option<SourceRevision> {
+        if self.session.session.provider != Provider::Codex {
+            return None;
+        }
+        self.session
+            .source_revision
+            .map(preview_revision)
+            .or_else(|| {
+                self.session
+                    .source_path
+                    .is_some()
+                    .then(SourceRevision::default)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -172,7 +189,7 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
-    indexed_titles: HashMap<String, String>,
+    indexed_titles: HashMap<String, (SourceRevision, String)>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
@@ -437,14 +454,30 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
-        self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
+        self.replace_provider_entries(
+            provider,
+            picker_entries(sessions, current_project, cached),
+            true,
+        );
     }
 
-    fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
+    fn replace_provider_entries(
+        &mut self,
+        provider: Provider,
+        mut entries: Vec<PickerEntry>,
+        complete: bool,
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
-        self.entries
-            .retain(|entry| entry.session.session.provider != provider);
+        self.forget_replaced_sources(&entries);
+        if provider == Provider::Codex && !complete {
+            let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
+            self.entries
+                .retain(|entry| !observed.contains(entry.key.as_str()));
+        } else {
+            self.entries
+                .retain(|entry| entry.session.session.provider != provider);
+        }
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
@@ -459,6 +492,7 @@ impl PickerState {
     fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
+        self.forget_replaced_sources(&entries);
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
         self.apply_derived_titles();
@@ -467,6 +501,28 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
+    }
+
+    fn forget_replaced_sources(&mut self, entries: &[PickerEntry]) {
+        for entry in entries {
+            let Some(index) = self.entry_positions.get(&entry.key) else {
+                continue;
+            };
+            let previous = &self.entries[*index];
+            let previous_key = self.preview_key(previous);
+            let path_changed = previous.session.source_revision.is_none()
+                && previous.session.source_path != entry.session.source_path;
+            if (path_changed || previous_key.source != self.preview_key(entry).source)
+                && (previous.session.source_path.is_some()
+                    || previous.session.source_revision.is_some()
+                    || self.preview_titles.contains_key(&entry.key)
+                    || self.previews.contains(&previous_key))
+            {
+                self.indexed_titles.remove(&entry.key);
+                self.preview_titles.remove(&entry.key);
+                self.previews.remove_session(&entry.session.session);
+            }
+        }
     }
 
     fn restore_selection(&mut self, selected_key: Option<String>) {
@@ -532,7 +588,7 @@ impl PickerState {
             ));
             return;
         }
-        let key = self.preview_key(&entry.session);
+        let key = self.preview_key(entry);
         let dialog = DeleteDialog {
             session: entry.session.session.clone(),
             title: display_title(&entry.session, self.previews.get(&key)),
@@ -545,8 +601,25 @@ impl PickerState {
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
+        self.deleted_sessions.insert(session.to_string());
+        self.remove_entry(session, None);
+    }
+
+    fn discard_stale_cached_preview(&mut self, key: &PreviewKey) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        let entry = &self.entries[index];
+        if entry.cached && self.preview_key(entry) == *key {
+            let selected = self.selected_entry().map(|entry| entry.key.clone());
+            self.remove_entry(&key.session, selected);
+        }
+    }
+
+    fn remove_entry(&mut self, session: &SessionRef, selected: Option<String>) {
         let key = session.to_string();
-        self.deleted_sessions.insert(key.clone());
+        self.indexed_titles.remove(&key);
+        self.preview_titles.remove(&key);
         self.entries.retain(|entry| entry.key != key);
         self.trajectory_matches.remove(&key);
         self.trajectory_match_order.remove(&key);
@@ -557,7 +630,7 @@ impl PickerState {
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
-        self.restore_selection(None);
+        self.restore_selection(selected);
     }
 
     fn reset_selection(&mut self) {
@@ -628,16 +701,31 @@ impl PickerState {
 
     fn remember_preview_title(
         &mut self,
-        key: &PreviewKey,
+        key: &mut PreviewKey,
         value: &PreviewValue,
-        indexed_title: PreviewIndexTitle,
-    ) {
+        read_revision: Option<SourceRevision>,
+        indexed_title: Option<IndexedTrajectoryTitle>,
+    ) -> bool {
         let session_key = key.session.to_string();
         let Some(&index) = self.entry_positions.get(&session_key) else {
-            return;
+            return false;
         };
-        if self.preview_key(&self.entries[index].session) != *key {
-            return;
+        if self.preview_key(&self.entries[index]) != *key {
+            return false;
+        }
+        if let Some(revision) = read_revision {
+            if key
+                .source
+                .as_ref()
+                .and_then(PreviewSource::revision)
+                .is_some_and(|expected| expected != revision)
+            {
+                return false;
+            }
+            if matches!(key.source, Some(PreviewSource::CachedCodex(_))) {
+                self.entries[index].session.source_revision = Some(revision);
+                key.source = Some(PreviewSource::CodexFile(revision));
+            }
         }
         let selected = self.selected_entry().map(|entry| entry.key.clone());
         let title = preview_continuation_title(value).or_else(|| preview_title(value));
@@ -651,39 +739,29 @@ impl PickerState {
             }
         } else if matches!(
             value,
-            PreviewValue::Ready {
-                complete: true,
-                can_use_first_title: true,
-                ..
-            }
+            PreviewValue::Ready { complete, can_use_first_title: true, .. } if *complete || key.session.provider == Provider::Codex
         ) {
             self.preview_titles.remove(&session_key).is_some()
         } else {
             false
         };
-        let index_changed = match indexed_title {
-            PreviewIndexTitle::NotWritten => false,
-            PreviewIndexTitle::Written(title) => self.update_indexed_title(&session_key, title),
-        };
+        let index_changed =
+            indexed_title.is_some_and(|receipt| self.update_indexed_title(index, receipt));
         if index_changed || preview_changed {
             self.refresh_entry_title(index);
             self.entries_generation = self.entries_generation.wrapping_add(1);
             self.restore_selection(selected);
         }
+        true
     }
 
-    fn remember_indexed_titles(
-        &mut self,
-        titles: impl IntoIterator<Item = (SessionRef, Option<String>)>,
-    ) {
+    fn remember_source_titles(&mut self, titles: impl IntoIterator<Item = IndexedTrajectoryTitle>) {
         let selected = self.selected_entry().map(|entry| entry.key.clone());
         let mut changed = false;
-        for (session, title) in titles {
-            let key = session.to_string();
-            if !self.update_indexed_title(&key, title) {
-                continue;
-            }
-            if let Some(&index) = self.entry_positions.get(&key) {
+        for receipt in titles {
+            if let Some(&index) = self.entry_positions.get(&receipt.session.to_string())
+                && self.update_indexed_title(index, receipt)
+            {
                 self.refresh_entry_title(index);
                 changed = true;
             }
@@ -694,25 +772,41 @@ impl PickerState {
         }
     }
 
-    fn update_indexed_title(&mut self, session_key: &str, title: Option<String>) -> bool {
-        if self.indexed_titles.get(session_key) == title.as_ref() {
+    fn update_indexed_title(&mut self, index: usize, receipt: IndexedTrajectoryTitle) -> bool {
+        let entry = &self.entries[index];
+        let revision = preview_revision(receipt.source_revision);
+        if receipt.session != entry.session.session
+            || (receipt.session.provider == Provider::Codex
+                && entry.source_revision().unwrap_or_default() != revision)
+        {
+            return false;
+        }
+        let title = receipt.title.map(|title| (revision, title));
+        if self.indexed_titles.get(&entry.key) == title.as_ref() {
             return false;
         }
         if let Some(title) = title {
-            self.indexed_titles.insert(session_key.to_owned(), title);
+            self.indexed_titles.insert(entry.key.clone(), title);
         } else {
-            self.indexed_titles.remove(session_key);
+            self.indexed_titles.remove(&entry.key);
         }
         true
     }
 
     fn refresh_entry_title(&mut self, index: usize) {
         let entry = &self.entries[index];
-        let indexed = self.indexed_titles.get(&entry.key).map(String::as_str);
+        let indexed = self
+            .indexed_titles
+            .get(&entry.key)
+            .filter(|(revision, _)| {
+                entry.session.session.provider != Provider::Codex
+                    || entry.source_revision().unwrap_or_default() == *revision
+            })
+            .map(|(_, title)| title.as_str());
         let preview = self
             .preview_titles
             .get(&entry.key)
-            .filter(|(key, _)| *key == self.preview_key(&entry.session))
+            .filter(|(key, _)| *key == self.preview_key(entry))
             .map(|(_, title)| title.as_str());
         let entry = &mut self.entries[index];
         if !entry.has_provider_title {
@@ -793,7 +887,11 @@ impl PickerState {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| entry.session.session.clone())
+                .map(|(_, entry)| TrajectorySelection {
+                    session: entry.session.session.clone(),
+                    source: (entry.session.session.provider == Provider::Codex)
+                        .then(|| entry.source_revision().unwrap_or_default()),
+                })
                 .collect(),
         })
     }
@@ -858,11 +956,20 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
-    fn preview_key(&self, session: &NativeSession) -> PreviewKey {
+    fn preview_key(&self, entry: &PickerEntry) -> PreviewKey {
         PreviewKey {
-            session: session.session.clone(),
-            updated_at: session.updated_at,
-            continuation_after: self.lineage.continuation_after(&session.session),
+            session: entry.session.session.clone(),
+            source: if let Some(revision) = entry.source_revision() {
+                Some(PreviewSource::CodexFile(revision))
+            } else if entry.cached && entry.session.session.provider == Provider::Codex {
+                Some(PreviewSource::CachedCodex(
+                    entry.session.project_path.clone(),
+                ))
+            } else {
+                entry.session.source_path.clone().map(PreviewSource::Path)
+            },
+            updated_at: entry.session.updated_at,
+            continuation_after: self.lineage.continuation_after(&entry.session.session),
         }
     }
 
@@ -878,12 +985,9 @@ impl PickerState {
             .filter_map(|row| row.checked_sub(offset))
             .filter_map(|row| visible.get(row))
             .filter_map(|index| self.entries.get(*index))
-            .map(|entry| self.preview_key(&entry.session))
+            .map(|entry| self.preview_key(entry))
             .collect::<Vec<_>>();
-        if let Some(selected_key) = self
-            .selected_entry()
-            .map(|entry| self.preview_key(&entry.session))
-        {
+        if let Some(selected_key) = self.selected_entry().map(|entry| self.preview_key(entry)) {
             window.retain(|key| key != &selected_key);
             window.insert(0, selected_key);
         }
@@ -902,7 +1006,7 @@ impl PickerState {
                 else {
                     continue;
                 };
-                let preview_key = self.preview_key(&entry.session);
+                let preview_key = self.preview_key(entry);
                 if !window.contains(&preview_key) {
                     window.push(preview_key);
                 }
@@ -919,7 +1023,7 @@ impl PickerState {
             .then(|| Instant::now() + PREVIEW_DEBOUNCE);
     }
 
-    fn due_preview_request(&mut self) -> Option<Vec<PreviewKey>> {
+    fn due_preview_request(&mut self) -> Option<Vec<PreviewRequest>> {
         let deadline = self.preview_deadline?;
         if Instant::now() < deadline {
             return None;
@@ -929,22 +1033,52 @@ impl PickerState {
             .preview_window
             .iter()
             .filter(|key| !self.previews.contains(key))
-            .cloned()
+            .filter_map(|key| {
+                let index = self.entry_positions.get(&key.session.to_string())?;
+                Some(PreviewRequest {
+                    key: key.clone(),
+                    source_path: self.entries[*index].session.source_path.clone(),
+                    cached: self.entries[*index].cached,
+                })
+            })
             .collect::<Vec<_>>();
         (!missing.is_empty()).then_some(missing)
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PreviewSource {
+    CodexFile(SourceRevision),
+    CachedCodex(Option<PathBuf>),
+    Path(PathBuf),
+}
+
+impl PreviewSource {
+    const fn revision(&self) -> Option<SourceRevision> {
+        match self {
+            Self::CodexFile(revision) => Some(*revision),
+            Self::Path(_) | Self::CachedCodex(_) => None,
+        }
+    }
+}
+
+const fn preview_revision(mut revision: SourceRevision) -> SourceRevision {
+    revision.missing_ancestor = None;
+    revision
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    source: Option<PreviewSource>,
     updated_at: Option<DateTime<Utc>>,
     continuation_after: Option<DateTime<Utc>>,
 }
 
-enum PreviewIndexTitle {
-    NotWritten,
-    Written(Option<String>),
+struct PreviewRequest {
+    key: PreviewKey,
+    source_path: Option<PathBuf>,
+    cached: bool,
 }
 
 enum PreviewValue {
@@ -1193,14 +1327,29 @@ fn picker_entries(
     normalized_picker_entries(sessions, current_project, cached)
 }
 
-fn cached_picker_entries(
-    store: &Store,
-    current_project: &Path,
-) -> Result<(Vec<PickerEntry>, Vec<String>)> {
-    let sessions = store
-        .indexed_sessions()?
+#[derive(Default)]
+struct CachedPickerEntries {
+    entries: Vec<PickerEntry>,
+    titles: Vec<omnis_store::IndexedTrajectoryTitle>,
+    warnings: Vec<String>,
+}
+
+fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
+    let (sessions, titles) = store.cached_sessions_with_titles(None)?;
+    let sources: HashMap<_, _> = titles
+        .iter()
+        .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
+        .map(|row| (&row.session, preview_revision(row.source_revision)))
+        .collect();
+    let sessions = sessions
         .into_iter()
         .map(workers::native_session)
+        .map(|mut session| {
+            if session.source_revision.is_none() {
+                session.source_revision = sources.get(&session.session).copied();
+            }
+            session
+        })
         .collect();
     let mut entries = picker_entries(sessions, current_project, true);
     let mut warnings = Vec::new();
@@ -1231,7 +1380,11 @@ fn cached_picker_entries(
             ),
         }
     }
-    Ok((entries, warnings))
+    Ok(CachedPickerEntries {
+        entries,
+        titles,
+        warnings,
+    })
 }
 
 fn normalized_picker_entries(
@@ -1253,11 +1406,11 @@ fn picker_entry(
 ) -> PickerEntry {
     PickerEntry {
         key: session.session.to_string(),
+        has_provider_title: session.title.is_some(),
         current_workspace: session
             .project_path
             .as_deref()
             .is_some_and(|path| matcher.matches(path)),
-        has_provider_title: session.title.is_some(),
         fields: SearchFields::new(&session, None),
         session,
         cached,
@@ -1318,7 +1471,7 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
-    eligible_sessions: Vec<SessionRef>,
+    eligible_sessions: Vec<TrajectorySelection>,
 }
 
 #[derive(Default)]
@@ -1378,7 +1531,7 @@ pub fn pick_session(
     new_session_targets: &[AgentTarget],
     initial_provider: Option<Provider>,
     all_projects: bool,
-    force_cross_provider: bool,
+    materialize: Option<CanMaterialize<'_>>,
     requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
@@ -1467,7 +1620,7 @@ pub fn pick_session(
                 target,
                 available_targets,
                 new_session_targets,
-                force_cross_provider,
+                materialize,
                 requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
@@ -1498,14 +1651,20 @@ fn select_picker_row(
     target: Option<AgentTarget>,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    force_cross_provider: bool,
+    materialize: Option<CanMaterialize<'_>>,
     requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
         if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(target, None, None, new_session_targets, requested_mode)? {
+        return match requested_target(
+            target,
+            TargetIntent::New,
+            None,
+            new_session_targets,
+            requested_mode,
+        )? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.target(),
                 mode: choice.mode,
@@ -1522,17 +1681,15 @@ fn select_picker_row(
     };
     let session = entry.session.session.clone();
     let project_path = entry.session.project_path.clone();
-    let targets = available_targets
-        .iter()
-        .copied()
-        .filter(|target| !force_cross_provider || target.provider != session.provider)
-        .collect::<Vec<_>>();
+    let intent = materialize.map_or(TargetIntent::Resume(&session), |can_copy| {
+        TargetIntent::Materialize(&session, can_copy)
+    });
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(
         target,
-        Some(&session),
+        intent,
         Some(preferred_target),
-        &targets,
+        available_targets,
         requested_mode,
     )? {
         TargetOutcome::Selected(choice) => {
@@ -1573,24 +1730,20 @@ fn select_picker_row(
 
 fn requested_target(
     target: Option<AgentTarget>,
-    source: Option<&SessionRef>,
+    intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     target.map_or_else(
-        || {
-            source.map_or_else(
-                || pick_new_target(targets, requested_mode),
-                |source| pick_target(source, preferred_target, targets, requested_mode),
-            )
-        },
+        || pick_target_for(intent, preferred_target, targets, requested_mode),
         |target| {
             // `--in` skipped the page, so `--mode` or the agent's default decides.
             Ok(TargetOutcome::Selected(TargetChoice {
                 provider: target.provider,
                 profile: target.profile,
-                fork: false,
+                fork: matches!(intent, TargetIntent::Materialize(source, can_copy)
+                    if source.provider == target.provider && can_copy(source, target)),
                 mode: None,
             }))
         },
@@ -1675,23 +1828,32 @@ struct TargetChoice {
     mode: Option<ModeKind>,
 }
 
+pub(super) type CanMaterialize<'a> = &'a dyn Fn(&SessionRef, AgentTarget) -> bool;
+
 #[derive(Clone, Copy)]
 enum TargetIntent<'a> {
     Resume(&'a SessionRef),
     Fork(&'a SessionRef),
+    Materialize(&'a SessionRef, CanMaterialize<'a>),
     New,
 }
 
 impl<'a> TargetIntent<'a> {
     fn source(self) -> Option<&'a SessionRef> {
         match self {
-            Self::Resume(source) | Self::Fork(source) => Some(source),
+            Self::Resume(source) | Self::Fork(source) | Self::Materialize(source, _) => {
+                Some(source)
+            }
             Self::New => None,
         }
     }
 
     fn source_provider(self) -> Option<Provider> {
         self.source().map(|source| source.provider)
+    }
+
+    fn creates_copy(self) -> bool {
+        matches!(self, Self::Fork(_) | Self::Materialize(..))
     }
 }
 
@@ -1864,38 +2026,20 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn pick_target(
-    source: &SessionRef,
-    preferred_target: Option<Provider>,
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(
-        TargetIntent::Resume(source),
-        preferred_target,
-        targets,
-        requested_mode,
-    )
-}
-
-fn pick_new_target(
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, None, targets, requested_mode)
-}
-
 pub fn pick_fork_target(
     source: &SessionRef,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
+    materialize: Option<CanMaterialize<'_>>,
 ) -> Result<Option<PickedTarget>> {
     require_terminal("`--in` is required without an interactive terminal")?;
     let _terminal = TerminalGuard::enter()?;
     theme::init();
     let preferred_target = crate::continuation_target_provider(source)?;
     match pick_target_for(
-        TargetIntent::Fork(source),
+        materialize.map_or(TargetIntent::Fork(source), |can_copy| {
+            TargetIntent::Materialize(source, can_copy)
+        }),
         Some(preferred_target),
         targets,
         requested_mode,
@@ -2050,7 +2194,7 @@ fn target_rows(intent: TargetIntent<'_>, choices: Vec<TargetChoice>) -> Vec<Targ
         .into_iter()
         .map(TargetRow::Agent)
         .collect::<Vec<_>>();
-    if intent.source().is_some() {
+    if matches!(intent, TargetIntent::Resume(_) | TargetIntent::Fork(_)) {
         rows.push(TargetRow::ClipboardHandoff);
     }
     rows
@@ -2158,10 +2302,15 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
     let source = intent.source_provider();
     let mut choices = Vec::with_capacity(targets.len() + 1);
     for &entry in targets {
-        let AgentTarget { provider, profile } = entry.into();
+        let target = entry.into();
+        let AgentTarget { provider, profile } = target;
         let same_provider = Some(provider) == source;
         let available = match intent {
             TargetIntent::New => supports_capability_on(provider, Capability::CleanStart, platform),
+            TargetIntent::Materialize(source, can_copy) => {
+                supports_capability_on(provider, Capability::CrossProviderImport, platform)
+                    && can_copy(source, target)
+            }
             TargetIntent::Resume(_) | TargetIntent::Fork(_) if same_provider => {
                 supports_capability_on(provider, Capability::SameProviderResume, platform)
             }
@@ -2173,10 +2322,7 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
         if !available {
             continue;
         }
-        let materialized_fork = matches!(
-            provider,
-            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
-        );
+        let materialized_fork = crate::transfer::materializes_native_forks(provider);
         if matches!(intent, TargetIntent::Fork(_))
             && same_provider
             && materialized_fork
@@ -2184,11 +2330,15 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
         {
             continue;
         }
-        let mode = launch_mode::default_mode(provider).map(|mode| mode.kind);
+        let mode = if matches!(intent, TargetIntent::Materialize(..)) {
+            None
+        } else {
+            launch_mode::default_mode(provider).map(|mode| mode.kind)
+        };
         choices.push(TargetChoice {
             provider,
             profile,
-            fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
+            fork: intent.creates_copy() && same_provider,
             mode,
         });
         if matches!(intent, TargetIntent::Resume(_))
@@ -2213,7 +2363,7 @@ fn profile_target_index(
     target: AgentTarget,
     choices: &[TargetChoice],
 ) -> Option<usize> {
-    let fork = matches!(intent, TargetIntent::Fork(_));
+    let fork = intent.creates_copy() && Some(target.provider) == intent.source_provider();
     choices
         .iter()
         .position(|choice| choice.target() == target && choice.fork == fork)
@@ -2226,7 +2376,7 @@ fn default_target_index(
 ) -> Option<usize> {
     let source = intent.source_provider();
     let preferred = preferred_target.or(source);
-    let fork = matches!(intent, TargetIntent::Fork(_)) && preferred == source;
+    let fork = intent.creates_copy() && preferred == source;
     preferred
         .and_then(|provider| {
             choices
@@ -2270,6 +2420,7 @@ fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String
             == crate::transfer::CrossProviderRoute::SemanticHandoff;
     let action = match intent {
         TargetIntent::New => format!("Start new session in {target_name}"),
+        TargetIntent::Materialize(..) => format!("Create a verified copy in {target_name}"),
         TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
         TargetIntent::Fork(_) if handoff => {
             format!("Fork continuation into {target_name} through semantic handoff")
@@ -2440,6 +2591,7 @@ fn render_target(
         TargetIntent::Resume(_) => "Where should this session open?",
         TargetIntent::Fork(_) => "Where should this session fork?",
         TargetIntent::New => "Where should this new session start?",
+        TargetIntent::Materialize(..) => "Where should the session copy be created?",
     };
     queue_styled(
         &mut frame,
@@ -2482,11 +2634,12 @@ fn render_target(
         queue!(frame, Print("\r\n"))?;
     }
     if visible.is_empty() {
-        queue_styled(
-            &mut frame,
-            DetailStyle::Muted,
-            &truncate("No available target matches this filter.", width),
-        )?;
+        let message = if filter.is_empty() && matches!(intent, TargetIntent::Materialize(..)) {
+            "No available target can create a copy of this session."
+        } else {
+            "No available target matches this filter."
+        };
+        queue_styled(&mut frame, DetailStyle::Muted, &truncate(message, width))?;
         queue!(frame, Print("\r\n\r\n"))?;
     }
     queue!(frame, Print("\r\n"))?;
@@ -2495,11 +2648,16 @@ fn render_target(
     } else {
         "Esc clear filter"
     };
+    let action = if matches!(intent, TargetIntent::Materialize(..)) {
+        "Enter create copy"
+    } else {
+        "←→ mode  Enter open"
+    };
     queue_styled(
         &mut frame,
         DetailStyle::Muted,
         &truncate(
-            &format!("Type to filter  ↑↓ target  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
+            &format!("Type to filter  ↑↓ target  {action}  {escape}  Ctrl-C cancel"),
             width,
         ),
     )?;
@@ -2804,7 +2962,9 @@ mod tests {
         store.save_bundle(&bundle).expect("save imported bundle");
         crate::index_bundle_source(&store, &bundle).expect("index imported bundle");
 
-        let (entries, warnings) = cached_picker_entries(&store, &project).expect("cached entries");
+        let CachedPickerEntries {
+            entries, warnings, ..
+        } = cached_picker_entries(&store, &project).expect("cached entries");
         let mut state = PickerState::new(Vec::new(), &project, None, false);
         state.replace_all_entries(entries);
 
@@ -2871,8 +3031,9 @@ mod tests {
             .upsert_indexed_session(&workers::indexed_session(&native))
             .expect("index native source");
 
-        let (entries, warnings) =
-            cached_picker_entries(&store, &workspace.root).expect("cached entries");
+        let CachedPickerEntries {
+            entries, warnings, ..
+        } = cached_picker_entries(&store, &workspace.root).expect("cached entries");
         assert!(warnings.is_empty());
         assert_eq!(entries.len(), 4);
         assert!(entries.iter().all(|entry| !entry.current_workspace));
@@ -2901,8 +3062,9 @@ mod tests {
                 .expect("index source");
         }
 
-        let (entries, warnings) =
-            cached_picker_entries(&store, temporary.path()).expect("cached entries");
+        let CachedPickerEntries {
+            entries, warnings, ..
+        } = cached_picker_entries(&store, temporary.path()).expect("cached entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(&missing_id));
@@ -3360,7 +3522,7 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
+        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], None, None)
             .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
@@ -3380,18 +3542,14 @@ mod tests {
             None,
             false,
         );
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0]);
         state.previews.insert(
             key,
             PreviewValue::Ready {
                 preview: Box::new(synthetic_preview("Start with cursor pagination.")),
                 continuation: None,
-                can_use_first_title: true,
                 complete: false,
+                can_use_first_title: true,
             },
             &[],
         );
@@ -3426,19 +3584,23 @@ mod tests {
     #[test]
     fn preview_titles_become_searchable() {
         let current = Path::new("/workspace");
-        let mut state = PickerState::new(
-            vec![session(Provider::Codex, "session", current, None)],
-            current,
-            None,
-            false,
-        );
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut original = session(Provider::Codex, id, current, None);
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(format!("rollout-original-{id}.jsonl"));
+        fs::write(&path, "original").unwrap();
+        original.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&path);
+        original.source_path = Some(path);
+        let revision = original.source_revision.unwrap();
+        let mut state = PickerState::new(vec![original.clone()], current, None, false);
         state.query = "pagination".to_owned();
         assert!(state.visible_indices().is_empty());
 
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
+        let mut key = state.preview_key(&state.entries[0]);
+        let receipt = |title: Option<&str>| IndexedTrajectoryTitle {
+            session: original.session.clone(),
+            source_revision: revision,
+            title: title.map(str::to_owned),
         };
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
@@ -3446,27 +3608,282 @@ mod tests {
             can_use_first_title: true,
             complete: false,
         };
+        let mut previous = PreviewKey {
+            source: Some(PreviewSource::Path(PathBuf::from(
+                "archived_sessions/old-rollout.jsonl",
+            ))),
+            ..key.clone()
+        };
+        state.remember_preview_title(&mut previous, &value, None, None);
+        assert!(state.visible_indices().is_empty());
         let sampled = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("A later pagination request")),
             continuation: None,
             complete: false,
             can_use_first_title: false,
         };
-        state.remember_preview_title(&key, &sampled, PreviewIndexTitle::Written(None));
+        state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
         assert!(state.visible_indices().is_empty());
         assert_eq!(
             display_title(&state.entries[0].session, Some(&sampled)),
             "Untitled session"
         );
 
-        state.remember_preview_title(&key, &value, PreviewIndexTitle::Written(None));
+        state.remember_preview_title(&mut key, &value, None, Some(receipt(None)));
         assert_eq!(state.visible_indices().len(), 1);
-        state.remember_indexed_titles([(key.session.clone(), Some("A separate title".to_owned()))]);
-        state.remember_indexed_titles([(key.session.clone(), None)]);
+        state.remember_source_titles([receipt(Some("A separate title"))]);
+        state.remember_source_titles([receipt(None)]);
         assert_eq!(state.visible_indices().len(), 1);
         assert_eq!(
             display_title(&state.entries[0].session, None),
             "Fix pagination without changing the API"
+        );
+
+        state.remember_source_titles([receipt(Some("Indexed pagination"))]);
+        let mut replacement = original.clone();
+        let path = home.path().join(format!("rollout-replacement-{id}.jsonl"));
+        fs::write(&path, "replacement").unwrap();
+        replacement.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&path);
+        replacement.source_path = Some(path);
+        state.replace_provider(Provider::Codex, vec![replacement], current, false);
+        assert!(state.visible_indices().is_empty());
+        assert!(state.entries[0].session.title.is_none());
+        state.remember_preview_title(
+            &mut key,
+            &value,
+            None,
+            Some(receipt(Some("Retired pagination"))),
+        );
+        assert!(state.visible_indices().is_empty());
+    }
+
+    #[test]
+    fn picker_preview_uses_the_rollout_from_fresh_discovery() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let write = |directory: &str, timestamp, prompt: &str| -> Result<()> {
+            let directory = home.path().join(directory);
+            fs::create_dir_all(&directory)?;
+            let header =
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":home.path()}});
+            let message = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":prompt}});
+            fs::write(
+                directory.join(format!("rollout-{timestamp}-{id}.jsonl")),
+                format!("{header}\n{message}\n"),
+            )?;
+            Ok(())
+        };
+        let registry = || {
+            let mut registry = AdapterRegistry::new();
+            registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+            registry
+        };
+        write(
+            "archived_sessions",
+            "2026-03-10T09-00-00",
+            "old conversation",
+        )?;
+        let worker = registry();
+        worker.find_native_session(Provider::Codex, id)?;
+        write(
+            "sessions/2026/03/11",
+            "2026-03-11T11-00-00",
+            "current conversation",
+        )?;
+        let fresh = registry()
+            .find_native_session(Provider::Codex, id)?
+            .unwrap();
+        let mut picker = PickerState::new(vec![fresh], home.path(), None, true);
+        picker.refresh_preview_window(1);
+        picker.preview_deadline = Some(Instant::now());
+        let request = picker.due_preview_request().unwrap().pop().unwrap();
+        let read = workers::read_picker_preview(
+            &worker,
+            &request.key,
+            request.source_path.as_deref(),
+            crate::search_index::FULL_READ_SOURCE_BYTES,
+            || {},
+        )?;
+        assert_eq!(
+            session_preview(&read.snapshot).first.unwrap().text,
+            "current conversation"
+        );
+        let path = request.source_path.as_deref().unwrap();
+        let header =
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":home.path()}});
+        let mut restored = fs::File::create(path)?;
+        writeln!(restored, "{header}")?;
+        restored.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))?;
+        drop(restored);
+        let (refresh, notifications) = mpsc::sync_channel(1);
+        assert!(
+            workers::read_picker_preview(
+                &worker,
+                &request.key,
+                Some(path),
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+                || {}
+            )
+            .is_err()
+        );
+        assert!(notifications.try_recv().is_err());
+        assert!(
+            workers::read_picker_preview(
+                &worker,
+                &request.key,
+                Some(path),
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+                || refresh.try_send(()).unwrap()
+            )
+            .is_err()
+        );
+        notifications.try_recv()?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_cached_codex_preview_verifies_the_recorded_workspace() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let sessions = home.path().join("sessions");
+        fs::create_dir(&sessions)?;
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let current = home.path().join("new");
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":current}});
+        fs::write(
+            sessions.join(format!("rollout-{id}.jsonl")),
+            format!("{header}\n"),
+        )?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+        let request = |project: &Path| {
+            let state = PickerState::new(
+                vec![session(Provider::Codex, id, project, None)],
+                project,
+                None,
+                true,
+            );
+            state.preview_key(&state.entries[0])
+        };
+        let (refresh, notifications) = mpsc::sync_channel(1);
+        assert!(
+            workers::read_picker_preview(
+                &registry,
+                &request(&home.path().join("old")),
+                None,
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+                || refresh.try_send(()).unwrap()
+            )
+            .is_err()
+        );
+        notifications.try_recv()?;
+        assert!(
+            workers::read_picker_preview(
+                &registry,
+                &request(&current),
+                None,
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+                || refresh.try_send(()).unwrap()
+            )?
+            .source_revision
+            .file
+            .is_some()
+        );
+        assert!(notifications.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_unseen_cached_codex_session_needs_complete_discovery_for_removal() {
+        let project = Path::new("/workspace");
+        let cached = session(Provider::Codex, "unseen", project, Some("Cached session"));
+        let found = session(Provider::Codex, "found", project, Some("Fresh session"));
+        let mut state = PickerState::new(vec![cached], project, None, true);
+        let found_entries = || picker_entries(vec![found.clone()], project, false);
+        state.replace_provider_entries(Provider::Codex, found_entries(), false);
+        assert_eq!(state.entries.len(), 2);
+        state.replace_provider_entries(Provider::Codex, found_entries(), true);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].session.session, found.session);
+    }
+
+    #[test]
+    fn a_stale_preview_hides_only_its_cached_row_until_rediscovery() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Codex, "restored", project, Some("Retired prompt"));
+        native.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native.clone()], project, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let other = PreviewKey {
+            source: Some(PreviewSource::CodexFile(SourceRevision::default())),
+            ..key.clone()
+        };
+        state.discard_stale_cached_preview(&other);
+        assert_eq!(state.entries.len(), 1);
+
+        state.discard_stale_cached_preview(&key);
+        assert!(state.entries.is_empty());
+        native.title = Some("Verified prompt".to_owned());
+        state.replace_provider(Provider::Codex, vec![native], project, false);
+        state.discard_stale_cached_preview(&key);
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Verified prompt")
+        );
+    }
+
+    #[test]
+    fn replaced_codex_rollout_rejects_queued_titles_and_previews() {
+        let home = tempfile::tempdir().unwrap();
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let rollout = home.path().join(format!("rollout-{uuid}.jsonl"));
+        fs::write(&rollout, b"archived rollout").unwrap();
+        let mut native = session(Provider::Codex, uuid, home.path(), None);
+        native.source_path = Some(rollout.clone());
+        native.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&rollout);
+        let receipt = |revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
+            session: SessionRef::new(Provider::Codex, uuid),
+            title: title.map(str::to_owned),
+            source_revision: revision,
+        };
+        let mut state = PickerState::new(vec![native.clone()], home.path(), None, true);
+        let mut old_key = state.preview_key(&state.entries[0]);
+        let archived = native.source_revision.unwrap();
+        let preview = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("Archived title")),
+            continuation: None,
+            complete: true,
+            can_use_first_title: true,
+        };
+        assert!(state.remember_preview_title(&mut old_key, &preview, None, None));
+        state.query = "archived title".to_owned();
+        state.query_changed();
+        assert_eq!(state.visible_indices().len(), 1);
+        let generation = state.trajectory_search_generation;
+
+        let new_file = home.path().join("replacement");
+        fs::write(&new_file, b"current rollout").unwrap();
+        fs::rename(&new_file, &rollout).unwrap();
+        native.project_path = Some(home.path().join("other"));
+        native.title = Some("Current title".to_owned());
+        native.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&rollout);
+        let current = native.source_revision.unwrap();
+        state.replace_provider(Provider::Codex, vec![native], home.path(), false);
+
+        assert!(!state.remember_preview_title(&mut old_key, &preview, None, None));
+        state.remember_source_titles([receipt(archived, Some("Archived title"))]);
+        assert!(state.visible_indices().is_empty());
+        assert_ne!(generation, state.trajectory_search_generation);
+        state.remember_source_titles([
+            receipt(current, Some("Current title")),
+            receipt(current, Some("Distinct current prompt")),
+            receipt(current, None),
+        ]);
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Current title")
         );
     }
 
@@ -3482,15 +3899,17 @@ mod tests {
             None,
             false,
         );
-        state.remember_indexed_titles(vec![
-            (
-                SessionRef::new(Provider::Codex, "untitled"),
-                Some("Rate limiter retry".to_owned()),
-            ),
-            (
-                SessionRef::new(Provider::Claude, "titled"),
-                Some("First prompt text".to_owned()),
-            ),
+        state.remember_source_titles([
+            omnis_store::IndexedTrajectoryTitle {
+                session: SessionRef::new(Provider::Codex, "untitled"),
+                title: Some("Rate limiter retry".to_owned()),
+                source_revision: SourceRevision::default(),
+            },
+            omnis_store::IndexedTrajectoryTitle {
+                session: SessionRef::new(Provider::Claude, "titled"),
+                title: Some("First prompt text".to_owned()),
+                source_revision: SourceRevision::default(),
+            },
         ]);
 
         let untitled = &state.entries[0].session;
@@ -3503,10 +3922,15 @@ mod tests {
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
-        state.remember_indexed_titles([
-            (SessionRef::new(Provider::Codex, "untitled"), None),
-            (SessionRef::new(Provider::Claude, "titled"), None),
-        ]);
+        state.remember_source_titles(
+            [(Provider::Codex, "untitled"), (Provider::Claude, "titled")]
+                .into_iter()
+                .map(|(provider, id)| IndexedTrajectoryTitle {
+                    session: SessionRef::new(provider, id),
+                    title: None,
+                    source_revision: SourceRevision::default(),
+                }),
+        );
         assert!(state.visible_indices().is_empty());
         state.query = "ratelimiter".to_owned();
         assert!(state.visible_indices().is_empty());
@@ -4013,11 +4437,7 @@ mod tests {
             false,
         );
         state.current_git_branch = Some("main".to_owned());
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0]);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -4044,8 +4464,8 @@ mod tests {
                     git_head: Some("0123456789abcdef".to_owned()),
                 }),
                 continuation: None,
-                can_use_first_title: true,
                 complete: false,
+                can_use_first_title: true,
             },
             &[],
         );
@@ -4182,12 +4602,12 @@ mod tests {
 
         assert_eq!(request.len(), row_count);
         assert_eq!(
-            request[0].session,
+            request[0].key.session,
             state.selected_entry().unwrap().session.session
         );
         for entry_index in visible.iter().skip(first).take(row_count) {
             let expected = &state.entries[*entry_index].session.session;
-            assert!(request.iter().any(|key| &key.session == expected));
+            assert!(request.iter().any(|r| &r.key.session == expected));
         }
         assert!(state.due_preview_request().is_none());
     }
@@ -4219,9 +4639,9 @@ mod tests {
         let request = state.due_preview_request().expect("preview request");
 
         assert_eq!(state.visible_indices().len(), 1);
-        assert!(request.iter().any(|key| key.session == parent));
+        assert!(request.iter().any(|r| r.key.session == parent));
         assert_eq!(
-            request[0].session,
+            request[0].key.session,
             state.selected_entry().unwrap().session.session
         );
     }
@@ -4231,6 +4651,7 @@ mod tests {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                source: None,
                 updated_at: None,
                 continuation_after: None,
             })
@@ -4243,6 +4664,7 @@ mod tests {
         cache.insert(
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                source: None,
                 updated_at: None,
                 continuation_after: None,
             },
@@ -4320,8 +4742,8 @@ mod tests {
                 git_head: None,
             }),
             continuation: None,
-            can_use_first_title: true,
             complete: false,
+            can_use_first_title: true,
         };
 
         let line = session_line(
@@ -4372,8 +4794,8 @@ mod tests {
                 role: HandoffRole::User,
                 text: "Fix the retry race after this fork".to_owned(),
             }),
-            can_use_first_title: true,
             complete: true,
+            can_use_first_title: true,
         };
 
         let line = session_line(
@@ -4862,7 +5284,11 @@ mod tests {
             .due_trajectory_search_request()
             .expect("current workspace request");
         assert_eq!(
-            current_request.eligible_sessions,
+            current_request
+                .eligible_sessions
+                .into_iter()
+                .map(|selection| selection.session)
+                .collect::<Vec<_>>(),
             vec![SessionRef::new(Provider::Codex, "current-codex")]
         );
 
@@ -4873,7 +5299,11 @@ mod tests {
             .due_trajectory_search_request()
             .expect("all-projects request");
         assert_eq!(
-            all_projects_request.eligible_sessions,
+            all_projects_request
+                .eligible_sessions
+                .into_iter()
+                .map(|selection| selection.session)
+                .collect::<Vec<_>>(),
             vec![
                 SessionRef::new(Provider::Codex, "current-codex"),
                 SessionRef::new(Provider::Codex, "other-codex"),
@@ -5136,21 +5566,25 @@ mod tests {
         let current = Path::new("/workspace");
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(PickerUpdate::Cached(Ok(picker_entries(
-                vec![session(
-                    Provider::Claude,
-                    "cached",
+            .send(PickerUpdate::Cached(Ok(CachedPickerEntries {
+                entries: picker_entries(
+                    vec![session(
+                        Provider::Claude,
+                        "cached",
+                        current,
+                        Some("Cached session"),
+                    )],
                     current,
-                    Some("Cached session"),
-                )],
-                current,
-                true,
-            ))))
+                    true,
+                ),
+                ..Default::default()
+            })))
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
+                complete: false,
             }))
             .expect("send failure");
 
@@ -5175,20 +5609,24 @@ mod tests {
         let current = Path::new("/workspace");
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(PickerUpdate::Cached(Ok(picker_entries(
-                vec![session(
-                    Provider::Claude,
-                    "cached",
+            .send(PickerUpdate::Cached(Ok(CachedPickerEntries {
+                entries: picker_entries(
+                    vec![session(
+                        Provider::Claude,
+                        "cached",
+                        current,
+                        Some("Cached session"),
+                    )],
                     current,
-                    Some("Cached session"),
-                )],
-                current,
-                true,
-            ))))
+                    true,
+                ),
+                ..Default::default()
+            })))
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
+                complete: true,
                 result: Ok(picker_entries(
                     vec![session(
                         Provider::Claude,
@@ -5294,6 +5732,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
         );
+    }
+
+    #[test]
+    fn materialize_only_offers_a_codex_copy_when_the_source_requires_import() {
+        let home = tempfile::tempdir().unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+        let can_copy = |session: &SessionRef, target| {
+            crate::transfer::can_materialize_target(&registry, session, target)
+        };
+        let targets = [Provider::Codex, Provider::Claude];
+        for (folder, expect_copy) in [("archived_sessions", true), ("sessions/2026/01/01", false)] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let directory = home.path().join(folder);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl")),
+                format!(r#"{{"type":"session_meta","payload":{{"id":"{id}"}}}}"#),
+            )
+            .unwrap();
+            let source = SessionRef::new(Provider::Codex, id);
+            let intent = TargetIntent::Materialize(&source, &can_copy);
+            let choices = target_choices_on(intent, &targets, Platform::Linux);
+            assert_eq!(
+                choices
+                    .iter()
+                    .any(|choice| choice.provider == Provider::Codex && choice.fork),
+                expect_copy
+            );
+            assert!(
+                choices
+                    .iter()
+                    .any(|choice| choice.provider == Provider::Claude && !choice.fork)
+            );
+            assert!(
+                target_rows(intent, choices)
+                    .iter()
+                    .all(|row| matches!(row, TargetRow::Agent(_)))
+            );
+        }
     }
 
     #[test]
@@ -5718,8 +6196,8 @@ agent = "codex"
         );
         assert_eq!(target.to_string(), "claude-local");
         // An `--in` choice skips the page and carries the same pair.
-        let requested =
-            requested_target(Some(target), None, None, &[], None).expect("requested target");
+        let requested = requested_target(Some(target), TargetIntent::New, None, &[], None)
+            .expect("requested target");
         let TargetOutcome::Selected(choice) = requested else {
             panic!("`--in` selects without a page");
         };
@@ -5893,6 +6371,7 @@ agent = "codex"
             updated_at_approximate: false,
             event_count: 0,
             source_path: None,
+            source_revision: None,
         }
     }
 

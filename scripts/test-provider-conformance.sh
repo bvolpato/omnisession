@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
+    matrix | replies | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -20,20 +20,24 @@ require_binary() {
     local variable=$1
     local command_name=$2
     local binary=${!variable:-}
+    local candidate
     if [[ -z "$binary" ]]; then
         while IFS= read -r candidate; do
-            if [[ -L "$candidate" && $(basename -- "$(readlink "$candidate")") == omni ]]; then
+            if [[ -L "$candidate" && $(basename -- "$(readlink -- "$candidate")") == omni ]]; then
                 continue
             fi
             binary=$candidate
             break
         done < <(type -a -p -- "$command_name" 2>/dev/null | awk '!seen[$0]++')
     fi
-    if [[ -z "$binary" || ! -x "$binary" ]]; then
+    if [[ ! -f "$binary" || ! -x "$binary" ]]; then
         printf 'error: %s requires %s or %s\n' "$command_name conformance" "$variable" "$command_name" >&2
         exit 1
     fi
-    declare -gx "$variable=$binary"
+    if [[ $binary != /* ]]; then
+        binary="${PWD%/}/$binary"
+    fi
+    export "$variable=$binary"
 }
 
 version_stub() {
@@ -58,7 +62,7 @@ ensure_version_stub() {
     fi
     local path
     path=$(version_stub "$name" "$(compatibility_value "$provider" minimum_version)")
-    declare -gx "$variable=$path"
+    export "$variable=$path"
 }
 
 ensure_cursor_ide_stub() {
@@ -97,6 +101,10 @@ case "$mode" in
         ensure_version_stub OMNI_TEST_PI_BIN pi pi
         ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
         ensure_cursor_ide_stub
+        ;;
+    replies)
+        require_binary OMNI_TEST_CLAUDE_BIN claude
+        require_binary OMNI_TEST_CODEX_BIN codex
         ;;
     adapters)
         ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
@@ -158,6 +166,21 @@ case "$mode" in
     matrix)
         isolated_cargo test --locked --package omnisession-cli --test native_conformance \
             installed_ten_by_ten_cross_provider_matrix -- --ignored --exact --nocapture
+        ;;
+    replies)
+        omni_binary=$(
+            cargo build --locked --package omnisession-cli --bin omni --message-format=json-render-diagnostics |
+                python3 -c '
+import json, sys
+paths = [
+    artifact["executable"] for artifact in map(json.loads, sys.stdin)
+    if artifact.get("executable") and artifact["target"]["name"] == "omni"
+]
+if len(paths) != 1:
+    sys.exit("expected Cargo to report one omni executable")
+print(paths[0])'
+        )
+        uv run scripts/test-provider-replies.py "$omni_binary" "$OMNI_TEST_CODEX_BIN" "$OMNI_TEST_CLAUDE_BIN"
         ;;
     adapters)
         cargo test --locked --package omnisession-adapters --tests

@@ -325,6 +325,7 @@ impl ProviderAdapter for AntigravityIdeAdapter {
                     usize::try_from(summary.step_count).unwrap_or(usize::MAX)
                 }),
                 source_path: Some(path),
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);

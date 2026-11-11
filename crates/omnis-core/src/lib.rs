@@ -43,9 +43,10 @@ const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
 const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
+const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
-/// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+/// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
+pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -734,29 +735,45 @@ pub struct SessionPreview {
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    let title = provider_search_title(snapshot)
-        .map(str::to_owned)
-        .or_else(|| {
-            // Only the first message is needed, so later messages are never redacted.
-            preview_messages(snapshot)
-                .next()
-                .filter(|message| message.role == HandoffRole::User)
-                .map(|message| message.text)
-        })?;
+    if let Some(title) = provider_search_title(snapshot) {
+        return Some(title);
+    }
+    let events = visible_events(snapshot);
+    title_opener(events).and_then(|(_, title)| title)
+}
+
+/// Returns the first visible message's sequence and its redacted title, if it provides one.
+/// The input must follow the provider's projection order.
+#[must_use]
+pub fn search_title_opener_from_messages(events: &[OmniEvent]) -> Option<(u64, Option<String>)> {
+    title_opener(events.iter().filter(|event| !is_secret(event)))
+}
+
+fn title_opener<'a>(
+    events: impl IntoIterator<Item = &'a OmniEvent>,
+) -> Option<(u64, Option<String>)> {
+    events.into_iter().find_map(|event| {
+        let message = preview_message(event)?;
+        let title = (message.role == HandoffRole::User)
+            .then(|| compact_search_title(&message.text))
+            .flatten();
+        Some((event.sequence, title))
+    })
+}
+
+/// Redacts and shortens a provider name or visible message for the search index.
+#[must_use]
+pub fn compact_search_title(title: &str) -> Option<String> {
     let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = redact_secrets(&safe_terminal_line(&compact))
         .chars()
         .take(SEARCH_TITLE_CHARACTER_LIMIT)
         .collect::<String>();
-    (!title.is_empty()).then_some(title)
+    (!title.trim().is_empty()).then_some(title)
 }
 
-fn provider_search_title(snapshot: &CanonicalSnapshot) -> Option<&str> {
-    snapshot.title.as_deref().filter(|title| {
-        title
-            .chars()
-            .any(|ch| !ch.is_whitespace() && !ch.is_control())
-    })
+fn provider_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    snapshot.title.as_deref().and_then(compact_search_title)
 }
 
 /// Returns whether this read can confirm the search title or its absence.
@@ -830,17 +847,23 @@ fn codex_verified_prefix_end(snapshot: &CanonicalSnapshot, event: &OmniEvent) ->
         || snapshot.session.provider != Provider::Codex
         || event.source.provider != Provider::Codex
         || event.source.native_session_id != snapshot.session.id
-        || !matches!(
-            event.source.raw_record_type.as_deref(),
-            Some(
-                "omnisession.codex_preview_prefix"
-                    | "omnisession.preview_limit"
-                    | "omnisession.record_size_limit"
-            )
-        )
         || reports_unverified_messages(event)
     {
         return None;
+    }
+    match event.source.raw_record_type.as_deref()? {
+        "omnisession.codex_preview_prefix"
+        | "omnisession.preview_limit"
+        | "omnisession.record_size_limit" => {}
+        CODEX_MALFORMED_RECORDS => {
+            let count = event.payload["malformed_records"]
+                .as_u64()
+                .filter(|count| *count > 0)?;
+            if event.payload["omitted_events"].as_u64() != Some(count) {
+                return None;
+            }
+        }
+        _ => return None,
     }
     event.payload["prefix_end_sequence"]
         .as_u64()
@@ -910,6 +933,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
 
 /// Visible user and assistant messages in order, redacted and bounded for preview. Each message
 /// is built only when the iterator reaches it.
+#[cfg(test)]
 fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = HandoffMessage> + '_ {
     visible_events(snapshot)
         .into_iter()
@@ -1347,7 +1371,9 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+/// Returns whether the text is a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -2658,7 +2684,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     omitted_history(event).is_some()
 }
 
@@ -2672,7 +2700,10 @@ fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
     if event.kind != EventKind::ProviderEvent {
         return None;
     }
-    if reports_unverified_messages(event) {
+    if reports_unverified_messages(event)
+        || (event.source.provider == Provider::Codex
+            && event.source.raw_record_type.as_deref() == Some(CODEX_MALFORMED_RECORDS))
+    {
         return Some(OmittedHistory::MayIncludeMessages);
     }
     let omitted = event.payload["omitted_events"]
@@ -3370,7 +3401,10 @@ pub fn build_semantic_handoff_report_for_snapshot(
         )
     });
     let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
-    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+    with_codex_history_warnings(
+        semantic_handoff_report(source, target, repository_matches, source_is_opaque),
+        snapshot,
+    )
 }
 
 fn semantic_handoff_report(
@@ -3584,7 +3618,38 @@ fn with_source_compaction(
             detail.push_str(". Source history includes a provider compaction summary");
         }
     }
+    with_codex_history_warnings(report, snapshot)
+}
+
+fn with_codex_history_warnings(
+    mut report: FidelityReport,
+    snapshot: &CanonicalSnapshot,
+) -> FidelityReport {
     report
+        .warnings
+        .extend(codex_history_warnings(snapshot).map(str::to_owned));
+    report
+}
+
+fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    [
+        (
+            "omnisession.codex_history_base",
+            "The Codex fork references earlier history that was unavailable for this transfer.",
+        ),
+        (
+            "omnisession.codex_compacted",
+            "This transfer could not reconstruct a Codex compaction checkpoint.",
+        ),
+    ]
+    .into_iter()
+    .filter_map(move |(record, warning)| {
+        (snapshot.session.provider == Provider::Codex
+            && snapshot.events.iter().any(|event| {
+                !is_secret(event) && event.source.raw_record_type.as_deref() == Some(record)
+            }))
+        .then_some(warning)
+    })
 }
 
 /// Builds a fidelity report for a captured snapshot and transfer target.
@@ -4953,6 +5018,10 @@ mod tests {
             session_search_title(&snapshot).as_deref(),
             Some("Fix the pagination bug with [REDACTED: API_KEY]")
         );
+        assert_eq!(
+            super::search_title_opener_from_messages(&snapshot.events),
+            Some((1, session_search_title(&snapshot)))
+        );
         snapshot.title = Some("Provider summary".to_owned());
         assert_eq!(
             session_search_title(&snapshot).as_deref(),
@@ -5074,6 +5143,11 @@ mod tests {
                 "omnisession.record_size_limit",
                 json!({"omitted_events": 1, "prefix_end_sequence": 3}),
             ),
+            (
+                true,
+                "omnisession.codex_malformed_records",
+                json!({"omitted_events": 1, "malformed_records": 1, "prefix_end_sequence": 3}),
+            ),
         ] {
             let mut notice = event(3, EventKind::ProviderEvent, payload);
             notice.source.raw_record_type = Some(record_type.to_owned());
@@ -5100,6 +5174,33 @@ mod tests {
             assert!(!super::session_message_prefix_is_known(
                 &snapshot, full_read
             ));
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn inconsistent_malformed_record_counts_cannot_confirm_a_title() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "A retained request"}),
+        )]);
+        for (omitted, malformed) in [
+            (Some(1), None),
+            (Some(1), Some(0)),
+            (Some(2), Some(1)),
+            (None, Some(1)),
+        ] {
+            let mut notice = event(
+                1,
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": omitted, "malformed_records": malformed, "prefix_end_sequence": 1,
+                }),
+            );
+            notice.source.raw_record_type = Some("omnisession.codex_malformed_records".to_owned());
+            snapshot.events.push(notice);
+            assert!(!super::session_message_prefix_is_known(&snapshot, true));
             snapshot.events.pop();
         }
     }

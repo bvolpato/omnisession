@@ -32,6 +32,7 @@ jobs:
               - 'scripts/test-provider-compatibility.sh'
               - 'scripts/test-provider-conformance.ps1'
               - 'scripts/test-provider-conformance.sh'
+              - 'scripts/test-provider-replies.py'
               - 'website/app/providers.generated.ts'
               - '.github/workflows/provider-conformance.yml'
               - '.github/workflows/extended-validation.yml'

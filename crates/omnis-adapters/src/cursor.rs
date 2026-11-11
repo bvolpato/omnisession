@@ -237,6 +237,7 @@ impl ProviderAdapter for CursorCliAdapter {
                 updated_at_approximate: false,
                 event_count: metadata.event_count,
                 source_path: Some(path),
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);
@@ -1028,6 +1029,7 @@ impl CursorIdeHeader {
             updated_at_approximate: false,
             event_count: 1,
             source_path: Some(self.source_path),
+            source_revision: None,
         }
     }
 }

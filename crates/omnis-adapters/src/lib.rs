@@ -23,7 +23,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -63,12 +63,17 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
+    /// The file revision observed with this session's metadata.
+    pub source_revision: Option<SourceRevision>,
 }
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Catalog metadata from the selected file, when the reader verified it.
+    pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
+    pub source_revision: SourceRevision,
 }
 
 /// Provider-specific launch input.
@@ -107,6 +112,13 @@ pub struct LaunchPlan {
     pub env: Vec<EnvChange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeResumeSupport {
+    Direct,
+    Since(&'static str),
+    ImportOnly,
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
@@ -133,6 +145,15 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Describes whether the provider can continue the stored representation by its session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot identify the source representation.
+    fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
+        Ok(NativeResumeSupport::Direct)
     }
 
     /// Non-fatal discovery observations from this adapter.
@@ -220,8 +241,10 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            native_session: None,
             snapshot,
             source_complete,
+            source_revision: SourceRevision::default(),
         })
     }
 

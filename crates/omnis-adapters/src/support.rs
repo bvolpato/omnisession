@@ -26,11 +26,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const MAX_PROVIDER_RECORDS: usize = 100_000;
-const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -808,13 +808,9 @@ pub(crate) struct JsonLineLocation {
 pub(crate) fn visit_json_lines_with_offsets(
     reader: &mut BufReader<File>,
     file_limit: u64,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(
-        reader,
-        JsonLinesLimits::streamed(file_limit),
-        |location, record, _| visit(location, record),
-    )
+    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -842,25 +838,6 @@ pub(crate) fn read_json_line_at(
     serde_json::from_slice(line).context("provider record changed while rereading transcript")
 }
 
-/// Streams records for visitors that fold them instead of collecting them.
-///
-/// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
-/// the end instead of failing at the collected record budget.
-pub(crate) fn visit_streamed_json_lines(
-    path: &Path,
-    file_limit: u64,
-    mut visit: impl FnMut(Value, usize) -> Result<()>,
-) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(
-        &mut BufReader::new(File::open(path)?),
-        JsonLinesLimits {
-            records: usize::MAX,
-            ..JsonLinesLimits::streamed(file_limit)
-        },
-        |_, record, preceding_oversized| visit(record, preceding_oversized),
-    )
-}
-
 /// Visible text for a user turn made only of images, so the turn stays in history.
 pub(crate) fn omitted_images_text(count: usize) -> String {
     if count == 1 {
@@ -876,7 +853,7 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record, _| {
+    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
         visit(record)
     })
 }
@@ -884,23 +861,46 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value, usize) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     reader.seek(SeekFrom::Start(0))?;
+    visit_json_reader(reader, limits, |location, value, _| visit(location, value))
+        .map(|(skipped, _)| skipped.oversized)
+}
+
+#[derive(Default)]
+pub(crate) struct JsonLineSkips {
+    pub(crate) oversized: usize,
+    pub(crate) malformed: usize,
+}
+
+impl JsonLineSkips {
+    pub(crate) fn total(&self) -> usize {
+        self.oversized + self.malformed
+    }
+}
+
+/// Reports skipped records and decoded bytes consumed, including skipped lines.
+/// The visitor receives the number of skipped nonempty records before each decoded record.
+pub(crate) fn visit_json_reader(
+    reader: &mut impl BufRead,
+    limits: JsonLinesLimits,
+    mut visit: impl FnMut(JsonLineLocation, Value, usize) -> Result<()>,
+) -> Result<(JsonLineSkips, u64)> {
     let mut line = Vec::new();
     let mut records = 0_usize;
-    let mut oversized_records = 0_usize;
+    let mut skipped = JsonLineSkips::default();
     let mut offset = 0_u64;
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
                 return Err(anyhow!("provider file exceeds safe record limit"));
             }
-            return Ok(oversized_records);
+            return Ok((skipped, offset));
         }
         let line_offset = offset;
         let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
@@ -911,14 +911,14 @@ fn visit_json_lines_with_offsets_and_limits(
             &mut line,
         )?
         else {
-            return Ok(oversized_records);
+            return Ok((skipped, offset));
         };
         records += 1;
         offset = offset
             .checked_add(read)
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
-            BoundedLine::Oversized => oversized_records += 1,
+            BoundedLine::Oversized => skipped.oversized += 1,
             BoundedLine::Complete => {
                 if let Ok(record) = serde_json::from_slice(&line) {
                     visit(
@@ -927,8 +927,10 @@ fn visit_json_lines_with_offsets_and_limits(
                             length: read,
                         },
                         record,
-                        oversized_records,
+                        skipped.total(),
                     )?;
+                } else if !line.iter().all(u8::is_ascii_whitespace) {
+                    skipped.malformed += 1;
                 }
             }
         }
@@ -1286,6 +1288,81 @@ pub(crate) struct EventBuilder {
     branch_id: Uuid,
     next_sequence: u64,
     events: Vec<OmniEvent>,
+    preview: Option<EventPreview>,
+}
+
+#[derive(Default)]
+struct EventPreview {
+    outline: Vec<PreviewEvent>,
+    selection: Option<VecDeque<PreviewEvent>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PreviewEvent {
+    sequence: u64,
+    bytes: usize,
+    tool: bool,
+}
+
+impl EventPreview {
+    fn record(
+        &mut self,
+        sequence: u64,
+        kind: &EventKind,
+        payload: &Value,
+        source_bytes: usize,
+    ) -> bool {
+        let item = PreviewEvent {
+            sequence,
+            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
+            tool: is_tool_event(kind),
+        };
+        self.outline.push(item);
+        let Some(selected) = self.selection.as_mut() else {
+            return false;
+        };
+        if selected
+            .front()
+            .is_some_and(|next| next.sequence == sequence)
+        {
+            return selected
+                .pop_front()
+                .is_some_and(|next| item.bytes <= next.bytes);
+        }
+        false
+    }
+}
+
+fn is_tool_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::ToolCalled
+            | EventKind::ToolCompleted
+            | EventKind::ToolFailed
+            | EventKind::CommandExecuted
+    )
+}
+
+fn retain_latest_matching<T>(
+    values: &mut Vec<T>,
+    limit: usize,
+    matches: impl Fn(&T) -> bool,
+) -> usize {
+    let removed = values
+        .iter()
+        .filter(|value| matches(value))
+        .count()
+        .saturating_sub(limit);
+    let mut remaining = removed;
+    values.retain(|value| {
+        if remaining > 0 && matches(value) {
+            remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 /// Conservative retained-memory estimate for a canonical event and its cloned JSON payload.
@@ -1337,7 +1414,70 @@ impl EventBuilder {
             branch_id: thread_id,
             next_sequence: 0,
             events: Vec::new(),
+            preview: None,
         }
+    }
+
+    /// The first pass retains only event sizes and sequence numbers. The second pass materializes the selection.
+    pub(crate) fn plan_preview(&mut self, selection: Option<VecDeque<PreviewEvent>>) {
+        self.preview = Some(EventPreview {
+            selection,
+            ..EventPreview::default()
+        });
+    }
+
+    pub(crate) fn select_preview(
+        &self,
+        limit: usize,
+        bytes_per_edge: usize,
+    ) -> (VecDeque<PreviewEvent>, usize, u64) {
+        let outline = &self
+            .preview
+            .as_ref()
+            .expect("preview planning enabled")
+            .outline;
+        let mut selected = VecDeque::new();
+        let add_edge = |events: &mut dyn Iterator<Item = &PreviewEvent>| {
+            let mut added = Vec::new();
+            let mut remaining = bytes_per_edge;
+            for event in events {
+                if event.bytes > bytes_per_edge {
+                    continue;
+                }
+                if added.len() == limit / 2 || event.bytes > remaining {
+                    break;
+                }
+                remaining -= event.bytes;
+                added.push(*event);
+            }
+            added
+        };
+        selected.extend(add_edge(&mut outline.iter()));
+        let end = selected.back().map(|event| event.sequence);
+        selected.extend(
+            add_edge(&mut outline.iter().rev())
+                .into_iter()
+                .rev()
+                .filter(|event| end.is_none_or(|last| event.sequence > last)),
+        );
+        let omitted = outline.len() - selected.len();
+        // An event above the byte limit can be missing even from the first edge.
+        let prefix_end = outline
+            .iter()
+            .enumerate()
+            .find(|(index, event)| selected.get(*index) != Some(*event))
+            .map_or(self.next_sequence, |(_, event)| event.sequence);
+        (selected, omitted, prefix_end)
+    }
+
+    pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
+        self.preview = None;
+        if self.events.len() != expected {
+            return Err(anyhow!(
+                "provider history changed while reading the preview"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn set_provider_version(&mut self, provider_version: Option<String>) {
@@ -1348,27 +1488,30 @@ impl EventBuilder {
         self.next_sequence
     }
 
+    pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
+        self.events.drain(..)
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        if let Some(preview) = &mut self.preview {
+            preview.outline.truncate(
+                preview
+                    .outline
+                    .partition_point(|event| event.sequence < checkpoint),
+            );
+        }
         self.events.retain(|event| event.sequence < checkpoint);
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
         if self.events.len() <= limit {
-            if self.provider == Provider::Codex {
-                self.push_codex_preview_prefix(self.checkpoint(), true, Some(timestamp));
-            }
             return;
         }
         let omitted = self.events.len() - limit;
-        let mut payload =
-            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit});
-        if self.provider == Provider::Codex {
-            payload["prefix_end_sequence"] = self.events[limit / 2].sequence.into();
-        }
         self.events.drain(limit / 2..limit / 2 + omitted);
         self.push(
             EventKind::ProviderEvent,
-            payload,
+            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit}),
             Some(timestamp),
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.preview_limit".to_owned()),
@@ -1411,6 +1554,29 @@ impl EventBuilder {
         );
     }
 
+    pub(crate) fn push_codex_malformed_record_notice(
+        &mut self,
+        count: usize,
+        prefix_end_sequence: u64,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.push(
+            EventKind::ProviderEvent,
+            serde_json::json!({
+                "omitted_events": count,
+                "malformed_records": count,
+                "prefix_end_sequence": prefix_end_sequence,
+            }),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.codex_malformed_records".to_owned()),
+            None,
+        );
+    }
+
     pub(crate) fn push_codex_preview_prefix(
         &mut self,
         prefix_end_sequence: u64,
@@ -1442,6 +1608,14 @@ impl EventBuilder {
     ) {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        if self.preview.as_mut().is_some_and(|preview| {
+            let source_bytes = self.session_id.len()
+                + self.provider_version.as_ref().map_or(0, String::len)
+                + raw_record_type.as_ref().map_or(0, String::len);
+            !preview.record(sequence, &kind, &payload, source_bytes)
+        }) {
+            return;
+        }
         let event_seed = event_id.map_or_else(
             || sequence.to_string(),
             |native_id| format!("{sequence}:{native_id}"),
@@ -1468,42 +1642,19 @@ impl EventBuilder {
     }
 
     pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
-        let tool_events = self
-            .events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.kind,
-                    EventKind::ToolCalled
-                        | EventKind::ToolCompleted
-                        | EventKind::ToolFailed
-                        | EventKind::CommandExecuted
-                )
-            })
-            .count();
-        let mut remaining = tool_events.saturating_sub(limit);
-        let removed = remaining;
-        self.events.retain(|event| {
-            if remaining > 0
-                && matches!(
-                    event.kind,
-                    EventKind::ToolCalled
-                        | EventKind::ToolCompleted
-                        | EventKind::ToolFailed
-                        | EventKind::CommandExecuted
-                )
-            {
-                remaining -= 1;
-                false
-            } else {
-                true
-            }
-        });
-        removed
+        if let Some(preview) = &mut self.preview {
+            return retain_latest_matching(&mut preview.outline, limit, |event| event.tool);
+        }
+        retain_latest_matching(&mut self.events, limit, |event| is_tool_event(&event.kind))
     }
 
     /// Drops the oldest events above `limit` and returns how many were dropped.
     pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        if let Some(preview) = &mut self.preview {
+            let omitted = preview.outline.len().saturating_sub(limit);
+            preview.outline.drain(..omitted);
+            return omitted;
+        }
         let omitted = self.events.len().saturating_sub(limit);
         self.events.drain(..omitted);
         omitted
@@ -1597,10 +1748,9 @@ mod tests {
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
         MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
-        json_lines_preview_with_prefix, json_lines_tail_with_offsets, nested_files_with_limit,
-        sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
-        sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
-        visit_json_lines_with_limits,
+        json_lines_tail_with_offsets, nested_files_with_limit, sample_files_concurrently,
+        snapshot_max_bytes, sqlite_snapshot, sqlite_snapshot_with_limits,
+        visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
 
     #[cfg(unix)]
@@ -2231,9 +2381,7 @@ mod tests {
         }
         std::fs::write(&path, content).expect("large JSONL fixture");
 
-        let sample = json_lines_preview_with_prefix(&path, 32).expect("preview records");
-        assert_eq!(sample.prefix_records, 32);
-        let records = sample.records;
+        let records = json_lines_preview(&path, 32).expect("preview records");
 
         assert!(records.len() <= 64);
         assert_eq!(
