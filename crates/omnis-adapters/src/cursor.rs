@@ -1144,22 +1144,21 @@ fn cursor_ide_events(
         )]);
     }
     let root_key = format!("composerData:{composer_id}");
-    let Some(root_bytes) = cursor_disk_value(transaction, &root_key)? else {
+    let Some((root_bytes, root_is_blob)) = cursor_disk_value(transaction, &root_key)? else {
         return Ok(vec![unsupported_cursor_ide_event(
             "missing_composer_data",
             None,
             None,
         )]);
     };
-    let root: Value = match serde_json::from_slice(&root_bytes) {
-        Ok(root) => root,
-        Err(_) => {
-            return Ok(vec![unsupported_cursor_ide_event(
-                "invalid_composer_data",
-                Some(&root_bytes),
-                None,
-            )]);
-        }
+    let Ok(root) = serde_json::from_slice::<Value>(&root_bytes) else {
+        let mut events = vec![unsupported_cursor_ide_event(
+            "invalid_composer_data",
+            Some(&root_bytes),
+            None,
+        )];
+        mark_cursor_blob_json(&mut events, root_is_blob, "composer");
+        return Ok(events);
     };
     let mut events = vec![CursorIdeEvent {
         kind: EventKind::ProviderEvent,
@@ -1168,6 +1167,7 @@ fn cursor_ide_events(
         replay_policy: ReplayPolicy::HistoricalOnly,
         raw_type: "cursor_ide.composer_data",
     }];
+    mark_cursor_blob_json(&mut events, root_is_blob, "composer");
     let Some(headers) = root
         .get("fullConversationHeadersOnly")
         .and_then(Value::as_array)
@@ -1202,7 +1202,8 @@ fn cursor_ide_events(
             bail!("Cursor IDE session contains duplicate bubble ID");
         }
         let key = format!("bubbleId:{composer_id}:{bubble_id}");
-        let Some(bytes) = cursor_ide_bubble_bytes(transaction, &key, bubble_id, &mut events)?
+        let Some((bytes, is_blob)) =
+            cursor_ide_bubble_bytes(transaction, &key, bubble_id, &mut events)?
         else {
             continue;
         };
@@ -1210,26 +1211,50 @@ fn cursor_ide_events(
         if trajectory_bytes > MAX_CURSOR_IDE_TRAJECTORY_BYTES {
             bail!("Cursor IDE session exceeds safe trajectory size limit");
         }
-        let bubble: Value = if let Ok(value) = serde_json::from_slice(&bytes) {
-            value
-        } else {
-            events.push(unsupported_cursor_ide_event(
-                "invalid_bubble_json",
-                Some(&bytes),
-                Some(bubble_id),
-            ));
-            continue;
-        };
-        if let Some(checkpoint_id) =
-            string_at(&bubble, &[&["checkpointId"], &["conversationCheckpointId"]])
-        {
-            checkpoint_ids.insert(checkpoint_id.to_owned());
-        }
-        push_cursor_ide_bubble(&mut events, header, &bubble, bubble_id, &bytes);
+        decode_cursor_ide_bubble(
+            &mut events,
+            &mut checkpoint_ids,
+            header,
+            bubble_id,
+            &bytes,
+            is_blob,
+        );
     }
     push_cursor_ide_checkpoints(transaction, composer_id, &checkpoint_ids, &mut events)?;
     push_cursor_ide_diffs(transaction, composer_id, &root, &mut events)?;
     Ok(events)
+}
+
+fn decode_cursor_ide_bubble(
+    events: &mut Vec<CursorIdeEvent>,
+    checkpoint_ids: &mut BTreeSet<String>,
+    header: &Value,
+    bubble_id: &str,
+    bytes: &[u8],
+    is_blob: bool,
+) {
+    let start = events.len();
+    if let Ok(bubble) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(id) = string_at(&bubble, &[&["checkpointId"], &["conversationCheckpointId"]]) {
+            checkpoint_ids.insert(id.to_owned());
+        }
+        push_cursor_ide_bubble(events, header, &bubble, bubble_id, bytes);
+    } else {
+        events.push(unsupported_cursor_ide_event(
+            "invalid_bubble_json",
+            Some(bytes),
+            Some(bubble_id),
+        ));
+    }
+    mark_cursor_blob_json(&mut events[start..], is_blob, "bubble");
+}
+
+fn mark_cursor_blob_json(events: &mut [CursorIdeEvent], is_blob: bool, record: &str) {
+    if is_blob {
+        for event in events {
+            event.payload["cursor_blob_json"] = Value::from(record);
+        }
+    }
 }
 
 /// Loads one bubble, or leaves an omission marker when it is missing or past the record limit.
@@ -1238,17 +1263,18 @@ fn cursor_ide_bubble_bytes(
     key: &str,
     bubble_id: &str,
     events: &mut Vec<CursorIdeEvent>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, bool)>> {
     let marker = match cursor_disk_record(transaction, key)? {
-        CursorDiskRecord::Present(bytes) => return Ok(Some(bytes)),
+        CursorDiskRecord::Present(bytes, is_blob) => return Ok(Some((bytes, is_blob))),
         CursorDiskRecord::Missing => {
             unsupported_cursor_ide_event("missing_bubble", None, Some(bubble_id))
         }
         // One oversized bubble, such as a huge tool result, stays an omission marker instead of
         // making the whole conversation unreadable.
-        CursorDiskRecord::Oversized(stored_bytes) => {
+        CursorDiskRecord::Oversized(stored_bytes, is_blob) => {
             let mut event = unsupported_cursor_ide_event("oversized_bubble", None, Some(bubble_id));
             event.payload["opaque_bytes"] = json!(stored_bytes);
+            mark_cursor_blob_json(std::slice::from_mut(&mut event), is_blob, "bubble");
             event
         }
     };
@@ -1256,20 +1282,20 @@ fn cursor_ide_bubble_bytes(
     Ok(None)
 }
 
-fn cursor_disk_value(transaction: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>> {
+fn cursor_disk_value(transaction: &Transaction<'_>, key: &str) -> Result<Option<(Vec<u8>, bool)>> {
     match cursor_disk_record(transaction, key)? {
-        CursorDiskRecord::Present(value) => Ok(Some(value)),
+        CursorDiskRecord::Present(value, is_blob) => Ok(Some((value, is_blob))),
         CursorDiskRecord::Missing => Ok(None),
-        CursorDiskRecord::Oversized(_) => {
+        CursorDiskRecord::Oversized(..) => {
             bail!("Cursor IDE trajectory record exceeds safe size limit")
         }
     }
 }
 
 enum CursorDiskRecord {
-    Present(Vec<u8>),
+    Present(Vec<u8>, bool),
     Missing,
-    Oversized(i64),
+    Oversized(i64, bool),
 }
 
 /// Reads one `cursorDiskKV` value only when its stored size is within the record limit.
@@ -1277,26 +1303,27 @@ fn cursor_disk_record(transaction: &Transaction<'_>, key: &str) -> Result<Cursor
     let limit = i64::try_from(MAX_CURSOR_IDE_RECORD_SIZE)?;
     let record = transaction
         .query_row(
-            "SELECT octet_length(value), CASE WHEN octet_length(value) <= ?2 THEN value END \
+            "SELECT octet_length(value), typeof(value) = 'blob', CASE WHEN octet_length(value) <= ?2 THEN value END \
              FROM cursorDiskKV WHERE key = ?1",
             rusqlite::params![key, limit],
             |row| {
                 let stored_bytes = row.get::<_, Option<i64>>(0)?.unwrap_or_default();
-                let value = match row.get_ref(1)? {
+                let is_blob = row.get::<_, bool>(1)?;
+                let value = match row.get_ref(2)? {
                     rusqlite::types::ValueRef::Text(value)
                     | rusqlite::types::ValueRef::Blob(value) => value.to_vec(),
                     _ => Vec::new(),
                 };
-                Ok((stored_bytes, value))
+                Ok((stored_bytes, value, is_blob))
             },
         )
         .optional()?;
     Ok(match record {
         None => CursorDiskRecord::Missing,
-        Some((stored_bytes, _)) if stored_bytes > limit => {
-            CursorDiskRecord::Oversized(stored_bytes)
+        Some((stored_bytes, _, is_blob)) if stored_bytes > limit => {
+            CursorDiskRecord::Oversized(stored_bytes, is_blob)
         }
-        Some((_, value)) => CursorDiskRecord::Present(value),
+        Some((_, value, is_blob)) => CursorDiskRecord::Present(value, is_blob),
     })
 }
 

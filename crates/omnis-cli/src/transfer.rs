@@ -1476,10 +1476,7 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
         );
     } else {
         print_fidelity(&report)?;
-        println!(
-            "\nOpening Cursor IDE at workspace; select `{}` from Show Chat History.",
-            context.source.id
-        );
+        println!("\nOpening the saved workspace in Cursor IDE.");
     }
     flush_stdout()?;
     if context.args.dry_run {
@@ -3000,13 +2997,9 @@ fn resolve_resume_request(
         };
         session_picker::pick_session(
             &project,
-            args.target,
+            args,
             &targets,
             &new_session_targets,
-            args.source_provider,
-            args.all_projects,
-            args.materialize_only,
-            args.mode,
             &delete_providers,
             &|session, workspace| delete_native_session(registry, session, workspace),
         )?

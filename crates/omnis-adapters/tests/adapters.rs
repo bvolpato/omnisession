@@ -428,6 +428,52 @@ fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
 }
 
 #[test]
+fn cursor_ide_recovers_messages_from_blob_json_that_the_ide_cannot_load() {
+    use omnis_ir::FidelityStatus;
+
+    let temporary = TempDir::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    for (key, complete, some_native_messages, tools_preserved) in [
+        (None, true, false, true),
+        (
+            Some("bubbleId:root-composer:assistant-1"),
+            false,
+            true,
+            true,
+        ),
+        (Some("bubbleId:root-composer:tool-1"), false, true, false),
+        (Some("composerData:root-composer"), false, false, false),
+    ] {
+        if let Some(key) = key {
+            connection
+                .execute(
+                    "UPDATE cursorDiskKV SET value=CAST(value AS BLOB) WHERE key=?1",
+                    [key],
+                )
+                .unwrap();
+        }
+        let snapshot = adapter.read_session(&session).unwrap();
+        let report = omnis_core::build_cursor_workspace_report(&snapshot, true);
+        let preserved = |name| {
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.feature == name && entry.status == FidelityStatus::Preserved)
+        };
+        assert_eq!(preserved("Native conversation"), complete);
+        assert_eq!(preserved("Available native messages"), some_native_messages);
+        assert_eq!(preserved("Tool history"), tools_preserved);
+        assert_eq!(snapshot.events[2].payload["text"], "Question");
+        assert_eq!(snapshot.events[3].payload["text"], "Answer");
+        assert!(!omnis_core::import_trajectory(&snapshot).truncated);
+    }
+}
+
+#[test]
 fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace-a");

@@ -41,7 +41,7 @@ use omnis_store::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    DELETE_PROVIDERS, PROVIDERS,
+    DELETE_PROVIDERS, PROVIDERS, ResumeArgs,
     fuzzy::{SearchFields, query_terms},
     launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
@@ -213,6 +213,15 @@ struct VisibleCache {
 }
 
 impl PickerState {
+    fn for_resume(current_project: &Path, args: &ResumeArgs) -> Self {
+        Self::new(
+            Vec::new(),
+            current_project,
+            args.source_provider,
+            args.all_projects,
+        )
+    }
+
     fn new(
         sessions: Vec<NativeSession>,
         current_project: &Path,
@@ -1281,16 +1290,11 @@ fn require_terminal(otherwise: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn pick_session(
+pub(super) fn pick_session(
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    initial_provider: Option<Provider>,
-    all_projects: bool,
-    force_cross_provider: bool,
-    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
@@ -1302,7 +1306,8 @@ pub fn pick_session(
     theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
-    let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    let target = args.target;
+    let mut state = PickerState::for_resume(current_project, args);
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
@@ -1375,11 +1380,9 @@ pub fn pick_session(
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
-                target,
+                args,
                 available_targets,
                 new_session_targets,
-                force_cross_provider,
-                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1406,17 +1409,17 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    force_cross_provider: bool,
-    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
-        if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
+        if args.target.is_none()
+            && target_choices(TargetIntent::New, new_session_targets).is_empty()
+        {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(target, None, None, new_session_targets, requested_mode)? {
+        return match requested_target(args, None, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.target(),
                 mode: choice.mode,
@@ -1436,16 +1439,10 @@ fn select_picker_row(
     let targets = available_targets
         .iter()
         .copied()
-        .filter(|target| !force_cross_provider || target.provider != session.provider)
+        .filter(|target| !args.materialize_only || target.provider != session.provider)
         .collect::<Vec<_>>();
     let preferred_target = crate::continuation_target_provider(&session)?;
-    match requested_target(
-        target,
-        Some(&session),
-        Some(preferred_target),
-        &targets,
-        requested_mode,
-    )? {
+    match requested_target(args, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => {
             // An imported row can name another machine's workspace.
             let stored = project_path
@@ -1513,29 +1510,26 @@ fn select_picker_row(
 }
 
 fn requested_target(
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     source: Option<&SessionRef>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
-    target.map_or_else(
-        || {
-            source.map_or_else(
-                || pick_new_target(targets, requested_mode),
-                |source| pick_target(source, preferred_target, targets, requested_mode),
-            )
-        },
-        |target| {
-            // `--in` skipped the page, so `--mode` or the agent's default decides.
-            Ok(TargetOutcome::Selected(TargetChoice {
-                provider: target.provider,
-                profile: target.profile,
-                fork: false,
-                mode: None,
-            }))
-        },
-    )
+    let intent = match source {
+        None => TargetIntent::New,
+        Some(source) if args.fork => TargetIntent::Fork(source),
+        Some(source) => TargetIntent::Resume(source),
+    };
+    if let Some(target) = args.target {
+        // `--in` skips the target page. Launch uses `--mode` or the agent's default.
+        return Ok(TargetOutcome::Selected(TargetChoice {
+            provider: target.provider,
+            profile: target.profile,
+            fork: args.fork && intent.source_provider() == Some(target.provider),
+            mode: None,
+        }));
+    }
+    pick_target_for(intent, preferred_target, targets, args.mode, args.no_fork)
 }
 
 fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers) -> bool {
@@ -1806,27 +1800,6 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn pick_target(
-    source: &SessionRef,
-    preferred_target: Option<Provider>,
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(
-        TargetIntent::Resume(source),
-        preferred_target,
-        targets,
-        requested_mode,
-    )
-}
-
-fn pick_new_target(
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, None, targets, requested_mode)
-}
-
 pub fn pick_fork_target(
     source: &SessionRef,
     targets: &[AgentTarget],
@@ -1841,6 +1814,7 @@ pub fn pick_fork_target(
         Some(preferred_target),
         targets,
         requested_mode,
+        false,
     )? {
         TargetOutcome::Selected(choice) => Ok(Some(PickedTarget::Agent {
             target: choice.target(),
@@ -1856,6 +1830,7 @@ fn pick_target_for(
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
+    no_fork: bool,
 ) -> Result<TargetOutcome> {
     if targets.is_empty() && intent.source().is_none() {
         bail!(
@@ -1863,6 +1838,9 @@ fn pick_target_for(
         );
     }
     let mut choices = target_choices(intent, targets);
+    if no_fork {
+        choices.retain(|choice| !choice.fork);
+    }
     seed_requested_mode(&mut choices, requested_mode);
     if choices.is_empty() && intent.source().is_none() {
         bail!("no runnable target agents support this action on the current platform");
@@ -3299,10 +3277,38 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
-            .expect("row selection");
+        let selection =
+            select_picker_row(&state, temporary.path(), &ResumeArgs::default(), &[], &[])
+                .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
+    }
+
+    #[test]
+    fn explicit_fork_keeps_the_saved_workspace_member_as_its_destination() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let member = temporary.path().join("member");
+        let saved = temporary.path().join("multi.code-workspace");
+        fs::create_dir(&member).unwrap();
+        fs::write(&saved, r#"{"folders":[{"path":"member"}]}"#).unwrap();
+        let state = PickerState::new(
+            vec![session(Provider::CursorIde, "chat", &saved, Some("Chat"))],
+            &member,
+            None,
+            true,
+        );
+        let args = ResumeArgs {
+            target: Some(Provider::CursorIde.into()),
+            fork: true,
+            ..Default::default()
+        };
+
+        let selected = select_picker_row(&state, &member, &args, &[], &[]).unwrap();
+        let RowSelection::Selected(PickerOutcome::Resume(selection)) = selected else {
+            panic!("expected the saved chat");
+        };
+        assert!(selection.fork);
+        assert!(selection.workspace_override.is_none());
     }
 
     #[test]
@@ -5621,8 +5627,16 @@ agent = "codex"
         );
         assert_eq!(target.to_string(), "claude-local");
         // An `--in` choice skips the page and carries the same pair.
-        let requested =
-            requested_target(Some(target), None, None, &[], None).expect("requested target");
+        let requested = requested_target(
+            &ResumeArgs {
+                target: Some(target),
+                ..Default::default()
+            },
+            None,
+            None,
+            &[],
+        )
+        .expect("requested target");
         let TargetOutcome::Selected(choice) = requested else {
             panic!("`--in` selects without a page");
         };

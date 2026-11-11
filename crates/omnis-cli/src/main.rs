@@ -3,6 +3,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
+    ffi::OsString,
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -1670,6 +1671,7 @@ struct ImportedWorkspaceMatcher<'a> {
     store: &'a Store,
     project: &'a Path,
     paths: omnis_core::SessionWorkspaceMatcher<'a>,
+    relocatable_paths: HashMap<Provider, HashMap<OsString, bool>>,
     providers: HashMap<String, Provider>,
     current_remote: OnceCell<Option<String>>,
 }
@@ -1680,9 +1682,20 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
             store,
             project,
             paths: omnis_core::SessionWorkspaceMatcher::new(project),
+            relocatable_paths: HashMap::new(),
             providers: store.bundle_source_providers()?,
             current_remote: OnceCell::new(),
         })
+    }
+
+    fn can_relocate(&mut self, provider: Provider, path: &Path) -> Result<bool> {
+        let paths = self.relocatable_paths.entry(provider).or_default();
+        if let Some(&result) = paths.get(path.as_os_str()) {
+            return Ok(result);
+        }
+        let result = can_relocate_workspace(provider, path)?;
+        paths.insert(path.as_os_str().to_owned(), result);
+        Ok(result)
     }
 
     fn matches(
@@ -1694,7 +1707,7 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
             if self.paths.matches(provider, path) {
                 return Ok(ImportedWorkspaceMatch::Recorded);
             }
-            if !can_relocate_workspace(provider, path)? {
+            if !self.can_relocate(provider, path)? {
                 return Ok(ImportedWorkspaceMatch::Other);
             }
         }
@@ -2316,9 +2329,12 @@ fn source_workspace_matches_with_cache(
     Ok(snapshot.workspace.git.remote_fingerprint.as_ref() == current.as_ref())
 }
 
+fn has_cursor_workspace_extension(provider: Provider, path: &Path) -> bool {
+    provider == Provider::CursorIde && path.extension().is_some_and(|ext| ext == "code-workspace")
+}
+
 fn cursor_workspace_file_path(provider: Provider, path: &Path) -> bool {
-    provider == Provider::CursorIde
-        && path.extension().is_some_and(|ext| ext == "code-workspace")
+    has_cursor_workspace_extension(provider, path)
         && !omnis_core::local_cursor_workspace_path(path)
             .is_ok_and(|resolved| resolved.is_some_and(|physical| physical.is_dir()))
 }
@@ -2326,7 +2342,9 @@ fn cursor_workspace_file_path(provider: Provider, path: &Path) -> bool {
 fn can_relocate_workspace(provider: Provider, path: &Path) -> Result<bool> {
     if path.as_os_str().is_empty()
         || omnis_core::may_reach_network(path)
-        || cursor_workspace_file_path(provider, path)
+        // A missing saved workspace cannot identify one repository. An existing folder with
+        // the same extension also stays in place, so neither case needs a configuration read.
+        || has_cursor_workspace_extension(provider, path)
     {
         return Ok(false);
     }
