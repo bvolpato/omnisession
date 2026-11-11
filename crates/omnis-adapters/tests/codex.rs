@@ -2017,6 +2017,7 @@ fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> an
             visible_text(&index(&link.join(&name))?.snapshot),
             ["archive"]
         );
+        fs::remove_file(link)?;
     }
     let other_id = "11111111-1111-4111-8111-111111111111";
     let other = active.with_file_name(name.replace(SESSION_ID, other_id));

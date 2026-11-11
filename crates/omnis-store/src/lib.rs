@@ -1012,6 +1012,20 @@ impl PreparedTrajectoryWrite<'_, '_> {
         Ok(())
     }
 
+    fn bind_discovered_home(&self, transaction: &Transaction<'_>) -> Result<()> {
+        transaction
+            .prepare_cached(
+                "UPDATE session_index SET codex_home=(SELECT home FROM current_codex_home)
+                 WHERE provider='codex' AND session_id=?1 AND codex_home IS NULL
+                 AND EXISTS (SELECT 1 FROM raw_session_catalog
+                     WHERE provider='codex' AND session_id=?1 AND matches_unscoped_document)",
+            )
+            .map_err(database_error)?
+            .execute([&self.session.id])
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     // A bounded read can verify a new name without replacing the full document already in search.
     fn refresh_current_title(
         &self,
@@ -2702,14 +2716,7 @@ impl Store {
     ) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        for observed in observed_names {
-            if let Some(current) = cached_session(&transaction, &observed.session, true)?
-                && same_codex_catalog_source(&current, observed)
-                && current.title != observed.title
-            {
-                return Err(StoreError::TrajectorySourceChanged);
-            }
-        }
+        let unowned = check_discovered_catalog(&transaction, observed_names)?;
         let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
         let mut update_catalog = false;
         let mut upsert_parent = transaction
@@ -2781,6 +2788,9 @@ impl Store {
                 write.refresh_current_title(&transaction, &title)?;
             }
             if let Some(trajectory_id) = trajectory_id {
+                if native_codex && observed && unowned.contains(write.session) {
+                    write.bind_discovered_home(&transaction)?;
+                }
                 // A later write of the same session replaces an earlier one in this batch.
                 rewritten.retain(|(other, _)| *other != trajectory_id);
                 rewritten.push((trajectory_id, document.redacted_text));
@@ -4095,6 +4105,26 @@ fn same_codex_catalog_source(left: &IndexedSession, right: &IndexedSession) -> b
                     .source_revision
                     .is_some_and(|other| revision.matches_file_contents(other))
         })
+}
+
+fn check_discovered_catalog<'a>(
+    connection: &Connection,
+    observed: &[&'a IndexedSession],
+) -> Result<std::collections::HashSet<&'a SessionRef>> {
+    let mut unowned = std::collections::HashSet::new();
+    for selected in observed {
+        let (current, legacy) = selected_catalog_rows(connection, &selected.session)?;
+        if let Some(current) = current
+            && same_codex_catalog_source(&current.metadata, selected)
+            && current.metadata.title != selected.title
+        {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
+        if legacy.is_some_and(|prior| prior.home.is_none() && prior.row == **selected) {
+            unowned.insert(&selected.session);
+        }
+    }
+    Ok(unowned)
 }
 
 fn selected_catalog_rows(
@@ -7364,6 +7394,99 @@ mod tests {
     }
 
     #[test]
+    fn background_index_binds_a_legacy_catalog_only_when_it_writes_the_selected_source() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let time = DateTime::from_timestamp_millis(100).unwrap();
+        let old = SourceRevision {
+            file: Some(Uuid::from_u128(1)),
+            contents: Some(Uuid::from_u128(2)),
+            ..SourceRevision::default()
+        };
+        let new = SourceRevision {
+            contents: Some(Uuid::from_u128(3)),
+            ..old
+        };
+        let catalog = IndexedSession {
+            title: None,
+            source_revision: Some(new),
+            updated_at: Some(time),
+            ..indexed_session(Provider::Codex, "appended", "")
+        };
+        let session = &catalog.session;
+        store
+            .upsert_trajectory_document(
+                session,
+                &rollout_document("older body", time, old, true, 6),
+            )
+            .unwrap();
+        store.upsert_indexed_session(&catalog).unwrap();
+        let remove_home = || {
+            store
+                .connection
+                .borrow()
+                .execute("UPDATE session_index SET codex_home=NULL", [])
+                .unwrap();
+        };
+        remove_home();
+        let observed = store.observe_codex_catalog_inventory().unwrap();
+        store
+            .refresh_codex_catalog_with_name_history(
+                std::slice::from_ref(&catalog),
+                true,
+                true,
+                &observed,
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert!(store.indexed_session(session).unwrap().is_none());
+
+        let observed_source = || {
+            super::TrajectorySourceGuard::Observed(store.trajectory_index_state(session).unwrap())
+        };
+        let publish = |complete, guard| {
+            let doc = rollout_document("appended rookery", time, new, complete, CODEX_VERSION);
+            store
+                .upsert_discovered_trajectory_documents(&[(session, doc, guard, None)], &[&catalog])
+        };
+        assert!(matches!(
+            publish(false, super::TrajectorySourceGuard::Observed(None)),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert!(store.indexed_session(session).unwrap().is_none());
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_chunk BEFORE INSERT ON session_trajectory_chunk_rows
+             BEGIN SELECT raise(ABORT,'cannot publish the document'); END;",
+            )
+            .unwrap();
+        assert!(publish(false, observed_source()).is_err());
+        assert!(store.indexed_session(session).unwrap().is_none());
+        store
+            .connection
+            .borrow()
+            .execute_batch("DROP TRIGGER fail_chunk")
+            .unwrap();
+        publish(false, observed_source()).unwrap();
+        assert_eq!(
+            store.indexed_session(session).unwrap().as_ref(),
+            Some(&catalog)
+        );
+        assert_eq!(
+            store.search_session_trajectories("rookery", 10).unwrap(),
+            vec![session.clone()]
+        );
+        publish(true, observed_source()).unwrap();
+        remove_home();
+        let full = store.trajectory_index_state(session).unwrap();
+        publish(false, observed_source()).unwrap();
+        assert_eq!(store.trajectory_index_state(session).unwrap(), full);
+        assert!(store.indexed_session(session).unwrap().is_none());
+    }
+
+    #[test]
     fn a_shared_codex_file_does_not_carry_a_name_between_homes() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
@@ -9211,15 +9334,25 @@ mod tests {
         let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
         let (header, workspace, document) = publish_workspace_fixture(&store);
         store.connection.borrow().execute(
-            "UPDATE session_trajectories SET document_version=?2 WHERE provider='codex' AND session_id=?1",
-            params![header.session.id, omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1],
+            "UPDATE session_trajectories SET document_version=13, derived_title='Earlier worksheet',
+                 derived_title_is_verified=1 WHERE provider='codex' AND session_id=?1",
+            [&header.session.id],
         ).unwrap();
-        let (cached, _) = store
-            .cached_sessions_with_titles(Some(Provider::Codex))
-            .unwrap();
-        assert_eq!(cached[0].title, header.title);
-        assert_eq!(cached[0].project_path, None);
-        assert_eq!(cached[0].git_branch, None);
+        for (cached, titles) in [
+            store
+                .cached_sessions_with_titles(Some(Provider::Codex))
+                .unwrap(),
+            store.cached_picker_sessions_with_titles().unwrap(),
+        ] {
+            assert_eq!(cached[0].title, header.title);
+            assert_eq!(cached[0].project_path, None);
+            assert_eq!(cached[0].git_branch, None);
+            let title = titles
+                .iter()
+                .find(|row| row.session == header.session)
+                .unwrap();
+            assert_eq!(title.title, None);
+        }
         let lookup = || {
             super::CodexWorkspace::discovery_index_from(
                 &store.connection.borrow(),

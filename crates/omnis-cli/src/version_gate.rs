@@ -1,4 +1,9 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    io::ErrorKind,
+    path::Path,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use omnis_ir::Provider;
@@ -6,6 +11,28 @@ use omnis_ir::Provider;
 /// Bound on a provider's `--version` probe. The first launch after a provider update can take
 /// several seconds on macOS, and a timeout sends the transfer to semantic handoff.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Codex installs helper shims before parsing `--help` or `--version` on its first run.
+pub(crate) fn isolate_first_codex_probe(
+    provider: Provider,
+    command: &mut Command,
+) -> Result<Option<tempfile::TempDir>> {
+    if provider != Provider::Codex || std::env::var("CODEX_HOME").is_ok_and(|home| !home.is_empty())
+    {
+        return Ok(None);
+    }
+    let first_run = omnis_adapters::CodexAdapter::default_home().is_some_and(|home| {
+        home.symlink_metadata()
+            .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+    });
+    if !first_run {
+        return Ok(None);
+    }
+    let home = crate::codex_import::temporary_home()
+        .context("creating a temporary Codex home for the capability check")?;
+    command.env("CODEX_HOME", home.path());
+    Ok(Some(home))
+}
 
 /// Reads the installed provider version with one deadline for the launcher and its workers.
 pub(crate) fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
@@ -20,6 +47,7 @@ pub(crate) fn installed_version(binary: &Path, provider: Provider) -> Result<Str
         _ => find_version,
     };
     let mut command = crate::provider_launch::provider_process(binary)?;
+    let _home = isolate_first_codex_probe(provider, &mut command)?;
     let output = crate::interrupt::with_provider_probes(|| {
         omnis_adapters::bounded_provider_line_output(
             command.arg("--version").stdin(Stdio::null()),

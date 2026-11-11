@@ -162,12 +162,17 @@ fn session_path(home: &Path, path: &Path, id: &str) -> bool {
     split.map_or(stem, |(prefix, _)| prefix).ends_with(id) && canonical_local_path(path).is_some()
 }
 
+struct HomeEvidence {
+    unique_home: Option<String>,
+    matches_catalog: bool,
+}
+
 impl Cache {
     fn collect(
         &self,
         key: &str,
         rows: &HashMap<&str, &IndexedSession>,
-        homes: &mut HashMap<String, Option<String>>,
+        homes: &mut HashMap<String, HomeEvidence>,
     ) -> Option<()> {
         if !schema_v1(&self.format)
             || !self.codex_home.is_absolute()
@@ -184,29 +189,38 @@ impl Cache {
             let Some(row) = rows.get(header.id.as_str()) else {
                 continue;
             };
+            if header.is_subagent {
+                continue;
+            }
             // The workspace migration clears unverified folders. A matching source can
             // still identify its home without restoring that folder.
             let workspace_matches = header.project_path == row.project_path
                 || (row.project_path.is_none() && row.source_revision.is_some());
-            if header.is_subagent
-                || !workspace_matches
-                || header.created_at.map(|t| t.timestamp_millis())
-                    != row.created_at.map(|t| t.timestamp_millis())
-                || !rollout.stamp.matches(row)
-            {
+            let matches_catalog = workspace_matches
+                && header.created_at.map(|t| t.timestamp_millis())
+                    == row.created_at.map(|t| t.timestamp_millis())
+                && rollout.stamp.matches(row);
+            if !matches_catalog && row.source_revision.is_some() {
                 continue;
             }
             let candidate = home
                 .as_ref()
                 .filter(|_| session_path(&self.codex_home, path, &header.id));
-            homes
+            if !matches_catalog && candidate.is_none() {
+                continue;
+            }
+            // An unstamped catalog row may belong to a rollout that has changed since
+            // indexing. A matching copy in another home cannot establish ownership.
+            let evidence = homes
                 .entry(header.id.clone())
-                .and_modify(|old| {
-                    if old.as_ref() != candidate {
-                        *old = None;
-                    }
-                })
-                .or_insert_with(|| candidate.cloned());
+                .or_insert_with(|| HomeEvidence {
+                    unique_home: candidate.cloned(),
+                    matches_catalog: false,
+                });
+            if evidence.unique_home.as_ref() != candidate {
+                evidence.unique_home = None;
+            }
+            evidence.matches_catalog |= matches_catalog;
         }
         Some(())
     }
@@ -249,7 +263,8 @@ pub(super) fn homes<'a>(
     }
     homes
         .into_iter()
-        .filter_map(|(id, home)| Some((id, home?)))
+        .filter(|(_, evidence)| evidence.matches_catalog)
+        .filter_map(|(id, evidence)| Some((id, evidence.unique_home?)))
         .collect()
 }
 
@@ -339,24 +354,31 @@ mod tests {
             updated_at_approximate: false,
             event_count: 0,
         };
-        let write_cache = |home: &Path| {
+        let write_cache = |home: &Path, modified: i64| {
             let name = cache.join(format!("codex-rollouts-{}.json", home_digest(home)));
-            let rollout = home
-                .join("sessions")
-                .join(format!("rollout-{}.jsonl", row.session.id));
+            let filename = format!("rollout-{}.jsonl", row.session.id);
+            let rollout = home.join("sessions").join(&filename);
+            let archive = home.join("archived_sessions").join(&filename);
             let record = json!({"header":{"id": row.session.id, "project_path": row.project_path, "is_subagent": false},
-                "stamp":{"len":100, "inode":5, "modified":[100,0], "changed":[100,0]}});
-            let data = json!({"format":"1-0.8.52-0123456789abcdef", "codex_home":home, "rollouts":{rollout.to_str().unwrap():record}});
+                "stamp":{"len":100, "inode":5, "modified":[modified,0], "changed":[modified,0]}});
+            let mut older = record.clone();
+            older["stamp"]["modified"] = json!([90, 0]);
+            let data = json!({"format":"1-0.8.52-0123456789abcdef", "codex_home":home,
+                "rollouts":{rollout.to_str().unwrap():record, archive.to_str().unwrap():older}});
             fs::write(&name, data.to_string()).unwrap();
             name
         };
         let first = state.join("A");
-        write_cache(&first);
+        write_cache(&first, 100);
         assert_eq!(
             homes(&state, [&row]).get(&row.session.id),
             first.to_str().map(str::to_owned).as_ref()
         );
-        let second = write_cache(&state.join("B"));
+        write_cache(&first, 101);
+        assert!(homes(&state, [&row]).is_empty());
+        let second = write_cache(&state.join("B"), 100);
+        assert!(homes(&state, [&row]).is_empty());
+        write_cache(&first, 100);
         assert!(homes(&state, [&row]).is_empty());
         fs::write(second, "{").unwrap();
         assert!(homes(&state, [&row]).is_empty());

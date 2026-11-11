@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::{
     CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, live_rollout_path,
     representations, restored_rollout, rollout_file,
-    rollout_identity::{self, HeaderEvidence},
+    rollout_identity::{self, HeaderEvidence, HistoryMode},
 };
 use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
 
@@ -358,49 +358,27 @@ impl CurrentRollout {
         expected: Option<&[PathBuf]>,
         mut checked_gzip: Option<(PathBuf, Option<CurrentFile>)>,
     ) -> Result<Option<CurrentFile>> {
-        let mut selected: Option<CurrentFile> = None;
-        let mut digest = None;
-        let mut bytes = COPY_COMPARISON_BYTES;
+        let mut agreement = CopyAgreement::new();
         for path in copies {
-            if selected.is_none()
-                && expected
-                    .as_ref()
-                    .is_some_and(|paths| !paths.contains(&path))
+            if agreement.selected.is_none() && expected.is_some_and(|paths| !paths.contains(&path))
             {
                 break;
             }
             if !accessible(home, root, &path)? {
                 continue;
             }
-            let copy = if checked_gzip
+            if checked_gzip
                 .as_ref()
                 .is_some_and(|(checked, _)| checked == &path)
             {
-                checked_gzip.take().and_then(|(_, file)| file)
-            } else {
-                self.check(&path, id)?
-            };
-            let Some(copy) = copy else { continue };
-            if let Some(prior) = &selected {
-                if prior.path.extension() == path.extension()
-                    && same_file::is_same_file(&prior.path, &path)
-                        .context(CurrentRolloutUnconfirmed)?
-                {
-                    continue;
+                if let Some(copy) = checked_gzip.take().and_then(|(_, file)| file) {
+                    agreement.consider_complete(copy)?;
                 }
-                let expected = match digest {
-                    Some(hash) => hash,
-                    None => hash_copy(prior, &mut bytes)?,
-                };
-                if hash_copy(&copy, &mut bytes)? != expected {
-                    return Err(CurrentRolloutUnavailable.into());
-                }
-                digest = Some(expected);
             } else {
-                selected = Some(copy);
+                agreement.observe(self, &path, id)?;
             }
         }
-        Ok(selected)
+        agreement.finish(id)
     }
 
     fn resolve_recorded_path(&self, home: &Path, id: &str) -> Result<Option<CurrentFile>> {
@@ -476,11 +454,13 @@ impl CurrentRollout {
         first: &FileHeader,
     ) -> Result<Option<CurrentFile>> {
         let file = first.file(path, id);
-        if self.paginated != Some(true) || file.as_ref().is_some_and(|file| file.paginated) {
+        if self.paginated != Some(true) {
             return Ok(file);
         }
-        if HeaderEvidence::read(&first.value, id) != HeaderEvidence::Incomplete {
-            return Ok(None);
+        match HeaderEvidence::read(&first.value, id) {
+            HeaderEvidence::Native(HistoryMode::Paginated) => return Ok(file),
+            HeaderEvidence::Incomplete => {}
+            _ => return Ok(None),
         }
         let name = rollout_file::jsonl_file_name(path).context(CurrentRolloutUnavailable)?;
         let counterpart = if path.starts_with(home.join("sessions")) {
@@ -488,75 +468,118 @@ impl CurrentRollout {
         } else {
             restored_rollout(home, path)
         };
-        let mut remaining = COPY_COMPARISON_BYTES;
-        let mut body = None;
-        let mut compare = |candidate: &Path| -> Result<Option<CurrentFile>> {
-            if candidate == path || !accessible(home, root, candidate)? {
-                return Ok(None);
-            }
-            let Some(other) = FileHeader::read(candidate)? else {
-                return Ok(None);
-            };
-            if other.value["payload"]["id"].as_str() != Some(id)
-                || !super::history_base::matching_header(first.value.clone(), &other.value)
+        let verify = || -> Result<Option<CurrentFile>> {
+            let mut agreement = CopyAgreement::new();
+            agreement
+                .damaged
+                .push((path.to_owned(), first.observed.revision));
+            for plain in [Some(path.with_file_name(name)), counterpart]
+                .into_iter()
+                .flatten()
             {
-                return Ok(None);
-            }
-            let expected = if let Some(previous) = body {
-                previous
-            } else {
-                let hash = digest(
-                    path,
-                    first.observed.revision,
-                    &mut remaining,
-                    CopyPart::Body,
-                )?;
-                body = Some(hash);
-                hash
-            };
-            let actual = digest(
-                candidate,
-                other.observed.revision,
-                &mut remaining,
-                CopyPart::Body,
-            )?;
-            Ok(if actual == expected {
-                other.file(candidate, id)
-            } else {
-                None
-            })
-        };
-        let mut uncertain = false;
-        for plain in [Some(path.with_file_name(name)), counterpart]
-            .into_iter()
-            .flatten()
-        {
-            for candidate in representations(&plain) {
-                match compare(&candidate) {
-                    Ok(Some(verified)) => {
-                        first.confirm(path)?;
-                        return Ok(Some(verified));
+                for candidate in representations(&plain) {
+                    if candidate != path && accessible(home, root, &candidate)? {
+                        agreement.observe(self, &candidate, id)?;
                     }
-                    Ok(None) => {}
-                    Err(error) => uncertain |= !error.is::<CurrentRolloutUnavailable>(),
                 }
             }
-        }
+            agreement.finish(id)
+        };
+        let verified = verify();
         first.confirm(path)?;
-        if first.value["type"] == "session_meta"
-            && first.value["payload"]["id"].as_str() == Some(id)
-            && rollout_identity::damaged_paginated_mode(&first.value)
-        {
-            return Ok(file);
+        match verified {
+            Ok(Some(copy)) => Ok(Some(copy)),
+            _ if first.owns_paginated_rows(id) => Ok(file),
+            Err(error) => Err(error),
+            Ok(None) => Err(CurrentRolloutUnavailable.into()),
         }
-        ensure!(!uncertain, CurrentRolloutUnconfirmed);
-        Err(CurrentRolloutUnavailable.into())
+    }
+}
+
+struct CopyAgreement {
+    selected: Option<CurrentFile>,
+    selected_hash: Option<CopyDigests>,
+    damaged: Vec<(PathBuf, SourceRevision)>,
+    remaining: u64,
+}
+
+impl CopyAgreement {
+    fn new() -> Self {
+        Self {
+            selected: None,
+            selected_hash: None,
+            damaged: Vec::new(),
+            remaining: COPY_COMPARISON_BYTES,
+        }
     }
 
-    fn check(&self, path: &Path, id: &str) -> Result<Option<CurrentFile>> {
-        Ok(FileHeader::read(path)?
-            .and_then(|header| header.file(path, id))
-            .filter(|file| self.paginated != Some(true) || file.paginated))
+    fn observe(&mut self, row: &CurrentRollout, path: &Path, id: &str) -> Result<()> {
+        let Some(header) = FileHeader::read_bounded(path, &mut self.remaining)? else {
+            return Ok(());
+        };
+        if row.paginated == Some(true) {
+            match HeaderEvidence::read(&header.value, id) {
+                HeaderEvidence::Native(HistoryMode::Paginated) => {}
+                HeaderEvidence::Incomplete if header.recognizable_paginated_header() => {
+                    self.damaged
+                        .push((path.to_owned(), header.observed.revision));
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+        if let Some(copy) = header.file(path, id) {
+            self.consider_complete(copy)?;
+        }
+        Ok(())
+    }
+
+    fn consider_complete(&mut self, copy: CurrentFile) -> Result<()> {
+        let Some(selected) = &self.selected else {
+            self.selected = Some(copy);
+            return Ok(());
+        };
+        if selected.path.extension() == copy.path.extension()
+            && same_file::is_same_file(&selected.path, &copy.path)
+                .context(CurrentRolloutUnconfirmed)?
+        {
+            return Ok(());
+        }
+        let expected = match self.selected_hash {
+            Some(hash) => hash,
+            None => hash_copy(selected, &mut self.remaining)?,
+        };
+        ensure!(
+            hash_copy(&copy, &mut self.remaining)?.wire == expected.wire,
+            CurrentRolloutUnavailable
+        );
+        self.selected_hash = Some(expected);
+        Ok(())
+    }
+
+    fn finish(mut self, id: &str) -> Result<Option<CurrentFile>> {
+        if let Some(selected) = &self.selected
+            && !self.damaged.is_empty()
+        {
+            let header =
+                FileHeader::read_revision(&selected.path, selected.revision, &mut self.remaining)?;
+            let expected = match self.selected_hash {
+                Some(hash) => hash,
+                None => hash_copy(selected, &mut self.remaining)?,
+            };
+            for (path, revision) in self.damaged {
+                let observed = FileHeader::read_revision(&path, revision, &mut self.remaining)?;
+                ensure!(
+                    header.value["payload"]["id"].as_str() == Some(id)
+                        && super::history_base::matching_header(observed.value, &header.value)
+                        && copy_digests(&path, revision, &mut self.remaining)?.body
+                            == expected.body,
+                    CurrentRolloutUnavailable
+                );
+            }
+            header.confirm(&selected.path)?;
+        }
+        Ok(self.selected)
     }
 }
 
@@ -567,8 +590,34 @@ struct FileHeader {
 
 impl FileHeader {
     fn read(path: &Path) -> Result<Option<Self>> {
+        let mut limit = MAX_TRANSCRIPT_LINE_SIZE;
+        Self::read_bounded(path, &mut limit)
+    }
+
+    fn read_revision(path: &Path, revision: SourceRevision, remaining: &mut u64) -> Result<Self> {
+        Self::read_bounded(path, remaining)?
+            .filter(|header| header.observed.revision == revision)
+            .context(CurrentRolloutUnconfirmed)
+    }
+
+    fn owns_paginated_rows(&self, id: &str) -> bool {
+        self.value["type"] == "session_meta"
+            && self.value["payload"]["id"].as_str() == Some(id)
+            && self.recognizable_paginated_header()
+    }
+
+    fn recognizable_paginated_header(&self) -> bool {
+        if self.value["type"] == "session_meta" {
+            HistoryMode::is_paginated(&self.value["payload"]["history_mode"])
+                || rollout_identity::damaged_paginated_mode(&self.value)
+        } else {
+            rollout_identity::damaged_header_type(&self.value)
+        }
+    }
+
+    fn read_bounded(path: &Path, remaining: &mut u64) -> Result<Option<Self>> {
         let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
-        let header = selected_header(path);
+        let header = selected_header(path, remaining);
         ensure!(
             CodexAdapter::index_file_revision(path) == Some(observed.revision),
             CurrentRolloutUnconfirmed
@@ -623,22 +672,21 @@ fn accessible(home: &Path, root: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn selected_header(path: &Path) -> Result<Option<serde_json::Value>> {
+fn selected_header(path: &Path, remaining: &mut u64) -> Result<Option<serde_json::Value>> {
+    let limit = MAX_TRANSCRIPT_LINE_SIZE.min(*remaining);
     let reader = rollout_file::open(path).context(CurrentRolloutUnconfirmed)?;
     let mut line = Vec::new();
-    if let Err(error) =
-        BufReader::new(reader.take(MAX_TRANSCRIPT_LINE_SIZE + 1)).read_until(b'\n', &mut line)
-    {
+    let result = BufReader::new(reader.take(limit + 1)).read_until(b'\n', &mut line);
+    let bytes = u64::try_from(line.len())?;
+    *remaining = remaining.saturating_sub(bytes);
+    ensure!(bytes <= limit, CurrentRolloutUnconfirmed);
+    if let Err(error) = result {
         let error = copy_read_error(path, error);
         if error.is::<CurrentRolloutUnavailable>() {
             return Ok(None);
         }
         return Err(error);
     }
-    ensure!(
-        u64::try_from(line.len())? <= MAX_TRANSCRIPT_LINE_SIZE,
-        CurrentRolloutUnconfirmed
-    );
     Ok(serde_json::from_slice(&line).ok())
 }
 
@@ -717,44 +765,43 @@ pub(super) fn timestamp(path: &Path) -> Option<&str> {
     (suffix == thread || suffix.split_once('_') == Some((thread, rollout))).then_some(stamp)
 }
 
-fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
-    digest(&copy.path, copy.revision, remaining, CopyPart::All)
+#[derive(Clone, Copy, Debug)]
+struct CopyDigests {
+    wire: [u8; 32],
+    body: [u8; 32],
 }
 
-#[derive(Clone, Copy)]
-enum CopyPart {
-    All,
-    Body,
+fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<CopyDigests> {
+    copy_digests(&copy.path, copy.revision, remaining)
 }
 
-fn digest(
-    path: &Path,
-    revision: SourceRevision,
-    remaining: &mut u64,
-    part: CopyPart,
-) -> Result<[u8; 32]> {
+fn copy_digests(path: &Path, revision: SourceRevision, remaining: &mut u64) -> Result<CopyDigests> {
     let encoded = fs::metadata(path).context(CurrentRolloutUnconfirmed)?.len();
     ensure!(encoded <= *remaining, CurrentRolloutUnconfirmed);
-    let mut hash = Sha256::new();
-    let mut reader = BufReader::new(
-        rollout_file::open(path)
-            .context(CurrentRolloutUnconfirmed)?
-            .take(*remaining + 1),
-    );
+    let mut wire = Sha256::new();
+    let mut body = Sha256::new();
+    let mut in_body = false;
+    let mut reader = rollout_file::open(path)
+        .context(CurrentRolloutUnconfirmed)?
+        .take(*remaining + 1);
     let mut buffer = [0; 16 * 1024];
     let result = (|| -> io::Result<()> {
-        if matches!(part, CopyPart::Body) {
-            reader.skip_until(b'\n')?;
-        }
         loop {
             let size = reader.read(&mut buffer)?;
             if size == 0 {
                 return Ok(());
             }
-            hash.update(&buffer[..size]);
+            let part = &buffer[..size];
+            wire.update(part);
+            if in_body {
+                body.update(part);
+            } else if let Some(newline) = memchr::memchr(b'\n', part) {
+                body.update(&part[newline + 1..]);
+                in_body = true;
+            }
         }
     })();
-    let decoded = *remaining + 1 - reader.get_ref().limit();
+    let decoded = *remaining + 1 - reader.limit();
     let fits = decoded <= *remaining;
     *remaining = remaining.saturating_sub(encoded.max(decoded));
     result.map_err(|error| copy_read_error(path, error))?;
@@ -763,7 +810,10 @@ fn digest(
         Some(revision) == CodexAdapter::index_file_revision(path),
         CurrentRolloutUnconfirmed
     );
-    Ok(hash.finalize().into())
+    Ok(CopyDigests {
+        wire: wire.finalize().into(),
+        body: body.finalize().into(),
+    })
 }
 
 #[cfg(test)]
@@ -780,8 +830,8 @@ mod tests {
         let path = directory.join(format!(
             "rollout-2026-01-01T00-00-00-{THREAD}{suffix}.jsonl"
         ));
-        let meta = serde_json::json!({"type":"session_meta","payload":{"id":THREAD,"history_mode":"paginated"}});
-        let item = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}});
+        let meta = serde_json::json!({"type":"session_meta","ordinal":0,"payload":{"id":THREAD,"history_mode":"paginated"}});
+        let item = serde_json::json!({"type":"event_msg","ordinal":1,"payload":{"type":"user_message","message":text}});
         fs::write(&path, format!("{meta}\n{item}\n"))?;
         Ok(path)
     }

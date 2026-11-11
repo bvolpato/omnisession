@@ -277,10 +277,14 @@ fn a_damaged_current_mode_keeps_every_local_turn_until_a_complete_copy_agrees() 
         let verified = backup == Some(&messages);
         let adapter = CodexAdapter::with_root(home.path());
         let session = SessionRef::new(Provider::Codex, THREAD);
-        let expected = if verified { &copy } else { &chosen }.canonicalize()?;
+        let expected = if verified { &copy } else { &chosen };
         let listed = adapter.list_sessions(None)?;
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].source_path.as_ref(), Some(&expected));
+        let selected = listed[0]
+            .source_path
+            .as_deref()
+            .expect("selected rollout path");
+        assert!(same_file::is_same_file(selected, expected)?);
         assert_eq!(
             adapter.native_resume_support(&session)?,
             NativeResumeSupport::ImportOnly
@@ -399,6 +403,76 @@ fn warm_index_readers_reconcile_fresh_discovery_hints_with_state() -> Result<()>
     )?;
     drop(db);
     check(&hint, &reverted, "current physical revert")
+}
+
+#[test]
+fn a_relocated_paginated_rollout_checks_the_body_of_an_owned_damaged_copy() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let active = home.join("sessions/2026/01/01");
+    let archived = home.join("archived_sessions");
+    fs::create_dir_all(&active)?;
+    fs::create_dir(&archived)?;
+    let name = format!("rollout-2026-01-01T00-00-00-{THREAD}_{SELECTED}.jsonl");
+    let chosen = active.join(&name);
+    let archive = archived.join(&name);
+    let database = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    database.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        [],
+    )?;
+    database.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+        [THREAD, &format!(r"C:\Retired\Codex\sessions\{name}")],
+    )?;
+    let short = rollout("opening request");
+    let tail = json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"user",
+        "content":[{"type":"input_text","text":"latest request"}]}});
+    let long = format!("{short}{tail}\n");
+    for (field, changed) in [
+        (r#""history_mode""#, r#""history_mnde""#),
+        (r#""id""#, r#""hd""#),
+        (r#""ordinal""#, r#""ordhnal""#),
+    ] {
+        let damaged = |source: &str| source.replacen(field, changed, 1);
+        for (left, right) in [(&long, &short), (&short, &long)] {
+            fs::write(&chosen, damaged(left))?;
+            fs::write(&archive, right)?;
+            assert_unavailable(home, &archive)?;
+        }
+        fs::write(&chosen, damaged(&short))?;
+        fs::write(&archive, &short)?;
+        assert_selected(home, &archive, &chosen, "opening request")?;
+        fs::remove_file(&archive)?;
+        assert_unavailable(home, &chosen)?;
+    }
+    fs::write(&chosen, long.replacen(THREAD, ABANDONED, 1))?;
+    fs::write(&archive, &short)?;
+    assert_selected(home, &archive, &chosen, "opening request")?;
+    let damaged = short.replacen("history_mode", "history_mnde", 1);
+    fs::write(&chosen, &damaged)?;
+
+    // A matching native sibling cannot validate a third copy with a different tail.
+    let sibling = chosen.with_extension("jsonl.zst");
+    fs::write(&sibling, zstd::stream::encode_all(short.as_bytes(), 1)?)?;
+    fs::write(&archive, &long)?;
+    assert_unavailable(home, &sibling)?;
+    database.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [chosen.to_str().unwrap()],
+    )?;
+    let adapter = CodexAdapter::with_root(home);
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let snapshot = adapter.read_session(&session)?;
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert!(conversation.truncated);
+    assert_eq!(conversation.messages.len(), 1);
+    assert_eq!(conversation.messages[0].text, "opening request");
+    assert!(snapshot.events.iter().any(|event| {
+        event.source.raw_record_type.as_deref() == Some("omnisession.codex_history_mode")
+    }));
+    assert_eq!(fs::read_to_string(chosen)?, damaged);
+    Ok(())
 }
 
 #[test]

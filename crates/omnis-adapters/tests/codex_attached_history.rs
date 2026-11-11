@@ -568,3 +568,169 @@ fn a_subagent_cutoff_does_not_hide_messages_in_legacy_history() -> Result<()> {
     }
     Ok(())
 }
+
+fn interrupted_fork(dir: &Path) -> Result<Vec<Value>> {
+    let parent = [header(PARENT, 0, None, false), message(1, "parent request")];
+    write(dir, &format!("2026-01-01T00-00-00-{PARENT}"), &parent)?;
+    Ok(vec![
+        header(CHILD, 2, Some(bookmark(PARENT, &parent)), true),
+        settings(3, dir),
+        message(4, "interrupted parent generation"),
+        json!({"timestamp":STAMP,"type":"event_msg","ordinal":5,"payload":{"type":"turn_aborted","reason":"interrupted"}}),
+        message(6, "child request"),
+    ])
+}
+
+#[test]
+fn an_attached_midturn_abort_hides_the_parent_when_an_ordinal_is_damaged() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let source = interrupted_fork(&dir)?;
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    for (row, replacement, extra_gap) in [
+        (0, Value::Null, false),
+        (0, json!(9), false),
+        (3, Value::Null, false),
+        (3, Value::Null, true),
+    ] {
+        let mut rows = source.clone();
+        rows[row]["ordinal"] = replacement;
+        if extra_gap {
+            let mut unplaced = message(7, "unplaced child message");
+            unplaced.as_object_mut().unwrap().remove("ordinal");
+            rows.extend([unplaced, message(8, "later child request")]);
+        }
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        if row == 0 {
+            assert_eq!(
+                adapter.native_resume_support(&session)?,
+                NativeResumeSupport::ImportOnly
+            );
+        }
+        let full_index = adapter.index_session(&session, None, u64::MAX)?;
+        assert!(full_index.source_complete);
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+            adapter.index_session(&session, None, 1)?.snapshot,
+            full_index.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let expected: &[&str] = if extra_gap {
+                &["child request", "later child request"]
+            } else {
+                &["child request"]
+            };
+            assert_eq!(
+                conversation
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(conversation.truncated, extra_gap);
+            let export = omnis_core::render_markdown_export(&snapshot);
+            assert!(!export.contains("interrupted parent generation"));
+            assert!(!export.contains("unplaced child message"));
+            assert_eq!(
+                export.matches("no valid ordinal").count(),
+                usize::from(extra_gap)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_detached_fork_obeys_its_attached_sources_bookmark() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let mut source = interrupted_fork(&dir)?;
+    source[3].as_object_mut().unwrap().remove("ordinal");
+    write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &source)?;
+    let session = SessionRef::new(Provider::Codex, REVERT);
+    for length in [3, 5] {
+        let base = bookmark(CHILD, &source[..length]);
+        let end = usize::try_from(base["end_ordinal_exclusive"].as_u64().unwrap())?;
+        let fork = [
+            header(REVERT, end, Some(base), false),
+            message(end + 1, "detached request"),
+        ];
+        write(&dir, &format!("2026-01-03T00-00-00-{REVERT}"), &fork)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.index_session(&session, None, 1)?.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert_eq!(conversation.truncated, length == 3);
+            let expected: &[&str] = if length == 3 {
+                &["detached request"]
+            } else {
+                &["child request", "detached request"]
+            };
+            assert_eq!(
+                conversation
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let text = serde_json::to_string(&snapshot)?;
+            assert!(!text.contains("interrupted parent generation"));
+            assert_eq!(
+                text.matches("could not verify which messages were visible")
+                    .count(),
+                usize::from(length == 3)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_attachment_preamble_keeps_the_confirmed_child_turn() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    let name = format!("2026-01-02T00-00-00-{CHILD}");
+    let mut rows = interrupted_fork(&dir)?;
+    rows[1] = message(3, "interrupted parent generation");
+    rows[2] = settings(4, &dir);
+    for replacement in [Some("{"), Some("{}"), None] {
+        if replacement.is_none() {
+            rows[0]["payload"]["history_base"] = json!({});
+        }
+        write(&dir, &name, &rows)?;
+        if let Some(replacement) = replacement {
+            let path = dir.join(format!("rollout-{name}.jsonl"));
+            let body = fs::read_to_string(&path)?.replace(&rows[2].to_string(), replacement);
+            fs::write(path, body)?;
+        }
+        let adapter = CodexAdapter::with_root(home.path());
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert!(conversation.truncated);
+            assert_eq!(conversation.messages.len(), 1);
+            assert_eq!(conversation.messages[0].text, "child request");
+            assert_eq!(
+                snapshot
+                    .events
+                    .iter()
+                    .filter(|event| event.payload["omitted_events"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0))
+                    .count(),
+                1
+            );
+            assert!(!serde_json::to_string(&snapshot)?.contains("interrupted parent generation"));
+        }
+    }
+    Ok(())
+}

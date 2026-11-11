@@ -205,7 +205,7 @@ impl CodexSession {
         )?;
         if matches!(
             self.history_base,
-            HistoryBase::Prefix(_) | HistoryBase::Invalid
+            HistoryBase::Prefix(_) | HistoryBase::Invalid | HistoryBase::InvalidAttachment
         ) {
             lineage.unavailable = Some("The rollout references earlier history that was not read.");
         }
@@ -231,7 +231,7 @@ impl CodexSession {
         let mut line = Vec::new();
         let mut workspace = WorkspaceScan::new(self.project_path.as_deref());
         let mut skipped = JsonLineSkips::default();
-        for _ in 0..limits.records {
+        for row in 1..=limits.records {
             let Some((kind, bytes)) = read_bounded_line_with_budget(
                 &mut reader,
                 limits.line_bytes,
@@ -252,7 +252,7 @@ impl CodexSession {
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
                         if let Ok(record) = serde_json::from_slice::<Value>(&line)
-                            && let Some(visible) = lineage.leaf_record_visibility(&record)
+                            && let Some(visible) = lineage.leaf_row_visibility(&record, row)
                         {
                             if !visible {
                                 if record["type"] == "event_msg"

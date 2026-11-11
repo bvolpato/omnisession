@@ -1,29 +1,25 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 
 use super::{Config, ConfiguredPath, SqliteHome};
 
-#[cfg(target_os = "macos")]
-pub(super) fn macos_preference_is_forced(domain: &str, key: &str) -> bool {
-    use objc2_core_foundation::{CFPreferencesAppValueIsForced, CFString};
-
-    CFPreferencesAppValueIsForced(&CFString::from_str(key), &CFString::from_str(domain))
-}
-
-#[cfg(any(target_os = "macos", test))]
-pub(super) fn check_macos_preferences(is_forced: impl Fn(&str, &str) -> bool) -> Result<()> {
-    // Either forced preference can change the selected state database. Leave its contents in Codex.
-    anyhow::ensure!(
-        !["config_toml_base64", "requirements_toml_base64"]
-            .iter()
-            .any(|key| is_forced("com.openai.codex", key)),
-        "Omni cannot verify the state database under this managed macOS Codex policy. Open the thread directly in Codex."
-    );
-    Ok(())
-}
+mod macos;
+pub(super) use macos::{MacPreferences, Preference};
 
 impl SqliteHome {
+    pub(super) fn mac_config(&self, home: &Path, key: Preference) -> Result<Option<Arc<Config>>> {
+        match &self.macos_preferences {
+            Some(prefs) => prefs.config(home, key).with_context(|| format!(
+                "Omni cannot verify the state database from the managed macOS Codex {}. Open the thread directly in Codex.", key.name()
+            )),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn legacy_managed_config(&self) -> Result<Option<Arc<Config>>> {
         if cfg!(unix)
             && let Some(system) = &self.system_config
@@ -35,7 +31,25 @@ impl SqliteHome {
         Ok(None)
     }
 
-    pub(super) fn required_home(&self) -> Result<Option<PathBuf>> {
+    pub(super) fn required_home(&self, home: &Path) -> Result<Option<PathBuf>> {
+        let managed = self.mac_config(home, Preference::Requirements)?;
+        let file = self.file_requirements()?;
+        if let Some(path) = managed.as_ref().and_then(|layer| layer.sqlite_home.clone()) {
+            return Ok(Some(path.into_path()?));
+        }
+        anyhow::ensure!(
+            !managed
+                .iter()
+                .chain(&file)
+                .any(|layer| layer.requires_server),
+            "Managed Codex requirements select a configuration server that may change the state database. Open the thread directly in Codex."
+        );
+        file.and_then(|config| config.sqlite_home.clone())
+            .map(ConfiguredPath::into_path)
+            .transpose()
+    }
+
+    fn file_requirements(&self) -> Result<Option<Arc<Config>>> {
         let Some(system) = &self.system_config else {
             return Ok(None);
         };
@@ -45,12 +59,6 @@ impl SqliteHome {
             check_requirements_path(&path)?;
         }
         self.configured(path)
-            .and_then(|config| {
-                config
-                    .and_then(|config| config.sqlite_home.clone())
-                    .map(ConfiguredPath::into_path)
-                    .transpose()
-            })
             .context("cannot verify sqlite_home in local Codex requirements.toml")
     }
 }
@@ -83,26 +91,39 @@ mod tests {
 
     use super::*;
     use crate::CodexLaunchOverrides;
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     #[test]
-    fn forced_macos_preferences_prevent_selection_from_lower_config() -> Result<()> {
+    fn managed_preferences_change_only_the_settings_that_select_local_storage() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let home = fixture.path();
         fs::write(home.join("config.toml"), "sqlite_home = 'user-db'")?;
         let mut selector = SqliteHome {
-            macos_preference_is_forced: Some(|_, _| false),
+            macos_preferences: Some(MacPreferences::new(|key| {
+                Ok(Some(STANDARD.encode(match key {
+                    Preference::Config => "model = 'example'\n[tui]\nanimations = false",
+                    Preference::Requirements => "allowed_approval_policies = ['on-request']",
+                })))
+            })),
             ..SqliteHome::default()
         };
         assert_eq!(selector.resolve(home)?, home.join("user-db"));
-        for forced in [
-            (|domain, key| domain == "com.openai.codex" && key == "config_toml_base64")
-                as fn(&str, &str) -> bool,
-            |domain, key| domain == "com.openai.codex" && key == "requirements_toml_base64",
-        ] {
-            selector.macos_preference_is_forced = Some(forced);
-            let error = selector.resolve(home).unwrap_err().to_string();
-            assert!(error.contains("Open the thread directly in Codex"));
-        }
+        selector.macos_preferences = Some(MacPreferences::new(|key| {
+            Ok(Some(STANDARD.encode(match key {
+                Preference::Config => "sqlite_home = 'configured'",
+                Preference::Requirements => "sqlite_home = 'required'",
+            })))
+        }));
+        assert_eq!(selector.resolve(home)?, home.join("required"));
+        let other_home = home.join("other");
+        assert_eq!(selector.resolve(&other_home)?, other_home.join("required"));
+        selector.macos_preferences = Some(MacPreferences::new(|key| {
+            Ok(matches!(key, Preference::Requirements)
+                .then(|| STANDARD.encode("[config_server]\nid = 'private'")))
+        }));
+        let error = format!("{:#}", selector.resolve(home).unwrap_err());
+        assert!(error.contains("configuration server"));
+        assert!(!error.contains("private"));
         Ok(())
     }
 

@@ -57,10 +57,10 @@ const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
-/// Minimum native Codex search projection that validates the stored subagent cutoff and its lineage.
-pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 12;
+/// Minimum readable projection for native Codex search text, titles, and workspace metadata.
+pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 14;
 // A title recheck can keep a readable conversation at the display minimum until the next index pass.
-const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 13;
+const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 15;
 
 /// Returns the search document generation written by the current native provider reader.
 #[must_use]
