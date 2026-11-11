@@ -40,6 +40,7 @@ pub(super) enum Detached {
     Timestamp { uncertain: bool },
     // The selected summary can survive even when its retained replies do not.
     Attachment { anchor: Option<Uuid> },
+    RejectedReplacement,
 }
 
 #[derive(Clone, Copy)]
@@ -624,6 +625,8 @@ pub(super) struct Branch {
     active_rejection: Option<usize>,
     // This selection can be ambiguous even when the original record has a verified parent.
     copied_rejection: Option<CopiedRejection>,
+    // A rejected replacement can undo a verified parent rewrite in the native conversation.
+    replaced_parents: HashMap<usize, usize>,
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
@@ -891,9 +894,7 @@ impl Branch {
                 .selected_summary()
                 .and_then(|s| compactions.by_summary.get(&s))
                 .is_some_and(|link| link.cutoff.is_some() && opaque.header_count <= link.header)
-            && parent
-                .source
-                .and_then(|source| self.cutoff_for_origin(source))
+            && self.cutoff_for_origin(parent.source.unwrap_or(decision.cutoff))
                 == Some(decision.cutoff)
         {
             parent.node = Some(decision.cutoff);
@@ -1002,19 +1003,24 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> Option<OpaqueReturn> {
-        let source = parent.source?;
-        let summary = self.cutoff_for_origin(source)?;
         let id = super::record_uuid(record, "parentUuid")?;
+        let prior = self.opaque_record(parent).and_then(|r| r.detached);
+        let summary = match parent.source.or(prior.map(|r| r.cutoff)) {
+            Some(origin) => self.cutoff_for_origin(origin)?,
+            // The checkpoint can remove an observed native record that had no conversation parent.
+            None => self.selected_summary()?,
+        };
         if parent.missing_ancestor
             || duplicates.contains(&id)
             || compactions.contains(summary, id, records)
-            || self.nodes[source]
-                .uuid
+            || parent
+                .source
+                .and_then(|s| self.nodes[s].uuid)
                 .is_some_and(|id| compactions.contains(summary, id, records))
         {
             return None;
         }
-        if let Some(prior) = self.opaque_record(parent).and_then(|r| r.detached)
+        if let Some(prior) = prior
             && prior.cutoff == summary
         {
             return Some(prior);
@@ -1067,7 +1073,37 @@ impl Branch {
         is_summary: bool,
         compactions: &Compactions,
     ) {
-        if !is_summary && let Some(copy) = self.copied_rejection {
+        if is_summary {
+            self.copied_rejection = None;
+            return;
+        }
+        let inherited = parent
+            .node
+            .and_then(|i| self.replaced_parents.get(&i))
+            .copied();
+        if let Some(failed) = self.copy_checkpoint()
+            && let Some(&verified) = compactions.rejected_replacements.get(&failed)
+            && self.summary_for(*parent) == Some(verified)
+            && parent
+                .source
+                .is_some_and(|source| verified < source && source < failed)
+            && parent.unverified.is_none()
+        {
+            self.replaced_parents.insert(self.nodes.len(), verified);
+            self.copied_rejection = Some(CopiedRejection {
+                checkpoint: failed,
+                affected: false,
+            });
+            return;
+        }
+        let selected = self.replaced_checkpoint();
+        if selected.is_some() && parent.suffix.is_some() {
+            // The verified checkpoint explicitly retained this parent.
+            self.copied_rejection = None;
+            return;
+        }
+        let mut archive = inherited;
+        if let Some(copy) = self.copied_rejection {
             let affected = parent.source.is_some_and(|source| {
                 let scope = if self.nodes[source].user {
                     RejectionScope::Source(source)
@@ -1081,11 +1117,13 @@ impl Branch {
                 && self.tip.is_some_and(|tip| tip < copy.checkpoint);
             if affected || continued_copy {
                 parent.unverified.get_or_insert(copy.checkpoint);
+                archive = archive.or(selected);
             }
         }
-        let copy_checkpoint = if is_summary {
-            None
-        } else if parent.node.is_none() && !parent.missing_ancestor {
+        if let Some(summary) = archive {
+            self.replaced_parents.insert(self.nodes.len(), summary);
+        }
+        let copy_checkpoint = if parent.node.is_none() && !parent.missing_ancestor {
             self.copy_checkpoint()
         } else {
             self.copied_rejection.map(|copy| copy.checkpoint)
@@ -1582,7 +1620,7 @@ impl Branch {
         owner.filter(|&index| parent < Some(index))
     }
 
-    fn previous_summary(&self, summary: usize) -> Option<usize> {
+    pub(super) fn previous_summary(&self, summary: usize) -> Option<usize> {
         self.nodes[summary]
             .parent
             .and_then(|parent| self.nodes[parent].summary)
@@ -1639,12 +1677,30 @@ impl Branch {
     pub(super) fn selected_path(&self) -> Vec<usize> {
         let mut path = Vec::new();
         let mut next = self.tip;
+        let replaced = self.replaced_checkpoint();
         while let Some(index) = next {
             path.push(index);
             next = self.nodes[index].parent;
+            if replaced.is_some()
+                && next == replaced
+                && let Some(source) = self
+                    .suffix_parents
+                    .get(&index)
+                    .and_then(|parent| parent.source)
+            {
+                next = Some(source);
+            }
         }
         path.reverse();
         path
+    }
+
+    pub(super) fn replaced_checkpoint(&self) -> Option<usize> {
+        self.replaced_parents.get(&self.tip?).copied()
+    }
+
+    pub(super) fn events_for(&self, node: usize) -> Range<usize> {
+        self.nodes[node].events.clone()
     }
 
     pub(super) fn trailing_path(

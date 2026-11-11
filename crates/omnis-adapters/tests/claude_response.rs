@@ -1,7 +1,9 @@
 use std::io::Write;
 
 use omnis_adapters::{ClaudeAdapter, ProviderAdapter};
-use omnis_core::{NativeTrajectoryItem, import_trajectory, native_trajectory_items};
+use omnis_core::{
+    ImportTrajectory, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -63,6 +65,15 @@ fn tool_outcomes(snapshot: &CanonicalSnapshot) -> Vec<(String, bool)> {
             } => Some((output, is_error)),
             NativeTrajectoryItem::Message { .. } => None,
         })
+        .collect()
+}
+
+fn handoff_messages(handoff: &ImportTrajectory) -> Vec<&str> {
+    handoff
+        .items
+        .iter()
+        .filter(|item| !item.text.starts_with("[OmniSession retained "))
+        .map(|item| item.text.lines().last().unwrap())
         .collect()
 }
 
@@ -423,6 +434,73 @@ fn returning_to_a_valid_summary_abandons_the_other_branches_rejected_list() {
             ]
         );
         assert!(!import_trajectory(&snapshot).truncated);
+    }
+}
+
+#[test]
+fn a_rejected_replacement_keeps_its_predecessor_in_recovery_after_a_branch_return() {
+    let left = message(2, 1, "assistant", json!("Discarded left"));
+    let mut base = vec![
+        message(1, 0, "user", json!("Task")),
+        left.clone(),
+        message(3, 1, "assistant", json!("Verified right")),
+    ];
+    base.extend(compaction(4, 3, &[3]));
+    base.extend([
+        message(6, 3, "user", json!("First continuation")),
+        message(7, 6, "assistant", json!("Known reply")),
+    ]);
+    let back = message(11, 7, "user", json!("On verified branch"));
+    let last = message(12, 2, "user", json!("New child of omitted left"));
+    for (rejected, copied, continued) in [
+        (false, false, true),
+        (true, false, true),
+        (true, true, true),
+        (true, false, false),
+        (true, true, false),
+    ] {
+        let mut rows = base.clone();
+        if rejected {
+            rows.extend(compaction(8, 7, &[3, 99]));
+        }
+        if copied {
+            rows.push(left.clone());
+        }
+        rows.push(back.clone());
+        if continued {
+            rows.push(last.clone());
+        }
+        let expected: &[&str] = if !rejected {
+            &["Summary 4", "Verified right", "New child of omitted left"]
+        } else if continued {
+            &["Task", "Discarded left", "New child of omitted left"]
+        } else {
+            &[
+                "Task",
+                "Verified right",
+                "First continuation",
+                "Known reply",
+                "On verified branch",
+            ]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&handoff),
+                expected,
+                "rejected={rejected} copied={copied} continued={continued} preview={preview}"
+            );
+            assert_eq!(handoff.truncated, rejected);
+            assert_eq!(
+                omnis_core::trajectory_search_document(&snapshot).source_complete,
+                !rejected
+            );
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            assert!(recovery.contains("Summary 4") && recovery.contains("Verified right"));
+        }
     }
 }
 
@@ -2639,8 +2717,11 @@ fn a_dated_directory_attachment_recovers_the_selected_compaction_at_its_own_time
     };
     let [first, earlier_summary] = compaction(4, 3, &[3, 70]);
     let [second, current_summary] = compaction(8, 7, &[7]);
+    let mut root = directory_attachment(69, 0);
+    root["parentUuid"] = Value::Null;
     let base = [
-        dated(1_000, message(1, 0, "user", json!("Start"))),
+        dated(500, root),
+        dated(1_000, message(1, 69, "user", json!("Start"))),
         dated(
             2_000,
             message(2, 1, "assistant", json!("Withdrawn left reply")),
@@ -2675,6 +2756,8 @@ fn a_dated_directory_attachment_recovers_the_selected_compaction_at_its_own_time
         (&selected[..], 2, 14_000, false, with_summary, false),
         (&selected, 2, 14_000, true, with_summary, false),
         (&selected, 2, 14_001, false, only_request, false),
+        (&selected, 69, 14_000, true, with_summary, true),
+        (&selected, 69, 14_001, false, only_request, true),
         (&selected, 5, 14_000, true, with_summary, false),
         (&selected, 7, 9_500, false, retained, false),
         (&[][..], 2, 9_500, false, only_request, true),
@@ -2697,14 +2780,9 @@ fn a_dated_directory_attachment_recovers_the_selected_compaction_at_its_own_time
         for preview in [false, true] {
             let snapshot = read_session(&rows, preview);
             let handoff = import_trajectory(&snapshot);
-            let recorded: Vec<_> = handoff
-                .items
-                .iter()
-                .filter(|i| !i.text.starts_with("[OmniSession retained "))
-                .map(|i| i.text.lines().last().unwrap())
-                .collect();
             assert_eq!(
-                recorded, expected,
+                handoff_messages(&handoff),
+                expected,
                 "{at} ms, parent {parent}, preview={preview}"
             );
             let search = omnis_core::trajectory_search_document(&snapshot);
@@ -2866,13 +2944,11 @@ fn a_turn_duration_copy_and_a_new_duration_on_either_side_of_a_checkpoint() {
         rows.push(timed(message(12, 11, "user", json!("New request")), "11"));
         for preview in [false, true] {
             let handoff = import_trajectory(&read_session(&rows, preview));
-            let text: Vec<_> = handoff
-                .items
-                .iter()
-                .filter(|item| !item.text.starts_with("[OmniSession retained "))
-                .map(|item| item.text.lines().last().unwrap())
-                .collect();
-            assert_eq!(text, expected, "before={before}, preview={preview}");
+            assert_eq!(
+                handoff_messages(&handoff),
+                expected,
+                "before={before}, preview={preview}"
+            );
         }
     }
 }

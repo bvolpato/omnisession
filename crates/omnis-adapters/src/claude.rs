@@ -520,6 +520,7 @@ struct Compactions {
     // A missing anchor can still connect later messages to the boundary that declared it.
     absent_anchors: HashMap<Uuid, Option<AbsentAnchor>>,
     absent_summary_nodes: HashMap<usize, Uuid>,
+    rejected_replacements: HashMap<usize, usize>,
     pending: Option<usize>,
     paths: Paths,
     marker_paths: markers::MarkerPaths,
@@ -876,6 +877,7 @@ impl Compactions {
         reason: String,
         records: &HashMap<Uuid, ClaudeRecord>,
         branch: &branch::Branch,
+        verified_anchor: bool,
     ) {
         let boundary = &self.headers[self.by_summary[&summary].header];
         let cutoff = boundary.order;
@@ -884,10 +886,33 @@ impl Compactions {
                 .filter(|record| record.order < cutoff)
         };
         let metadata = &boundary.value["compactMetadata"];
+        let predecessor = branch.previous_summary(summary).filter(|index| {
+            verified_anchor
+                && !self.absent_summary_nodes.contains_key(&summary)
+                && self
+                    .by_summary
+                    .get(index)
+                    .is_some_and(|prior| prior.cutoff.is_some())
+        });
+        let mut replacement = None;
+        let mut note_overlap = |id: Uuid, record: &ClaudeRecord| {
+            if replacement.is_none()
+                && !record.branch.transparent
+                && record.branch.source.is_some()
+                && let Some(prior) = predecessor
+                && self.contains(prior, id, records)
+            {
+                replacement = Some(prior);
+            }
+        };
         let members = if metadata["preservedMessages"].is_null() {
             let declaration = &metadata["preservedSegment"];
             let head = record_uuid(declaration, "headUuid");
-            let head_source = head.and_then(|id| before(&id)?.branch.source);
+            let head_source = head.and_then(|id| {
+                let record = before(&id)?;
+                note_overlap(id, record);
+                record.branch.source
+            });
             let mut current = record_uuid(declaration, "tailUuid");
             let mut seen = HashSet::new();
             let mut ids = Vec::new();
@@ -898,6 +923,7 @@ impl Compactions {
                 if !seen.insert(id) {
                     break;
                 }
+                note_overlap(id, record);
                 ids.push(id);
                 if Some(id) == head {
                     break;
@@ -922,13 +948,21 @@ impl Compactions {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|entry| before(&entry.as_str()?.parse().ok()?)?.branch.source)
+                .filter_map(|entry| {
+                    let id = entry.as_str()?.parse().ok()?;
+                    let record = before(&id)?;
+                    note_overlap(id, record);
+                    record.branch.source
+                })
                 .collect();
             SummaryMembers::RejectedSources {
                 turns: Members::listed(sources.iter().map(|&source| branch.turn(source)).collect()),
                 sources: Members::listed(sources),
             }
         };
+        if let Some(prior) = replacement {
+            self.rejected_replacements.insert(summary, prior);
+        }
         let link = self
             .by_summary
             .get_mut(&summary)
@@ -1854,8 +1888,13 @@ impl ClaudeTranscript {
                         .remember_retention(&context.records, &self.records);
                 }
                 Err(error) => {
-                    self.compactions
-                        .reject(index, error.to_string(), &self.records, &self.branch);
+                    self.compactions.reject(
+                        index,
+                        error.to_string(),
+                        &self.records,
+                        &self.branch,
+                        verified,
+                    );
                     self.branch.mark_unverified_retention(index);
                 }
                 Ok(None) => {}
@@ -2023,14 +2062,54 @@ impl ClaudeTranscript {
             });
         }
         path = rewind.apply_to_path(path, &moved);
-        let (order, ambiguous) = self.branch.event_order(
+        let (mut order, ambiguous) = self.branch.event_order(
             &mut self.events,
             &path,
             &rewind,
             &self.duplicate_records,
             inspect,
         );
+        if let Some(summary) = self.branch.replaced_checkpoint()
+            && let Err(failure) = self.archive_replaced_checkpoint(summary, &mut order)
+        {
+            error.get_or_insert(failure);
+        }
         (order, error, ambiguous)
+    }
+
+    fn archive_replaced_checkpoint(
+        &mut self,
+        summary: usize,
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        let Some(&first) = order.first() else {
+            return Ok(());
+        };
+        let Some((retained, _)) = self.retained_nodes(summary, None)? else {
+            return Ok(());
+        };
+        let mut present: HashSet<_> = order.iter().copied().collect();
+        let mut historical = Vec::new();
+        for node in std::iter::once(summary).chain(retained) {
+            for event in self.branch.events_for(node) {
+                if matches!(
+                    self.events[event].kind,
+                    EventKind::CompactionCreated
+                        | EventKind::MessageUser
+                        | EventKind::MessageAssistant
+                ) && present.insert(event)
+                {
+                    historical.push(event);
+                }
+            }
+        }
+        self.branch
+            .detached_events
+            .entry(first)
+            .or_insert(branch::Detached::RejectedReplacement);
+        historical.append(order);
+        *order = historical;
+        Ok(())
     }
 
     fn validate_source(&self, session: &SessionRef, sampled: bool) -> Result<()> {
@@ -2068,6 +2147,11 @@ impl ClaudeTranscript {
                         true,
                         anchor,
                         "Claude's compaction removed the attachment parent. Only a summary verified by its branch and timestamp can precede this continuation",
+                    ),
+                    branch::Detached::RejectedReplacement => (
+                        true,
+                        None,
+                        "Claude's rejected replacement makes the earlier checkpoint uncertain. The continuation follows its recorded parents",
                     ),
                 };
                 self.events.push(ClaudeEvent {
