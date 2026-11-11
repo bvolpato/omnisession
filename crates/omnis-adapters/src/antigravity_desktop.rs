@@ -64,38 +64,12 @@ impl AntigravityDesktopAdapter {
         }
     }
 
-    /// Returns ordered fingerprints of the native database rows represented by this read.
-    /// Each fingerprint binds the SQLite index, the native bytes, and whether the row is opaque.
+    /// Returns the native row fingerprints for a Desktop database read.
     #[must_use]
     pub fn step_proof(snapshot: &CanonicalSnapshot) -> Option<Vec<Uuid>> {
-        if snapshot.session.provider != Provider::AntigravityDesktop {
-            return None;
-        }
-        let mut steps = Vec::new();
-        for event in &snapshot.events {
-            if event.source.provider != snapshot.session.provider
-                || event.source.native_session_id != snapshot.session.id
-            {
-                return None;
-            }
-            if event.source.raw_record_type.as_deref()
-                == Some(crate::antigravity::STEP_LIMIT_RECORD)
-            {
-                let missing = event.payload["declared_steps"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_sub(event.payload["stored_steps"].as_u64().unwrap_or(0));
-                if event.payload["omitted_events"].as_u64().unwrap_or(0) > missing {
-                    return None;
-                }
-            } else {
-                if steps.len() == crate::antigravity::MAX_DATABASE_STEPS {
-                    return None;
-                }
-                steps.push(event.raw_blob_hash.as_ref()?.parse().ok()?);
-            }
-        }
-        Some(steps)
+        (snapshot.session.provider == Provider::AntigravityDesktop)
+            .then(|| crate::antigravity::AntigravityAdapter::database_step_proof(snapshot))
+            .flatten()
     }
 
     fn root(&self) -> Result<&Path> {

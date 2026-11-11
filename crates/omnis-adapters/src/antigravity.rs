@@ -45,6 +45,41 @@ impl AntigravityAdapter {
         }
     }
 
+    /// Returns ordered fingerprints of the native database rows represented by this read.
+    /// Each fingerprint binds the SQLite index, the native bytes, and whether the row is opaque.
+    #[must_use]
+    pub fn database_step_proof(snapshot: &CanonicalSnapshot) -> Option<Vec<Uuid>> {
+        if !matches!(
+            snapshot.session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) {
+            return None;
+        }
+        let mut steps = Vec::new();
+        for event in &snapshot.events {
+            if event.source.provider != snapshot.session.provider
+                || event.source.native_session_id != snapshot.session.id
+            {
+                return None;
+            }
+            if event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD) {
+                let missing = event.payload["declared_steps"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(event.payload["stored_steps"].as_u64().unwrap_or(0));
+                if event.payload["omitted_events"].as_u64().unwrap_or(0) > missing {
+                    return None;
+                }
+            } else {
+                if steps.len() == MAX_DATABASE_STEPS {
+                    return None;
+                }
+                steps.push(event.raw_blob_hash.as_ref()?.parse().ok()?);
+            }
+        }
+        Some(steps)
+    }
+
     fn root(&self) -> Result<&Path> {
         self.root
             .as_deref()
@@ -999,7 +1034,7 @@ fn push_database_steps_with_limits(
                 Some(event.record_type),
                 None,
             );
-            builder.record_desktop_step_hash(row.get_ref(2)?.as_i64().ok(), &payload);
+            builder.record_database_step_hash(row.get_ref(2)?.as_i64().ok(), &payload);
         }
     }
     if omitted > 0 || unsupported > 0 {
@@ -1372,6 +1407,51 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn cli_database_proof_preserves_multiline_boundaries_and_distinguishes_duplicate_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("steps.db");
+        let read = |texts: &[&str]| {
+            let steps = texts
+                .iter()
+                .map(|text| {
+                    synthetic_step(
+                        14,
+                        Some(proto_step::Step::UserInput(ProtoUserInput {
+                            query: (*text).to_owned(),
+                            ..Default::default()
+                        })),
+                    )
+                })
+                .collect::<Vec<_>>();
+            write_steps_database(&database, &steps);
+            let session = SessionRef::new(Provider::Antigravity, "synthetic");
+            let mut events = EventBuilder::new(session.provider, &session.id);
+            push_database_steps(root.path(), &database, &mut events, steps.len() + 1).unwrap();
+            let snapshot = events.snapshot(session, None, None, None, Utc::now());
+            let proof = super::AntigravityAdapter::database_step_proof(&snapshot).unwrap();
+            let document = omnis_core::trajectory_search_document(&snapshot);
+            assert!(document.desktop_projection.is_some());
+            std::fs::remove_file(&database).unwrap();
+            proof
+        };
+        let old = read(&["bluebird\n\nchecklist", "duplicate", "duplicate"]);
+        assert_ne!(old[1], old[2]);
+        let split = read(&[
+            "bluebird",
+            "duplicate",
+            "duplicate",
+            "interveningword",
+            "checklist",
+        ]);
+        assert!(!split.contains(&old[0]));
+        assert_eq!(split[1..3], old[1..]);
+        assert_eq!(
+            read(&["bluebird\n\nchecklist", "duplicate", "duplicate"]),
+            old
+        );
     }
 
     #[test]

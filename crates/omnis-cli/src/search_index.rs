@@ -1425,7 +1425,7 @@ struct PreparedIndex {
     guard: TrajectorySourceGuard,
     candidate: IndexCandidate,
     document: SearchDocument,
-    desktop_step_proof: Option<Vec<uuid::Uuid>>,
+    database_step_proof: Option<Vec<uuid::Uuid>>,
     source: SearchSource,
     source_complete: bool,
     provider_limited: bool,
@@ -1491,7 +1491,7 @@ impl PreparedIndex {
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
-            desktop_step_proof: self.desktop_step_proof.as_deref(),
+            database_step_proof: self.database_step_proof.as_deref(),
             desktop_projection: self.document.desktop_projection.as_ref(),
             legacy_utf8_text: self.document.legacy_utf8_text.as_ref(),
             redacted_text: &self.document.text,
@@ -1547,19 +1547,22 @@ fn verified_source(
 }
 
 impl SearchSource {
-    pub(super) fn desktop_step_proof(
+    pub(super) fn database_step_proof(
         &self,
         snapshot: &CanonicalSnapshot,
     ) -> Option<Vec<uuid::Uuid>> {
         let observed = self.observation.as_ref()?;
         if observed.session.session != snapshot.session
-            || snapshot.session.provider != Provider::AntigravityDesktop
+            || !observed.session.source_path.as_deref().is_some_and(|path| {
+                path.extension().is_some_and(|ext| ext == "db")
+                    && !AntigravityAdapter::is_summary_catalog(path)
+            })
             || observed.revision.file.is_none()
             || observed.revision.contents.is_none()
         {
             return None;
         }
-        AntigravityDesktopAdapter::step_proof(snapshot)
+        AntigravityAdapter::database_step_proof(snapshot)
     }
 
     fn native_home(&self) -> Option<&std::ffi::OsStr> {
@@ -1778,7 +1781,7 @@ fn prepare_session(
         guard: guard_observed_home(guard, source.observation.as_ref()),
         candidate: candidate.clone(),
         document,
-        desktop_step_proof: source.desktop_step_proof(&snapshot),
+        database_step_proof: source.database_step_proof(&snapshot),
         source,
         source_complete,
         provider_limited,
@@ -2311,7 +2314,7 @@ mod tests {
             .upsert_trajectory_document(
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
-                    desktop_step_proof: None,
+                    database_step_proof: None,
                     desktop_projection: None,
                     legacy_utf8_text: None,
                     source_revision: SourceRevision::default(),
@@ -2588,7 +2591,7 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
-                desktop_step_proof: None,
+                database_step_proof: None,
                 workspace: None,
                 guard: TrajectorySourceGuard::NewerSource,
                 candidate: IndexCandidate {

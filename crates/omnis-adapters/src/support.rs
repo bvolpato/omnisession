@@ -2307,10 +2307,8 @@ impl EventBuilder {
         }
     }
 
-    pub(crate) fn record_desktop_step_hash(&mut self, index: Option<i64>, wire: &[u8]) {
-        if self.provider != Provider::AntigravityDesktop
-            || self.events.len() > crate::antigravity::MAX_DATABASE_STEPS
-        {
+    pub(crate) fn record_database_step_hash(&mut self, index: Option<i64>, wire: &[u8]) {
+        if self.events.len() > crate::antigravity::MAX_DATABASE_STEPS {
             return;
         }
         if let (Some(index), Some(event)) = (index, self.events.last_mut())

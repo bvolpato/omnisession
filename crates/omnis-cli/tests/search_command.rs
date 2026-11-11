@@ -618,7 +618,7 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
             &session,
             &TrajectoryDocument {
                 redacted_text: obsolete,
-                desktop_step_proof: None,
+                database_step_proof: None,
                 desktop_projection: None,
                 legacy_utf8_text: None,
                 source_updated_at: state.source_updated_at,
@@ -1473,7 +1473,7 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
             &omnis_store::TrajectoryDocument {
                 source_revision: omnis_ir::SourceRevision::default(),
                 redacted_text: preview,
-                desktop_step_proof: None,
+                database_step_proof: None,
                 desktop_projection: None,
                 legacy_utf8_text: None,
                 indexed_byte_count: preview.len(),

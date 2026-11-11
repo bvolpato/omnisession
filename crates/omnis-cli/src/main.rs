@@ -342,7 +342,7 @@ fn store_observed_search_document(
         &omnis_adapters::RollbackTitle::Unknown,
         None,
     );
-    let desktop_step_proof = source.desktop_step_proof(snapshot);
+    let database_step_proof = source.database_step_proof(snapshot);
     let mut document = trajectory_document(
         session.provider,
         &document,
@@ -352,7 +352,7 @@ fn store_observed_search_document(
         full_read,
         source.origin,
     );
-    document.desktop_step_proof = desktop_step_proof.as_deref();
+    document.database_step_proof = database_step_proof.as_deref();
     if let Some(locator) = locator {
         return store.upsert_imported_session_document(locator, &document);
     }
@@ -387,7 +387,7 @@ fn trajectory_document<'a>(
     origin: SessionTrajectoryOrigin,
 ) -> omnis_store::TrajectoryDocument<'a> {
     omnis_store::TrajectoryDocument {
-        desktop_step_proof: None,
+        database_step_proof: None,
         desktop_projection: document.desktop_projection.as_ref(),
         legacy_utf8_text: document.legacy_utf8_text.as_ref(),
         redacted_text: &document.text,

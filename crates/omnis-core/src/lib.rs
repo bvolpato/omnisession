@@ -61,8 +61,7 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 8;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity => 11,
-        Provider::AntigravityDesktop => 12,
+        Provider::Antigravity | Provider::AntigravityDesktop => 12,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -1231,8 +1230,11 @@ fn trajectory_search_document_with_limits(
                 Provider::Antigravity | Provider::AntigravityDesktop
             ),
     );
-    let mut desktop_projection = (snapshot.session.provider == Provider::AntigravityDesktop)
-        .then(|| DesktopProjection::new(document_edge_limit));
+    let mut desktop_projection = matches!(
+        snapshot.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    )
+    .then(|| DesktopProjection::new(document_edge_limit));
     for event in events {
         let mut start = retained.total_byte_count;
         if let Some(event_text) = search_event_text(event, event_edge_limit)

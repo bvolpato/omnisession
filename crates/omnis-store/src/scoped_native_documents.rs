@@ -1,6 +1,6 @@
 pub(super) mod chunks;
 mod coverage;
-pub(super) mod desktop_receipts;
+pub(super) mod database_receipts;
 mod text;
 
 use std::borrow::Cow;
@@ -95,7 +95,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
          END;",
     )
     .map_err(database_error)?;
-    desktop_receipts::initialize(tx)?;
+    database_receipts::initialize(tx)?;
     chunks::initialize(tx)
 }
 
@@ -239,15 +239,15 @@ fn save_scoped(
             document.redacted_text,write.source_complete,write.complete,document.provider_limited,document.derived_title,document.source_updated_at.timestamp_millis(),document.document_version,preserve_previous,
         ], |row| Ok((row.get(0)?, row.get(1)?))).optional()
     }).map_err(database_error)?;
-    if write.session.provider == crate::Provider::AntigravityDesktop {
-        desktop_receipts::save(
+    if TrajectorySourceGuard::uses_catalog_home(write.session.provider) {
+        database_receipts::save(
             tx,
-            id,
+            write.session,
             home,
             file,
             contents,
             &write.content_hash,
-            document.desktop_step_proof,
+            document.database_step_proof,
         )?;
     }
     confirm_document_version(tx, changed)

@@ -1,4 +1,4 @@
-//! Indexed byte coverage for search results from a native Desktop database.
+//! Indexed byte coverage for search results from a native Antigravity database.
 
 use std::ops::Range;
 
@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::truncation_notice;
 
-/// The range each verified Desktop row occupies after per-event truncation and before document truncation.
+/// The range each verified Antigravity database row occupies after per-event truncation and before document truncation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopProjection {
     rows: Vec<(Uuid, Range<usize>)>,
