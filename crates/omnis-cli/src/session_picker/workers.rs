@@ -596,6 +596,7 @@ fn reports_incomplete_preview(event: &omnis_ir::OmniEvent) -> bool {
             event.source.raw_record_type.as_deref(),
             Some(
                 "omnisession.grok_missing_updates"
+                    | "omnisession.grok_malformed_updates"
                     | "omnisession.record_size_limit"
                     | "omnisession.malformed_records"
                     | "omnisession.collection_limit"

@@ -478,11 +478,7 @@ impl GrokAdapter {
                     GrokHistoryError::ForeignOwner
                 );
                 read_any = true;
-                if record
-                    .pointer("/params/update")
-                    .is_some_and(|update| !update.is_null())
-                    || string_at(&record, &[&["sessionUpdate"], &["type"], &["event"]]).is_some()
-                {
+                if is_update_record(&record) {
                     observed += 1;
                 }
                 updates.push_record(&mut builder, record);
@@ -885,6 +881,7 @@ struct GrokUpdateProcessor {
     pending: Option<PendingMessage>,
     preservation: GrokPreservationBudget,
     unsupported_text_records: usize,
+    malformed_updates: usize,
 }
 
 struct GrokPreservationBudget {
@@ -944,20 +941,33 @@ fn estimated_value_size(value: &Value, limit: usize) -> usize {
     size
 }
 
+fn is_update_record(record: &Value) -> bool {
+    record["method"].as_str() == Some("session/update")
+        || record
+            .pointer("/params/update")
+            .is_some_and(|update| !update.is_null())
+        || string_at(record, &[&["sessionUpdate"], &["type"], &["event"]]).is_some()
+}
+
 impl GrokUpdateProcessor {
     fn push_record(&mut self, builder: &mut EventBuilder, mut record: Value) {
         let timestamp = parse_timestamp(value_at(
             &record,
             &[&["timestamp"], &["created_at"], &["createdAt"]],
         ));
+        let is_update_envelope = record["method"].as_str() == Some("session/update");
         let nested_update = record
             .as_object_mut()
             .and_then(|object| object.get_mut("params"))
             .and_then(Value::as_object_mut)
             .and_then(|params| params.remove("update"));
+        let missing_update = is_update_envelope && nested_update.is_none();
         let update = nested_update.unwrap_or(record);
-        let raw_type =
-            string_at(&update, &[&["sessionUpdate"], &["type"], &["event"]]).map(str::to_owned);
+        let raw_type = if missing_update {
+            None
+        } else {
+            string_at(&update, &[&["sessionUpdate"], &["type"], &["event"]]).map(str::to_owned)
+        };
         let update_type = raw_type.as_deref().unwrap_or("");
         let message_kind = match update_type {
             "user_message_chunk" | "user" | "user_message" => Some(EventKind::MessageUser),
@@ -1007,7 +1017,9 @@ impl GrokUpdateProcessor {
             {
                 return;
             }
-            if kind == EventKind::ProviderEvent && update_type != "tool_call_update" {
+            if is_update_envelope && update_type.is_empty() {
+                self.malformed_updates = self.malformed_updates.saturating_add(1);
+            } else if kind == EventKind::ProviderEvent && update_type != "tool_call_update" {
                 self.unsupported_text_records = self.unsupported_text_records.saturating_add(1);
             }
             let mut update = update;
@@ -1038,6 +1050,10 @@ impl GrokUpdateProcessor {
                     "reason": "Grok nontext, reasoning, plan, and opaque historical records exceeded the collection budget"}),
                 None, ReplayPolicy::HistoricalOnly,
                 Some("omnisession.collection_limit".to_owned()), None);
+        }
+        let malformed_updates = std::mem::take(&mut self.malformed_updates);
+        if malformed_updates > 0 {
+            builder.push(EventKind::ProviderEvent, json!({"omitted_events": malformed_updates, "malformed_updates": malformed_updates}), None, ReplayPolicy::HistoricalOnly, Some("omnisession.grok_malformed_updates".to_owned()), None);
         }
         let unsupported_text_records = std::mem::take(&mut self.unsupported_text_records);
         if unsupported_text_records > 0 {
@@ -1732,6 +1748,45 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_update_envelopes_count_as_present_but_incomplete() {
+        let root = tempfile::tempdir().expect("synthetic Grok root");
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id": SESSION_ID, "num_messages": 4}),
+            &[
+                json!({"sessionUpdate": "user_message_chunk", "content": {"text": "question"}}),
+                json!({"method": "session/update", "params": {"sessionId": SESSION_ID}}),
+                json!({"method": "session/update", "params": {"sessionId": SESSION_ID, "update": null}}),
+                json!({"method": "session/update", "params": {"sessionId": SESSION_ID, "update": {"sessionUpdate": "session_info_update", "title": "Example"}}}),
+            ],
+        );
+        let snapshot = GrokAdapter::with_root(root.path())
+            .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+            .expect("partially readable history");
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .find_map(|event| event.payload["malformed_updates"].as_u64()),
+            Some(2)
+        );
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.source.raw_record_type.as_deref()
+                    == Some("omnisession.grok_missing_updates"))
+        );
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::MessageUser)
+        );
+    }
+
+    #[test]
     fn unknown_text_updates_are_preserved_and_report_unsupported_transfer() {
         let root = tempfile::tempdir().expect("synthetic Grok root");
         let records = [
@@ -2280,6 +2335,7 @@ mod tests {
         let mut processor = GrokUpdateProcessor {
             pending: None,
             unsupported_text_records: 0,
+            malformed_updates: 0,
             preservation: GrokPreservationBudget {
                 bytes_left: 2_048,
                 records_left: 2,
@@ -2342,6 +2398,7 @@ mod tests {
         let mut processor = GrokUpdateProcessor {
             pending: None,
             unsupported_text_records: 0,
+            malformed_updates: 0,
             preservation: GrokPreservationBudget {
                 bytes_left: 64 * 1024,
                 records_left: 1,
