@@ -912,7 +912,7 @@ fn read_picker_preview(
             return None;
         }
         let complete = (strict || imported) && read.source_complete;
-        let snapshot = read.snapshot;
+        let (snapshot, prefix_end) = (read.snapshot, read.verified_prefix_end);
         if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
             let stored = crate::store_search_document(
                 store,
@@ -960,7 +960,7 @@ fn read_picker_preview(
             return None;
         }
         return Some((
-            PreviewValue::from_snapshot(&snapshot, key.continuation_after, complete),
+            PreviewValue::from_snapshot(snapshot, key.continuation_after, complete, prefix_end),
             revision.file.map(|_| revision),
         ));
     }
@@ -968,15 +968,27 @@ fn read_picker_preview(
 
 impl PreviewValue {
     fn from_snapshot(
-        snapshot: &omnis_ir::CanonicalSnapshot,
+        mut snapshot: omnis_ir::CanonicalSnapshot,
         continuation_after: Option<DateTime<Utc>>,
         complete: bool,
+        verified_prefix_end: Option<u64>,
     ) -> Self {
+        let preview = Box::new(session_preview(&snapshot));
+        let continuation = continuation_after.and_then(|at| {
+            if let Some(end) = verified_prefix_end {
+                snapshot.events.truncate(
+                    snapshot
+                        .events
+                        .partition_point(|event| event.sequence < end),
+                );
+            } else if !complete {
+                return None;
+            }
+            first_user_message_after(&snapshot, at)
+        });
         Self::Ready {
-            continuation: continuation_after
-                .filter(|_| complete)
-                .and_then(|at| first_user_message_after(snapshot, at)),
-            preview: Box::new(session_preview(snapshot)),
+            continuation,
+            preview,
             complete,
         }
     }

@@ -256,6 +256,10 @@ fn observed_preview_reports_damage_and_keeps_the_messages_on_both_sides() {
         .read_full_index_at(&session, Some(&path.canonicalize().unwrap()))
         .unwrap();
     assert!(!full.source_complete);
+    assert_eq!(
+        full.verified_prefix_end,
+        Some(full.snapshot.events[1].sequence)
+    );
     assert!(
         full.snapshot
             .events

@@ -85,6 +85,8 @@ pub struct NativeSession {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Exclusive event sequence at the first gap in an otherwise sequential read.
+    pub verified_prefix_end: Option<u64>,
     /// Sequence ranges for native records that produced multiple canonical events.
     pub search_record_groups: Vec<std::ops::Range<u64>>,
     /// Catalog metadata verified by the reader of the selected native transcript.
@@ -173,6 +175,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    verified_prefix_end: None,
                     search_record_groups: Vec::new(),
                     native_session: None,
                     snapshot,
@@ -186,6 +189,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        verified_prefix_end: None,
         search_record_groups: Vec::new(),
         native_session: None,
         snapshot: read(true)?,
@@ -342,6 +346,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            verified_prefix_end: None,
             search_record_groups: Vec::new(),
             native_session: None,
             snapshot: self.read_session_at(session, source_path)?,

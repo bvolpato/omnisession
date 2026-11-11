@@ -1261,6 +1261,11 @@ impl SearchDocumentBuilder {
         self.source_byte_count
     }
 
+    #[must_use]
+    pub const fn projected_byte_count(&self) -> usize {
+        self.retained.total_byte_count
+    }
+
     /// Hashes the bounded text as it would appear in the search index at this point.
     #[must_use]
     pub fn indexed_text_hash(&self) -> [u8; 32] {

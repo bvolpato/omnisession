@@ -1250,6 +1250,14 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                 }));
             }
         }
+        if doc.truncation_strategy == "source_incomplete"
+            && count.and_then(|n| usize::try_from(n).ok()) == Some(length)
+            && let (Some(digest), Some(starts)) =
+                (prefix.as_deref(), projection.interior_damage.as_deref())
+            && let Some(record) = legacy_record_at_gap(&previous, digest, doc.redacted_text, starts)
+        {
+            return Ok(LegacySampleUpdate::Restore(record));
+        }
         let mut observed = doc.redacted_text.split("\n\n");
         if previous
             .split("\n\n")
@@ -1345,7 +1353,8 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             missing,
             old_gap.is_some(),
             RecordEvidence { time, anchor },
-            doc.projection.and_then(|p| p.earliest_suffix_time),
+            doc.projection
+                .map_or(&[][..], |p| p.dated_suffix_records.as_slice()),
         ))
     }
 
@@ -5030,6 +5039,63 @@ fn verified_gap_start(text: &str, starts: &[usize], digest: &[u8]) -> Option<usi
     None
 }
 
+// An R19 preview kept a contiguous head and tail. Match both at a confirmed gap
+// before carrying its verified final record into the full projection.
+fn legacy_record_at_gap(
+    previous: &str,
+    digest: &[u8],
+    observed: &str,
+    starts: &[usize],
+) -> Option<RecoveredRecord> {
+    let mut hash = Sha256::new();
+    let mut consumed = 0;
+    let boundary = previous.match_indices("\n\n").find_map(|(start, _)| {
+        hash.update(previous.get(consumed..start)?.as_bytes());
+        consumed = start;
+        (hash.clone().finalize().as_slice() == digest).then_some(start)
+    })?;
+    let (sample, gap) = previous.split_at(boundary);
+    let shared = sample
+        .split("\n\n")
+        .zip(observed.split("\n\n"))
+        .take_while(|(old, new)| old == new)
+        .map(|(word, _)| word.len() + 2)
+        .sum::<usize>();
+    let tail = sample.get(shared.saturating_sub(2)..)?;
+    let start = if tail.is_empty() {
+        starts.binary_search(&boundary).ok().map(|_| boundary)?
+    } else {
+        if shared == 0 {
+            return None;
+        }
+        let mut matches = observed.match_indices(tail).filter_map(|(offset, _)| {
+            let end = offset + tail.len();
+            (offset >= shared && starts.binary_search(&end).is_ok()).then_some(end)
+        });
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        first
+    };
+    let (before, after) = observed.split_at(start);
+    if observed.len() + gap.len() > 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+        || record_occurrences(after, gap.strip_prefix("\n\n")?)
+            .next()
+            .is_some()
+    {
+        return None;
+    }
+    Some(RecoveredRecord {
+        text: [before, gap, after].concat(),
+        start,
+        evidence: RecordEvidence {
+            time: None,
+            anchor: (!after.is_empty()).then_some(after.len()),
+        },
+    })
+}
+
 struct RecordEvidence {
     time: Option<i64>,
     anchor: Option<usize>,
@@ -5054,7 +5120,7 @@ fn recover_missing_record_text(
     missing: usize,
     previously_recovered: bool,
     mut evidence: RecordEvidence,
-    earliest_suffix_time: Option<i64>,
+    dated_records: &[(usize, usize, i64)],
 ) -> Option<RecoveredRecord> {
     let separator = if start == 0 && !observed.is_empty() && !previously_recovered {
         "\n\n"
@@ -5081,7 +5147,7 @@ fn recover_missing_record_text(
     let anchor = evidence
         .anchor
         .or_else(|| {
-            (previously_recovered && !suffix_contains_record(prior_suffix, record))
+            (previously_recovered && record_occurrences(prior_suffix, record).next().is_none())
                 .then_some(prior_suffix.len())
         })
         .filter(|&len| {
@@ -5091,12 +5157,20 @@ fn recover_missing_record_text(
                     .and_then(|anchor| suffix.strip_prefix(anchor))
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with("\n\n"))
         });
-    let later = evidence
-        .time
-        .zip(earliest_suffix_time)
-        .is_some_and(|(old, first)| first > old);
-    let repeated = suffix_contains_record(suffix, record);
-    if repeated && !later && anchor.is_none() {
+    let mut matches = record_occurrences(suffix, record).peekable();
+    let repeated = matches.peek().is_some();
+    if repeated
+        && anchor.is_none()
+        && !matches.all(|offset| {
+            let position = start + offset;
+            dated_records
+                .binary_search_by_key(&position, |&(from, _, _)| from)
+                .is_ok_and(|index| {
+                    let (_, end, time) = dated_records[index];
+                    end == position + record.len() && evidence.time.is_some_and(|old| time > old)
+                })
+        })
+    {
         return None;
     }
     let mut text = String::with_capacity(size);
@@ -5112,12 +5186,15 @@ fn recover_missing_record_text(
     })
 }
 
-fn suffix_contains_record(suffix: &str, record: &str) -> bool {
-    !record.is_empty()
-        && suffix.match_indices(record).any(|(start, matched)| {
+fn record_occurrences<'a>(suffix: &'a str, record: &'a str) -> impl Iterator<Item = usize> + 'a {
+    suffix
+        .match_indices(record)
+        .filter_map(move |(start, matched)| {
             let end = start + matched.len();
-            (start == 0 || suffix[..start].ends_with("\n\n"))
-                && (end == suffix.len() || suffix[end..].starts_with("\n\n"))
+            (!record.is_empty()
+                && (start == 0 || suffix[..start].ends_with("\n\n"))
+                && (end == suffix.len() || suffix[end..].starts_with("\n\n")))
+            .then_some(start)
         })
 }
 

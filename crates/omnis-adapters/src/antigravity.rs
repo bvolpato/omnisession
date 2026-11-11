@@ -138,6 +138,10 @@ impl AntigravityAdapter {
         );
         let (snapshot, search_record_groups) = read?;
         Ok(IndexRead {
+            verified_prefix_end: tail
+                .damage()
+                .filter(|_| !preview)
+                .and_then(JsonLineDamage::verified_prefix_end),
             search_record_groups,
             snapshot,
             source_complete: !preview && tail.damage().is_none_or(|damage| damage.count() == 0),
@@ -177,6 +181,9 @@ impl AntigravityAdapter {
                     let start = builder.checkpoint();
                     push_transcript_record(&mut builder, &record);
                     let end = builder.checkpoint();
+                    if !preview && let Some(damage) = tail.damage() {
+                        damage.confirm_prefix(end);
+                    }
                     if end - start > 1 {
                         groups.push(start..end);
                     }
@@ -228,26 +235,26 @@ impl AntigravityAdapter {
 
 #[derive(Default)]
 struct DamagedRecordPositions {
-    suffix_time: Option<i64>,
-    unknown_suffix_time: bool,
+    dated_records: Vec<(usize, usize, i64)>,
     interior_seen: usize,
     starts: Vec<usize>,
 }
 
 impl DamagedRecordPositions {
     fn observe_suffix(&mut self, record: &serde_json::Value, before: usize, after: usize) {
-        if self.interior_seen > 0 && after > before {
-            let time =
-                parse_timestamp(record.get("created_at")).and_then(|t| t.timestamp_nanos_opt());
-            if let Some(time) = time {
-                self.suffix_time = Some(self.suffix_time.map_or(time, |old| old.min(time)));
-            } else {
-                self.unknown_suffix_time = true;
-            }
+        if self.interior_seen > 0
+            && after > before
+            && after <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+            && let Some(time) =
+                parse_timestamp(record.get("created_at")).and_then(|t| t.timestamp_nanos_opt())
+        {
+            let start = if before == 0 { 0 } else { before + 2 };
+            self.dated_records.push((start, after, time));
         }
     }
 
-    fn observe(&mut self, damage: &JsonLineDamage, bytes: usize) {
+    fn observe(&mut self, damage: &JsonLineDamage, document: &SearchDocumentBuilder) -> usize {
+        let bytes = document.projected_byte_count();
         if damage.interior_count() > self.interior_seen || damage.final_record() {
             self.interior_seen = damage.interior_count();
             if bytes <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
@@ -256,6 +263,7 @@ impl DamagedRecordPositions {
                 self.starts.push(bytes);
             }
         }
+        bytes
     }
 }
 
@@ -418,9 +426,7 @@ fn finish_search_document(
         projection.torn_final = torn_final;
         projection.legacy_torn_sample = legacy_sample;
         if gaps.interior_seen > 0 {
-            if !gaps.unknown_suffix_time {
-                projection.earliest_suffix_time = gaps.suffix_time;
-            }
+            projection.dated_suffix_records = gaps.dated_records;
             projection.interior_damage = Some(gaps.starts);
         }
     }
@@ -642,10 +648,9 @@ impl ProviderAdapter for AntigravityAdapter {
         let mut document = SearchDocumentBuilder::default();
         let mut gaps = DamagedRecordPositions::default();
         let mut push = |record| {
-            let before = document.source_byte_count();
-            gaps.observe(&torn, before);
+            let before = gaps.observe(&torn, &document);
             project_search_record(&record, &mut events, &mut document, &mut title_source);
-            gaps.observe_suffix(&record, before, document.source_byte_count());
+            gaps.observe_suffix(&record, before, document.projected_byte_count());
             prefix.observe(&document);
             document.source_byte_count()
         };
@@ -682,7 +687,7 @@ impl ProviderAdapter for AntigravityAdapter {
         for event in events.drain_events() {
             document.push(&event);
         }
-        gaps.observe(&torn, document.source_byte_count());
+        gaps.observe(&torn, &document);
         let document = finish_search_document(
             document,
             gaps,
@@ -694,6 +699,7 @@ impl ProviderAdapter for AntigravityAdapter {
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {
+                verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 snapshot: title_source,
                 source_complete: !limited && torn.count() == 0,

@@ -845,12 +845,24 @@ impl std::error::Error for IncompleteTranscript {}
 
 #[derive(Debug, Default)]
 pub(crate) struct JsonLineDamage {
+    oversized: Cell<bool>,
+    prefix_end: Cell<u64>,
     interior: Cell<usize>,
     last_offset: Cell<Option<u64>>,
     final_record: Cell<bool>,
 }
 
 impl JsonLineDamage {
+    pub(crate) fn confirm_prefix(&self, end: u64) {
+        if self.verified_prefix_end().is_none() {
+            self.prefix_end.set(end);
+        }
+    }
+
+    pub(crate) fn verified_prefix_end(&self) -> Option<u64> {
+        (self.count() > 0 || self.oversized.get()).then(|| self.prefix_end.get())
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.interior.get() + usize::from(self.final_record.get())
     }
@@ -1270,6 +1282,9 @@ fn visit_json_lines_with_offsets_and_limits(
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
             BoundedLine::Oversized => {
+                if let Some(damage) = limits.tail.damage() {
+                    damage.oversized.set(true);
+                }
                 oversized_records += usize::from(limits.tail.check_skipped_end(
                     reader,
                     offset == end,

@@ -1052,6 +1052,7 @@ fn prepare_session(
         let updated_at = snapshot.captured_at;
         (
             IndexRead {
+                verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 native_session: None,
                 source_revision: SourceRevision::default(),
@@ -1102,6 +1103,7 @@ fn prepare_session(
     };
     let IndexedSearchDocument { document, read } = indexed;
     let IndexRead {
+        verified_prefix_end: _,
         search_record_groups: _,
         snapshot,
         source_complete,

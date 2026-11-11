@@ -105,6 +105,7 @@ impl AntigravityDesktopAdapter {
                 .and_then(|path| path.metadata().ok())
                 .is_some_and(|metadata| metadata.len() <= budget);
         Ok(IndexRead {
+            verified_prefix_end: None,
             search_record_groups: Vec::new(),
             snapshot: read?,
             source_complete: complete,

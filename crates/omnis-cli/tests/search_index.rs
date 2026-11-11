@@ -564,7 +564,9 @@ fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
         fs::write(&path, format!("{opening}\n{old_reply}\n")).unwrap();
         assert_eq!(snippet(&sequential, false), "opening acknowledged");
         assert_eq!(snippet(&direct, false), "opening acknowledged");
-        let partial = format!("{opening}\n{{broken}}\n{}\n", step(2, "nextquestion"));
+        let ambiguous = format!("unchanged-time-{dated}");
+        assert_eq!(snippet(&ambiguous, false), "opening acknowledged");
+        let partial = format!("{opening}\n{{broken}}\n{}\n", step(1, "nextquestion"));
         fs::write(&path, &partial).unwrap();
         assert_eq!(
             snippet(&sequential, false),
@@ -582,6 +584,13 @@ fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
                     "opening acknowledged nextquestion acknowledged"
                 );
             }
+        }
+        fs::write(&path, format!("{partial}{old_reply}\n")).unwrap();
+        for cached in [false, true] {
+            assert_eq!(
+                snippet(&ambiguous, cached),
+                "opening nextquestion acknowledged"
+            );
         }
     }
 }

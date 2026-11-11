@@ -875,6 +875,7 @@ impl SelectedPiFile {
             })
         } else {
             self.full_snapshot(session).map(|snapshot| IndexRead {
+                verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 native_session: None,
                 snapshot,

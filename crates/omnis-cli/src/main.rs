@@ -1467,6 +1467,7 @@ fn read_search_snapshot(
         let updated_at = snapshot.captured_at;
         return Ok((
             omnis_adapters::IndexRead {
+                verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
@@ -1495,6 +1496,7 @@ fn read_search_snapshot(
             adapter.read_full_index_at(session, path)?
         } else {
             omnis_adapters::IndexRead {
+                verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
