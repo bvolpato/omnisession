@@ -199,6 +199,7 @@ struct InventoryFile {
     native: Option<NativeSession>,
     changing_id: Option<String>,
     prefix: Option<HeaderPrefix>,
+    read_denied: bool,
 }
 
 impl InventoryFile {
@@ -209,6 +210,9 @@ impl InventoryFile {
         }
         *self = Self::default();
         let Some(canonical) = resolver.resolve(path) else {
+            self.read_denied = path
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
             return;
         };
         match SelectedPiFile::open_header(canonical, path.to_owned(), provider, true) {
@@ -221,13 +225,23 @@ impl InventoryFile {
                 if let Some(changed) = error.downcast_ref::<ChangedPiHeader>() {
                     self.changing_id.clone_from(&changed.id);
                     self.prefix.clone_from(&changed.prefix);
-                } else if !error.is::<std::io::Error>() {
+                } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    self.read_denied = error.kind() == std::io::ErrorKind::PermissionDenied;
+                } else {
                     // A stable invalid header can become a competing ID after an in-place edit.
                     self.revision =
                         revision.filter(|r| Some(*r) == crate::source_file_revision(path));
                 }
             }
         }
+    }
+
+    fn still_denies_read(root: &Path, path: &Path) -> bool {
+        let access = match provider_file(root, path) {
+            Some(canonical) => fs::File::open(canonical).map(drop),
+            None => path.symlink_metadata().map(drop),
+        };
+        access.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
     }
 }
 
@@ -326,6 +340,10 @@ impl NativeSelectionInventory for PiSelectionInventory {
             .iter()
             .take_while(|(path, _)| path.as_path() <= last)
             .find(|(path, file)| {
+                if file.read_denied {
+                    // An unreadable file cannot win an ID. Check access again before committing.
+                    return !InventoryFile::still_denies_read(&self.root, path);
+                }
                 let current = crate::source_file_revision(path);
                 if current.is_some() && current == file.revision {
                     return false;
@@ -1944,6 +1962,47 @@ mod tests {
             inventory.selected("later").unwrap().source_path.as_ref(),
             Some(&paths[1])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_predecessor_only_shadows_a_session_after_access_returns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("first");
+        fs::create_dir(&directory).unwrap();
+        let earlier = directory.join("earlier.jsonl");
+        let later = temp.path().join("last.jsonl");
+        write_inventory_header(&earlier, "same-id");
+        write_inventory_header(&later, "same-id");
+        let later_request = [(
+            "same-id",
+            later.as_path(),
+            crate::source_file_revision(&later).unwrap(),
+        )];
+        for (restricted, mode) in [(&earlier, 0), (&directory, 0o400)] {
+            let original = fs::metadata(restricted).unwrap().permissions();
+            fs::set_permissions(restricted, fs::Permissions::from_mode(mode)).unwrap();
+            if fs::File::open(&earlier).is_ok() {
+                // A privileged user can still read this file.
+                fs::set_permissions(restricted, original).unwrap();
+                continue;
+            }
+            let mut inventory = PiAdapter::oh_my_pi_with_root(temp.path())
+                .selection_inventory()
+                .unwrap()
+                .unwrap();
+            assert_eq!(inventory.validate(&later_request), [true]);
+            fs::set_permissions(restricted, original).unwrap();
+            assert_eq!(inventory.validate(&later_request), [false]);
+            inventory.refresh().unwrap();
+            assert_eq!(
+                inventory.selected("same-id").unwrap().source_path.as_ref(),
+                Some(&earlier)
+            );
+            assert_eq!(inventory.validate(&later_request), [false]);
+        }
     }
 
     #[test]
