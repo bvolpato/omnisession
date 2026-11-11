@@ -156,20 +156,60 @@ fn a_damaged_wal_commit_cannot_restore_an_older_zero_step_summary() {
     *damaged.last_mut().unwrap() ^= 1;
     let short = &damaged[..damaged.len() - 1];
 
-    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
     for (wal, verified) in [(zero.as_slice(), true), (short, false), (&damaged, false)] {
-        let root = tempdir().unwrap();
-        fs::copy(&database, root.path().join("conversation_summaries.db")).unwrap();
-        fs::write(root.path().join("conversation_summaries.db-wal"), wal).unwrap();
-        let adapter = AntigravityAdapter::with_root(root.path());
-        let listed = adapter.list_sessions(None).unwrap();
-        assert_eq!(listed[0].source_path.is_some(), verified);
-        let read = adapter.read_session(&session);
-        if verified {
-            assert!(read.unwrap().events.is_empty());
-        } else {
-            assert!(read.is_err());
-        }
+        assert_catalog_only_source(&database, wal, verified);
+    }
+}
+
+#[test]
+fn an_older_wal_frame_cannot_hide_a_later_current_frame() {
+    let source = tempdir().unwrap();
+    summary_database(source.path(), source.path());
+    let database = source.path().join("conversation_summaries.db");
+    let wal = source.path().join("conversation_summaries.db-wal");
+    let writer = Connection::open(&database).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         UPDATE conversation_summaries SET step_count=0;
+         UPDATE conversation_summaries SET title='old a';
+         UPDATE conversation_summaries SET title='old b';",
+        )
+        .unwrap();
+    let old = fs::read(&wal).unwrap();
+    let page = u32::from_be_bytes(old[8..12].try_into().unwrap()) as usize;
+    writer
+        .execute_batch(
+            "PRAGMA wal_checkpoint(RESTART);
+         UPDATE conversation_summaries SET title='current';",
+        )
+        .unwrap();
+    let reset = fs::read(&wal).unwrap();
+    assert_eq!(reset.len(), old.len());
+    assert_ne!(&reset[16..24], &old[16..24]);
+    assert_catalog_only_source(&database, &reset, true);
+
+    writer
+        .execute("UPDATE conversation_summaries SET step_count=1", [])
+        .unwrap();
+    let mut restored = fs::read(&wal).unwrap();
+    let first = 32..32 + 24 + page;
+    restored[first.clone()].copy_from_slice(&old[first]);
+    assert_catalog_only_source(&database, &restored, false);
+}
+
+fn assert_catalog_only_source(database: &Path, wal: &[u8], verified: bool) {
+    let root = tempdir().unwrap();
+    fs::copy(database, root.path().join("conversation_summaries.db")).unwrap();
+    fs::write(root.path().join("conversation_summaries.db-wal"), wal).unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let listed = adapter.list_sessions(None).unwrap();
+    assert_eq!(listed[0].source_path.is_some(), verified);
+    let read = adapter.read_session(&SessionRef::new(Provider::Antigravity, SESSION_ID));
+    if verified {
+        assert!(read.unwrap().events.is_empty());
+    } else {
+        assert!(read.is_err());
     }
 }
 

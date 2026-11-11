@@ -43,6 +43,7 @@ pub use opencode::{
 pub use pi::PiAdapter;
 pub use provider_process::provider_process;
 pub use sqlite_wal::UnverifiedSqliteWal;
+pub use support::IncompleteTranscript;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
-        estimated_event_bytes, json_lines_preview, parse_timestamp, paths_match,
-        provider_executable, provider_file, provider_root, sidecar, sort_sessions, sqlite_snapshot,
-        store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, IncompleteTranscript, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp,
+        paths_match, provider_executable, provider_file, provider_root, sidecar, sort_sessions,
+        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines_with_tail,
     },
 };
 
@@ -102,15 +102,23 @@ impl AntigravityAdapter {
         let transcript = path.extension().is_some_and(|ext| ext == "jsonl");
         if transcript {
             if preview {
-                for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
+                for record in json_lines_preview_with_tail(
+                    &path,
+                    PREVIEW_RECORDS,
+                    JsonLineTail::RequireComplete,
+                )? {
                     push_transcript_record(&mut builder, &record);
                 }
             } else {
-                let oversized_records =
-                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                let oversized_records = visit_json_lines_with_tail(
+                    &path,
+                    MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+                    JsonLineTail::RequireComplete,
+                    |record| {
                         push_transcript_record(&mut builder, &record);
                         Ok(())
-                    })?;
+                    },
+                )?;
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if !Self::is_summary_catalog(&path) {
@@ -132,8 +140,11 @@ impl AntigravityAdapter {
                 })?;
         }
         if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
+            if transcript && (summary.step_count != Some(0) || fs::metadata(&path)?.len() != 0) {
+                return Err(IncompleteTranscript.into());
+            }
             ensure!(
-                summary.step_count == Some(0) && (!transcript || fs::metadata(&path)?.len() == 0),
+                summary.step_count == Some(0),
                 "Antigravity session `{}` has no readable steps in its history",
                 session.id
             );

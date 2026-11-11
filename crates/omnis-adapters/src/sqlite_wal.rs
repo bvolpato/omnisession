@@ -30,6 +30,8 @@ const HEADER_BYTES: u64 = 32;
 const FRAME_HEADER_BYTES: u64 = 24;
 // A large write still in progress can wait for its next commit before an empty result is published.
 const MAX_UNCOMMITTED_BYTES: u64 = 4 * 1024 * 1024;
+// Each older frame needs one header read and a seek over its page.
+const MAX_OLDER_HEADERS: u64 = 1_024;
 
 pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
     let mut wal = match File::open(path) {
@@ -88,24 +90,16 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
     wal.seek(SeekFrom::Start(prefix_end))?;
     let mut page = vec![0; usize::try_from(page_size)?];
     let mut work = 0;
-    for _ in 0..(len - prefix_end) / stride {
+    let suffix_frames = (len - prefix_end) / stride;
+    let current = [words[4], words[5]];
+    for index in 0..suffix_frames {
         let mut frame = [0; 24];
         wal.read_exact(&mut frame)?;
         let fields = frame.as_chunks::<4>().0;
-        let older_generation = fields[2..4] != words[4..6];
-        if older_generation {
-            // A reset increments the first salt and randomizes the second. Old frames may remain
-            // after a shorter transaction overwrites the beginning of a previous WAL.
-            let age = u32::from_be_bytes(words[4]).wrapping_sub(u32::from_be_bytes(fields[2]));
-            ensure!(
-                i32::try_from(age).is_ok_and(|distance| distance > 0) && fields[3] != words[5],
-                "ambiguous SQLite WAL generation"
-            );
-        } else {
-            ensure!(
-                fields[0] != [0; 4] && fields[1] == [0; 4],
-                "unverified SQLite WAL commit"
-            );
+        let salts = [fields[2], fields[3]];
+        ensure!(fields[0] != [0; 4], "invalid SQLite WAL page number");
+        if salts == current {
+            ensure!(fields[1] == [0; 4], "unverified SQLite WAL commit");
             work += stride;
             ensure!(
                 work <= MAX_UNCOMMITTED_BYTES,
@@ -117,15 +111,63 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
         running = checksum(&page, read, running);
         let matches =
             running[0].to_be_bytes() == fields[4] && running[1].to_be_bytes() == fields[5];
-        if older_generation {
+        if salts != current {
             // Frame checksums exclude the salts. A current checksum makes the apparent reset ambiguous.
             ensure!(
                 !matches,
                 "SQLite WAL frame has conflicting generation and checksum"
             );
-            return Ok(());
+            return verify_older_headers(
+                &mut wal,
+                suffix_frames - index,
+                page_size,
+                current,
+                salts,
+            );
         }
         ensure!(matches, "unverified SQLite WAL frame checksum");
+    }
+    Ok(())
+}
+
+fn verify_older_headers(
+    wal: &mut File,
+    frames: u64,
+    page_size: u32,
+    current: [[u8; 4]; 2],
+    mut previous: [[u8; 4]; 2],
+) -> Result<()> {
+    ensure!(
+        frames <= MAX_OLDER_HEADERS,
+        "older SQLite WAL frames exceed verification budget"
+    );
+    let age = |salts: [[u8; 4]; 2]| -> Result<u32> {
+        // SQLite increments the first salt and randomizes the second when it resets a WAL.
+        let age = u32::from_be_bytes(current[0]).wrapping_sub(u32::from_be_bytes(salts[0]));
+        ensure!(
+            i32::try_from(age).is_ok_and(|distance| distance > 0) && salts[1] != current[1],
+            "ambiguous SQLite WAL generation"
+        );
+        Ok(age)
+    };
+    let mut previous_age = age(previous)?;
+    for _ in 1..frames {
+        let mut header = [0; 24];
+        wal.read_exact(&mut header)?;
+        let fields = header.as_chunks::<4>().0;
+        ensure!(fields[0] != [0; 4], "invalid SQLite WAL page number");
+        let salts = [fields[2], fields[3]];
+        if salts != previous {
+            let next_age = age(salts)?;
+            // Each reset overwrites a prefix. A generation deeper in the suffix must be older.
+            ensure!(
+                next_age > previous_age,
+                "interleaved SQLite WAL generations"
+            );
+            previous = salts;
+            previous_age = next_age;
+        }
+        wal.seek(SeekFrom::Current(i64::from(page_size)))?;
     }
     Ok(())
 }

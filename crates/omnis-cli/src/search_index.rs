@@ -213,7 +213,7 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
 /// Whether a later read can succeed even if the provider's session time stays the same.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.is::<omnis_adapters::UnverifiedSqliteWal>() || cause
+        cause.is::<omnis_adapters::UnverifiedSqliteWal>() || cause.is::<omnis_adapters::IncompleteTranscript>() || cause
             .downcast_ref::<rusqlite::Error>()
             .and_then(rusqlite::Error::sqlite_error_code)
             .is_some_and(|code| {
