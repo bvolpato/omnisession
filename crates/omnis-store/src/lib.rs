@@ -200,11 +200,11 @@ const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' â
 /// matches many chunks read one such page per match only to learn the trajectory.
 const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
 
-// A failed replacement hides the old native text until that rollout is selected again.
-const CONFLICTING_FILE_FAILURE: &str = "trajectories.provider IN ('pi', 'omp')
+// A confirmed file failure hides conversation text and titles until a verified read clears it.
+const HIDDEN_FAILED_TRAJECTORY: &str = "trajectories.provider IN ('pi', 'omp')
     AND trajectories.origin = 'native' AND failed.provider = trajectories.provider
     AND failed.session_id = trajectories.session_id AND failed.source_file_id IS NOT NULL
-    AND (failed.source_file_id IS NOT trajectories.source_file_id
+    AND (failed.source_contents_id IS NOT NULL OR failed.source_file_id IS NOT trajectories.source_file_id
         OR failed.source_contents_id IS NOT trajectories.source_contents_id
         OR failed.source_updated_at IS NOT trajectories.source_updated_at
         OR failed.source_updated_submillis IS NOT trajectories.source_updated_submillis)";
@@ -239,7 +239,7 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
             AND (eligible.file IS NOT NULL OR NOT EXISTS (
                  SELECT 1 FROM session_index AS catalog WHERE {CONFLICTING_FILE_CATALOG}))
             AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed
-                            WHERE {CONFLICTING_FILE_FAILURE})"
+                            WHERE {HIDDEN_FAILED_TRAJECTORY})"
     )
 }
 const EXACT_SNIPPET_LEADING_BYTES: usize = 80;
@@ -372,6 +372,8 @@ pub enum StoreError {
     TrajectoryBatchTooLarge,
     #[error("indexed source changed during the read")]
     TrajectorySourceChanged,
+    #[error("a full read rejected this file revision")]
+    TrajectoryPreviewRejected,
     #[error("workspace root must have a lossless UTF-8 representation")]
     InvalidWorkspaceRoot,
     #[error("task not found")]
@@ -729,6 +731,35 @@ pub struct TrajectoryIndexFailure {
     pub document_version: u32,
 }
 
+impl TrajectoryIndexFailure {
+    /// Whether the reader selected the exact file and contents that failed.
+    #[must_use]
+    pub fn matches_file_revision(self, revision: SourceRevision) -> bool {
+        revision.file.is_some()
+            && revision.contents.is_some()
+            && self.source_file == revision.file
+            && self.source_contents == revision.contents
+    }
+}
+
+fn index_failure(
+    connection: &Connection,
+    session: &SessionRef,
+) -> Result<Option<TrajectoryIndexFailure>> {
+    connection
+        .prepare_cached(
+            "SELECT source_updated_at, document_version, source_updated_submillis,
+                    source_file_id, source_contents_id FROM trajectory_index_failures
+             WHERE provider = ?1 AND session_id = ?2",
+        )
+        .map_err(database_error)?
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            failure_from_row(row, 0)
+        })
+        .optional()
+        .map_err(database_error)
+}
+
 /// One search document, the prior state its reader observed, and any catalog read from the same file.
 pub type SelectedTrajectoryDocument<'s, 'd> = (
     &'s SessionRef,
@@ -797,6 +828,37 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         self.source_complete
             && self.document.origin == SessionTrajectoryOrigin::Native
             && matches!(self.guard, TrajectorySourceGuard::ObservedDocument(_))
+    }
+
+    fn should_publish(&self, transaction: &Transaction<'_>) -> Result<bool> {
+        let revision = self.document.source_revision;
+        let guard = self
+            .guard
+            .check(transaction, self.session, self.document.source_updated_at);
+        // A stored sample can already match this write when a full read fails.
+        // Check the failure before accepting either the sample or an idempotent write.
+        let failure = if self.document.origin == SessionTrajectoryOrigin::Native
+            && revision.contents.is_some()
+            && (!self.source_complete || guard.is_err())
+        {
+            index_failure(transaction, self.session)?
+        } else {
+            None
+        };
+        if !self.source_complete
+            && failure.is_some_and(|failed| failed.matches_file_revision(revision))
+        {
+            return Err(StoreError::TrajectoryPreviewRejected);
+        }
+        if let (Err(StoreError::TrajectorySourceChanged), Some(metadata)) =
+            (&guard, self.verified_metadata)
+            && failure.is_none()
+            && self.matches_stored(transaction)?
+            && matches_catalog_row(transaction, metadata)?
+        {
+            return Ok(false);
+        }
+        guard.map(|()| true)
     }
 
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
@@ -1947,6 +2009,24 @@ impl Store {
                 Err(error) => return Err(error),
             }
         }
+        self.merge_retried_indexed_sessions(retry, sessions, verify)
+            .map(Some)
+    }
+
+    /// Publishes only rows that still agree with the retried inventory, preserving refresh times.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid sessions or a failed database operation.
+    pub fn merge_retried_indexed_sessions(
+        &self,
+        retry: &CatalogRetry,
+        sessions: &[IndexedSession],
+        verify: impl Fn(usize, SourceRevision) -> bool,
+    ) -> Result<Vec<usize>> {
+        let provider = retry.observation.provider;
+        validate_catalog_rows(provider, sessions)?;
+        let counts = catalog_id_counts(sessions);
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let current = (catalog_generation(&transaction, provider)? != retry.observation.generation)
@@ -1974,7 +2054,7 @@ impl Store {
             }
         }
         transaction.commit().map_err(database_error)?;
-        Ok(Some(accepted))
+        Ok(accepted)
     }
 
     /// Publishes the catalog only if both the store and the listed files still match discovery.
@@ -2347,20 +2427,10 @@ impl Store {
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
-            let verified_metadata = write.verified_metadata;
-            let guard = write.guard.check(
-                &transaction,
-                write.session,
-                write.document.source_updated_at,
-            );
-            if let (Err(StoreError::TrajectorySourceChanged), Some(metadata)) =
-                (&guard, verified_metadata)
-                && write.matches_stored(&transaction)?
-                && matches_catalog_row(&transaction, metadata)?
-            {
+            if !write.should_publish(&transaction)? {
                 continue;
             }
-            guard?;
+            let verified_metadata = write.verified_metadata;
             let revision = write.document.source_revision;
             let trajectory_id = upsert_parent
                 .query_row(
@@ -2577,6 +2647,19 @@ impl Store {
             states.insert(session, state_from_row(row, 2).map_err(database_error)?);
         }
         Ok(states)
+    }
+
+    /// Reads the previous failure for one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the failure cannot be read.
+    pub fn trajectory_index_failure(
+        &self,
+        session: &SessionRef,
+    ) -> Result<Option<TrajectoryIndexFailure>> {
+        validate_session_ref(session)?;
+        index_failure(&self.connection.borrow(), session)
     }
 
     /// Returns every recorded search indexing failure.
@@ -2825,7 +2908,7 @@ impl Store {
             source_file_id, missing_ancestor_id, source_contents_id
             FROM session_trajectories AS trajectories
             WHERE NOT EXISTS (SELECT 1 FROM session_index AS catalog WHERE {CONFLICTING_FILE_CATALOG})
-              AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed WHERE {CONFLICTING_FILE_FAILURE}) ");
+              AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed WHERE {HIDDEN_FAILED_TRAJECTORY}) ");
         let scope = if let Some(session) = session {
             validate_session_ref(session)?;
             sql.push_str("AND provider = ?1 AND session_id = ?2");
@@ -6309,6 +6392,83 @@ mod tests {
             derived_title: Some(text),
             title_authoritative: true,
         }
+    }
+
+    #[test]
+    fn a_rejected_file_hides_stored_samples_until_a_full_read_succeeds() -> super::Result<()> {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3"))?;
+        let time = DateTime::from_timestamp(1000, 843).unwrap();
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(1)),
+            contents: Some(Uuid::from_u128(2)),
+            missing_ancestor: None,
+        };
+        let metadata = IndexedSession {
+            updated_at: Some(time),
+            source_revision: Some(revision),
+            ..indexed_session(Provider::Pi, "failed", "Synthetic header")
+        };
+        let session = &metadata.session;
+        let observe = || store.observe_verified_session(session);
+        let publish = |doc, guard| store.upsert_verified_session_document(&metadata, doc, guard);
+        let sample = TrajectoryDocument {
+            source_complete: false,
+            ..physical_document("orphanedreply", time, revision)
+        };
+        publish(sample, observe()?)?;
+        let before_failure = observe()?;
+        let failure = super::TrajectoryIndexFailure {
+            source_file: revision.file,
+            source_contents: revision.contents,
+            source_updated_at: Some(time),
+            source_time_precise: true,
+            document_version: sample.document_version,
+        };
+        store.record_observed_trajectory_index_failure(session, &failure, before_failure)?;
+        assert!(
+            store
+                .search_session_trajectories("orphanedreply", 1)?
+                .is_empty()
+        );
+        assert_eq!(store.trajectory_title(session)?, None);
+        for guard in [before_failure, observe()?] {
+            for provider_limited in [false, true] {
+                assert!(matches!(
+                    publish(
+                        TrajectoryDocument {
+                            provider_limited,
+                            ..sample
+                        },
+                        guard
+                    ),
+                    Err(StoreError::TrajectoryPreviewRejected)
+                ));
+            }
+        }
+        assert_eq!(store.trajectory_index_failure(session)?, Some(failure));
+
+        let verified = TrajectoryDocument {
+            source_complete: true,
+            source_byte_count: sample.indexed_byte_count + 10,
+            truncation_strategy: "event_head_tail",
+            ..sample
+        };
+        publish(verified, observe()?)?;
+        assert_eq!(store.trajectory_index_failure(session)?, None);
+        assert_eq!(
+            store.search_session_trajectories("orphanedreply", 1)?,
+            std::slice::from_ref(session)
+        );
+        let before_failure = observe()?;
+        store.record_observed_trajectory_index_failure(session, &failure, before_failure)?;
+        assert!(matches!(
+            publish(verified, before_failure),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        publish(verified, observe()?)?;
+        assert_eq!(store.trajectory_index_failure(session)?, None);
+        Ok(())
     }
 
     #[test]

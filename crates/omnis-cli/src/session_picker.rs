@@ -652,6 +652,12 @@ impl PickerState {
             key.source = Some(PreviewSource::File(revision));
             self.query_changed();
         }
+        if key
+            .revision()
+            .is_some_and(|revision| self.previews.rejected(&key.session, revision))
+        {
+            return;
+        }
         self.remember_preview_title(&key, &value);
         self.previews.insert(key, value, &self.preview_window);
         self.trajectory_index_changed();
@@ -698,7 +704,9 @@ impl PickerState {
         let mut changed = false;
         for (session, record) in titles {
             let key = session.to_string();
-            if self.derived_titles.get(&key) == Some(&record) {
+            if self.previews.rejected(&session, record.source_revision)
+                || self.derived_titles.get(&key) == Some(&record)
+            {
                 continue;
             }
             if let Some(entry) = self
@@ -726,6 +734,37 @@ impl PickerState {
                 apply_derived_title(entry, record);
             }
         }
+    }
+
+    fn replace_preview_failures(
+        &mut self,
+        failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
+    ) {
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        for (session, failure) in &failures {
+            let key = session.to_string();
+            if self
+                .derived_titles
+                .get(&key)
+                .is_some_and(|title| failure.matches_file_revision(title.source_revision))
+            {
+                self.derived_titles.remove(&key);
+                if let Some(index) = self.entry_positions.get(&key) {
+                    let entry = &mut self.entries[*index];
+                    entry.session.title.clone_from(&entry.listed_title);
+                    entry.fields = SearchFields::new(&entry.session, None);
+                }
+            }
+        }
+        self.previews.replace_failures(failures);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected);
+        self.preview_deadline = self
+            .preview_window
+            .iter()
+            .any(|key| !self.previews.contains(key))
+            .then(|| Instant::now() + PREVIEW_DEBOUNCE);
+        self.trajectory_index_changed();
     }
 
     fn due_index_request(&mut self) -> Option<Vec<IndexCandidate>> {
@@ -978,15 +1017,44 @@ enum PreviewValue {
 struct PreviewCache {
     values: HashMap<PreviewKey, PreviewValue>,
     order: VecDeque<PreviewKey>,
+    failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
 }
 
 impl PreviewCache {
+    fn rejected(&self, session: &SessionRef, revision: SourceRevision) -> bool {
+        self.failures
+            .get(session)
+            .is_some_and(|failure| failure.matches_file_revision(revision))
+    }
+
+    fn replace_failures(
+        &mut self,
+        failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
+    ) {
+        self.values.retain(|key, _| {
+            !key.revision().is_some_and(|revision| {
+                failures
+                    .get(&key.session)
+                    .is_some_and(|failure| failure.matches_file_revision(revision))
+            })
+        });
+        self.order.retain(|key| self.values.contains_key(key));
+        self.failures = failures;
+    }
+
     fn contains(&self, key: &PreviewKey) -> bool {
-        self.values.contains_key(key)
+        self.get(key).is_some()
     }
 
     fn get(&self, key: &PreviewKey) -> Option<&PreviewValue> {
-        self.values.get(key)
+        if key
+            .revision()
+            .is_some_and(|revision| self.rejected(&key.session, revision))
+        {
+            Some(&PreviewValue::Unavailable)
+        } else {
+            self.values.get(key)
+        }
     }
 
     fn insert(&mut self, key: PreviewKey, value: PreviewValue, protected: &[PreviewKey]) {
@@ -2798,6 +2866,7 @@ mod tests {
                     None,
                     std::slice::from_ref(&observed),
                     complete,
+                    false,
                     workers::indexed_session,
                 ),
                 retry: None,
@@ -3936,6 +4005,78 @@ mod tests {
 
         assert!(rendered.contains("No installed agent can continue this session."));
         assert!(!rendered.contains("? he…"));
+    }
+
+    #[test]
+    fn strict_file_failure_withdraws_a_cached_preview_and_rejects_late_updates() {
+        let root = Path::new("/workspace");
+        let source = SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        };
+        let failed = omnis_store::TrajectoryIndexFailure {
+            source_file: source.file,
+            source_contents: source.contents,
+            source_updated_at: None,
+            source_time_precise: true,
+            document_version: 7,
+        };
+        let ready = || PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("Bounded title")),
+            continuation: None,
+            complete: false,
+        };
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let mut native = session(provider, "selected", root, None);
+            native.source_revision = Some(source);
+            let mut state = PickerState::new(vec![native.clone()], root, None, true);
+            let key = state.preview_key(&native);
+            state.preview_window = vec![key.clone()];
+            state.accept_preview(key.clone(), ready(), Some(source));
+            assert_eq!(
+                state.entries[0].session.title.as_deref(),
+                Some("Bounded title")
+            );
+            let failures = HashMap::from([(native.session.clone(), failed)]);
+            state.replace_preview_failures(failures.clone());
+            state.accept_preview(key.clone(), ready(), Some(source));
+            state.remember_derived_titles([(
+                native.session.clone(),
+                omnis_store::IndexedTitle {
+                    title: Some("Delayed title".to_owned()),
+                    source_revision: source,
+                    ..Default::default()
+                },
+            )]);
+            assert!(matches!(
+                state.previews.get(&key),
+                Some(PreviewValue::Unavailable)
+            ));
+            assert!(state.entries[0].session.title.is_none());
+            state.query = "Bounded title".into();
+            assert!(state.visible_indices().is_empty());
+
+            state.replace_preview_failures(HashMap::new());
+            state.preview_deadline = state.preview_deadline.map(|_| Instant::now());
+            assert_eq!(state.due_preview_request(), Some(vec![key.clone()]));
+            state.accept_preview(key, ready(), Some(source));
+            assert_eq!(state.visible_indices().len(), 1);
+            state.replace_preview_failures(failures);
+            let repaired = SourceRevision {
+                contents: Some(uuid::Uuid::from_u128(3)),
+                ..source
+            };
+            native.source_revision = Some(repaired);
+            state.replace_provider(provider, vec![native.clone()], root, false);
+            let repaired_key = state.preview_key(&native);
+            state.accept_preview(repaired_key.clone(), ready(), Some(repaired));
+            assert!(matches!(
+                state.previews.get(&repaired_key),
+                Some(PreviewValue::Ready { .. })
+            ));
+            assert_eq!(state.visible_indices().len(), 1);
+        }
     }
 
     fn synthetic_preview(first: &str) -> SessionPreview {

@@ -107,6 +107,7 @@ pub(super) enum PickerUpdate {
     Warning(String),
     Titles(Vec<(SessionRef, omnis_store::IndexedTitle)>),
     Indexing(IndexProgress),
+    PreviewFailures(HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>),
     /// Unreadable sessions among the latest indexing candidates.
     IndexFailures(usize),
 }
@@ -170,6 +171,7 @@ pub(super) fn spawn_search_index(
         // Failed reads are recorded and later passes skip them, so warn about the whole unreadable
         // set only after this picker run found new failures.
         let mut found_failures = false;
+        let mut preview_failures = HashMap::new();
         loop {
             let next = pending.borrow_mut().take();
             let candidates = match next {
@@ -201,6 +203,12 @@ pub(super) fn spawn_search_index(
                 },
             ) {
                 Ok(summary) => {
+                    if summary.failed > 0
+                        || summary.failed_skipped > 0
+                        || !preview_failures.is_empty()
+                    {
+                        refresh_preview_failures(&store, &sender, &mut preview_failures);
+                    }
                     found_failures |= summary.failed > 0;
                     if found_failures && !summary.stopped {
                         let _ = sender.send(PickerUpdate::IndexFailures(
@@ -217,6 +225,39 @@ pub(super) fn spawn_search_index(
             }
         }
     });
+}
+
+fn refresh_preview_failures(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    previous: &mut HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
+) {
+    let Ok(mut failures) = store.trajectory_index_failures() else {
+        return;
+    };
+    failures.retain(|session, failure| {
+        TrajectorySourceGuard::uses_file_time(session.provider)
+            && failure.source_file.is_some()
+            && failure.source_contents.is_some()
+    });
+    if failures == *previous {
+        return;
+    }
+    let restored_titles: Vec<_> = previous
+        .keys()
+        .filter(|session| !failures.contains_key(*session))
+        .filter_map(|session| {
+            store
+                .trajectory_title_records(Some(session))
+                .ok()?
+                .remove_entry(session)
+        })
+        .collect();
+    previous.clone_from(&failures);
+    let _ = sender.send(PickerUpdate::PreviewFailures(failures));
+    if !restored_titles.is_empty() {
+        let _ = sender.send(PickerUpdate::Titles(restored_titles));
+    }
 }
 
 pub(super) fn spawn_update_check(sender: Sender<PickerUpdate>) {
@@ -466,7 +507,8 @@ pub(super) fn discover_for_picker(
     let mut retry = None;
     for _ in 0..2 {
         let (mut sessions, notes) = crate::discover_search_sessions(registry, provider, None)?;
-        let complete = notes.is_empty()
+        let unstable = !notes.is_empty();
+        let complete = !unstable
             && registry
                 .adapter(provider)
                 .is_ok_and(ProviderAdapter::discovery_is_complete);
@@ -482,6 +524,7 @@ pub(super) fn discover_for_picker(
                 observation.take(),
                 &sessions,
                 complete,
+                unstable,
                 indexed_session,
             );
             if index_sender
@@ -660,7 +703,9 @@ fn read_picker_preview(
                 }
             }
         });
-        let (read, source_time) = read_search_snapshot(registry, &key.session, full_read).ok()?;
+        // If the store is unavailable, only a full read can validate this native conversation.
+        let strict = full_read || (file_backed && writer.is_none());
+        let (read, source_time) = read_search_snapshot(registry, &key.session, strict).ok()?;
         if file_backed && source_time.is_none() {
             if retry {
                 retry = false;
@@ -688,12 +733,15 @@ fn read_picker_preview(
                 store,
                 &key.session,
                 &snapshot,
-                full_read || imported,
+                strict || imported,
                 (source_time, revision),
                 guard,
                 read.native_session.as_ref(),
             )
         {
+            if matches!(error, omnis_store::StoreError::TrajectoryPreviewRejected) {
+                return Some((PreviewValue::Unavailable, Some(revision)));
+            }
             if matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
                 if retry {
                     retry = false;
@@ -704,6 +752,9 @@ fn read_picker_preview(
             let _ = sender.send(PickerUpdate::Warning(format!(
                 "trajectory index write: {error}"
             )));
+            if file_backed && !strict {
+                return None;
+            }
         }
         if key.session.provider == Provider::OhMyPi && source_time != key.updated_at {
             return None;
@@ -714,7 +765,7 @@ fn read_picker_preview(
                     .continuation_after
                     .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
                 preview: Box::new(session_preview(&snapshot)),
-                complete: full_read || imported,
+                complete: strict || imported,
             },
             revision.file.map(|_| revision),
         ));
@@ -825,6 +876,7 @@ pub(super) fn receive_updates(
                 state.trajectory_index_changed();
             }
             PickerUpdate::IndexFailures(count) => record_index_failures(warnings, count),
+            PickerUpdate::PreviewFailures(failures) => state.replace_preview_failures(failures),
         }
     }
     changed
