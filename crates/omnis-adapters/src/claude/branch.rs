@@ -18,10 +18,10 @@ pub(super) struct Parent {
     pub(super) node: Option<usize>,
     // Transparent records keep the physical conversation parent across summary rewrites.
     pub(super) source: Option<usize>,
-    transparent: bool,
+    pub(super) transparent: bool,
     unverified: Option<usize>,
     suffix: Option<Uuid>,
-    missing_ancestor: bool,
+    pub(super) missing_ancestor: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -550,6 +550,12 @@ impl RetainedBranch<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CachedMarker {
+    revision: usize,
+    owner: Option<(usize, Uuid)>,
+}
+
 /// A progress or attachment record points to its nearest conversation ancestor in the UUID map.
 #[derive(Default)]
 pub(super) struct Branch {
@@ -563,7 +569,8 @@ pub(super) struct Branch {
     #[cfg(test)]
     pub(super) transparent_links_read: usize,
     // Only lookups requested by an input record get a cross-summary entry.
-    queried_owners: HashMap<(usize, Uuid), Option<(usize, Uuid)>>,
+    queried_owners: HashMap<(usize, Uuid), CachedMarker>,
+    marker_revision: usize,
     // Unretained links have the same next possible cutoff in every summary.
     next_markers: HashMap<Uuid, Option<Uuid>>,
     unverified_nodes: HashMap<usize, usize>,
@@ -679,6 +686,7 @@ impl Branch {
     pub(super) fn observe(
         &mut self,
         record: &Value,
+        is_summary: bool,
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
@@ -750,7 +758,7 @@ impl Branch {
                 .is_some_and(|parts| {
                     !parts.is_empty() && parts.iter().all(|part| part["type"] == "tool_result")
                 });
-        let turn = if record["isCompactSummary"] == true || (role == Some("user") && !result_only) {
+        let turn = if is_summary || (role == Some("user") && !result_only) {
             index
         } else {
             // Retention rewrites the logical parent to a summary. The source still
@@ -764,7 +772,7 @@ impl Branch {
             turn,
             uuid: super::record_uuid(record, "uuid"),
             parent: parent.node,
-            summary: if record["isCompactSummary"] == true {
+            summary: if is_summary {
                 Some(index)
             } else {
                 parent.node.and_then(|i| self.nodes[i].summary)
@@ -885,6 +893,14 @@ impl Branch {
         self.tip.is_some_and(|i| self.nodes[i].missing_ancestor)
     }
 
+    pub(super) fn may_have_missing_parent(&self, parent: Parent) -> bool {
+        parent.missing_ancestor || self.external_parents.is_some()
+    }
+
+    pub(super) fn tip_uuid(&self) -> Option<Uuid> {
+        self.nodes[self.tip?].uuid
+    }
+
     pub(super) fn selected_summary(&self) -> Option<usize> {
         self.nodes[self.tip?].summary
     }
@@ -909,8 +925,10 @@ impl Branch {
         if parent.node == Some(summary) || parent.source >= Some(summary) {
             return None;
         }
-        if let Some(&owner) = self.queried_owners.get(&(summary, id)) {
-            return owner;
+        if let Some(cached) = self.queried_owners.get(&(summary, id))
+            && cached.revision == self.marker_revision
+        {
+            return cached.owner;
         }
 
         let source = parent.source?;
@@ -937,10 +955,20 @@ impl Branch {
         if latest_marker.is_none() || latest_marker < owner.map(|(s, _)| s) {
             return owner;
         }
+        if let Ok(result) =
+            self.indexed_marker(latest_marker, id, source, owner, records, compactions)
+        {
+            self.cache_marker(summary, id, result);
+            return result;
+        }
         let mut path = Vec::new();
         let mut cursor = Some(id);
         let mut complete = true;
         while let Some(uuid) = self.next_marker(cursor, source, records, duplicates) {
+            #[cfg(test)]
+            {
+                self.transparent_links_read += 1;
+            }
             let Some(record) = records.get(&uuid) else {
                 // A sampled tail can supply an unresolved UUID later.
                 complete = false;
@@ -981,9 +1009,51 @@ impl Branch {
             }
         }
         if complete {
-            self.queried_owners.insert((summary, id), owner);
+            self.cache_marker(summary, id, owner);
         }
         owner
+    }
+
+    fn cache_marker(&mut self, summary: usize, id: Uuid, owner: Option<(usize, Uuid)>) {
+        self.queried_owners.insert(
+            (summary, id),
+            CachedMarker {
+                revision: self.marker_revision,
+                owner,
+            },
+        );
+    }
+
+    fn indexed_marker(
+        &mut self,
+        mut summary: Option<usize>,
+        id: Uuid,
+        source: usize,
+        mut owner: Option<(usize, Uuid)>,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        compactions: &Compactions,
+    ) -> Result<Option<(usize, Uuid)>, super::markers::Unindexed> {
+        let query = compactions.marker_paths.query(records[&id].order)?;
+        if let Some(duplicate) = query.duplicate {
+            let current = records[&duplicate].branch;
+            if current.transparent
+                && current.source == Some(source)
+                && let Some(s) =
+                    self.retained_summary(duplicate, current.node, records, compactions)
+                && Some(s) >= owner.map(|(s, _)| s)
+            {
+                owner = Some((s, duplicate));
+            }
+        }
+        while let Some(s) = summary.filter(|s| Some(*s) >= owner.map(|(o, _)| o)) {
+            if let Some(marker) = compactions.nearest_marker(s, &query)? {
+                return Ok(Some((s, marker)));
+            }
+            summary = self
+                .previous_summary(s)
+                .and_then(|p| self.latest_marker_summary.get(&p).copied().flatten());
+        }
+        Ok(owner)
     }
 
     fn next_marker(
@@ -1061,6 +1131,8 @@ impl Branch {
     }
 
     pub(super) fn record_replaced(&mut self, id: Uuid) {
+        // An indexed path can now stop at this UUID even if it was never retained.
+        self.marker_revision += 1;
         let retained = self.ever_retained.contains(&id);
         self.replaced_retained_uuid |= retained;
         if retained || self.next_markers.contains_key(&id) {
@@ -1180,8 +1252,8 @@ impl Branch {
         let mut calls = ToolCalls::default();
         let no_retention = Rewind::default();
         for (index, node) in self.nodes[..=last].iter().enumerate() {
-            if let Some(unit) = self.response_unit(index) {
-                calls.observe(index, self, unit, false, &no_retention, events);
+            if !node.user {
+                calls.observe(index, self, false, &no_retention, events);
                 continue;
             }
             let Some(summary) = node.summary.filter(|_| node.user) else {
@@ -1323,7 +1395,10 @@ impl Branch {
         let mut first = HashMap::<_, usize>::new();
         let mut kept = 0;
         for i in 0..events.len() {
-            if events[i].kind == EventKind::CompactionCreated {
+            if events[i].kind == EventKind::CompactionCreated
+                || events[i].raw_type.as_deref()
+                    == Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY)
+            {
                 first.clear();
             }
             if let Some(super::ClaudeEventSource::Response(node)) = events[i].source
@@ -1675,6 +1750,69 @@ impl Branch {
         })
     }
 
+    fn missing_declared_call(
+        &self,
+        source: ToolSource,
+        result: usize,
+        carrier: Option<usize>,
+        anchors: &[Option<usize>],
+        calls: &ToolCalls<'_>,
+        id: Option<&str>,
+    ) -> bool {
+        let result = &self.nodes[result];
+        let issuer = match source {
+            ToolSource::Missing => return true,
+            ToolSource::Record(issuer) => issuer,
+            ToolSource::Duplicate { uuid, .. } => {
+                let writer = result.writer.as_deref();
+                if id.is_some_and(|id| {
+                    calls
+                        .by_source
+                        .contains_key(&(writer, uuid, result.summary, id))
+                }) {
+                    return false;
+                }
+                let selected = carrier
+                    .filter(|&node| {
+                        self.nodes[node].uuid == Some(uuid)
+                            && self.nodes[node].writer == result.writer
+                    })
+                    .or_else(|| {
+                        calls
+                            .selected_sources
+                            .get(&(writer, uuid, result.summary))
+                            .copied()
+                    });
+                let Some(issuer) = selected else {
+                    return false;
+                };
+                issuer
+            }
+            _ => return false,
+        };
+        if self.nodes[issuer].writer != result.writer
+            || id.is_some_and(|id| calls.by_record.contains_key(&(issuer, id)))
+        {
+            return false;
+        }
+        let declared = self.response_unit(issuer);
+        let parent = carrier.and_then(|node| self.response_unit(node));
+        // A retained result can outlive its issuer. Its original response still
+        // distinguishes a missing block from an abandoned retry.
+        if anchors[issuer].is_none()
+            && carrier != Some(issuer)
+            && (parent.is_none() || parent != declared)
+        {
+            return false;
+        }
+        !id.is_some_and(|id| {
+            [declared, parent]
+                .into_iter()
+                .flatten()
+                .any(|unit| calls.by_response.contains_key(&(unit, id)))
+        })
+    }
+
     /// Resolve outcomes against the calls that already existed when Claude wrote each result.
     fn parallel_results(
         &self,
@@ -1692,9 +1830,7 @@ impl Branch {
         let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             if !node.user {
-                if let Some(unit) = self.response_unit(index) {
-                    calls.observe(index, self, unit, anchors[index].is_some(), rewind, events);
-                }
+                calls.observe(index, self, anchors[index].is_some(), rewind, events);
                 continue;
             }
             let partial = active[index] && rewind.results_only(index);
@@ -1717,7 +1853,16 @@ impl Branch {
                 }
                 let id = event.payload["tool_use_id"].as_str();
                 if selected {
-                    results.observe_selected(position, source, &calls, node.writer.as_deref(), id);
+                    let missing =
+                        self.missing_declared_call(source, index, issuer, anchors, &calls, id);
+                    results.observe_selected(
+                        position,
+                        source,
+                        &calls,
+                        node.writer.as_deref(),
+                        id,
+                        missing,
+                    );
                 }
                 let Some(id) = id else {
                     transport = None;
@@ -1816,8 +1961,9 @@ impl ToolResults {
         calls: &ToolCalls<'_>,
         writer: Option<&str>,
         id: Option<&str>,
+        missing: bool,
     ) {
-        if source == ToolSource::Missing {
+        if missing {
             self.documentary.insert(position);
             self.missing_source = true;
             return;
@@ -1925,6 +2071,7 @@ struct ToolCalls<'a> {
     by_scope: HashMap<ScopedCall<'a, usize>, CallsWithId>,
     by_source: HashMap<ScopedCall<'a, Uuid>, CallsWithId>,
     selected_ids: HashSet<(Option<&'a str>, &'a str)>,
+    selected_sources: HashMap<(Option<&'a str>, Uuid, Option<usize>), usize>,
 }
 
 fn record_call<K: std::hash::Hash + Eq>(map: &mut HashMap<K, CallsWithId>, key: K, call: ToolCall) {
@@ -1942,7 +2089,6 @@ impl<'a> ToolCalls<'a> {
         &mut self,
         index: usize,
         branch: &'a Branch,
-        unit: ResponseUnit<'a>,
         selected: bool,
         rewind: &Rewind,
         events: &'a [ClaudeEvent],
@@ -1951,6 +2097,13 @@ impl<'a> ToolCalls<'a> {
         let duplicate = node
             .uuid
             .filter(|uuid| branch.duplicate_tool_sources.contains(uuid));
+        if selected && let Some(uuid) = duplicate {
+            self.selected_sources
+                .insert((node.writer.as_deref(), uuid, node.summary), index);
+        }
+        let Some(unit) = branch.response_unit(index) else {
+            return;
+        };
         for position in node.events.clone() {
             let event = &events[position];
             if event.kind == EventKind::ToolCalled

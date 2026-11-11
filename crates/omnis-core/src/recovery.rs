@@ -42,6 +42,15 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
     }
     let heading = match event.kind {
         EventKind::CompactionCreated => {
+            if event.replay_policy == ReplayPolicy::HistoricalOnly
+                && event.source.provider == super::Provider::Claude
+                && event.source.raw_record_type.as_deref()
+                    == Some(super::CLAUDE_MISSING_COMPACTION_SUMMARY)
+            {
+                return event.payload["text"].as_str().map(|text| {
+                    RecoveryEntry::Message("Unverified Claude compaction anchor", text)
+                });
+            }
             return source_compaction_text(event)
                 .map(|text| RecoveryEntry::Message("Source compaction summary", text));
         }

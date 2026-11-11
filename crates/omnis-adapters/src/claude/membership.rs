@@ -91,18 +91,78 @@ impl Paths {
         })
     }
 
-    fn tree_distance(&self, ancestor: usize, mut descendant: usize) -> Option<usize> {
-        let depth = self.links.get(ancestor)?.depth;
-        let distance = self.links.get(descendant)?.depth.checked_sub(depth)?;
-        while self.links[descendant].depth > depth {
-            let link = self.links[descendant];
-            descendant = if self.links[link.jump].depth >= depth {
+    pub(super) fn depth(&self, node: usize) -> usize {
+        self.links[node].depth
+    }
+
+    fn at_depth(&self, mut node: usize, depth: usize) -> usize {
+        while self.links[node].depth > depth {
+            let link = self.links[node];
+            node = if self.links[link.jump].depth >= depth {
                 link.jump
             } else {
                 link.parent
             };
         }
-        (descendant == ancestor).then_some(distance)
+        node
+    }
+
+    fn tree_distance(&self, ancestor: usize, descendant: usize) -> Option<usize> {
+        let depth = self.links.get(ancestor)?.depth;
+        let distance = self.links.get(descendant)?.depth.checked_sub(depth)?;
+        (self.at_depth(descendant, depth) == ancestor).then_some(distance)
+    }
+
+    pub(super) fn common_ancestor(&self, left: usize, right: usize) -> Option<usize> {
+        if self.links[left].root != self.links[right].root {
+            return None;
+        }
+        let depth = self.depth(left).min(self.depth(right));
+        let mut left = self.at_depth(left, depth);
+        let mut right = self.at_depth(right, depth);
+        while left != right {
+            let (a, b) = (self.links[left], self.links[right]);
+            (left, right) = if a.jump == b.jump {
+                (a.parent, b.parent)
+            } else {
+                (a.jump, b.jump)
+            };
+        }
+        Some(left)
+    }
+
+    // Enter and leave positions stay in the same order when later children are appended.
+    pub(super) fn walk_order(
+        &self,
+        left: (usize, bool),
+        right: (usize, bool),
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let ((a, leave_a), (b, leave_b)) = (left, right);
+        if a == b {
+            return leave_a.cmp(&leave_b);
+        }
+        match self.common_ancestor(a, b) {
+            None => self.links[a].root.cmp(&self.links[b].root),
+            Some(ancestor) if ancestor == a => {
+                if leave_a {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            Some(ancestor) if ancestor == b => {
+                if leave_b {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            Some(ancestor) => {
+                let depth = self.depth(ancestor) + 1;
+                self.at_depth(a, depth).cmp(&self.at_depth(b, depth))
+            }
+        }
     }
 }
 

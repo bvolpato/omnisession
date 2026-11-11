@@ -48,7 +48,7 @@ const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
-/// The Claude transcript records a compaction here but contains no summary text.
+/// Claude compacted the transcript here, but its summary is missing or unverified.
 pub const CLAUDE_MISSING_COMPACTION_SUMMARY: &str = "omnisession.missing_compaction_summary";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
@@ -2787,53 +2787,50 @@ fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
         &event.payload,
         &["summary", "text", "content", "message", "prompt"],
     )?;
-    let text = if event.source.provider == Provider::Claude {
-        claude_compaction_body(text)
-    } else {
-        text
-    };
+    if event.source.provider == Provider::Claude {
+        return claude_compaction_summary(text, true);
+    }
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn claude_compaction_body(text: &str) -> &str {
+/// Reads a nonempty Claude summary. An unmarked anchor needs a recognized summary envelope.
+#[must_use]
+pub fn claude_compaction_summary(text: &str, is_compact_summary: bool) -> Option<&str> {
+    let body = claude_envelope_body(text).or_else(|| is_compact_summary.then_some(text))?;
+    (!body.trim().is_empty()).then_some(body)
+}
+
+fn claude_envelope_body(text: &str) -> Option<&str> {
     const INTRO: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
     const TRANSCRIPT_FOOTER: &str = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at:";
     const CONTINUATION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
     const RECENT_MESSAGES_FOOTER: &str = "The messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written without seeing them, so something it says has not happened yet may already have happened in them.";
 
-    let Some(rest) = text.strip_prefix(INTRO) else {
-        return text;
-    };
+    let rest = text.strip_prefix(INTRO)?;
     let rest = rest.trim_start();
     let rest = if let Some(reminder) =
         rest.strip_prefix("<system-reminder>\n<tools-used-before-summary>")
     {
-        let Some((_, rest)) =
-            reminder.split_once("</tools-used-before-summary>\n</system-reminder>")
-        else {
-            return text;
-        };
+        let (_, rest) = reminder.split_once("</tools-used-before-summary>\n</system-reminder>")?;
         rest.trim_start()
     } else {
         rest
     };
-    let Some(summary) = rest.strip_prefix("Summary:\n") else {
-        return text;
-    };
+    let summary = rest.strip_prefix("Summary:\n")?;
     let Some((body, footer)) = summary.rsplit_once(TRANSCRIPT_FOOTER) else {
-        return summary.trim();
+        return Some(summary.trim());
     };
     let Some((_, continuation)) = footer.trim_start().split_once('\n') else {
-        return summary.trim();
+        return Some(summary.trim());
     };
     if continuation
         .trim_start()
         .strip_prefix(CONTINUATION)
         .is_some_and(|recent| recent.trim() == RECENT_MESSAGES_FOOTER)
     {
-        body.trim()
+        Some(body.trim())
     } else {
-        summary.trim()
+        Some(summary.trim())
     }
 }
 
@@ -6171,7 +6168,8 @@ mod tests {
             "\n\nKeep this user-authored qualification.\n\nThe messages after this summary",
         );
         assert!(
-            super::claude_compaction_body(&extra_footer_content)
+            super::claude_compaction_summary(&extra_footer_content, true)
+                .unwrap()
                 .contains("Keep this user-authored qualification.")
         );
     }
@@ -6248,10 +6246,16 @@ mod tests {
         let known_intro = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
         let unknown_footer = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /synthetic/transcript.jsonl\nKeep this user-authored explanation.";
         let unknown = "An unknown compaction envelope.\nSummary:\nRetain all source text.";
-        assert_eq!(super::claude_compaction_body(unknown), unknown);
+        assert_eq!(
+            super::claude_compaction_summary(unknown, true),
+            Some(unknown)
+        );
         let body = format!("Retain these constraints.{unknown_footer}");
         let wrapped = format!("{known_intro}\n\nSummary:\n{body}");
-        assert_eq!(super::claude_compaction_body(&wrapped), body);
+        assert_eq!(
+            super::claude_compaction_summary(&wrapped, true),
+            Some(body.as_str())
+        );
         let other_provider = compaction(0, Provider::Codex, &wrapped);
         assert_eq!(
             super::source_compaction_text(&other_provider),
