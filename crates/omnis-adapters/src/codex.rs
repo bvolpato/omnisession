@@ -215,6 +215,16 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Returns the verified treatment of a leading tilde in `CODEX_SQLITE_HOME` for this Codex release.
+    #[must_use]
+    pub fn expands_sqlite_env_tilde(version: &str) -> Option<bool> {
+        match version {
+            "0.137.0" => Some(false),
+            "0.167.1" => Some(true),
+            _ => None,
+        }
+    }
+
     /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
     ///
     /// # Errors
@@ -339,12 +349,12 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
-                provider_limited: false,
                 ownership_revision: None,
                 rollback_title,
                 workspace_projection,
                 snapshot,
                 source_complete: document.source_complete,
+                provider_limited: read.provider_limited,
                 source_revision: read.source_revision,
                 native_session: read.native_session.clone(),
             }))
@@ -443,6 +453,14 @@ impl CodexAdapter {
             listing: Arc::default(),
             titles: Arc::default(),
         }
+    }
+
+    /// Selects existing threads from the SQLite directory used for the native import.
+    #[must_use]
+    pub fn for_import(codex_home: &Path, sqlite_home: &Path) -> Self {
+        let mut adapter = Self::with_root(codex_home);
+        adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
+        adapter
     }
 
     fn discover_session_scan(&self) -> CodexFileScan {
@@ -1753,13 +1771,13 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
-            provider_limited: false,
             ownership_revision: None,
             native_session,
             snapshot,
             rollback_title,
             workspace_projection,
             source_complete,
+            provider_limited: false,
             source_revision,
         })
     }
@@ -1815,13 +1833,13 @@ impl CodexSession {
         );
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
-            provider_limited: false,
             ownership_revision: None,
             native_session: None,
             workspace_projection,
             rollback_title,
             snapshot,
             source_complete,
+            provider_limited: false,
             source_revision: SourceRevision::default(),
         })
     }
@@ -2747,6 +2765,14 @@ impl ProviderAdapter for CodexAdapter {
             native.preview(session)
         })
         .map(|(snapshot, _, _)| snapshot)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, u64::MAX)
     }
 
     fn index_session(

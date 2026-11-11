@@ -991,7 +991,6 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         .upsert_trajectory_document(
             &session,
             &TrajectoryDocument {
-                provider_limited: false,
                 redacted_text: obsolete,
                 source_updated_at: state.source_updated_at,
                 source_revision: state.source_revision,
@@ -1001,6 +1000,8 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
                 source_complete: true,
                 origin: SessionTrajectoryOrigin::Native,
                 document_version: state.document_version,
+                provider_limited: false,
+                title_authoritative: false,
                 derived_title: None,
                 withdrawn_title: None,
                 title_is_verified: false,
