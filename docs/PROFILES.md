@@ -122,6 +122,8 @@ A cross-agent import uses the installed agent to write the new session. For a pr
 
 The [permission mode](../README.md#permission-modes) flags come from the agent that the profile starts. OmniSession adds a mode flag only when the program that runs lists that flag in `--help`. When a profile sets `program`, that program is the one that is asked. An older program steps down to the nearest mode it has, and the warning names the profile.
 
+If the program's help command fails, OmniSession checks again the next time a launch needs a permission mode.
+
 ## Check a profile
 
 `omni profiles` prints the file, then each profile with a summary and its state:

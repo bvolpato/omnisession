@@ -825,7 +825,7 @@ fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
         _ => return None,
     };
     let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-    (!is_harness_envelope(event, &text)).then_some(HandoffMessage { role, text })
+    (!is_user_harness_envelope(event, &text)).then_some(HandoffMessage { role, text })
 }
 
 fn is_preview_message(event: &OmniEvent) -> bool {
@@ -934,7 +934,7 @@ pub fn first_user_message_after(
             return None;
         }
         let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-        if is_harness_envelope(event, &text) {
+        if is_user_harness_envelope(event, &text) {
             return None;
         }
         Some(HandoffMessage {
@@ -1078,7 +1078,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
             }
             let text =
                 text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
-            if is_harness_envelope(event, &text) {
+            if is_user_harness_envelope(event, &text) {
                 return None;
             }
             text
@@ -1253,15 +1253,20 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(event: &OmniEvent, text: &str) -> bool {
+fn is_user_harness_envelope(event: &OmniEvent, text: &str) -> bool {
+    event.kind == EventKind::MessageUser && is_harness_envelope(text)
+}
+
+/// Returns whether a user message contains a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
-    event.kind == EventKind::MessageUser
-        && (harness_envelope_prefix(text).is_some()
-            || is_import_boundary(text)
-            || matches!(
-                text,
-                "[Request interrupted by user]" | "[Request aborted by user]"
-            ))
+    harness_envelope_prefix(text).is_some()
+        || is_import_boundary(text)
+        || matches!(
+            text,
+            "[Request interrupted by user]" | "[Request aborted by user]"
+        )
 }
 
 fn harness_envelope_prefix(text: &str) -> Option<&'static str> {
@@ -1533,7 +1538,7 @@ fn import_conversation_with_limit(
             }
             _ => continue,
         };
-        if is_harness_envelope(event, &text) {
+        if is_user_harness_envelope(event, &text) {
             continue;
         }
         truncated |= message_truncated;
@@ -1678,7 +1683,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 TrajectoryItemKind::Assistant
             };
             let (text, mut truncated) = bounded_message_text(event, limits.message, limits.redact)?;
-            if is_harness_envelope(event, &text) {
+            if is_user_harness_envelope(event, &text) {
                 return None;
             }
             let (kind, text) =
@@ -2210,13 +2215,13 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .rev()
         .filter_map(|event| match event.kind {
             EventKind::MessageUser => message_text(event)
-                .filter(|text| !is_harness_envelope(event, text))
+                .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::User,
                     text,
                 }),
             EventKind::MessageAssistant => message_text(event)
-                .filter(|text| !is_harness_envelope(event, text))
+                .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
                     text,
@@ -2235,7 +2240,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                 .rev()
                 .filter(|event| event.kind == EventKind::MessageUser)
                 .find_map(|event| {
-                    message_text(event).filter(|text| !is_harness_envelope(event, text))
+                    message_text(event).filter(|text| !is_user_harness_envelope(event, text))
                 })
         });
     recent_messages.reverse();
@@ -2671,7 +2676,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
         && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
             || ["omitted_events", "unsupported_text_records"]

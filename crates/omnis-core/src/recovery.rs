@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use super::{
     CODEX_IMPORT_MARKER, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, VisibleHistory, bounded_text,
-    is_documentary_tool_message, is_harness_envelope, is_secret, latest_plan_action,
+    is_documentary_tool_message, is_secret, is_user_harness_envelope, latest_plan_action,
     markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
     render_recorded_workspace, source_compaction_text, text_from_payload_ref, visible_history,
 };
@@ -53,7 +53,7 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return None;
     }
     let text = text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
-    if text.trim().is_empty() || is_harness_envelope(event, text) {
+    if text.trim().is_empty() || is_user_harness_envelope(event, text) {
         return None;
     }
     if event.kind == EventKind::MessageAssistant && is_documentary_tool_message(text) {
