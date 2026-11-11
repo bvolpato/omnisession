@@ -1172,7 +1172,10 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         home: Option<&Path>,
     ) -> Result<LegacySampleUpdate> {
         let doc = self.document;
-        let Some(projection) = doc.projection.filter(|p| p.torn_final) else {
+        let Some(projection) = doc
+            .projection
+            .filter(|p| p.torn_final || p.legacy_damage_sample.is_some())
+        else {
             return Ok(LegacySampleUpdate::Observed);
         };
         if self.guard.matches_document_file(doc.source_revision) != Some(true)
@@ -1180,7 +1183,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         {
             return Ok(LegacySampleUpdate::Observed);
         }
-        let Some((digest, sampled)) = projection.legacy_torn_sample else {
+        let Some((digest, sampled)) = projection.legacy_damage_sample else {
             let unchanged = transaction.query_row(
                 "SELECT EXISTS (SELECT 1 FROM session_trajectories d JOIN native_search_document_homes h
                  ON h.trajectory_id=d.id AND h.source_file=d.source_file_id
@@ -1230,7 +1233,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         let Some(previous) = stored_projection_text(transaction, id, length)? else {
             return Ok(LegacySampleUpdate::Keep);
         };
-        if prefix.as_deref() == Some(&digest) {
+        if projection.torn_final && prefix.as_deref() == Some(&digest) {
             let missing = count
                 .and_then(|n| usize::try_from(n).ok())
                 .and_then(|n| n.checked_sub(sampled));
@@ -5163,12 +5166,9 @@ fn recover_missing_record_text(
         && anchor.is_none()
         && !matches.all(|offset| {
             let position = start + offset;
-            dated_records
-                .binary_search_by_key(&position, |&(from, _, _)| from)
-                .is_ok_and(|index| {
-                    let (_, end, time) = dated_records[index];
-                    end == position + record.len() && evidence.time.is_some_and(|old| time > old)
-                })
+            evidence.time.is_some_and(|old| {
+                occurrence_is_later(dated_records, position, position + record.len(), old)
+            })
         })
     {
         return None;
@@ -5184,6 +5184,26 @@ fn recover_missing_record_text(
         start,
         evidence,
     })
+}
+
+fn occurrence_is_later(
+    dated_records: &[(usize, usize, i64)],
+    start: usize,
+    end: usize,
+    historical_time: i64,
+) -> bool {
+    let first = dated_records.partition_point(|&(_, to, _)| to <= start);
+    let mut position = start;
+    for &(from, to, time) in &dated_records[first..] {
+        if from > position || time <= historical_time {
+            return false;
+        }
+        if to >= end {
+            return true;
+        }
+        position = to + "\n\n".len();
+    }
+    false
 }
 
 fn record_occurrences<'a>(suffix: &'a str, record: &'a str) -> impl Iterator<Item = usize> + 'a {

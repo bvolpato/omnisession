@@ -136,15 +136,18 @@ impl AntigravityAdapter {
                 && current.native_session(selected).source_revision == native.source_revision,
             "Antigravity history changed during the search read"
         );
-        let (snapshot, search_record_groups) = read?;
+        let history = read?;
         Ok(IndexRead {
-            verified_prefix_end: tail
-                .damage()
-                .filter(|_| !preview)
-                .and_then(JsonLineDamage::verified_prefix_end),
-            search_record_groups,
-            snapshot,
-            source_complete: !preview && tail.damage().is_none_or(|damage| damage.count() == 0),
+            verified_prefix_end: history.database_prefix_end.or_else(|| {
+                tail.damage()
+                    .filter(|_| !preview)
+                    .and_then(JsonLineDamage::verified_prefix_end)
+            }),
+            search_record_groups: history.search_record_groups,
+            snapshot: history.snapshot,
+            source_complete: !preview
+                && history.database_prefix_end.is_none()
+                && tail.damage().is_none_or(|damage| damage.count() == 0),
             provider_limited: false,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: Some(native),
@@ -161,7 +164,7 @@ impl AntigravityAdapter {
             preview,
             JsonLineTail::ReportIncomplete(&torn_tail),
         )
-        .map(|(snapshot, _)| snapshot)
+        .map(|history| history.snapshot)
     }
 
     fn read_summary(
@@ -170,11 +173,12 @@ impl AntigravityAdapter {
         summary: &Summary,
         preview: bool,
         tail: JsonLineTail<'_>,
-    ) -> Result<(CanonicalSnapshot, Vec<std::ops::Range<u64>>)> {
+    ) -> Result<ObservedHistory> {
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
         let mut groups = Vec::new();
+        let mut database_prefix_end = None;
         match self.source(summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
                 let mut push = |record: Value| {
@@ -209,7 +213,8 @@ impl AntigravityAdapter {
                 record_jsonl_damage(&mut builder, tail, summary.updated_at);
             }
             Some(path) => {
-                push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
+                (_, database_prefix_end) =
+                    push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
             }
             None if summary.step_count > 0 => {
                 return Err(anyhow!(
@@ -220,17 +225,24 @@ impl AntigravityAdapter {
             None => {}
         }
 
-        Ok((
-            builder.snapshot(
+        Ok(ObservedHistory {
+            snapshot: builder.snapshot(
                 session.clone(),
                 nonempty(summary.title.clone()),
                 summary.project_path.clone(),
                 None,
                 captured_at,
             ),
-            groups,
-        ))
+            search_record_groups: groups,
+            database_prefix_end,
+        })
     }
+}
+
+struct ObservedHistory {
+    snapshot: CanonicalSnapshot,
+    search_record_groups: Vec<std::ops::Range<u64>>,
+    database_prefix_end: Option<u64>,
 }
 
 #[derive(Default)]
@@ -353,6 +365,19 @@ impl PreviousSearchPrefix {
         }
     }
 
+    fn needs_damage_check(damage: &JsonLineDamage, prior: Option<PriorSearchDocument>) -> bool {
+        damage.final_record()
+            || (damage.interior_count() > 0
+                && matches!(
+                    prior,
+                    Some(PriorSearchDocument::Partial {
+                        recover_from_full_scan: true,
+                        sampled_file_bytes: None,
+                        ..
+                    })
+                ))
+    }
+
     fn verify(
         &self,
         torn: bool,
@@ -424,7 +449,7 @@ fn finish_search_document(
     {
         projection.fully_scanned_bytes = Some(length);
         projection.torn_final = torn_final;
-        projection.legacy_torn_sample = legacy_sample;
+        projection.legacy_damage_sample = legacy_sample;
         if gaps.interior_seen > 0 {
             projection.dated_suffix_records = gaps.dated_records;
             projection.interior_damage = Some(gaps.starts);
@@ -670,7 +695,7 @@ impl ProviderAdapter for AntigravityAdapter {
         let checked = oversized.and_then(|count| {
             prefix
                 .verify(
-                    torn.final_record(),
+                    PreviousSearchPrefix::needs_damage_check(&torn, prior),
                     &mut handle,
                     session,
                     length,
@@ -1050,13 +1075,13 @@ fn push_historical(
     );
 }
 
-/// Pushes decoded conversation steps and returns how many stored steps were decoded.
+/// Returns the decoded step count and the exclusive event sequence at the earliest gap.
 pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
     declared_steps: usize,
-) -> Result<usize> {
+) -> Result<(usize, Option<u64>)> {
     push_database_steps_with_limits(
         root,
         database,
@@ -1091,7 +1116,7 @@ fn push_database_steps_with_limits(
     builder: &mut EventBuilder,
     declared_steps: usize,
     limits: DatabaseReadLimits,
-) -> Result<usize> {
+) -> Result<(usize, Option<u64>)> {
     let snapshot = sqlite_snapshot(root, database)
         .context("failed to snapshot Antigravity conversation database")?;
     let stored = usize::try_from(snapshot.connection.query_row(
@@ -1116,6 +1141,7 @@ fn push_database_steps_with_limits(
         .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
     let mut rows = statement.query([i64::try_from(limits.records)?])?;
     let mut retained = Vec::new();
+    let mut position = 0;
     let mut decoded = 0;
     let mut remaining_wire = limits.wire_bytes;
     let mut remaining_history = limits.history_bytes;
@@ -1124,6 +1150,7 @@ fn push_database_steps_with_limits(
     let mut previous_index = None;
     let mut order_verified = true;
     while let Some(row) = rows.next()? {
+        position += 1;
         let index: Option<i64> = row.get(2)?;
         order_verified &= index.is_some() && index != previous_index;
         previous_index = index;
@@ -1148,7 +1175,7 @@ fn push_database_steps_with_limits(
         let bytes = estimated_event_bytes(&event.payload);
         if bytes <= remaining_history {
             remaining_history -= bytes;
-            retained.push(event);
+            retained.push((position, event));
         }
     }
     if decoded == 0 && damaged > 0 {
@@ -1157,16 +1184,12 @@ fn push_database_steps_with_limits(
         ));
     }
     let omitted = stored.max(declared_steps) - retained.len();
-    for event in retained.into_iter().rev() {
-        builder.push(
-            event.kind,
-            event.payload,
-            event.timestamp,
-            event.replay_policy,
-            Some(event.record_type),
-            None,
-        );
-    }
+    let prefix_end = push_ordered_steps(
+        builder,
+        retained,
+        stored.max(declared_steps),
+        order_verified,
+    );
     if omitted > 0 || unsupported > 0 || !order_verified {
         let mut notice =
             json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
@@ -1186,7 +1209,34 @@ fn push_database_steps_with_limits(
             None,
         );
     }
-    Ok(decoded)
+    Ok((decoded, prefix_end))
+}
+
+fn push_ordered_steps(
+    builder: &mut EventBuilder,
+    retained: Vec<(usize, DatabaseStepEvent)>,
+    mut position: usize,
+    order_verified: bool,
+) -> Option<u64> {
+    let mut prefix_end = (!order_verified).then(|| builder.checkpoint());
+    for (row, event) in retained.into_iter().rev() {
+        if row != position || event.replay_policy == ReplayPolicy::HistoricalOnly {
+            prefix_end.get_or_insert_with(|| builder.checkpoint());
+        }
+        position = row - 1;
+        builder.push(
+            event.kind,
+            event.payload,
+            event.timestamp,
+            event.replay_policy,
+            Some(event.record_type),
+            None,
+        );
+    }
+    if position > 0 {
+        prefix_end.get_or_insert_with(|| builder.checkpoint());
+    }
+    prefix_end
 }
 
 fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static str, &'static str)> {
@@ -1466,7 +1516,9 @@ mod tests {
             );
             let mut builder = EventBuilder::new(session.provider, &session.id);
             assert_eq!(
-                push_database_steps(temporary.path(), &database, &mut builder, 2).unwrap(),
+                push_database_steps(temporary.path(), &database, &mut builder, 2)
+                    .unwrap()
+                    .0,
                 2
             );
             let snapshot = builder.snapshot(session, None, None, None, Utc::now());
@@ -1571,7 +1623,7 @@ mod tests {
             ),
         ] {
             let mut builder = EventBuilder::new(session.provider, &session.id);
-            let decoded = super::push_database_steps_with_limits(
+            let (decoded, prefix_end) = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
                 &mut builder,
@@ -1580,6 +1632,10 @@ mod tests {
             )
             .unwrap();
             assert!(decoded >= expected.len());
+            assert_eq!(
+                prefix_end,
+                Some(if expected.len() == text.len() { 2 } else { 0 })
+            );
             let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
             let (notice, messages) = snapshot.events.split_last().unwrap();
             let actual = messages
@@ -1614,7 +1670,7 @@ mod tests {
         let mut builder = EventBuilder::new(Provider::Antigravity, id);
         assert_eq!(
             push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap(),
-            1
+            (1, Some(0))
         );
         let snapshot = builder.snapshot(
             SessionRef::new(Provider::Antigravity, id),
@@ -1716,7 +1772,7 @@ mod tests {
         );
         assert_eq!(
             push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
-            1
+            (1, Some(0))
         );
         let snapshot = builder.snapshot(
             SessionRef::new(

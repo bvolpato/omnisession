@@ -538,6 +538,9 @@ fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
             if dated {
                 record["created_at"] = json!(format!("2026-06-01T00:00:0{i}Z"));
             }
+            if i == 3 {
+                record["tool_calls"] = json!([{"name":"lookup"}]);
+            }
             record.to_string()
         };
         let snippet = |state: &str, cached: bool| {
@@ -576,12 +579,12 @@ fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
         for cached in [false, true, false] {
             assert_eq!(
                 snippet(&sequential, cached),
-                "opening acknowledged nextquestion acknowledged"
+                r#"opening acknowledged nextquestion acknowledged {"arguments":null,"name":"lookup"}"#
             );
             if dated {
                 assert_eq!(
                     snippet(&direct, cached),
-                    "opening acknowledged nextquestion acknowledged"
+                    r#"opening acknowledged nextquestion acknowledged {"arguments":null,"name":"lookup"}"#
                 );
             }
         }

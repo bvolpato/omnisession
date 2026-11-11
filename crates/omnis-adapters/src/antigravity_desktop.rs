@@ -62,19 +62,23 @@ impl AntigravityDesktopAdapter {
         Ok(native_session(id, database, summaries.get(id)))
     }
 
-    fn snapshot(&self, native: &NativeSession) -> Result<CanonicalSnapshot> {
+    fn snapshot(&self, native: &NativeSession) -> Result<(CanonicalSnapshot, Option<u64>)> {
         let database = native
             .source_path
             .as_deref()
             .ok_or_else(|| anyhow!("Antigravity Desktop history changed during the search read"))?;
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &native.session.id);
-        push_database_steps(self.root()?, database, &mut builder, native.event_count)?;
-        Ok(builder.snapshot(
-            native.session.clone(),
-            native.title.clone(),
-            native.project_path.clone(),
-            native.git_branch.clone(),
-            native.updated_at.unwrap_or_else(Utc::now),
+        let (_, prefix_end) =
+            push_database_steps(self.root()?, database, &mut builder, native.event_count)?;
+        Ok((
+            builder.snapshot(
+                native.session.clone(),
+                native.title.clone(),
+                native.project_path.clone(),
+                native.git_branch.clone(),
+                native.updated_at.unwrap_or_else(Utc::now),
+            ),
+            prefix_end,
         ))
     }
 
@@ -104,11 +108,12 @@ impl AntigravityDesktopAdapter {
                 .as_deref()
                 .and_then(|path| path.metadata().ok())
                 .is_some_and(|metadata| metadata.len() <= budget);
+        let (snapshot, verified_prefix_end) = read?;
         Ok(IndexRead {
-            verified_prefix_end: None,
+            verified_prefix_end,
             search_record_groups: Vec::new(),
-            snapshot: read?,
-            source_complete: complete,
+            snapshot,
+            source_complete: complete && verified_prefix_end.is_none(),
             provider_limited: false,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: (!hidden).then_some(native),
@@ -189,6 +194,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         validate_provider(session, Provider::AntigravityDesktop)?;
         validate_id(&session.id)?;
         self.snapshot(&self.selected(&session.id)?)
+            .map(|(snapshot, _)| snapshot)
     }
 
     fn read_full_index_at(&self, session: &SessionRef, path: Option<&Path>) -> Result<IndexRead> {

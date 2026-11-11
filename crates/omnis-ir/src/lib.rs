@@ -30,8 +30,8 @@ pub struct SearchProjection {
     pub dated_suffix_records: Vec<(usize, usize, i64)>,
     /// Physical length at which the JSONL head and tail windows were sampled.
     pub sampled_file_bytes: Option<u64>,
-    /// Digest and length of the legacy sample of confirmed text before a torn final record.
-    pub legacy_torn_sample: Option<([u8; 32], usize)>,
+    /// Digest and length of the confirmed text in the legacy sampling windows after damage.
+    pub legacy_damage_sample: Option<([u8; 32], usize)>,
     pub torn_final: bool,
     /// Physical length scanned from start to end, including unreadable native records.
     pub fully_scanned_bytes: Option<u64>,
@@ -48,7 +48,7 @@ impl SearchProjection {
             last_record_time: None,
             dated_suffix_records: Vec::new(),
             sampled_file_bytes: None,
-            legacy_torn_sample: None,
+            legacy_damage_sample: None,
             torn_final: false,
             fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
@@ -79,7 +79,7 @@ impl PartialEq for SearchProjection {
             && self.dated_suffix_records == other.dated_suffix_records
             && self.interior_damage == other.interior_damage
             && self.sampled_file_bytes == other.sampled_file_bytes
-            && self.legacy_torn_sample == other.legacy_torn_sample
+            && self.legacy_damage_sample == other.legacy_damage_sample
             && self.torn_final == other.torn_final
             && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
