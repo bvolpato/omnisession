@@ -859,6 +859,115 @@ fn progress_written_between_checkpoints_uses_the_latest_retained_tail() {
 }
 
 #[test]
+fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directory() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Removed reply")),
+        directory_attachment(30, 2),
+    ];
+    base.extend(compaction(3, 2, &[]));
+    base.push(message(10, 0, "user", json!("Independent turn")));
+    for parent in [10, 30] {
+        let mut rows = base.clone();
+        rows.push(message(11, parent, "user", json!("New request")));
+        for (second, row) in (1..).zip(&mut rows) {
+            row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+            row["isSidechain"] = json!(false);
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Independent turn", "New request"],
+                "parent={parent}, preview={preview}"
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert!(text.contains("Independent turn"));
+            }
+        }
+    }
+}
+
+#[test]
+fn progress_through_a_compacted_duration_selects_the_later_checkpoint() {
+    let mut duration = opaque(30, 2, "system");
+    duration["subtype"] = json!("turn_duration");
+    duration["durationMs"] = json!(300);
+    duration["level"] = json!("info");
+    duration["content"] = json!("Turn duration");
+    for link in [directory_attachment(30, 2), duration] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("First task")),
+            message(2, 1, "assistant", json!("First reply")),
+            link,
+        ];
+        rows.extend(compaction(3, 2, &[2]));
+        rows.extend([
+            opaque(50, 30, "progress"),
+            message(5, 2, "user", json!("Second task")),
+            message(6, 5, "assistant", json!("Second reply")),
+        ]);
+        rows.extend(compaction(7, 6, &[6]));
+        rows.push(message(10, 0, "user", json!("Independent root")));
+        rows.push(message(11, 50, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 7", "Second reply", "New request"]
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert!(text.contains("Second reply") && !text.contains("Independent root"));
+            }
+        }
+    }
+}
+
+#[test]
+fn meta_user_records_carry_the_removed_directory_link_to_the_visible_request() {
+    let mut root = directory_attachment(30, 0);
+    root["parentUuid"] = Value::Null;
+    let mut base = vec![
+        root,
+        message(1, 30, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    base.extend(compaction(3, 2, &[2]));
+    for via_meta in [false, true] {
+        let mut rows = base.clone();
+        if via_meta {
+            let mut meta = message(45, 30, "user", json!("Internal meta text"));
+            meta["isMeta"] = json!(true);
+            rows.push(meta);
+        }
+        rows.push(message(
+            11,
+            if via_meta { 45 } else { 30 },
+            "user",
+            json!("New request"),
+        ));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 3", "Retained reply", "New request"]
+            );
+            assert!(!active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert!(text.contains("Retained reply") && !text.contains("Internal meta text"));
+            }
+        }
+    }
+}
+
+#[test]
 fn descendants_of_an_omitted_directory_keep_its_cutoff_when_the_request_was_retained() {
     let mut base = vec![
         message(1, 0, "user", json!("Original task")),
@@ -975,17 +1084,27 @@ fn a_new_directory_after_a_checkpoint_can_supersede_an_inherited_cutoff() {
         row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
         row["isSidechain"] = json!(false);
     }
-    for preview in [false, true] {
-        let snapshot = read_session(&rows, preview);
-        let active = import_trajectory(&snapshot);
-        assert_eq!(handoff_messages(&active), ["Summary 7", "New request"]);
-        assert!(active.truncated);
-        let search = omnis_core::trajectory_search_document(&snapshot);
-        assert!(!search.source_complete);
-        let recovery = recovery_text(&snapshot);
-        assert!(recovery.contains("Summary 7"));
-        for text in [&search.text, &recovery] {
-            assert!(text.contains("Second reply") && !text.contains("First reply"));
+    for padded in [false, true] {
+        let mut rows = rows.clone();
+        if padded {
+            let boundary = rows.len() - 2;
+            let padding = json!({"type":"progress", "padding":"x".repeat(64 * 1024)});
+            for position in [boundary + 1, boundary] {
+                rows.splice(position..position, std::iter::repeat_n(padding.clone(), 68));
+            }
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(handoff_messages(&active), ["Summary 7", "New request"]);
+            assert!(active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            let recovery = recovery_text(&snapshot);
+            assert!(recovery.contains("Summary 7"));
+            for text in [&search.text, &recovery] {
+                assert!(text.contains("Second reply") && !text.contains("First reply"));
+            }
         }
     }
 }

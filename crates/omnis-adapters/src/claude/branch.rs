@@ -55,7 +55,7 @@ struct OpaqueRecord {
     parent: Option<NonZeroUsize>,
     // Number of compaction headers read before this occurrence.
     header_count: usize,
-    typed_attachment: bool,
+    native_link: bool,
     detached: Option<OpaqueReturn>,
 }
 
@@ -661,9 +661,9 @@ impl Branch {
     }
 
     pub(super) fn start_sampled_tail(&mut self, connected: bool) {
-        self.clock.interrupt();
         self.external_parents = Some(HashMap::new());
         if !connected {
+            self.clock.interrupt();
             self.tip = None;
             self.forked = true;
             self.active_rejection = None;
@@ -923,7 +923,11 @@ impl Branch {
                 anchor: decision.anchor,
             });
         }
-        let Some(summary) = self.selected_summary() else {
+        let summary = self.selected_summary().or_else(|| {
+            self.latest_attachment_checkpoint(compactions)
+                .filter(|&summary| compactions.empty_cutoff(summary))
+        });
+        let Some(summary) = summary else {
             if uncertain {
                 self.uncertain_cutoffs.insert(self.nodes.len());
             }
@@ -1007,8 +1011,7 @@ impl Branch {
                 uuid,
                 parent: parent.opaque,
                 header_count: compactions.headers.len(),
-                typed_attachment: record["type"] == "attachment"
-                    && record["attachment"]["type"].is_string(),
+                native_link: super::is_native_attachment_or_duration(record),
                 detached,
             });
             parent.opaque = NonZeroUsize::new(self.opaque_records.len());
@@ -1048,8 +1051,7 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
     ) -> Option<Uuid> {
         self.nodes[summary].uuid.filter(|id| {
-            (super::is_turn_duration(record)
-                || (record["type"] == "attachment" && record["attachment"]["type"].is_string()))
+            super::is_native_attachment_or_duration(record)
                 && self.clock.ordered()
                 && parent.unverified.is_none()
                 && !duplicates.contains(id)
@@ -1081,6 +1083,7 @@ impl Branch {
         // Returning directly to an omitted child can use the retained tail. A new
         // attachment written under that child must establish its own timestamp link.
         if let Some(summary) = latest
+            && record["isMeta"] != true
             && parent.node == Some(summary)
             && parent.suffix.is_some()
             && let Some(opaque) = self.opaque_record(parent)
@@ -1251,9 +1254,8 @@ impl Branch {
         let previous = self.tip_parent();
         let inherits_previous = self.inherits_previous(record, compactions);
         let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
-        let conversation = record["type"] != "progress"
-            && matches!(role, Some("user" | "assistant"))
-            && record["isMeta"] != true;
+        let conversation =
+            record["type"] != "progress" && matches!(role, Some("user" | "assistant"));
         let mut resolve = |value: &Value| {
             self.resolve_parent(
                 value,
@@ -1280,7 +1282,7 @@ impl Branch {
             None | Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
         };
-        if !conversation {
+        if !conversation || record["isMeta"] == true {
             return self.through_link(record, parent, records, duplicates, compactions);
         }
         // Legacy turns can have UUIDs and link only their compaction summaries.
@@ -1539,7 +1541,7 @@ impl Branch {
         let retained = if compactions.contains(summary, occurrence.uuid, records) {
             // An explicit entry establishes its own position even when its old parent is missing.
             occurrence.uuid
-        } else if ((conversation && occurrence.typed_attachment)
+        } else if ((conversation && occurrence.native_link)
             || (parent.source.is_some() && parent.node == parent.source))
             && occurrence.header_count <= checkpoint.header
             && !duplicates.contains(&occurrence.uuid)

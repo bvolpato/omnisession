@@ -1134,6 +1134,11 @@ fn is_turn_duration(record: &Value) -> bool {
     record["type"] == "system" && record["subtype"] == "turn_duration"
 }
 
+fn is_native_attachment_or_duration(record: &Value) -> bool {
+    is_turn_duration(record)
+        || (record["type"] == "attachment" && record["attachment"]["type"].is_string())
+}
+
 fn is_transcript_record(record: &Value) -> bool {
     match record["type"].as_str() {
         Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
@@ -2199,7 +2204,7 @@ impl ClaudeTranscript {
         coverage: input::InputCoverage,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         self.validate_source(session, coverage.sampled)?;
-        if coverage.has_gaps() {
+        if coverage.skipped_records() {
             self.branch.clock.interrupt();
         }
         let (preservation_error, ambiguity) = if !self.compactions.headers.is_empty()

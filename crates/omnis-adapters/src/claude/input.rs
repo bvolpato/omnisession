@@ -35,8 +35,8 @@ pub(super) struct InputCoverage {
 }
 
 impl InputCoverage {
-    pub(super) fn has_gaps(&self) -> bool {
-        self.sampled || self.oversized != 0 || self.malformed != 0
+    pub(super) fn skipped_records(&self) -> bool {
+        self.oversized != 0 || self.malformed != 0
     }
 
     pub(super) fn report(self, builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
@@ -117,14 +117,19 @@ struct GapRecord<'a> {
     role: Option<&'a str>,
     #[serde(borrow)]
     message: Option<GapMessage<'a>>,
-    #[serde(default)]
-    is_sidechain: bool,
+    #[serde(default, deserialize_with = "present_bool")]
+    is_sidechain: Option<bool>,
     team_name: Option<&'a str>,
+    timestamp: Option<Value>,
     #[serde(default)]
     is_compact_summary: bool,
     uuid: Option<&'a str>,
     #[serde(borrow, default)]
     parent_uuid: GapParent<'a>,
+}
+
+fn present_bool<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(value).map(Some)
 }
 
 #[derive(Default, Deserialize)]
@@ -176,7 +181,7 @@ fn read_gap_links(
             }
             return Ok(false);
         };
-        if record.is_sidechain || record.team_name.is_some() {
+        if record.is_sidechain == Some(true) || record.team_name.is_some() {
             continue;
         }
         let role = record
@@ -192,6 +197,9 @@ fn read_gap_links(
         {
             return Ok(false);
         }
+        if record.uuid.is_none() && matches!(record.kind, Some("attachment" | "system")) {
+            return Ok(false);
+        }
         if let Some(id) = record.uuid {
             let GapParent::Explicit(parent) = record.parent_uuid else {
                 return Ok(false);
@@ -205,6 +213,12 @@ fn read_gap_links(
                 "uuid": id,
                 "parentUuid": parent,
             });
+            if let Some(timestamp) = record.timestamp {
+                row["timestamp"] = timestamp;
+            }
+            if let Some(side) = record.is_sidechain {
+                row["isSidechain"] = Value::Bool(side);
+            }
             // A copied link must match its complete original record.
             let definition: Option<Value> =
                 if super::RecordCopies::compares_link(record.kind.or(role), &row) {
