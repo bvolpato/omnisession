@@ -165,7 +165,8 @@ jobs:
       - name: Continue imported Claude and Codex sessions on loopback
         id: replies
         if: ${{ always() }}
-        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh replies
+        working-directory: ${{ runner.temp }}
+        run: PATH="provider-clis/bin:$PATH" "$GITHUB_WORKSPACE/scripts/test-provider-conformance.sh" replies
       - name: Run installed Claude conformance
         id: claude
         if: ${{ always() }}

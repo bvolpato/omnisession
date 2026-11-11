@@ -20,18 +20,22 @@ require_binary() {
     local variable=$1
     local command_name=$2
     local binary=${!variable:-}
+    local candidate
     if [[ -z "$binary" ]]; then
         while IFS= read -r candidate; do
-            if [[ -L "$candidate" && $(basename -- "$(readlink "$candidate")") == omni ]]; then
+            if [[ -L "$candidate" && $(basename -- "$(readlink -- "$candidate")") == omni ]]; then
                 continue
             fi
             binary=$candidate
             break
         done < <(type -a -p -- "$command_name" 2>/dev/null | awk '!seen[$0]++')
     fi
-    if [[ -z "$binary" || ! -x "$binary" ]]; then
+    if [[ ! -f "$binary" || ! -x "$binary" ]]; then
         printf 'error: %s requires %s or %s\n' "$command_name conformance" "$variable" "$command_name" >&2
         exit 1
+    fi
+    if [[ $binary != /* ]]; then
+        binary="${PWD%/}/$binary"
     fi
     export "$variable=$binary"
 }
