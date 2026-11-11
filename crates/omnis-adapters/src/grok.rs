@@ -578,6 +578,7 @@ struct PendingMessage {
     kind: EventKind,
     text: String,
     content: Vec<Value>,
+    content_unreadable: bool,
     timestamp: Option<DateTime<Utc>>,
     raw_type: Option<String>,
     message_id: Option<String>,
@@ -943,9 +944,7 @@ fn estimated_value_size(value: &Value, limit: usize) -> usize {
 
 fn is_update_record(record: &Value) -> bool {
     record["method"].as_str() == Some("session/update")
-        || record
-            .pointer("/params/update")
-            .is_some_and(|update| !update.is_null())
+        || record.pointer("/params/update").is_some()
         || string_at(record, &[&["sessionUpdate"], &["type"], &["event"]]).is_some()
 }
 
@@ -955,7 +954,8 @@ impl GrokUpdateProcessor {
             &record,
             &[&["timestamp"], &["created_at"], &["createdAt"]],
         ));
-        let is_update_envelope = record["method"].as_str() == Some("session/update");
+        let is_update_envelope = record["method"].as_str() == Some("session/update")
+            || record.pointer("/params/update").is_some();
         let nested_update = record
             .as_object_mut()
             .and_then(|object| object.get_mut("params"))
@@ -987,11 +987,16 @@ impl GrokUpdateProcessor {
                 &[&["messageId"], &["message_id"], &["message", "id"]],
             )
             .map(str::to_owned);
-            let (text, content) = message_content(&update, &mut self.preservation);
+            let (text, content, content_unreadable) =
+                message_content(&update, &mut self.preservation);
+            if content_unreadable {
+                self.malformed_updates = self.malformed_updates.saturating_add(1);
+            }
             match &mut self.pending {
                 Some(pending) if pending.kind == kind && pending.message_id == message_id => {
                     pending.text.push_str(&text);
                     pending.content.extend(content);
+                    pending.content_unreadable |= content_unreadable;
                 }
                 _ => {
                     flush_message(builder, &mut self.pending);
@@ -999,6 +1004,7 @@ impl GrokUpdateProcessor {
                         kind,
                         text,
                         content,
+                        content_unreadable,
                         timestamp,
                         raw_type,
                         message_id,
@@ -1096,16 +1102,19 @@ fn nonmessage_kind(update_type: &str, status: Option<&str>) -> Option<EventKind>
 fn message_content(
     update: &Value,
     preservation: &mut GrokPreservationBudget,
-) -> (String, Vec<Value>) {
+) -> (String, Vec<Value>, bool) {
     let mut text = String::new();
     let mut historical_content = Vec::new();
+    let mut content_unreadable = false;
     let mut push = |block: &Value| {
         if let Some(chunk) = block
             .as_str()
             .or_else(|| block.get("text").and_then(Value::as_str))
         {
             text.push_str(chunk);
-        } else if !block.is_null() && preservation.retain(block) {
+        } else if block.is_null() || block["type"] == "text" {
+            content_unreadable = true;
+        } else if preservation.retain(block) {
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -1117,7 +1126,16 @@ fn message_content(
             historical_content.push(block.clone());
         }
     };
-    if let Some(content) = update.get("content") {
+    let body = [
+        update.get("content"),
+        update.get("text"),
+        update.pointer("/message/content"),
+        update.pointer("/message/text"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_null());
+    if let Some(content) = body {
         if let Some(blocks) = content.as_array() {
             for block in blocks {
                 push(block);
@@ -1125,13 +1143,10 @@ fn message_content(
         } else {
             push(content);
         }
-    } else if let Some(fallback) = value_at(
-        update,
-        &[&["text"], &["message", "content"], &["message", "text"]],
-    ) {
-        push(fallback);
+    } else {
+        content_unreadable = true;
     }
-    (text, historical_content)
+    (text, historical_content, content_unreadable)
 }
 
 fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
@@ -1232,8 +1247,14 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let Some(pending) = pending.take() else {
         return;
     };
-    if !pending.text.is_empty() {
+    if !pending.text.is_empty() || pending.content_unreadable {
         let mut payload = json!({ "text": pending.text });
+        if pending.content_unreadable {
+            payload["content_unreadable"] = Value::Bool(true);
+            if let Some(id) = pending.message_id {
+                payload["message_id"] = Value::String(id);
+            }
+        }
         let nontext_blocks = pending.content.len();
         if !pending.content.is_empty() {
             payload["content"] = Value::Array(pending.content);
@@ -1753,9 +1774,11 @@ mod tests {
         write_session(
             root.path(),
             SESSION_ID,
-            &json!({"id": SESSION_ID, "num_messages": 4}),
+            &json!({"id": SESSION_ID, "num_messages": 6}),
             &[
                 json!({"sessionUpdate": "user_message_chunk", "content": {"text": "question"}}),
+                json!({"params": {"sessionId": SESSION_ID, "update": 17}}),
+                json!({"sessionUpdate": "agent_message_chunk", "messageId": "reply"}),
                 json!({"method": "session/update", "params": {"sessionId": SESSION_ID}}),
                 json!({"method": "session/update", "params": {"sessionId": SESSION_ID, "update": null}}),
                 json!({"method": "session/update", "params": {"sessionId": SESSION_ID, "update": {"sessionUpdate": "session_info_update", "title": "Example"}}}),
@@ -1769,8 +1792,16 @@ mod tests {
                 .events
                 .iter()
                 .find_map(|event| event.payload["malformed_updates"].as_u64()),
-            Some(2)
+            Some(4)
         );
+        let assistant = snapshot
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::MessageAssistant)
+            .expect("recorded assistant chunk");
+        assert_eq!(assistant.payload["message_id"], "reply");
+        assert_eq!(assistant.payload["content_unreadable"], true);
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
         assert!(
             !snapshot
                 .events
