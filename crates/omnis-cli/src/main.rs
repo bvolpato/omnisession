@@ -151,8 +151,12 @@ impl IndexedSessionReader for AdapterRegistry {
                         continue;
                     }
                     if let Ok((_, guard)) = &observed
-                        && let Err(write_error) =
-                            search_index::record_strict_read_failure(self, &store, *guard, &error)
+                        && let Err(write_error) = search_index::record_strict_read_failure(
+                            &mut search_index::FileSelections::new(self),
+                            &store,
+                            *guard,
+                            &error,
+                        )
                     {
                         if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
                             retry = false;
@@ -250,21 +254,20 @@ fn store_search_document(
     };
     let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
-        let verify = |session: &SessionRef, expected: SourceRevision| {
-            search_index::selected_file_matches(
-                registry,
-                session,
-                native.source_path.as_deref(),
-                expected,
-                guard,
-            )
-        };
-        store.upsert_verified_session_document_checked(
-            &indexed_session_metadata(native),
-            document,
+        let check = search_index::FileCheck {
+            session,
+            path: native.source_path.as_deref(),
+            revision: source_revision,
             guard,
-            verify,
-        )?
+        };
+        search_index::FileSelections::new(registry).write(&[check], |verify| {
+            store.upsert_verified_session_document_checked(
+                &indexed_session_metadata(native),
+                document,
+                guard,
+                verify,
+            )
+        })?
     } else {
         store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
     };

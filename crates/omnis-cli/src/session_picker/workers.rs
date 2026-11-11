@@ -725,14 +725,19 @@ fn report_rejected_preview(
     let Some((store, guard)) = writer else {
         return Ok(None);
     };
-    let Some(native) = search_index::record_strict_read_failure(registry, store, guard, error)
-        .inspect_err(|error| {
-            if !matches!(error, StoreError::TrajectorySourceChanged) {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index write: {error}"
-                )));
-            }
-        })?
+    let Some(native) = search_index::record_strict_read_failure(
+        &mut search_index::FileSelections::new(registry),
+        store,
+        guard,
+        error,
+    )
+    .inspect_err(|error| {
+        if !matches!(error, StoreError::TrajectorySourceChanged) {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "trajectory index write: {error}"
+            )));
+        }
+    })?
     else {
         return Ok(None);
     };

@@ -158,6 +158,23 @@ fn read_budgeted_transcript(
     })
 }
 
+/// The files a native provider selects when more than one transcript can identify the same session.
+pub trait NativeSelectionInventory: Send + Sync {
+    /// Updates the inventory outside the search store's write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error when the provider directory cannot be inspected.
+    fn refresh(&mut self) -> Result<()>;
+
+    /// Returns the entry chosen by the provider's exact-ID rule.
+    fn selected(&self, id: &str) -> Option<&NativeSession>;
+
+    /// Checks known paths together and returns the result for each request in order.
+    /// If a transcript changed, the adapter can check its previously observed header.
+    fn validate(&self, requests: &[(&str, &Path, SourceRevision)]) -> Vec<bool>;
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
@@ -218,6 +235,15 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(self
             .find_native_session(id)?
             .filter(|session| session.source_path.as_deref() == Some(source_path)))
+    }
+
+    /// Captures the current file selections for repeated checks during one index operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error when a provider with an inventory cannot inspect its files.
+    fn selection_inventory(&self) -> Result<Option<Box<dyn NativeSelectionInventory>>> {
+        Ok(None)
     }
 
     /// Non-fatal discovery observations from this adapter.

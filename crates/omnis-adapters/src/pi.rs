@@ -1,24 +1,29 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
-    IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
-    read_budgeted_transcript,
+    IndexRead, LaunchPlan, LaunchTarget, NativeSelectionInventory, NativeSession, ProviderAdapter,
+    ProviderInstallation, read_budgeted_transcript,
     source_file::ObservedSourceFile,
     support::{
         EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles,
-        json_lines_preview_file_with_suffix, nested_files, omitted_images_text, parse_timestamp,
-        paths_match, provider_executable, provider_file, provider_root, read_json_line_at,
-        sort_sessions, string_at, validate_provider, visit_json_lines_with_offsets,
+        json_lines_preview_file_with_suffix, nested_files, nested_files_matching,
+        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, read_json_line_at, sort_sessions, string_at, validate_provider,
+        visit_json_lines_with_offsets,
     },
 };
 
@@ -144,6 +149,220 @@ fn is_session_file(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
 }
 
+#[derive(Eq, PartialEq)]
+struct DirectoryRevision {
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(windows)]
+    identity: (u64, u64),
+    #[cfg(not(unix))]
+    created: SystemTime,
+}
+
+impl DirectoryRevision {
+    fn read(path: &Path, root: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = if path == root {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
+        }
+        .ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        #[cfg(windows)]
+        let info =
+            winapi_util::file::information(winapi_util::Handle::from_path_any(path).ok()?).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(windows)]
+            identity: (info.volume_serial_number(), info.file_index()),
+            #[cfg(not(unix))]
+            created: metadata.created().ok()?,
+        })
+    }
+}
+
+#[derive(Default)]
+struct InventoryFile {
+    revision: Option<SourceRevision>,
+    native: Option<NativeSession>,
+    changing_id: Option<String>,
+    prefix: Option<HeaderPrefix>,
+}
+
+impl InventoryFile {
+    fn refresh(&mut self, path: &Path, resolver: &mut ProviderFiles, provider: Provider) {
+        let revision = crate::source_file_revision(path).filter(|r| r.contents.is_some());
+        if revision.is_some() && self.revision == revision {
+            return;
+        }
+        *self = Self::default();
+        let Some(canonical) = resolver.resolve(path) else {
+            return;
+        };
+        match SelectedPiFile::open_header(canonical, path.to_owned(), provider, true) {
+            Ok(file) => {
+                self.revision = Some(file.observed.revision).filter(|r| r.contents.is_some());
+                self.native = Some(file.native_session(provider));
+                self.prefix = file.prefix;
+            }
+            Err(error) => {
+                if let Some(changed) = error.downcast_ref::<ChangedPiHeader>() {
+                    self.changing_id.clone_from(&changed.id);
+                    self.prefix.clone_from(&changed.prefix);
+                } else if !error.is::<std::io::Error>() {
+                    // A stable invalid header can become a competing ID after an in-place edit.
+                    self.revision =
+                        revision.filter(|r| Some(*r) == crate::source_file_revision(path));
+                }
+            }
+        }
+    }
+}
+
+struct PiSelectionInventory {
+    provider: Provider,
+    root: PathBuf,
+    directories: Vec<(PathBuf, Option<DirectoryRevision>)>,
+    files: BTreeMap<PathBuf, InventoryFile>,
+    winners: HashMap<String, PathBuf>,
+}
+
+impl PiSelectionInventory {
+    fn new(provider: Provider, root: &Path) -> Self {
+        Self {
+            provider,
+            root: root.to_owned(),
+            directories: Vec::new(),
+            files: BTreeMap::new(),
+            winners: HashMap::new(),
+        }
+    }
+
+    fn refresh_membership(&mut self) {
+        // Observe each directory before listing it. A concurrent addition invalidates this inventory.
+        let directories = RefCell::new(vec![(
+            self.root.clone(),
+            DirectoryRevision::read(&self.root, &self.root),
+        )]);
+        let paths = nested_files_matching(&self.root, 1, &|path, directory| {
+            if directory {
+                directories
+                    .borrow_mut()
+                    .push((path.to_owned(), DirectoryRevision::read(path, &self.root)));
+            }
+            true
+        });
+        let mut previous = std::mem::take(&mut self.files);
+        self.files = paths
+            .into_iter()
+            .filter(|path| is_session_file(path))
+            .map(|path| {
+                let observation = previous.remove(&path).unwrap_or_default();
+                (path, observation)
+            })
+            .collect();
+        self.directories = directories.into_inner();
+    }
+
+    fn directory_changed(&self, path: &Path, known: Option<&DirectoryRevision>) -> bool {
+        known.is_none() || DirectoryRevision::read(path, &self.root).as_ref() != known
+    }
+}
+
+impl NativeSelectionInventory for PiSelectionInventory {
+    fn refresh(&mut self) -> Result<()> {
+        if self.directories.is_empty()
+            || self
+                .directories
+                .iter()
+                .any(|(path, known)| self.directory_changed(path, known.as_ref()))
+        {
+            self.refresh_membership();
+        }
+        let mut resolver = ProviderFiles::new(&self.root);
+        self.winners.clear();
+        for (path, file) in &mut self.files {
+            file.refresh(path, &mut resolver, self.provider);
+            let Some(id) = file
+                .native
+                .as_ref()
+                .map(|native| &native.session.id)
+                .or(file.changing_id.as_ref())
+            else {
+                continue;
+            };
+            self.winners
+                .entry(id.clone())
+                .or_insert_with(|| path.clone());
+        }
+        Ok(())
+    }
+
+    fn selected(&self, id: &str) -> Option<&NativeSession> {
+        self.files.get(self.winners.get(id)?)?.native.as_ref()
+    }
+
+    fn validate(&self, requests: &[(&str, &Path, SourceRevision)]) -> Vec<bool> {
+        let Some(last) = requests.iter().map(|(_, path, _)| *path).max() else {
+            return Vec::new();
+        };
+        // Selection uses path order. An earlier changed directory could contain a new winning file,
+        // and a changed header could now name any later session in the batch.
+        let mut changed_sources = HashSet::new();
+        let first_file = self
+            .files
+            .iter()
+            .take_while(|(path, _)| path.as_path() <= last)
+            .find(|(path, file)| {
+                let current = crate::source_file_revision(path);
+                if current.is_some() && current == file.revision {
+                    return false;
+                }
+                changed_sources.insert(path.as_path());
+                !file.prefix.as_ref().is_some_and(|prefix| {
+                    current.and_then(|r| r.file) == Some(prefix.object)
+                        && prefix.confirm(&self.root, path).is_some()
+                })
+            })
+            .map(|(path, _)| path.as_path());
+        let first_change = self
+            .directories
+            .iter()
+            .filter(|(path, revision)| {
+                path.as_path() <= first_file.unwrap_or(last)
+                    && self.directory_changed(path, revision.as_ref())
+            })
+            .map(|(path, _)| path.as_path())
+            .min()
+            .or(first_file);
+        requests
+            .iter()
+            .map(|(id, path, revision)| {
+                first_change.is_none_or(|first| *path < first)
+                    && !changed_sources.contains(path)
+                    && self.selected(id).is_some_and(|native| {
+                        native.source_path.as_deref() == Some(*path)
+                            && native
+                                .source_revision
+                                .is_some_and(|r| r.matches_file_contents(*revision))
+                    })
+            })
+            .collect()
+    }
+}
+
 impl Default for PiAdapter {
     fn default() -> Self {
         let sessions_root = env::var_os("PI_CODING_AGENT_SESSION_DIR")
@@ -210,13 +429,47 @@ fn header_record(record: &Value) -> Result<PiHeader> {
     })
 }
 
-/// Mirrors Pi's bounded header discovery: skip malformed leading lines, then
-/// require first parsed entry to be a v3 session header. Discovery never scans
-/// a full transcript.
-fn read_header(reader: &mut BufReader<fs::File>, provider: Provider) -> Result<PiHeader> {
+#[derive(Clone, Debug)]
+struct HeaderPrefix {
+    object: Uuid,
+    length: u64,
+    digest: [u8; 32],
+    newline: bool,
+}
+
+impl HeaderPrefix {
+    // A provider can append while we check another session. Only its header decides which ID it shadows.
+    fn confirm(&self, root: &Path, path: &Path) -> Option<()> {
+        let canonical = provider_file(root, path)?;
+        let mut file = fs::File::open(&canonical).ok()?;
+        let opened = ObservedSourceFile::from_open_file(&canonical, &file, &file.metadata().ok()?)?;
+        (opened.revision.file == Some(self.object)).then_some(())?;
+        let mut bytes = Vec::with_capacity(usize::try_from(self.length).ok()?);
+        (&mut file).take(self.length).read_to_end(&mut bytes).ok()?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if digest != self.digest {
+            return None;
+        }
+        if !self.newline {
+            let mut next = [0];
+            if file.read(&mut next).ok()? != 0 && next[0] != b'\n' {
+                return None;
+            }
+        }
+        (crate::source_file_revision(path)?.file == Some(self.object)).then_some(())
+    }
+}
+
+/// Skips malformed leading lines, then requires the first parsed entry to be a v3 session header.
+fn read_header(
+    reader: &mut BufReader<fs::File>,
+    provider: Provider,
+    record_prefix: Option<Uuid>,
+) -> Result<(PiHeader, Option<HeaderPrefix>)> {
     let mut scanned = 0_u64;
     let mut title_seen = false;
     let mut title = None;
+    let mut digest = record_prefix.map(|object| (object, Sha256::new()));
     while scanned < MAX_HEADER_SCAN_BYTES {
         let remaining = MAX_HEADER_SCAN_BYTES - scanned;
         let mut line = Vec::new();
@@ -230,6 +483,9 @@ fn read_header(reader: &mut BufReader<fs::File>, provider: Provider) -> Result<P
         scanned = scanned.saturating_add(read);
         if read > MAX_HEADER_LINE_BYTES {
             bail!("Pi session header line exceeds safe scan limit");
+        }
+        if let Some((_, digest)) = &mut digest {
+            digest.update(&line);
         }
         let first = line.iter().position(|byte| !byte.is_ascii_whitespace());
         let last = line.iter().rposition(|byte| !byte.is_ascii_whitespace());
@@ -246,7 +502,13 @@ fn read_header(reader: &mut BufReader<fs::File>, provider: Provider) -> Result<P
             if title_seen {
                 header.title = title;
             }
-            return Ok(header);
+            let prefix = digest.map(|(object, digest)| HeaderPrefix {
+                object,
+                length: scanned,
+                digest: digest.finalize().into(),
+                newline: line.ends_with(b"\n"),
+            });
+            return Ok((header, prefix));
         }
     }
     bail!("Pi session contains no valid v3 header within safe scan limit")
@@ -388,6 +650,7 @@ struct SelectedPiFile {
     selected: PathBuf,
     reader: BufReader<fs::File>,
     header: PiHeader,
+    prefix: Option<HeaderPrefix>,
     observed: ObservedSourceFile,
     length: u64,
 }
@@ -395,6 +658,7 @@ struct SelectedPiFile {
 #[derive(Debug)]
 struct ChangedPiHeader {
     id: Option<String>,
+    prefix: Option<HeaderPrefix>,
 }
 
 impl std::fmt::Display for ChangedPiHeader {
@@ -407,27 +671,41 @@ impl std::error::Error for ChangedPiHeader {}
 
 impl SelectedPiFile {
     fn open(canonical: PathBuf, selected: PathBuf, provider: Provider) -> Result<Self> {
+        Self::open_header(canonical, selected, provider, false)
+    }
+
+    fn open_header(
+        canonical: PathBuf,
+        selected: PathBuf,
+        provider: Provider,
+        record_prefix: bool,
+    ) -> Result<Self> {
         let file = fs::File::open(&canonical)?;
         let metadata = file.metadata()?;
         let observed = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)
             .context("Pi session path is not a regular file")?;
         let mut reader = BufReader::new(file);
-        let header = read_header(&mut reader, provider);
+        let header = read_header(
+            &mut reader,
+            provider,
+            observed.revision.file.filter(|_| record_prefix),
+        );
         if observed
             .ensure_unchanged(&canonical, &selected, reader.get_ref())
             .is_err()
         {
-            return Err(ChangedPiHeader {
-                id: header.ok().map(|header| header.id),
-            }
-            .into());
+            let (id, prefix) = header
+                .map(|(h, prefix)| (Some(h.id), prefix))
+                .unwrap_or_default();
+            return Err(ChangedPiHeader { id, prefix }.into());
         }
-        let header = header?;
+        let (header, prefix) = header?;
         Ok(Self {
             canonical,
             selected,
             reader,
             header,
+            prefix,
             observed,
             length: metadata.len(),
         })
@@ -1358,6 +1636,15 @@ impl ProviderAdapter for PiAdapter {
             .map(|file| file.native_session(self.provider)))
     }
 
+    fn selection_inventory(&self) -> Result<Option<Box<dyn NativeSelectionInventory>>> {
+        let Some(root) = self.sessions_root.as_ref() else {
+            return Ok(None);
+        };
+        let mut inventory = PiSelectionInventory::new(self.provider, root);
+        inventory.refresh()?;
+        Ok(Some(Box::new(inventory)))
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         self.read_session_at(session, None)
     }
@@ -1598,6 +1885,112 @@ mod tests {
                 &[&duplicate, &unique],
             );
         }
+    }
+
+    fn write_inventory_header(path: &Path, id: &str) {
+        fs::write(
+            path,
+            serialized_records(&[json!({"type":"session","version":3,"id":id,"cwd":"/project"})]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn inventory_distinguishes_appends_from_competing_header_edits() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let paths = ["0.jsonl", "1.jsonl", "2.jsonl"].map(|name| root.join(name));
+        let ids = ["first", "other", "later"];
+        for (path, id) in paths.iter().zip(ids) {
+            write_inventory_header(path, id);
+        }
+        let mut inventory = PiAdapter::with_root(root)
+            .selection_inventory()
+            .unwrap()
+            .unwrap();
+        let requests = std::array::from_fn::<_, 3, _>(|i| {
+            let id = ids[i];
+            let source = inventory.selected(id).unwrap().source_revision.unwrap();
+            (id, paths[i].as_path(), source)
+        });
+        assert_eq!(inventory.validate(&requests), [true, true, true]);
+        let append = || {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&paths[1])
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
+        };
+        append();
+        assert_eq!(inventory.validate(&requests), [true, false, true]);
+        inventory.refresh().unwrap();
+        #[cfg(unix)]
+        let modified = fs::metadata(&paths[1]).unwrap().modified().unwrap();
+        write_inventory_header(&paths[1], "later");
+        append();
+        #[cfg(unix)]
+        fs::File::options()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(inventory.validate(&requests), [true, false, false]);
+        inventory.refresh().unwrap();
+        assert_eq!(
+            inventory.selected("later").unwrap().source_path.as_ref(),
+            Some(&paths[1])
+        );
+    }
+
+    #[test]
+    fn inventory_tracks_empty_directories_and_replaced_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let empty = root.join("0-empty");
+        let current = root.join("1-current");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir(&current).unwrap();
+        let original = current.join("session.jsonl");
+        write_inventory_header(&original, "wanted");
+        let mut inventory = PiAdapter::oh_my_pi_with_root(&root)
+            .selection_inventory()
+            .unwrap()
+            .unwrap();
+        let request = [(
+            "wanted",
+            original.as_path(),
+            crate::source_file_revision(&original).unwrap(),
+        )];
+        assert_eq!(inventory.validate(&request), [true]);
+        let added = empty.join("new.jsonl");
+        fs::write(&added, b"malformed header\n").unwrap();
+        assert_eq!(inventory.validate(&request), [false]);
+        inventory.refresh().unwrap();
+        assert_eq!(inventory.validate(&request), [true]);
+        write_inventory_header(&added, "wanted");
+        assert_eq!(inventory.validate(&request), [false]);
+        inventory.refresh().unwrap();
+        assert_eq!(
+            inventory.selected("wanted").unwrap().source_path.as_ref(),
+            Some(&added)
+        );
+        let replacement = [(
+            "wanted",
+            added.as_path(),
+            crate::source_file_revision(&added).unwrap(),
+        )];
+        fs::rename(&empty, temp.path().join("withdrawn")).unwrap();
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(inventory.validate(&replacement), [false]);
+        inventory.refresh().unwrap();
+        assert_eq!(
+            inventory.selected("wanted").unwrap().source_path.as_ref(),
+            Some(&original)
+        );
     }
 
     #[test]
