@@ -35,23 +35,79 @@ if [ "$LAUNCH_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
 exit "$LAUNCH_EXIT_CODE"
 "#;
 
+#[cfg(any(unix, windows))]
+fn codex_sqlite_override(root: &std::path::Path) -> String {
+    let home = serde_json::to_string(&root.join("codex")).expect("UTF-8 fixture path");
+    format!("sqlite_home={home}")
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
+    let fixture = Fixture::new();
+    let subdirectory = fixture.workspace.join("nested");
+    let caller = fixture.workspace.join("sibling");
+    fs::create_dir(&subdirectory).unwrap();
+    fs::create_dir(&caller).unwrap();
+    fixture.init_git();
+    let path = fixture.root.join(format!(
+        "codex/sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"
+    ));
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        file,
+        "\n{}",
+        json!({"type":"turn_context","payload":{"cwd":subdirectory}})
+    )
+    .unwrap();
+    drop(file);
+
+    let plan = |options: &[&str]| {
+        let output = fixture
+            .command()
+            .current_dir(&caller)
+            .args([
+                "--json",
+                "resume",
+                SOURCE_ID,
+                "--in",
+                "codex",
+                "--no-fork",
+                "--dry-run",
+            ])
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["launch"].clone()
+    };
+    let resumed = plan(&[]);
+    assert_eq!(resumed["cwd"], json!(subdirectory));
+    assert_eq!(
+        resumed["args"],
+        json!([
+            "--cd",
+            ".",
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "resume",
+            SOURCE_ID
+        ])
+    );
+    assert_eq!(plan(&["--allow-workspace-mismatch"])["cwd"], json!(caller));
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_opencode_resolves_the_last_listed_id_and_retries_export_in_its_directory() {
     let fixture = Fixture::new();
     let directory = fixture.workspace.join("subdir");
     fs::create_dir(&directory).unwrap();
-    assert!(
-        Command::new("git")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .args(["init", "--quiet"])
-            .arg(&fixture.workspace)
-            .env("HOME", fixture.root.join("home"))
-            .status()
-            .unwrap()
-            .success()
-    );
+    fixture.init_git();
     let id = "ses_selected";
     let mut rows: Vec<_> = (0..10_000)
         .map(|i| json!({"id": format!("ses_other_{i}")}))
@@ -175,7 +231,15 @@ fn bare_id_forks_a_codex_subagent_thread_that_listings_hide() {
         String::from_utf8_lossy(&fork.stderr)
     );
     let plan: serde_json::Value = serde_json::from_str(&stdout).expect("fork plan JSON");
-    assert_eq!(plan["launch"]["args"], json!(["fork", SUBAGENT_ID]));
+    assert_eq!(
+        plan["launch"]["args"],
+        json!([
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "fork",
+            SUBAGENT_ID
+        ])
+    );
 }
 
 #[cfg(unix)]
@@ -257,6 +321,20 @@ impl Fixture {
         )
         .expect("write synthetic history");
         fixture
+    }
+
+    fn init_git(&self) {
+        assert!(
+            Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.join("home"))
+                .args(["init", "--quiet"])
+                .arg(&self.workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn command(&self) -> Command {
@@ -386,6 +464,54 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
 "#;
 
     #[test]
+    fn off_path_codex_cmd_uses_workspace_flags_only_for_the_native_package() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let package = fixture.root.join("npm/node_modules/@openai/codex");
+        fs::create_dir_all(package.join("bin")).unwrap();
+        fs::write(package.join("bin/codex.js"), PROVIDER_SCRIPT).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let state = fixture.root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("profiles.toml"),
+            format!(
+                "[profiles.selected]\nagent = 'codex'\nprogram = {}\nargs = ['--cd', {}]\n",
+                json!(fixture.codex),
+                json!(fixture.capture),
+            ),
+        )
+        .unwrap();
+        let source = format!("codex:{CODEX_SOURCE_ID}");
+        let fork = || {
+            fixture
+                .command()
+                .env_remove("OMNI_CODEX_BIN")
+                .args(["--json", "fork", &source, "--in", "selected", "--dry-run"])
+                .output()
+                .unwrap()
+        };
+        let wrapped = fork();
+        assert_success(&wrapped, "plan a fork through another npm package");
+
+        fs::write(
+            &fixture.codex,
+            format!(
+                "{NPM_COMMAND_SHIM_PREFIX}node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n"
+            ),
+        )
+        .unwrap();
+        let native = fork();
+        assert!(!native.status.success());
+        assert!(String::from_utf8_lossy(&native.stderr).contains("--allow-workspace-mismatch"));
+    }
+
+    #[test]
     fn npm_providers_resume_and_fork_as_direct_omni_children() {
         let Some(fixture) = Fixture::new() else {
             return;
@@ -408,16 +534,17 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
         }
 
+        let codex_sqlite = super::codex_sqlite_override(&fixture.root);
         for (source, fork, expected) in [
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 false,
-                vec!["resume", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "resume", CODEX_SOURCE_ID],
             ),
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 true,
-                vec!["fork", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "fork", CODEX_SOURCE_ID],
             ),
             (
                 format!("grok:{GROK_SOURCE_ID}"),
@@ -485,11 +612,16 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             let launch = fixture.take_launch();
             fixture.assert_direct_launch(&launch, omni);
             let arguments = launch_args(&launch);
-            assert_eq!(arguments.len(), 1, "{target} argv: {arguments:?}");
+            let (prompt, options) = arguments.split_last().expect("provider handoff prompt");
+            if target == "codex" {
+                let home = super::codex_sqlite_override(&fixture.root);
+                assert_eq!(options, ["-c", home.as_str()]);
+            } else {
+                assert!(options.is_empty(), "{target} argv: {arguments:?}");
+            }
             assert!(
-                arguments[0].starts_with("Read `") && !arguments[0].contains(marker),
-                "{target} prompt must point at a private handoff: {}",
-                arguments[0]
+                prompt.starts_with("Read `") && !prompt.contains(marker),
+                "{target} prompt must point at a private handoff: {prompt}"
             );
             let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
             assert_eq!(
@@ -668,6 +800,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             command
                 .current_dir(&self.workspace)
                 .env("PATH", &self.path)
+                .env_remove("CODEX_SQLITE_HOME")
                 .env("HOME", &home)
                 .env("USERPROFILE", &home)
                 .env("OMNISESSION_HOME", self.root.join("state"))
