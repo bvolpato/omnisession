@@ -314,6 +314,7 @@ pub struct CanonicalSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum TransferMode {
     NativeResume,
+    OpenWorkspace,
     NativeFork,
     OfficialImport,
     NativeMaterialization,
@@ -325,6 +326,7 @@ impl fmt::Display for TransferMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::NativeResume => "native resume",
+            Self::OpenWorkspace => "open workspace",
             Self::NativeFork => "native fork",
             Self::OfficialImport => "official import",
             Self::NativeMaterialization => "native materialization",

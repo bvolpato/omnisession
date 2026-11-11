@@ -6,6 +6,7 @@ mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
+mod cursor_identity;
 mod grok;
 mod hermes;
 mod omp;
@@ -32,6 +33,9 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
+pub use cursor_identity::{
+    cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
+};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
@@ -43,18 +47,34 @@ pub use opencode::{
     read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::{InvalidPiTree, PiAdapter};
-pub use provider_process::{bounded_provider_output, provider_process};
+#[cfg(windows)]
+pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
+pub use provider_process::{
+    ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
+    bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
+    inherit_provider_probes, provider_process, with_provider_probes,
+};
 pub use source_file::source_file_revision;
 pub use support::TranscriptReadLimit;
 pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
 
-/// Reads the revision of the file selected for this session in the configured provider store.
+/// Verifies a visible catalog row and its selected history in the configured Antigravity store.
 #[must_use]
-pub fn selected_search_file_revision(session: &SessionRef, path: &Path) -> Option<SourceRevision> {
-    if session.provider == Provider::Antigravity {
-        return antigravity::selected_transcript_revision(session, path);
+pub fn selected_antigravity_search_session(
+    session: &SessionRef,
+    path: &Path,
+) -> Option<NativeSession> {
+    match session.provider {
+        Provider::Antigravity => AntigravityAdapter::default()
+            .selected_session_at(&session.id, path)
+            .ok()
+            .flatten(),
+        Provider::AntigravityDesktop => AntigravityDesktopAdapter::default()
+            .selected_session_at(&session.id, path)
+            .ok()
+            .flatten(),
+        _ => None,
     }
-    source_file_revision(path)
 }
 
 /// Installation state discovered without reading provider credentials.

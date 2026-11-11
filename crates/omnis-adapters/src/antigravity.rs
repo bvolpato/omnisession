@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -13,16 +14,17 @@ use omnis_ir::{
 use prost::Message;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     IncompleteTranscript, IndexRead, IndexedSearchDocument, LaunchPlan, LaunchTarget,
     NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes,
-        json_lines_preview_with_tail, parse_timestamp, paths_match, provider_executable,
-        provider_file, provider_root, sort_sessions, sqlite_snapshot, store_is_missing,
-        validate_provider, visit_json_lines_with_tail, visit_limited_search_edges,
-        visit_streamed_json_file,
+        EventBuilder, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
+        estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp, paths_match,
+        provider_executable, provider_file, provider_root, sort_sessions, sqlite_snapshot,
+        store_is_missing, validate_provider, visit_json_lines_with_tail,
+        visit_limited_search_edges, visit_streamed_json_file,
     },
 };
 
@@ -32,6 +34,7 @@ const PREVIEW_RECORDS: usize = 1_024;
 #[derive(Clone, Debug)]
 pub struct AntigravityAdapter {
     root: Option<PathBuf>,
+    summaries: Arc<SqliteSnapshotCache>,
 }
 
 impl AntigravityAdapter {
@@ -39,6 +42,7 @@ impl AntigravityAdapter {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
+            summaries: Arc::default(),
         }
     }
 
@@ -52,18 +56,8 @@ impl AntigravityAdapter {
         validate_id(id)?;
         let root = self.root()?;
         let database = root.join(SUMMARY_DATABASE);
-        let snapshot = sqlite_snapshot(root, &database)
-            .context("failed to snapshot Antigravity summary database")?;
-        snapshot
-            .connection
-            .query_row(
-                "SELECT conversation_id, title, step_count, last_modified_time, \
-                 workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
-                [id],
-                summary_from_row,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
+        self.summaries
+            .read(root, &database, |connection| summary_by_id(connection, id))
     }
 
     fn source(&self, summary: &Summary) -> Option<PathBuf> {
@@ -86,11 +80,15 @@ impl AntigravityAdapter {
             "Antigravity history changed during the search read"
         );
         let native = summary.native_session(selected.clone());
+        anyhow::ensure!(
+            selected.is_none() || native.source_revision.is_some(),
+            "Antigravity history changed during the search read"
+        );
         let read = self.read_summary(session, &summary, preview);
         let current = self.summary(&session.id)?;
         anyhow::ensure!(
             self.source(&current) == selected
-                && current.updated_at == summary.updated_at
+                && current == summary
                 && current.native_session(selected).source_revision == native.source_revision,
             "Antigravity history changed during the search read"
         );
@@ -192,22 +190,6 @@ fn selected_history(root: &Path, paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find_map(|path| provider_file(root, path))
 }
 
-pub(super) fn selected_transcript_revision(
-    session: &SessionRef,
-    path: &Path,
-) -> Option<SourceRevision> {
-    if path.extension().is_none_or(|ext| ext != "jsonl") {
-        return None;
-    }
-    validate_id(&session.id).ok()?;
-    let adapter = AntigravityAdapter::default();
-    let root = adapter.root.as_deref()?;
-    let selected = selected_history(root, &history_paths(root, &session.id))?;
-    (selected == path)
-        .then(|| crate::source_file_revision(&selected))
-        .flatten()
-}
-
 fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
     let logs = root.join("brain").join(id).join(".system_generated/logs");
     [
@@ -221,6 +203,7 @@ impl Default for AntigravityAdapter {
     fn default() -> Self {
         Self {
             root: provider_root("ANTIGRAVITY_CLI_HOME", &[".gemini", "antigravity-cli"]),
+            summaries: Arc::default(),
         }
     }
 }
@@ -274,6 +257,14 @@ impl ProviderAdapter for AntigravityAdapter {
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn selected_session_at(&self, id: &str, path: &Path) -> Result<Option<NativeSession>> {
+        let summary = self.summary(id)?;
+        Ok(self
+            .source(&summary)
+            .filter(|selected| selected == path)
+            .map(|selected| summary.native_session(Some(selected))))
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -332,7 +323,7 @@ impl ProviderAdapter for AntigravityAdapter {
         let observed = crate::source_file::ObservedSourceFile::from_open_file(path, &file, &before)
             .context("Antigravity history changed during the search read")?;
         anyhow::ensure!(
-            native.source_revision == Some(observed.revision),
+            native.source_revision == history_revision(path, observed.revision, summary.step_count),
             "Antigravity history changed during the search read"
         );
         let handle = file.try_clone()?;
@@ -401,7 +392,9 @@ impl ProviderAdapter for AntigravityAdapter {
                 snapshot: title_source,
                 source_complete: !limited,
                 provider_limited: limited && prior_search_bytes.is_some(),
-                source_revision: observed.revision,
+                source_revision: native
+                    .source_revision
+                    .context("Antigravity history changed during the search read")?,
                 native_session: Some(native),
             },
         })
@@ -443,7 +436,7 @@ impl ProviderAdapter for AntigravityAdapter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Summary {
     id: String,
     title: String,
@@ -455,10 +448,9 @@ struct Summary {
 impl Summary {
     fn native_session(&self, source_path: Option<PathBuf>) -> NativeSession {
         let session = SessionRef::new(Provider::Antigravity, self.id.clone());
-        let revision = source_path
-            .as_deref()
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .and_then(crate::source_file_revision);
+        let revision = source_path.as_deref().and_then(|path| {
+            history_revision(path, crate::source_file_revision(path)?, self.step_count)
+        });
         let updated_at = self.updated_at.or_else(|| {
             source_path
                 .as_ref()?
@@ -481,6 +473,62 @@ impl Summary {
             source_revision: revision,
         }
     }
+}
+
+#[derive(serde::Serialize)]
+enum WalRevision {
+    Missing,
+    Present(Uuid),
+}
+
+pub(super) fn history_revision(
+    path: &Path,
+    revision: SourceRevision,
+    declared_steps: usize,
+) -> Option<SourceRevision> {
+    let file = revision.file?;
+    let history = revision.contents?;
+    let database = path.extension().is_some_and(|ext| ext == "db");
+    let wal = if database {
+        let sidecar = crate::support::sidecar(path, "-wal");
+        match sidecar.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => {
+                let wal = provider_file(path.parent()?, &sidecar)?;
+                Some(WalRevision::Present(
+                    crate::source_file_revision(&wal)?.contents?,
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(WalRevision::Missing)
+            }
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    let signature = serde_json::to_vec(&(
+        history,
+        wal,
+        database.then_some(declared_steps),
+        None::<bool>,
+    ))
+    .ok()?;
+    Some(SourceRevision {
+        contents: Some(Uuid::new_v5(&file, &signature)),
+        ..revision
+    })
+}
+
+fn summary_by_id(connection: &rusqlite::Connection, id: &str) -> Result<Summary> {
+    connection
+        .query_row(
+            "SELECT conversation_id, title, step_count, last_modified_time, \
+             workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
+            [id],
+            summary_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
 }
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {

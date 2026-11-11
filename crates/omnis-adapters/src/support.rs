@@ -703,7 +703,7 @@ fn ensure_snapshot_space(directory: &Path, bytes: u64, reserve: u64) -> Result<(
     Ok(())
 }
 
-fn sidecar(database: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(database: &Path, suffix: &str) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)

@@ -47,7 +47,7 @@ const INTERRUPT_STEP: Duration = Duration::from_secs(40);
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
-    printf 'codex-cli 0.146.0\n'
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.146.0}"
     exit 0
 fi
 if [ "$1" = "--help" ]; then
@@ -215,7 +215,23 @@ const args = process.argv.slice(2);
 const append = (name, text) => fs.appendFileSync(path.join(capture, name), text);
 
 if (args[0] === "--version") {
-  fs.writeSync(1, "codex-cli 0.146.0\n");
+  if (env.FAKE_CODEX_HOLD_NATIVE_VERSION === "1") {
+    const seen = path.join(capture, "first-version");
+    if (fs.existsSync(seen)) {
+      const pid = path.join(capture, "native-version-pid");
+      fs.writeFileSync(pid + ".staged", String(process.pid));
+      fs.renameSync(pid + ".staged", pid);
+      const sleep = new Int32Array(new SharedArrayBuffer(4));
+      const end = Date.now() + 20000;
+      while (!fs.existsSync(path.join(capture, "release-version"))) {
+        if (Date.now() >= end) process.exit(97);
+        Atomics.wait(sleep, 0, 0, 10);
+      }
+    } else {
+      fs.writeFileSync(seen, "");
+    }
+  }
+  fs.writeSync(1, `codex-cli ${env.FAKE_CODEX_VERSION || "0.146.0"}\n`);
   process.exit(0);
 }
 if (args[0] === "--help") {
@@ -820,6 +836,38 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
     );
     assert!(!fixture.generated_rollout().exists());
     assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[test]
+fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = format!("claude:{SOURCE_ID}");
+    let version = ("FAKE_CODEX_VERSION", "0.1.0");
+    let inspected = fixture
+        .command()
+        .env(version.0, version.1)
+        .args(["--json", "inspect", &source, "--target", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let report: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["mode"], "semantic_handoff");
+    assert!(fixture.launch_arguments().is_none());
+
+    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    assert!(resumed.status.success(), "{}", resumed.stderr);
+    assert!(
+        fs::read_to_string(fixture.capture.join("handoff.md"))
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
 }
 
 #[test]
@@ -1791,6 +1839,53 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
         );
         fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_version_probe_survives_console_break_until_rollback() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut sender = ConsoleBreakSender::start(&fixture.capture);
+    let version_pid = fixture.capture.join("native-version-pid");
+    let acknowledged = fixture.capture.join("interrupt-ack");
+    let run = fixture.run_during(
+        &Route::Resume.args(),
+        &[
+            ("FAKE_CODEX_HOLD_NATIVE_VERSION", "1"),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
+        ],
+        |omni| {
+            // The second version check runs under the native import's interrupt guard.
+            wait_for_file(&version_pid, INTERRUPT_STEP)?;
+            let probe: u32 = fs::read_to_string(&version_pid)
+                .map_err(|error| error.to_string())?
+                .parse()
+                .map_err(|error: std::num::ParseIntError| error.to_string())?;
+            sender.attach(omni.id())?;
+            let console = sender.send_break()?;
+            wait_for_file(&acknowledged, INTERRUPT_STEP)?;
+            fs::write(fixture.capture.join("release-version"), "")
+                .map_err(|error| error.to_string())?;
+            if !console.contains(&omni.id()) || console.contains(&probe) {
+                return Err(format!(
+                    "omni {} and version probe {probe} did not have separate consoles: {console:?}",
+                    omni.id()
+                ));
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+    assert_eq!(
+        rolled_back_target("version probe", &run),
+        format!("codex:{THREAD_ID}")
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
 }
 
 #[test]

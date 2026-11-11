@@ -148,6 +148,94 @@ fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog(
         1
     );
     assert_eq!(search("restoredword")["index"]["stale"], 0);
+
+    // A restored database with the same messages changes the source of the existing search text.
+    let histories = home.join("conversations");
+    fs::create_dir_all(&histories).unwrap();
+    Connection::open(histories.join(format!("{id}.db")))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES (0, x'080e9a010b0a096669727374776f7264'),
+                                      (1, x'080e9a010e0a0c726573746f726564776f7264');",
+        )
+        .unwrap();
+    Connection::open(environment.state_root.join("store.sqlite3"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER preserve_chunks BEFORE DELETE ON session_trajectory_chunk_rows
+             BEGIN SELECT RAISE(ABORT, 'unexpected change to reusable search text'); END;",
+        )
+        .unwrap();
+    fs::remove_file(preferred).unwrap();
+    fs::remove_file(fallback).unwrap();
+    assert_eq!(search("restoredword")["index"]["indexed"], 1);
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
+}
+
+#[test]
+fn search_reads_committed_antigravity_steps_from_the_wal() {
+    for (provider, directory) in [
+        ("antigravity", "antigravity-cli"),
+        ("antigravity-desktop", "antigravity-desktop"),
+    ] {
+        let root = tempdir().unwrap();
+        let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+        let home = environment.home.join(directory);
+        let id = Uuid::new_v4().to_string();
+        let histories = home.join("conversations");
+        fs::create_dir_all(&histories).unwrap();
+        if provider == "antigravity" {
+            let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+            catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT)").unwrap();
+            catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'History', 2, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
+        }
+        let database = histories.join(format!("{id}.db"));
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+            INSERT INTO steps VALUES (0, x'080e9a01070a056669727374');
+            PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let search = |term: &str| {
+            let output = environment
+                .command()
+                .args([
+                    "--json",
+                    "search",
+                    "--all-projects",
+                    "--provider",
+                    provider,
+                    term,
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        assert_eq!(search("first")["results"].as_array().unwrap().len(), 1);
+        let before = database.metadata().unwrap();
+        writer
+            .execute(
+                "INSERT INTO steps VALUES (1, x'080e9a010a0a08726573746f726564')",
+                [],
+            )
+            .unwrap();
+        let after = database.metadata().unwrap();
+        assert_eq!(
+            (before.len(), before.modified().unwrap()),
+            (after.len(), after.modified().unwrap())
+        );
+        assert_eq!(
+            search("restored")["results"].as_array().unwrap().len(),
+            1,
+            "{provider}"
+        );
+        assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+    }
 }
 
 #[cfg(unix)]
@@ -806,14 +894,11 @@ fn assert_read_commands(
         .output()
         .expect("inspect imported source in reopened process");
     assert!(
-        inspected.status.success(),
-        "inspect imported source failed: {}",
-        String::from_utf8_lossy(&inspected.stderr)
+        !inspected.status.success(),
+        "the bundle needs an installed Codex to receive a handoff"
     );
-    let inspected: serde_json::Value =
-        serde_json::from_slice(&inspected.stdout).expect("inspect JSON");
-    assert_eq!(inspected["source"], "codex");
-    assert_eq!(inspected["target"], "codex");
+    assert!(String::from_utf8_lossy(&inspected.stderr).contains("OMNI_CODEX_BIN"));
+    assert!(inspected.stdout.is_empty());
 
     let exported_path = output_root.join("re-exported.json");
     let exported = environment

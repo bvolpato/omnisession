@@ -31,6 +31,7 @@ pub(super) enum CatalogReply {
     Partial {
         accepted: Vec<usize>,
         visible: Vec<IndexedSession>,
+        retry_hidden: Vec<usize>,
     },
     Retry(CatalogRetry),
 }
@@ -50,10 +51,29 @@ impl SessionCacheUpdate {
             self.catalog
                 .persist_retry(store, &retry)
                 .and_then(|accepted| match accepted {
-                    Some(accepted) => Ok(CatalogReply::Partial {
-                        accepted,
-                        visible: store.indexed_sessions_for_provider(self.catalog.provider)?,
-                    }),
+                    Some(accepted) => {
+                        let visible = store.indexed_sessions_for_provider(self.catalog.provider)?;
+                        let ids: HashSet<_> = visible.iter().map(|row| &row.session.id).collect();
+                        let mut retry_hidden = Vec::new();
+                        for &index in &accepted {
+                            let row = &self.catalog.sessions[index];
+                            if !ids.contains(&row.session.id)
+                                && let Some(revision) = row.source_revision
+                                && store.can_retry_hidden_session(
+                                    &row.session,
+                                    revision,
+                                    omnis_core::search_document_version(row.session.provider),
+                                )?
+                            {
+                                retry_hidden.push(index);
+                            }
+                        }
+                        Ok(CatalogReply::Partial {
+                            accepted,
+                            visible,
+                            retry_hidden,
+                        })
+                    }
                     None => Ok(CatalogReply::Published),
                 })
         } else {
@@ -463,7 +483,7 @@ pub(super) fn discover_for_picker(
 ) -> Result<Vec<PickerEntry>> {
     let mut retry = None;
     for _ in 0..2 {
-        let (mut sessions, notes) = registry.list_sessions_with_notes(provider, None)?;
+        let (mut sessions, notes) = crate::discover_search_sessions(registry, provider, None)?;
         let complete = notes.is_empty()
             && registry
                 .adapter(provider)
@@ -500,13 +520,34 @@ pub(super) fn discover_for_picker(
                         retry = Some(current);
                         continue;
                     }
-                    CatalogReply::Partial { accepted, visible } => {
+                    CatalogReply::Partial {
+                        accepted,
+                        mut visible,
+                        retry_hidden,
+                    } => {
                         let note = crate::discovery_conflict_note(
                             provider,
                             sessions.len(),
                             accepted.len(),
                         );
                         let _ = sender.send(PickerUpdate::Warning(note));
+                        if !retry_hidden.is_empty() {
+                            let hidden: HashMap<_, _> = retry_hidden
+                                .into_iter()
+                                .map(|index| {
+                                    let selected = &sessions[index];
+                                    (&selected.session.id, selected)
+                                })
+                                .collect();
+                            for current in registry.adapter(provider)?.list_search_sessions(None)? {
+                                if let Some(prior) = hidden.get(&current.session.id)
+                                    && prior.source_path == current.source_path
+                                    && prior.source_revision == current.source_revision
+                                {
+                                    visible.push(indexed_session(&current));
+                                }
+                            }
+                        }
                         DiscoveredCatalog::retain_accepted(&mut sessions, &accepted);
                         return Ok(reconcile_partial(sessions, visible, current_project));
                     }
@@ -528,7 +569,7 @@ fn reconcile_partial(
         .into_iter()
         .map(|session| (session.session.id.clone(), session))
         .collect();
-    let mut matcher = super::WorkspaceMatcher::new(project);
+    let mut matcher = super::SessionWorkspaceMatcher::new(project);
     visible
         .into_iter()
         .map(|row| {
