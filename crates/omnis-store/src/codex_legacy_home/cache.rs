@@ -47,33 +47,33 @@ struct Stamp {
     file_id: Option<Uuid>,
 }
 
+#[cfg(unix)]
+fn identifies_live_file(stamp: &Stamp, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(stat) = path.symlink_metadata() else {
+        return false;
+    };
+    if !stat.is_file() || stamp.inode == 0 || stat.ino() != stamp.inode {
+        return false;
+    }
+    if let Some(file) = stamp.file_id {
+        let name = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
+        let object = [stat.dev().to_le_bytes(), stat.ino().to_le_bytes()];
+        return file == Uuid::new_v5(&name, object.as_flattened());
+    }
+    stat.len() == stamp.len
+        && (stat.mtime(), stat.mtime_nsec()) == (stamp.modified.0, i64::from(stamp.modified.1))
+        && (stat.ctime(), stat.ctime_nsec()) == (stamp.changed.0, i64::from(stamp.changed.1))
+        && stat.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn identifies_live_file(_: &Stamp, _: &Path) -> bool {
+    // These cache stamps do not include an inode for verifying a changed path.
+    false
+}
+
 impl Stamp {
-    #[cfg(unix)]
-    fn identifies_live_file(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(stat) = path.symlink_metadata() else {
-            return false;
-        };
-        if !stat.is_file() || self.inode == 0 || stat.ino() != self.inode {
-            return false;
-        }
-        if let Some(file) = self.file_id {
-            let name = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
-            let object = [stat.dev().to_le_bytes(), stat.ino().to_le_bytes()];
-            return file == Uuid::new_v5(&name, object.as_flattened());
-        }
-        stat.len() == self.len
-            && (stat.mtime(), stat.mtime_nsec()) == (self.modified.0, i64::from(self.modified.1))
-            && (stat.ctime(), stat.ctime_nsec()) == (self.changed.0, i64::from(self.changed.1))
-            && stat.nlink() == 1
-    }
-
-    #[cfg(not(unix))]
-    fn identifies_live_file(&self, _: &Path) -> bool {
-        // These cache stamps do not include an inode for verifying a changed path.
-        false
-    }
-
     fn matches(&self, row: &IndexedSession) -> bool {
         if self.modified.1 >= 1_000_000_000 || self.changed.1 >= 1_000_000_000 {
             return false;
@@ -280,7 +280,7 @@ impl Cache {
                         .strip_prefix(&self.codex_home)
                         .map_or_else(|_| path.to_owned(), |suffix| home.join(suffix));
                     same_path(&rollout_path, &expected)
-                        && rollout.stamp.identifies_live_file(&rollout_path)
+                        && identifies_live_file(&rollout.stamp, &rollout_path)
                 })
                 .and_then(Path::to_str);
             // An unstamped catalog row may belong to a rollout that has changed since
