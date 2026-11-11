@@ -3,10 +3,10 @@ use super::{
     matches_catalog_row, now_timestamp, timestamp_from_db,
 };
 use chrono::{DateTime, Utc};
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -116,6 +116,47 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Returns the stored revisions that belong to the selected native home.
+    /// A selected file can identify a document from a reader that did not record its home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document or its home cannot be read.
+    pub fn selected_document_revisions(
+        &self,
+        provider: Provider,
+        home: &Path,
+        sessions: &[(&str, Option<Uuid>)],
+    ) -> Result<HashMap<String, SourceRevision>> {
+        let picked: Vec<_> = sessions
+            .iter()
+            .map(|(id, file)| (id, file.map(|f| f.simple().to_string())))
+            .collect();
+        let json =
+            serde_json::to_string(&picked).map_err(|_| StoreError::InvalidSessionReference)?;
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare_cached(
+            "SELECT doc.session_id, doc.source_file_id, doc.missing_ancestor_id, doc.source_contents_id
+             FROM json_each(?1) AS picked
+             JOIN session_trajectories AS doc ON doc.provider=?2 AND doc.session_id=(picked.value ->> 0)
+             LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
+             WHERE doc.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3
+               ELSE hex(doc.source_file_id)=upper(picked.value ->> 1) END"
+        ).map_err(database_error)?;
+        statement
+            .query_map(
+                params![
+                    json,
+                    provider.to_string(),
+                    home.as_os_str().as_encoded_bytes()
+                ],
+                |row| Ok((row.get(0)?, super::source_revision_from_row(row, 1)?)),
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
     /// Returns the files from the last listing whose search upgrade has not finished.
     ///
     /// # Errors
@@ -188,6 +229,27 @@ pub(super) fn record_discovery_home(
     Ok(())
 }
 
+pub(super) fn record_verified_document_home(
+    transaction: &Transaction<'_>,
+    session: &SessionRef,
+    revision: SourceRevision,
+    home: &Path,
+) -> Result<()> {
+    transaction.prepare_cached(
+        "INSERT INTO native_search_document_homes(trajectory_id,source_file,source_home,verification)
+         SELECT id,source_file_id,?5,1 FROM session_trajectories
+         WHERE provider=?1 AND session_id=?2 AND origin='native'
+           AND source_file_id=?3 AND source_contents_id IS ?4
+         ON CONFLICT(trajectory_id) DO UPDATE SET source_file=excluded.source_file,
+           source_home=excluded.source_home, verification=1, declared_steps=NULL
+         WHERE (source_file,source_home,verification) IS NOT (excluded.source_file,excluded.source_home,1)"
+    ).and_then(|mut statement| statement.execute(params![
+        session.provider.to_string(), session.id, revision.file.map(Uuid::into_bytes),
+        revision.contents.map(Uuid::into_bytes), home.as_os_str().as_encoded_bytes()
+    ])).map_err(database_error)?;
+    Ok(())
+}
+
 pub(super) fn initialize_session_index_checks(transaction: &Transaction<'_>) -> Result<()> {
     transaction
         .execute_batch(
@@ -238,6 +300,13 @@ pub(super) fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Resu
                     FOREIGN KEY (provider, session_id) REFERENCES session_index (provider, session_id)
                         ON DELETE CASCADE
                 ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS native_search_document_homes (
+            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+            source_file BLOB NOT NULL,
+            source_home BLOB NOT NULL,
+            verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1)),
+            declared_steps INTEGER CHECK(declared_steps >= 0)
+        );
         CREATE TRIGGER IF NOT EXISTS forget_changed_catalog_home
                 AFTER UPDATE ON session_index
                 WHEN NEW.provider IN ('antigravity', 'antigravity-desktop')
@@ -263,6 +332,16 @@ pub(super) fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Resu
                 END;",
         )
         .map_err(database_error)?;
+    let (verified, steps): (bool, bool) = transaction.query_row(
+        "SELECT count(*) FILTER (WHERE name='verification'), count(*) FILTER (WHERE name='declared_steps')
+         FROM pragma_table_info('native_search_document_homes')", [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(database_error)?;
+    if !verified {
+        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1));").map_err(database_error)?;
+    }
+    if !steps {
+        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN declared_steps INTEGER CHECK(declared_steps >= 0);").map_err(database_error)?;
+    }
     if !enrolled {
         transaction.execute("DELETE FROM session_index_reader_checks WHERE provider IN ('antigravity','antigravity-desktop')", []).map_err(database_error)?;
     }

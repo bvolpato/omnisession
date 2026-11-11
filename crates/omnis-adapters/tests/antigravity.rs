@@ -308,3 +308,33 @@ fn plans_documented_resume_and_rejects_unsupported_fork() {
             .contains("no documented native conversation fork")
     );
 }
+
+#[test]
+fn a_torn_tail_preserves_confirmed_turns_for_handoff_and_rejects_search_replacement() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    summary_database(root, root);
+    let mut bytes = transcript(root);
+    let adapter = AntigravityAdapter::with_root(root);
+    let native = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let path = native.source_path.as_deref().unwrap();
+    let intact = adapter.read_session(&native.session).unwrap();
+    bytes.extend_from_slice(b"\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"unconfirmed");
+    for padding in ["", "\n", "\n\n", "\r\n \t\r\n"] {
+        fs::write(path, [bytes.as_slice(), padding.as_bytes()].concat()).unwrap();
+        for budget in [0, u64::MAX] {
+            let failed = adapter.index_search_document(&native.session, Some(path), budget, None);
+            assert!(
+                failed
+                    .err()
+                    .expect("torn search read")
+                    .is::<omnis_adapters::IncompleteTranscript>()
+            );
+        }
+        let snapshot = adapter.read_session(&native.session).unwrap();
+        let (notice, confirmed) = snapshot.events.split_last().unwrap();
+        assert_eq!(confirmed, intact.events);
+        assert!(omnis_core::reports_omitted_events(notice));
+        assert_eq!(notice.payload["omitted_events"], 1);
+    }
+}

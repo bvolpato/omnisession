@@ -2619,6 +2619,12 @@ impl Store {
                 }
                 if let Some(home) = homes.get(&metadata.session.provider) {
                     record_discovery_home(&transaction, &metadata.session, home)?;
+                    discovery::record_verified_document_home(
+                        &transaction,
+                        &metadata.session,
+                        write.document.source_revision,
+                        home,
+                    )?;
                 }
             }
             if let Some(trajectory_id) = trajectory_id {

@@ -846,9 +846,8 @@ impl PickerState {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| TrajectorySelection {
-                    session: entry.session.session.clone(),
-                    source: crate::selected_search_source(&entry.session, entry.cached),
+                .filter_map(|(_, entry)| {
+                    crate::selected_search_trajectory(&entry.session, entry.cached)
                 })
                 .collect(),
         })
@@ -1298,14 +1297,14 @@ fn cached_picker_entries(
     store: &Store,
     current_project: &Path,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
-    let mut sessions =
-        crate::cached_native_catalog(&AdapterRegistry::with_local_adapters(), store, None)?
-            .into_iter()
-            .map(workers::native_session)
-            .collect::<Vec<_>>();
+    let (catalog, mut warnings) =
+        crate::cached_native_catalog(&AdapterRegistry::with_local_adapters(), store, None)?;
+    let mut sessions = catalog
+        .into_iter()
+        .map(workers::native_session)
+        .collect::<Vec<_>>();
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
-    let mut warnings = Vec::new();
     let mut paths = SessionWorkspaceMatcher::new(current_project);
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {

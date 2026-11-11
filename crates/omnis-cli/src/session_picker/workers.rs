@@ -362,18 +362,29 @@ pub(super) fn spawn_cache_updates(
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;
         }
-        if let Ok(titles) = store.trajectory_title_records(None)
-            && sender
-                .send(PickerUpdate::Titles(titles.into_iter().collect()))
-                .is_err()
-        {
-            return;
+        let registry = AdapterRegistry::with_local_adapters();
+        if let Ok(mut titles) = store.trajectory_title_records(None) {
+            let mut eligible = titles
+                .keys()
+                .map(|session| omnis_store::TrajectorySelection {
+                    session: session.clone(),
+                    source: None,
+                })
+                .collect();
+            if crate::scope_search_trajectories(&registry, &store, &mut eligible).is_ok() {
+                crate::retain_scoped_titles(&mut titles, &eligible);
+                if sender
+                    .send(PickerUpdate::Titles(titles.into_iter().collect()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
         if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
             return;
         }
-        let registry = AdapterRegistry::with_local_adapters();
         let freshness = PROVIDERS.map(|provider| {
             (
                 provider,
@@ -830,11 +841,16 @@ fn report_rejected_preview(
         .filter(|&revision| preview_source_matches(key, Some(native), revision)))
 }
 
-fn publish_preview_title(store: &Store, session: &SessionRef, sender: &Sender<PickerUpdate>) {
+fn publish_preview_title(
+    registry: &AdapterRegistry,
+    store: &Store,
+    session: &SessionRef,
+    sender: &Sender<PickerUpdate>,
+) {
     if matches!(
         session.provider,
         Provider::Antigravity | Provider::AntigravityDesktop
-    ) && let Some(title) = search_index::stored_title_update(store, session)
+    ) && let Some(title) = search_index::stored_title_update(registry, store, session)
     {
         let _ = sender.send(PickerUpdate::Titles(vec![title]));
     }
@@ -930,7 +946,7 @@ fn read_picker_preview(
                     return None;
                 }
             } else {
-                publish_preview_title(store, &key.session, sender);
+                publish_preview_title(registry, store, &key.session, sender);
             }
         }
         if let Some((store, _)) = writer
@@ -994,6 +1010,12 @@ pub(super) fn spawn_trajectory_search_updates(
             let result = store.as_ref().map_or_else(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
+                    crate::scope_search_trajectories(
+                        &AdapterRegistry::with_local_adapters(),
+                        store,
+                        &mut request.eligible_sessions,
+                    )
+                    .map_err(|error| error.to_string())?;
                     store
                         .search_selected_trajectory_page(
                             &request.query,

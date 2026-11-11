@@ -83,6 +83,41 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
 }
 
 #[test]
+fn cached_search_keeps_other_providers_when_a_home_cannot_be_resolved() {
+    let fixture = Fixture::new();
+    let indexed = fixture
+        .command()
+        .args(["index", "--provider", "claude"])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let inaccessible = fixture.root.join("not-a-directory");
+    fs::write(&inaccessible, "").unwrap();
+    let search = fixture
+        .command()
+        .env("ANTIGRAVITY_CLI_HOME", inaccessible.join("provider"))
+        .args([
+            "--json",
+            "search",
+            "zebracorn",
+            "--cached",
+            "--all-projects",
+        ])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{search:?}");
+    let cached: Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+    assert!(
+        cached["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("antigravity"))
+    );
+}
+
+#[test]
 fn incomplete_discovery_preserves_cached_metadata_and_history() {
     let fixture = Fixture::new();
     let index = || {

@@ -142,6 +142,13 @@ impl IndexedSessionReader for AdapterRegistry {
             };
             let (read, source_time) = match read_search_snapshot(self, session, true) {
                 Ok(read) => read,
+                Err(error)
+                    if session.provider == Provider::Antigravity
+                        && error.is::<omnis_adapters::IncompleteTranscript>() =>
+                {
+                    // Recover confirmed turns for the caller without replacing the search document.
+                    return read_session(self, session);
+                }
                 Err(error) => {
                     if retry
                         && TrajectorySourceGuard::uses_file_time(session.provider)
@@ -238,6 +245,9 @@ fn store_search_document(
     guard: TrajectorySourceGuard,
     native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
+    if native_session.is_some_and(|(_, native)| has_empty_cli_history(native)) {
+        return Ok(false);
+    }
     let (source_updated_at, source_revision) = source;
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
@@ -720,23 +730,33 @@ fn cached_native_catalog(
     registry: &AdapterRegistry,
     store: &Store,
     provider: Option<Provider>,
-) -> Result<Vec<IndexedSession>> {
+) -> Result<(Vec<IndexedSession>, Vec<String>)> {
     let mut rows = match provider {
         Some(Provider::Imported) => Vec::new(),
         Some(provider) => store.indexed_sessions_for_provider(provider)?,
         None => store.indexed_sessions()?,
     };
+    let mut warnings = Vec::new();
     for selected in [Provider::Antigravity, Provider::AntigravityDesktop] {
-        if provider.is_none_or(|provider| provider == selected)
-            && let Some(home) = registry.discovery_cache_home(selected)?
-        {
-            let excluded = store.excluded_catalog_ids(selected, &home)?;
-            rows.retain(|row| {
-                row.session.provider != selected || !excluded.contains(&row.session.id)
-            });
+        if provider.is_some_and(|provider| provider != selected) {
+            continue;
+        }
+        match registry.discovery_cache_home(selected) {
+            Ok(Some(home)) => {
+                let excluded = store.excluded_catalog_ids(selected, &home)?;
+                rows.retain(|row| {
+                    row.session.provider != selected || !excluded.contains(&row.session.id)
+                });
+            }
+            Ok(None) => {}
+            Err(error) if provider.is_none() => {
+                rows.retain(|row| row.session.provider != selected);
+                warnings.push(format!("{selected} cached sessions skipped: {error}"));
+            }
+            Err(error) => return Err(error),
         }
     }
-    Ok(rows)
+    Ok((rows, warnings))
 }
 
 fn cached_search_sessions(
@@ -745,8 +765,7 @@ fn cached_search_sessions(
     args: &SearchArgs,
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
-    let mut warnings = Vec::new();
-    let indexed = cached_native_catalog(registry, store, args.provider)?;
+    let (indexed, mut warnings) = cached_native_catalog(registry, store, args.provider)?;
     let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
@@ -835,12 +854,18 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
-    let stored = store
+    let mut eligible = sessions
+        .iter()
+        .filter_map(|session| selected_search_trajectory(session, args.cached))
+        .collect();
+    scope_search_trajectories(registry, &store, &mut eligible)?;
+    let mut stored = store
         .trajectory_title_records(None)
         .context("reading derived session titles")?;
+    retain_scoped_titles(&mut stored, &eligible);
     let titles = resolve_search_titles(&mut sessions, stored, args.cached);
     let (hits, has_more) =
-        rank_search_hits(&store, &query, &sessions, &titles, args.limit, args.cached)?;
+        rank_search_hits(&store, &query, &sessions, &titles, args.limit, &eligible)?;
     if json_output {
         let mut value = search_json(
             &query,
@@ -880,14 +905,94 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     Ok(())
 }
 
-fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
-    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+fn has_empty_cli_history(session: &NativeSession) -> bool {
+    session.session.provider == Provider::Antigravity
+        && session.source_path.is_none()
+        && session.source_revision.is_none()
+        && session.event_count == 0
+}
+
+fn selected_search_trajectory(
+    session: &NativeSession,
+    cached: bool,
+) -> Option<TrajectorySelection> {
+    if has_empty_cli_history(session) {
+        return None;
+    }
+    let source = if matches!(
+        session.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) {
+        session.source_revision
+    } else if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         None
     } else if cached {
         session.source_revision
     } else {
         Some(session.source_revision.unwrap_or_default())
+    };
+    Some(TrajectorySelection {
+        session: session.session.clone(),
+        source,
+    })
+}
+
+fn scope_search_trajectories(
+    registry: &AdapterRegistry,
+    store: &Store,
+    eligible: &mut Vec<TrajectorySelection>,
+) -> Result<()> {
+    for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+        let sessions: Vec<_> = eligible
+            .iter()
+            .filter(|row| row.session.provider == provider)
+            .map(|row| {
+                (
+                    row.session.id.as_str(),
+                    row.source.and_then(|source| source.file),
+                )
+            })
+            .collect();
+        if sessions.is_empty() {
+            continue;
+        }
+        let revisions = registry
+            .discovery_cache_home(provider)
+            .ok()
+            .flatten()
+            .map(|home| store.selected_document_revisions(provider, &home, &sessions))
+            .transpose()?
+            .unwrap_or_default();
+        eligible.retain_mut(|row| {
+            if row.session.provider != provider {
+                return true;
+            }
+            let Some(revision) = revisions.get(&row.session.id) else {
+                return false;
+            };
+            row.source = Some(*revision);
+            true
+        });
     }
+    Ok(())
+}
+
+fn retain_scoped_titles(
+    titles: &mut HashMap<SessionRef, omnis_store::IndexedTitle>,
+    eligible: &[TrajectorySelection],
+) {
+    let revisions: HashMap<_, _> = eligible
+        .iter()
+        .filter_map(|row| Some((&row.session, row.source?)))
+        .collect();
+    titles.retain(|session, title| {
+        !matches!(
+            session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) || revisions
+            .get(session)
+            .is_some_and(|revision| revision.matches_file_contents(title.source_revision))
+    });
 }
 
 fn title_matches_search_source(
@@ -895,6 +1000,9 @@ fn title_matches_search_source(
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
+    if has_empty_cli_history(session) {
+        return false;
+    }
     if matches!(
         session.session.provider,
         Provider::Antigravity | Provider::AntigravityDesktop
@@ -972,7 +1080,7 @@ fn rank_search_hits<'a>(
     sessions: &'a [NativeSession],
     titles: &HashMap<SessionRef, String>,
     limit: usize,
-    cached: bool,
+    eligible: &[TrajectorySelection],
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let terms = fuzzy::query_terms(query);
     let display_title = |session: &NativeSession| {
@@ -1023,16 +1131,9 @@ fn rank_search_hits<'a>(
         .iter()
         .map(|session| &session.session)
         .collect::<HashSet<_>>();
-    let eligible = sessions
-        .iter()
-        .map(|session| TrajectorySelection {
-            session: session.session.clone(),
-            source: selected_search_source(session, cached),
-        })
-        .collect::<Vec<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
     let page = store
-        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), &eligible)
+        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), eligible)
         .context("searching indexed conversations")?;
     let by_reference = sessions
         .iter()
@@ -4041,7 +4142,10 @@ mod tests {
                 &sessions,
                 &super::HashMap::new(),
                 limit,
-                false,
+                &sessions
+                    .iter()
+                    .filter_map(|session| super::selected_search_trajectory(session, false))
+                    .collect::<Vec<_>>(),
             )
             .expect("rank matches");
             assert_eq!(

@@ -761,7 +761,7 @@ fn flush_batch(
     if let Ok(indexed) = stored {
         summary.indexed += indexed;
         for prepared in batch.drain(..) {
-            prepared.report_title(store, titles);
+            prepared.report_title(selections.registry, store, titles);
         }
     } else {
         for mut prepared in batch.drain(..) {
@@ -779,7 +779,7 @@ fn flush_batch(
             }
             if let Ok(indexed) = stored {
                 summary.indexed += indexed;
-                prepared.report_title(store, titles);
+                prepared.report_title(selections.registry, store, titles);
             } else {
                 summary.failed += 1;
             }
@@ -909,6 +909,7 @@ struct PreparedIndex {
 }
 
 pub(crate) fn stored_title_update(
+    registry: &AdapterRegistry,
     store: &Store,
     session: &SessionRef,
 ) -> Option<(SessionRef, omnis_store::IndexedTitle)> {
@@ -916,6 +917,19 @@ pub(crate) fn stored_title_update(
         .trajectory_title_records(Some(session))
         .ok()?
         .remove_entry(session)?;
+    if matches!(
+        session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) {
+        let home = registry.discovery_cache_home(session.provider).ok()??;
+        let revision = store
+            .selected_document_revisions(session.provider, &home, &[(&session.id, None)])
+            .ok()?
+            .remove(&session.id)?;
+        if !revision.matches_file_contents(record.source_revision) {
+            return None;
+        }
+    }
     let known = record.title.is_some()
         || record.verified_at.is_some()
         || (record.source_revision.contents.is_some()
@@ -929,10 +943,15 @@ pub(crate) fn stored_title_update(
 impl PreparedIndex {
     fn report_title(
         self,
+        registry: &AdapterRegistry,
         store: &Store,
         titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
     ) {
-        titles.extend(stored_title_update(store, &self.candidate.session));
+        titles.extend(stored_title_update(
+            registry,
+            store,
+            &self.candidate.session,
+        ));
     }
 
     fn store(

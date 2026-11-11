@@ -103,6 +103,120 @@ fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure(
 }
 
 #[test]
+fn antigravity_search_keeps_a_verified_conversation_in_its_original_home() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let id = Uuid::new_v4().to_string();
+    let a = root.path().join("home-a");
+    let b = root.path().join("home-b");
+    for (home, title, count) in [(&a, "First workspace", 2), (&b, "Empty workspace", 0)] {
+        fs::create_dir(home).unwrap();
+        let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+        catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+        catalog.execute("INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, '2026-07-28T12:00:00Z', '[]')", params![id, title, count]).unwrap();
+    }
+    let logs = a.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        logs.join("transcript_full.jsonl"),
+        concat!(
+            r#"{"type":"USER_INPUT","content":"originalprompt"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"homeaword"}"#,
+        ),
+    )
+    .unwrap();
+    let run = |home: &Path, args: &[&str]| {
+        let output = environment
+            .command()
+            .env("ANTIGRAVITY_CLI_HOME", home)
+            .arg("--json")
+            .args(args)
+            .args(["--provider", "antigravity"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let query = ["search", "--all-projects", "homeaword"];
+    assert_eq!(run(&a, &query)["results"].as_array().unwrap().len(), 1);
+    for (steps, torn) in [(0, false), (1, false), (1, true)] {
+        Connection::open(b.join("conversation_summaries.db"))
+            .unwrap()
+            .execute("UPDATE conversation_summaries SET step_count=?1", [steps])
+            .unwrap();
+        if torn {
+            let logs = b.join("brain").join(&id).join(".system_generated/logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(
+                logs.join("transcript_full.jsonl"),
+                r#"{"type":"USER_INPUT","content":"torn"#,
+            )
+            .unwrap();
+        }
+        for flag in [Some("--no-index"), None] {
+            for term in ["originalprompt", "homeaword"] {
+                let mut args = vec!["search", "--all-projects", term];
+                args.extend(flag);
+                assert!(
+                    run(&b, &args)["results"].as_array().unwrap().is_empty(),
+                    "{steps} {torn} {term}"
+                );
+            }
+        }
+        if steps == 0 {
+            let shown = environment
+                .command()
+                .env("ANTIGRAVITY_CLI_HOME", &b)
+                .args(["--json", "show", &format!("antigravity:{id}")])
+                .output()
+                .unwrap();
+            assert!(shown.status.success(), "{shown:?}");
+            let snapshot: CanonicalSnapshot = serde_json::from_slice(&shown.stdout).unwrap();
+            assert!(snapshot.events.is_empty());
+        }
+        run(&b, &["index"]);
+        assert!(
+            run(&b, &["search", "--cached", "--all-projects", "homeaword"])["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            run(&b, &["search", "--cached", "--all-projects", "Empty"])["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    fs::remove_file(logs.join("transcript_full.jsonl")).unwrap();
+    assert_eq!(run(&a, &query)["results"].as_array().unwrap().len(), 1);
+}
+
+fn assert_recovered_antigravity_prefix(environment: &TestEnvironment, id: &str, confirmed: &str) {
+    let shown = environment
+        .command()
+        .args(["--json", "show", &format!("antigravity:{id}")])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let recovered = serde_json::from_slice::<omnis_ir::CanonicalSnapshot>(&shown.stdout).unwrap();
+    assert!(
+        recovered
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+    );
+    assert!(
+        recovered
+            .events
+            .iter()
+            .any(|event| event.payload["text"] == confirmed)
+    );
+}
+
+#[test]
 fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog() {
     let root = tempdir().unwrap();
     let environment = TestEnvironment::new(root.path(), root.path().to_owned());
@@ -136,7 +250,9 @@ fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog(
     fs::write(&preferred, first).unwrap();
     assert_eq!(search("firstword")["results"].as_array().unwrap().len(), 1);
     fs::rename(&preferred, &fallback).unwrap();
-    fs::write(&fallback, r#"{"type":"USER_INPUT","content":"torn"#).unwrap();
+    let torn = r#"{"type":"USER_INPUT","content":"torn"#;
+    fs::write(&fallback, format!("{last}\n{torn}\n\n")).unwrap();
+    assert_recovered_antigravity_prefix(&environment, &id, "restoredword");
     let failed = search("firstword");
     assert_eq!(failed["index"]["failed"], 1);
     assert_eq!(failed["results"].as_array().unwrap().len(), 1);

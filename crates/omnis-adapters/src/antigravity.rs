@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell::Cell,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -84,7 +85,7 @@ impl AntigravityAdapter {
             selected.is_none() || native.source_revision.is_some(),
             "Antigravity history changed during the search read"
         );
-        let read = self.read_summary(session, &summary, preview);
+        let read = self.read_summary(session, &summary, preview, JsonLineTail::RequireComplete);
         let current = self.summary(&session.id)?;
         anyhow::ensure!(
             self.source(&current) == selected
@@ -104,7 +105,13 @@ impl AntigravityAdapter {
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Antigravity)?;
         let summary = self.summary(&session.id)?;
-        self.read_summary(session, &summary, preview)
+        let torn_tail = Cell::new(false);
+        self.read_summary(
+            session,
+            &summary,
+            preview,
+            JsonLineTail::ReportIncomplete(&torn_tail),
+        )
     }
 
     fn read_summary(
@@ -112,6 +119,7 @@ impl AntigravityAdapter {
         session: &SessionRef,
         summary: &Summary,
         preview: bool,
+        tail: JsonLineTail<'_>,
     ) -> Result<CanonicalSnapshot> {
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
@@ -119,11 +127,7 @@ impl AntigravityAdapter {
         match self.source(summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
                 let oversized = if preview {
-                    for record in json_lines_preview_with_tail(
-                        &path,
-                        PREVIEW_RECORDS,
-                        JsonLineTail::RequireComplete,
-                    )? {
+                    for record in json_lines_preview_with_tail(&path, PREVIEW_RECORDS, tail)? {
                         push_transcript_record(&mut builder, &record);
                     }
                     0
@@ -131,7 +135,7 @@ impl AntigravityAdapter {
                     visit_json_lines_with_tail(
                         &path,
                         MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-                        JsonLineTail::RequireComplete,
+                        tail,
                         |record| {
                             push_transcript_record(&mut builder, &record);
                             Ok(())
@@ -140,6 +144,16 @@ impl AntigravityAdapter {
                 };
                 verify_jsonl_history(summary, &builder)?;
                 builder.push_oversized_record_notice(oversized, summary.updated_at);
+                if matches!(tail, JsonLineTail::ReportIncomplete(torn) if torn.get()) {
+                    builder.push(
+                        EventKind::ProviderEvent,
+                        json!({"omitted_events": 1, "native_history_unverified": true, "incomplete_final_record": true}),
+                        summary.updated_at,
+                        ReplayPolicy::HistoricalOnly,
+                        Some("omnisession.antigravity_incomplete_tail".to_owned()),
+                        None,
+                    );
+                }
             }
             Some(path) => {
                 push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
