@@ -109,19 +109,38 @@ fn resume_from_snapshot(
         progress_line("Checking workspace state...")?;
     }
     let current = current_project()?;
-    let project = resume_project(
-        source,
-        &snapshot,
-        &current,
-        args.allow_workspace_mismatch,
-        request.picker_selection.as_ref(),
-    )?;
+    let (project, matches) = if request.resume_in_place
+        && source.provider == Provider::CursorIde
+        && target == Provider::CursorIde
+    {
+        cursor_session_workspace(
+            target,
+            Some(&snapshot.workspace.root),
+            &current,
+            args.allow_workspace_mismatch,
+            request.picker_selection.as_ref(),
+        )?
+    } else {
+        let project = resume_project(
+            source,
+            &snapshot,
+            &current,
+            args.allow_workspace_mismatch,
+            request.picker_selection.as_ref(),
+        )?;
+        let matches = workspace_state_matches(&snapshot.workspace, &project)?;
+        (project, matches)
+    };
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
-        launch_mode_args(request.agent_target(), request.mode, &project, json_output)?
+        launch_mode_args(
+            request.agent_target(),
+            request.mode,
+            cursor_working_directory(target, &project),
+            json_output,
+        )?
     };
-    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     let context = ResumeContext {
         registry,
         args,
@@ -417,7 +436,18 @@ fn resume_native_without_snapshot(
         bail!("`--materialize-only` requires a supported cross-provider native import");
     }
     let current = current_project()?;
-    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
+    let (project, repository_matches) = if request.target == Provider::CursorCli {
+        let session = registry
+            .find_native_session(request.target, &request.source.id)?
+            .with_context(|| format!("finding `{}` metadata", request.source))?;
+        cursor_session_workspace(
+            request.target,
+            session.project_path.as_deref(),
+            &current,
+            args.allow_workspace_mismatch,
+            request.picker_selection.as_ref(),
+        )?
+    } else if let Some(selection) = &request.picker_selection {
         let project = selected_native_workspace(selection, &current)?;
         let repository_matches = workspace_paths_match(&project, &current);
         (project, repository_matches)
@@ -600,11 +630,12 @@ fn resume_opencode_v2_fork(
     let lineage = record_transfer_lineage(&request.source, &child, report, task_binding)
         .context("recording OpenCode fork lineage")
         .map_err(fail)?;
-    println!("Linked OpenCode fork `{child}` under `{}`.", request.source);
-    println!("Launching {}...", request.agent_target());
-    let flushed = flush_stdout();
+    notify_stdout(format_args!(
+        "Linked OpenCode fork `{child}` under `{}`.",
+        request.source
+    ));
+    notify_stdout(format_args!("Launching {}...", request.agent_target()));
     interrupt.finish_recorded(&child, rollback, lineage)?;
-    flushed?;
     run_launch(&plan)
 }
 
@@ -696,6 +727,90 @@ fn explicit_native_workspace(
         safe_terminal_line(&recorded.display().to_string()),
         current.display()
     )
+}
+
+/// Cursor identifies a chat workspace by its exact folder or IDE workspace file.
+pub(super) fn cursor_session_workspace(
+    provider: Provider,
+    recorded: Option<&Path>,
+    current: &Path,
+    allow_workspace_mismatch: bool,
+    selection: Option<&session_picker::PickerSelection>,
+) -> Result<(PathBuf, bool)> {
+    let stored_path =
+        recorded.filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path));
+    let recorded = stored_path
+        .and_then(|path| omnis_core::canonicalize_path(path).ok())
+        .filter(|path| path.is_dir() || is_cursor_workspace_file(provider, path));
+    let matches = |workspace: &Path| {
+        recorded.as_deref().is_some_and(|original| {
+            workspace_paths_match(
+                cursor_working_directory(provider, original),
+                cursor_working_directory(provider, workspace),
+            )
+        })
+    };
+    if let Some(chosen) = selection.and_then(|selection| selection.workspace_override.as_deref()) {
+        anyhow::ensure!(
+            chosen.is_absolute() && !omnis_core::may_reach_network(chosen),
+            "selected Cursor workspace must be a local absolute path"
+        );
+        let chosen = omnis_core::canonicalize_path(chosen)
+            .context("selected Cursor workspace is unavailable")?;
+        anyhow::ensure!(
+            chosen.is_dir() || is_cursor_workspace_file(provider, &chosen),
+            "selected Cursor workspace is not a folder or workspace file"
+        );
+        let repository_matches = matches(&chosen);
+        return Ok((chosen, repository_matches));
+    }
+    let repository_matches = matches(current);
+    if let Some(recorded) = recorded.as_ref()
+        && (repository_matches || selection.is_some_and(|selection| selection.across_projects))
+    {
+        if let Some(selection) = selection {
+            let listed = selection
+                .project_path
+                .as_deref()
+                .filter(|path| !omnis_core::may_reach_network(path))
+                .and_then(|path| omnis_core::canonicalize_path(path).ok());
+            anyhow::ensure!(
+                listed.as_deref() == Some(recorded)
+                    && (provider != Provider::CursorIde
+                        || selection.project_path.as_deref() == stored_path),
+                "selected Cursor session workspace changed during discovery"
+            );
+        }
+        // Cursor IDE hashes the workspace URI. A symlink and its target can have different chat histories.
+        let open_path = if provider == Provider::CursorIde {
+            stored_path.unwrap_or(recorded)
+        } else {
+            recorded
+        };
+        return Ok((open_path.to_path_buf(), true));
+    }
+    if allow_workspace_mismatch {
+        return Ok((current.to_owned(), repository_matches));
+    }
+    bail!(
+        "the recorded Cursor workspace is unavailable or outside this worktree. To use the current workspace, run `omni resume <session> --no-fork --allow-workspace-mismatch`"
+    )
+}
+
+pub(super) fn is_cursor_workspace_file(provider: Provider, path: &Path) -> bool {
+    provider == Provider::CursorIde
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("code-workspace"))
+        && path.is_file()
+}
+
+pub(super) fn cursor_working_directory(provider: Provider, workspace: &Path) -> &Path {
+    if is_cursor_workspace_file(provider, workspace) {
+        workspace.parent().unwrap_or(workspace)
+    } else {
+        workspace
+    }
 }
 
 pub(super) fn selected_native_workspace(
@@ -1282,18 +1397,25 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     Ok(())
 }
 
+pub(super) fn cursor_ide_workspace_plan(workspace: &Path) -> Result<LaunchPlan> {
+    Ok(LaunchPlan {
+        program: cursor_ide_binary()?.to_string_lossy().into_owned(),
+        args: vec![workspace.display().to_string()],
+        cwd: Some(omnis_core::canonicalize_path(cursor_working_directory(
+            Provider::CursorIde,
+            workspace,
+        ))?),
+        env: Vec::new(),
+    })
+}
+
 fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
     if context.args.materialize_only {
         bail!("`--materialize-only` requires a new target session");
     }
-    let binary = cursor_ide_binary()?;
-    let plan = LaunchPlan {
-        program: binary.to_string_lossy().into_owned(),
-        args: vec![context.project.display().to_string()],
-        cwd: Some(context.project.to_path_buf()),
-        env: Vec::new(),
-    };
-    let report = omnis_core::build_cursor_workspace_report(context.repository_matches);
+    let plan = cursor_ide_workspace_plan(context.project)?;
+    let report =
+        omnis_core::build_cursor_workspace_report(context.snapshot, context.repository_matches);
     if context.json_output {
         println!(
             "{}",

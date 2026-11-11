@@ -1870,9 +1870,27 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
     };
     transfer::reject_unsupported_target(target.provider)?;
     transfer::check_launch_profile(target)?;
-    let project = current_project()?;
-    transfer::launch_mode_args(target, args.mode, &project, true)?;
-    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
+    let current = current_project()?;
+    let (project, matches) = if source.provider == target.provider
+        && matches!(target.provider, Provider::CursorCli | Provider::CursorIde)
+    {
+        transfer::cursor_session_workspace(
+            target.provider,
+            Some(&snapshot.workspace.root),
+            &current,
+            false,
+            None,
+        )?
+    } else {
+        let matches = workspace_state_matches(&snapshot.workspace, &current)?;
+        (current, matches)
+    };
+    transfer::launch_mode_args(
+        target,
+        args.mode,
+        transfer::cursor_working_directory(target.provider, &project),
+        true,
+    )?;
     inspect_report(
         registry,
         source.provider,
@@ -1894,8 +1912,9 @@ fn inspect_report(
     let target = agent.provider;
     if source == target {
         if target == Provider::CursorIde {
-            cursor_ide_binary()?;
+            transfer::cursor_ide_workspace_plan(project)?;
             return Ok(omnis_core::build_cursor_workspace_report(
+                snapshot,
                 repository_matches,
             ));
         }

@@ -427,7 +427,9 @@ Ordered user and assistant messages plus bounded tool activity carry over. Tool 
 
 Inspection checks the permission mode that `resume` would use, including your `OMNI_MODE` preference. Use `omni inspect <session> --target <agent> --mode <mode>` to check an explicit override.
 
-Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`. For an existing Cursor IDE chat, both commands check the desktop launcher. Cursor opens the workspace, where you select the chat from Show Chat History.
+Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`.
+
+Cursor Agent resumes the chat in its recorded folder, including a subdirectory of the current repository. Cursor IDE opens the recorded folder or `.code-workspace` file. Select the chat from Show Chat History. If the local Cursor IDE store is missing messages, `inspect` and `resume` report the omission.
 
 **My agent is older than the version gate. What happens?**
 The native import cannot run. On a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel. Scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try.

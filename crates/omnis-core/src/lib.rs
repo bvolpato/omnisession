@@ -3334,12 +3334,80 @@ pub fn build_native_fork_report(provider: Provider, repository_matches: bool) ->
 
 /// Reports the in-place Cursor route that opens the workspace containing the original chat.
 #[must_use]
-pub fn build_cursor_workspace_report(repository_matches: bool) -> FidelityReport {
-    let mut report = native_session_report(
+pub fn build_cursor_workspace_report(
+    snapshot: &CanonicalSnapshot,
+    repository_matches: bool,
+) -> FidelityReport {
+    let mut missing = false;
+    let mut unverified = false;
+    let mut has_messages = false;
+    for event in &snapshot.events {
+        if event.source.provider != Provider::CursorIde {
+            continue;
+        }
+        match event.kind {
+            EventKind::MessageUser | EventKind::MessageAssistant => has_messages = true,
+            EventKind::ProviderEvent
+                if event.source.raw_record_type.as_deref() == Some("cursor_ide.unknown") =>
+            {
+                match event.payload["reason"].as_str() {
+                    Some("missing_bubble" | "missing_composer_data") => missing = true,
+                    _ => unverified = true,
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut history = Vec::new();
+    if !missing && !unverified {
+        history.push(fidelity_entry(
+            "Native conversation",
+            FidelityStatus::Preserved,
+        ));
+    } else if has_messages {
+        history.push(fidelity_entry(
+            "Available native messages",
+            FidelityStatus::Preserved,
+        ));
+    }
+    if missing {
+        history.push(fidelity_entry(
+            "Missing native conversation records",
+            FidelityStatus::Omitted,
+        ));
+    }
+    if unverified {
+        history.push(fidelity_entry(
+            "Unverified native conversation records",
+            FidelityStatus::Unsupported,
+        ));
+    }
+    let mut tools = fidelity_entry("Tool history", FidelityStatus::Preserved);
+    if missing || unverified {
+        tools.status = FidelityStatus::Unsupported;
+        tools.detail = Some(
+            "OmniSession cannot verify tool calls or results in missing or unreadable chat records. Cursor retains the available tool history."
+                .to_owned(),
+        );
+    }
+    history.push(tools);
+    let mut report = native_session_report_with_history(
         Provider::CursorIde,
         TransferMode::OpenWorkspace,
         repository_matches,
+        history,
     );
+    if missing {
+        report
+            .warnings
+            .push("Conversation records are missing from the local Cursor IDE chat.".to_owned());
+    }
+    if unverified {
+        report.warnings.push(
+            "OmniSession could not verify all conversation records in the local Cursor IDE chat."
+                .to_owned(),
+        );
+    }
     report.entries.push(FidelityEntry {
         feature: "Exact chat selection".to_owned(),
         status: FidelityStatus::Unsupported,
@@ -3353,17 +3421,33 @@ fn native_session_report(
     mode: TransferMode,
     repository_matches: bool,
 ) -> FidelityReport {
+    native_session_report_with_history(
+        provider,
+        mode,
+        repository_matches,
+        vec![
+            fidelity_entry("Native conversation", FidelityStatus::Preserved),
+            fidelity_entry("Tool history", FidelityStatus::Preserved),
+        ],
+    )
+}
+
+fn native_session_report_with_history(
+    provider: Provider,
+    mode: TransferMode,
+    repository_matches: bool,
+    mut entries: Vec<FidelityEntry>,
+) -> FidelityReport {
+    entries.extend([
+        fidelity_entry("Workspace state", workspace_status(repository_matches)),
+        fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
+    ]);
     FidelityReport {
         source: provider,
         target: provider,
         mode,
         repository_matches,
-        entries: vec![
-            fidelity_entry("Native conversation", FidelityStatus::Preserved),
-            fidelity_entry("Tool history", FidelityStatus::Preserved),
-            fidelity_entry("Workspace state", workspace_status(repository_matches)),
-            fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
-        ],
+        entries,
         warnings: repository_warning(repository_matches),
     }
 }

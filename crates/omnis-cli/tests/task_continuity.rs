@@ -804,8 +804,19 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
 
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let workspace = root.join("workspace");
-    fs::create_dir(&workspace).unwrap();
+    let repo = root.join("repo");
+    let nested = repo.join("nested");
+    let workspace = repo.join("cursor-workspace");
+    fs::create_dir_all(&nested).unwrap();
+    std::os::unix::fs::symlink(&nested, &workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let cursor = root.join("cursor-data");
     fs::create_dir_all(cursor.join("globalStorage")).unwrap();
     let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
@@ -821,7 +832,7 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
     let desktop = root.join("Cursor.AppImage");
     let source = format!("cursor-ide:{SESSION_ID}");
     let run = |args: &[&str]| {
-        command(root, &workspace)
+        command(root, &repo)
             .env("CURSOR_IDE_HOME", &cursor)
             .env("OMNI_CURSOR_IDE_BIN", &desktop)
             .args(args)
@@ -842,9 +853,77 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
     assert_eq!(report["mode"], "open_workspace");
     assert_eq!(report, resumed["fidelity"]);
     assert_eq!(resumed["exact_chat_selection"], false);
+    let selected = omnis_core::canonicalize_path(&workspace).unwrap();
+    assert_eq!(resumed["launch"]["args"], json!([workspace]));
+    assert_eq!(resumed["launch"]["cwd"], json!(selected));
+
+    let workspace_file = workspace.join("multi.code-workspace");
+    fs::write(&workspace_file, r#"{"folders":[{"path":"."}]}"#).unwrap();
+    let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
+    database
+        .execute(
+            "UPDATE composerHeaders SET value = ?1",
+            [json!({"workspacePath": workspace_file}).to_string()],
+        )
+        .unwrap();
+    drop(database);
+    let opened: Value = serde_json::from_slice(&run(&resume).stdout).unwrap();
+    assert_eq!(opened["launch"]["args"], json!([workspace_file]));
+    assert_eq!(opened["launch"]["cwd"], json!(selected));
     assert_eq!(
-        resumed["launch"]["args"],
-        json!([omnis_core::canonicalize_path(&workspace).unwrap()])
+        opened["fidelity"],
+        serde_json::from_slice::<Value>(&run(&inspect).stdout).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_agent_checks_and_resumes_in_the_chats_recorded_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let repo = root.join("repo");
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let chats = root.join("chats");
+    let session = chats.join("workspace-id").join(SESSION_ID);
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("meta.json"),
+        json!({"id": SESSION_ID, "cwd": nested}).to_string(),
+    )
+    .unwrap();
+    let agent = root.join("cursor-agent");
+    fs::write(&agent, "#!/bin/sh\npwd > \"$PROBE_CWD\"\n").unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+    let probed = root.join("probed");
+    let source = format!("cursor-cli:{SESSION_ID}");
+    let invocation = || {
+        let mut omni = command(root, &repo);
+        omni.env("CURSOR_AGENT_HOME", &chats)
+            .env("OMNI_CURSOR_AGENT_BIN", &agent)
+            .env("PROBE_CWD", &probed)
+            .arg("--json");
+        omni
+    };
+    let inspected = successful_json(invocation().args(["inspect", &source]));
+    let resumed = successful_json(invocation().args(["resume", &source, "--no-fork", "--dry-run"]));
+    let actual = omnis_core::canonicalize_path(&nested).unwrap();
+    assert_eq!(resumed["launch"]["cwd"], json!(actual));
+    assert_eq!(resumed["launch"]["args"], json!(["--resume", SESSION_ID]));
+    assert_eq!(inspected, resumed["fidelity"]);
+    assert_eq!(
+        Path::new(fs::read_to_string(probed).unwrap().trim()),
+        actual
     );
 }
 
@@ -1005,6 +1084,106 @@ fn antigravity_desktop_source_has_its_own_identity_and_continues_elsewhere() {
     );
     assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
     assert_eq!(fs::read(database).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_ide_reports_missing_and_unverified_chat_records() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let cursor = root.join("cursor");
+    fs::create_dir_all(cursor.join("globalStorage")).unwrap();
+    let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
+    database.execute_batch(
+        "CREATE TABLE composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, value);
+         CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+    ).unwrap();
+    database
+        .execute(
+            "INSERT INTO composerHeaders VALUES (?1, NULL, 1, 2, 0, 0, ?2)",
+            [SESSION_ID, &json!({"workspacePath": workspace}).to_string()],
+        )
+        .unwrap();
+    let put = |key: String, value: Value| {
+        database
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                [key, value.to_string()],
+            )
+            .unwrap();
+    };
+    put(
+        format!("composerData:{SESSION_ID}"),
+        json!({
+            "composerId": SESSION_ID, "fullConversationHeadersOnly": [
+                {"bubbleId":"user", "type":1}, {"bubbleId":"reply", "type":2}
+            ]
+        }),
+    );
+    put(
+        format!("bubbleId:{SESSION_ID}:user"),
+        json!({"bubbleId":"user", "type":1, "text":"Synthetic user question"}),
+    );
+    let desktop = root.join("Cursor.AppImage");
+    fs::write(&desktop, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("cursor-ide:{SESSION_ID}");
+    let run = |args: &[&str]| {
+        successful_json(
+            command(root, &workspace)
+                .env("CURSOR_IDE_HOME", &cursor)
+                .env("OMNI_CURSOR_IDE_BIN", &desktop)
+                .args(args),
+        )
+    };
+    for (reply, feature, status, warning) in [
+        (
+            None,
+            "Missing native conversation records",
+            "omitted",
+            "missing",
+        ),
+        (
+            Some(json!({"bubbleId":"reply", "type":2, "futureFormat":true})),
+            "Unverified native conversation records",
+            "unsupported",
+            "could not verify",
+        ),
+    ] {
+        if let Some(reply) = reply {
+            put(format!("bubbleId:{SESSION_ID}:reply"), reply);
+        }
+        let inspected = run(&["--json", "inspect", &source]);
+        let resumed = run(&["--json", "resume", &source, "--dry-run"]);
+        assert_eq!(inspected, resumed["fidelity"]);
+        assert_eq!(inspected["mode"], "open_workspace");
+        assert_eq!(resumed["exact_chat_selection"], false);
+        let entries: HashMap<_, _> = inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry["feature"].as_str().unwrap(), entry))
+            .collect();
+        assert_eq!(entries[feature]["status"], status);
+        assert_eq!(entries["Available native messages"]["status"], "preserved");
+        assert_eq!(entries["Tool history"]["status"], "unsupported");
+        assert!(!entries.contains_key("Native conversation"));
+        assert_eq!(
+            entries.values().any(|e| e["status"] == "omitted"),
+            status == "omitted"
+        );
+        assert!(
+            inspected["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains(warning))
+        );
+    }
 }
 
 #[test]

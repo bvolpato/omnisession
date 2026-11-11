@@ -41,7 +41,12 @@ esac
 
 #[test]
 fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
-    for remove in [true, false] {
+    for (phase, remove) in [
+        ("readback", true),
+        ("readback", false),
+        ("recorded", true),
+        ("launch", true),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let workspace = root.join("workspace");
@@ -64,7 +69,11 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
             .write(true)
             .open(&fifo)
             .unwrap();
-        let mut omni = command(root, &workspace)
+        let mut cli = command(root, &workspace);
+        if phase == "recorded" {
+            cli.env("OMNI_TEST_IMPORT_INTERRUPT", phase);
+        }
+        let mut omni = cli
             .args(["fork", "opencode:ses_parent", "--in", "opencode"])
             .env("PATH", "/usr/bin:/bin")
             .env("OMNI_OPENCODE_BIN", &provider)
@@ -73,16 +82,19 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
             .env("ROOT", root)
             .env("REMOVE", if remove { "yes" } else { "no" })
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
             .unwrap();
         let held = wait_for_marker(&mut omni, &root.join("reading"));
-        if held {
+        drop(omni.stdout.take());
+        let acknowledged = if held && phase == "readback" {
             kill_process_group(Pid::from_child(&omni), Signal::INT).unwrap();
-        }
-        let acknowledged = held && wait_for_marker(&mut omni, &root.join("ack"));
+            wait_for_marker(&mut omni, &root.join("ack"))
+        } else {
+            held
+        };
         release.write_all(b"continue\n").unwrap();
         if omni.wait_timeout(Duration::from_secs(5)).unwrap().is_none() {
             omni.kill().unwrap();
@@ -93,6 +105,13 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
             held && acknowledged,
             "Ctrl+C did not reach the fork guard: {stderr}"
         );
+        assert!(root.join("ses_parent").exists() && root.join("ses_other").exists());
+        if phase == "launch" {
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert!(root.join("ses_child").exists() && root.join("launched").exists());
+            assert!(!root.join("deleted").exists());
+            continue;
+        }
         assert_eq!(
             output.status.code(),
             Some(if remove { 130 } else { 1 }),
@@ -103,7 +122,6 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
             "ses_child\n"
         );
         assert_eq!(root.join("ses_child").exists(), !remove);
-        assert!(root.join("ses_parent").exists() && root.join("ses_other").exists());
         assert!(!root.join("launched").exists());
         assert!(stderr.contains("ses_child"), "{stderr}");
         if !remove {
