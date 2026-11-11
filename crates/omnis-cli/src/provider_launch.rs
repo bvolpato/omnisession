@@ -134,6 +134,63 @@ pub(super) fn resolved_provider_binary(provider: Provider) -> Result<PathBuf> {
     resolve_real_binary(provider, &legacy_alias_directory()?)
 }
 
+/// Checks file identity without requiring read access to an executable on Unix.
+pub(super) fn same_executable(left: &Path, right: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = fs::metadata(left)?;
+        let right = fs::metadata(right)?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    same_file::is_same_file(left, right)
+}
+
+/// An off-PATH Codex installation identifies its executable in the standalone or npm manifest.
+pub(super) fn is_codex_package_entrypoint(program: &Path) -> bool {
+    use std::io::Read;
+    const MANIFEST_LIMIT: u64 = 64 * 1024;
+    let Ok(program) = fs::canonicalize(program) else {
+        return false;
+    };
+    let Some(bin) = program
+        .parent()
+        .filter(|directory| directory.ends_with("bin"))
+    else {
+        return false;
+    };
+    let Some(root) = bin.parent() else {
+        return false;
+    };
+    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let manifest = match name {
+        "codex" | "codex.exe" => root.join("codex-package.json"),
+        "codex.js" => root.join("package.json"),
+        _ => return false,
+    };
+    if !manifest
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.len() <= MANIFEST_LIMIT)
+    {
+        return false;
+    }
+    let Some(metadata) = fs::File::open(manifest).ok().and_then(|file| {
+        serde_json::from_reader::<_, serde_json::Value>(file.take(MANIFEST_LIMIT)).ok()
+    }) else {
+        return false;
+    };
+    if name == "codex.js" {
+        metadata["name"] == "@openai/codex" && metadata["bin"]["codex"] == "bin/codex.js"
+    } else {
+        metadata["layoutVersion"] == 1
+            && metadata["variant"] == "codex"
+            && metadata["entrypoint"] == format!("bin/{name}")
+    }
+}
+
 pub(super) fn cursor_ide_binary() -> Result<PathBuf> {
     if let Some(path) = env::var_os("OMNI_CURSOR_IDE_BIN").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
