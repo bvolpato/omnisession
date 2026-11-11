@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::hash_map::RandomState,
+    collections::{HashMap, HashSet, hash_map::RandomState},
     fmt::{self, Write as _},
     fs,
     hash::{BuildHasher, Hasher},
@@ -213,7 +213,7 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
         "FROM session_trajectory_chunks_fts
          INNER JOIN {chunk_source}
              ON chunks.id = session_trajectory_chunks_fts.rowid
-         INNER JOIN session_trajectories AS trajectories
+         INNER JOIN visible_trajectories AS trajectories
              ON trajectories.id = chunks.trajectory_id
          INNER JOIN eligible
              ON eligible.provider = trajectories.provider
@@ -227,8 +227,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         provider, session_id, redacted_text, content_hash,
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
-        truncation_strategy, origin, protected_by_bundle, document_version, derived_title
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        truncation_strategy, origin, protected_by_bundle, document_version, derived_title, codex_home
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -244,9 +244,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             excluded.protected_by_bundle
         ),
         document_version = excluded.document_version,
-        derived_title = coalesce(excluded.derived_title, session_trajectories.derived_title)
+        codex_home = excluded.codex_home,
+        derived_title = CASE WHEN excluded.codex_home IS NOT session_trajectories.codex_home
+            THEN excluded.derived_title ELSE coalesce(excluded.derived_title, session_trajectories.derived_title) END
     WHERE excluded.document_version >= session_trajectories.document_version AND (
-       excluded.document_version > session_trajectories.document_version
+       (excluded.codex_home IS NOT NULL AND excluded.codex_home IS NOT session_trajectories.codex_home)
+       OR excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
        OR (
            excluded.source_updated_at = session_trajectories.source_updated_at
@@ -422,6 +425,15 @@ pub struct IndexedSession {
     pub event_count: usize,
 }
 
+/// Effective workspace from a read of a specific Codex rollout revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedCodexWorkspace {
+    pub source_path: PathBuf,
+    pub source_stamp: String,
+    pub project_path: Option<PathBuf>,
+    pub git_branch: Option<String>,
+}
+
 /// One ranked full-text session match with bounded redacted context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionTrajectoryMatch {
@@ -504,6 +516,7 @@ struct PreparedTrajectoryWrite<'session, 'document> {
 /// `SQLite`-backed state for one local `OmniSession` installation.
 pub struct Store {
     connection: RefCell<Connection>,
+    codex_home: Option<String>,
 }
 
 impl Store {
@@ -536,8 +549,14 @@ impl Store {
 
         let store = Self {
             connection: RefCell::new(connection),
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+                .and_then(|path| codex_home_key(&path)),
         };
         store.initialize_schema()?;
+        store.initialize_trajectory_scope()?;
         set_private_file(path)?;
         for suffix in ["-wal", "-shm"] {
             let mut auxiliary = path.as_os_str().to_os_string();
@@ -548,6 +567,25 @@ impl Store {
             }
         }
         Ok(store)
+    }
+
+    fn initialize_trajectory_scope(&self) -> Result<()> {
+        let connection = self.connection.borrow();
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE current_codex_home (home TEXT);
+             CREATE TEMP VIEW visible_trajectories AS SELECT * FROM main.session_trajectories AS t
+             WHERE t.provider <> 'codex' OR t.origin = 'imported_bundle'
+                 OR t.codex_home = (SELECT home FROM current_codex_home);",
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "INSERT INTO current_codex_home VALUES (?1)",
+                [&self.codex_home],
+            )
+            .map_err(database_error)?;
+        Ok(())
     }
 
     /// Opens `OMNISESSION_HOME` or `~/.omnisession` as state root.
@@ -1080,22 +1118,7 @@ impl Store {
     ///
     /// Returns an error when cached metadata cannot be read.
     pub fn indexed_sessions(&self) -> Result<Vec<IndexedSession>> {
-        let connection = self.connection.borrow();
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, updated_at_approximate, event_count
-                FROM session_index
-                ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id
-                ",
-            )
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], indexed_session_from_row)
-            .map_err(database_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| StoreError::CorruptStore)
+        self.read_session_index(None, self.codex_home.as_deref())
     }
 
     /// Returns cached metadata for one provider, ordered by most recent update.
@@ -1104,20 +1127,52 @@ impl Store {
     ///
     /// Returns an error when cached metadata cannot be read.
     pub fn indexed_sessions_for_provider(&self, provider: Provider) -> Result<Vec<IndexedSession>> {
+        self.read_session_index(Some(provider), self.codex_home.as_deref())
+    }
+
+    fn read_session_index(
+        &self,
+        provider: Option<Provider>,
+        observation_home: Option<&str>,
+    ) -> Result<Vec<IndexedSession>> {
         let connection = self.connection.borrow();
+        let condition = if provider.is_some() {
+            "WHERE provider = ?3"
+        } else {
+            ""
+        };
         let mut statement = connection
-            .prepare(
-                "
-                SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, updated_at_approximate, event_count
-                FROM session_index
-                WHERE provider = ?1
-                ORDER BY updated_at IS NULL, updated_at DESC, session_id
-                ",
-            )
+            .prepare(&format!(
+                "WITH observed AS (
+                     SELECT 'codex' AS provider, w.session_id,
+                            CASE WHEN i.session_id IS NULL THEN w.title ELSE i.title END AS title,
+                            w.project_path, w.git_branch,
+                            CASE WHEN i.session_id IS NULL THEN w.created_at ELSE i.created_at END AS created_at,
+                            w.source_updated_at AS updated_at, 0 AS updated_at_approximate,
+                            coalesce(i.event_count, w.event_count) AS event_count
+                     FROM codex_workspace_observations AS w LEFT JOIN session_index AS i
+                       ON i.provider = 'codex' AND i.session_id = w.session_id AND i.codex_home = w.provider_home
+                     WHERE w.provider_home = ?1 AND (i.session_id IS NULL
+                         OR (i.updated_at = w.source_updated_at AND i.updated_at_approximate = 0))
+                 ), sessions AS (
+                     SELECT i.provider, i.session_id, i.title, i.project_path, i.git_branch,
+                            i.created_at, i.updated_at, i.updated_at_approximate, i.event_count
+                     FROM session_index AS i WHERE i.provider != 'codex' OR
+                         (i.codex_home = ?2 AND NOT EXISTS (
+                             SELECT 1 FROM observed AS w WHERE w.session_id = i.session_id))
+                     UNION ALL SELECT * FROM observed
+                 )
+                 SELECT * FROM sessions {condition} ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id",
+            ))
             .map_err(database_error)?;
+        let parameters = [observation_home.map(str::to_owned), self.codex_home.clone()]
+            .into_iter()
+            .chain(provider.map(|p| Some(p.to_string())));
         let rows = statement
-            .query_map(params![provider.to_string()], indexed_session_from_row)
+            .query_map(
+                rusqlite::params_from_iter(parameters),
+                indexed_session_from_row,
+            )
             .map_err(database_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
@@ -1167,6 +1222,17 @@ impl Store {
         transaction.commit().map_err(database_error)
     }
 
+    fn codex_home_for(&self, provider: Provider) -> Option<&str> {
+        self.codex_home
+            .as_deref()
+            .filter(|_| provider == Provider::Codex)
+    }
+
+    fn index_check_key(&self, provider: Provider) -> String {
+        self.codex_home_for(provider)
+            .map_or_else(|| provider.to_string(), |home| format!("codex:{home}"))
+    }
+
     /// Inserts or refreshes one cached session without replacing other rows for its provider.
     ///
     /// This is used for durable local sources, whose lifecycle is independent from native
@@ -1190,8 +1256,8 @@ impl Store {
                 "
                 INSERT INTO session_index (
                     provider, session_id, title, project_path, git_branch,
-                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    created_at, updated_at, updated_at_approximate, event_count, indexed_at, codex_home
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT (provider, session_id) DO UPDATE SET
                     title = excluded.title,
                     project_path = excluded.project_path,
@@ -1200,7 +1266,8 @@ impl Store {
                     updated_at = excluded.updated_at,
                     updated_at_approximate = excluded.updated_at_approximate,
                     event_count = excluded.event_count,
-                    indexed_at = excluded.indexed_at
+                    indexed_at = excluded.indexed_at,
+                    codex_home = excluded.codex_home
                 ",
                 params![
                     session.session.provider.to_string(),
@@ -1213,10 +1280,154 @@ impl Store {
                     session.updated_at_approximate,
                     event_count,
                     now_timestamp(),
+                    self.codex_home_for(session.session.provider),
                 ],
             )
             .map_err(database_error)?;
         Ok(())
+    }
+
+    /// Records the workspace found in a rollout and makes the session available to cached discovery.
+    /// The adapter checks the source stamp before it supplies this observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source lacks an exact timestamp, its metadata is invalid, or persistence fails.
+    pub fn record_codex_workspace(
+        &self,
+        session: &IndexedSession,
+        home: &Path,
+        source_path: &Path,
+        source_stamp: &str,
+    ) -> Result<()> {
+        validate_session_ref(&session.session)?;
+        let home = home
+            .to_str()
+            .filter(|home| !home.is_empty())
+            .ok_or(StoreError::InvalidWorkspaceRoot)?;
+        if session.session.provider != Provider::Codex
+            || source_stamp.is_empty()
+            || session.updated_at_approximate
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        let updated_at = session
+            .updated_at
+            .ok_or(StoreError::InvalidSessionReference)?
+            .timestamp_millis();
+        let source_path = source_path
+            .to_str()
+            .filter(|path| !path.is_empty())
+            .ok_or(StoreError::InvalidWorkspaceRoot)?;
+        let project_path = session
+            .project_path
+            .as_deref()
+            .map(|path| path.to_str().ok_or(StoreError::InvalidWorkspaceRoot))
+            .transpose()?;
+        let event_count =
+            i64::try_from(session.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction.execute(
+            "UPDATE session_index AS i SET project_path = NULL, git_branch = NULL
+             WHERE provider = 'codex' AND session_id = ?1 AND codex_home = ?2 AND EXISTS (
+                 SELECT 1 FROM codex_workspace_observations AS w WHERE w.session_id = i.session_id
+                 AND w.provider_home = ?2 AND w.source_stamp != ?3 AND
+                     (w.project_path, w.git_branch, w.source_updated_at) IS (i.project_path, i.git_branch, i.updated_at))",
+            params![session.session.id, home, source_stamp],
+        ).map_err(database_error)?;
+        let changed = transaction.execute(
+            "INSERT INTO codex_workspace_observations
+                 (session_id, source_path, source_stamp, source_updated_at, project_path, git_branch,
+                  provider_home, title, created_at, event_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT (provider_home, session_id) DO UPDATE SET
+                 source_path = excluded.source_path, source_stamp = excluded.source_stamp,
+                 source_updated_at = excluded.source_updated_at, project_path = excluded.project_path,
+                 git_branch = excluded.git_branch, title = excluded.title, created_at = excluded.created_at,
+                 event_count = excluded.event_count
+             WHERE (source_path, source_stamp, source_updated_at, project_path, git_branch, title, created_at, event_count)
+                IS NOT (excluded.source_path, excluded.source_stamp, excluded.source_updated_at,
+                        excluded.project_path, excluded.git_branch, excluded.title, excluded.created_at, excluded.event_count)",
+            params![session.session.id, source_path, source_stamp, updated_at, project_path, session.git_branch,
+                    home, session.title, session.created_at.map(|t| t.timestamp_millis()), event_count],
+        ).map_err(database_error)?;
+        if changed != 0 {
+            transaction.execute(
+                "DELETE FROM session_index WHERE provider = 'codex' AND session_id = ?1 AND codex_home = ?2
+                 AND (updated_at IS NOT ?3 OR updated_at_approximate != 0)",
+                params![session.session.id, home, updated_at],
+            ).map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
+    }
+
+    /// Returns all observed Codex workspaces for a provider discovery pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observations cannot be read.
+    pub fn indexed_codex_workspaces(
+        &self,
+        home: &Path,
+    ) -> Result<HashMap<String, IndexedCodexWorkspace>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare(
+            "SELECT source_path, source_stamp, project_path, git_branch, session_id FROM codex_workspace_observations WHERE provider_home = ?1",
+        ).map_err(database_error)?;
+        statement
+            .query_map([home.to_str()], |row| {
+                Ok((row.get(4)?, codex_workspace_from_row(row)?))
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
+    /// Returns the observation for a selected Codex session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observation cannot be read.
+    pub fn indexed_codex_workspace(
+        &self,
+        home: &Path,
+        id: &str,
+    ) -> Result<Option<IndexedCodexWorkspace>> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT source_path, source_stamp, project_path, git_branch
+             FROM codex_workspace_observations WHERE session_id = ?1 AND provider_home = ?2",
+                params![id, home.to_str()],
+                codex_workspace_from_row,
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    /// Removes a stale observation if the stored stamp still matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observation cannot be removed.
+    pub fn forget_codex_workspace(&self, home: &Path, id: &str, old_stamp: &str) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction.execute(
+            "UPDATE session_index SET project_path = NULL, git_branch = NULL
+             WHERE provider = 'codex' AND session_id = ?1 AND codex_home = ?3 AND EXISTS (
+                 SELECT 1 FROM codex_workspace_observations AS w
+                 WHERE w.session_id = ?1 AND w.source_stamp = ?2 AND w.provider_home = ?3 AND
+                       (w.project_path, w.git_branch, w.source_updated_at)
+                       IS (session_index.project_path, session_index.git_branch, session_index.updated_at))",
+            params![id, old_stamp, home.to_str()],
+        ).map_err(database_error)?;
+        transaction.execute(
+                "DELETE FROM codex_workspace_observations WHERE session_id = ?1 AND source_stamp = ?2 AND provider_home = ?3",
+                params![id, old_stamp, home.to_str()],
+        ).map_err(database_error)?;
+        transaction.commit().map_err(database_error)
     }
 
     /// Removes cached metadata and redacted search content for one native session.
@@ -1232,15 +1443,18 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider = session.provider.to_string();
+        remove_codex_workspace(&transaction, session, self.codex_home.as_deref())?;
         transaction
             .execute(
-                "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
+                "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2
+                 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = (SELECT home FROM current_codex_home))",
                 params![provider, session.id],
             )
             .map_err(database_error)?;
         transaction
             .execute(
-                "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+                "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+                 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = (SELECT home FROM current_codex_home))",
                 params![provider, session.id],
             )
             .map_err(database_error)?;
@@ -1308,8 +1522,10 @@ impl Store {
             .map(|binding| binding.session);
         let provider = session.provider.to_string();
         for statement in [
-            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
-            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2
+                 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = (SELECT home FROM current_codex_home))",
+            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+                 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = (SELECT home FROM current_codex_home))",
             "UPDATE session_bindings SET is_current = 0
              WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
         ] {
@@ -1317,6 +1533,7 @@ impl Store {
                 .execute(statement, params![provider, session.id])
                 .map_err(database_error)?;
         }
+        remove_codex_workspace(&transaction, session, self.codex_home.as_deref())?;
         if let Some(replaced) = &replaced {
             replace_branch_head(
                 &transaction,
@@ -1343,7 +1560,7 @@ impl Store {
         let timestamp = connection
             .query_row(
                 "SELECT indexed_at FROM session_index_state WHERE provider = ?1",
-                params![provider.to_string()],
+                params![self.index_check_key(provider)],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -1361,7 +1578,7 @@ impl Store {
         let timestamp = connection
             .query_row(
                 "SELECT checked_at FROM session_index_checks WHERE provider = ?1",
-                params![provider.to_string()],
+                params![self.index_check_key(provider)],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -1383,7 +1600,7 @@ impl Store {
                 VALUES (?1, ?2)
                 ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at
                 ",
-                params![provider.to_string(), now_timestamp()],
+                params![self.index_check_key(provider), now_timestamp()],
             )
             .map_err(database_error)?;
         Ok(())
@@ -1423,31 +1640,19 @@ impl Store {
         sessions: &[IndexedSession],
         complete: bool,
     ) -> Result<()> {
-        if sessions
-            .iter()
-            .any(|session| session.session.provider != provider || session.session.id.is_empty())
-        {
-            return Err(StoreError::InvalidSessionReference);
-        }
-        if sessions.iter().any(|session| {
-            session
-                .project_path
-                .as_deref()
-                .is_some_and(|path| path.to_str().is_none())
-        }) {
-            return Err(StoreError::InvalidWorkspaceRoot);
-        }
+        validate_indexed_sessions(provider, sessions, complete)?;
         if complete && provider_index_matches(self, provider, sessions)? {
             return record_unchanged_provider_refresh(self, provider);
         }
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider_name = provider.to_string();
+        let codex_home = self.codex_home_for(provider);
         if complete {
             transaction
                 .execute(
-                    "DELETE FROM session_index WHERE provider = ?1",
-                    params![provider_name],
+                    "DELETE FROM session_index WHERE provider = ?1 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = ?2)",
+                    params![provider_name, codex_home],
                 )
                 .map_err(database_error)?;
         }
@@ -1456,11 +1661,11 @@ impl Store {
             let mut insert = "
                 INSERT INTO session_index (
                     provider, session_id, title, project_path, git_branch,
-                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    created_at, updated_at, updated_at_approximate, event_count, indexed_at, codex_home
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "
             .to_owned();
-            if !complete {
+            if !complete || provider == Provider::Codex {
                 insert.push_str(
                     "ON CONFLICT (provider, session_id) DO UPDATE SET
                         title = excluded.title,
@@ -1470,7 +1675,7 @@ impl Store {
                         updated_at = excluded.updated_at,
                         updated_at_approximate = excluded.updated_at_approximate,
                         event_count = excluded.event_count,
-                        indexed_at = excluded.indexed_at",
+                        indexed_at = excluded.indexed_at, codex_home = excluded.codex_home",
                 );
             }
             let mut statement = transaction.prepare(&insert).map_err(database_error)?;
@@ -1490,6 +1695,7 @@ impl Store {
                         session.updated_at_approximate,
                         event_count,
                         indexed_at,
+                        codex_home,
                     ])
                     .map_err(database_error)?;
             }
@@ -1502,7 +1708,7 @@ impl Store {
                     VALUES (?1, ?2)
                     ON CONFLICT (provider) DO UPDATE SET indexed_at = excluded.indexed_at
                     ",
-                    params![provider_name, indexed_at],
+                    params![self.index_check_key(provider), indexed_at],
                 )
                 .map_err(database_error)?;
         }
@@ -1513,11 +1719,11 @@ impl Store {
                 VALUES (?1, ?2)
                 ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at
                 ",
-                params![provider_name, indexed_at],
+                params![self.index_check_key(provider), indexed_at],
             )
             .map_err(database_error)?;
         if complete {
-            prune_stale_native_trajectories(&transaction, &provider_name)?;
+            prune_stale_native_trajectories(&transaction, &provider_name, codex_home)?;
         }
         transaction.commit().map_err(database_error)
     }
@@ -1709,6 +1915,10 @@ impl Store {
                         i64::from(write.document.origin == SessionTrajectoryOrigin::ImportedBundle),
                         i64::from(write.document.document_version),
                         write.document.derived_title,
+                        (write.session.provider == Provider::Codex
+                            && write.document.origin == SessionTrajectoryOrigin::Native)
+                            .then_some(self.codex_home.as_deref())
+                            .flatten(),
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1750,7 +1960,7 @@ impl Store {
                 "
                 SELECT EXISTS (
                     SELECT 1
-                    FROM session_trajectories
+                    FROM visible_trajectories
                     WHERE provider = ?1
                       AND session_id = ?2
                       AND complete = 1
@@ -1799,7 +2009,7 @@ impl Store {
         connection
             .query_row(
                 "SELECT EXISTS (
-                    SELECT 1 FROM session_trajectories
+                    SELECT 1 FROM visible_trajectories
                     WHERE provider = ?1 AND session_id = ?2
                       AND source_complete = 1 AND source_updated_at >= ?3 AND document_version >= ?4
                 )",
@@ -1826,7 +2036,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version
-                 FROM session_trajectories",
+                 FROM visible_trajectories",
             )
             .map_err(database_error)?;
         let rows = statement
@@ -1872,7 +2082,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, document_version
-                 FROM trajectory_index_failures",
+                 FROM trajectory_index_failures WHERE provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home)",
             )
             .map_err(database_error)?;
         let rows = statement
@@ -1919,12 +2129,12 @@ impl Store {
         connection
             .execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     provider, session_id, source_updated_at, document_version, failed_at, codex_home
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (provider, session_id) DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
                      document_version = excluded.document_version,
-                     failed_at = excluded.failed_at",
+                     failed_at = excluded.failed_at, codex_home = excluded.codex_home",
                 params![
                     session.provider.to_string(),
                     session.id,
@@ -1934,6 +2144,7 @@ impl Store {
                         .map(DateTime::timestamp_millis),
                     i64::from(failure.document_version),
                     now_timestamp(),
+                    (session.provider == Provider::Codex).then_some(self.codex_home.as_deref()).flatten(),
                 ],
             )
             .map_err(database_error)?;
@@ -1950,7 +2161,8 @@ impl Store {
         let connection = self.connection.borrow_mut();
         connection
             .execute(
-                "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2",
+                "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2
+                 AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = (SELECT home FROM current_codex_home))",
                 params![session.provider.to_string(), session.id],
             )
             .map_err(database_error)?;
@@ -1966,7 +2178,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, derived_title FROM session_trajectories
+                "SELECT provider, session_id, derived_title FROM visible_trajectories
                  WHERE derived_title IS NOT NULL AND derived_title <> ''",
             )
             .map_err(database_error)?;
@@ -2218,6 +2430,7 @@ impl Store {
                     title TEXT,
                     project_path TEXT,
                     git_branch TEXT,
+                    codex_home TEXT,
                     created_at INTEGER,
                     updated_at INTEGER,
                     updated_at_approximate INTEGER NOT NULL DEFAULT 0
@@ -2249,12 +2462,11 @@ impl Store {
                     document_version INTEGER NOT NULL CHECK (document_version >= 0),
                     failed_at INTEGER NOT NULL,
                     PRIMARY KEY (provider, session_id)
-                ) WITHOUT ROWID;
-
-                ",
+                ) WITHOUT ROWID;",
             )
             .map_err(database_error)?;
         ensure_session_index_approximation_column(&transaction)?;
+        initialize_codex_workspace_schema(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         if stored_format < STORE_FORMAT {
@@ -2609,6 +2821,45 @@ fn multi_clause_page_sql(
     sql
 }
 
+fn codex_home_key(path: &Path) -> Option<String> {
+    let absolute = std::path::absolute(path).ok()?;
+    // A missing provider home can still have cached sessions under a symlinked parent directory.
+    let resolved = absolute.ancestors().find_map(|ancestor| {
+        let canonical = fs::canonicalize(ancestor).ok()?;
+        let suffix = absolute.strip_prefix(ancestor).ok()?;
+        Some(if suffix.as_os_str().is_empty() {
+            canonical
+        } else {
+            canonical.join(suffix)
+        })
+    })?;
+    resolved.into_os_string().into_string().ok()
+}
+
+fn validate_indexed_sessions(
+    provider: Provider,
+    sessions: &[IndexedSession],
+    complete: bool,
+) -> Result<()> {
+    let mut ids = HashSet::new();
+    if sessions.iter().any(|session| {
+        session.session.provider != provider
+            || session.session.id.is_empty()
+            || (complete && provider == Provider::Codex && !ids.insert(&session.session.id))
+    }) {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    if sessions.iter().any(|session| {
+        session
+            .project_path
+            .as_deref()
+            .is_some_and(|path| path.to_str().is_none())
+    }) {
+        return Err(StoreError::InvalidWorkspaceRoot);
+    }
+    Ok(())
+}
+
 fn provider_index_matches(
     store: &Store,
     provider: Provider,
@@ -2617,7 +2868,7 @@ fn provider_index_matches(
     if store.session_index_refreshed_at(provider)?.is_none() {
         return Ok(false);
     }
-    let mut existing = store.indexed_sessions_for_provider(provider)?;
+    let mut existing = store.read_session_index(Some(provider), None)?;
     let mut incoming = sessions.iter().collect::<Vec<_>>();
     existing.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     incoming.sort_by(|left, right| left.session.id.cmp(&right.session.id));
@@ -2646,25 +2897,37 @@ fn record_unchanged_provider_refresh(store: &Store, provider: Provider) -> Resul
             "INSERT INTO session_index_checks (provider, checked_at)
              VALUES (?1, ?2)
              ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at",
-            params![provider_name, now_timestamp()],
+            params![store.index_check_key(provider), now_timestamp()],
         )
         .map_err(database_error)?;
-    prune_stale_native_trajectories(&transaction, &provider_name)?;
+    prune_stale_native_trajectories(&transaction, &provider_name, store.codex_home.as_deref())?;
     transaction.commit().map_err(database_error)
 }
 
-fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str) -> Result<()> {
+fn prune_stale_native_trajectories(
+    transaction: &Transaction<'_>,
+    provider: &str,
+    codex_home: Option<&str>,
+) -> Result<()> {
+    if provider == "codex" {
+        transaction.execute(
+            "DELETE FROM codex_workspace_observations AS w WHERE w.provider_home = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM session_index WHERE provider = 'codex' AND session_id = w.session_id AND codex_home = ?1)",
+            [codex_home],
+        ).map_err(database_error)?;
+    }
     transaction
         .execute(
             "DELETE FROM session_trajectories
              WHERE provider = ?1
                AND protected_by_bundle = 0
+               AND (provider <> 'codex' OR codex_home IS NULL OR codex_home = ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM session_index
                    WHERE session_index.provider = session_trajectories.provider
                      AND session_index.session_id = session_trajectories.session_id
                )",
-            params![provider],
+            params![provider, codex_home],
         )
         .map_err(database_error)?;
     Ok(())
@@ -2695,6 +2958,50 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
         .map_err(database_error)
 }
 
+fn initialize_codex_workspace_schema(transaction: &Transaction<'_>) -> Result<()> {
+    for table in ["session_index", "trajectory_index_failures"] {
+        let has_home = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = 'codex_home')",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error)?;
+        if !has_home {
+            transaction
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN codex_home TEXT;"))
+                .map_err(database_error)?;
+        }
+    }
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS codex_workspace_observations (
+             provider_home TEXT NOT NULL, session_id TEXT NOT NULL, source_path TEXT NOT NULL,
+             source_stamp TEXT NOT NULL, source_updated_at INTEGER NOT NULL, project_path TEXT,
+             git_branch TEXT, title TEXT, created_at INTEGER, event_count INTEGER NOT NULL,
+             PRIMARY KEY (provider_home, session_id)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS codex_workspace_session_id ON codex_workspace_observations (session_id);",
+        )
+        .map_err(database_error)
+}
+
+fn remove_codex_workspace(
+    transaction: &Transaction<'_>,
+    session: &SessionRef,
+    home: Option<&str>,
+) -> Result<()> {
+    if session.provider == Provider::Codex {
+        transaction
+            .execute(
+                "DELETE FROM codex_workspace_observations WHERE session_id = ?1 AND provider_home = ?2",
+                params![session.id, home],
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
     transaction
         .execute_batch(
@@ -2722,6 +3029,22 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
         )
         .map_err(database_error)?;
     ensure_trajectory_coverage_columns(transaction)?;
+    for (name, event) in [
+        (
+            "changed",
+            "UPDATE OF source_stamp ON codex_workspace_observations WHEN old.source_stamp IS NOT new.source_stamp",
+        ),
+        ("removed", "DELETE ON codex_workspace_observations"),
+    ] {
+        transaction.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS codex_workspace_{name} AFTER {event} BEGIN
+                 UPDATE session_trajectories SET codex_home = NULL
+                  WHERE provider = 'codex' AND session_id = old.session_id AND codex_home = old.provider_home;
+                 DELETE FROM trajectory_index_failures
+                  WHERE provider = 'codex' AND session_id = old.session_id AND codex_home = old.provider_home;
+             END;"
+        )).map_err(database_error)?;
+    }
     initialize_trajectory_chunk_schema(transaction)
 }
 
@@ -2828,6 +3151,11 @@ fn ensure_trajectory_version_columns(
                  ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0
                  CHECK (document_version >= 0);",
             )
+            .map_err(database_error)?;
+    }
+    if !columns.iter().any(|column| column == "codex_home") {
+        transaction
+            .execute_batch("ALTER TABLE session_trajectories ADD COLUMN codex_home TEXT;")
             .map_err(database_error)?;
     }
     if !columns.iter().any(|column| column == "derived_title") {
@@ -3331,6 +3659,15 @@ fn handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRecord> 
     })
 }
 
+fn codex_workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedCodexWorkspace> {
+    Ok(IndexedCodexWorkspace {
+        source_path: PathBuf::from(row.get::<_, String>(0)?),
+        source_stamp: row.get(1)?,
+        project_path: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+        git_branch: row.get(3)?,
+    })
+}
+
 fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
     let provider = row
         .get::<_, String>(0)?
@@ -3670,6 +4007,236 @@ mod tests {
                 .expect("second selection")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn codex_workspace_survives_discovery_until_its_source_changes() {
+        let temporary = tempdir().unwrap();
+        let home = temporary.path();
+        let mut store = Store::open(home.join("store.sqlite3")).unwrap();
+        store.codex_home = home.to_str().map(str::to_owned);
+        let mut header = indexed_session(Provider::Codex, "moved", "Synthetic session");
+        header.updated_at = DateTime::from_timestamp_millis(77);
+        let mut observed = header.clone();
+        observed.project_path = Some(temporary.path().join("moved-workspace"));
+        observed.git_branch = None;
+        let source = temporary.path().join("rollout.jsonl");
+        store
+            .record_codex_workspace(&observed, home, &source, "first")
+            .unwrap();
+        assert_eq!(store.indexed_sessions().unwrap(), [observed.clone()]);
+        let changes = store.connection.borrow().total_changes();
+        store
+            .record_codex_workspace(&observed, home, &source, "first")
+            .unwrap();
+        assert_eq!(store.connection.borrow().total_changes(), changes);
+        store
+            .replace_indexed_sessions(Provider::Codex, std::slice::from_ref(&header))
+            .unwrap();
+        assert_eq!(store.indexed_sessions().unwrap(), [observed.clone()]);
+
+        let mut replaced = observed;
+        replaced.project_path = None;
+        let new_source = temporary.path().join("replacement.jsonl");
+        store
+            .record_codex_workspace(&replaced, home, &new_source, "second")
+            .unwrap();
+        store
+            .forget_codex_workspace(home, "moved", "first")
+            .unwrap();
+        let workspace = store
+            .indexed_codex_workspace(home, "moved")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.source_stamp, "second");
+        assert_eq!(workspace.source_path, new_source);
+        assert_eq!(
+            store.indexed_codex_workspaces(home).unwrap()["moved"],
+            workspace
+        );
+        assert_eq!(
+            store
+                .indexed_sessions_for_provider(Provider::Codex)
+                .unwrap(),
+            [replaced]
+        );
+        store
+            .forget_codex_workspace(home, "moved", "second")
+            .unwrap();
+        assert_eq!(store.indexed_sessions().unwrap(), [header]);
+    }
+
+    #[test]
+    fn codex_workspaces_with_the_same_id_and_timestamp_are_isolated_by_home() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("store.sqlite3");
+        let home_a = temporary.path().join("codex-a");
+        let home_b = temporary.path().join("codex-b");
+        let mut first = Store::open(&path).unwrap();
+        first.codex_home = home_a.to_str().map(str::to_owned);
+        let mut second = Store::open(&path).unwrap();
+        second.codex_home = home_b.to_str().map(str::to_owned);
+        let mut a = indexed_session(Provider::Codex, "shared", "First session");
+        a.updated_at = DateTime::from_timestamp_millis(77);
+        let mut b = a.clone();
+        b.title = Some("Second session".into());
+        b.project_path = Some(temporary.path().join("second-workspace"));
+        let mut disjoint = indexed_session(Provider::Codex, "only-first", "First header only");
+        disjoint.updated_at = None;
+        first
+            .replace_indexed_sessions(Provider::Codex, std::slice::from_ref(&disjoint))
+            .unwrap();
+        assert!(
+            second
+                .session_index_checked_at(Provider::Codex)
+                .unwrap()
+                .is_none()
+        );
+        first
+            .record_codex_workspace(&a, &home_a, &home_a.join("rollout"), "stamp")
+            .unwrap();
+        second
+            .record_codex_workspace(&b, &home_b, &home_b.join("rollout"), "stamp")
+            .unwrap();
+        second
+            .replace_indexed_sessions(Provider::Codex, std::slice::from_ref(&b))
+            .unwrap();
+        assert_eq!(
+            first.indexed_sessions().unwrap(),
+            [a.clone(), disjoint.clone()]
+        );
+        assert_eq!(second.indexed_sessions().unwrap(), [b.clone()]);
+
+        second
+            .forget_codex_workspace(&home_b, "shared", "stamp")
+            .unwrap();
+        let cached = second.indexed_sessions().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].project_path, None);
+        assert_eq!(cached[0].git_branch, None);
+        assert_eq!(
+            first.indexed_sessions().unwrap(),
+            [a.clone(), disjoint.clone()]
+        );
+        second
+            .connection
+            .borrow()
+            .execute(
+                "UPDATE session_index SET codex_home = NULL WHERE session_id = 'shared'",
+                [],
+            )
+            .unwrap();
+        assert!(second.indexed_sessions().unwrap().is_empty());
+        assert_eq!(
+            first.indexed_sessions().unwrap(),
+            [a.clone(), disjoint.clone()]
+        );
+        second
+            .replace_indexed_sessions(Provider::Codex, &[])
+            .unwrap();
+        assert!(second.indexed_sessions().unwrap().is_empty());
+        assert_eq!(first.indexed_sessions().unwrap(), [a, disjoint]);
+    }
+
+    #[test]
+    fn unowned_codex_cache_rows_require_a_new_read_before_they_are_visible() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("cache")).unwrap();
+        let session = indexed_session(Provider::Codex, "legacy", "Old private title");
+        store.upsert_indexed_session(&session).unwrap();
+        let time = Utc::now();
+        store
+            .upsert_session_trajectory(&session.session, "Old private message", time, true)
+            .unwrap();
+        store.connection.borrow().execute_batch(
+            "UPDATE session_trajectories SET codex_home = NULL, derived_title = 'Old private title';
+             UPDATE session_index SET codex_home = NULL;"
+        ).unwrap();
+        assert!(store.indexed_sessions().unwrap().is_empty());
+        assert!(store.trajectory_titles().unwrap().is_empty());
+        assert!(
+            store
+                .search_session_trajectories("private", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .session_trajectory_source_is_current(&session.session, time)
+                .unwrap()
+        );
+        store
+            .upsert_session_trajectory(&session.session, "Fresh conversation", time, true)
+            .unwrap();
+        assert_eq!(
+            store.search_session_trajectories("fresh", 10).unwrap(),
+            [session.session]
+        );
+        assert!(store.trajectory_titles().unwrap().is_empty());
+
+        let explicit = SessionRef::new(Provider::Codex, "imported");
+        let marker = "Portable bundle";
+        store
+            .upsert_session_trajectory_document(
+                &explicit,
+                marker,
+                time,
+                marker.len(),
+                marker.len(),
+                "none",
+                true,
+                SessionTrajectoryOrigin::ImportedBundle,
+            )
+            .unwrap();
+        assert_eq!(
+            store.search_session_trajectories("portable", 10).unwrap(),
+            [explicit]
+        );
+    }
+
+    #[test]
+    fn codex_workspace_respects_missing_timestamps_and_partial_refreshes() {
+        let temporary = tempdir().unwrap();
+        let home = temporary.path();
+        let mut store = Store::open(home.join("store.sqlite3")).unwrap();
+        store.codex_home = home.to_str().map(str::to_owned);
+        let source = temporary.path().join("rollout");
+        let mut session = indexed_session(Provider::Codex, "id", "Session");
+        assert!(
+            store
+                .record_codex_workspace(&session, home, &source, "stamp")
+                .is_err()
+        );
+        session.updated_at = DateTime::from_timestamp_millis(7);
+        session.updated_at_approximate = true;
+        assert!(
+            store
+                .record_codex_workspace(&session, home, &source, "stamp")
+                .is_err()
+        );
+        assert!(store.indexed_codex_workspaces(home).unwrap().is_empty());
+
+        session.updated_at_approximate = false;
+        store
+            .record_codex_workspace(&session, home, &source, "stamp")
+            .unwrap();
+        let mut new_header = session.clone();
+        new_header.project_path = Some(temporary.path().join("other"));
+        new_header.updated_at = None;
+        store
+            .merge_indexed_sessions(Provider::Codex, &[new_header.clone()])
+            .unwrap();
+        assert_eq!(store.indexed_sessions().unwrap(), [new_header]);
+        assert!(store.indexed_codex_workspace(home, "id").unwrap().is_some());
+        store
+            .replace_indexed_sessions(Provider::Codex, &[])
+            .unwrap();
+        assert!(store.indexed_codex_workspace(home, "id").unwrap().is_none());
+        store
+            .record_codex_workspace(&session, home, &source, "stamp")
+            .unwrap();
+        store.forget_session(&session.session).unwrap();
+        assert!(store.indexed_codex_workspaces(home).unwrap().is_empty());
     }
 
     #[test]
@@ -5591,11 +6158,11 @@ mod tests {
                 INSERT INTO session_trajectories (
                     provider, session_id, redacted_text, source_updated_at, complete, indexed_at
                 ) VALUES (
-                    'codex', 'legacy', 'legacy migration searchable marker', 1, 1, 1
+                    'claude', 'legacy', 'legacy migration searchable marker', 1, 1, 1
                 );
                 INSERT INTO bundles (bundle_id, bundle_json, saved_at) VALUES (
                     'synthetic-bundle',
-                    '{"snapshot":{"session":{"provider":"codex","id":"legacy"}}}',
+                    '{"snapshot":{"session":{"provider":"claude","id":"legacy"}}}',
                     1
                 );"#,
             )
@@ -5636,13 +6203,13 @@ mod tests {
         drop(connection);
 
         store
-            .replace_indexed_sessions(Provider::Codex, &[])
+            .replace_indexed_sessions(Provider::Claude, &[])
             .expect("successful empty refresh");
         assert_eq!(
             store
                 .search_session_trajectories("migration searchable", 10)
                 .expect("bundle-protected migrated trajectory"),
-            vec![SessionRef::new(Provider::Codex, "legacy")]
+            vec![SessionRef::new(Provider::Claude, "legacy")]
         );
     }
 

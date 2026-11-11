@@ -24,7 +24,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -108,6 +108,14 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// Workspace evidence for a session whose active directory can change between turns.
+pub struct NativeWorkspace {
+    pub directory: Option<PathBuf>,
+    /// Directory the native client can safely infer when it opens the session.
+    pub startup_directory: Option<PathBuf>,
+    pub git: GitState,
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
@@ -145,6 +153,28 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Finds an exact ID, with an optional workspace for providers whose listings depend on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn find_native_session_with_project(
+        &self,
+        id: &str,
+        _project: Option<&Path>,
+    ) -> Result<Option<NativeSession>> {
+        self.find_native_session(id)
+    }
+
+    /// Reads the effective workspace when it can differ from the discovery metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot determine the effective directory.
+    fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+        Ok(None)
     }
 
     /// Non-fatal discovery observations from this adapter.

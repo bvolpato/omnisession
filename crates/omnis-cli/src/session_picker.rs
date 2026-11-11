@@ -441,23 +441,24 @@ impl PickerState {
             return Ok(());
         };
         let source = &entry.session.session;
-        let Some(live) = registry
-            .find_native_session(source.provider, &source.id)
-            .with_context(|| {
-                format!("could not verify the workspace for cached session `{source}`")
-            })?
-            .filter(|live| &live.session == source)
-        else {
-            bail!("Could not verify the workspace for cached session `{source}` by exact ID.");
-        };
-        if live.project_path.as_deref().map(Path::as_os_str)
+        let project_path =
+            verified_picker_workspace(registry, &entry.session).with_context(|| {
+                format!("Could not verify the workspace for cached session `{source}` by exact ID")
+            })?;
+        if project_path.as_deref().map(Path::as_os_str)
             == entry.session.project_path.as_deref().map(Path::as_os_str)
         {
             return Ok(());
         }
+        let updated = NativeSession {
+            project_path,
+            ..entry.session.clone()
+        };
+        self.previews.remove_session(&updated.session);
+        self.preview_deadline = Some(Instant::now() + PREVIEW_DEBOUNCE);
         self.update_provider_entries(
-            source.provider,
-            picker_entries(vec![live], current_project, false),
+            updated.session.provider,
+            picker_entries(vec![updated], current_project, true),
             false,
         );
         bail!(
@@ -686,6 +687,44 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
+    fn remember_preview_workspace(&mut self, key: &PreviewKey, value: &PreviewValue) {
+        let PreviewValue::Ready { preview, .. } = value else {
+            return;
+        };
+        if key.session.provider != Provider::Codex {
+            return;
+        }
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let Some(entry) = self
+            .entry_positions
+            .get(&key.session.to_string())
+            .and_then(|index| self.entries.get_mut(*index))
+        else {
+            return;
+        };
+        if key.updated_at != entry.session.updated_at
+            || (entry.session.project_path.as_deref().map(Path::as_os_str)
+                == preview.workspace_root.as_deref().map(Path::as_os_str)
+                && entry.session.git_branch == preview.git_branch)
+        {
+            return;
+        }
+        entry
+            .session
+            .project_path
+            .clone_from(&preview.workspace_root);
+        entry.session.git_branch.clone_from(&preview.git_branch);
+        entry.current_workspace = preview.workspace_root.as_deref().is_some_and(|path| {
+            omnis_core::session_workspace_matches(key.session.provider, path, &self.current_project)
+        });
+        entry.fields = SearchFields::new(
+            &entry.session,
+            self.derived_titles.get(&entry.key).map(String::as_str),
+        );
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected_key);
+    }
+
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
             self.remember_derived_titles(vec![(key.session.clone(), title)]);
@@ -852,9 +891,22 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
+    fn session_directory(&self, entry: &PickerEntry) -> Option<PathBuf> {
+        let session = &entry.session;
+        match self.previews.get(&self.preview_key(session)) {
+            Some(PreviewValue::Ready { preview, .. })
+                if !entry.cached && session.session.provider == Provider::Codex =>
+            {
+                preview.workspace_root.clone()
+            }
+            _ => session.project_path.clone(),
+        }
+    }
+
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
         PreviewKey {
             session: session.session.clone(),
+            revision: self.previews.revision(&session.session),
             updated_at: session.updated_at,
             continuation_after: self.lineage.continuation_after(&session.session),
         }
@@ -932,6 +984,7 @@ impl PickerState {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    revision: u64,
     updated_at: Option<DateTime<Utc>>,
     continuation_after: Option<DateTime<Utc>>,
 }
@@ -949,9 +1002,14 @@ enum PreviewValue {
 struct PreviewCache {
     values: HashMap<PreviewKey, PreviewValue>,
     order: VecDeque<PreviewKey>,
+    revisions: HashMap<SessionRef, u64>,
 }
 
 impl PreviewCache {
+    fn revision(&self, session: &SessionRef) -> u64 {
+        self.revisions.get(session).copied().unwrap_or_default()
+    }
+
     fn contains(&self, key: &PreviewKey) -> bool {
         self.values.contains_key(key)
     }
@@ -980,6 +1038,8 @@ impl PreviewCache {
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
+        let revision = self.revisions.entry(session.clone()).or_default();
+        *revision = revision.wrapping_add(1);
         self.order.retain(|key| key.session != *session);
         self.values.retain(|key, _| key.session != *session);
     }
@@ -1218,6 +1278,22 @@ fn cached_picker_entries(
         entries.push(PickerEntry::new(session, current, true));
     }
     Ok((entries, warnings))
+}
+
+fn verified_picker_workspace(
+    registry: &AdapterRegistry,
+    cached: &NativeSession,
+) -> Result<Option<PathBuf>> {
+    let source = &cached.session;
+    let adapter = registry.adapter(source.provider)?;
+    if let Some(workspace) = adapter.native_workspace(source)? {
+        return Ok(workspace.directory);
+    }
+    let live = adapter
+        .find_native_session_with_project(&source.id, cached.project_path.as_deref())?
+        .filter(|session| &session.session == source)
+        .context("the provider did not return the selected session")?;
+    Ok(live.project_path)
 }
 
 fn normalized_picker_entries(
@@ -1489,7 +1565,7 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
-    let project_path = entry.session.project_path.clone();
+    let project_path = state.session_directory(entry);
     let targets = available_targets
         .iter()
         .copied()
@@ -3420,11 +3496,7 @@ mod tests {
             None,
             false,
         );
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -3474,11 +3546,7 @@ mod tests {
         state.query = "pagination".to_owned();
         assert!(state.visible_indices().is_empty());
 
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
@@ -4020,11 +4088,7 @@ mod tests {
             false,
         );
         state.current_git_branch = Some("main".to_owned());
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -4237,6 +4301,7 @@ mod tests {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                revision: 0,
                 updated_at: None,
                 continuation_after: None,
             })
@@ -4249,6 +4314,7 @@ mod tests {
         cache.insert(
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                revision: 0,
                 updated_at: None,
                 continuation_after: None,
             },
@@ -5248,11 +5314,12 @@ mod tests {
         let metadata = serde_json::json!({
             "type": "session_meta",
             "timestamp": "2026-09-09T00:00:00Z",
-            "payload": {"id": id, "cwd": current}
+            "payload": {"id": id, "cwd": previous}
         });
+        let moved = serde_json::json!({"type": "turn_context", "payload": {"cwd": current}});
         fs::write(
             sessions.join(format!("rollout-{id}.jsonl")),
-            metadata.to_string(),
+            format!("{metadata}\n{moved}\n"),
         )
         .unwrap();
         let mut registry = AdapterRegistry::new();
@@ -5266,9 +5333,43 @@ mod tests {
         };
         let cached = session(Provider::Codex, id, &previous, Some("Moved session"));
         let mut state = PickerState::new(vec![cached], &previous, None, false);
-
+        let key = state.preview_key(&state.entries[0].session);
         assert!(matches!(select(&mut state), RowSelection::Notice(_)));
         assert!(state.visible_indices().is_empty());
+
+        // The background worker can finish an earlier preview after Enter verifies the move.
+        let deliver = |state: &mut PickerState, key: PreviewKey, workspace: &Path| {
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(PickerUpdate::Preview {
+                    key,
+                    value: PreviewValue::Ready {
+                        preview: Box::new(SessionPreview {
+                            workspace_root: Some(workspace.to_path_buf()),
+                            ..synthetic_preview("Workspace preview")
+                        }),
+                        continuation: None,
+                        complete: false,
+                    },
+                })
+                .unwrap();
+            receive_updates(
+                &receiver,
+                state,
+                &mut HashSet::new(),
+                &mut Vec::new(),
+                &previous,
+            );
+        };
+        deliver(&mut state, key, &previous);
+        assert!(
+            state.visible_indices().is_empty(),
+            "late preview restored the old workspace"
+        );
+        let current_key = state.preview_key(&state.entries[0].session);
+        deliver(&mut state, current_key.clone(), &current);
+        assert!(state.previews.contains(&current_key));
+
         state.all_projects = true;
         assert!(matches!(select(&mut state),
             RowSelection::Selected(PickerOutcome::Resume(choice))

@@ -20,23 +20,30 @@ fn cached_search_repairs_titles_saved_by_an_older_picker() {
     let directory = fixture.root.join("state");
     fs::create_dir_all(&directory).unwrap();
     let path = directory.join("store.sqlite3");
-    let store = omnis_store::Store::open(&path).unwrap();
-    rusqlite::Connection::open(&path)
-        .unwrap()
+    omnis_store::Store::open(&path).unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
         .execute(
             "INSERT INTO session_index (provider, session_id, title, event_count, indexed_at)
-         VALUES ('codex', ?1, 'Archived example, password=fixture', 0, 0)",
-            [CODEX_ID],
+             VALUES ('claude', ?1, ?3, 0, 0), ('codex', ?2, ?3, 0, 0)",
+            [CLAUDE_ID, CODEX_ID, "Archived example, password=fixture"],
         )
         .unwrap();
 
     let result = fixture.search_json(&["Archived", "--all-projects", "--cached", "--show-text"]);
     let expected = "Archived example, password=[REDACTED: PASSWORD]";
-    assert_eq!(result_sessions(&result), [format!("codex:{CODEX_ID}")]);
+    // Legacy Codex metadata has no verified provider home. Its stored title is still redacted.
+    assert_eq!(result_sessions(&result), [format!("claude:{CLAUDE_ID}")]);
     assert_eq!(result["results"][0]["title"], expected);
     assert_eq!(
-        store.indexed_sessions().unwrap()[0].title.as_deref(),
-        Some(expected)
+        database
+            .query_row(
+                "SELECT count(*) FROM session_index WHERE title = ?1",
+                [expected],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
     );
 }
 

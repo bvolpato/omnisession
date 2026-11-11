@@ -94,6 +94,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
         sender.clone(),
         search_index_receiver,
         Arc::clone(&search_index_stop),
+        current_project.to_path_buf(),
     );
     spawn_update_check(sender);
 
@@ -111,6 +112,7 @@ pub(super) fn spawn_search_index(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<IndexCandidate>>,
     stop: Arc<AtomicBool>,
+    current_project: PathBuf,
 ) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
@@ -131,6 +133,9 @@ pub(super) fn spawn_search_index(
                 },
             };
             let candidates = receiver.try_iter().last().unwrap_or(candidates);
+            let has_codex = candidates
+                .iter()
+                .any(|candidate| candidate.session.provider == Provider::Codex);
             let should_stop = || {
                 if stop.load(Ordering::Relaxed) {
                     return true;
@@ -152,6 +157,19 @@ pub(super) fn spawn_search_index(
                 },
             ) {
                 Ok(summary) => {
+                    if has_codex
+                        && summary.indexed > 0
+                        && !stop.load(Ordering::Relaxed)
+                        && let Ok(mut sessions) = registry.list_sessions(Provider::Codex, None)
+                    {
+                        populate_approximate_updated_at(&mut sessions);
+                        let entries = normalized_picker_entries(sessions, &current_project, false);
+                        let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                            provider: Provider::Codex,
+                            // Indexing refreshes observed workspaces. Only discovery can remove rows.
+                            result: Ok((entries, false)),
+                        }));
+                    }
                     found_failures |= summary.failed > 0;
                     if found_failures && !summary.stopped {
                         let _ = sender.send(PickerUpdate::IndexFailures(
@@ -568,8 +586,11 @@ pub(super) fn receive_updates(
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
             PickerUpdate::Preview { key, value } => {
-                state.remember_preview_title(&key, &value);
-                state.previews.insert(key, value, &state.preview_window);
+                if key.revision == state.previews.revision(&key.session) {
+                    state.remember_preview_workspace(&key, &value);
+                    state.remember_preview_title(&key, &value);
+                    state.previews.insert(key, value, &state.preview_window);
+                }
                 state.trajectory_index_changed();
             }
             PickerUpdate::TrajectorySearch { generation, result } => {

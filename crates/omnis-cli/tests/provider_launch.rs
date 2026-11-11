@@ -37,21 +37,99 @@ exit "$LAUNCH_EXIT_CODE"
 
 #[cfg(unix)]
 #[test]
+fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
+    let fixture = Fixture::new();
+    let subdirectory = fixture.workspace.join("nested");
+    fs::create_dir(&subdirectory).unwrap();
+    fixture.init_git();
+    let path = fixture.root.join(format!(
+        "codex/sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"
+    ));
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        file,
+        "\n{}",
+        json!({"type":"turn_context","payload":{"cwd":subdirectory}})
+    )
+    .unwrap();
+    drop(file);
+
+    let plan = |options: &[&str]| {
+        let output = fixture
+            .command()
+            .args([
+                "--json",
+                "resume",
+                SOURCE_ID,
+                "--in",
+                "codex",
+                "--no-fork",
+                "--dry-run",
+            ])
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["launch"].clone()
+    };
+    let resumed = plan(&[]);
+    assert_eq!(resumed["cwd"], json!(subdirectory));
+    assert_eq!(resumed["args"], json!(["--cd", ".", "resume", SOURCE_ID]));
+    assert_eq!(
+        plan(&["--allow-workspace-mismatch"])["cwd"],
+        json!(fixture.workspace)
+    );
+
+    let probe = fixture.root.join("codex-probe");
+    fs::write(
+        &probe,
+        r#"#!/bin/sh
+case "$1" in
+  --version) echo 'codex-cli 0.167.1' ;;
+  --help) pwd -P >> "$LAUNCH_CAPTURE/codex-probes"; echo '  --approve-for-me' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output_after_write(Command::new(&probe).arg("--version"))
+            .status
+            .success()
+    );
+    let inspection = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", probe)
+        .args([
+            "--json", "inspect", SOURCE_ID, "--target", "codex", "--mode", "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inspection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let probes = fs::read_to_string(fixture.capture.join("codex-probes")).unwrap();
+    let directories = probes.lines().map(std::path::Path::new).collect::<Vec<_>>();
+    assert_eq!(
+        directories,
+        [subdirectory.as_path(), subdirectory.as_path()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn legacy_opencode_resolves_the_last_listed_id_and_retries_export_in_its_directory() {
     let fixture = Fixture::new();
     let directory = fixture.workspace.join("subdir");
     fs::create_dir(&directory).unwrap();
-    assert!(
-        Command::new("git")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .args(["init", "--quiet"])
-            .arg(&fixture.workspace)
-            .env("HOME", fixture.root.join("home"))
-            .status()
-            .unwrap()
-            .success()
-    );
+    fixture.init_git();
     let id = "ses_selected";
     let mut rows: Vec<_> = (0..10_000)
         .map(|i| json!({"id": format!("ses_other_{i}")}))
@@ -257,6 +335,20 @@ impl Fixture {
         )
         .expect("write synthetic history");
         fixture
+    }
+
+    fn init_git(&self) {
+        assert!(
+            Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.join("home"))
+                .args(["init", "--quiet"])
+                .arg(&self.workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn command(&self) -> Command {
