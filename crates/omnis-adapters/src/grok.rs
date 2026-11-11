@@ -1113,7 +1113,11 @@ fn message_content(
         {
             text.push_str(chunk);
         } else if block.is_null() || block["type"] == "text" {
+            text.push_str("\n[Source message content unreadable]\n");
             content_unreadable = true;
+            if !block.is_null() && preservation.retain(block) {
+                historical_content.push(block.clone());
+            }
         } else if preservation.retain(block) {
             if !text.is_empty() {
                 text.push('\n');
@@ -1144,7 +1148,7 @@ fn message_content(
             push(content);
         }
     } else {
-        content_unreadable = true;
+        push(&Value::Null);
     }
     (text, historical_content, content_unreadable)
 }
@@ -1247,7 +1251,7 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let Some(pending) = pending.take() else {
         return;
     };
-    if !pending.text.is_empty() || pending.content_unreadable {
+    if !pending.text.is_empty() {
         let mut payload = json!({ "text": pending.text });
         if pending.content_unreadable {
             payload["content_unreadable"] = Value::Bool(true);
@@ -1255,7 +1259,11 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
                 payload["message_id"] = Value::String(id);
             }
         }
-        let nontext_blocks = pending.content.len();
+        let nontext_blocks = pending
+            .content
+            .iter()
+            .filter(|block| block["type"] != "text")
+            .count();
         if !pending.content.is_empty() {
             payload["content"] = Value::Array(pending.content);
         }
@@ -1815,6 +1823,30 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == EventKind::MessageUser)
         );
+    }
+
+    #[test]
+    fn malformed_blocks_preserve_the_gap_and_opaque_evidence() {
+        let root = tempfile::tempdir().expect("synthetic Grok root");
+        let block = json!({"type": "text", "text": {"part": "opaque"}, "annotations": {"audience": ["user"]}});
+        let records = ["Release ticket A".into(), block.clone(), "B is ready".into()]
+            .map(|content: Value| json!({"sessionUpdate": "agent_message_chunk", "messageId": "reply", "content": content}));
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id": SESSION_ID}),
+            &records,
+        );
+        let snapshot = GrokAdapter::with_root(root.path())
+            .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+            .expect("partial message");
+        let payload = &snapshot.events[0].payload;
+        assert_eq!(
+            payload["text"],
+            "Release ticket A\n[Source message content unreadable]\nB is ready"
+        );
+        assert_eq!(payload["content"][0], block);
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
     }
 
     #[test]
