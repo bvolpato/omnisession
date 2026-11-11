@@ -827,7 +827,7 @@ enum CompletedKind {
     User,
     Assistant,
     AsyncAssistant,
-    Compaction,
+    Documentary,
     Plan,
     Tool,
 }
@@ -843,7 +843,7 @@ impl CompletedKind {
             }
             Some("AgentMessage") => Self::Assistant,
             Some("Plan") => Self::Plan,
-            Some("ContextCompaction") => Self::Compaction,
+            Some(_) if !completed_item::model_receipt(&payload["item"]) => Self::Documentary,
             _ => Self::Tool,
         }
     }
@@ -851,6 +851,7 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
+    model: Option<u64>,
     kind: CompletedKind,
     sequence: u64,
 }
@@ -1158,6 +1159,7 @@ impl CodexHistory {
         if self.source_ordinal == 0 {
             self.rollout_lines.start_segment(record);
             self.paginated = self.rollout_lines.paginated();
+            self.items.tool_projection.paginated = self.paginated;
         }
         let disposition =
             self.rollout_lines
@@ -1900,6 +1902,7 @@ impl CodexHistory {
             });
             push_response_item(builder, payload, stamp, &mut self.items);
             self.items.tool_owner = None;
+            self.finish_unscoped_result(id);
             self.items.projected
         };
         let key = self.paginated_tool_id(payload, turn.as_deref(), id);
@@ -1968,7 +1971,8 @@ impl CodexHistory {
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
         let kind = CompletedKind::for_item(payload);
-        let (scope, original) = self.completion_position(builder, &native_turn, id, kind, display);
+        let projection = self.completion_position(builder, &native_turn, id, kind, display);
+        let original = projection.original;
         let owner = self
             .named_turns
             .get(&native_turn)
@@ -1991,6 +1995,9 @@ impl CodexHistory {
         let user = payload["item"]["type"] == "UserMessage";
         items.identity = MessageIdentity::completed(turn, id, user);
         let scoped = MessageIdentity::completed(&native_turn, id, user);
+        items.tool_projection.paginated = self.paginated;
+        items.tool_projection.peer = projection.peer;
+        items.tool_projection.matched_turn = None;
         items.tool_turn = Some(native_turn.clone());
         items.tool_owner = self.named_turns.get(&native_turn).copied();
         items.cited_display = matches!(
@@ -2007,6 +2014,7 @@ impl CodexHistory {
         items.projected = None;
         let new_turn = items.project_identified(builder, payload, turn, id, timestamp);
         let previous_message = items.previous_message.take();
+        let peer = items.tool_projection.peer.take();
         let projected = items.finish_identified();
         let was_displayed = self.observe_reply_revision(builder, previous_message, message_input);
         if owner.is_some() {
@@ -2018,7 +2026,13 @@ impl CodexHistory {
                 .observe(builder, sequence, input, previous_display);
         }
         if display {
-            self.observe_display_sequence(builder, sequence, turn, id, &payload["item"]);
+            self.observe_display_sequence(
+                builder,
+                peer.unwrap_or(sequence),
+                turn,
+                id,
+                &payload["item"],
+            );
         }
         if let Some(key) = message_id {
             self.message_ids.insert(key, sequence);
@@ -2048,14 +2062,7 @@ impl CodexHistory {
         {
             self.place_early_answer(builder, input, sequence);
         }
-        let positions = self
-            .completed
-            .entry(self.aliases.resolve(turn).to_owned())
-            .or_default();
-        if scope == CompletionScope::Published {
-            positions.remove(&(CompletionScope::Historical(kind), id.to_owned()));
-        }
-        positions.insert((scope, id.to_owned()), CompletedPosition { kind, sequence });
+        self.remember_completion(turn, id, kind, projection, sequence, peer);
         Some(sequence)
     }
 
@@ -2319,7 +2326,15 @@ fn push_codex_session_metadata(
 }
 
 #[derive(Default)]
+struct ToolProjection {
+    paginated: bool,
+    peer: Option<u64>,
+    matched_turn: Option<String>,
+}
+
+#[derive(Default)]
 struct CodexItems {
+    tool_projection: ToolProjection,
     message: Option<VisibleMessage>,
     previous_message: Option<(u64, PreviousDisplay)>,
     mirrors: MessageMirrors,
@@ -2469,12 +2484,29 @@ impl CodexItems {
             self.outcomes.take(
                 id,
                 display,
-                self.update,
+                if self.tool_projection.paginated {
+                    self.tool_projection.peer
+                } else {
+                    self.update
+                },
                 self.tool_turn.as_deref(),
                 self.tool_owner,
             )
         });
-        let original = self.update.or(matched);
+        let matched = matched.map(|entry| {
+            self.tool_projection.matched_turn = entry.turn;
+            entry.sequence
+        });
+        let mirror = self
+            .tool_projection
+            .paginated
+            .then(|| self.tool_projection.peer.take().or(matched))
+            .flatten();
+        let original = if self.tool_projection.paginated {
+            self.update
+        } else {
+            self.update.or(matched)
+        };
         if let Some(sequence) = original
             && let Some(previous) = builder.event_at_mut(sequence)
         {
@@ -2498,11 +2530,11 @@ impl CodexItems {
                 previous.source.raw_record_type = Some(raw_type);
                 previous.replay_policy = ReplayPolicy::HistoricalOnly;
             }
-            self.projected = Some(sequence);
+            self.finish_tool_projection(builder, sequence, display, mirror);
             return;
         }
         let sequence = builder.checkpoint();
-        if let Some(id) = result_id {
+        if let Some(id) = result_id.filter(|_| mirror.is_none()) {
             self.outcomes.push(
                 id,
                 display,
@@ -2511,7 +2543,6 @@ impl CodexItems {
                 self.tool_owner,
             );
         }
-        self.projected = Some(sequence);
         if !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent) {
             self.tool_events += 1;
         }
@@ -2523,6 +2554,25 @@ impl CodexItems {
             Some(raw_type),
             None,
         );
+        self.finish_tool_projection(builder, sequence, display, mirror);
+    }
+
+    fn finish_tool_projection(
+        &mut self,
+        builder: &mut EventBuilder,
+        sequence: u64,
+        display: bool,
+        mirror: Option<u64>,
+    ) {
+        self.projected = Some(sequence);
+        self.tool_projection.peer = mirror.filter(|&other| {
+            let (slot, model) = if display {
+                (sequence, other)
+            } else {
+                (other, sequence)
+            };
+            completion_positions::pair(builder, slot, model)
+        });
     }
 }
 
@@ -2537,7 +2587,7 @@ fn push_completed_item(
         Some("AgentMessage") => EventKind::MessageAssistant,
         _ => {
             if let Some((kind, payload)) = completed_item::historical_item(item) {
-                let id = (!matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent))
+                let id = completed_item::model_receipt(item)
                     .then(|| item["id"].as_str())
                     .flatten();
                 items.push_historical(

@@ -16,7 +16,7 @@ impl PendingOutcomes {
         known: Option<u64>,
         turn: Option<&str>,
         owner: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<ScopedRecord> {
         let opposite = if display {
             &mut self.model
         } else {
@@ -46,7 +46,7 @@ impl PendingOutcomes {
                 })
             }),
         };
-        let matched = queue.remove(index?)?.sequence;
+        let matched = queue.remove(index?)?;
         if queue.is_empty() {
             opposite.remove(id);
         }

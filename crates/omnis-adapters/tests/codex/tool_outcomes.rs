@@ -1092,3 +1092,71 @@ fn replacing_a_published_slot_preserves_one_physical_model_result() {
         }
     }
 }
+
+#[test]
+fn image_view_replacing_a_command_keeps_its_path_and_the_physical_receipt() {
+    let image = json!({"type":"ImageView","id":"cmd","path":"file:///fixture/published-image.png"});
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "inspect fixture"),
+        call(Some("turn")),
+        model_result("physical receipt"),
+        command("turn", "failed"),
+        turn_item("turn", &image),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(search.source_complete);
+        assert!(search.text.contains("published-image.png"));
+        assert_eq!(
+            results(&snapshot),
+            [(&EventKind::ToolCompleted, "physical receipt")]
+        );
+    }
+}
+
+#[test]
+fn a_request_replacing_a_command_keeps_its_slot_when_the_model_result_arrives() {
+    for late_result in [false, true] {
+        let mut records = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            call(Some("turn")),
+        ];
+        let result = model_result("physical output");
+        if !late_result {
+            records.push(result.clone());
+        }
+        records.extend([
+            command("turn", "completed"),
+            page_user("turn", "second", "last objective"),
+            page_user("turn", "cmd", "revised first slot"),
+        ]);
+        if late_result {
+            records.push(result);
+        }
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                omnis_core::plan_semantic_handoff(&snapshot)
+                    .objective
+                    .as_deref(),
+                Some("last objective")
+            );
+            assert_eq!(
+                visible_text(&snapshot),
+                ["revised first slot", "last objective"]
+            );
+            assert_eq!(
+                results(&snapshot),
+                [(&EventKind::ToolCompleted, "physical output")]
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert!(text.contains("last objective") && text.contains("physical output"));
+            }
+        }
+    }
+}

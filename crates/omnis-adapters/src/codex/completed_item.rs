@@ -125,6 +125,20 @@ fn byte_range(value: &Value) -> bool {
     checkpoint_wire::fields(value, &[("start", offset), ("end", offset)])
 }
 
+pub(super) fn model_receipt(item: &Value) -> bool {
+    matches!(
+        item["type"].as_str(),
+        Some(
+            "CommandExecution"
+                | "FileChange"
+                | "FunctionCallOutput"
+                | "DynamicToolCall"
+                | "McpToolCall"
+                | "CollabAgentToolCall"
+        )
+    )
+}
+
 /// Select the historical fields from a completed Codex turn item. The caller handles messages.
 pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     let item_type = item["type"].as_str()?;

@@ -264,6 +264,12 @@ impl PaginatedAnswers {
             .map(|(_, turn, _)| turn)
     }
 
+    pub(super) fn move_tool_display(&mut self, from: u64, to: u64) {
+        if let Some(display) = self.tool_displays.remove(&from) {
+            self.tool_displays.insert(to, display);
+        }
+    }
+
     pub(super) fn forget_tool_display(&mut self, sequence: u64) {
         self.tool_displays.remove(&sequence);
     }

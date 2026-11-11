@@ -347,6 +347,7 @@ fn completed_positions(
             let super::CompletedPosition {
                 kind,
                 sequence: seq,
+                ..
             } = *position;
             if !matches!(
                 kind,
