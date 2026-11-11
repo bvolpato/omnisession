@@ -1419,6 +1419,17 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
         assert!(!hit("Topazjackdaw"));
         assert!(hit("Visible"));
         assert_eq!(fixture.index_codex()["stale"], 0);
+        if !substituted {
+            // Older readers marked a verified projection partial when the rollout had malformed records.
+            assert_eq!(db.execute(
+                "UPDATE session_trajectories SET source_complete=0, tail_reader_version=0 WHERE session_id=?1",
+                [CODEX_ID],
+            ).unwrap(), 1);
+            assert_eq!(fixture.index_codex()["indexed"], 1);
+            assert!(hit("Bronzekestrel"));
+            assert!(hit("Visible"));
+            assert_eq!(fixture.index_codex()["stale"], 0);
+        }
     }
 }
 

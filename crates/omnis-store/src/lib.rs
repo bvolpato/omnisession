@@ -3884,16 +3884,17 @@ impl Store {
             .map_err(database_error)
     }
 
-    /// Reads the SHA-256 digest of a full Codex projection that predates file and contents revisions.
-    /// Version 5 rows must match the digest and source time recorded during the schema upgrade.
+    /// Reads the digest of a Codex projection that can be verified against the selected rollout.
+    /// A partial projection must still refer to the same physical file and contents.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid session reference or a failed database read.
-    pub fn legacy_codex_projection_hash(
+    pub fn codex_projection_hash(
         &self,
         session: &SessionRef,
         source_updated_at: DateTime<Utc>,
+        revision: SourceRevision,
     ) -> Result<Option<[u8; 32]>> {
         validate_session_ref(session)?;
         if session.provider != Provider::Codex {
@@ -3904,18 +3905,33 @@ impl Store {
             .query_row(
                 "SELECT t.content_hash FROM session_trajectories AS t
                  WHERE t.provider = 'codex' AND t.session_id = ?1 AND t.source_updated_at = ?2
-                   AND t.origin = 'native' AND t.source_complete = 1
-                   AND t.source_file_id IS NULL AND t.source_contents_id IS NULL AND t.missing_ancestor_id IS NULL
-                   AND typeof(t.content_hash) = 'blob' AND length(t.content_hash) = 32
-                   AND (t.document_version = 4 OR (t.document_version = 5 AND EXISTS (
-                       SELECT 1 FROM legacy_codex_v5_projections AS old
-                       WHERE old.trajectory_id = t.id AND old.source_updated_at = t.source_updated_at
-                         AND old.content_hash = t.content_hash)))",
-                params![session.id, source_updated_at.timestamp_millis()],
+                   AND t.origin = 'native' AND typeof(t.content_hash) = 'blob' AND length(t.content_hash) = 32
+                   AND t.source_file_id IS ?3 AND t.source_contents_id IS ?4 AND t.missing_ancestor_id IS NULL
+                   AND ((?3 IS NOT NULL AND ?4 IS NOT NULL AND t.source_complete = 0 AND t.tail_reader_version = 0)
+                     OR (?3 IS NULL AND ?4 IS NULL AND t.source_complete = 1
+                       AND (t.document_version = 4 OR (t.document_version = 5 AND EXISTS (
+                           SELECT 1 FROM legacy_codex_v5_projections AS old
+                           WHERE old.trajectory_id = t.id AND old.source_updated_at = t.source_updated_at
+                             AND old.content_hash = t.content_hash)))))",
+                params![session.id, source_updated_at.timestamp_millis(), revision.file.map(Uuid::into_bytes),
+                        revision.contents.map(Uuid::into_bytes)],
                 |row| row.get(0),
             )
             .optional()
             .map_err(database_error)
+    }
+
+    /// Reads the digest of a full Codex projection that predates file and contents revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or a failed database read.
+    pub fn legacy_codex_projection_hash(
+        &self,
+        session: &SessionRef,
+        source_updated_at: DateTime<Utc>,
+    ) -> Result<Option<[u8; 32]>> {
+        self.codex_projection_hash(session, source_updated_at, SourceRevision::default())
     }
 
     /// Allows the indexer to retry a failed source while its revision still hides the old text.

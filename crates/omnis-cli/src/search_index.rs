@@ -251,17 +251,29 @@ pub(crate) fn projection_read_budget(
     }
 }
 
-fn needs_legacy_projection_check(
+fn legacy_projection_source(
     guard: TrajectorySourceGuard,
     updated_at: Option<DateTime<Utc>>,
-) -> bool {
+    revision: SourceRevision,
+) -> Option<SourceRevision> {
     let TrajectorySourceGuard::ObservedRevision(Some(prior)) = guard else {
-        return false;
+        return None;
     };
-    matches!(prior.document_version, 4 | 5)
+    if updated_at.is_some_and(|time| source_time_changed(Provider::Codex, time, &prior)) {
+        return None;
+    }
+    if matches!(prior.document_version, 4 | 5)
         && prior.source_complete
         && prior.source_revision == SourceRevision::default()
-        && updated_at.is_none_or(|time| !source_time_changed(Provider::Codex, time, &prior))
+    {
+        return Some(prior.source_revision);
+    }
+    (prior.legacy_tail_receipt.is_some()
+        && prior.document_version == SEARCH_DOCUMENT_VERSION
+        && revision.file.is_some()
+        && revision.contents.is_some()
+        && revision.matches_file_contents(prior.source_revision))
+    .then_some(prior.source_revision)
 }
 
 pub(crate) fn verify_legacy_search_read(
@@ -276,13 +288,22 @@ pub(crate) fn verify_legacy_search_read(
         || session.provider != Provider::Codex
         || read.source_revision.file.is_none()
         || read.source_revision.contents.is_none()
-        || !needs_legacy_projection_check(guard, Some(time))
     {
         return Ok(read);
     }
-    let Some(hash) = store.legacy_codex_projection_hash(session, time)? else {
+    let Some(source) = legacy_projection_source(guard, Some(time), read.source_revision) else {
         return Ok(read);
     };
+    let Some(hash) = store.codex_projection_hash(session, time, source)? else {
+        return Ok(read);
+    };
+    if source.file.is_some() {
+        use sha2::{Digest, Sha256};
+        let sample = trajectory_search_document(&read.snapshot);
+        if Sha256::digest(sample.text.as_bytes())[..] == hash {
+            return Ok(read);
+        }
+    }
     let selected_path = || -> Result<PathBuf> {
         registry
             .find_native_session(Provider::Codex, &session.id)?
@@ -729,7 +750,8 @@ pub(crate) fn index_candidates(
     let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
         // Read an oversized full transcript on the calling thread to bound peak memory.
         (reads_transcript_file(candidate.session.provider)
-            && !needs_legacy_projection_check(*guard, candidate.updated_at)
+            && legacy_projection_source(*guard, candidate.updated_at, candidate.source_revision)
+                .is_none()
             && (*budget == FULL_READ_SOURCE_BYTES || candidate.can_upgrade_preview()))
         .then(|| prepare_session(registry, candidate, *guard, *budget, None))
     };
