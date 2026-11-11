@@ -74,6 +74,71 @@ fn restoring_a_grok_uuid_directory_replaces_the_indexed_backup() {
     );
 }
 
+#[test]
+fn cached_grok_text_follows_the_selected_project_after_losing_native_history() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let grok = root.path().join("grok");
+    let id = "11111111-1111-4111-8111-111111111111";
+    let old = root.path().join("first");
+    let current = root.path().join("second");
+    for project in [&old, &current] {
+        fs::create_dir(project).unwrap();
+    }
+    let directory = grok.join("sessions/restored").join(id);
+    fs::create_dir_all(&directory).unwrap();
+    let summary = directory.join("summary.json");
+    fs::write(
+        &summary,
+        json!({"info":{"id":id,"cwd":old},"updated_at":"2026-01-02T00:00:00Z","num_messages":1})
+            .to_string(),
+    )
+    .unwrap();
+    fs::write(directory.join("updates.jsonl"), json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"magpiehistory"}}).to_string()).unwrap();
+    let invoke = |project: &Path, args: &[&str]| {
+        let output = env
+            .command()
+            .env("GROK_HOME", &grok)
+            .current_dir(project)
+            .arg("--json")
+            .args(args)
+            .args(["--provider", "grok"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let hits = |project: &Path| {
+        invoke(project, &["search", "--cached", "magpiehistory"])["results"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(invoke(&old, &["index"])["indexed"], 1);
+    assert_eq!(hits(&old), 1);
+    // Older caches stored assistant-only text without a derived title or a physical file receipt.
+    let db = Connection::open(env.state_root.join("store.sqlite3")).unwrap();
+    db.execute_batch("UPDATE session_index SET source_file_id = NULL, source_contents_id = NULL WHERE provider = 'grok';
+        UPDATE session_trajectories SET source_file_id = NULL, source_contents_id = NULL WHERE provider = 'grok'").unwrap();
+    assert_eq!(hits(&old), 1);
+    fs::write(&summary, "{").unwrap();
+    let catalog = Connection::open(grok.join("sessions/session_search.sqlite")).unwrap();
+    catalog
+        .execute_batch(
+            "CREATE TABLE session_docs (session_id TEXT, cwd TEXT, updated_at INTEGER, title TEXT)",
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO session_docs VALUES (?1, ?2, 1, 'Recovered project')",
+            params![id, current.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(catalog);
+    invoke(&current, &["index"]);
+    assert_eq!(hits(&current), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {

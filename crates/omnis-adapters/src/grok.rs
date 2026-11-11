@@ -12,12 +12,13 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
     ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, SnapshotFileStamp, SqliteSnapshotCache,
         encode_uri_component, json_lines_preview, nested_files, parse_timestamp, paths_match,
         percent_decode, provider_executable, provider_file, provider_root, read_json,
         sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
@@ -41,6 +42,14 @@ impl GrokAdapter {
             has_ambiguous_ids: Arc::default(),
             listed_catalog: Arc::default(),
         }
+    }
+
+    /// Size of the update log that supplies searchable conversation text.
+    #[must_use]
+    pub fn updates_size(summary: &Path) -> Option<u64> {
+        let directory = summary.parent()?;
+        let file = provider_file(directory, &directory.join("updates.jsonl"))?;
+        Some(fs::metadata(file).ok()?.len())
     }
 
     fn summaries(&self) -> Vec<PathBuf> {
@@ -108,8 +117,13 @@ impl GrokAdapter {
         let Some(root) = self.sessions_root.as_deref() else {
             return Vec::new();
         };
+        let path = root.join("session_search.sqlite");
+        let revision = SourceRevision {
+            file: Some(path_id(&path)),
+            ..SourceRevision::default()
+        };
         self.catalog
-            .read(root, &root.join("session_search.sqlite"), |connection| {
+            .read(root, &path, |connection| {
                 let all = "SELECT session_id, cwd, updated_at, title FROM session_docs";
                 let sql = id.map_or_else(
                     || all.to_owned(),
@@ -127,7 +141,7 @@ impl GrokAdapter {
                         updated_at_approximate: false,
                         event_count: 0,
                         source_path: None,
-                        source_revision: None,
+                        source_revision: Some(revision),
                     })
                 })?;
                 Ok(rows
@@ -178,7 +192,7 @@ impl GrokAdapter {
         session: &SessionRef,
         summary: &Value,
         path: &Path,
-        metadata: GrokMetadata,
+        metadata: &GrokMetadata,
         full: bool,
     ) -> Result<CanonicalSnapshot> {
         const SAMPLE_RECORDS: usize = 1_024;
@@ -222,9 +236,9 @@ impl GrokAdapter {
         builder.push_oversized_record_notice(oversized, metadata.updated_at);
         Ok(builder.snapshot(
             session.clone(),
-            metadata.title,
-            metadata.project_path,
-            metadata.git_branch,
+            metadata.title.clone(),
+            metadata.project_path.clone(),
+            metadata.git_branch.clone(),
             metadata.updated_at.unwrap_or_else(Utc::now),
         ))
     }
@@ -293,14 +307,8 @@ fn can_fork_summary(summary: &Value) -> bool {
             .is_some()
 }
 
-fn source_revision(path: &Path) -> SourceRevision {
-    SourceRevision {
-        file: Some(uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_URL,
-            path.as_os_str().as_encoded_bytes(),
-        )),
-        ..SourceRevision::default()
-    }
+fn path_id(path: &Path) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes())
 }
 
 fn unique_summary(id: &str, paths: Vec<PathBuf>) -> Result<Option<(Value, PathBuf)>> {
@@ -389,7 +397,27 @@ impl GrokMetadata {
         }
     }
 
+    fn source_revision(&self, path: &Path) -> SourceRevision {
+        let file = path_id(path);
+        let project = self.project_path.as_deref().unwrap_or(Path::new(""));
+        let scope = Uuid::new_v5(&file, project.as_os_str().as_encoded_bytes());
+        let metadata = Uuid::new_v5(&scope, self.title.as_deref().unwrap_or_default().as_bytes());
+        let contents = path
+            .parent()
+            .and_then(|directory| {
+                let updates = provider_file(directory, &directory.join("updates.jsonl"))?;
+                Some(SnapshotFileStamp::read(&updates).ok()?.revision(metadata))
+            })
+            .unwrap_or(metadata);
+        SourceRevision {
+            file: Some(file),
+            contents: Some(contents),
+            ..SourceRevision::default()
+        }
+    }
+
     fn into_session(self, id: String, source: PathBuf) -> NativeSession {
+        let revision = self.source_revision(&source);
         NativeSession {
             session: SessionRef::new(Provider::Grok, id),
             title: self.title,
@@ -399,7 +427,7 @@ impl GrokMetadata {
             updated_at: self.updated_at,
             updated_at_approximate: false,
             event_count: 0,
-            source_revision: Some(source_revision(&source)),
+            source_revision: Some(revision),
             source_path: Some(source),
         }
     }
@@ -1002,12 +1030,17 @@ impl ProviderAdapter for GrokAdapter {
     ) -> Result<IndexRead> {
         validate_provider(session, Provider::Grok)?;
         let (summary, path, metadata) = self.resolved_summary(&session.id, listed_path)?;
-        let source_complete = fs::metadata(&path)?.len() <= full_read_bytes;
-        let snapshot = self.snapshot(session, &summary, &path, metadata, source_complete)?;
+        let source_revision = metadata.source_revision(&path);
+        let source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
+        let snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete)?;
+        anyhow::ensure!(
+            metadata.source_revision(&path) == source_revision,
+            "selected Grok source changed during its read"
+        );
         Ok(IndexRead {
             snapshot,
             source_complete,
-            source_revision: source_revision(&path),
+            source_revision,
             native_session: None,
         })
     }

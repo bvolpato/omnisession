@@ -14,7 +14,7 @@ use std::sync::{
 };
 
 use anyhow::Context;
-use omnis_adapters::ProviderAdapter;
+use omnis_adapters::{GrokAdapter, ProviderAdapter};
 use omnis_ir::SourceRevision;
 
 use crate::{
@@ -89,14 +89,27 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
     let search_index_stop = Arc::new(AtomicBool::new(false));
 
+    // Grok index and preview reads use the catalog snapshot that supplied their candidates.
+    let grok = GrokAdapter::default();
+    let worker_registry = || {
+        let mut registry = AdapterRegistry::with_local_adapters();
+        registry.register(grok.clone());
+        registry
+    };
     spawn_index_writer(sender.clone(), index_receiver);
-    spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
-    spawn_preview_updates(sender.clone(), preview_receiver);
+    spawn_cache_updates(
+        sender.clone(),
+        index_sender,
+        current_project.to_path_buf(),
+        Arc::new(worker_registry()),
+    );
+    spawn_preview_updates(sender.clone(), preview_receiver, worker_registry());
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
     spawn_search_index(
         sender.clone(),
         search_index_receiver,
         Arc::clone(&search_index_stop),
+        worker_registry(),
     );
     spawn_update_check(sender);
 
@@ -114,9 +127,9 @@ pub(super) fn spawn_search_index(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<IndexCandidate>>,
     stop: Arc<AtomicBool>,
+    registry: AdapterRegistry,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let Ok(store) = Store::open_default() else {
             return;
         };
@@ -239,13 +252,14 @@ pub(super) fn spawn_cache_updates(
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
+    registry: Arc<AdapterRegistry>,
 ) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
             let _ = sender.send(PickerUpdate::Cached(Err(
                 "session index is unavailable".to_owned()
             )));
-            spawn_all_provider_updates(&sender, &index_sender, &current_project);
+            spawn_all_provider_updates(&sender, &index_sender, &current_project, &registry);
             return;
         };
         let cached =
@@ -294,7 +308,13 @@ pub(super) fn spawn_cache_updates(
             {
                 return;
             }
-            start_provider_update(&sender, &index_sender, &current_project, provider);
+            start_provider_update(
+                &sender,
+                &index_sender,
+                &current_project,
+                provider,
+                &registry,
+            );
         }
     });
 }
@@ -303,9 +323,10 @@ pub(super) fn spawn_all_provider_updates(
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
+    registry: &Arc<AdapterRegistry>,
 ) {
     for provider in PROVIDERS {
-        start_provider_update(sender, index_sender, current_project, provider);
+        start_provider_update(sender, index_sender, current_project, provider, registry);
     }
 }
 
@@ -314,6 +335,7 @@ pub(super) fn start_provider_update(
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
+    registry: &Arc<AdapterRegistry>,
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
         spawn_provider_update(
@@ -321,6 +343,7 @@ pub(super) fn start_provider_update(
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
+            Arc::clone(registry),
         );
     }
 }
@@ -356,9 +379,9 @@ pub(super) fn spawn_provider_update(
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
+    registry: Arc<AdapterRegistry>,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let result = registry.list_sessions_with_notes(provider, None);
         match result {
             Ok((mut sessions, notes)) => {
@@ -410,40 +433,46 @@ pub(super) fn read_picker_preview(
     projection_budget: u64,
 ) -> anyhow::Result<omnis_adapters::IndexRead> {
     let session = &key.session;
-    if session.provider == Provider::Codex {
+    if matches!(session.provider, Provider::Codex | Provider::Grok) {
         let budget = if key.continuation_after.is_some() {
             u64::MAX
+        } else if session.provider == Provider::Grok {
+            0
         } else {
             projection_budget
         };
         let read = registry.index_session(session, source_path, budget)?;
         let revision = preview_revision(read.source_revision);
         match &key.source {
-            Some(PreviewSource::CodexFile(expected)) if *expected != revision => {
-                anyhow::bail!("Codex rollout changed before its preview was read");
+            Some(PreviewSource::SelectedFile(expected)) if *expected != revision => {
+                anyhow::bail!(
+                    "selected {} source changed before its preview was read",
+                    session.provider
+                );
             }
-            Some(PreviewSource::CachedCodex(expected)) => {
-                let header = read
-                    .native_session
-                    .as_ref()
-                    .context("cached Codex preview has no verified catalog metadata")?;
+            Some(PreviewSource::CachedWorkspace(expected)) => {
+                if session.provider == Provider::Codex {
+                    read.native_session
+                        .as_ref()
+                        .context("cached Codex preview has no verified catalog metadata")?;
+                }
                 let effective = &read.snapshot.workspace.current_dir;
                 let workspace = if effective.as_os_str().is_empty() {
-                    header.project_path.as_deref()
+                    read.native_session
+                        .as_ref()
+                        .and_then(|header| header.project_path.as_deref())
                 } else {
                     Some(effective.as_path())
                 };
                 anyhow::ensure!(
                     workspace.map(Path::as_os_str) == expected.as_deref().map(Path::as_os_str),
-                    "cached Codex workspace changed before its preview was read"
+                    "cached {} workspace changed before its preview was read",
+                    session.provider
                 );
             }
             _ => {}
         }
         return Ok(read);
-    }
-    if session.provider == Provider::Grok && key.continuation_after.is_none() {
-        return registry.index_session(session, source_path, 0);
     }
     if session.provider == Provider::Imported || key.continuation_after.is_some() {
         return full_index_read(registry, session);
@@ -502,10 +531,11 @@ fn preview_update(
                 return Ok(read);
             };
             let read = search_index::verify_legacy_search_read(registry, store, guard, read)?;
-            if let Some(PreviewSource::CodexFile(expected)) = key.source.as_ref() {
+            if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
                 anyhow::ensure!(
                     *expected == preview_revision(read.source_revision),
-                    "Codex rollout changed during its preview"
+                    "selected {} source changed during its preview",
+                    key.session.provider
                 );
             }
             Ok(read)
@@ -560,9 +590,9 @@ fn preview_update(
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewRequest>>,
+    registry: AdapterRegistry,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let mut store_warning_sent = false;
         let mut open_store = || match Store::open_default() {
             Ok(store) => Some(store),

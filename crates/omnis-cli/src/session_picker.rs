@@ -149,7 +149,10 @@ struct PickerEntry {
 
 impl PickerEntry {
     fn source_revision(&self) -> Option<SourceRevision> {
-        if self.session.session.provider != Provider::Codex {
+        if !matches!(
+            self.session.session.provider,
+            Provider::Codex | Provider::Grok
+        ) {
             return None;
         }
         self.session
@@ -678,6 +681,9 @@ impl PickerState {
         let mut changed = false;
         for index in rows {
             let entry = &mut self.entries[index];
+            if entry.session.session.provider != Provider::Codex {
+                continue;
+            }
             let Some(revision) = entry.source_revision() else {
                 continue;
             };
@@ -726,11 +732,11 @@ impl PickerState {
         if self.preview_key(&self.entries[index]) != *key {
             return false;
         }
-        if matches!(key.source, Some(PreviewSource::CachedCodex(_)))
+        if matches!(key.source, Some(PreviewSource::CachedWorkspace(_)))
             && let Some(revision) = read_revision
         {
             self.entries[index].session.source_revision = Some(revision);
-            key.source = Some(PreviewSource::CodexFile(revision));
+            key.source = Some(PreviewSource::SelectedFile(revision));
         }
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
             self.remember_source_titles([omnis_store::IndexedTrajectoryTitle {
@@ -758,7 +764,7 @@ impl PickerState {
                 continue;
             };
             let entry = &mut self.entries[index];
-            if receipt.session.provider == Provider::Codex {
+            if matches!(receipt.session.provider, Provider::Codex | Provider::Grok) {
                 if entry.source_revision().unwrap_or_default()
                     != preview_revision(receipt.source_revision)
                 {
@@ -790,8 +796,10 @@ impl PickerState {
     fn apply_derived_titles(&mut self) {
         for entry in &mut self.entries {
             if let Some((revision, title)) = self.derived_titles.get(&entry.key)
-                && (entry.session.session.provider != Provider::Codex
-                    || entry.source_revision().unwrap_or_default() == *revision)
+                && (!matches!(
+                    entry.session.session.provider,
+                    Provider::Codex | Provider::Grok
+                ) || entry.source_revision().unwrap_or_default() == *revision)
             {
                 apply_derived_title(entry, Some(title));
             }
@@ -863,8 +871,7 @@ impl PickerState {
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
                 .map(|(_, entry)| TrajectorySelection {
                     session: entry.session.session.clone(),
-                    source: (entry.session.session.provider == Provider::Codex)
-                        .then(|| entry.source_revision().unwrap_or_default()),
+                    source: crate::selected_search_revision(&entry.session, false),
                 })
                 .collect(),
         })
@@ -934,9 +941,14 @@ impl PickerState {
         PreviewKey {
             session: entry.session.session.clone(),
             source: if let Some(revision) = entry.source_revision() {
-                Some(PreviewSource::CodexFile(revision))
-            } else if entry.cached && entry.session.session.provider == Provider::Codex {
-                Some(PreviewSource::CachedCodex(
+                Some(PreviewSource::SelectedFile(revision))
+            } else if entry.cached
+                && matches!(
+                    entry.session.session.provider,
+                    Provider::Codex | Provider::Grok
+                )
+            {
+                Some(PreviewSource::CachedWorkspace(
                     entry.session.project_path.clone(),
                 ))
             } else {
@@ -1021,16 +1033,16 @@ impl PickerState {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum PreviewSource {
-    CodexFile(SourceRevision),
-    CachedCodex(Option<PathBuf>),
+    SelectedFile(SourceRevision),
+    CachedWorkspace(Option<PathBuf>),
     Path(PathBuf),
 }
 
 impl PreviewSource {
     const fn revision(&self) -> Option<SourceRevision> {
         match self {
-            Self::CodexFile(revision) => Some(*revision),
-            Self::Path(_) | Self::CachedCodex(_) => None,
+            Self::SelectedFile(revision) => Some(*revision),
+            Self::Path(_) | Self::CachedWorkspace(_) => None,
         }
     }
 }

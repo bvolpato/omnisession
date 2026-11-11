@@ -111,6 +111,13 @@ impl IndexCandidate {
     }
 
     fn can_upgrade_preview(&self) -> bool {
+        if self.session.provider == Provider::Grok {
+            return self
+                .source_path
+                .as_deref()
+                .and_then(omnis_adapters::GrokAdapter::updates_size)
+                .is_some_and(|size| size <= FULL_READ_SOURCE_BYTES);
+        }
         if self.session.provider == Provider::Hermes
             || (self.session.provider == Provider::Codex
                 && self

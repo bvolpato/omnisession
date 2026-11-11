@@ -212,7 +212,7 @@ const CONFLICTING_CODEX_FAILURE: &str = "trajectories.provider = 'codex'
         OR failed.source_updated_at IS NOT trajectories.source_updated_at)";
 
 // Discovery can select a replacement before its first transcript read succeeds.
-const CONFLICTING_CODEX_CATALOG: &str = "trajectories.provider = 'codex'
+const CONFLICTING_NATIVE_CATALOG: &str = "trajectories.provider IN ('codex', 'grok')
     AND trajectories.origin = 'native' AND catalog.provider = trajectories.provider
     AND catalog.session_id = trajectories.session_id AND catalog.source_file_id IS NOT NULL
     AND (catalog.source_file_id IS NOT trajectories.source_file_id
@@ -238,8 +238,8 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
             AND eligible.session_id = trajectories.session_id
             AND (eligible.file IS NULL OR (eligible.file = hex(trajectories.source_file_id)
                  AND eligible.contents = hex(trajectories.source_contents_id)))
-            AND (eligible.file IS NOT NULL OR NOT EXISTS (
-                 SELECT 1 FROM session_index AS catalog WHERE {CONFLICTING_CODEX_CATALOG}))
+            AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
+                 SELECT 1 FROM session_index AS catalog WHERE {CONFLICTING_NATIVE_CATALOG}))
             AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed
                             WHERE {CONFLICTING_CODEX_FAILURE})"
     )
@@ -2519,7 +2519,7 @@ impl Store {
         let connection = self.connection.borrow();
         let sql = format!(
             "SELECT trajectories.session_id FROM session_trajectories AS trajectories
-                          INNER JOIN session_index AS catalog ON {CONFLICTING_CODEX_CATALOG}"
+                          INNER JOIN session_index AS catalog ON {CONFLICTING_NATIVE_CATALOG}"
         );
         let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         statement
@@ -2688,19 +2688,21 @@ impl Store {
         let mut eligibility = eligible_sessions
             .iter()
             .filter(|selection| {
-                selection
-                    .source
-                    .is_none_or(|revision| revision.file.is_some())
+                selection.session.provider == Provider::Grok
+                    || selection
+                        .source
+                        .is_none_or(|revision| revision.file.is_some())
             })
             .map(|selection| {
                 let encode = |id: Uuid| id.simple().to_string().to_ascii_uppercase();
                 (
                     selection.session.provider.to_string(),
                     &selection.session.id,
+                    // A selected legacy Grok cache row matches only a receipt-free document.
+                    // SQLite hex(NULL) is the empty string. NULL here means unrestricted.
                     selection
                         .source
-                        .and_then(|revision| revision.file)
-                        .map(encode),
+                        .map(|revision| revision.file.map(encode).unwrap_or_default()),
                     selection
                         .source
                         .map(|revision| revision.contents.map(encode).unwrap_or_default()),
@@ -3022,7 +3024,7 @@ fn indexed_titles_sql() -> String {
                      WHEN failed.session_id IS NOT NULL THEN failed.source_contents_id ELSE trajectories.source_contents_id END
              FROM session_trajectories AS trajectories
              LEFT JOIN trajectory_index_failures AS failed ON {CONFLICTING_CODEX_FAILURE}
-             LEFT JOIN session_index AS catalog ON {CONFLICTING_CODEX_CATALOG}")
+             LEFT JOIN session_index AS catalog ON {CONFLICTING_NATIVE_CATALOG}")
 }
 
 fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTrajectoryTitle> {

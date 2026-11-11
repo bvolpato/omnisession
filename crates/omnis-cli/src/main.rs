@@ -554,6 +554,9 @@ fn cached_search_sessions(
         })
         .map(|session| NativeSession {
             source_revision: session.source_revision.or_else(|| {
+                if session.session.provider == Provider::Grok {
+                    return None;
+                }
                 match sources.get(&session.session) {
                     Some(revision) if revision.file.is_some() => Some(*revision),
                     Some(_) => None,
@@ -725,18 +728,20 @@ fn refresh_search_workspaces(
     Ok(())
 }
 
+fn selected_search_revision(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
+    match session.session.provider {
+        Provider::Codex if cached => session.source_revision,
+        Provider::Grok | Provider::Codex => Some(session.source_revision.unwrap_or_default()),
+        _ => None,
+    }
+}
+
 fn search_selections(sessions: &[NativeSession], cached: bool) -> Vec<TrajectorySelection> {
     sessions
         .iter()
         .map(|session| TrajectorySelection {
             session: session.session.clone(),
-            source: if !matches!(session.session.provider, Provider::Codex | Provider::Grok) {
-                None
-            } else if cached {
-                session.source_revision
-            } else {
-                Some(session.source_revision.unwrap_or_default())
-            },
+            source: selected_search_revision(session, cached),
         })
         .collect()
 }
@@ -760,7 +765,12 @@ fn rank_search_hits<'a>(
             let selected = sources.get(&entry.session)?;
             let title = entry.title?;
             selected
-                .is_none_or(|revision| revision.matches_file_contents(entry.source_revision))
+                .is_none_or(|revision| {
+                    revision.matches_file_contents(entry.source_revision)
+                        || (entry.session.provider == Provider::Grok
+                            && revision == SourceRevision::default()
+                            && entry.source_revision == revision)
+                })
                 .then_some((entry.session, title))
         })
         .collect();

@@ -467,7 +467,7 @@ impl SnapshotLimits {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct SnapshotFileStamp {
+pub(crate) struct SnapshotFileStamp {
     len: u64,
     modified: SystemTime,
     created: Option<SystemTime>,
@@ -476,7 +476,28 @@ struct SnapshotFileStamp {
 }
 
 impl SnapshotFileStamp {
-    fn read(path: &Path) -> io::Result<Self> {
+    pub(crate) fn revision(&self, namespace: Uuid) -> Uuid {
+        let modified = DateTime::<Utc>::from(self.modified);
+        let mut hash = Sha256::new();
+        hash.update(self.len.to_le_bytes());
+        hash.update(modified.timestamp().to_le_bytes());
+        hash.update(modified.timestamp_subsec_nanos().to_le_bytes());
+        if let Some(created) = self.created.map(DateTime::<Utc>::from) {
+            hash.update(created.timestamp().to_le_bytes());
+            hash.update(created.timestamp_subsec_nanos().to_le_bytes());
+        }
+        #[cfg(unix)]
+        {
+            let (device, inode, seconds, nanos) = self.identity;
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+            hash.update(nanos.to_le_bytes());
+        }
+        Uuid::new_v5(&namespace, &hash.finalize())
+    }
+
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
         let metadata = path.metadata()?;
         Ok(Self {
             len: metadata.len(),
