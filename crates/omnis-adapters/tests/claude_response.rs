@@ -168,3 +168,169 @@ fn ambiguous_or_foreign_orphans_cannot_answer_an_active_call() {
             .any(|e| matches!(e.kind, EventKind::ToolFailed | EventKind::ToolCompleted))
     );
 }
+
+fn compaction(index: u128, parent: u128, retained: &[u128]) -> [Value; 2] {
+    let id = Uuid::from_u128;
+    let header = json!({"type":"system","subtype":"compact_boundary","uuid":id(index),"logicalParentUuid":id(parent),
+        "compactMetadata":{"preservedMessages":{"anchorUuid":id(index+1),"uuids":retained.iter().copied().map(id).collect::<Vec<_>>()}}});
+    let mut summary = message(index + 1, index, "user", json!(format!("Summary {index}")));
+    summary["isCompactSummary"] = json!(true);
+    [header, summary]
+}
+
+#[test]
+fn late_parallel_results_follow_retained_calls_after_compaction() {
+    let mut records = vec![
+        message(1, 0, "user", json!("Read both")),
+        block(2, 1, "request", json!([call("a"), call("b")])),
+    ];
+    records.extend(compaction(3, 2, &[2]));
+    records.extend([
+        message(5, 2, "user", json!([result("b", "second", false)])),
+        message(6, 2, "user", json!([result("a", "first", false)])),
+        message(7, 6, "assistant", json!("Finished")),
+    ]);
+    assert_eq!(
+        tool_outcomes(&read(&records)),
+        [("first".into(), false), ("second".into(), false)]
+    );
+}
+
+#[test]
+fn a_later_compaction_keeps_earlier_rewind_cutoffs_out_of_search_and_recovery() {
+    let mut records = vec![
+        message(1, 0, "user", json!("Initial task")),
+        message(2, 1, "assistant", json!("Retained result")),
+        message(3, 2, "user", json!("Abandoned request")),
+    ];
+    records.extend(compaction(4, 3, &[2, 3]));
+    records.push(message(6, 2, "user", json!("Replacement request")));
+    for retained in [&[][..], &[6][..]] {
+        let mut rows = records.clone();
+        rows.extend(compaction(7, 6, retained));
+        let snapshot = read(&rows);
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            String::from_utf8(recovery).unwrap(),
+        ] {
+            assert!(text.contains("Retained result"));
+            assert!(text.contains("Replacement request"));
+            assert!(!text.contains("Abandoned request"));
+        }
+    }
+}
+
+#[test]
+fn compacted_calls_do_not_recover_results_the_summary_omitted() {
+    let mut records = vec![
+        message(1, 0, "user", json!("Check")),
+        block(2, 1, "request", json!([call("a"), call("b")])),
+        message(
+            3,
+            2,
+            "user",
+            json!([result("a", "stalebeforecompaction", true)]),
+        ),
+    ];
+    records.extend(compaction(4, 3, &[2]));
+    records.push(message(
+        6,
+        2,
+        "user",
+        json!([result("b", "current", false)]),
+    ));
+    let snapshot = read(&records);
+    assert!(
+        import_trajectory(&snapshot)
+            .items
+            .iter()
+            .any(|item| item.text.contains("current"))
+    );
+    assert!(
+        !import_trajectory(&snapshot)
+            .items
+            .iter()
+            .any(|item| item.text.contains("stalebeforecompaction"))
+    );
+}
+
+fn linked_result(index: u128, parent: u128, source: u128, id: &str, output: &str) -> Value {
+    let mut row = message(index, parent, "user", json!([result(id, output, false)]));
+    row["sourceToolAssistantUUID"] = json!(Uuid::from_u128(source));
+    row
+}
+
+#[test]
+fn result_source_identifies_the_selected_response_chunk_after_a_retry() {
+    let snapshot = read(&[
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "abandoned", json!([call("reused")])),
+        block(3, 1, "selected", json!([call("primary")])),
+        block(4, 1, "selected", json!([call("reused")])),
+        message(5, 3, "user", json!([result("primary", "first", false)])),
+        linked_result(6, 5, 4, "reused", "second"),
+        linked_result(7, 6, 3, "primary", "discarded first result"),
+        message(8, 5, "assistant", json!("Finished")),
+    ]);
+    assert_eq!(
+        tool_outcomes(&snapshot),
+        [("first".into(), false), ("second".into(), false)]
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|e| e.payload["content"] != "discarded first result")
+    );
+}
+
+#[test]
+fn a_conflicting_result_source_cannot_attach_a_discarded_result() {
+    for (parent, source, id) in [
+        (3, 2, "reused"),  // The source belongs to a discarded retry.
+        (2, 3, "reused"),  // Two different assistants both issued this call ID.
+        (3, 4, "unique"),  // The source is a progress record.
+        (1, 99, "unique"), // The source is missing.
+        (1, 3, "split"),   // This assistant did not issue the call.
+        (1, 5, "unique"),  // The source belongs to a different writer.
+    ] {
+        let mut foreign = block(5, 1, "selected", json!([call("unique")]));
+        foreign["agentId"] = json!("other");
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "abandoned", json!([call("reused")])),
+            block(3, 1, "selected", json!([call("reused"), call("unique")])),
+            json!({"type":"progress", "uuid":Uuid::from_u128(4), "parentUuid":Uuid::from_u128(3)}),
+            foreign,
+            block(8, 1, "selected", json!([call("split")])),
+            linked_result(6, parent, source, id, "discarded"),
+            message(7, 3, "assistant", json!("Waiting")),
+        ]);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|e| e.payload["content"] != "discarded"),
+            "parent {parent}, source {source}, id {id}"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_source_uuid_cannot_disambiguate_a_reused_tool_id() {
+    let snapshot = read(&[
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "abandoned", json!([call("same")])),
+        block(2, 1, "selected", json!([call("same")])),
+        linked_result(3, 1, 2, "same", "ambiguous"),
+        message(4, 2, "assistant", json!("Waiting")),
+    ]);
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|e| e.payload["content"] != "ambiguous")
+    );
+}

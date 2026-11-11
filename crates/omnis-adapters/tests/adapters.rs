@@ -30,6 +30,16 @@ fn claude_progress_records_do_not_hide_the_final_reply() {
     writeln!(writer, r#"{{"type":"assistant","uuid":"{reply}","parentUuid":"{user}","message":{{"content":"working"}}}}"#).unwrap();
     let mut parent = reply;
     for sequence in 3..100_004 {
+        if sequence == 50_000 {
+            let attachment = uuid::Uuid::from_u128(200_001);
+            writeln!(
+                writer,
+                r#"{{"type":"attachment","uuid":"{attachment}","parentUuid":"{parent}"}}"#
+            )
+            .unwrap();
+            writeln!(writer, r#"{{"type":"assistant","isSidechain":true,"message":{{"content":"worker reply"}}}}"#).unwrap();
+            parent = attachment;
+        }
         let id = uuid::Uuid::from_u128(sequence);
         writeln!(
             writer,
@@ -72,8 +82,11 @@ fn claude_sampled_preview_keeps_only_the_selected_tail_branch() {
     let padding = json!({"type": "progress", "padding": "x".repeat(4 * 1024 * 1024)});
     for record in [
         message("user", 1, None, "head"),
+        message("assistant", 12, Some(id(1)), "first head reply"),
+        message("assistant", 13, Some(id(1)), "abandoned head reply"),
+        bridge("attachment", 14, 12),
         padding.clone(),
-        message("user", 2, Some(id(1)), "middle request"),
+        message("user", 2, Some(id(14)), "middle request"),
         message("user", 3, Some(id(1)), "other request"),
         bridge("progress", 11, 1),
         padding,
@@ -90,8 +103,16 @@ fn claude_sampled_preview_keeps_only_the_selected_tail_branch() {
     let adapter = ClaudeAdapter::with_root(temporary.path());
     let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
     for (budget, expected) in [
-        (u64::MAX, vec!["head", "middle request", "selected reply"]),
-        (1, vec!["head", "selected reply"]),
+        (
+            u64::MAX,
+            vec![
+                "head",
+                "first head reply",
+                "middle request",
+                "selected reply",
+            ],
+        ),
+        (1, vec!["selected reply"]),
     ] {
         let indexed = adapter
             .index_session(&session, Some(&source), budget)
@@ -104,6 +125,44 @@ fn claude_sampled_preview_keeps_only_the_selected_tail_branch() {
             .filter_map(|event| event.payload["text"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(text, expected);
+    }
+    // A tail link can identify a head branch directly, through an attachment.
+    writeln!(file, "{}", bridge("progress", 15, 14)).unwrap();
+    writeln!(
+        file,
+        "{}",
+        message("user", 16, Some(id(15)), "explicit rewind")
+    )
+    .unwrap();
+    let preview = adapter.preview_session(&session).unwrap();
+    let text = preview
+        .events
+        .iter()
+        .filter_map(|event| event.payload["text"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(text, ["head", "first head reply", "explicit rewind"]);
+}
+
+#[test]
+fn claude_empty_or_sidechain_samples_cannot_classify_the_unread_middle() {
+    use std::io::Write;
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let padding = " ".repeat(4 * 1024 * 1024);
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for edge in [
+        "",
+        r#"{"type":"assistant","isSidechain":true,"message":{"content":"worker"}}"#,
+    ] {
+        let mut file = fs::File::create(&source).unwrap();
+        writeln!(file, "{edge}\n{padding}\n{{\"type\":\"user\",\"message\":{{\"content\":\"main request\"}}}}\n{padding}\n{edge}").unwrap();
+        let full = adapter.read_session(&session).unwrap();
+        assert_eq!(full.events[0].payload["text"], "main request");
+        let sampled = adapter.preview_session(&session).unwrap();
+        assert_eq!(sampled.events.len(), 1);
+        assert_eq!(sampled.events[0].payload["native_history_unverified"], true);
     }
 }
 
