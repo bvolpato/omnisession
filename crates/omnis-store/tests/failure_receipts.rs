@@ -841,6 +841,69 @@ fn a_new_desktop_declaration_survives_loss_of_the_catalog_locator() {
     assert_eq!(count(), Some(3));
     discover(&home, omnis_store::DiscoveryScope::Workspace);
     discover(&other, omnis_store::DiscoveryScope::Workspace);
+    assert_eq!(count(), Some(0));
+}
+
+#[test]
+fn a_direct_desktop_declaration_rejects_older_reads_and_catalogs() {
+    let fixture = Fixture::new();
+    let store = &fixture.index;
+    let provider = Provider::AntigravityDesktop;
+    let session = SessionRef::new(provider, "restored");
+    let home = fixture.root.path();
+    let file = Uuid::from_u128(2);
+    let row = |count| IndexedSession {
+        event_count: count,
+        source_revision: Some(revision(2, 2)),
+        ..locator(&session)
+    };
+    let observed = || store.observe_trajectory_document(&session).unwrap();
+    store
+        .record_desktop_step_declaration(&row(3), home, observed(), |_| true)
+        .unwrap();
+    let old_read = observed();
+    let old_scan = store
+        .mark_session_discovery_attempted(provider, 7, home)
+        .unwrap();
+    let old_workspace = store
+        .session_discovery_checkpoint(provider, 7, home, Some(home))
+        .unwrap();
+    let count = || {
+        store
+            .verified_desktop_step_count(&session, home, file)
+            .unwrap()
+    };
+
+    store
+        .record_desktop_step_declaration(&row(3), home, observed(), |_| true)
+        .unwrap();
+    assert!(matches!(
+        store.record_desktop_step_declaration(&row(1), home, old_read, |_| true),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert!(matches!(
+        store.publish_session_discovery(
+            &old_scan,
+            &[row(1)],
+            DiscoveryScope::CompleteProvider,
+            chrono::Utc::now()
+        ),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert!(matches!(
+        store.merge_sessions_at_discovery_checkpoint(&old_workspace, &[row(1)]),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert!(matches!(
+        store.record_desktop_step_declaration(&row(0), home, observed(), |_| false),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert_eq!(count(), Some(3));
+    store
+        .record_desktop_step_declaration(&row(0), home, observed(), |_| true)
+        .unwrap();
+    assert_eq!(count(), Some(0));
+    store.forget_session(&session).unwrap();
     assert_eq!(count(), None);
 }
 
@@ -912,4 +975,105 @@ fn a_legacy_document_home_needs_a_selected_file_before_it_can_survive_a_restore(
             .as_deref(),
         Some("Old title")
     );
+}
+
+#[test]
+fn a_partial_read_from_another_home_owns_its_preview_and_retires_its_failure() {
+    let f = Fixture::new();
+    let a = f.root.path().join("a");
+    let b = f.root.path().join("b");
+    let publish = |home: &std::path::Path, doc: TrajectoryDocument<'_>, verified| {
+        let metadata = IndexedSession {
+            source_revision: Some(doc.source_revision),
+            ..locator(&f.session)
+        };
+        f.index.upsert_verified_session_document_in_home(
+            &metadata,
+            Some(home),
+            doc,
+            f.observe()
+                .with_incomplete_native_history(!doc.source_complete),
+            |_, _| verified,
+        )
+    };
+    let original_text = format!("{}firstsuffix", "first home ".repeat(12_000));
+    let primary = full(&original_text, revision(1, 1));
+    publish(&a, primary, true).unwrap();
+    let partial = TrajectoryDocument {
+        source_complete: false,
+        truncation_strategy: "source_incomplete",
+        ..full("second home", revision(2, 2))
+    };
+    let matches = |home| {
+        f.index
+            .read_trajectory_search(|snapshot| {
+                snapshot.search_scoped_native_documents(
+                    "second",
+                    1,
+                    &[(f.session.clone(), home, partial.source_revision.file)],
+                )
+            })
+            .unwrap()
+            .matches
+    };
+    let failed = failure(partial);
+    f.record(&failed);
+    assert!(matches!(
+        publish(&b, partial, false),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert_eq!(f.saved(), Some(failed));
+    assert!(matches(Some(b.clone())).is_empty());
+
+    assert_eq!(publish(&b, partial, true).unwrap(), 1);
+    assert!(f.saved().is_none());
+    assert_eq!(matches(None)[0].session, f.session);
+    assert!(matches(Some(a.clone())).is_empty());
+    assert_eq!(
+        f.index
+            .trajectory_index_state(&f.session)
+            .unwrap()
+            .unwrap()
+            .source_revision,
+        primary.source_revision
+    );
+    publish(&b, full("restored", revision(2, 3)), true).unwrap();
+    assert!(matches(Some(b)).is_empty());
+
+    let restore = TrajectoryDocument {
+        source_complete: false,
+        truncation_strategy: "source_incomplete",
+        ..full("first home", revision(1, 4))
+    };
+    publish(&a, restore, true).unwrap();
+    for home in [Some(&a), None] {
+        let hit = f
+            .index
+            .read_trajectory_search(|snapshot| {
+                let file = primary.source_revision.file;
+                let conflicts = if let Some(home) = home {
+                    snapshot.conflicting_native_documents(
+                        f.session.provider,
+                        home,
+                        &[(&f.session.id, file)],
+                    )?
+                } else {
+                    snapshot.conflicting_cached_documents(f.session.provider, &[&f.session.id])?
+                };
+                assert!(conflicts.contains(&f.session));
+                snapshot.search_scoped_native_documents(
+                    "firstsuffix",
+                    1,
+                    &[(f.session.clone(), home.cloned(), file)],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            hit.matches.len(),
+            1,
+            "lost original suffix for home {home:?}"
+        );
+        assert!(hit.matches[0].source_complete);
+        assert_eq!(hit.matches[0].indexed_byte_count, original_text.len());
+    }
 }

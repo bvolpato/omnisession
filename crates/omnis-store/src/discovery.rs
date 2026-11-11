@@ -130,6 +130,7 @@ pub struct SessionDiscoveryCheckpoint {
     observation: Option<Observation>,
     workspace: Option<PathBuf>,
     workspace_publication: Option<(i64, bool)>,
+    desktop_generation: Option<i64>,
 }
 
 impl SessionDiscoveryCheckpoint {
@@ -247,6 +248,30 @@ pub(super) enum CatalogWrite<'a> {
 }
 
 impl CatalogWrite<'_> {
+    pub(super) fn desktop_generation(
+        &self,
+        tx: &Transaction<'_>,
+        provider: Provider,
+    ) -> Result<Option<i64>> {
+        if provider != Provider::AntigravityDesktop {
+            return Ok(None);
+        }
+        match self {
+            Self::Unchecked => Ok(None),
+            Self::Merge(checkpoint) => Ok(checkpoint.desktop_generation),
+            Self::Publish(attempt, _, _) => tx
+                .query_row(
+                    "SELECT desktop_generation FROM session_index_reader_checks
+                 WHERE provider='antigravity-desktop' AND reader_version=?1 AND attempt_id=?2",
+                    params![attempt.version, attempt.id.into_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map(Option::flatten)
+                .map_err(database_error),
+        }
+    }
+
     pub(super) fn permits(
         self,
         transaction: &Transaction<'_>,
@@ -301,6 +326,7 @@ impl Store {
             version,
             home: home.to_owned(),
             observation: current_attempt(&tx, provider, version, home)?,
+            desktop_generation: crate::desktop_declarations::generation(&tx, provider)?,
             workspace: workspace.map(Path::to_owned),
             workspace_publication: workspace_publication(&tx, provider, home, workspace)?,
         };
@@ -448,11 +474,13 @@ impl Store {
         let id = Uuid::new_v4();
         let now = now_timestamp();
         transaction.execute(
-            "INSERT INTO session_index_reader_checks (provider, reader_version, source_home, checked_at, attempt_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO session_index_reader_checks (provider, reader_version, source_home, checked_at, attempt_id, desktop_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (provider, reader_version) DO UPDATE SET source_home = excluded.source_home,
-                 checked_at = excluded.checked_at, attempt_id = excluded.attempt_id",
-            params![name, version, home.as_os_str().as_encoded_bytes(), now, id.into_bytes()],
+                 checked_at = excluded.checked_at, attempt_id = excluded.attempt_id,
+                 desktop_generation = excluded.desktop_generation",
+            params![name, version, home.as_os_str().as_encoded_bytes(), now, id.into_bytes(),
+                    crate::desktop_declarations::generation(&transaction, provider)?],
         ).map_err(database_error)?;
         transaction
             .execute(

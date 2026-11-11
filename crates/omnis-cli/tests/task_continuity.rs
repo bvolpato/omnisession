@@ -1001,6 +1001,32 @@ struct IdeWorkspace {
     workspace_folder_absolute_uri: String,
 }
 
+fn write_desktop_step(connection: &rusqlite::Connection, index: u32, text: &str) {
+    let step = IdeStep {
+        r#type: 14,
+        user_input: Some(IdeUserInput {
+            user_response: text.to_owned(),
+        }),
+    };
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO steps VALUES (?1, ?2)",
+            rusqlite::params![index, prost::Message::encode_to_vec(&step)],
+        )
+        .unwrap();
+}
+
+fn set_desktop_summary(home: &Path, title: &str, count: u32) {
+    use prost::Message;
+
+    let path = home.join("agyhub_summaries_proto.pb");
+    let mut summaries = IdeSummaries::decode(fs::read(&path).unwrap().as_slice()).unwrap();
+    let summary = summaries.summaries.get_mut(SESSION_ID).unwrap();
+    title.clone_into(&mut summary.summary);
+    summary.step_count = count;
+    fs::write(path, summaries.encode_to_vec()).unwrap();
+}
+
 /// Antigravity desktop app store with one conversation database and its summary entry.
 fn write_synthetic_antigravity_ide(root: &Path, workspace: &Path) -> PathBuf {
     let store = root.join("antigravity-ide");
@@ -1012,18 +1038,7 @@ fn write_synthetic_antigravity_ide(root: &Path, workspace: &Path) -> PathBuf {
     connection
         .execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);")
         .unwrap();
-    let step = IdeStep {
-        r#type: 14,
-        user_input: Some(IdeUserInput {
-            user_response: "Synthetic IDE continuity request".to_owned(),
-        }),
-    };
-    connection
-        .execute(
-            "INSERT INTO steps VALUES (0, ?1)",
-            [prost::Message::encode_to_vec(&step)],
-        )
-        .unwrap();
+    write_desktop_step(&connection, 0, "Synthetic IDE continuity request");
     let mut uri_path = workspace.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
         uri_path.insert(0, '/');
@@ -1086,34 +1101,15 @@ fn antigravity_ide_source_lists_and_continues_in_another_provider() {
 
 #[test]
 fn desktop_search_keeps_readable_steps_until_the_missing_history_arrives() {
-    use prost::Message;
-
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let workspace = root.join("workspace");
     let home = write_synthetic_antigravity_ide(root, &workspace);
-    let summary = home.join("agyhub_summaries_proto.pb");
-    let mut summaries = IdeSummaries::decode(fs::read(&summary).unwrap().as_slice()).unwrap();
-    summaries.summaries.get_mut(SESSION_ID).unwrap().step_count = 2;
-    fs::write(&summary, summaries.encode_to_vec()).unwrap();
+    set_desktop_summary(&home, "Desktop session", 2);
     let database = home.join("conversations").join(format!("{SESSION_ID}.db"));
     let connection = rusqlite::Connection::open(database).unwrap();
-    let step = |text: &str| {
-        IdeStep {
-            r#type: 14,
-            user_input: Some(IdeUserInput {
-                user_response: text.to_owned(),
-            }),
-        }
-        .encode_to_vec()
-    };
     let opening = format!("{} readablebody", "opening ".repeat(64));
-    connection
-        .execute(
-            "UPDATE steps SET step_payload=?1 WHERE idx=0",
-            [step(&opening)],
-        )
-        .unwrap();
+    write_desktop_step(&connection, 0, &opening);
     let run = |state, args: &[&str]| {
         successful_json(
             command(root, &workspace)
@@ -1151,17 +1147,79 @@ fn desktop_search_keeps_readable_steps_until_the_missing_history_arrives() {
     );
     assert_eq!(cached["results"][0]["coverage"], "preview", "{cached}");
 
+    // A large database keeps the recovered document within the indexer's preview budget.
     connection
-        .execute(
-            "INSERT INTO steps VALUES (1, ?1)",
-            [step("Recovered suffix")],
+        .execute_batch(
+            "CREATE TABLE padding (data BLOB); INSERT INTO padding VALUES (zeroblob(17825792));",
         )
         .unwrap();
-    assert_eq!(search("suffix")["results"].as_array().unwrap().len(), 1);
+    write_desktop_step(&connection, 1, "Recovered suffix");
+    assert_eq!(search("suffix")["results"][0]["coverage"], "preview");
     connection
         .execute("DELETE FROM steps WHERE idx=1", [])
         .unwrap();
-    assert_eq!(search("suffix")["results"].as_array().unwrap().len(), 1);
+    assert_eq!(search("suffix")["results"][0]["coverage"], "preview");
+}
+
+#[test]
+fn desktop_restores_history_from_the_selected_home_after_another_home_completes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace_a = root.join("project-a");
+    let workspace_b = root.join("project-b");
+    let a = write_synthetic_antigravity_ide(&root.join("a"), &workspace_a);
+    let b = write_synthetic_antigravity_ide(&root.join("b"), &workspace_b);
+    let database = |home: &Path| home.join("conversations").join(format!("{SESSION_ID}.db"));
+    let open = |home: &Path| rusqlite::Connection::open(database(home)).unwrap();
+    let search = |home: &Path, query: &str, flags: &[&str]| {
+        let result = successful_json(
+            command(
+                root,
+                if home == a {
+                    &workspace_a
+                } else {
+                    &workspace_b
+                },
+            )
+            .env("ANTIGRAVITY_DESKTOP_HOME", home)
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity-desktop",
+                query,
+            ])
+            .args(flags),
+        );
+        result["results"].as_array().unwrap().len()
+    };
+    let db = open(&a);
+    write_desktop_step(&db, 1, "asuffix");
+    set_desktop_summary(&a, "Redwood session", 2);
+    set_desktop_summary(&b, "Birch session", 1);
+    assert_eq!(search(&a, "asuffix", &[]), 1);
+    assert_eq!(search(&b, "continuity", &[]), 1);
+    assert_eq!(search(&b, "asuffix", &["--cached"]), 0);
+
+    db.execute("DELETE FROM steps WHERE idx=1", []).unwrap();
+    fs::remove_file(a.join("agyhub_summaries_proto.pb")).unwrap();
+    assert_eq!(search(&a, "asuffix", &[]), 1);
+    assert_eq!(search(&a, "Redwood", &["--no-index"]), 1);
+    assert_eq!(search(&a, "Birch", &["--no-index"]), 0);
+    assert_eq!(
+        search(&a, "asuffix", &["--project", workspace_b.to_str().unwrap()]),
+        0
+    );
+    open(&b).execute("DELETE FROM steps", []).unwrap();
+    set_desktop_summary(&b, "Birch session", 0);
+    assert_eq!(search(&b, "asuffix", &[]), 0);
+    assert_eq!(search(&b, "continuity", &["--cached"]), 0);
+    assert_eq!(search(&a, "asuffix", &["--no-index"]), 1);
+    drop(db);
+    fs::rename(database(&a), a.join("old.db")).unwrap();
+    fs::copy(database(&b), database(&a)).unwrap();
+    assert_eq!(search(&a, "asuffix", &["--no-index"]), 0);
+    assert_eq!(search(&a, "asuffix", &[]), 0);
 }
 
 #[test]

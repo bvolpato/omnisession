@@ -380,6 +380,60 @@ fn a_damaged_wal_commit_cannot_restore_an_older_zero_step_summary() {
 }
 
 #[test]
+fn a_torn_catalog_wal_cannot_certify_the_visible_step_count() {
+    let source = tempdir().unwrap();
+    summary_database(source.path(), source.path());
+    let database = source.path().join("conversation_summaries.db");
+    let writer = Connection::open(&database).unwrap();
+    writer
+        .execute_batch(
+            "UPDATE conversation_summaries SET step_count=1;
+             PRAGMA journal_mode=WAL;
+             UPDATE conversation_summaries SET step_count=3;",
+        )
+        .unwrap();
+    let wal = fs::read(source.path().join("conversation_summaries.db-wal")).unwrap();
+
+    let root = tempdir().unwrap();
+    fs::copy(database, root.path().join("conversation_summaries.db")).unwrap();
+    let restored_wal = root.path().join("conversation_summaries.db-wal");
+    let conversations = root.path().join("conversations");
+    fs::create_dir(&conversations).unwrap();
+    Connection::open(conversations.join(format!("{SESSION_ID}.db")))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES(0, x'080e9a01030a0178');",
+        )
+        .unwrap();
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let base = observed_revision(&adapter, SESSION_ID);
+    let complete = adapter.read_session(&session).unwrap();
+    assert!(!AntigravityAdapter::has_missing_database_steps(&complete));
+
+    fs::write(&restored_wal, &wal[..wal.len() - 1]).unwrap();
+    let torn = observed_revision(&adapter, SESSION_ID);
+    assert_ne!(torn.revision, base.revision);
+    let partial = adapter.read_session(&session).unwrap();
+    assert_eq!(partial.events[0].payload["text"], "x");
+    assert!(AntigravityAdapter::has_missing_database_steps(&partial));
+    assert!(
+        partial
+            .events
+            .last()
+            .unwrap()
+            .payload
+            .get("declared_steps")
+            .is_none()
+    );
+
+    fs::write(restored_wal, wal).unwrap();
+    let repaired = adapter.read_session(&session).unwrap();
+    assert_eq!(repaired.events.last().unwrap().payload["omitted_events"], 2);
+}
+
+#[test]
 fn an_older_wal_frame_cannot_hide_a_later_current_frame() {
     let source = tempdir().unwrap();
     summary_database(source.path(), source.path());

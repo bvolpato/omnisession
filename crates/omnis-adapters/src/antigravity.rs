@@ -65,7 +65,7 @@ impl AntigravityAdapter {
             .is_some_and(|name| name == SUMMARY_DATABASE)
     }
 
-    /// Returns whether a native database had fewer step rows than its catalog declared.
+    /// Returns whether a native database read detected missing steps or an unverified WAL.
     #[must_use]
     pub fn has_missing_database_steps(snapshot: &CanonicalSnapshot) -> bool {
         snapshot.events.last().is_some_and(|event| {
@@ -75,12 +75,13 @@ impl AntigravityAdapter {
             ) && event.kind == EventKind::ProviderEvent
                 && event.replay_policy == ReplayPolicy::HistoricalOnly
                 && event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD)
-                && event
-                    .payload
-                    .get("stored_steps")
-                    .and_then(Value::as_u64)
-                    .zip(event.payload.get("declared_steps").and_then(Value::as_u64))
-                    .is_some_and(|(stored, declared)| stored < declared)
+                && (event.payload["native_history_unverified"] == true
+                    || event
+                        .payload
+                        .get("stored_steps")
+                        .and_then(Value::as_u64)
+                        .zip(event.payload.get("declared_steps").and_then(Value::as_u64))
+                        .is_some_and(|(stored, declared)| stored < declared))
         })
     }
 
@@ -107,7 +108,16 @@ impl AntigravityAdapter {
 
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Antigravity)?;
-        let summary = self.summary(&session.id)?;
+        validate_id(&session.id)?;
+        let root = self.root()?;
+        let (summary, mut catalog_wal_error) =
+            self.summaries
+                .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
+                    Ok((
+                        summary_by_id(&catalog.connection, &session.id)?,
+                        catalog.verify_wal().err(),
+                    ))
+                })?;
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
@@ -135,12 +145,18 @@ impl AntigravityAdapter {
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if !Self::is_summary_catalog(&path) {
-            push_database_steps(
-                self.root()?,
-                &path,
-                &mut builder,
-                summary.step_count.unwrap_or(0),
-            )?;
+            let declared = if catalog_wal_error.is_none() {
+                summary.step_count.unwrap_or(0)
+            } else {
+                0
+            };
+            let decoded = push_database_steps(root, &path, &mut builder, declared)?;
+            if let Some(error) = catalog_wal_error.take() {
+                if decoded == 0 {
+                    return Err(error);
+                }
+                mark_unverified_wal(&mut builder);
+            }
         }
 
         let snapshot = builder.snapshot(
@@ -150,12 +166,10 @@ impl AntigravityAdapter {
             None,
             captured_at,
         );
-        if snapshot.events.is_empty() {
-            let root = self.root()?;
-            self.summaries
-                .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
-                    catalog.verify_wal()
-                })?;
+        if snapshot.events.is_empty()
+            && let Some(error) = catalog_wal_error
+        {
+            return Err(error);
         }
         if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
             if transcript && (summary.step_count != Some(0) || fs::metadata(&path)?.len() != 0) {
@@ -211,6 +225,7 @@ impl ProviderAdapter for AntigravityAdapter {
         }
         let snapshot = sqlite_snapshot(root, &database)
             .context("failed to snapshot Antigravity summary database")?;
+        let catalog_wal_verified = snapshot.verify_wal().is_ok();
         let mut statement = snapshot.connection.prepare(
             "SELECT conversation_id, title, step_count, last_modified_time, workspace_uris \
              FROM conversation_summaries",
@@ -229,24 +244,16 @@ impl ProviderAdapter for AntigravityAdapter {
             {
                 continue;
             }
-            let source_path = self.source(&summary).ok();
-            let source_revision = source_path
-                .as_deref()
-                .and_then(|path| summary.search_revision(root, path).ok());
+            let source_path = self
+                .source(&summary)
+                .ok()
+                .filter(|path| catalog_wal_verified || !Self::is_summary_catalog(path));
+            let source_revision = source_path.as_deref().and_then(|path| {
+                summary
+                    .search_revision(root, path, catalog_wal_verified)
+                    .ok()
+            });
             sessions.push(summary.native_session(source_path, source_revision));
-        }
-        drop(statement);
-        let catalog_only = |session: &NativeSession| {
-            session
-                .source_path
-                .as_deref()
-                .is_some_and(Self::is_summary_catalog)
-        };
-        if sessions.iter().any(catalog_only) && snapshot.verify_wal().is_err() {
-            for session in sessions.iter_mut().filter(|session| catalog_only(session)) {
-                session.source_path = None;
-                session.source_revision = None;
-            }
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -293,10 +300,11 @@ impl ProviderAdapter for AntigravityAdapter {
                         }),
                     "Antigravity history source changed during search read"
                 );
+                let catalog_wal = snapshot.verify_wal();
+                let revision = summary.search_revision(root, &source, catalog_wal.is_ok())?;
                 if Self::is_summary_catalog(&source) {
-                    snapshot.verify_wal()?;
+                    catalog_wal?;
                 }
-                let revision = summary.search_revision(root, &source)?;
                 Ok(summary.native_session(Some(source), Some(revision)))
             })
         })
@@ -456,7 +464,12 @@ impl Summary {
         }
     }
 
-    fn search_revision(&self, root: &Path, source: &Path) -> Result<SourceRevision> {
+    fn search_revision(
+        &self,
+        root: &Path,
+        source: &Path,
+        catalog_wal_verified: bool,
+    ) -> Result<SourceRevision> {
         let (file, history, wal) = if AntigravityAdapter::is_summary_catalog(source) {
             // All zero-step rows share a path. Each row keeps its own identity across catalog writes.
             let catalog = Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_os_str().as_encoded_bytes());
@@ -485,13 +498,19 @@ impl Summary {
             None
         };
         // The declared count affects database step decoding and the proof of an empty history.
-        let declared_steps = if wal.is_some() || empty_sources_verified.is_some() {
+        let relies_on_catalog = wal.is_some() || empty_sources_verified.is_some();
+        let declared_steps = if relies_on_catalog {
             self.step_count
         } else {
             None
         };
         let contents =
             history_contents(file, history, wal, declared_steps, empty_sources_verified)?;
+        let contents = if !catalog_wal_verified && relies_on_catalog {
+            Uuid::new_v5(&contents, b"unverified-catalog-wal")
+        } else {
+            contents
+        };
         Ok(SourceRevision {
             file: Some(file),
             contents: Some(contents),
@@ -928,11 +947,15 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
-    snapshot.verify_wal()?;
-    if stored == 0 && declared_steps > 0 {
-        return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
-            "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
-        )));
+    let wal = snapshot.verify_wal();
+    if stored == 0 {
+        wal?;
+        if declared_steps > 0 {
+            return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
+                "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+            )));
+        }
+        return Ok(0);
     }
     let mut statement = snapshot
         .connection
@@ -996,7 +1019,27 @@ fn push_database_steps_with_limits(
             None,
         );
     }
+    if let Err(error) = wal {
+        if decoded == 0 {
+            return Err(error);
+        }
+        mark_unverified_wal(builder);
+    }
     Ok(decoded)
+}
+
+fn mark_unverified_wal(builder: &mut EventBuilder) {
+    builder.push(
+        EventKind::ProviderEvent,
+        json!({
+            "native_history_unverified": true,
+            "reason": "The SQLite WAL could not confirm the end of this history."
+        }),
+        None,
+        ReplayPolicy::HistoricalOnly,
+        Some(STEP_LIMIT_RECORD.to_owned()),
+        None,
+    );
 }
 
 struct DatabaseStepEvent {
@@ -1333,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nonempty_checkpoint_cannot_hide_a_torn_wal_commit() {
+    fn a_torn_wal_keeps_its_committed_prefix_with_unknown_coverage() {
         let source = tempfile::tempdir().unwrap();
         let database = source.path().join("steps.db");
         write_steps_database(&database, &[synthetic_step(21, None)]);
@@ -1341,21 +1384,53 @@ mod tests {
         writer
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
-                 INSERT INTO steps SELECT idx + 1, step_type, step_payload FROM steps;",
+                 INSERT INTO steps SELECT 1, step_type, step_payload FROM steps WHERE idx=0;
+                 INSERT INTO steps SELECT 2, step_type, step_payload FROM steps WHERE idx=0;",
             )
             .unwrap();
         let wal = std::fs::read(source.path().join("steps.db-wal")).unwrap();
         let restored = tempfile::tempdir().unwrap();
         let copy = restored.path().join("steps.db");
         std::fs::copy(&database, &copy).unwrap();
-        let read = |bytes: &[u8]| {
+        for (bytes, expected, torn) in [(&wal[..], 3, false), (&wal[..wal.len() - 1], 2, true)] {
             std::fs::write(restored.path().join("steps.db-wal"), bytes).unwrap();
-            let mut events = EventBuilder::new(Provider::AntigravityDesktop, "synthetic");
-            push_database_steps(restored.path(), &copy, &mut events, 0)
-        };
-        assert_eq!(read(&wal).unwrap(), 2);
-        let error = read(&wal[..wal.len() - 1]).unwrap_err();
-        assert!(error.is::<crate::UnverifiedSqliteWal>());
+            let session = SessionRef::new(Provider::AntigravityDesktop, "synthetic");
+            let mut events = EventBuilder::new(session.provider, &session.id);
+            let decoded = push_database_steps(restored.path(), &copy, &mut events, 0).unwrap();
+            assert_eq!(decoded, expected);
+            let snapshot = events.snapshot(session, None, None, None, Utc::now());
+            assert_eq!(
+                super::AntigravityAdapter::has_missing_database_steps(&snapshot),
+                torn
+            );
+        }
+    }
+
+    #[test]
+    fn reset_wal_with_a_large_previous_generation_covers_all_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("steps.db");
+        write_steps_database(&database, &[synthetic_step(21, None)]);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE padding(bytes BLOB);
+             INSERT INTO padding VALUES(zeroblob(5242880));
+             PRAGMA wal_checkpoint(RESTART);
+             INSERT INTO steps SELECT 1, step_type, step_payload FROM steps WHERE idx=0;",
+            )
+            .unwrap();
+        let session = SessionRef::new(Provider::AntigravityDesktop, "synthetic");
+        let mut events = EventBuilder::new(session.provider, &session.id);
+        assert_eq!(
+            push_database_steps(root.path(), &database, &mut events, 0).unwrap(),
+            2
+        );
+        let snapshot = events.snapshot(session, None, None, None, Utc::now());
+        assert!(!super::AntigravityAdapter::has_missing_database_steps(
+            &snapshot
+        ));
     }
 
     #[test]

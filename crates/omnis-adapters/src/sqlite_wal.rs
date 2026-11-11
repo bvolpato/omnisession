@@ -3,7 +3,7 @@
 use std::{
     fmt,
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -28,11 +28,6 @@ impl std::error::Error for UnverifiedSqliteWal {}
 
 const HEADER_BYTES: u64 = 32;
 const FRAME_HEADER_BYTES: u64 = 24;
-// A large write still in progress can wait for its next commit before its results are published.
-const MAX_UNCOMMITTED_BYTES: u64 = 4 * 1024 * 1024;
-// Each older frame needs one header read and a seek over its page.
-const MAX_OLDER_HEADERS: u64 = 1_024;
-
 pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
     let mut wal = match File::open(path) {
         Ok(file) => file,
@@ -89,7 +84,6 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
     }
     wal.seek(SeekFrom::Start(prefix_end))?;
     let mut page = vec![0; usize::try_from(page_size)?];
-    let mut work = 0;
     let suffix_frames = (len - prefix_end) / stride;
     let current = [words[4], words[5]];
     for index in 0..suffix_frames {
@@ -100,11 +94,6 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
         ensure!(fields[0] != [0; 4], "invalid SQLite WAL page number");
         if salts == current {
             ensure!(fields[1] == [0; 4], "unverified SQLite WAL commit");
-            work += stride;
-            ensure!(
-                work <= MAX_UNCOMMITTED_BYTES,
-                "uncommitted SQLite WAL exceeds verification budget"
-            );
         }
         wal.read_exact(&mut page)?;
         running = checksum(&frame[..8], read, running);
@@ -137,10 +126,8 @@ fn verify_older_headers(
     current: [[u8; 4]; 2],
     mut previous: [[u8; 4]; 2],
 ) -> Result<()> {
-    ensure!(
-        frames <= MAX_OLDER_HEADERS,
-        "older SQLite WAL frames exceed verification budget"
-    );
+    // The snapshot byte limit bounds the scan. Buffer nearby frame headers for small pages.
+    let mut wal = BufReader::with_capacity(64 * 1024, wal);
     let age = |salts: [[u8; 4]; 2]| -> Result<u32> {
         // SQLite increments the first salt and randomizes the second when it resets a WAL.
         let age = u32::from_be_bytes(current[0]).wrapping_sub(u32::from_be_bytes(salts[0]));
@@ -167,7 +154,7 @@ fn verify_older_headers(
             previous = salts;
             previous_age = next_age;
         }
-        wal.seek(SeekFrom::Current(i64::from(page_size)))?;
+        wal.seek_relative(i64::from(page_size))?;
     }
     Ok(())
 }

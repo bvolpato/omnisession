@@ -1330,30 +1330,12 @@ pub(super) fn spawn_trajectory_search_updates(
                 |store| {
                     store
                         .read_trajectory_search(|snapshot| {
-                            let conflicts = crate::conflicting_search_documents(
+                            let selections = crate::ScopedSearchSelections::new(
                                 snapshot,
                                 Some(&request.homes),
-                                request
-                                    .eligible_sessions
-                                    .iter()
-                                    .map(|(selection, file)| (&selection.session, *file)),
+                                request.eligible_sessions,
                             )?;
-                            let eligible = request
-                                .eligible_sessions
-                                .into_iter()
-                                .filter_map(|(selection, _)| {
-                                    let session = &selection.session;
-                                    ((!has_scoped_home(session.provider)
-                                        || request.homes.contains_key(&session.provider))
-                                        && !conflicts.contains(session))
-                                    .then_some(selection)
-                                })
-                                .collect::<Vec<_>>();
-                            snapshot.search_selected_trajectory_page(
-                                &request.query,
-                                TRAJECTORY_SEARCH_LIMIT,
-                                &eligible,
-                            )
+                            selections.search(snapshot, &request.query, TRAJECTORY_SEARCH_LIMIT)
                         })
                         .map_err(|error| error.to_string())
                 },

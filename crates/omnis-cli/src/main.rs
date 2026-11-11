@@ -328,12 +328,30 @@ fn store_observed_search_document(
     guard: TrajectorySourceGuard,
     locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
-    let Some(full_read) =
-        search_index::index_source_complete(Some(store), session, snapshot, full_read)?
+    let document = trajectory_search_document(snapshot);
+    let Some((full_read, guard)) = search_index::index_source_coverage(
+        Some(store),
+        session,
+        snapshot,
+        source,
+        &document.text,
+        full_read,
+        guard,
+    )?
     else {
+        if let Some(observation) = &source.observation
+            && session.provider == Provider::AntigravityDesktop
+            && !observation.desktop_summaries_unavailable
+        {
+            store.record_desktop_step_declaration(
+                &indexed_session_metadata(&observation.session),
+                &observation.home,
+                guard,
+                |revision| source.verifies(revision),
+            )?;
+        }
         return Ok(false);
     };
-    let document = trajectory_search_document(snapshot);
     let title = search_index::IndexedTitle::from_read(
         session.provider,
         snapshot,
@@ -1543,7 +1561,11 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         } else {
             snapshot.trajectory_titles_with_sources()?
         };
-        let selections = scoped_search_selections(snapshot, &homes, &sessions, args.cached)?;
+        let selections = ScopedSearchSelections::new(
+            snapshot,
+            (!args.cached).then_some(&homes),
+            search_selections(&sessions, args.cached),
+        )?;
         rank_search_hits(snapshot, &query, &sessions, &selections, titles, args.limit)
     })?;
     if json_output {
@@ -1587,25 +1609,63 @@ fn order_search_sessions(sessions: &mut Vec<NativeSession>) {
     sessions.retain(|session| seen.insert(session.session.clone()));
 }
 
-fn scoped_search_selections(
-    snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
-    homes: &HashMap<Provider, PathBuf>,
-    sessions: &[NativeSession],
-    cached: bool,
-) -> omnis_store::Result<Vec<TrajectorySelection>> {
-    let conflicts = conflicting_search_documents(
-        snapshot,
-        (!cached).then_some(homes),
-        sessions.iter().map(|session| {
-            (
-                &session.session,
-                session.source_revision.and_then(|revision| revision.file),
-            )
-        }),
-    )?;
-    let mut selections = search_selections(sessions, cached);
-    selections.retain(|entry| !conflicts.contains(&entry.session));
-    Ok(selections)
+struct ScopedSearchSelections {
+    primary: Vec<TrajectorySelection>,
+    scoped_documents: Vec<(SessionRef, Option<PathBuf>, Option<Uuid>)>,
+}
+
+impl ScopedSearchSelections {
+    fn new(
+        snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
+        live_homes: Option<&HashMap<Provider, PathBuf>>,
+        candidates: Vec<(TrajectorySelection, Option<Uuid>)>,
+    ) -> omnis_store::Result<Self> {
+        let conflicts = conflicting_search_documents(
+            snapshot,
+            live_homes,
+            candidates
+                .iter()
+                .map(|(entry, file)| (&entry.session, *file)),
+        )?;
+        let mut primary = Vec::with_capacity(candidates.len());
+        let mut scoped_documents = Vec::new();
+        for (entry, file) in candidates {
+            let provider = entry.session.provider;
+            let home = live_homes.and_then(|homes| homes.get(&provider));
+            if TrajectorySourceGuard::uses_catalog_home(provider)
+                && live_homes.is_some()
+                && home.is_none()
+            {
+                continue;
+            }
+            if conflicts.contains(&entry.session) {
+                scoped_documents.push((entry.session, home.cloned(), file));
+            } else {
+                primary.push(entry);
+            }
+        }
+        Ok(Self {
+            primary,
+            scoped_documents,
+        })
+    }
+
+    fn search(
+        &self,
+        snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
+        query: &str,
+        limit: usize,
+    ) -> omnis_store::Result<omnis_store::SessionTrajectorySearchPage> {
+        let mut page = snapshot.search_selected_trajectory_page(query, limit, &self.primary)?;
+        if !self.scoped_documents.is_empty() && !page.has_more {
+            let scoped_documents =
+                snapshot.search_scoped_native_documents(query, limit, &self.scoped_documents)?;
+            page.matches.extend(scoped_documents.matches);
+            page.has_more = scoped_documents.has_more || page.matches.len() > limit;
+            page.matches.truncate(limit);
+        }
+        Ok(page)
+    }
 }
 
 fn conflicting_search_documents<'a>(
@@ -1672,18 +1732,26 @@ fn refresh_search_workspaces(
     Ok(())
 }
 
-fn search_selections(sessions: &[NativeSession], cached: bool) -> Vec<TrajectorySelection> {
+fn search_selections(
+    sessions: &[NativeSession],
+    cached: bool,
+) -> Vec<(TrajectorySelection, Option<Uuid>)> {
     sessions
         .iter()
-        .map(|session| TrajectorySelection {
-            session: session.session.clone(),
-            source: if session.session.provider != Provider::Codex {
-                None
-            } else if cached {
-                session.source_revision
-            } else {
-                Some(session.source_revision.unwrap_or_default())
-            },
+        .map(|session| {
+            (
+                TrajectorySelection {
+                    session: session.session.clone(),
+                    source: if session.session.provider != Provider::Codex {
+                        None
+                    } else if cached {
+                        session.source_revision
+                    } else {
+                        Some(session.source_revision.unwrap_or_default())
+                    },
+                },
+                session.source_revision.and_then(|revision| revision.file),
+            )
         })
         .collect()
 }
@@ -1693,11 +1761,12 @@ fn rank_search_hits<'a>(
     snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
     query: &str,
     sessions: &'a [NativeSession],
-    selections: &[TrajectorySelection],
+    selections: &ScopedSearchSelections,
     indexed_titles: Vec<IndexedTrajectoryTitle>,
     limit: usize,
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let sources: HashMap<_, _> = selections
+        .primary
         .iter()
         .map(|entry| (&entry.session, entry.source))
         .collect();
@@ -1761,8 +1830,8 @@ fn rank_search_hits<'a>(
         .map(|session| &session.session)
         .collect::<HashSet<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
-    let page = snapshot
-        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), selections)
+    let page = selections
+        .search(snapshot, query, limit.saturating_add(metadata.len()))
         .context("searching indexed conversations")?;
     let by_reference = sessions
         .iter()
@@ -4005,6 +4074,10 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
         .filter(|event| event.kind == EventKind::ProviderEvent)
         .filter_map(|event| event.payload.get("omitted_events").and_then(Value::as_u64))
         .sum::<u64>();
+    let native_history_unverified = snapshot.events.iter().any(|event| {
+        event.kind == EventKind::ProviderEvent
+            && event.payload["native_history_unverified"].as_bool() == Some(true)
+    });
     if json_output {
         println!(
             "{}",
@@ -4013,6 +4086,7 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
                 "readable": true,
                 "events": snapshot.events.len(),
                 "omitted_events": omitted_events,
+                "native_history_unverified": native_history_unverified,
                 "kinds": kinds,
             }))?
         );
@@ -4020,6 +4094,9 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
         println!("{session}: readable, {} events", snapshot.events.len());
         if omitted_events > 0 {
             println!("  {omitted_events} provider events omitted");
+        }
+        if native_history_unverified {
+            println!("  The native source could not verify whether more events were omitted.");
         }
         for (kind, count) in kinds {
             println!("  {kind:<24} {count}");
@@ -4866,7 +4943,11 @@ mod tests {
                         snapshot,
                         "needle",
                         &sessions,
-                        &super::search_selections(&sessions, true),
+                        &super::ScopedSearchSelections::new(
+                            snapshot,
+                            None,
+                            super::search_selections(&sessions, true),
+                        )?,
                         Vec::new(),
                         limit,
                     )

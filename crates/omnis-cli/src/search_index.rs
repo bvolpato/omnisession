@@ -1633,38 +1633,38 @@ pub(crate) fn observe_native_read<T>(
 }
 
 /// Returns the coverage to publish, or `None` when an incomplete read would replace better history.
-pub(super) fn index_source_complete(
+pub(super) fn index_source_coverage(
     store: Option<&Store>,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
+    source: &SearchSource,
+    text: &str,
     source_complete: bool,
-) -> omnis_store::Result<Option<bool>> {
+    guard: TrajectorySourceGuard,
+) -> omnis_store::Result<Option<(bool, TrajectorySourceGuard)>> {
     if session.provider == Provider::Imported
         || !AntigravityAdapter::has_missing_database_steps(snapshot)
     {
-        return Ok(Some(source_complete));
+        return Ok(Some((source_complete, guard)));
     }
-    let Some(store) = store else {
-        return Ok(None);
-    };
-    let prior = store.trajectory_index_state(session)?;
-    if prior.is_some_and(|prior| prior.source_complete || prior.provider_limited) {
-        Ok(None)
+    if let (Some(store), Some(observed)) = (store, &source.observation)
+        && store.can_index_native_partial(session, &observed.home, text)?
+    {
+        Ok(Some((false, guard.with_incomplete_native_history(true))))
     } else {
-        Ok(Some(false))
+        Ok(None)
     }
 }
 
-fn prepare_session(
+fn read_index_candidate(
     registry: &AdapterRegistry,
     store: Option<&Store>,
     candidate: &IndexCandidate,
-    guard: TrajectorySourceGuard,
     full_read_bytes: u64,
-) -> anyhow::Result<PreparedIndex> {
+) -> anyhow::Result<(IndexRead, SearchSource)> {
     let session = &candidate.session;
     let path = candidate.source_path.as_deref();
-    let (read, source) = match session.provider {
+    Ok(match session.provider {
         Provider::Imported => {
             let read = read_imported(store, session)?;
             let source = SearchSource::imported(read.snapshot.captured_at);
@@ -1700,7 +1700,18 @@ fn prepare_session(
                 source.context("transcript changed during search read")?,
             )
         }
-    };
+    })
+}
+
+fn prepare_session(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    candidate: &IndexCandidate,
+    guard: TrajectorySourceGuard,
+    full_read_bytes: u64,
+) -> anyhow::Result<PreparedIndex> {
+    let session = &candidate.session;
+    let (read, source) = read_index_candidate(registry, store, candidate, full_read_bytes)?;
     let IndexRead {
         native_session,
         rollback_title,
@@ -1716,8 +1727,7 @@ fn prepare_session(
     } else {
         read
     };
-    let source_complete = index_source_complete(store, session, &snapshot, source_complete)?
-        .ok_or(omnis_adapters::IncompleteTranscript)?;
+
     let source_revision = source
         .observation
         .as_ref()
@@ -1731,6 +1741,16 @@ fn prepare_session(
         return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
     }
     let document = trajectory_search_document(&snapshot);
+    let (source_complete, guard) = index_source_coverage(
+        store,
+        session,
+        &snapshot,
+        &source,
+        &document.text,
+        source_complete,
+        guard,
+    )?
+    .ok_or(omnis_adapters::IncompleteTranscript)?;
     let title = IndexedTitle::from_read(
         session.provider,
         &snapshot,
