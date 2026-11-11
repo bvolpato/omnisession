@@ -16,8 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
-    AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
-    ProviderInstallation, installed_opencode_model_with_binary,
+    AdapterRegistry, CodexWorkspaceProjection, EnvChange, LaunchPlan, LaunchTarget, NativeSession,
+    ProviderAdapter, ProviderInstallation, installed_opencode_model_with_binary,
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
@@ -118,19 +118,37 @@ const DELETE_PROVIDERS: [Provider; 4] = [
 ];
 
 trait IndexedSessionReader {
-    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
+    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        self.read_selected_session_indexed(session, None)
+    }
+
+    fn read_selected_session_indexed(
+        &self,
+        session: &SessionRef,
+        expected: Option<SourceRevision>,
+    ) -> Result<CanonicalSnapshot>;
 }
 
 fn full_index_read(
     registry: &AdapterRegistry,
     session: &SessionRef,
+    expected: Option<SourceRevision>,
 ) -> Result<omnis_adapters::IndexRead> {
     if session.provider == Provider::Codex {
-        registry.index_session(session, None, u64::MAX)
+        let read = registry.index_session(session, None, u64::MAX)?;
+        if let Some(expected) = expected {
+            anyhow::ensure!(
+                expected.matches_file_contents(read.source_revision),
+                "selected Codex rollout changed before the continuation could read it"
+            );
+        }
+        Ok(read)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
             source_complete: true,
             source_revision: SourceRevision::default(),
         })
@@ -138,7 +156,11 @@ fn full_index_read(
 }
 
 impl IndexedSessionReader for AdapterRegistry {
-    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+    fn read_selected_session_indexed(
+        &self,
+        session: &SessionRef,
+        expected: Option<SourceRevision>,
+    ) -> Result<CanonicalSnapshot> {
         let cache = Store::open_default().and_then(|store| {
             let (prior, observation) = if session.provider == Provider::Codex {
                 let observed = store.observe_selected_session(session)?;
@@ -148,8 +170,8 @@ impl IndexedSessionReader for AdapterRegistry {
             };
             Ok((store, prior, observation))
         });
-        let read = full_index_read(self, session)?;
-        let snapshot = read.snapshot;
+        let mut read = full_index_read(self, session, expected)?;
+        let snapshot = &mut read.snapshot;
         match cache {
             Ok((store, prior, observation)) => {
                 let current = prior.is_some_and(|state| {
@@ -162,23 +184,36 @@ impl IndexedSessionReader for AdapterRegistry {
                             state.source_updated_at,
                         )
                 });
-                let selected = read.native_session.map(|native| {
-                    let mut selected = indexed_session_metadata(&native);
+                let selected = read.native_session.as_ref().map(|native| {
+                    let mut selected = indexed_session_metadata(native);
                     selected.project_path =
                         (!snapshot.workspace.current_dir.as_os_str().is_empty())
                             .then(|| snapshot.workspace.current_dir.clone());
                     selected
                         .git_branch
                         .clone_from(&snapshot.workspace.git.branch);
-                    // A full transcript read may have less catalog information than discovery.
-                    if prior.is_some_and(|state| state.source_revision == read.source_revision)
-                        && let Some(old) =
-                            observation.as_ref().and_then(|obs| obs.metadata.as_ref())
-                        && selected.source_revision == old.source_revision
-                        && selected.project_path == old.project_path
-                        && selected.updated_at == old.updated_at
-                    {
-                        selected.title = selected.title.or_else(|| old.title.clone());
+                    let previous = observation
+                        .as_ref()
+                        .and_then(|obs| obs.metadata.as_ref())
+                        .filter(|old| {
+                            read.source_revision.file.is_some()
+                                && read.source_revision.contents.is_some()
+                                && selected.source_revision.is_some_and(|revision| {
+                                    revision.matches_file_contents(read.source_revision)
+                                })
+                                && selected.source_revision == old.source_revision
+                                && selected.project_path == old.project_path
+                                && !old.updated_at_approximate
+                                && selected.updated_at.is_some()
+                                && selected.updated_at == old.updated_at
+                        });
+                    if !self.adapter(session.provider).is_ok_and(|adapter| {
+                        adapter.confirms_session_title(&session.id, native.title.as_deref())
+                    }) {
+                        selected.title = previous.and_then(|old| old.title.clone());
+                        snapshot.title.clone_from(&selected.title);
+                    }
+                    if let Some(old) = previous {
                         selected.event_count = selected.event_count.max(old.event_count);
                     }
                     selected
@@ -192,9 +227,7 @@ impl IndexedSessionReader for AdapterRegistry {
                                 SearchDocumentTarget::Selected(selected, observed)
                             },
                         ),
-                        &snapshot,
-                        read.source_complete,
-                        read.source_revision,
+                        SearchDocumentInput::Read(&read),
                         (session.provider != Provider::Imported).then_some(self),
                         search_index::source_guard(session.provider, prior.as_ref()),
                     )
@@ -204,7 +237,7 @@ impl IndexedSessionReader for AdapterRegistry {
             }
             Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
         }
-        Ok(snapshot)
+        Ok(read.snapshot)
     }
 }
 
@@ -212,43 +245,44 @@ fn codex_workspace_update(
     snapshot: &CanonicalSnapshot,
     revision: SourceRevision,
     source_complete: bool,
+    workspace_projection: &CodexWorkspaceProjection,
 ) -> Option<omnis_store::CodexWorkspaceUpdate> {
-    if !source_complete
-        || snapshot.session.provider != Provider::Codex
+    if snapshot.session.provider != Provider::Codex
         || revision.file.is_none()
         || revision.contents.is_none()
     {
         return None;
     }
-    if snapshot.events.iter().any(|event| {
-        matches!(
-            event.source.raw_record_type.as_deref(),
-            Some("omnisession.codex_malformed_records" | "omnisession.record_size_limit")
-        ) && event.payload["omitted_events"]
-            .as_u64()
-            .is_some_and(|count| count > 0)
-    }) {
-        return Some(omnis_store::CodexWorkspaceUpdate::Withdrawn(revision));
-    }
+    let directory = &snapshot.workspace.current_dir;
+    let directory = match workspace_projection {
+        CodexWorkspaceProjection::Observed(directory) => directory.as_deref(),
+        CodexWorkspaceProjection::Unchecked if !source_complete => return None,
+        CodexWorkspaceProjection::Unchecked => {
+            if snapshot.events.iter().any(|event| {
+                matches!(
+                    event.source.raw_record_type.as_deref(),
+                    Some(
+                        "omnisession.codex_malformed_records"
+                            | "omnisession.record_size_limit"
+                            | "omnisession.codex_workspace_unknown"
+                    )
+                ) && event.payload["workspace_unknown"] == true
+            }) {
+                return Some(omnis_store::CodexWorkspaceUpdate::Withdrawn(revision));
+            }
+            (!directory.as_os_str().is_empty()).then_some(directory.as_path())
+        }
+    };
+    let git_branch = directory
+        .filter(|path| path.as_os_str() == snapshot.workspace.current_dir.as_os_str())
+        .and(snapshot.workspace.git.branch.clone());
     Some(omnis_store::CodexWorkspaceUpdate::Verified(
         omnis_store::CodexWorkspace {
             source_revision: revision,
-            project_path: (!snapshot.workspace.current_dir.as_os_str().is_empty())
-                .then(|| snapshot.workspace.current_dir.clone()),
-            git_branch: snapshot.workspace.git.branch.clone(),
+            git_branch,
+            project_path: directory.map(Path::to_path_buf),
         },
     ))
-}
-
-fn verified_codex_workspace(
-    snapshot: &CanonicalSnapshot,
-    revision: SourceRevision,
-    source_complete: bool,
-) -> Option<omnis_store::CodexWorkspace> {
-    match codex_workspace_update(snapshot, revision, source_complete)? {
-        omnis_store::CodexWorkspaceUpdate::Verified(workspace) => Some(workspace),
-        omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => None,
-    }
 }
 
 enum SearchDocumentTarget<'a> {
@@ -266,18 +300,40 @@ impl<'a> From<&'a SessionRef> for SearchDocumentTarget<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SearchDocumentInput<'a> {
+    Read(&'a omnis_adapters::IndexRead),
+    Bundle(&'a CanonicalSnapshot),
+}
+
 /// Stores the observed document and source revision, then returns its indexed title.
 fn store_search_document<'a>(
     store: &Store,
     target: impl Into<SearchDocumentTarget<'a>>,
-    snapshot: &CanonicalSnapshot,
-    source_complete: bool,
-    source_revision: SourceRevision,
+    input: SearchDocumentInput<'_>,
     native_registry: Option<&AdapterRegistry>,
     guard: TrajectorySourceGuard,
 ) -> Result<Option<IndexedTrajectoryTitle>> {
+    let (snapshot, read) = match input {
+        SearchDocumentInput::Read(read) => (&read.snapshot, Some(read)),
+        SearchDocumentInput::Bundle(snapshot) => (snapshot, None),
+    };
+    let source_complete = read.is_none_or(|read| read.source_complete);
+    let source_revision = read.map(|read| read.source_revision).unwrap_or_default();
+    let workspace_projection = read.map_or(&CodexWorkspaceProjection::Unchecked, |read| {
+        &read.workspace_projection
+    });
+    let rollback_title = read.map_or(&omnis_adapters::RollbackTitle::Unknown, |read| {
+        &read.rollback_title
+    });
     let document = trajectory_search_document(snapshot);
-    let mut title = search_index::IndexedTitle::from_read(snapshot, source_complete, &document);
+    let mut title = search_index::IndexedTitle::from_read(
+        snapshot,
+        source_complete,
+        &document,
+        rollback_title,
+        native_registry,
+    );
     let origin = if let Some(registry) = native_registry {
         title.check_withdrawal(registry, store, &snapshot.session, source_revision)?;
         SessionTrajectoryOrigin::Native
@@ -298,6 +354,7 @@ fn store_search_document<'a>(
         withdrawn_title: title.withdrawn.as_deref(),
         title_is_verified: title.is_verified(),
         title_authoritative: title.authoritative,
+        local_opener: title.local_opener,
     };
     let session = match target.into() {
         SearchDocumentTarget::Session(session) => {
@@ -305,7 +362,12 @@ fn store_search_document<'a>(
             session
         }
         SearchDocumentTarget::VisibleNative(native) => {
-            let workspace = codex_workspace_update(snapshot, source_revision, source_complete);
+            let workspace = codex_workspace_update(
+                snapshot,
+                source_revision,
+                source_complete,
+                workspace_projection,
+            );
             store.upsert_observed_trajectory_documents_with_workspaces(&[(
                 &native.session,
                 document,
@@ -315,7 +377,12 @@ fn store_search_document<'a>(
             &native.session
         }
         SearchDocumentTarget::Selected(selected, observed) => {
-            let workspace = codex_workspace_update(snapshot, source_revision, source_complete);
+            let workspace = codex_workspace_update(
+                snapshot,
+                source_revision,
+                source_complete,
+                workspace_projection,
+            );
             store.upsert_selected_session_document_with_workspace(
                 selected,
                 observed,
@@ -469,35 +536,25 @@ fn discover_sessions(
     });
     for (provider, result) in discovered {
         match result {
-            Ok((found, notes)) => {
-                if let Some(store) = cache {
-                    let indexed = found
-                        .iter()
-                        .map(indexed_session_metadata)
-                        .collect::<Vec<_>>();
+            Ok((mut found, notes)) => {
+                if let Some(store) =
+                    cache.filter(|_| !project_search || provider == Provider::Codex)
+                    && let Ok(adapter) = registry.adapter(provider)
+                {
                     // Omission proves deletion only after explicitly complete discovery.
-                    let complete = project.is_none()
+                    let complete = !project_search
+                        && project.is_none()
                         && notes.is_empty()
-                        && registry
-                            .adapter(provider)
-                            .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if provider == Provider::Codex {
-                        observed_codex.as_ref().map_or(Ok(()), |observed| {
-                            let names_complete = registry
-                                .adapter(provider)
-                                .is_ok_and(ProviderAdapter::session_titles_are_complete);
-                            store.refresh_codex_catalog(
-                                &indexed,
-                                complete,
-                                names_complete,
-                                observed,
-                            )
-                        })
-                    } else if complete {
-                        store.replace_indexed_sessions(provider, &indexed)
-                    } else {
-                        store.merge_indexed_sessions(provider, &indexed)
-                    };
+                        && adapter.discovery_is_complete();
+                    let refreshed = cache_discovered_sessions(
+                        store,
+                        adapter,
+                        provider,
+                        &mut found,
+                        observed_codex.as_deref(),
+                        complete,
+                        project_search,
+                    );
                     if let Err(error) = refreshed {
                         warnings.push(format!("{provider} session cache: {error}"));
                     }
@@ -518,6 +575,54 @@ fn discover_sessions(
         }
     }
     (sessions, warnings)
+}
+
+fn cache_discovered_sessions(
+    store: &Store,
+    adapter: &dyn ProviderAdapter,
+    provider: Provider,
+    sessions: &mut [NativeSession],
+    observed_codex: Option<&[IndexedSession]>,
+    complete: bool,
+    project_search: bool,
+) -> omnis_store::Result<()> {
+    let indexed = sessions
+        .iter()
+        .map(indexed_session_metadata)
+        .collect::<Vec<_>>();
+    if provider != Provider::Codex {
+        return if complete {
+            store.replace_indexed_sessions(provider, &indexed)
+        } else {
+            store.merge_indexed_sessions(provider, &indexed)
+        };
+    }
+    let Some(observed) = observed_codex else {
+        return Ok(());
+    };
+    let names_complete = adapter.session_titles_are_complete();
+    if !project_search {
+        return store.refresh_codex_catalog(&indexed, complete, names_complete, observed);
+    }
+    let merged = store.merge_codex_search_catalog(&indexed, names_complete, observed);
+    if matches!(
+        merged,
+        Err(omnis_store::StoreError::TrajectorySourceChanged)
+    ) {
+        for session in sessions {
+            if !adapter.confirms_session_title(&session.session.id, session.title.as_deref())
+                && let Ok(Some(current)) = adapter.find_native_session(&session.session.id)
+                && let Some(revision) = current.source_revision
+                && revision.file.is_some()
+                && revision.contents.is_some()
+                && session.source_revision == Some(revision)
+                && current.updated_at == session.updated_at
+            {
+                session.title = current.title;
+            }
+        }
+    }
+    merged
 }
 
 const SEARCH_TEXT_WIDTH: usize = 80;
@@ -632,7 +737,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             registry,
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
-            None,
+            (!args.no_index).then_some(&store),
             !args.no_index,
         );
         (sessions, warnings, None)
@@ -1503,7 +1608,7 @@ fn main() -> ExitCode {
         // The command already reported the interrupted work.
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            let _ = writeln!(io::stderr().lock(), "error: {error:#}");
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
                 Some(ProviderExit(status)) => {
@@ -1528,7 +1633,10 @@ fn run(cli: Cli) -> Result<()> {
             show(&registry, &session, cli.json)
         }
         Commands::Markdown(args) => markdown(&registry, &args, cli.json),
-        Commands::Handoff(args) => handoff::run(&registry, &args.session, cli.json),
+        Commands::Handoff(args) => {
+            let source = resolve_session_ref(&registry, &args.session)?;
+            handoff::run(&registry, &source, None, cli.json)
+        }
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
         Commands::Fork(args) => fork(&registry, &args, cli.json),
@@ -2686,9 +2794,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store_search_document(
         store,
         &imported,
-        &bundle.snapshot,
-        true,
-        SourceRevision::default(),
+        SearchDocumentInput::Bundle(&bundle.snapshot),
         None,
         TrajectorySourceGuard::NewerSource,
     )
@@ -2947,22 +3053,24 @@ fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool 
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
-    println!("Transfer: {} -> {}", report.source, report.target);
-    println!("Mode: {}", report.mode);
-    println!("Repository match: {}", report.repository_matches);
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Transfer: {} -> {}", report.source, report.target)?;
+    writeln!(stdout, "Mode: {}", report.mode)?;
+    writeln!(stdout, "Repository match: {}", report.repository_matches)?;
     for entry in &report.entries {
         if let Some(detail) = &entry.detail {
-            println!(
+            writeln!(
+                stdout,
                 "  {:<24} {:?} ({})",
                 entry.feature,
                 entry.status,
                 safe_terminal_line(detail)
-            );
+            )?;
         } else {
-            println!("  {:<24} {:?}", entry.feature, entry.status);
+            writeln!(stdout, "  {:<24} {:?}", entry.feature, entry.status)?;
         }
     }
-    flush_stdout()?;
+    stdout.flush()?;
     for warning in &report.warnings {
         progress_line(&format!("warning: {warning}"))?;
     }
@@ -3122,11 +3230,6 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
                 "--force".to_owned(),
             ]
         }
-        Provider::OpenCode => {
-            let binary = resolved_provider_binary(session.provider)
-                .unwrap_or_else(|_| PathBuf::from("opencode"));
-            omnis_adapters::opencode_command_args(&binary, &["session", "delete", &session.id])?
-        }
         Provider::Grok => {
             validate_grok_session_id(&session.id)?;
             vec![
@@ -3207,7 +3310,16 @@ fn delete_native_session(
             let binary = cursor_ide_binary()?;
             Some(cursor_ide_import::delete_session(session, &binary)?)
         }
-        Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
+        Provider::OpenCode => {
+            let binary = resolved_provider_binary(Provider::OpenCode)?;
+            let cwd = workspace
+                .into_iter()
+                .chain(native.project_path.as_deref())
+                .find(|path| path.is_dir());
+            transfer::delete_opencode_session(&binary, session, cwd)?;
+            None
+        }
+        Provider::Codex | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
             None
         }
@@ -3222,7 +3334,7 @@ fn delete_native_session(
     if sessions
         .iter()
         .any(|candidate| candidate.session == *session)
-        || registry.read_session(session).is_ok()
+        || (session.provider != Provider::OpenCode && registry.read_session(session).is_ok())
         || (session.provider == Provider::Grok
             && grok_session_directory_exists(
                 registry
@@ -3413,7 +3525,7 @@ fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
     Ok(file)
 }
 
-fn write_private_json(document: &Value) -> Result<NamedTempFile> {
+fn create_private_import_file() -> Result<NamedTempFile> {
     let _store = Store::open_default().context("validating OmniSession state root")?;
     let directory = state_root()
         .context("resolving OmniSession state")?
@@ -3435,19 +3547,11 @@ fn write_private_json(document: &Value) -> Result<NamedTempFile> {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .context("securing import directory")?;
     }
-    let mut file = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix("opencode-")
         .suffix(".json")
         .tempfile_in(&directory)
-        .context("creating private import")?;
-    serde_json::to_writer(file.as_file_mut(), document).context("writing private import")?;
-    file.as_file()
-        .sync_all()
-        .context("syncing private import")?;
-    if file.as_file().metadata()?.len() > MAX_BUNDLE_SIZE {
-        bail!("OpenCode import exceeds {MAX_BUNDLE_SIZE} byte safety limit");
-    }
-    Ok(file)
+        .context("creating private import")
 }
 
 fn sanitize_snapshot(mut snapshot: CanonicalSnapshot) -> CanonicalSnapshot {
@@ -4111,6 +4215,43 @@ mod tests {
             grok_session_directory_exists(Some(root.path()), "019fa3c6000070008000000000000000")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn workspace_projection_keeps_git_metadata_only_for_the_recorded_directory() {
+        use omnis_adapters::{CodexWorkspaceProjection, ProviderAdapter};
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let id = "019fae41-ace0-7000-8000-123456789abc";
+        let path = sessions.join(format!("rollout-{id}.jsonl"));
+        let created = root.path().join("creation");
+        let moved = root.path().join("continuation");
+        let header = json!({"type":"session_meta","payload":{"id":id,"cwd":created,"git":{"branch":"creation-branch"}}});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let read = CodexAdapter::with_root(root.path())
+            .index_session(&SessionRef::new(Provider::Codex, id), Some(&path), u64::MAX)
+            .unwrap();
+        for (directory, expected_branch) in [
+            (Some(created), Some("creation-branch")),
+            (Some(moved), None),
+            (None, None),
+        ] {
+            let projection = CodexWorkspaceProjection::Observed(directory.clone());
+            let update = super::codex_workspace_update(
+                &read.snapshot,
+                read.source_revision,
+                false,
+                &projection,
+            )
+            .unwrap();
+            let omnis_store::CodexWorkspaceUpdate::Verified(workspace) = update else {
+                panic!("a stamped workspace projection must be accepted");
+            };
+            assert_eq!(workspace.project_path, directory);
+            assert_eq!(workspace.git_branch.as_deref(), expected_branch);
+        }
     }
 
     #[test]

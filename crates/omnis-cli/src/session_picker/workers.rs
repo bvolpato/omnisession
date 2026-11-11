@@ -501,10 +501,21 @@ pub(super) fn read_picker_preview(
                     .as_ref()
                     .context("cached Codex preview has no verified catalog metadata")?;
                 let effective = &read.snapshot.workspace.current_dir;
-                let workspace = if effective.as_os_str().is_empty() {
-                    header.project_path.as_deref()
-                } else {
-                    Some(effective.as_path())
+                let workspace = match &read.workspace_projection {
+                    omnis_adapters::CodexWorkspaceProjection::Observed(project) => {
+                        project.as_deref()
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked
+                        if !effective.as_os_str().is_empty() =>
+                    {
+                        Some(effective.as_path())
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked if read.source_complete => {
+                        None
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked => {
+                        header.project_path.as_deref()
+                    }
                 };
                 workspace.map(Path::as_os_str) != expected.as_deref().map(Path::as_os_str)
             }
@@ -517,13 +528,15 @@ pub(super) fn read_picker_preview(
         return Ok(read);
     }
     if session.provider == Provider::Imported || key.continuation_after.is_some() {
-        return full_index_read(registry, session);
+        return full_index_read(registry, session, None);
     }
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             source_complete: false,
             source_revision: SourceRevision::default(),
         })
@@ -626,7 +639,12 @@ fn record_preview(
     let mut metadata = PreviewMetadata {
         read_revision: revision.file.map(|_| preview_revision(revision)),
         workspace: native.and_then(|_| {
-            crate::codex_workspace_update(&read.snapshot, revision, read.source_complete)
+            crate::codex_workspace_update(
+                &read.snapshot,
+                revision,
+                read.source_complete,
+                &read.workspace_projection,
+            )
         }),
         ..PreviewMetadata::default()
     };
@@ -681,9 +699,7 @@ fn record_preview(
         metadata.indexed_title = crate::store_search_document(
             writer.store,
             target,
-            &read.snapshot,
-            read.source_complete,
-            revision,
+            crate::SearchDocumentInput::Read(read),
             (session.provider != Provider::Imported).then_some(registry),
             writer.guard,
         )?;

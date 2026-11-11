@@ -86,14 +86,14 @@ pub(super) const LEGACY_PROJECTION_LIMITS: JsonLinesLimits = JsonLinesLimits {
 pub(super) fn visit_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
-    visit: impl FnMut(Value, usize) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records_with_limits(open(path)?, limits, visit)
 }
 
 pub(super) fn visit(
     path: &Path,
-    visit: impl FnMut(Value, usize) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records(open(path)?, visit)
 }
@@ -104,17 +104,21 @@ pub(super) fn visit_all_records(
     mut visit: impl FnMut(Value) -> Result<bool>,
 ) -> Result<bool> {
     let mut accepted = true;
-    let (omissions, _) =
-        visit_json_reader(&mut BufReader::new(open(path)?), LIMITS, |_, record, _| {
+    let (omissions, _) = visit_json_reader(
+        &mut BufReader::new(open(path)?),
+        LIMITS,
+        workspace_record_candidate,
+        |_, record, _| {
             accepted &= visit(record)?;
             Ok(())
-        })?;
+        },
+    )?;
     Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
 }
 
 pub(super) fn read_records(
     reader: impl Read,
-    visit: impl FnMut(Value, usize) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records_with_limits(reader, LIMITS, visit)
 }
@@ -122,11 +126,12 @@ pub(super) fn read_records(
 fn read_records_with_limits(
     reader: impl Read,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(Value, usize) -> Result<()>,
+    mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     visit_json_reader(
         &mut BufReader::new(reader),
         limits,
+        workspace_record_candidate,
         |_, record, skipped_before| visit(record, skipped_before),
     )
     .map(|(omissions, _)| omissions)
@@ -141,6 +146,50 @@ pub(super) enum Sample {
         prefix_records: usize,
     },
     Reconstruct,
+}
+
+pub(super) fn workspace_record_candidate(line: &[u8]) -> bool {
+    if !line.trim_ascii_start().starts_with(b"{") {
+        return false;
+    }
+    match string_field(line, "type").as_deref() {
+        Some("event_msg") => matches!(
+            field(line, "payload")
+                .and_then(|payload| string_field(payload, "type"))
+                .as_deref(),
+            None | Some("thread_rolled_back" | "thread_settings_applied")
+        ),
+        None | Some("turn_context" | "session_meta") => true,
+        Some(_) => false,
+    }
+}
+
+fn string_field(line: &[u8], name: &str) -> Option<String> {
+    serde_json::Deserializer::from_slice(field(line, name)?)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+}
+
+/// Reads object keys in order. A field before the damage still identifies the enclosing record.
+fn field<'a>(line: &'a [u8], target: &str) -> Option<&'a [u8]> {
+    let mut rest = line.trim_ascii_start().strip_prefix(b"{")?;
+    loop {
+        let mut key = serde_json::Deserializer::from_slice(rest).into_iter::<String>();
+        let name = key.next()?.ok()?;
+        rest = rest[key.byte_offset()..]
+            .trim_ascii_start()
+            .strip_prefix(b":")?;
+        if name == target {
+            return Some(rest);
+        }
+        let mut ignored =
+            serde_json::Deserializer::from_slice(rest).into_iter::<serde::de::IgnoredAny>();
+        ignored.next()?.ok()?;
+        rest = rest[ignored.byte_offset()..]
+            .trim_ascii_start()
+            .strip_prefix(b",")?;
+    }
 }
 
 /// Read small rollouts once. Larger compressed files have no seekable tail, so sample the
@@ -162,8 +211,9 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
     let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
+        workspace_record_candidate,
         |loc, record, skipped_before| {
-            let ordinal = count + skipped_before;
+            let ordinal = count + skipped_before.total();
             count += 1;
             reconstruct |= record["type"] == "compacted"
                 || (record["type"] == "event_msg"
@@ -191,7 +241,7 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
             Ok(())
         },
     )?;
-    if reconstruct {
+    if reconstruct || unreadable.workspace_gaps() > 0 {
         return Ok(Sample::Reconstruct);
     }
     for (offset, ordinal, record) in tail {

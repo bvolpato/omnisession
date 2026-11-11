@@ -868,9 +868,12 @@ fn visit_json_lines_with_offsets_and_limits(
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     reader.seek(SeekFrom::Start(0))?;
-    visit_json_reader(reader, limits, |location, record, _| {
-        visit(location, record)
-    })
+    visit_json_reader(
+        reader,
+        limits,
+        |_| false,
+        |location, record, _| visit(location, record),
+    )
     .map(|(omissions, _)| omissions.oversized)
 }
 
@@ -878,6 +881,7 @@ fn visit_json_lines_with_offsets_and_limits(
 pub(crate) struct JsonLineSkips {
     pub(crate) oversized: usize,
     pub(crate) malformed: usize,
+    matched_malformed: usize,
 }
 
 impl JsonLineSkips {
@@ -885,10 +889,15 @@ impl JsonLineSkips {
         self.oversized + self.malformed
     }
 
-    fn parse(&mut self, line: &[u8]) -> Option<Value> {
+    pub(crate) fn workspace_gaps(self) -> usize {
+        self.oversized + self.matched_malformed
+    }
+
+    fn parse(&mut self, line: &[u8], match_malformed: &impl Fn(&[u8]) -> bool) -> Option<Value> {
         let record = serde_json::from_slice(line).ok();
         if record.is_none() && !line.iter().all(u8::is_ascii_whitespace) {
             self.malformed += 1;
+            self.matched_malformed += usize::from(match_malformed(line));
         }
         record
     }
@@ -898,7 +907,8 @@ impl JsonLineSkips {
 pub(crate) fn visit_json_reader(
     reader: &mut impl BufRead,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value, usize) -> Result<()>,
+    match_malformed: impl Fn(&[u8]) -> bool,
+    mut visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
 ) -> Result<(JsonLineSkips, u64)> {
     let mut line = Vec::new();
     let mut records = 0_usize;
@@ -929,14 +939,14 @@ pub(crate) fn visit_json_reader(
         match line_kind {
             BoundedLine::Oversized => omissions.oversized += 1,
             BoundedLine::Complete => {
-                if let Some(record) = omissions.parse(&line) {
+                if let Some(record) = omissions.parse(&line, &match_malformed) {
                     visit(
                         JsonLineLocation {
                             offset: line_offset,
                             length: read,
                         },
                         record,
-                        omissions.total(),
+                        omissions,
                     )?;
                 }
             }
@@ -981,7 +991,22 @@ impl IndexScan {
 ///
 /// Files above the byte budget keep their newest suffix, starting at the first complete record.
 /// Oversized records are skipped and counted. Only open or read failures are errors.
-pub(crate) fn visit_index_json_lines(path: &Path, visit: impl FnMut(Value)) -> Result<IndexScan> {
+pub(crate) fn visit_index_json_lines(
+    path: &Path,
+    mut visit: impl FnMut(Value),
+) -> Result<IndexScan> {
+    visit_index_json_lines_with_gaps(path, |record| {
+        if let Some(record) = record {
+            visit(record);
+        }
+    })
+}
+
+/// Reports an unreadable nonblank row as `None` at its position in the file.
+pub(crate) fn visit_index_json_lines_with_gaps(
+    path: &Path,
+    visit: impl FnMut(Option<Value>),
+) -> Result<IndexScan> {
     visit_index_json_lines_with_limits(path, MAX_INDEX_FILE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, visit)
 }
 
@@ -989,7 +1014,7 @@ fn visit_index_json_lines_with_limits(
     path: &Path,
     file_limit: u64,
     line_limit: u64,
-    mut visit: impl FnMut(Value),
+    mut visit: impl FnMut(Option<Value>),
 ) -> Result<IndexScan> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -1009,10 +1034,16 @@ fn visit_index_json_lines_with_limits(
     let mut line = Vec::new();
     while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
         match line_kind {
-            BoundedLine::Oversized => scan.oversized_records += 1,
+            BoundedLine::Oversized => {
+                scan.oversized_records += 1;
+                visit(None);
+            }
             BoundedLine::Complete => match serde_json::from_slice(&line) {
-                Ok(record) => visit(record),
-                Err(_) if !line.iter().all(u8::is_ascii_whitespace) => scan.malformed_records += 1,
+                Ok(record) => visit(Some(record)),
+                Err(_) if !line.iter().all(u8::is_ascii_whitespace) => {
+                    scan.malformed_records += 1;
+                    visit(None);
+                }
                 Err(_) => {}
             },
         }
@@ -1020,7 +1051,7 @@ fn visit_index_json_lines_with_limits(
     Ok(scan)
 }
 
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     Complete,
     Oversized,
 }
@@ -1037,7 +1068,7 @@ fn read_bounded_line(
 }
 
 /// Reads one bounded line without consuming bytes beyond the transcript file budget.
-fn read_bounded_line_with_budget(
+pub(crate) fn read_bounded_line_with_budget(
     reader: &mut impl BufRead,
     line_limit: u64,
     file_budget: u64,
@@ -1088,7 +1119,7 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
-    Ok(json_lines_preview_with_omissions(path, sample_records)?.records)
+    Ok(json_lines_preview_with_omissions(path, sample_records, |_| false)?.records)
 }
 
 #[derive(Default)]
@@ -1103,6 +1134,7 @@ pub(crate) struct JsonLinesPreview {
 pub(crate) fn json_lines_preview_with_omissions(
     path: &Path,
     sample_records: usize,
+    match_malformed: impl Fn(&[u8]) -> bool,
 ) -> Result<JsonLinesPreview> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -1116,12 +1148,18 @@ pub(crate) fn json_lines_preview_with_omissions(
     } else {
         sample_records
     };
-    let prefix_end = read_json_lines_prefix(&file, limit, &mut preview)?;
+    let prefix_end = read_json_lines_prefix(&file, limit, &mut preview, &match_malformed)?;
     if small {
         preview.sampled = prefix_end < metadata.len();
         return Ok(preview);
     }
-    let tail = read_json_lines_tail(&file, sample_records, prefix_end, &mut preview)?;
+    let tail = read_json_lines_tail(
+        &file,
+        sample_records,
+        prefix_end,
+        &mut preview,
+        &match_malformed,
+    )?;
     preview
         .records
         .extend(tail.into_iter().map(|(_, record)| record));
@@ -1135,6 +1173,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         limit,
         0,
         &mut JsonLinesPreview::default(),
+        &|_| false,
     )
 }
 
@@ -1143,6 +1182,7 @@ fn read_json_lines_tail(
     limit: usize,
     prefix_end: u64,
     preview: &mut JsonLinesPreview,
+    match_malformed: &impl Fn(&[u8]) -> bool,
 ) -> Result<Vec<(u64, Value)>> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1175,7 +1215,7 @@ fn read_json_lines_tail(
             preview.omissions.oversized += 1;
             continue;
         }
-        if let Some(record) = preview.omissions.parse(&line) {
+        if let Some(record) = preview.omissions.parse(&line, match_malformed) {
             if limit == 0 {
                 preview.sampled = true;
                 continue;
@@ -1199,7 +1239,7 @@ fn read_json_lines_tail(
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
     let file = File::open(path)?;
     let mut preview = JsonLinesPreview::default();
-    read_json_lines_prefix(&file, limit, &mut preview)?;
+    read_json_lines_prefix(&file, limit, &mut preview, &|_| false)?;
     Ok(preview.records)
 }
 
@@ -1208,6 +1248,7 @@ fn read_json_lines_prefix(
     file: &File,
     limit: usize,
     preview: &mut JsonLinesPreview,
+    match_malformed: &impl Fn(&[u8]) -> bool,
 ) -> Result<u64> {
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1225,7 +1266,7 @@ fn read_json_lines_prefix(
         match line_kind {
             BoundedLine::Oversized => preview.omissions.oversized += 1,
             BoundedLine::Complete => {
-                if let Some(record) = preview.omissions.parse(&line) {
+                if let Some(record) = preview.omissions.parse(&line, match_malformed) {
                     if preview.omissions.total() == 0 {
                         preview.prefix_records += 1;
                     }
@@ -1306,6 +1347,18 @@ pub(crate) struct EventBuilder {
     next_sequence: u64,
     events: Vec<OmniEvent>,
     preview: Option<EventPreview>,
+    rollback_opener: Option<RollbackOpener>,
+}
+
+#[derive(Default)]
+struct RollbackOpener {
+    full_read: bool,
+    first_message: Option<(u64, Option<String>)>,
+    applied_rollback: bool,
+    gap: bool,
+    /// A repeated surviving opener cancels an earlier withdrawal of the same title.
+    withdrawn: crate::WithdrawnOpeners,
+    target: Option<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -1432,6 +1485,7 @@ impl EventBuilder {
             next_sequence: 0,
             events: Vec::new(),
             preview: None,
+            rollback_opener: None,
         }
     }
 
@@ -1509,7 +1563,65 @@ impl EventBuilder {
         self.events.drain(..)
     }
 
+    pub(crate) fn track_rollback_opener(&mut self, full_read: bool) {
+        self.rollback_opener = Some(RollbackOpener {
+            full_read,
+            ..RollbackOpener::default()
+        });
+    }
+
+    pub(crate) fn track_saved_opener(&mut self, title: &str) {
+        self.rollback_opener = Some(RollbackOpener {
+            target: Some(crate::RollbackTitle::fingerprint(title)),
+            ..RollbackOpener::default()
+        });
+    }
+
+    pub(crate) fn tracks_rollback_opener(&self) -> bool {
+        self.rollback_opener.is_some()
+    }
+
+    pub(crate) fn discard_rollback_opener(&mut self) {
+        self.rollback_opener = None;
+    }
+
+    pub(crate) fn note_rollback_history_gap(&mut self) {
+        if let Some(opener) = &mut self.rollback_opener {
+            opener.gap = true;
+        }
+    }
+
+    pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
+        match &self.rollback_opener {
+            Some(opener) if opener.gap => opener.withdrawn.after_gap(),
+            Some(opener) if opener.full_read || opener.applied_rollback => {
+                crate::RollbackTitle::Known(
+                    opener
+                        .first_message
+                        .as_ref()
+                        .and_then(|(_, title)| title.clone()),
+                )
+            }
+            Some(_) => crate::RollbackTitle::UnknownLocal,
+            None => crate::RollbackTitle::Unknown,
+        }
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        if let Some(opener) = &mut self.rollback_opener
+            && !opener.gap
+        {
+            opener.applied_rollback = true;
+            if let Some((_, Some(title))) = opener
+                .first_message
+                .take_if(|(sequence, _)| *sequence >= checkpoint)
+            {
+                let hash = crate::RollbackTitle::fingerprint(&title);
+                if opener.target.is_none_or(|target| target == hash) {
+                    opener.withdrawn.record(hash);
+                }
+            }
+        }
         if let Some(preview) = &mut self.preview {
             preview.outline.truncate(
                 preview
@@ -1544,7 +1656,7 @@ impl EventBuilder {
         self.push_json_line_omissions(
             JsonLineSkips {
                 oversized: omitted_records,
-                malformed: 0,
+                ..Default::default()
             },
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             None,
@@ -1616,6 +1728,27 @@ impl EventBuilder {
         );
     }
 
+    /// Keeps the workspace decision even when a sampled preview leaves out the omission event.
+    pub(crate) fn mark_codex_workspace_unknown(&mut self, timestamp: Option<DateTime<Utc>>) {
+        if let Some(event) = self.events.iter_mut().rev().find(|event| {
+            matches!(
+                event.source.raw_record_type.as_deref(),
+                Some("omnisession.codex_malformed_records" | "omnisession.record_size_limit")
+            )
+        }) {
+            event.payload["workspace_unknown"] = true.into();
+        } else {
+            self.push(
+                EventKind::ProviderEvent,
+                serde_json::json!({"workspace_unknown":true}),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_workspace_unknown".to_owned()),
+                None,
+            );
+        }
+    }
+
     pub(crate) fn push(
         &mut self,
         kind: EventKind,
@@ -1627,19 +1760,25 @@ impl EventBuilder {
     ) {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        if self.preview.as_mut().is_some_and(|preview| {
+        let retained = self.preview.as_mut().is_none_or(|preview| {
             let source_bytes = self.session_id.len()
                 + self.provider_version.as_ref().map_or(0, String::len)
                 + raw_record_type.as_ref().map_or(0, String::len);
-            !preview.record(sequence, &kind, &payload, source_bytes)
-        }) {
+            preview.record(sequence, &kind, &payload, source_bytes)
+        });
+        let observe = self.rollback_opener.as_mut().filter(|opener| {
+            !opener.gap
+                && opener.first_message.is_none()
+                && matches!(kind, EventKind::MessageUser | EventKind::MessageAssistant)
+        });
+        if !retained && observe.is_none() {
             return;
         }
         let event_seed = event_id.map_or_else(
             || sequence.to_string(),
             |native_id| format!("{sequence}:{native_id}"),
         );
-        self.events.push(OmniEvent {
+        let event = OmniEvent {
             schema_version: SCHEMA_VERSION.to_owned(),
             event_id: Uuid::new_v5(&self.thread_id, event_seed.as_bytes()),
             thread_id: self.thread_id,
@@ -1657,7 +1796,17 @@ impl EventBuilder {
             raw_blob_hash: None,
             sensitivity: Sensitivity::Normal,
             replay_policy,
-        });
+        };
+        if let Some(opener) = observe {
+            opener.first_message =
+                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event));
+            if let Some((_, Some(title))) = &opener.first_message {
+                opener.withdrawn.reissued(title);
+            }
+        }
+        if retained {
+            self.events.push(event);
+        }
     }
 
     pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
@@ -2073,7 +2222,7 @@ mod tests {
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {
         let mut values = Vec::new();
         let scan = visit_index_json_lines_with_limits(path, file_limit, line_limit, |record| {
-            values.extend(record["n"].as_u64());
+            values.extend(record.and_then(|record| record["n"].as_u64()));
         })
         .expect("index scan");
         (values, scan)

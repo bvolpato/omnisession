@@ -6,20 +6,23 @@ use omnis_core::{
     HandoffRole, import_conversation, render_markdown_export, safe_terminal_line,
     safe_terminal_text,
 };
-use omnis_ir::CanonicalSnapshot;
+use omnis_ir::{CanonicalSnapshot, SessionRef, SourceRevision};
 use serde_json::json;
 
 use crate::{
-    IndexedSessionReader, clipboard, provider_name, resolve_session_ref, sanitize_snapshot,
-    write_private_handoff,
+    IndexedSessionReader, clipboard, provider_name, sanitize_snapshot, write_private_handoff,
 };
 
 const CLIPBOARD_BYTE_LIMIT: usize = 4_000;
 
-pub(super) fn run(registry: &AdapterRegistry, selector: &str, json_output: bool) -> Result<()> {
-    let source = resolve_session_ref(registry, selector)?;
+pub(super) fn run(
+    registry: &AdapterRegistry,
+    source: &SessionRef,
+    revision: Option<SourceRevision>,
+    json_output: bool,
+) -> Result<()> {
     let snapshot = registry
-        .read_session_indexed(&source)
+        .read_selected_session_indexed(source, revision)
         .with_context(|| format!("reading `{source}`"))?;
     let snapshot = sanitize_snapshot(snapshot);
     let harness = provider_name(snapshot.session.provider);

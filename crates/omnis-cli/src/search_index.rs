@@ -17,14 +17,14 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
+use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession, RollbackTitle};
 use omnis_core::{
     SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title,
     session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    IndexedSession, IndexedTrajectoryTitle, MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+    IndexedSession, IndexedTrajectoryTitle, LocalOpenerEvidence, MAX_TRAJECTORY_WRITE_BATCH_BYTES,
     MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SelectedSessionObservation, SessionTrajectoryOrigin,
     Store, TrajectoryDocument, TrajectoryIndexFailure, TrajectoryIndexState, TrajectorySourceGuard,
 };
@@ -699,6 +699,9 @@ fn publish_selected_read(
             .and_then(omnis_core::compact_search_title);
         document.derived_title = retained.as_deref();
         document.title_authoritative = retained.is_some();
+        document.title_is_verified = retained.is_some();
+        document.local_opener = LocalOpenerEvidence::Unknown;
+        document.withdrawn_title = None;
     }
     store.upsert_selected_session_document_with_workspace(
         &metadata,
@@ -935,6 +938,8 @@ pub(crate) struct IndexedTitle {
     pub(crate) current: Option<String>,
     pub(crate) authoritative: bool,
     pub(crate) withdrawn: Option<String>,
+    pub(crate) local_opener: LocalOpenerEvidence,
+    uncertain_rollback: RollbackTitle,
     check_local_rollback: bool,
 }
 
@@ -943,8 +948,52 @@ impl IndexedTitle {
         snapshot: &CanonicalSnapshot,
         full_read: bool,
         document: &SearchDocument,
+        rollback_title: &RollbackTitle,
+        native_registry: Option<&AdapterRegistry>,
     ) -> Self {
+        if let Some(name) = snapshot
+            .title
+            .as_deref()
+            .and_then(omnis_core::compact_search_title)
+        {
+            return Self {
+                current: Some(name),
+                authoritative: true,
+                ..Self::default()
+            };
+        }
         let authoritative = session_search_title_is_authoritative(snapshot, full_read);
+        let local = match rollback_title {
+            RollbackTitle::Known(current) => Some(current.clone()),
+            RollbackTitle::UnknownLocal | RollbackTitle::UnknownAfterWithdrawal(_)
+                if authoritative =>
+            {
+                Some(session_search_title(snapshot))
+            }
+            _ => None,
+        };
+        if let Some(current) = local
+            && !current
+                .as_deref()
+                .is_some_and(|title| rollback_title.withdraws(title))
+        {
+            // A readable local opener can replace a provider name only after verified catalog removal.
+            let name_absent = native_registry
+                .and_then(|registry| registry.adapter(Provider::Codex).ok())
+                .is_some_and(|adapter| adapter.confirms_session_title(&snapshot.session.id, None));
+            return Self {
+                current,
+                authoritative: name_absent,
+                local_opener: LocalOpenerEvidence::Current,
+                ..Self::default()
+            };
+        }
+        if matches!(rollback_title, RollbackTitle::UnknownAfterWithdrawal(_)) {
+            return Self {
+                uncertain_rollback: rollback_title.clone(),
+                ..Self::default()
+            };
+        }
         let check_local_rollback = !document.source_complete
             && !authoritative
             && snapshot.session.provider == Provider::Codex
@@ -961,13 +1010,16 @@ impl IndexedTitle {
                 session_search_title(snapshot)
             },
             authoritative,
+            local_opener: LocalOpenerEvidence::Unknown,
+            uncertain_rollback: RollbackTitle::Unknown,
             check_local_rollback,
             withdrawn: None,
         }
     }
 
     pub(crate) fn is_verified(&self) -> bool {
-        self.authoritative && self.current.is_some()
+        self.current.is_some()
+            && (self.authoritative || self.local_opener == LocalOpenerEvidence::Current)
     }
 
     pub(crate) fn check_withdrawal(
@@ -977,26 +1029,50 @@ impl IndexedTitle {
         session: &SessionRef,
         revision: SourceRevision,
     ) -> Result<()> {
-        if !self.check_local_rollback {
+        let uncertain = matches!(
+            self.uncertain_rollback,
+            RollbackTitle::UnknownAfterWithdrawal(_)
+        );
+        if !self.check_local_rollback && !uncertain {
             return Ok(());
         }
         let Some(file) = revision.file else {
             return Ok(());
         };
-        let Some(prior) = store.withdrawable_trajectory_title(session, file)? else {
+        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
             return Ok(());
         };
-        let path = registry
-            .find_native_session(Provider::Codex, &session.id)?
-            .filter(|selected| {
-                selected
-                    .source_revision
-                    .is_some_and(|selected| selected.matches_file_contents(revision))
-            })
-            .and_then(|selected| selected.source_path)
-            .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+        let selected_path = || -> Result<PathBuf> {
+            registry
+                .find_native_session(Provider::Codex, &session.id)?
+                .filter(|selected| {
+                    selected
+                        .source_revision
+                        .is_some_and(|selected| selected.matches_file_contents(revision))
+                })
+                .and_then(|selected| selected.source_path)
+                .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
+        };
+        if uncertain {
+            if self.uncertain_rollback.withdraws(&prior)
+                || (self.uncertain_rollback.needs_withdrawal_check(&prior)
+                    && omnis_adapters::CodexAdapter::verify_earlier_opener_withdrawal(
+                        &selected_path()?,
+                        session,
+                        revision,
+                        &prior,
+                    )?)
+            {
+                self.withdrawn = Some(prior);
+                self.local_opener = LocalOpenerEvidence::Withdrawn;
+            }
+            return Ok(());
+        }
         if omnis_adapters::CodexAdapter::rollout_withdrew_search_title(
-            &path, session, revision, &prior,
+            &selected_path()?,
+            session,
+            revision,
+            &prior,
         )? {
             self.withdrawn = Some(prior);
         }
@@ -1051,6 +1127,7 @@ impl PreparedIndex {
             withdrawn_title: self.title.withdrawn.as_deref(),
             title_is_verified: self.title.is_verified(),
             title_authoritative: self.title.authoritative,
+            local_opener: self.title.local_opener,
         }
     }
 }
@@ -1066,6 +1143,8 @@ fn prepare_session(
         read_session(registry, &candidate.session).map(|snapshot| IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: RollbackTitle::Unknown,
+            workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             source_complete: true,
             source_revision: SourceRevision::default(),
         })
@@ -1085,6 +1164,8 @@ fn prepare_session(
     }
     let IndexRead {
         native_session,
+        rollback_title,
+        workspace_projection,
         snapshot,
         source_complete,
         source_revision,
@@ -1107,10 +1188,21 @@ fn prepare_session(
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let title = IndexedTitle::from_read(&snapshot, source_complete, &document);
+    let title = IndexedTitle::from_read(
+        &snapshot,
+        source_complete,
+        &document,
+        &rollback_title,
+        (!imported).then_some(registry),
+    );
     Ok(PreparedIndex {
         workspace: native_session.as_ref().and_then(|_| {
-            crate::codex_workspace_update(&snapshot, source_revision, source_complete)
+            crate::codex_workspace_update(
+                &snapshot,
+                source_revision,
+                source_complete,
+                &workspace_projection,
+            )
         }),
         guard,
         candidate: candidate.clone(),
@@ -1573,6 +1665,7 @@ mod tests {
                     withdrawn_title: None,
                     title_is_verified: false,
                     title_authoritative: false,
+                    local_opener: omnis_store::LocalOpenerEvidence::Unknown,
                 },
             )
             .unwrap();

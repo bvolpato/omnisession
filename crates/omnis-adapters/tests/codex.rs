@@ -395,6 +395,205 @@ fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> any
     Ok(())
 }
 
+fn rollback_title_reads(
+    header: &Value,
+    rows: &[Value],
+    trailing: &str,
+) -> anyhow::Result<(omnis_adapters::IndexRead, omnis_adapters::IndexRead)> {
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let records = std::iter::once(header)
+        .chain(rows)
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{records}\n{trailing}"))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let direct = adapter.index_session(&session, Some(&path), u64::MAX)?;
+    let sampled = adapter.index_session(&session, Some(&path), 1)?;
+    Ok((direct, sampled))
+}
+
+fn rollback_title_read(
+    header: &Value,
+    rows: &[Value],
+    trailing: &str,
+) -> anyhow::Result<omnis_adapters::IndexRead> {
+    let (direct, sampled) = rollback_title_reads(header, rows, trailing)?;
+    assert_eq!(direct.rollback_title, sampled.rollback_title);
+    Ok(sampled)
+}
+
+#[test]
+fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::{Known, Unknown, UnknownLocal};
+
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
+    let old = || message("user", "old opener");
+    for rows in [vec![old()], vec![old(), rollback(0)]] {
+        let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
+        assert_eq!(full.rollback_title, Known(Some("old opener".into())));
+        assert_eq!(sampled.rollback_title, UnknownLocal);
+    }
+    for (rows, expected) in [
+        (vec![old(), rollback(1)], Known(None)),
+        (
+            vec![old(), rollback(1), message("assistant", "preface"), old()],
+            Known(None),
+        ),
+        (
+            vec![old(), rollback(1), old()],
+            Known(Some("old opener".into())),
+        ),
+        (
+            vec![old(), rollback(1), json!({"type":"unrecognized"})],
+            Unknown,
+        ),
+        (
+            vec![
+                old(),
+                rollback(1),
+                json!({"type":"compacted","payload":{"message":"checkpoint"}}),
+            ],
+            Unknown,
+        ),
+    ] {
+        let result = rollback_title_read(&header, &rows, "")?;
+        assert!(!result.source_complete);
+        assert_eq!(result.rollback_title, expected, "{rows:?}");
+    }
+    let rows = [old(), rollback(1), message("user", "replacement")];
+    for (field, value) in [
+        ("history_mode", json!("paginated")),
+        ("history_base", json!({"thread_id":"unavailable"})),
+        (
+            "forked_from_id",
+            json!("11111111-1111-4111-8111-111111111111"),
+        ),
+    ] {
+        let mut ambiguous = header.clone();
+        ambiguous["payload"][field] = value;
+        assert_eq!(
+            rollback_title_read(&ambiguous, &rows, "")?.rollback_title,
+            Unknown
+        );
+    }
+
+    let replacement = format!(
+        "Investigate   sk-proj-{} {}",
+        "a".repeat(36),
+        "details ".repeat(620_000)
+    );
+    let result = rollback_title_read(
+        &header,
+        &[
+            old(),
+            rollback(1),
+            message("user", &replacement),
+            message("user", "later follow-up"),
+        ],
+        "",
+    )?;
+    assert_eq!(visible_text(&result.snapshot), ["later follow-up"]);
+    let Known(Some(title)) = result.rollback_title else {
+        panic!("missing rolled-back title proof")
+    };
+    assert_eq!(title.chars().count(), 240);
+    assert!(title.starts_with("Investigate [REDACTED: API_KEY] details"));
+    Ok(())
+}
+
+#[test]
+fn bounded_reconstruction_distinguishes_gaps_before_and_after_withdrawal() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::UnknownLocal;
+
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
+    let old = || message("user", "old opener");
+    let rows = [old(), rollback(1), message("user", "replacement")];
+    let after = rollback_title_read(&header, &rows, "{malformed\n")?.rollback_title;
+    assert!(after.withdraws("old opener"));
+    assert!(!after.withdraws("other opener"));
+    let oversized_successor = format!(
+        "{}\n{}\n",
+        message("user", &"x".repeat(17 * 1024 * 1024)),
+        message("assistant", "retained reply"),
+    );
+    let after = rollback_title_read(&header, &[old(), rollback(1)], &oversized_successor)?;
+    assert!(after.rollback_title.withdraws("old opener"));
+    assert_eq!(visible_text(&after.snapshot), ["retained reply"]);
+    let early_gap = format!("{{malformed\n{}\n", rollback(1));
+    assert_eq!(
+        rollback_title_read(&header, &[old()], &early_gap)?.rollback_title,
+        UnknownLocal
+    );
+    assert_eq!(
+        rollback_title_read(&header, &[old(), rollback(1), old()], "{malformed\n")?.rollback_title,
+        UnknownLocal
+    );
+    assert!(
+        rollback_title_read(
+            &header,
+            &[old(), rollback(1), old(), rollback(1)],
+            "{malformed\n"
+        )?
+        .rollback_title
+        .withdraws("old opener")
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_reconstruction_checks_distinct_withdrawn_openers_after_overflow() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let mut rows = vec![header.to_string()];
+    for id in 0..12 {
+        rows.push(message("user", &format!("opening {id}")).to_string());
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})).to_string());
+    }
+    for reissued in [None, Some("opening 0"), Some("opening 10")] {
+        let mut records = rows.clone();
+        if let Some(title) = reissued {
+            records.push(message("user", title).to_string());
+        }
+        records.push("{unread".into());
+        fs::write(&path, records.join("\n"))?;
+        let item = CodexAdapter::with_root(home.path()).index_session(&session, Some(&path), 1)?;
+        let receipt = item.rollback_title;
+        assert!(receipt.withdraws("opening 1"));
+        assert!(!receipt.needs_withdrawal_check("opening 1"));
+        assert_eq!(
+            receipt.withdraws("opening 0"),
+            reissued != Some("opening 0")
+        );
+        for candidate in ["opening 0", "opening 10", "never present"] {
+            if receipt.withdraws(candidate) {
+                continue;
+            }
+            assert!(receipt.needs_withdrawal_check(candidate));
+            assert_eq!(
+                CodexAdapter::verify_earlier_opener_withdrawal(
+                    &path,
+                    &session,
+                    item.source_revision,
+                    candidate,
+                )?,
+                candidate != "never present" && reissued != Some(candidate)
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn compressed_rollback_title_evidence_requires_a_verified_complete_stream() -> anyhow::Result<()> {
     use std::io::Write as _;
@@ -689,28 +888,23 @@ fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_mid
 
 #[test]
 fn codex_preview_certifies_absence_only_after_reading_through_eof() {
-    let metadata = event("token_count", json!({"padding": "x".repeat(4_500)})).to_string();
-    for trailing_oversized in [false, true] {
-        let mut records = vec![metadata.clone(); 1_023];
-        records.push(event("token_count", json!({})).to_string());
-        if trailing_oversized {
-            records.push(message("user", &"x".repeat(2 * 1024 * 1024)).to_string());
+    const MIB: usize = 1024 * 1024;
+    let metadata = event("token_count", json!({"padding": "x".repeat(MIB)})).to_string();
+    for (opener_bytes, visible_bytes, known) in [
+        (0, None, true),
+        (2 * MIB, Some(2 * MIB), true),
+        (5 * MIB, None, false),
+    ] {
+        let mut records = vec![metadata.clone(); 5];
+        if opener_bytes > 0 {
+            records.push(message("user", &"x".repeat(opener_bytes)).to_string());
         }
-        let snapshot = read_records_with_preview(records, true).expect("message-free preview");
-        assert!(visible_text(&snapshot).is_empty());
-        let marker = snapshot
-            .events
-            .iter()
-            .find(|event| {
-                event.source.raw_record_type.as_deref() == Some("omnisession.codex_preview_prefix")
-            })
-            .expect("source prefix evidence");
+        let snapshot = read_records_with_preview(records, true).expect("bounded preview");
+        let lengths: Vec<_> = visible_text(&snapshot).into_iter().map(str::len).collect();
+        assert_eq!(lengths, visible_bytes.as_slice());
         assert_eq!(
-            marker
-                .payload
-                .get("prefix_complete")
-                .and_then(Value::as_bool),
-            (!trailing_oversized).then_some(true)
+            omnis_core::session_message_prefix_is_known(&snapshot, false),
+            known
         );
     }
 }
@@ -792,6 +986,96 @@ fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
         writer.finish().unwrap()
     } else {
         zstd::stream::encode_all(contents, 1).unwrap()
+    }
+}
+
+#[test]
+fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
+    use std::fmt::Write as _;
+
+    for codec in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(format!("rollout-{SESSION_ID}.{codec}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/creation","git":{"branch":"creation"}}});
+        let turn = |cwd| json!({"type":"turn_context","payload":{"cwd":cwd}});
+        for (damaged, ambiguous) in [
+            (r#"{"type":"turn_context","payload":"#, true),
+            (r#"{"type":"turn_co"#, true),
+            (r#"{"type":"t"#, true),
+            (r#"{"t"#, true),
+            ("{", true),
+            (
+                r#"{"type":"response_item","payload":{"text":"turn_context"#,
+                false,
+            ),
+            (
+                r#"{"timestamp":"2026-01-02","type":"event_msg","payload":{"type":"thread_rolled_ba"#,
+                true,
+            ),
+            (
+                r#"{"timestamp":"2026-01-02","type":"event_msg","payload":{"type":"token_count","text":"turn_context"#,
+                false,
+            ),
+        ] {
+            for (moved, recovered) in [(false, false), (true, false), (true, true)] {
+                let mut body = format!("{header}\n{}\n", message("user", "preserved request"));
+                if moved {
+                    writeln!(body, "{}", turn("/moved")).unwrap();
+                }
+                body.push_str(damaged);
+                if recovered {
+                    writeln!(body, "\n{}", turn("/recovered")).unwrap();
+                }
+                let bytes = codec.strip_prefix("jsonl.").map_or_else(
+                    || body.as_bytes().to_vec(),
+                    |ext| encode_rollout(body.as_bytes(), ext),
+                );
+                fs::write(&path, &bytes).unwrap();
+                let adapter = CodexAdapter::with_root(home.path());
+                let unknown = ambiguous && !recovered;
+                let expected = if unknown {
+                    ""
+                } else if recovered {
+                    "/recovered"
+                } else if moved {
+                    "/moved"
+                } else {
+                    "/creation"
+                };
+                for snapshot in [
+                    adapter.read_session(&session).unwrap(),
+                    adapter.preview_session(&session).unwrap(),
+                    adapter
+                        .index_session(&session, Some(&path), 1)
+                        .unwrap()
+                        .snapshot,
+                ] {
+                    assert_eq!(
+                        snapshot.workspace.current_dir,
+                        Path::new(expected),
+                        "{codec}, {damaged}"
+                    );
+                    assert_eq!(snapshot.workspace.root, Path::new(expected));
+                    assert_eq!(
+                        snapshot.workspace.git.branch.as_deref(),
+                        (expected == "/creation").then_some("creation")
+                    );
+                    assert_eq!(
+                        snapshot
+                            .events
+                            .iter()
+                            .any(|event| event.payload["workspace_unknown"] == true),
+                        unknown
+                    );
+                    assert_eq!(visible_text(&snapshot), ["preserved request"]);
+                    assert!(omnis_core::import_conversation(&snapshot).truncated);
+                }
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
     }
 }
 
@@ -1055,7 +1339,15 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     .unwrap();
     writeln!(writer, "{}", message("user", "surviving head")).unwrap();
     let surviving = message("assistant", &"s".repeat(128 * 1024)).to_string();
-    for _ in 0..96 {
+    for index in 0..96 {
+        if index == 48 {
+            writeln!(
+                writer,
+                "{}",
+                message("assistant", "middle outside both edges")
+            )
+            .unwrap();
+        }
         writeln!(writer, "{surviving}").unwrap();
     }
     writeln!(writer, "{}", message("assistant", "reply before rollback")).unwrap();
@@ -1088,6 +1380,11 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     let text = visible_text(&read.snapshot);
     assert_eq!(text.first(), Some(&"surviving head"));
     assert!(text.ends_with(&["reply before rollback", "follow-up"]));
+    assert!(!text.contains(&"middle outside both edges"));
+    assert_eq!(
+        read.workspace_projection,
+        omnis_adapters::CodexWorkspaceProjection::Observed(Some("/synthetic/surviving".into()))
+    );
     assert!(text.iter().all(|message| !message.starts_with("discarded")));
     assert!(omnis_core::session_message_prefix_is_known(
         &read.snapshot,
