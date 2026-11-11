@@ -151,10 +151,8 @@ impl IndexedSessionReader for AdapterRegistry {
                         continue;
                     }
                     if let Ok((_, guard)) = &observed
-                        && let Some(invalid) = error.downcast_ref::<omnis_adapters::InvalidPiTree>()
-                        && let Some(candidate) =
-                            search_index::IndexCandidate::from_session(&invalid.source)
-                        && let Err(write_error) = candidate.record_failure(&store, *guard)
+                        && let Err(write_error) =
+                            search_index::record_strict_read_failure(self, &store, *guard, &error)
                     {
                         if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
                             retry = false;
@@ -200,7 +198,7 @@ impl IndexedSessionReader for AdapterRegistry {
                     true,
                     (source_time, read.source_revision),
                     guard,
-                    read.native_session.as_ref(),
+                    read.native_session.as_ref().map(|native| (self, native)),
                 )
             {
                 if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
@@ -226,7 +224,7 @@ fn store_search_document(
     full_read: bool,
     source: (chrono::DateTime<Utc>, SourceRevision),
     guard: TrajectorySourceGuard,
-    native_session: Option<&NativeSession>,
+    native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
     let (source_updated_at, source_revision) = source;
     let origin = if session.provider == Provider::Imported {
@@ -251,13 +249,15 @@ fn store_search_document(
         title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
     };
     let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
-        let native = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
-        let verify = |_: &SessionRef, expected: SourceRevision| {
-            native
-                .source_path
-                .as_deref()
-                .and_then(omnis_adapters::source_file_revision)
-                .is_some_and(|current| expected.matches_file_contents(current))
+        let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
+        let verify = |session: &SessionRef, expected: SourceRevision| {
+            search_index::selected_file_matches(
+                registry,
+                session,
+                native.source_path.as_deref(),
+                expected,
+                guard,
+            )
         };
         store.upsert_verified_session_document_checked(
             &indexed_session_metadata(native),

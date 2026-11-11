@@ -621,7 +621,10 @@ pub enum TrajectorySourceGuard {
     /// The indexed document observed before reading a source whose update time can repeat.
     ObservedDocument(Option<[u8; 32]>),
     /// The document and catalog observed before opening one native session.
-    Verified([u8; 32]),
+    Verified {
+        state: [u8; 32],
+        known_files: [Option<Uuid>; 3],
+    },
 }
 
 impl TrajectorySourceGuard {
@@ -629,6 +632,12 @@ impl TrajectorySourceGuard {
     #[must_use]
     pub const fn uses_file_time(provider: Provider) -> bool {
         matches!(provider, Provider::Pi | Provider::OhMyPi)
+    }
+
+    /// Whether the stored document, catalog, or failure identifies another physical file for this session.
+    #[must_use]
+    pub fn has_competing_file(self, file: Option<Uuid>) -> bool {
+        matches!((self, file), (Self::Verified { known_files, .. }, Some(file)) if known_files.into_iter().flatten().any(|known| known != file))
     }
 
     fn check(
@@ -646,8 +655,8 @@ impl TrajectorySourceGuard {
                     Err(StoreError::TrajectorySourceChanged)
                 };
             }
-            Self::Verified(expected) => {
-                return if expected == verified_session_state(transaction, session)? {
+            Self::Verified { .. } => {
+                return if self == verified_session_state(transaction, session)? {
                     Ok(())
                 } else {
                     Err(StoreError::TrajectorySourceChanged)
@@ -912,7 +921,7 @@ fn validate_selected_catalog(
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
         || !TrajectorySourceGuard::uses_file_time(session.provider)
-        || !matches!(guard, TrajectorySourceGuard::Verified(_))
+        || !matches!(guard, TrajectorySourceGuard::Verified { .. })
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete
             || (document.source_revision.file.is_some()
@@ -946,7 +955,10 @@ fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Opt
         .map_err(database_error)
 }
 
-fn verified_session_state(connection: &Connection, session: &SessionRef) -> Result<[u8; 32]> {
+fn verified_session_state(
+    connection: &Connection,
+    session: &SessionRef,
+) -> Result<TrajectorySourceGuard> {
     observed_file_state(connection, session, None).map(|(state, _)| state)
 }
 
@@ -954,37 +966,41 @@ fn observed_file_state(
     connection: &Connection,
     session: &SessionRef,
     file: Option<Uuid>,
-) -> Result<([u8; 32], bool)> {
+) -> Result<(TrajectorySourceGuard, bool)> {
     // A restored file can reuse its modification time. Observe content, coverage and catalog
     // together so another full reader cannot restore an obsolete title or workspace.
     let sql = format!(
         "SELECT json_array(?1, ?2, ({DOCUMENT_RECEIPT_SQL}),
-            (SELECT json_array(title, project_path, git_branch, created_at, updated_at,
-                 updated_at_approximate, event_count, source_updated_submillis,
-                 hex(source_file_id), hex(source_contents_id))
-             FROM session_index WHERE provider = ?1 AND session_id = ?2),
-            (SELECT json_array(source_updated_at, source_updated_submillis, document_version,
-                 hex(source_file_id), hex(source_contents_id))
-             FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2)),
-         CASE WHEN ?3 IS NULL THEN 0 ELSE EXISTS (
-           SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2 AND source_file_id != ?3
-           UNION ALL SELECT 1 FROM session_index WHERE provider = ?1 AND session_id = ?2 AND source_file_id != ?3
-           UNION ALL SELECT 1 FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2
-             AND source_contents_id IS NOT NULL AND source_file_id != ?3) END"
+            CASE WHEN catalog.provider IS NOT NULL THEN json_array(catalog.title, catalog.project_path,
+                catalog.git_branch, catalog.created_at, catalog.updated_at, catalog.updated_at_approximate,
+                catalog.event_count, catalog.source_updated_submillis, hex(catalog.source_file_id),
+                hex(catalog.source_contents_id)) END,
+            CASE WHEN failed.provider IS NOT NULL THEN json_array(failed.source_updated_at,
+                failed.source_updated_submillis, failed.document_version, hex(failed.source_file_id),
+                hex(failed.source_contents_id)) END),
+            doc.source_file_id, catalog.source_file_id,
+            CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END
+         FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
+         LEFT JOIN session_trajectories AS doc USING (provider, session_id)
+         LEFT JOIN session_index AS catalog USING (provider, session_id)
+         LEFT JOIN trajectory_index_failures AS failed USING (provider, session_id)"
     );
-    let (state, conflict): (String, bool) = connection
+    let guard = connection
         .prepare_cached(&sql)
         .map_err(database_error)?
-        .query_row(
-            params![
-                session.provider.to_string(),
-                session.id,
-                file.map(Uuid::into_bytes)
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            let state: String = row.get(0)?;
+            Ok(TrajectorySourceGuard::Verified {
+                state: Sha256::digest(state.as_bytes()).into(),
+                known_files: [
+                    optional_uuid(row, 1)?,
+                    optional_uuid(row, 2)?,
+                    optional_uuid(row, 3)?,
+                ],
+            })
+        })
         .map_err(database_error)?;
-    Ok((Sha256::digest(state.as_bytes()).into(), conflict))
+    Ok((guard, guard.has_competing_file(file)))
 }
 
 fn matches_catalog_row(connection: &Connection, metadata: &IndexedSession) -> Result<bool> {
@@ -2340,7 +2356,6 @@ impl Store {
     pub fn observe_verified_session(&self, session: &SessionRef) -> Result<TrajectorySourceGuard> {
         validate_session_ref(session)?;
         verified_session_state(&self.connection.borrow(), session)
-            .map(TrajectorySourceGuard::Verified)
     }
 
     /// Captures the session state and checks whether its stored sources name a different file.
@@ -2355,7 +2370,6 @@ impl Store {
     ) -> Result<(TrajectorySourceGuard, bool)> {
         validate_session_ref(session)?;
         observed_file_state(&self.connection.borrow(), session, Some(file))
-            .map(|(state, conflict)| (TrajectorySourceGuard::Verified(state), conflict))
     }
 
     /// Publishes the native catalog and search document from the same selected source.
