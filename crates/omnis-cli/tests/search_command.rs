@@ -20,6 +20,69 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
+    for upgrade in [false, true] {
+        let fixture = Fixture::new();
+        let transcript = fixture
+            .root
+            .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+        let direct = |text: &str| json!({"type":"user", "cwd":fixture.workspace, "message":{"role":"user","content":text}});
+        let mut ambiguous = direct("ambiguousneedle");
+        ambiguous["isSidechain"] = json!("broken");
+        write_jsonl(
+            &transcript,
+            &[
+                direct("Synthetic opening"),
+                direct("firstneedle"),
+                ambiguous.clone(),
+                direct("lastneedle"),
+            ],
+        );
+        if upgrade {
+            let state = fixture.root.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let store = omnis_store::Store::open(state.join("store.sqlite3")).unwrap();
+            let cached = "ambiguousneedle";
+            store
+                .upsert_trajectory_document(
+                    &omnis_ir::SessionRef::new(omnis_ir::Provider::Claude, CLAUDE_ID),
+                    &omnis_store::TrajectoryDocument {
+                        redacted_text: cached,
+                        source_updated_at: chrono::Utc::now(),
+                        source_byte_count: cached.len(),
+                        indexed_byte_count: cached.len(),
+                        truncation_strategy: "none",
+                        source_complete: true,
+                        origin: omnis_store::SessionTrajectoryOrigin::Native,
+                        document_version: 7,
+                        derived_title: None,
+                    },
+                )
+                .unwrap();
+        }
+        let search = |text: &str| fixture.search_json(&[text, "--provider", "claude"]);
+        let excluded = search("ambiguousneedle");
+        assert_eq!(excluded["index"]["indexed"], 1);
+        assert!(result_sessions(&excluded).is_empty());
+        for marker in ["firstneedle", "lastneedle"] {
+            let found = search(marker);
+            assert_eq!(found["index"]["indexed"], 0);
+            assert_eq!(found["results"][0]["coverage"], "preview", "{found}");
+        }
+        write_jsonl(&transcript, &[ambiguous]);
+        let output = fixture
+            .command()
+            .args(["show", "--json", &format!("claude:{CLAUDE_ID}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["events"][0]["payload"]["omitted_events"], 1);
+        assert!(!shown.to_string().contains("ambiguousneedle"));
+    }
+}
+
+#[test]
 fn cached_search_repairs_titles_saved_by_an_older_picker() {
     let fixture = Fixture::new();
     let directory = fixture.root.join("state");

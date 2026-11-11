@@ -230,6 +230,9 @@ struct TitleCandidates {
 
 impl TitleCandidates {
     fn observe(&mut self, record: &Value) {
+        if thread_ownership(record) != ThreadOwnership::Main {
+            return;
+        }
         let generated = match record.get("type").and_then(Value::as_str) {
             Some("summary") => string_at(record, &[&["summary"], &["title"]]),
             Some("ai-title") => string_at(record, &[&["aiTitle"]]),
@@ -384,19 +387,56 @@ fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> 
     }
 }
 
-fn is_main_record(record: &Value) -> bool {
-    matches!(record.get("isSidechain"), None | Some(Value::Bool(false)))
-        && record["teamName"].as_str().is_none()
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadOwnership {
+    Main,
+    Sidechain,
+    Unknown,
+}
+
+fn thread_ownership(record: &Value) -> ThreadOwnership {
+    match (record.get("isSidechain"), record.get("teamName")) {
+        (Some(Value::Bool(true)), _) | (_, Some(Value::String(_))) => ThreadOwnership::Sidechain,
+        (None | Some(Value::Bool(false)), None | Some(Value::Null)) => ThreadOwnership::Main,
+        _ => ThreadOwnership::Unknown,
+    }
+}
+
+#[derive(Default)]
+struct ThreadCoverage {
+    has_conversation: bool,
+    has_possible_main_conversation: bool,
+    unknown_records: usize,
+}
+
+impl ThreadCoverage {
+    fn observe(&mut self, record: &Value) -> ThreadOwnership {
+        let ownership = thread_ownership(record);
+        if matches!(record["type"].as_str(), Some("assistant" | "user")) {
+            self.has_conversation = true;
+            self.has_possible_main_conversation |= ownership != ThreadOwnership::Sidechain;
+        }
+        self.unknown_records += usize::from(ownership == ThreadOwnership::Unknown);
+        ownership
+    }
+
+    fn validate(&self, session: &SessionRef) -> Result<()> {
+        anyhow::ensure!(
+            !self.has_conversation || self.has_possible_main_conversation,
+            "Claude session `{session}` is a sidechain and cannot be resumed directly"
+        );
+        Ok(())
+    }
 }
 
 impl ClaudeMetadata {
     fn observe(&mut self, record: &Value) {
-        if is_main_record(record)
+        if thread_ownership(record) == ThreadOwnership::Main
             && let Some(cwd) = string_at(record, &[&["cwd"]])
         {
             self.project_path = Some(PathBuf::from(cwd));
         }
-        if is_main_record(record)
+        if thread_ownership(record) == ThreadOwnership::Main
             && let Some(branch) = string_at(record, &[&["gitBranch"]])
         {
             self.git_branch = Some(branch.to_owned());
@@ -742,8 +782,7 @@ struct ClaudeTranscript {
     duplicate_records: HashSet<Uuid>,
     preserved_context: Option<Result<PreservedContext>>,
     has_records: bool,
-    has_conversation: bool,
-    has_main_conversation: bool,
+    coverage: ThreadCoverage,
 }
 
 impl ClaudeTranscript {
@@ -751,15 +790,7 @@ impl ClaudeTranscript {
         self.has_records = true;
         self.metadata.observe(record);
         self.titles.observe(record);
-        let main_record = is_main_record(record);
-        if matches!(
-            record.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
-            self.has_conversation = true;
-            self.has_main_conversation |= main_record;
-        }
-        if !main_record {
+        if self.coverage.observe(record) != ThreadOwnership::Main {
             return;
         }
         if record.get("type").and_then(Value::as_str) == Some("system")
@@ -874,12 +905,7 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        if self.has_conversation && !self.has_main_conversation {
-            return Err(anyhow!(
-                "Claude session `{}` is a sidechain and cannot be resumed directly",
-                session.id
-            ));
-        }
+        self.coverage.validate(session)?;
         let preservation_error = self.restore_preserved_context().err();
         // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
         drop(self.responses);
@@ -897,6 +923,16 @@ impl ClaudeTranscript {
             );
         }
         builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
+        if self.coverage.unknown_records > 0 {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"omitted_events": self.coverage.unknown_records, "reason": "Claude records have ambiguous thread ownership."}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.ambiguous_claude_thread".to_owned()),
+                None,
+            );
+        }
         if let Some(error) = preservation_error {
             builder.push(
                 EventKind::ProviderEvent,
@@ -1014,8 +1050,8 @@ impl ProviderAdapter for ClaudeAdapter {
         let mut workspace: Option<PathBuf> = None;
         let mut uncertain = false;
         let mut has_records = false;
-        let mut has_conversation = false;
-        let mut has_main_conversation = false;
+        let mut coverage = ThreadCoverage::default();
+        let mut main_workspace_seen = false;
         let skipped = crate::support::visit_streamed_json_records_with_offsets(
             &mut BufReader::new(File::open(path)?),
             crate::support::MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
@@ -1029,12 +1065,11 @@ impl ProviderAdapter for ClaudeAdapter {
                     }
                 };
                 has_records = true;
-                let main = is_main_record(&record);
-                if matches!(record["type"].as_str(), Some("assistant" | "user")) {
-                    has_conversation = true;
-                    has_main_conversation |= main;
-                }
-                if main && let Some(directory) = string_at(&record, &[&["cwd"]]) {
+                let ownership = coverage.observe(&record);
+                if ownership != ThreadOwnership::Sidechain
+                    && let Some(directory) = string_at(&record, &[&["cwd"]])
+                {
+                    main_workspace_seen |= ownership == ThreadOwnership::Main;
                     let directory = Path::new(directory);
                     // Restored or rewound branches can name different folders. The user
                     // must choose the destination when the transcript does not agree.
@@ -1051,11 +1086,9 @@ impl ProviderAdapter for ClaudeAdapter {
             has_records,
             "Claude session `{session}` contains no valid records"
         );
-        anyhow::ensure!(
-            !has_conversation || has_main_conversation,
-            "Claude session `{session}` is a sidechain and cannot be resumed directly"
-        );
-        Ok(workspace.filter(|path| !uncertain && skipped == 0 && path.is_absolute()))
+        coverage.validate(session)?;
+        Ok(workspace
+            .filter(|path| main_workspace_seen && !uncertain && skipped == 0 && path.is_absolute()))
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {

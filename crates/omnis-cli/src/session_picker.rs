@@ -5525,6 +5525,21 @@ mod tests {
         let record = serde_json::json!({"type":"user", "cwd":workspace});
         let sidechain =
             serde_json::json!({"type":"assistant", "isSidechain":true, "cwd":root.path()});
+        let mut ambiguous = sidechain.clone();
+        ambiguous["isSidechain"] = serde_json::json!("broken");
+        for (directory, expected) in [
+            (root.path(), WorkspaceVerification::ConfirmDestination),
+            (workspace.as_path(), WorkspaceVerification::Ready),
+        ] {
+            ambiguous["cwd"] = serde_json::json!(directory);
+            fs::write(&path, format!("{ambiguous}\n{record}\n")).unwrap();
+            assert_eq!(
+                state
+                    .verify_selected_workspace(&registry, &workspace)
+                    .unwrap(),
+                expected
+            );
+        }
         let mut transcript = format!("{record}\n").repeat(100_001);
         transcript.push_str(&sidechain.to_string());
         fs::write(&path, transcript).unwrap();
