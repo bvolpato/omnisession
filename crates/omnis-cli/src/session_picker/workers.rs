@@ -5,7 +5,7 @@ use super::{
     SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
     TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
     first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
-    session_preview, thread, trajectory_search_document,
+    session_preview, thread,
 };
 
 use std::sync::{
@@ -14,9 +14,10 @@ use std::sync::{
 };
 
 use omnis_adapters::ProviderAdapter;
+use omnis_ir::SourceRevision;
 
 use crate::{
-    read_session,
+    full_index_read,
     search_index::{self, IndexCandidate, IndexProgress},
 };
 
@@ -416,6 +417,30 @@ pub(super) fn spawn_provider_update(
     });
 }
 
+fn read_picker_preview(
+    registry: &AdapterRegistry,
+    key: &PreviewKey,
+) -> anyhow::Result<omnis_adapters::IndexRead> {
+    let session = &key.session;
+    if session.provider == Provider::Imported || key.continuation_after.is_some() {
+        return full_index_read(registry, session);
+    }
+    if session.provider == Provider::Codex {
+        return registry.index_session(
+            session,
+            key.source_path.as_deref(),
+            search_index::FULL_READ_SOURCE_BYTES,
+        );
+    }
+    registry
+        .preview_session(session)
+        .map(|snapshot| omnis_adapters::IndexRead {
+            snapshot,
+            source_complete: false,
+            source_revision: SourceRevision::default(),
+        })
+}
+
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewKey>>,
@@ -453,46 +478,43 @@ pub(super) fn spawn_preview_updates(
                     queue = VecDeque::from(newer);
                 }
                 let full_read = key.continuation_after.is_some();
+                let writer = store.as_ref().and_then(|store| {
+                    match crate::search_index::observe_source(store, &key.session) {
+                        Ok(guard) => Some((store, guard)),
+                        Err(error) => {
+                            let _ = sender.send(PickerUpdate::Warning(format!(
+                                "trajectory index status: {error}"
+                            )));
+                            None
+                        }
+                    }
+                });
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let read = if imported {
-                        read_session(&registry, &key.session).map(|snapshot| (snapshot, true))
-                    } else if full_read {
-                        registry
-                            .read_session(&key.session)
-                            .map(|snapshot| (snapshot, true))
-                    } else if key.session.provider == Provider::Codex {
-                        // The archive's size does not tell us whether a preview covers the full rollout.
-                        registry
-                            .index_session(&key.session, None, search_index::FULL_READ_SOURCE_BYTES)
-                            .map(|read| (read.snapshot, read.source_complete))
-                    } else {
-                        registry
-                            .preview_session(&key.session)
-                            .map(|snapshot| (snapshot, false))
-                    };
-                    read.map_or(PreviewValue::Unavailable, |(snapshot, complete)| {
-                        if let Some(store) = &store {
-                            let document = trajectory_search_document(&snapshot);
-                            if let Err(error) = crate::store_search_document(
+                    let read = read_picker_preview(&registry, &key);
+                    read.map_or(PreviewValue::Unavailable, |read| {
+                        let snapshot = read.snapshot;
+                        let complete = read.source_complete;
+                        if let Some((store, guard)) = writer
+                            && let Err(error) = crate::store_search_document(
                                 store,
                                 &key.session,
                                 &snapshot,
-                                &document,
                                 complete,
+                                read.source_revision,
                                 if imported {
                                     SessionTrajectoryOrigin::ImportedBundle
                                 } else {
                                     SessionTrajectoryOrigin::Native
                                 },
-                                snapshot.captured_at,
-                            ) {
-                                let _ = sender.send(PickerUpdate::Warning(format!(
-                                    "trajectory index write: {error}"
-                                )));
-                            }
+                                guard,
+                            )
+                        {
+                            let _ = sender.send(PickerUpdate::Warning(format!(
+                                "trajectory index write: {error}"
+                            )));
                         }
                         PreviewValue::Ready {
                             continuation: key.continuation_after.and_then(|handoff_at| {

@@ -23,7 +23,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -69,6 +69,7 @@ pub struct NativeSession {
 pub struct IndexRead {
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
+    pub source_revision: SourceRevision,
 }
 
 /// Provider-specific launch input.
@@ -238,6 +239,7 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(IndexRead {
             snapshot,
             source_complete,
+            source_revision: SourceRevision::default(),
         })
     }
 

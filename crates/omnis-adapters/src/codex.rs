@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -41,14 +41,51 @@ const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
     files: Vec<PathBuf>,
-    selected: HashMap<String, usize>,
+    candidates: HashMap<String, Vec<usize>>,
     notes: Vec<String>,
 }
 
 impl CodexFileScan {
-    fn selected_path(&self, id: &str) -> Option<&Path> {
-        self.selected.get(id).map(|&i| self.files[i].as_path())
+    fn paths(&self, id: &str) -> impl Iterator<Item = &Path> {
+        self.candidates
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|&i| self.files[i].as_path())
     }
+}
+
+#[derive(Default)]
+struct InvalidHeaders {
+    unreadable: usize,
+    without_metadata: usize,
+    first_error: Option<anyhow::Error>,
+}
+
+struct SelectedRollout {
+    session: CodexSession,
+    shadowed: bool,
+}
+
+fn select_rollout<'a>(
+    candidates: impl IntoIterator<Item = &'a Path>,
+    mut read: impl FnMut(&Path) -> Result<Option<CodexSession>>,
+    invalid: &mut InvalidHeaders,
+) -> Option<SelectedRollout> {
+    let mut shadowed = false;
+    for path in candidates {
+        match read(path) {
+            Ok(Some(session)) => return Some(SelectedRollout { session, shadowed }),
+            Ok(None) => invalid.without_metadata += 1,
+            Err(error) => {
+                invalid.unreadable += 1;
+                invalid.first_error.get_or_insert(error);
+            }
+        }
+        // A native lookup by ID can still open the malformed file before its valid sibling.
+        shadowed |= path.extension().is_some_and(|ext| ext != "gz");
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -74,14 +111,15 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
-    /// A leaf rollout cannot supply the history stored in an unresolved ancestor.
+    /// Identifies a physical rollout even if another file shares its thread ID and modification time.
     #[must_use]
-    pub fn has_unavailable_ancestry(snapshot: &omnis_ir::CanonicalSnapshot) -> bool {
-        snapshot.session.provider == Provider::Codex
-            && snapshot
-                .events
-                .iter()
-                .any(|event| event.source.raw_record_type.as_deref() == Some(UNAVAILABLE_ANCESTRY))
+    pub fn index_file_id(path: &Path) -> Option<Uuid> {
+        path_uuid(path)?;
+        let canonical = fs::canonicalize(path).ok()?;
+        Some(Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            canonical.as_os_str().as_encoded_bytes(),
+        ))
     }
 
     /// The decoded size of a compressed rollout can differ from its filesystem metadata.
@@ -178,31 +216,24 @@ impl CodexAdapter {
             .and_then(|(path, home)| RolloutCache::load(path, home));
         let mut sessions = Vec::new();
         let mut subagents = 0_usize;
-        let mut unreadable_files = 0_usize;
-        let mut skipped_metadata = 0_usize;
-        let mut first_unreadable: Option<String> = None;
-        for path in &scan.files {
-            if path_uuid(path).is_some_and(|id| scan.selected_path(&id) != Some(path.as_path())) {
-                continue;
-            }
-            match listed_session(path, cache.as_mut()) {
-                Ok(Some(mut session)) => {
-                    if session.is_subagent {
-                        subagents += 1;
-                        continue;
-                    }
-                    if let Some(title) = title_index.titles.get(&session.id) {
-                        session.title = Some(title.clone());
-                    }
-                    sessions.push(session);
+        let mut invalid = InvalidHeaders {
+            without_metadata: scan.files.len()
+                - scan.candidates.values().map(Vec::len).sum::<usize>(),
+            ..Default::default()
+        };
+        for indices in scan.candidates.values() {
+            let paths = indices.iter().map(|&i| scan.files[i].as_path());
+            if let Some(SelectedRollout { mut session, .. }) = select_rollout(
+                paths,
+                |path| listed_session(path, cache.as_mut()),
+                &mut invalid,
+            ) {
+                if session.is_subagent {
+                    subagents += 1;
+                    continue;
                 }
-                Ok(None) => skipped_metadata += 1,
-                Err(error) => {
-                    unreadable_files += 1;
-                    if first_unreadable.is_none() {
-                        first_unreadable = Some(compact_discovery_error(&error));
-                    }
-                }
+                session.title = title_index.titles.get(&session.id).cloned();
+                sessions.push(session);
             }
         }
         if let Some(cache) = cache {
@@ -212,27 +243,27 @@ impl CodexAdapter {
             scan,
             sessions.len(),
             subagents,
-            unreadable_files,
-            skipped_metadata,
-            first_unreadable.as_deref(),
+            invalid.unreadable,
+            invalid.without_metadata,
+            invalid
+                .first_error
+                .as_ref()
+                .map(compact_discovery_error)
+                .as_deref(),
         );
         notes.extend(title_index.notes.iter().cloned());
         CodexListing { sessions, notes }
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
-        let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_metadata_path_result(&path)?
-            .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
-        if let Some(title) = self.title_index().titles.get(id) {
-            session.title = Some(title.clone());
-        }
+        let mut session = self.require_rollout(id)?.session;
+        session.title = self.title_index().titles.get(id).cloned();
         Ok(session)
     }
 
-    fn find_session_path(&self, id: &str) -> Result<PathBuf> {
+    fn require_rollout(&self, id: &str) -> Result<SelectedRollout> {
         Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
-        self.session_path(id)
+        self.selected_rollout(id)?
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 
@@ -248,35 +279,72 @@ impl CodexAdapter {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let Some(path) = self.session_path(id) else {
+        let Some(selected) = self.selected_rollout(id)? else {
             return Ok(None);
         };
-        let records = rollout_file::header(&path)?;
+        let records = rollout_file::header(&selected.session.path)?;
         Ok(records
             .first()
             .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
             .and_then(|record| record.get("payload"))
+            .filter(|payload| string_at(payload, &[&["id"], &["session_id"]]) == Some(id))
             .and_then(|payload| string_at(payload, &[&["model_provider"]]))
             .map(str::to_owned))
     }
 
-    fn session_path(&self, id: &str) -> Option<PathBuf> {
-        // A provider can move or compress a rollout after the command's first scan.
-        let home = self.codex_home.as_deref()?;
-        let usable =
-            |path: &&Path| provider_file(home, path).is_some() && rollout_file::preferred(path);
-        if let Some(path) = self.session_scan().selected_path(id).filter(usable) {
-            if path.starts_with(home.join("archived_sessions"))
-                && let Some(active) = restored_rollout(home, path)
-            {
-                return Some(active);
-            }
-            return Some(path.to_path_buf());
-        }
-        self.discover_session_scan()
-            .selected_path(id)
-            .filter(usable)
+    fn selected_rollout(&self, id: &str) -> Result<Option<SelectedRollout>> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(None);
+        };
+        let mut paths = self
+            .session_scan()
+            .paths(id)
             .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if !paths.iter().any(|path| path.is_file()) {
+            // A native fork or archive can move or create a rollout after the first scan.
+            paths = self
+                .discover_session_scan()
+                .paths(id)
+                .map(Path::to_path_buf)
+                .collect();
+        }
+        let active = home.join("sessions");
+        let archive = home.join("archived_sessions");
+        let mut alternatives = Vec::new();
+        for path in &paths {
+            if path.starts_with(&archive)
+                && let Some(plain) = restored_rollout(home, path)
+            {
+                alternatives.extend(representations(&plain));
+            }
+            if let Some(name) = rollout_file::jsonl_file_name(path) {
+                alternatives.extend(representations(&path.with_file_name(name)));
+            }
+        }
+        paths.extend(alternatives);
+        paths.sort_unstable_by(|a, b| {
+            rollout_priority(b, &active).cmp(&rollout_priority(a, &active))
+        });
+        paths.dedup();
+        let Ok(canonical_home) = fs::canonicalize(home) else {
+            return Ok(None);
+        };
+        let mut invalid = InvalidHeaders::default();
+        let live = paths.iter().map(PathBuf::as_path).filter(|path| {
+            path.strip_prefix(home).is_ok_and(|relative| {
+                path.is_file()
+                    && fs::canonicalize(path)
+                        .is_ok_and(|actual| actual == canonical_home.join(relative))
+            })
+        });
+        let selected = select_rollout(live, CodexSession::parse_metadata_path_result, &mut invalid);
+        if selected.is_none()
+            && let Some(error) = invalid.first_error
+        {
+            return Err(error);
+        }
+        Ok(selected)
     }
 
     /// Finds user sessions created after a native fork command started.
@@ -326,10 +394,19 @@ impl CodexAdapter {
                 &mut unreadable_dirs,
                 &mut depth_limited_dirs,
             );
-            for path in paths {
-                let Some(session) = CodexSession::parse_metadata_path_result(&path)? else {
+            for indices in ranked_rollouts(&paths, &home.join("sessions")).into_values() {
+                let mut invalid = InvalidHeaders::default();
+                let Some(selected) = select_rollout(
+                    indices.iter().map(|&i| paths[i].as_path()),
+                    CodexSession::parse_metadata_path_result,
+                    &mut invalid,
+                ) else {
+                    if let Some(error) = invalid.first_error {
+                        return Err(error);
+                    }
                     continue;
                 };
+                let session = selected.session;
                 if session.id == source.id
                     || session.is_subagent
                     || session
@@ -432,26 +509,28 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             "Codex scan stopped after {limit} newest jsonl files; older sessions are omitted."
         ));
     }
-    let active = home.join("sessions");
-    let mut selected = HashMap::new();
+    let candidates = ranked_rollouts(&files, &home.join("sessions"));
+    CodexFileScan {
+        files,
+        candidates,
+        notes,
+    }
+}
+
+fn ranked_rollouts(files: &[PathBuf], active: &Path) -> HashMap<String, Vec<usize>> {
+    let mut candidates = HashMap::<String, Vec<usize>>::new();
     for (i, path) in files.iter().enumerate() {
         let Some(id) = path_uuid(path) else {
             continue;
         };
-        selected
-            .entry(id)
-            .and_modify(|current: &mut usize| {
-                if rollout_priority(path, &active) > rollout_priority(&files[*current], &active) {
-                    *current = i;
-                }
-            })
-            .or_insert(i);
+        candidates.entry(id).or_default().push(i);
     }
-    CodexFileScan {
-        files,
-        selected,
-        notes,
+    for indices in candidates.values_mut() {
+        indices.sort_unstable_by(|&a, &b| {
+            rollout_priority(&files[b], active).cmp(&rollout_priority(&files[a], active))
+        });
     }
+    candidates
 }
 
 // Codex restores archived files into the active directory named by their original date.
@@ -459,15 +538,17 @@ fn restored_rollout(home: &Path, archived: &Path) -> Option<PathBuf> {
     let name = rollout_file::jsonl_file_name(archived)?;
     let stamp = name.to_str()?.strip_prefix("rollout-")?.get(..10)?;
     let day = stamp.parse::<chrono::NaiveDate>().ok()?;
-    let plain = fs::canonicalize(home)
-        .ok()?
-        .join("sessions")
-        .join(day.format("%Y/%m/%d").to_string())
-        .join(name);
+    Some(
+        home.join("sessions")
+            .join(day.format("%Y/%m/%d").to_string())
+            .join(name),
+    )
+}
+
+fn representations(plain: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     ["jsonl", "jsonl.zst", "jsonl.gz"]
         .into_iter()
         .map(|ext| plain.with_extension(ext))
-        .find(|path| provider_file(home, path).as_ref() == Some(path))
 }
 
 // The provider opens active, native rollouts. A backup's mtime does not change that choice.
@@ -537,6 +618,10 @@ fn collect_jsonl(
     if output.len() >= limit {
         return;
     }
+    if fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        *unreadable_dirs = unreadable_dirs.saturating_add(1);
+        return;
+    }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return,
@@ -568,11 +653,7 @@ fn collect_jsonl(
         let name = entry.file_name();
         if file_type.is_dir() {
             directories.push(name);
-        } else if file_type.is_file()
-            && rollout_file::jsonl_file_name(Path::new(&name)).is_some()
-            && (!rollout_file::compressed(Path::new(&name))
-                || rollout_file::preferred(&root.join(&name)))
-        {
+        } else if file_type.is_file() && rollout_file::jsonl_file_name(Path::new(&name)).is_some() {
             if files.len() < file_limit {
                 files.push(Reverse(name));
             } else if files
@@ -835,6 +916,29 @@ impl CodexSession {
         ))
     }
 
+    fn index(self, session: &SessionRef, full_read_bytes: u64) -> Result<IndexRead> {
+        let source_revision = SourceRevision {
+            file: CodexAdapter::index_file_id(&self.path),
+            missing_ancestor: None,
+        };
+        if full_read_bytes != u64::MAX && rollout_file::compressed(&self.path) {
+            let mut read = self.compressed_sample(session, full_read_bytes)?;
+            read.source_revision = source_revision;
+            return Ok(read);
+        }
+        let source_complete = fs::metadata(&self.path)?.len() <= full_read_bytes;
+        let snapshot = if source_complete {
+            self.read(session)?
+        } else {
+            self.preview(session)?
+        };
+        Ok(IndexRead {
+            snapshot,
+            source_complete,
+            source_revision,
+        })
+    }
+
     fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let (events, project, source_complete) = match rollout_file::sample(&self.path, budget)
@@ -873,8 +977,9 @@ impl CodexSession {
             captured_at,
         );
         Ok(IndexRead {
-            source_complete: source_complete && !CodexAdapter::has_unavailable_ancestry(&snapshot),
             snapshot,
+            source_complete,
+            source_revision: SourceRevision::default(),
         })
     }
 
@@ -1570,27 +1675,31 @@ impl ProviderAdapter for CodexAdapter {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let Some(path) = self.session_path(id) else {
+        let Some(selected) = self.selected_rollout(id)? else {
             return Ok(None);
         };
-        let Some(mut session) = CodexSession::parse_metadata_path_result(&path)? else {
-            return Ok(None);
-        };
+        let mut session = selected.session;
         session.title = self.title_index().titles.get(id).cloned();
         Ok(Some(session.native_session()))
     }
 
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Codex)?;
-        let path = self.find_session_path(&session.id)?;
+        let selected = self.require_rollout(&session.id)?;
+        let path = selected.session.path;
         let archived = self
             .codex_home
             .as_ref()
             .is_some_and(|home| path.starts_with(home.join("archived_sessions")));
+        let compressed = rollout_file::compressed(&path);
         Ok(
-            if archived || path.extension().is_some_and(|ext| ext == "gz") {
+            if selected.shadowed
+                || archived
+                || path.extension().is_some_and(|ext| ext == "gz")
+                || (compressed && fs::symlink_metadata(path.with_extension("")).is_ok())
+            {
                 NativeResumeSupport::ImportOnly
-            } else if rollout_file::compressed(&path) {
+            } else if compressed {
                 NativeResumeSupport::Since("0.137.0")
             } else {
                 NativeResumeSupport::Direct
@@ -1611,24 +1720,18 @@ impl ProviderAdapter for CodexAdapter {
     fn index_session(
         &self,
         session: &SessionRef,
-        _source_path: Option<&Path>,
+        source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session(&session.id)?;
-        if rollout_file::compressed(&native.path) {
-            return native.compressed_sample(session, full_read_bytes);
-        }
-        let source_complete = fs::metadata(&native.path)?.len() <= full_read_bytes;
-        let snapshot = if source_complete {
-            native.read(session)?
+        let changed = source_path.is_some_and(|path| path != native.path);
+        let read = native.index(session, full_read_bytes);
+        if changed {
+            read.context("selected Codex rollout changed during indexing")
         } else {
-            native.preview(session)?
-        };
-        Ok(IndexRead {
-            source_complete: source_complete && !Self::has_unavailable_ancestry(&snapshot),
-            snapshot,
-        })
+            read
+        }
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1870,7 +1973,7 @@ mod tests {
     fn listing_notes_describe_empty_and_partial_scans() {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
-            selected: HashMap::new(),
+            candidates: HashMap::new(),
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),

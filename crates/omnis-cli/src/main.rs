@@ -30,10 +30,12 @@ use omnis_core::{
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
-    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
+    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef,
+    SourceRevision, TransferMode,
 };
 use omnis_store::{
     IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
+    TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -119,37 +121,57 @@ trait IndexedSessionReader {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
 }
 
+fn full_index_read(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+) -> Result<omnis_adapters::IndexRead> {
+    if session.provider == Provider::Codex {
+        registry.index_session(session, None, u64::MAX)
+    } else {
+        read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            snapshot,
+            source_complete: true,
+            source_revision: SourceRevision::default(),
+        })
+    }
+}
+
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        let snapshot = read_session(self, session)?;
-        match Store::open_default() {
-            Ok(store) => {
-                let current = match store
-                    .session_trajectory_source_is_current(session, snapshot.captured_at)
-                {
-                    Ok(current) => current,
-                    Err(error) => {
-                        eprintln!("warning: local trajectory index status: {error}");
-                        false
-                    }
-                };
-                if !current {
-                    let document = trajectory_search_document(&snapshot);
-                    if let Err(error) = store_search_document(
+        let cache = Store::open_default().and_then(|store| {
+            let prior = store.trajectory_index_state(session)?;
+            Ok((store, prior))
+        });
+        let read = full_index_read(self, session)?;
+        let snapshot = read.snapshot;
+        match cache {
+            Ok((store, prior)) => {
+                let current = prior.is_some_and(|state| {
+                    state.source_complete
+                        && state.source_revision == read.source_revision
+                        && state.document_version >= omnis_core::SEARCH_DOCUMENT_VERSION
+                        && !search_index::source_time_changed(
+                            session.provider,
+                            snapshot.captured_at,
+                            state.source_updated_at,
+                        )
+                });
+                if !current
+                    && let Err(error) = store_search_document(
                         &store,
                         session,
                         &snapshot,
-                        &document,
-                        true,
+                        read.source_complete,
+                        read.source_revision,
                         if session.provider == Provider::Imported {
                             SessionTrajectoryOrigin::ImportedBundle
                         } else {
                             SessionTrajectoryOrigin::Native
                         },
-                        snapshot.captured_at,
-                    ) {
-                        eprintln!("warning: local trajectory index write: {error}");
-                    }
+                        search_index::source_guard(session.provider, prior.as_ref()),
+                    )
+                {
+                    eprintln!("warning: local trajectory index write: {error}");
                 }
             }
             Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
@@ -158,37 +180,35 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
-/// Stores a versioned search document and returns the title derived from the snapshot.
-///
-/// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
-/// reported by the adapter stay visible through the document's truncation strategy, so a full
-/// read of such a source is current and does not need indexing again.
+/// Stores a search document with the source revision and coverage observed by the reader.
 fn store_search_document(
     store: &Store,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
-    document: &omnis_core::SearchDocument,
-    full_read: bool,
+    source_complete: bool,
+    source_revision: SourceRevision,
     origin: SessionTrajectoryOrigin,
-    source_updated_at: chrono::DateTime<Utc>,
+    guard: TrajectorySourceGuard,
 ) -> omnis_store::Result<Option<String>> {
+    let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_trajectory_document(
+    store.upsert_observed_trajectory_documents(&[(
         session,
-        &omnis_store::TrajectoryDocument {
+        omnis_store::TrajectoryDocument {
             redacted_text: &document.text,
-            source_updated_at,
+            source_updated_at: snapshot.captured_at,
             source_byte_count: document.source_byte_count,
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read
-                && !omnis_adapters::CodexAdapter::has_unavailable_ancestry(snapshot),
+            source_complete,
+            source_revision,
             origin,
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
         },
-    )?;
-    Ok(derived_title)
+        guard,
+    )])?;
+    store.trajectory_title(session)
 }
 
 fn build_search_index(
@@ -2430,15 +2450,14 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
             event_count: bundle.manifest.event_count,
         })
         .context("indexing imported bundle metadata")?;
-    let document = trajectory_search_document(&bundle.snapshot);
     store_search_document(
         store,
         &imported,
         &bundle.snapshot,
-        &document,
         true,
+        SourceRevision::default(),
         SessionTrajectoryOrigin::ImportedBundle,
-        bundle.snapshot.captured_at,
+        TrajectorySourceGuard::NewerSource,
     )
     .context("indexing imported bundle trajectory")?;
     Ok(())

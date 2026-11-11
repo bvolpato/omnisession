@@ -29,7 +29,7 @@ Antigravity CLI 1.1.8 and newer are accepted as private Linux and macOS SQLite/p
 
 Codex 0.146.0 and newer are accepted. OmniSession gives its provider-owned app-server importer a private temporary, redacted transcript, waits for the generated thread ID, verifies completed visible turns through `thread/read`, and verifies the result again through the read-only Codex adapter. No rollout or catalog file is written directly.
 
-Codex can resume an active Zstandard rollout by its original thread ID from version 0.137.0. For a gzip rollout or an archived thread, OmniSession can import a copy into a new Codex thread. An explicit `--no-fork` or the picker's “Continue original session” requires the original thread and stops before creating a copy. Use `omni fork <session> --in codex` to restore a copy. When the native importer is unavailable, an interactive continuation can use a semantic handoff.
+Codex can resume an active Zstandard rollout by its original thread ID from version 0.137.0. For a gzip rollout or an archived thread, OmniSession can import a copy into a new Codex thread. It also imports a copy when native lookup could select a damaged sibling before the verified source. An explicit `--no-fork` or the picker's “Continue original session” requires the original thread and stops before creating a copy. Use `omni fork <session> --in codex` to restore a copy. When the native importer is unavailable, an interactive continuation can use a semantic handoff.
 
 When a launch profile selects a Codex model provider, OmniSession also checks the `modelProvider` returned by `thread/read`. If it is missing or differs from the selected provider, OmniSession rolls back the generated thread instead of launching it.
 

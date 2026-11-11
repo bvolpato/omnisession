@@ -31,7 +31,7 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    session_preview, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -624,6 +624,12 @@ impl PickerState {
     }
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        if self.preview_key(&self.entries[index].session) != *key {
+            return;
+        }
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
             self.remember_derived_titles(vec![(key.session.clone(), title)]);
         }
@@ -792,6 +798,7 @@ impl PickerState {
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
         PreviewKey {
             session: session.session.clone(),
+            source_path: session.source_path.clone(),
             updated_at: session.updated_at,
             continuation_after: self.lineage.continuation_after(&session.session),
         }
@@ -869,6 +876,7 @@ impl PickerState {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    source_path: Option<PathBuf>,
     updated_at: Option<DateTime<Utc>>,
     continuation_after: Option<DateTime<Utc>>,
 }
@@ -3319,6 +3327,7 @@ mod tests {
         );
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source_path: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -3373,6 +3382,7 @@ mod tests {
 
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source_path: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -3381,6 +3391,12 @@ mod tests {
             continuation: None,
             complete: false,
         };
+        let previous = PreviewKey {
+            source_path: Some(PathBuf::from("archived_sessions/old-rollout.jsonl")),
+            ..key.clone()
+        };
+        state.remember_preview_title(&previous, &value);
+        assert!(state.visible_indices().is_empty());
         state.remember_preview_title(&key, &value);
 
         assert_eq!(state.visible_indices().len(), 1);
@@ -3919,6 +3935,7 @@ mod tests {
         state.current_git_branch = Some("main".to_owned());
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source_path: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -4134,6 +4151,7 @@ mod tests {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                source_path: None,
                 updated_at: None,
                 continuation_after: None,
             })
@@ -4146,6 +4164,7 @@ mod tests {
         cache.insert(
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                source_path: None,
                 updated_at: None,
                 continuation_after: None,
             },

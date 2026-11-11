@@ -618,9 +618,10 @@ fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
         let indexed = adapter
             .index_session(&session, Some(&source), 4 * 1024 * 1024)
             .unwrap();
-        if inherited {
-            assert!(!indexed.source_complete, "referenced prefix was not read");
-        }
+        assert!(
+            indexed.source_complete,
+            "the complete leaf rollout was read"
+        );
         for snapshot in [
             indexed.snapshot,
             adapter.read_session(&session).unwrap(),
@@ -807,7 +808,10 @@ fn codex_list_read_index_and_resume_choose_the_same_rollout() -> anyhow::Result<
     let cached = picker.list_sessions(None)?.pop().unwrap();
     assert_eq!(cached.source_path.as_ref(), Some(&archive));
     fs::write(&active, source("active request"))?;
-    fs::File::open(&active)?.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))?;
+    fs::File::options()
+        .write(true)
+        .open(&active)?
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))?;
     let adapter = CodexAdapter::with_root(home.path());
     let listed = adapter.list_sessions(None)?;
     assert_eq!(listed.len(), 1);
@@ -842,5 +846,70 @@ fn codex_list_read_index_and_resume_choose_the_same_rollout() -> anyhow::Result<
         adapter.native_resume_support(session)?,
         NativeResumeSupport::ImportOnly
     );
+    Ok(())
+}
+
+#[test]
+fn unreadable_active_headers_fall_back_to_verified_archives_and_siblings() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let active = home.path().join("sessions/2026/03/10");
+    let archive = home.path().join("archived_sessions");
+    fs::create_dir_all(&active)?;
+    fs::create_dir(&archive)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let wrong_id = "11111111-1111-4111-8111-111111111111";
+    let contents = |id, text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":id,"model_provider":text}}),
+            message("user", text)
+        )
+    };
+    let plain = active.join(&name);
+    let compressed = plain.with_extension("jsonl.zst");
+    fs::write(&plain, contents(wrong_id, "unrelated"))?;
+    fs::write(&compressed, [0x28, 0xb5, 0x2f])?;
+    let fallback = archive.join(name);
+    fs::write(&fallback, contents(SESSION_ID, "archived"))?;
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    for (path, expected) in [(&fallback, "archived"), (&compressed, "compressed")] {
+        if expected == "compressed" {
+            fs::write(
+                &compressed,
+                encode_rollout(contents(SESSION_ID, expected).as_bytes(), "zst"),
+            )?;
+        }
+        let adapter = CodexAdapter::with_root(home.path());
+        let listed = adapter.list_sessions(None)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_path.as_ref(), Some(path));
+        assert_eq!(
+            adapter
+                .find_native_session(SESSION_ID)?
+                .unwrap()
+                .source_path
+                .as_ref(),
+            Some(path)
+        );
+        assert_eq!(
+            adapter.recorded_model_provider(SESSION_ID)?.as_deref(),
+            Some(expected)
+        );
+        assert_eq!(visible_text(&adapter.read_session(&source)?), [expected]);
+        assert_eq!(
+            visible_text(
+                &adapter
+                    .index_session(&source, Some(&plain), u64::MAX)?
+                    .snapshot
+            ),
+            [expected]
+        );
+        assert_eq!(
+            adapter.native_resume_support(&source)?,
+            NativeResumeSupport::ImportOnly
+        );
+    }
     Ok(())
 }

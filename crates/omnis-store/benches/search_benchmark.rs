@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
-    SessionRef, WorkspaceSnapshot,
+    SessionRef, SourceRevision, WorkspaceSnapshot,
 };
 use omnis_store::{
     IndexedSession, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SessionTrajectoryOrigin, Store,
@@ -191,6 +191,7 @@ fn synthetic_batch_documents() -> Vec<(SessionRef, String)> {
 fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
         redacted_text: text,
+        source_revision: SourceRevision::default(),
         source_updated_at: benchmark_timestamp(),
         source_byte_count: text.len(),
         indexed_byte_count: text.len(),

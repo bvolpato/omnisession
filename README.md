@@ -78,7 +78,7 @@ omni inspect <session> --target grok   # what gets preserved, summarized, or omi
 
 - **Run `omni`.** Sessions from every installed agent appear in one list, current workspace first. Related sessions stay grouped as a tree across agents.
 - **Fuzzy and full-text.** Titles, folders, branches, and IDs match fuzzily as you type. Conversation text matches come from a local, redacted full-text index. Quoted text matches exactly.
-- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index.
+- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index. If you restore a Codex rollout with an older file modification time, the next index refresh picks up its contents.
 - **Scriptable.** `omni search` works without the picker, and `--json` returns structured results.
 
 ```sh

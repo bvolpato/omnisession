@@ -280,6 +280,13 @@ pub struct WorkspaceSnapshot {
     pub available_tools: Vec<String>,
 }
 
+/// The selected provider file and the missing source that can complete this index entry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceRevision {
+    pub file: Option<Uuid>,
+    pub missing_ancestor: Option<Uuid>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalSnapshot {

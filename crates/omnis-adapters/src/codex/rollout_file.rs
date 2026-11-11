@@ -33,22 +33,6 @@ pub(super) fn compressed(path: &Path) -> bool {
         .is_some_and(|extension| extension == "zst" || extension == "gz")
 }
 
-fn regular_file(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
-}
-
-/// Codex first uses an existing plain sibling, then its native zstd representation.
-pub(super) fn preferred(path: &Path) -> bool {
-    if !compressed(path) {
-        return true;
-    }
-    let plain = path.with_extension("");
-    if regular_file(&plain) {
-        return false;
-    }
-    path.extension().is_none_or(|ext| ext != "gz") || !regular_file(&path.with_extension("zst"))
-}
-
 pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
     if !fs::symlink_metadata(path)?.is_file() {
         bail!("Codex rollout must be a regular file");
