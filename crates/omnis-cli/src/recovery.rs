@@ -21,7 +21,8 @@ impl ImportSource for CanonicalSnapshot {
 /// Keep the file for later resumes until the operating system cleans its temporary directory.
 pub(crate) fn keep_handoff(mut file: NamedTempFile) {
     file.disable_cleanup(true);
-    eprintln!(
+    let _ = writeln!(
+        std::io::stderr().lock(),
         "Recovery handoff saved to {}",
         safe_terminal_line(&file.path().display().to_string())
     );

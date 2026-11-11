@@ -99,7 +99,7 @@ impl AntigravityAdapter {
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if let Some(path) = self.conversation_database(&session.id) {
-            push_database_steps(self.root()?, &path, &mut builder)?;
+            push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
         } else if summary.step_count > 0 {
             return Err(anyhow!(
                 "Antigravity session `{}` declares history but has no readable transcript",
@@ -426,8 +426,15 @@ pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
 ) -> Result<usize> {
-    push_database_steps_with_limits(root, database, builder, DatabaseReadLimits::default())
+    push_database_steps_with_limits(
+        root,
+        database,
+        builder,
+        declared_steps,
+        DatabaseReadLimits::default(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -453,6 +460,7 @@ fn push_database_steps_with_limits(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
     limits: DatabaseReadLimits,
 ) -> Result<usize> {
     let snapshot = sqlite_snapshot(root, database)
@@ -462,14 +470,21 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
+    if stored == 0 && declared_steps > 0 {
+        return Err(anyhow!(
+            "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+        ));
+    }
+    let (key, newest_first) = database_step_order(&snapshot.connection)?;
     // Look at sizes first so a skipped step does not read its blob or displace a smaller one.
-    let mut statement = snapshot.connection.prepare(
-        "SELECT idx, CASE WHEN typeof(step_payload) = 'blob' THEN length(step_payload) END \
-         FROM steps ORDER BY idx DESC LIMIT ?1",
-    )?;
-    let mut payload_by_index = snapshot
+    let mut statement = snapshot.connection.prepare(&format!(
+        "SELECT {key}, CASE WHEN typeof(step_payload) = 'blob' THEN length(step_payload) END, \
+         CASE WHEN typeof(idx) = 'integer' THEN idx END \
+         FROM steps ORDER BY {newest_first} LIMIT ?1"
+    ))?;
+    let mut payload_by_key = snapshot
         .connection
-        .prepare("SELECT step_payload FROM steps WHERE idx = ?1")?;
+        .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
     let mut rows = statement.query([i64::try_from(limits.records)?])?;
     let mut retained = Vec::new();
     let mut decoded = 0;
@@ -477,8 +492,13 @@ fn push_database_steps_with_limits(
     let mut remaining_history = limits.history_bytes;
     let mut unsupported = 0;
     let mut damaged = 0;
+    let mut previous_index = None;
+    let mut order_verified = true;
     while let Some(row) = rows.next()? {
-        let Some(length) = row.get::<_, Option<i64>>(1)? else {
+        let index: Option<i64> = row.get(2)?;
+        order_verified &= index.is_some() && index != previous_index;
+        previous_index = index;
+        let Some(length) = row.get::<_, Option<i64>>(1)?.filter(|length| *length > 0) else {
             damaged += 1;
             continue;
         };
@@ -487,8 +507,8 @@ fn push_database_steps_with_limits(
             continue;
         }
         remaining_wire -= bytes;
-        let index: i64 = row.get(0)?;
-        let payload: Vec<u8> = payload_by_index.query_row([index], |record| record.get(0))?;
+        let row_key = rusqlite::types::ToSqlOutput::Borrowed(row.get_ref(0)?);
+        let payload: Vec<u8> = payload_by_key.query_row([row_key], |record| record.get(0))?;
         let Ok(step) = ProtoStep::decode(payload.as_slice()) else {
             damaged += 1;
             continue;
@@ -507,7 +527,7 @@ fn push_database_steps_with_limits(
             "no Antigravity steps could be decoded ({damaged} selected step payloads were missing or invalid)"
         ));
     }
-    let omitted = stored - retained.len();
+    let omitted = stored.max(declared_steps) - retained.len();
     for event in retained.into_iter().rev() {
         builder.push(
             event.kind,
@@ -518,10 +538,19 @@ fn push_database_steps_with_limits(
             None,
         );
     }
-    if omitted > 0 || unsupported > 0 {
+    if omitted > 0 || unsupported > 0 || !order_verified {
+        let mut notice =
+            json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
+        if !order_verified {
+            notice["native_history_unverified"] = json!(true);
+        }
+        if declared_steps > stored {
+            notice["declared_steps"] = json!(declared_steps);
+            notice["stored_steps"] = json!(stored);
+        }
         builder.push(
             EventKind::ProviderEvent,
-            json!({"omitted_events": omitted, "unsupported_text_records": unsupported}),
+            notice,
             None,
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.antigravity_step_limit".to_owned()),
@@ -529,6 +558,27 @@ fn push_database_steps_with_limits(
         );
     }
     Ok(decoded)
+}
+
+fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static str, &'static str)> {
+    let without_rowid: bool = connection.query_row(
+        "SELECT wr FROM pragma_table_list('steps') WHERE schema = 'main' AND type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !without_rowid {
+        return Ok(("_rowid_", "idx DESC, _rowid_ DESC"));
+    }
+    let indexed_by_step: bool = connection.query_row(
+        "SELECT count(*) = 1 AND min(lower(name)) = 'idx' FROM pragma_table_info('steps') WHERE pk > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        indexed_by_step,
+        "Antigravity steps have neither a rowid nor an idx primary key"
+    );
+    Ok(("idx", "idx DESC"))
 }
 
 struct DatabaseStepEvent {
@@ -780,28 +830,40 @@ mod tests {
             ],
         );
 
-        let mut builder = EventBuilder::new(
-            Provider::Antigravity,
-            "11111111-1111-4111-8111-111111111111",
-        );
-        let decoded =
-            push_database_steps(temporary.path(), &database, &mut builder).expect("native steps");
-        assert_eq!(decoded, 2);
-        let snapshot = builder.snapshot(
-            SessionRef::new(
+        let assert_messages = |order_verified| {
+            let session = SessionRef::new(
                 Provider::Antigravity,
                 "11111111-1111-4111-8111-111111111111",
-            ),
-            None,
-            None,
-            None,
-            Utc::now(),
-        );
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
-        assert_eq!(snapshot.events[0].payload["text"], "question");
-        assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
-        assert_eq!(snapshot.events[1].payload["text"], "answer");
+            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
+            assert_eq!(
+                push_database_steps(temporary.path(), &database, &mut builder, 2).unwrap(),
+                2
+            );
+            let snapshot = builder.snapshot(session, None, None, None, Utc::now());
+            assert_eq!(snapshot.events.len(), if order_verified { 2 } else { 3 });
+            if !order_verified {
+                assert_eq!(
+                    snapshot.events[2].payload["native_history_unverified"],
+                    true
+                );
+            }
+            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+            assert_eq!(snapshot.events[0].payload["text"], "question");
+            assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
+            assert_eq!(snapshot.events[1].payload["text"], "answer");
+        };
+        assert_messages(true);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE restored AS SELECT * FROM steps ORDER BY idx;
+             DROP TABLE steps;
+             ALTER TABLE restored RENAME TO steps;
+             UPDATE steps SET idx = 0;",
+            )
+            .unwrap();
+        assert_messages(false);
     }
 
     #[test]
@@ -884,6 +946,7 @@ mod tests {
                 temporary.path(),
                 &database,
                 &mut builder,
+                3,
                 limits,
             )
             .unwrap();
@@ -916,12 +979,12 @@ mod tests {
         write_steps_database(&database, &[request]);
         let conn = rusqlite::Connection::open(&database).unwrap();
         conn.execute_batch(
-            "INSERT INTO steps (idx, step_payload) VALUES (1, NULL), (2, x'80'), (3, 'invalid')",
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 15, NULL), (2, 14, x'80'), (3, 14, 'invalid'), (4, 14, x'')",
         )
         .unwrap();
         let mut builder = EventBuilder::new(Provider::Antigravity, id);
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap(),
             1
         );
         let snapshot = builder.snapshot(
@@ -935,10 +998,12 @@ mod tests {
             snapshot.events[0].payload["text"],
             "Latest readable request"
         );
-        assert_eq!(snapshot.events[1].payload["omitted_events"], 3);
+        assert_eq!(snapshot.events[1].payload["omitted_events"], 5);
+        assert_eq!(snapshot.events[1].payload["declared_steps"], 6);
+        assert_eq!(snapshot.events[1].payload["stored_steps"], 5);
         conn.execute("DELETE FROM steps WHERE idx = 0", []).unwrap();
         let mut builder = EventBuilder::new(Provider::Antigravity, id);
-        assert!(push_database_steps(temporary.path(), &database, &mut builder).is_err());
+        assert!(push_database_steps(temporary.path(), &database, &mut builder, 6).is_err());
     }
 
     #[test]
@@ -1021,7 +1086,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         );
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
             1
         );
         let snapshot = builder.snapshot(

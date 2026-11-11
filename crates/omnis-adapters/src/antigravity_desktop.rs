@@ -129,13 +129,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         let summaries = read_summaries(root).unwrap_or_default();
         let listed = native_session(&session.id, database.clone(), summaries.get(&session.id));
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let decoded = push_database_steps(root, &database, &mut builder)?;
-        if decoded == 0 && listed.event_count > 0 && builder.checkpoint() == 0 {
-            return Err(anyhow!(
-                "Antigravity Desktop session `{}` declares history but has no readable steps",
-                session.id
-            ));
-        }
+        push_database_steps(root, &database, &mut builder, listed.event_count)?;
         Ok(builder.snapshot(
             session.clone(),
             listed.title,
