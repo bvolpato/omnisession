@@ -204,7 +204,7 @@ const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' â
 const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
 
 // A failed replacement hides the old native text until that rollout is selected again.
-const CONFLICTING_CODEX_FAILURE: &str = "trajectories.provider = 'codex'
+const CONFLICTING_NATIVE_FAILURE: &str = "trajectories.provider IN ('codex', 'grok')
     AND trajectories.origin = 'native' AND failed.provider = trajectories.provider
     AND failed.session_id = trajectories.session_id AND failed.source_file_id IS NOT NULL
     AND (failed.source_file_id IS NOT trajectories.source_file_id
@@ -241,7 +241,7 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
             AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
                  SELECT 1 FROM session_index AS catalog WHERE {CONFLICTING_NATIVE_CATALOG}))
             AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed
-                            WHERE {CONFLICTING_CODEX_FAILURE})"
+                            WHERE {CONFLICTING_NATIVE_FAILURE})"
     )
 }
 const EXACT_SNIPPET_LEADING_BYTES: usize = 80;
@@ -286,7 +286,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                     OR NOT session_trajectories.derived_title_is_verified
                     OR excluded.source_file_id IS NOT session_trajectories.source_file_id))
                 OR (?17 AND excluded.source_file_id IS NOT NULL
-                        AND excluded.source_file_id IS NOT session_trajectories.source_file_id)
+                        AND (excluded.source_file_id IS NOT session_trajectories.source_file_id
+                             OR (excluded.provider = 'grok' AND excluded.source_contents_id IS NOT session_trajectories.source_contents_id)))
                 OR (?17 AND excluded.source_complete AND excluded.truncation_strategy IN (
                     'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
                 ))
@@ -2510,21 +2511,26 @@ impl Store {
         ).optional().map_err(database_error)
     }
 
-    /// Returns native Codex documents whose catalog row belongs to another rollout revision.
+    /// Returns native documents whose cached metadata no longer identifies their physical source.
     ///
     /// # Errors
     ///
     /// Returns an error if the index cannot be read.
-    pub fn conflicting_codex_catalog_rows(&self) -> Result<std::collections::HashSet<SessionRef>> {
+    pub fn conflicting_native_catalog_rows(
+        &self,
+        provider: Provider,
+    ) -> Result<std::collections::HashSet<SessionRef>> {
         let connection = self.connection.borrow();
         let sql = format!(
             "SELECT trajectories.session_id FROM session_trajectories AS trajectories
-                          INNER JOIN session_index AS catalog ON {CONFLICTING_NATIVE_CATALOG}"
+             LEFT JOIN session_index AS catalog ON catalog.provider = trajectories.provider AND catalog.session_id = trajectories.session_id
+             WHERE trajectories.provider = ?1 AND ({CONFLICTING_NATIVE_CATALOG}
+                OR (?1 = 'grok' AND catalog.session_id IS NULL AND trajectories.source_file_id IS NOT NULL))"
         );
         let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         statement
-            .query_map([], |row| {
-                Ok(SessionRef::new(Provider::Codex, row.get::<_, String>(0)?))
+            .query_map([provider.to_string()], |row| {
+                Ok(SessionRef::new(provider, row.get::<_, String>(0)?))
             })
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
@@ -3023,7 +3029,7 @@ fn indexed_titles_sql() -> String {
                 CASE WHEN catalog.session_id IS NOT NULL THEN catalog.source_contents_id
                      WHEN failed.session_id IS NOT NULL THEN failed.source_contents_id ELSE trajectories.source_contents_id END
              FROM session_trajectories AS trajectories
-             LEFT JOIN trajectory_index_failures AS failed ON {CONFLICTING_CODEX_FAILURE}
+             LEFT JOIN trajectory_index_failures AS failed ON {CONFLICTING_NATIVE_FAILURE}
              LEFT JOIN session_index AS catalog ON {CONFLICTING_NATIVE_CATALOG}")
 }
 

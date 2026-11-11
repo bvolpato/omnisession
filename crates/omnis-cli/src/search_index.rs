@@ -66,6 +66,22 @@ impl IndexCandidate {
         .then_some(session)
     }
 
+    fn selected_metadata(
+        &self,
+        registry: &AdapterRegistry,
+        revision: SourceRevision,
+    ) -> Option<IndexedSession> {
+        if self.session.provider == Provider::Grok {
+            return self.metadata.clone().filter(|row| {
+                row.source_revision
+                    .is_some_and(|selected| selected.matches_file_contents(revision))
+            });
+        }
+        self.selected_codex(registry, revision)
+            .as_ref()
+            .map(crate::indexed_session_metadata)
+    }
+
     fn record_failure(
         &self,
         registry: &AdapterRegistry,
@@ -105,7 +121,7 @@ impl IndexCandidate {
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
             source_revision: session.source_revision.unwrap_or_default(),
-            metadata: (provider == Provider::Codex)
+            metadata: matches!(provider, Provider::Codex | Provider::Grok)
                 .then(|| crate::indexed_session_metadata(session)),
         })
     }
@@ -302,6 +318,29 @@ fn needs_index_at(
         || (!state.source_complete && candidate.can_upgrade_preview())
 }
 
+/// Rechecks a cached Grok projection when a detailed read rejects the current log.
+pub(crate) fn refresh_rejected_grok_source(
+    registry: &AdapterRegistry,
+    store: &Store,
+    session: &SessionRef,
+) -> Result<()> {
+    if let Some(candidate) = registry
+        .find_native_session(Provider::Grok, &session.id)?
+        .as_ref()
+        .and_then(IndexCandidate::from_session)
+    {
+        index_candidates(
+            registry,
+            store,
+            vec![candidate],
+            false,
+            &|| false,
+            &mut |_| {},
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether a recorded failure still covers the candidate, so reading it again would repeat it.
 ///
 /// Retry when the source time or document version changes. Without a source time, only the
@@ -387,14 +426,15 @@ struct Pending {
 
 fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
-    let conflicts = if candidates
-        .iter()
-        .any(|candidate| candidate.session.provider == Provider::Codex)
-    {
-        store.conflicting_codex_catalog_rows()?
-    } else {
-        HashSet::new()
-    };
+    let mut conflicts = HashSet::new();
+    for provider in [Provider::Codex, Provider::Grok] {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.session.provider == provider)
+        {
+            conflicts.extend(store.conflicting_native_catalog_rows(provider)?);
+        }
+    }
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
         candidates: candidates.len(),
@@ -408,7 +448,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
         if !needs_index_at(&candidate, revision, prior) {
-            if candidate.session.provider == Provider::Codex
+            if matches!(candidate.session.provider, Provider::Codex | Provider::Grok)
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
                     || failure
@@ -458,14 +498,9 @@ fn restore_cached_sources(
             missing_ancestor: None,
             ..prior.source_revision
         };
-        if let Some(selected) = candidate.selected_codex(registry, revision)
+        if let Some(selected) = candidate.selected_metadata(registry, revision)
             && store
-                .restore_indexed_source(
-                    &crate::indexed_session_metadata(&selected),
-                    prior,
-                    observed.as_ref(),
-                    failure,
-                )
+                .restore_indexed_source(&selected, prior, observed.as_ref(), failure)
                 .is_ok()
         {
             titles.extend(store.indexed_trajectory_title(&candidate.session)?);
@@ -486,16 +521,24 @@ fn observe_replacements(
     {
         return Ok(observations);
     }
-    let catalog = store
-        .indexed_sessions_for_provider(Provider::Codex)?
-        .into_iter()
-        .map(|row| (row.session.clone(), row))
-        .collect::<HashMap<_, _>>();
+    let catalog: HashMap<_, _> = if stale
+        .iter()
+        .any(|(candidate, _)| candidate.session.provider == Provider::Codex)
+    {
+        store
+            .indexed_sessions_for_provider(Provider::Codex)?
+            .into_iter()
+            .map(|row| (row.session.clone(), row))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     for (candidate, guard) in stale {
         let Some(metadata) = &candidate.metadata else {
             continue;
         };
-        if failures.contains_key(&candidate.session)
+        if candidate.session.provider == Provider::Grok
+            || failures.contains_key(&candidate.session)
             || matches!(guard, TrajectorySourceGuard::Observed(Some(prior)) if prior.source_revision.file != candidate.source_revision.file)
             || catalog
                 .get(&candidate.session)
@@ -694,10 +737,10 @@ fn publish_selected_read(
     );
     let selected = read
         .candidate
-        .selected_codex(registry, revision)
+        .selected_metadata(registry, revision)
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
     store.upsert_selected_session_document_with_workspace(
-        &crate::indexed_session_metadata(&selected),
+        &selected,
         observation,
         read.store_document(),
         read.workspace.as_ref(),
@@ -1107,12 +1150,19 @@ fn prepare_session(
         SessionTrajectoryOrigin::Native
     };
     let title = IndexedTitle::from_read(&snapshot, source_complete, &document);
+    let mut candidate = candidate.clone();
+    if let Some(native) = native_session
+        .as_ref()
+        .filter(|row| row.session.provider == Provider::Grok)
+    {
+        candidate.metadata = Some(crate::indexed_session_metadata(native));
+    }
     Ok(PreparedIndex {
         workspace: native_session.as_ref().and_then(|_| {
             crate::codex_workspace_update(&snapshot, source_revision, source_complete)
         }),
         guard,
-        candidate: candidate.clone(),
+        candidate,
         document,
         source_updated_at,
         source_complete,

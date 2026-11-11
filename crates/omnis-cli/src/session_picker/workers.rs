@@ -494,6 +494,24 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
     })
 }
 
+fn preview_source_guard(
+    store: &Store,
+    session: &omnis_ir::SessionRef,
+) -> omnis_store::Result<(
+    omnis_store::TrajectorySourceGuard,
+    Option<omnis_store::SelectedSessionObservation>,
+)> {
+    if session.provider == Provider::Grok {
+        let observation = store.observe_selected_session(session)?;
+        Ok((
+            omnis_store::TrajectorySourceGuard::Observed(observation.state),
+            Some(observation),
+        ))
+    } else {
+        Ok((search_index::observe_source(store, session)?, None))
+    }
+}
+
 fn preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -502,18 +520,15 @@ fn preview_update(
 ) -> PickerUpdate {
     let PreviewRequest { key, source_path } = request;
     let full_read = key.continuation_after.is_some();
-    let writer =
-        store.and_then(
-            |store| match crate::search_index::observe_source(store, &key.session) {
-                Ok(guard) => Some((store, guard)),
-                Err(error) => {
-                    let _ = sender.send(PickerUpdate::Warning(format!(
-                        "trajectory index status: {error}"
-                    )));
-                    None
-                }
-            },
-        );
+    let writer = store.and_then(|store| match preview_source_guard(store, &key.session) {
+        Ok((guard, observed)) => Some((store, guard, observed)),
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "trajectory index status: {error}"
+            )));
+            None
+        }
+    });
     let mut read_revision = None;
     let mut workspace = None;
     let value = if key.session.provider == Provider::OpenCode && !full_read {
@@ -524,13 +539,13 @@ fn preview_update(
             registry,
             &key,
             source_path.as_deref(),
-            preview_read_budget(&key, writer.map(|(_, guard)| guard)),
+            preview_read_budget(&key, writer.as_ref().map(|(_, guard, _)| *guard)),
         );
         let read = read.and_then(|read| {
-            let Some((store, guard)) = writer else {
+            let Some((store, guard, _)) = writer.as_ref() else {
                 return Ok(read);
             };
-            let read = search_index::verify_legacy_search_read(registry, store, guard, read)?;
+            let read = search_index::verify_legacy_search_read(registry, store, *guard, read)?;
             if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
                 anyhow::ensure!(
                     *expected == preview_revision(read.source_revision),
@@ -551,13 +566,23 @@ fn preview_update(
                     crate::codex_workspace_update(&snapshot, read.source_revision, complete)
                         .map(Box::new);
             }
-            if let Some((store, guard)) = writer
+            let selected = read
+                .native_session
+                .as_ref()
+                .filter(|native| native.session.provider == Provider::Grok)
+                .map(crate::indexed_session_metadata);
+            if let Some((store, guard, observation)) = writer
                 && let Err(error) = crate::store_search_document(
                     store,
-                    read.native_session.as_ref().map_or(
-                        crate::SearchDocumentTarget::Session(&key.session),
-                        crate::SearchDocumentTarget::VisibleNative,
-                    ),
+                    match (selected.as_ref(), observation.as_ref()) {
+                        (Some(selected), Some(observation)) => {
+                            crate::SearchDocumentTarget::Selected(selected, observation)
+                        }
+                        _ => read.native_session.as_ref().map_or(
+                            crate::SearchDocumentTarget::Session(&key.session),
+                            crate::SearchDocumentTarget::VisibleNative,
+                        ),
+                    },
                     &snapshot,
                     complete,
                     read.source_revision,

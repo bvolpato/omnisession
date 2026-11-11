@@ -811,7 +811,7 @@ pub(crate) fn visit_json_lines(
     file_limit: u64,
     visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
+    visit_json_lines_with_omissions(path, file_limit, visit).map(|skips| skips.oversized)
 }
 
 /// Byte location of one complete JSON value in a bounded JSONL transcript.
@@ -832,6 +832,7 @@ pub(crate) fn visit_json_lines_with_offsets(
     visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+        .map(|skips| skips.oversized)
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -868,6 +869,20 @@ pub(crate) fn omitted_images_text(count: usize) -> String {
     }
 }
 
+pub(crate) fn visit_json_lines_with_omissions(
+    path: &Path,
+    file_limit: u64,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    let file = File::open(path)?;
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        JsonLinesLimits::streamed(file_limit),
+        |_, record| visit(record),
+    )
+}
+
+#[cfg(test)]
 fn visit_json_lines_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
@@ -877,13 +892,14 @@ fn visit_json_lines_with_limits(
     visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
         visit(record)
     })
+    .map(|skips| skips.oversized)
 }
 
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
     mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
-) -> Result<usize> {
+) -> Result<JsonLineSkips> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
@@ -892,7 +908,7 @@ fn visit_json_lines_with_offsets_and_limits(
     visit_json_reader(reader, limits, |location, record, _| {
         visit(location, record)
     })
-    .map(|(omissions, _)| omissions.oversized)
+    .map(|(omissions, _)| omissions)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1121,6 +1137,15 @@ pub(crate) fn json_lines_preview_with_omissions(
     path: &Path,
     sample_records: usize,
 ) -> Result<JsonLinesPreview> {
+    json_lines_preview_bounded(path, sample_records, u64::MAX)
+}
+
+/// Limits the bytes read from the beginning before seeking to the sampled tail.
+pub(crate) fn json_lines_preview_bounded(
+    path: &Path,
+    sample_records: usize,
+    prefix_bytes: u64,
+) -> Result<JsonLinesPreview> {
     let metadata = File::open(path)?.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1132,7 +1157,7 @@ pub(crate) fn json_lines_preview_with_omissions(
     } else {
         sample_records
     };
-    let prefix_end = read_json_lines_prefix(path, limit, &mut preview)?;
+    let prefix_end = read_json_lines_prefix(path, limit, prefix_bytes, &mut preview)?;
     if small {
         preview.sampled = prefix_end < metadata.len();
         return Ok(preview);
@@ -1203,7 +1228,7 @@ fn read_json_lines_tail(
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
     let mut preview = JsonLinesPreview::default();
-    read_json_lines_prefix(path, limit, &mut preview)?;
+    read_json_lines_prefix(path, limit, u64::MAX, &mut preview)?;
     Ok(preview.records)
 }
 
@@ -1211,13 +1236,15 @@ fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
 fn read_json_lines_prefix(
     path: &Path,
     limit: usize,
+    byte_budget: u64,
     preview: &mut JsonLinesPreview,
 ) -> Result<u64> {
     let file = File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(byte_budget));
     let mut line = Vec::new();
     let mut consumed = 0_u64;
     for _ in 0..limit {
@@ -1226,7 +1253,12 @@ fn read_json_lines_prefix(
         else {
             break;
         };
-        consumed += read;
+        let end = consumed + read;
+        if end == byte_budget && end < metadata.len() && line.last() != Some(&b'\n') {
+            preview.sampled = true;
+            break;
+        }
+        consumed = end;
         match line_kind {
             BoundedLine::Oversized => preview.omissions.oversized += 1,
             BoundedLine::Complete => {
@@ -1622,7 +1654,14 @@ impl EventBuilder {
                 payload,
                 timestamp,
                 ReplayPolicy::HistoricalOnly,
-                Some("omnisession.codex_malformed_records".to_owned()),
+                Some(
+                    if self.provider == Provider::Codex {
+                        "omnisession.codex_malformed_records"
+                    } else {
+                        "omnisession.malformed_records"
+                    }
+                    .to_owned(),
+                ),
                 None,
             );
         }

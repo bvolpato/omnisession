@@ -140,15 +140,23 @@ fn full_index_read(
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let cache = Store::open_default().and_then(|store| {
-            let (prior, observation) = if session.provider == Provider::Codex {
-                let observed = store.observe_selected_session(session)?;
-                (observed.state, Some(observed))
-            } else {
-                (store.trajectory_index_state(session)?, None)
-            };
+            let (prior, observation) =
+                if matches!(session.provider, Provider::Codex | Provider::Grok) {
+                    let observed = store.observe_selected_session(session)?;
+                    (observed.state, Some(observed))
+                } else {
+                    (store.trajectory_index_state(session)?, None)
+                };
             Ok((store, prior, observation))
         });
-        let read = full_index_read(self, session)?;
+        let read = full_index_read(self, session).inspect_err(|_| {
+            if session.provider == Provider::Grok
+                && let Ok((store, Some(_), _)) = &cache
+                && let Err(error) = search_index::refresh_rejected_grok_source(self, store, session)
+            {
+                eprintln!("warning: local trajectory index refresh: {error}");
+            }
+        })?;
         let snapshot = read.snapshot;
         match cache {
             Ok((store, prior, observation)) => {
@@ -183,7 +191,10 @@ impl IndexedSessionReader for AdapterRegistry {
                     }
                     selected
                 });
-                if (!current || session.provider == Provider::Codex)
+                let metadata_changed = selected.as_ref().zip(observation.as_ref()).is_some_and(
+                    |(selected, observed)| observed.metadata.as_ref() != Some(selected),
+                );
+                if (!current || session.provider == Provider::Codex || metadata_changed)
                     && let Err(error) = store_search_document(
                         &store,
                         selected.as_ref().zip(observation.as_ref()).map_or(
