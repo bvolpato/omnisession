@@ -17,10 +17,10 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at,
-        visit_index_json_lines, visit_streamed_json_lines,
+        EventBuilder, JsonLinesPreview, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix,
+        json_lines_preview_with_prefix, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, provider_file, provider_root, sort_sessions, string_at,
+        validate_provider, value_at, visit_index_json_lines, visit_streamed_json_lines,
     },
 };
 
@@ -670,15 +670,23 @@ impl CodexSession {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
-        let oversized_records =
-            visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+        let mut first_gap = None;
+        let oversized_records = visit_streamed_json_lines(
+            &self.path,
+            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+            |record, preceding_oversized| {
+                if preceding_oversized > 0 {
+                    first_gap.get_or_insert_with(|| builder.checkpoint());
+                }
                 history.push(&mut builder, &record)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
                     history.compact(&mut builder);
                 }
                 Ok(())
-            })?;
+            },
+        )?;
+        let prefix_end_sequence = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -709,21 +717,35 @@ impl CodexSession {
                 None,
             );
         }
-        builder.push_oversized_record_notice(oversized_records, self.updated_at);
+        builder.push_positioned_oversized_record_notice(
+            oversized_records,
+            Some(prefix_end_sequence),
+            self.updated_at,
+        );
         Ok((builder, history.project_path))
     }
 
     fn preview_events(&self) -> Result<EventBuilder> {
         const SAMPLE_RECORDS: usize = 1_024;
-        Ok(self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?))
+        Ok(self.events_from_preview(json_lines_preview_with_prefix(&self.path, SAMPLE_RECORDS)?))
     }
 
-    fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
+    fn events_from_preview(&self, sample: JsonLinesPreview) -> EventBuilder {
         let mut builder = self.event_builder();
         let mut last_visible: Option<(EventKind, String, &'static str)> = None;
+        let mut records = sample.records.into_iter();
+        for record in records.by_ref().take(sample.prefix_records) {
+            push_record(&mut builder, &record, &mut last_visible);
+        }
+        let prefix_end_sequence = builder.checkpoint();
         for record in records {
             push_record(&mut builder, &record, &mut last_visible);
         }
+        builder.push_codex_preview_prefix(
+            prefix_end_sequence,
+            sample.reached_end_without_gap,
+            self.updated_at,
+        );
         builder
     }
 

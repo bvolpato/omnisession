@@ -401,6 +401,15 @@ fn codex_preview_reports_sampling_after_rollback_reconstruction() {
         snapshot.events.last().unwrap().payload["omitted_events"],
         75
     );
+    let prefix_end = snapshot.events.last().unwrap().payload["prefix_end_sequence"]
+        .as_u64()
+        .expect("position of the first skipped request");
+    let in_prefix = snapshot
+        .events
+        .iter()
+        .take_while(|event| event.sequence < prefix_end)
+        .count();
+    assert_eq!(in_prefix, 512);
     assert!(omnis_core::import_conversation(&snapshot).truncated);
     assert!(!visible_text(&snapshot).contains(&"request 1099"));
 }
@@ -438,6 +447,75 @@ fn codex_skips_oversized_records_and_reports_omission() {
         2
     );
     assert!(omnis_core::import_conversation(&snapshot).truncated);
+}
+
+#[test]
+fn codex_prefix_ends_at_the_first_skipped_source_record() {
+    let oversized = message("user", &"x".repeat(16 * 1024 * 1024)).to_string();
+    for preview in [true, false] {
+        for original_precedes_gap in [true, false] {
+            let mut records = Vec::new();
+            if original_precedes_gap {
+                records.push(message("user", "original request").to_string());
+            }
+            records.extend([
+                oversized.clone(),
+                message("user", "later request").to_string(),
+            ]);
+            let snapshot = read_records_with_preview(records, preview).expect("bounded rollout");
+            let raw_type = if preview {
+                "omnisession.codex_preview_prefix"
+            } else {
+                "omnisession.record_size_limit"
+            };
+            let bound = snapshot
+                .events
+                .iter()
+                .find(|event| event.source.raw_record_type.as_deref() == Some(raw_type))
+                .and_then(|event| event.payload["prefix_end_sequence"].as_u64())
+                .expect("known contiguous source prefix");
+            let proven = snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser && event.sequence < bound)
+                .map(|event| event.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                proven,
+                original_precedes_gap
+                    .then_some("original request")
+                    .as_slice()
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_preview_certifies_absence_only_after_reading_through_eof() {
+    let metadata = event("token_count", json!({"padding": "x".repeat(4_500)})).to_string();
+    for trailing_oversized in [false, true] {
+        let mut records = vec![metadata.clone(); 1_023];
+        records.push(event("token_count", json!({})).to_string());
+        if trailing_oversized {
+            records.push(message("user", &"x".repeat(2 * 1024 * 1024)).to_string());
+        }
+        let snapshot = read_records_with_preview(records, true).expect("message-free preview");
+        assert!(visible_text(&snapshot).is_empty());
+        let marker = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                event.source.raw_record_type.as_deref() == Some("omnisession.codex_preview_prefix")
+            })
+            .expect("source prefix evidence");
+        assert_eq!(
+            marker
+                .payload
+                .get("prefix_complete")
+                .and_then(Value::as_bool),
+            (!trailing_oversized).then_some(true)
+        );
+    }
 }
 
 #[test]

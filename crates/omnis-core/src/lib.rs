@@ -774,24 +774,77 @@ pub fn session_search_title_is_authoritative(
 
 /// Returns whether this read covers the first visible message or confirms there are none.
 ///
-/// A bounded read can skip the first message. A full read can also omit earlier history.
+/// A bounded read or a read with omissions can still include the start of the conversation.
+/// The reader records the sequence where its verified prefix ends.
 #[must_use]
 pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: bool) -> bool {
-    if !full_read {
-        return false;
-    }
     let events = || snapshot.events.iter().filter(|event| !is_secret(event));
-    if events().any(|event| omitted_history(event) == Some(OmittedHistory::MayIncludeMessages)) {
+    let mut prefix_end = None::<u64>;
+    let mut only_eof_markers = true;
+    for event in events() {
+        if let Some(end) = codex_verified_prefix_end(snapshot, event) {
+            prefix_end = Some(prefix_end.map_or(end, |previous| previous.min(end)));
+            only_eof_markers &= end == event.sequence
+                && event.source.raw_record_type.as_deref()
+                    == Some("omnisession.codex_preview_prefix")
+                && event.payload["prefix_complete"].as_bool() == Some(true)
+                && omitted_history(event).is_none();
+        } else if omitted_history(event) == Some(OmittedHistory::MayIncludeMessages) {
+            return false;
+        }
+    }
+    // Only the EOF marker can occupy the final sequence.
+    let reached_eof = only_eof_markers
+        && prefix_end.is_some_and(|end| {
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.sequence >= end)
+                .take(2)
+                .count()
+                == 1
+        });
+    if reached_eof {
+        prefix_end = None;
+    } else if !full_read && prefix_end.is_none() {
         return false;
     }
     let first_checkpoint = events()
         .filter(|event| source_compaction_text(event).is_some())
         .map(|event| (event.sequence, event.event_id))
         .min();
-    first_checkpoint.is_none_or(|checkpoint| {
-        events()
-            .any(|event| (event.sequence, event.event_id) < checkpoint && is_preview_message(event))
+    if prefix_end.is_none() && first_checkpoint.is_none() {
+        return true;
+    }
+    events().any(|event| {
+        prefix_end.is_none_or(|end| event.sequence < end)
+            && first_checkpoint
+                .is_none_or(|checkpoint| (event.sequence, event.event_id) < checkpoint)
+            && is_preview_message(event)
     })
+}
+
+fn codex_verified_prefix_end(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<u64> {
+    if event.kind != EventKind::ProviderEvent
+        || event.replay_policy != ReplayPolicy::HistoricalOnly
+        || snapshot.session.provider != Provider::Codex
+        || event.source.provider != Provider::Codex
+        || event.source.native_session_id != snapshot.session.id
+        || !matches!(
+            event.source.raw_record_type.as_deref(),
+            Some(
+                "omnisession.codex_preview_prefix"
+                    | "omnisession.preview_limit"
+                    | "omnisession.record_size_limit"
+            )
+        )
+        || reports_unverified_messages(event)
+    {
+        return None;
+    }
+    event.payload["prefix_end_sequence"]
+        .as_u64()
+        .filter(|end| *end <= event.sequence)
 }
 
 /// Selects first and latest visible messages without retaining full conversation.
@@ -803,6 +856,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut first = None;
     let mut latest = None;
     let mut message_count = 0;
+    let mut event_count = snapshot.events.len();
     let metadata = session_recorded_metadata(snapshot);
 
     for event in visible_events(snapshot) {
@@ -810,6 +864,11 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
             first.get_or_insert(event);
             latest = Some(event);
             message_count += 1;
+        } else if event.source.raw_record_type.as_deref()
+            == Some("omnisession.codex_preview_prefix")
+            && codex_verified_prefix_end(snapshot, event).is_some()
+        {
+            event_count -= 1;
         }
     }
 
@@ -817,7 +876,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         first: first.and_then(preview_message),
         latest: latest.and_then(preview_message),
         message_count,
-        event_count: snapshot.events.len(),
+        event_count,
         tool_event_count: snapshot
             .events
             .iter()
@@ -2613,11 +2672,7 @@ fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
     if event.kind != EventKind::ProviderEvent {
         return None;
     }
-    if event.payload["native_history_unverified"].as_bool() == Some(true)
-        || event.payload["unsupported_text_records"]
-            .as_u64()
-            .is_some_and(|count| count > 0)
-    {
+    if reports_unverified_messages(event) {
         return Some(OmittedHistory::MayIncludeMessages);
     }
     let omitted = event.payload["omitted_events"]
@@ -2631,6 +2686,13 @@ fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
     } else {
         Some(OmittedHistory::MayIncludeMessages)
     }
+}
+
+fn reports_unverified_messages(event: &OmniEvent) -> bool {
+    event.payload["native_history_unverified"].as_bool() == Some(true)
+        || event.payload["unsupported_text_records"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -4977,6 +5039,113 @@ mod tests {
             );
             snapshot.events.pop();
         }
+    }
+
+    #[test]
+    fn title_authority_uses_the_first_gap_in_the_visible_message_prefix() {
+        let mut first_secret = event(0, EventKind::MessageUser, json!({"text": "Hidden message"}));
+        first_secret.sensitivity = Sensitivity::Secret;
+        let mut snapshot = snapshot_with_events(vec![
+            first_secret,
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text": "<environment_context>setup"}),
+            ),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Opening request"}),
+            ),
+        ]);
+        for (full_read, record_type, payload) in [
+            (
+                false,
+                "omnisession.codex_preview_prefix",
+                json!({"prefix_end_sequence": 3}),
+            ),
+            (
+                false,
+                "omnisession.preview_limit",
+                json!({"omitted_events": 1, "prefix_end_sequence": 3}),
+            ),
+            (
+                true,
+                "omnisession.record_size_limit",
+                json!({"omitted_events": 1, "prefix_end_sequence": 3}),
+            ),
+        ] {
+            let mut notice = event(3, EventKind::ProviderEvent, payload);
+            notice.source.raw_record_type = Some(record_type.to_owned());
+            snapshot.events.push(notice);
+            assert_eq!(
+                super::session_preview(&snapshot).event_count,
+                snapshot.events.len()
+                    - usize::from(record_type == "omnisession.codex_preview_prefix")
+            );
+            assert!(
+                super::session_message_prefix_is_known(&snapshot, full_read),
+                "{record_type}"
+            );
+            snapshot.events.push(event(
+                4,
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+            ));
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            snapshot.events.pop();
+            snapshot.events.last_mut().unwrap().payload["prefix_end_sequence"] = 2.into();
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn complete_preview_confirms_no_messages_only_at_an_uninterrupted_eof() {
+        let mut notice = event(
+            2,
+            EventKind::ProviderEvent,
+            json!({"prefix_end_sequence": 2, "prefix_complete": true}),
+        );
+        notice.source.raw_record_type = Some("omnisession.codex_preview_prefix".to_owned());
+        let mut snapshot = snapshot_with_events(vec![
+            event(0, EventKind::ToolCompleted, json!({"output": "Worked"})),
+            notice,
+        ]);
+        assert!(session_search_title(&snapshot).is_none());
+        assert!(super::session_message_prefix_is_known(&snapshot, false));
+
+        let mut positioned_gap = event(
+            1,
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1, "prefix_end_sequence": 1}),
+        );
+        positioned_gap.source.raw_record_type = Some("omnisession.record_size_limit".to_owned());
+        for gap in [
+            positioned_gap,
+            event(
+                1,
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+            ),
+            compaction(1, Provider::Codex, "A retained checkpoint"),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Conflicting sequence"}),
+            ),
+            event(3, EventKind::MessageUser, json!({"text": "Later request"})),
+        ] {
+            snapshot.events.push(gap);
+            assert!(!super::session_message_prefix_is_known(&snapshot, false));
+            snapshot.events.pop();
+        }
+        snapshot.events[1].source.native_session_id = "different-session".to_owned();
+        assert!(!super::session_message_prefix_is_known(&snapshot, false));
     }
 
     #[test]

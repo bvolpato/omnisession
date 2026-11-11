@@ -808,9 +808,13 @@ pub(crate) struct JsonLineLocation {
 pub(crate) fn visit_json_lines_with_offsets(
     reader: &mut BufReader<File>,
     file_limit: u64,
-    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+    visit_json_lines_with_offsets_and_limits(
+        reader,
+        JsonLinesLimits::streamed(file_limit),
+        |location, record, _| visit(location, record),
+    )
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -845,15 +849,15 @@ pub(crate) fn read_json_line_at(
 pub(crate) fn visit_streamed_json_lines(
     path: &Path,
     file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
+    mut visit: impl FnMut(Value, usize) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_limits(
-        path,
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(File::open(path)?),
         JsonLinesLimits {
             records: usize::MAX,
             ..JsonLinesLimits::streamed(file_limit)
         },
-        visit,
+        |_, record, preceding_oversized| visit(record, preceding_oversized),
     )
 }
 
@@ -872,7 +876,7 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
+    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record, _| {
         visit(record)
     })
 }
@@ -880,7 +884,7 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value, usize) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
@@ -923,6 +927,7 @@ fn visit_json_lines_with_offsets_and_limits(
                             length: read,
                         },
                         record,
+                        oversized_records,
                     )?;
                 }
             }
@@ -1072,25 +1077,56 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
-    let metadata = File::open(path)?.metadata()?;
+    Ok(json_lines_preview_with_prefix(path, sample_records)?.records)
+}
+
+pub(crate) struct JsonLinesPreview {
+    pub(crate) records: Vec<Value>,
+    /// Number of leading records read without skipping a source row.
+    pub(crate) prefix_records: usize,
+    pub(crate) reached_end_without_gap: bool,
+}
+
+pub(crate) fn json_lines_preview_with_prefix(
+    path: &Path,
+    sample_records: usize,
+) -> Result<JsonLinesPreview> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        return read_json_lines(path, MAX_PROVIDER_RECORDS);
+    let read_tail = metadata.len() > MAX_PREVIEW_TAIL_SIZE;
+    let head_limit = if read_tail {
+        sample_records
+    } else {
+        MAX_PROVIDER_RECORDS
+    };
+    let mut head = read_json_lines_with_end(&file, head_limit)?;
+    if read_tail && head.end < metadata.len() {
+        let head_end = head.end;
+        for (location, record) in json_lines_tail_with_offsets(&file, sample_records)? {
+            if location.offset < head_end {
+                continue;
+            }
+            if location.offset != head.end {
+                head.first_gap.get_or_insert(head.records.len());
+            }
+            head.end = location.offset + location.length;
+            head.records.push(record);
+        }
     }
-
-    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records)?;
-    records.extend(
-        json_lines_tail_with_offsets(path, sample_records)?
-            .into_iter()
-            .filter_map(|(offset, record)| (offset >= prefix_end).then_some(record)),
-    );
-    Ok(records)
+    Ok(JsonLinesPreview {
+        prefix_records: head.first_gap.unwrap_or(head.records.len()),
+        reached_end_without_gap: head.first_gap.is_none() && head.end == metadata.len(),
+        records: head.records,
+    })
 }
 
-fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
-    let mut file = File::open(path)?;
+fn json_lines_tail_with_offsets(
+    mut file: &File,
+    limit: usize,
+) -> Result<Vec<(JsonLineLocation, Value)>> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1123,19 +1159,29 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
             if records.len() == limit {
                 records.pop_front();
             }
-            records.push_back((line_offset, record));
+            records.push_back((
+                JsonLineLocation {
+                    offset: line_offset,
+                    length: u64::try_from(read)?,
+                },
+                record,
+            ));
         }
     }
     Ok(records.into_iter().collect())
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    Ok(read_json_lines_with_end(path, limit)?.0)
+    Ok(read_json_lines_with_end(&File::open(path)?, limit)?.records)
 }
 
-/// Reads up to `limit` leading lines and returns their records and consumed bytes.
-fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
-    let file = File::open(path)?;
+struct JsonLinesHead {
+    records: Vec<Value>,
+    end: u64,
+    first_gap: Option<usize>,
+}
+
+fn read_json_lines_with_end(file: &File, limit: usize) -> Result<JsonLinesHead> {
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
@@ -1143,6 +1189,7 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
     let mut records = Vec::new();
     let mut line = Vec::new();
     let mut consumed = 0_u64;
+    let mut first_gap = None;
     for _ in 0..limit {
         let Some((line_kind, read)) =
             read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
@@ -1152,15 +1199,23 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
         consumed += read;
         // Previews skip oversized records the way streamed reads do.
         match line_kind {
-            BoundedLine::Oversized => {}
+            BoundedLine::Oversized => {
+                first_gap.get_or_insert(records.len());
+            }
             BoundedLine::Complete => {
                 if let Ok(record) = serde_json::from_slice(&line) {
                     records.push(record);
+                } else if !line.iter().all(u8::is_ascii_whitespace) {
+                    first_gap.get_or_insert(records.len());
                 }
             }
         }
     }
-    Ok((records, consumed))
+    Ok(JsonLinesHead {
+        records,
+        end: consumed,
+        first_gap,
+    })
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -1299,13 +1354,21 @@ impl EventBuilder {
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
         if self.events.len() <= limit {
+            if self.provider == Provider::Codex {
+                self.push_codex_preview_prefix(self.checkpoint(), true, Some(timestamp));
+            }
             return;
         }
         let omitted = self.events.len() - limit;
+        let mut payload =
+            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit});
+        if self.provider == Provider::Codex {
+            payload["prefix_end_sequence"] = self.events[limit / 2].sequence.into();
+        }
         self.events.drain(limit / 2..limit / 2 + omitted);
         self.push(
             EventKind::ProviderEvent,
-            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit}),
+            payload,
             Some(timestamp),
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.preview_limit".to_owned()),
@@ -1318,19 +1381,52 @@ impl EventBuilder {
         omitted_records: usize,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        self.push_positioned_oversized_record_notice(omitted_records, None, timestamp);
+    }
+
+    pub(crate) fn push_positioned_oversized_record_notice(
+        &mut self,
+        omitted_records: usize,
+        prefix_end_sequence: Option<u64>,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
         if omitted_records == 0 {
             return;
         }
+        let mut payload = serde_json::json!({
+            "omitted_events": omitted_records,
+            "omitted_records": omitted_records,
+            "max_record_bytes": MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        });
+        if let Some(sequence) = prefix_end_sequence {
+            payload["prefix_end_sequence"] = sequence.into();
+        }
         self.push(
             EventKind::ProviderEvent,
-            serde_json::json!({
-                "omitted_events": omitted_records,
-                "omitted_records": omitted_records,
-                "max_record_bytes": MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-            }),
+            payload,
             timestamp,
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.record_size_limit".to_owned()),
+            None,
+        );
+    }
+
+    pub(crate) fn push_codex_preview_prefix(
+        &mut self,
+        prefix_end_sequence: u64,
+        complete: bool,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let mut payload = serde_json::json!({"prefix_end_sequence": prefix_end_sequence});
+        if complete {
+            payload["prefix_complete"] = true.into();
+        }
+        self.push(
+            EventKind::ProviderEvent,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.codex_preview_prefix".to_owned()),
             None,
         );
     }
@@ -1501,9 +1597,10 @@ mod tests {
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
         MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
-        json_lines_tail_with_offsets, nested_files_with_limit, sample_files_concurrently,
-        snapshot_max_bytes, sqlite_snapshot, sqlite_snapshot_with_limits,
-        visit_index_json_lines_with_limits, visit_json_lines_with_limits,
+        json_lines_preview_with_prefix, json_lines_tail_with_offsets, nested_files_with_limit,
+        sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
+        sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
+        visit_json_lines_with_limits,
     };
 
     #[cfg(unix)]
@@ -2108,7 +2205,7 @@ mod tests {
         }
         std::fs::write(&path, content).expect("JSONL fixture");
 
-        let records = json_lines_tail_with_offsets(&path, 2)
+        let records = json_lines_tail_with_offsets(&std::fs::File::open(&path).unwrap(), 2)
             .expect("tail records")
             .into_iter()
             .map(|(_, record)| record)
@@ -2134,7 +2231,9 @@ mod tests {
         }
         std::fs::write(&path, content).expect("large JSONL fixture");
 
-        let records = json_lines_preview(&path, 32).expect("preview records");
+        let sample = json_lines_preview_with_prefix(&path, 32).expect("preview records");
+        assert_eq!(sample.prefix_records, 32);
+        let records = sample.records;
 
         assert!(records.len() <= 64);
         assert_eq!(
@@ -2231,7 +2330,7 @@ mod tests {
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = json_lines_tail_with_offsets(&path, records);
+            let _ = json_lines_tail_with_offsets(&std::fs::File::open(&path).unwrap(), records);
         }
 
         #[test]

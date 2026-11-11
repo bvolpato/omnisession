@@ -2316,6 +2316,7 @@ impl Store {
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
+        migrate_legacy_codex_titles(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -2884,6 +2885,38 @@ fn ensure_trajectory_version_columns(
         transaction
             .execute_batch("ALTER TABLE session_trajectories ADD COLUMN derived_title TEXT;")
             .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+/// Older indexes could use a follow-up from a partial Codex transcript as its title.
+fn migrate_legacy_codex_titles(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_trajectory_migrations (
+                 name TEXT PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )
+        .map_err(database_error)?;
+    let inserted = transaction
+        .execute(
+            "INSERT OR IGNORE INTO session_trajectory_migrations (name) VALUES ('codex_title_authority')",
+            [],
+        )
+        .map_err(database_error)?;
+    if inserted != 0 {
+        transaction.execute_batch(
+            "UPDATE session_trajectories AS trajectory SET derived_title = NULL
+             WHERE provider = 'codex' AND origin = 'native' AND derived_title IS NOT NULL
+               AND (source_complete = 0 OR truncation_strategy NOT IN (
+                   'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
+               ))
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_index AS native
+                   WHERE native.provider = trajectory.provider AND native.session_id = trajectory.session_id
+                     AND native.title = trajectory.derived_title
+               );",
+        ).map_err(database_error)?;
     }
     Ok(())
 }
@@ -4330,9 +4363,46 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_clears_unproven_legacy_codex_titles() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let store = Store::open(&path).unwrap();
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "DROP TABLE IF EXISTS session_trajectory_migrations;
+             INSERT INTO session_index(provider, session_id, title, event_count, indexed_at)
+             VALUES ('codex', 'named', 'named', 0, 1);
+             WITH legacy(provider, id, full, strategy, origin) AS (VALUES
+                ('codex', 'sampled', 0, 'none', 'native'),
+                ('codex', 'omitted', 1, 'source_incomplete', 'native'),
+                ('codex', 'complete', 1, 'none', 'native'),
+                ('codex', 'named', 0, 'none', 'native'),
+                ('codex', 'imported', 0, 'none', 'imported_bundle'),
+                ('claude', 'other', 0, 'none', 'native')
+             )
+             INSERT INTO session_trajectories
+                (provider, session_id, redacted_text, content_hash, source_updated_at,
+                 source_complete, complete, indexed_at, source_byte_count, indexed_byte_count,
+                 truncation_strategy, origin, protected_by_bundle, document_version, derived_title)
+             SELECT provider, id, '', X'00', 1, full, full AND strategy = 'none', 1, 0, 0,
+                    strategy, origin, 0, 4, id FROM legacy;",
+            )
+            .unwrap();
+        drop(store);
+
+        let titles = Store::open(&path).unwrap().trajectory_titles().unwrap();
+        assert_eq!(
+            titles.into_values().collect::<HashSet<_>>(),
+            HashSet::from(["complete", "named", "imported", "other"].map(str::to_owned))
+        );
+    }
+
+    #[test]
     fn observed_writes_change_titles_only_when_the_first_title_is_known() {
         let temporary = tempdir().unwrap();
-        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        let path = temporary.path().join("store.sqlite3");
         let session = SessionRef::new(Provider::Codex, "sampled-title");
         let first = Utc::now();
         let mut prior = None;
@@ -4351,6 +4421,7 @@ mod tests {
         ];
         let titles = reads.map(
             |(offset, full_read, strategy, title_authoritative, title)| {
+                let store = Store::open(&path).unwrap();
                 let time = first + chrono::Duration::seconds(offset);
                 let text = "Synthetic visible text";
                 let document = TrajectoryDocument {
