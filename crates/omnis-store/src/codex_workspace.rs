@@ -1,6 +1,9 @@
 //! Workspaces established by reading a specific Codex rollout.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use omnis_ir::{Provider, SourceRevision};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
@@ -15,18 +18,31 @@ const UNCERTAIN_LEGACY_SOURCE: &str =
     "(NOT t.source_complete OR t.truncation_strategy GLOB 'source_incomplete*'
     OR t.truncation_strategy IN ('legacy_unknown','legacy_bounded'))";
 
-const LEGACY_RECHECKS: &str = "SELECT t.id AS trajectory_id,t.source_file_id,t.source_contents_id
-    FROM session_trajectories t LEFT JOIN codex_indexed_workspaces w ON w.trajectory_id=t.id
-      AND w.source_file_id=t.source_file_id AND w.source_contents_id=t.source_contents_id
-    WHERE t.provider='codex' AND t.origin='native' AND t.document_version=6
-      AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL
-      AND (NOT t.source_complete OR (t.truncation_strategy GLOB 'source_incomplete*' AND w.project_path IS NULL))";
+// Older search documents did not record directory changes between turns. A stored
+// workspace can also belong to another physical copy of the same thread.
+const LEGACY_RECHECKS: &str = "SELECT t.trajectory_id,t.source_file_id,t.source_contents_id FROM (
+    SELECT id AS trajectory_id,source_file_id,source_contents_id FROM session_trajectories
+      WHERE provider='codex' AND origin='native' AND document_version=6
+        AND source_file_id IS NOT NULL AND source_contents_id IS NOT NULL
+    UNION ALL SELECT trajectory_id,source_file_id,source_contents_id FROM codex_indexed_workspaces
+    ) AS t WHERE 1";
 
 /// The workspace observations and pending reads for the selected rollout revisions.
 #[derive(Debug, Default)]
 pub struct CodexWorkspaceIndex {
     pub verified: HashMap<Uuid, CodexWorkspace>,
-    pub pending: HashMap<Uuid, SourceRevision>,
+    pub pending: HashSet<SourceRevision>,
+}
+
+impl CodexWorkspaceIndex {
+    /// Returns whether a fresh read must establish this physical rollout’s working directory.
+    #[must_use]
+    pub fn needs_recheck(&self, revision: SourceRevision) -> bool {
+        self.pending.contains(&SourceRevision {
+            missing_ancestor: None,
+            ..revision
+        })
+    }
 }
 
 /// A workspace and branch read from the selected rollout revision.
@@ -72,27 +88,36 @@ impl CodexWorkspace {
         connection: &Connection,
         file: Option<Uuid>,
     ) -> Result<CodexWorkspaceIndex> {
-        let migrated = has_rechecks(connection)?;
-        let (mut pending, pending_filter) = if migrated {
-            ("SELECT trajectory_id,source_file_id,source_contents_id FROM codex_workspace_rechecks WHERE 1".to_owned(), " AND source_file_id=?1")
+        let (stored_filter, legacy_filter, workspace_filter) = if file.is_some() {
+            (
+                " AND source_file_id=?1",
+                " AND t.source_file_id=?1",
+                " AND w.source_file_id=?1",
+            )
         } else {
-            (LEGACY_RECHECKS.to_owned(), " AND t.source_file_id=?1")
+            ("", "", "")
         };
-        let mut certified = format!("SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0
-            FROM codex_indexed_workspaces w JOIN session_trajectories t ON t.id=w.trajectory_id
-            WHERE (t.document_version <> 6 OR NOT {UNCERTAIN_LEGACY_SOURCE}
-                OR t.source_file_id IS NOT w.source_file_id OR t.source_contents_id IS NOT w.source_contents_id OR EXISTS (
-                SELECT 1 FROM pragma_table_info('session_trajectories')
-                WHERE name='derived_title_is_local_opener'))
-              AND NOT EXISTS(SELECT 1 FROM pending p WHERE p.trajectory_id=w.trajectory_id
-                  AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id)");
-        if file.is_some() {
-            pending.push_str(pending_filter);
-            certified.push_str(" AND w.source_file_id=?1");
+        let settings_checked = has_settings_generation(connection)?;
+        let mut pending_queries = Vec::new();
+        if has_rechecks(connection)? {
+            pending_queries.push(format!("SELECT trajectory_id,source_file_id,source_contents_id FROM codex_workspace_rechecks WHERE 1{stored_filter}"));
         }
+        if !settings_checked {
+            pending_queries.push(format!("{LEGACY_RECHECKS}{legacy_filter}"));
+        }
+        let pending_rows = pending_queries.join(" UNION ");
+        let workspace_rows = if settings_checked {
+            format!(" UNION ALL SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0
+                FROM codex_indexed_workspaces w
+                WHERE NOT EXISTS(SELECT 1 FROM pending p WHERE p.trajectory_id=w.trajectory_id
+                    AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id)
+                {workspace_filter}")
+        } else {
+            String::new()
+        };
         let sql = format!(
-            "WITH pending AS ({pending}) {certified}
-            UNION ALL SELECT source_file_id,source_contents_id,NULL,NULL,1 FROM pending"
+            "WITH pending AS ({pending_rows})
+            SELECT source_file_id,source_contents_id,NULL,NULL,1 FROM pending{workspace_rows}"
         );
         let filter = file.map(Uuid::into_bytes);
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
@@ -105,7 +130,7 @@ impl CodexWorkspace {
         for row in rows {
             let ((file, workspace), pending) = row.map_err(database_error)?;
             if pending {
-                index.pending.insert(file, workspace.source_revision);
+                index.pending.insert(workspace.source_revision);
             } else {
                 index.verified.insert(file, workspace);
             }
@@ -120,21 +145,15 @@ impl CodexWorkspace {
     ///
     /// Returns an error if the search catalog cannot be read.
     pub fn refresh_hints() -> Result<HashMap<Uuid, Self>> {
-        Self::read_rows(
-            "SELECT t.source_file_id,t.source_contents_id,c.project_path,c.git_branch
+        let connection = open_index()?;
+        let sql = "SELECT t.source_file_id,t.source_contents_id,c.project_path,c.git_branch
              FROM session_trajectories t JOIN session_index c USING(provider,session_id)
              WHERE t.provider='codex' AND t.origin='native' AND t.source_complete=1
                AND t.document_version < ?1 AND c.project_path IS NOT NULL
-               AND c.source_file_id=t.source_file_id AND c.source_contents_id=t.source_contents_id",
-            [omnis_core::SEARCH_DOCUMENT_VERSION],
-        )
-    }
-
-    fn read_rows(sql: &str, params: impl rusqlite::Params) -> Result<HashMap<Uuid, Self>> {
-        let connection = open_index()?;
+               AND c.source_file_id=t.source_file_id AND c.source_contents_id=t.source_contents_id";
         let mut statement = connection.prepare(sql).map_err(database_error)?;
         statement
-            .query_map(params, workspace_row)
+            .query_map([omnis_core::SEARCH_DOCUMENT_VERSION], workspace_row)
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
             .map_err(database_error)
@@ -239,6 +258,13 @@ fn has_rechecks(connection: &Connection) -> Result<bool> {
     connection.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='table' AND name='codex_workspace_rechecks')", [], |row| row.get(0)).map_err(database_error)
 }
 
+fn has_settings_generation(connection: &Connection) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('codex_workspace_rechecks') WHERE name='source_contents_id' AND pk>0)",
+        [], |row| row.get(0),
+    ).map_err(database_error)
+}
+
 pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
     let exists: bool = transaction
         .query_row(
@@ -263,19 +289,39 @@ pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
         )
         .map_err(database_error)?;
     }
-    if !has_rechecks(transaction)? {
+    if !has_settings_generation(transaction)? {
         schedule_legacy_workspace_rechecks(transaction)?;
     }
     Ok(())
 }
 
 fn schedule_legacy_workspace_rechecks(transaction: &Transaction<'_>) -> Result<()> {
+    crate::schedule_legacy_codex_title_proofs(transaction)?;
+    let previous_queue = has_rechecks(transaction)?;
+    if previous_queue {
+        transaction
+            .execute_batch(
+                "ALTER TABLE codex_workspace_rechecks RENAME TO previous_codex_workspace_rechecks",
+            )
+            .map_err(database_error)?;
+    }
     transaction.execute_batch(&format!(
         "CREATE TABLE codex_workspace_rechecks(
-            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
-            source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);
-         CREATE INDEX codex_workspace_rechecks_source ON codex_workspace_rechecks(source_file_id,source_contents_id);
-         INSERT INTO codex_workspace_rechecks {LEGACY_RECHECKS};
+            trajectory_id INTEGER NOT NULL REFERENCES session_trajectories(id) ON DELETE CASCADE,
+            source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL,
+            PRIMARY KEY(trajectory_id,source_file_id,source_contents_id)) WITHOUT ROWID;
+         INSERT OR IGNORE INTO codex_workspace_rechecks(trajectory_id,source_file_id,source_contents_id)
+             {LEGACY_RECHECKS};"
+    )).map_err(database_error)?;
+    if previous_queue {
+        transaction.execute_batch(
+            "INSERT OR IGNORE INTO codex_workspace_rechecks(trajectory_id,source_file_id,source_contents_id)
+             SELECT trajectory_id,source_file_id,source_contents_id FROM previous_codex_workspace_rechecks;
+             DROP TABLE previous_codex_workspace_rechecks;"
+        ).map_err(database_error)?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX codex_workspace_rechecks_source ON codex_workspace_rechecks(source_file_id,source_contents_id);
          DELETE FROM codex_indexed_workspaces AS w WHERE EXISTS (SELECT 1 FROM codex_workspace_rechecks p
              WHERE p.trajectory_id=w.trajectory_id AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id);
          UPDATE session_index AS c SET project_path=NULL,git_branch=NULL WHERE c.provider='codex' AND EXISTS (
@@ -284,9 +330,12 @@ fn schedule_legacy_workspace_rechecks(transaction: &Transaction<'_>) -> Result<(
          UPDATE trajectory_index_failures AS f SET document_version=5 WHERE f.provider='codex' AND f.document_version=6 AND EXISTS (
              SELECT 1 FROM codex_workspace_rechecks p JOIN session_trajectories t ON t.id=p.trajectory_id
              WHERE t.session_id=f.session_id AND t.source_updated_at IS f.source_updated_at
+             AND t.source_file_id=f.source_file_id AND t.source_contents_id=f.source_contents_id
              AND p.source_file_id=f.source_file_id AND p.source_contents_id=f.source_contents_id);
-         UPDATE session_trajectories SET document_version=5 WHERE id IN (SELECT trajectory_id FROM codex_workspace_rechecks);"
-    )).map_err(database_error)
+         UPDATE session_trajectories AS t SET document_version=5 WHERE t.provider='codex' AND t.origin='native'
+             AND t.document_version=6 AND EXISTS (SELECT 1 FROM codex_workspace_rechecks p WHERE p.trajectory_id=t.id
+             AND p.source_file_id=t.source_file_id AND p.source_contents_id=t.source_contents_id);"
+    ).map_err(database_error)
 }
 
 /// Rechecks version 6 documents whose workspace or opening message the reader could misidentify.

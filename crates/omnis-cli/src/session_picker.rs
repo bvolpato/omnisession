@@ -669,6 +669,21 @@ impl PickerState {
         self.notice = None;
     }
 
+    fn finish_delete(&mut self, session: &SessionRef, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                self.remove_session(session);
+                self.delete_dialog = None;
+                self.notice = Some(format!("Deleted source session {session}"));
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.delete_dialog {
+                    dialog.phase = DeletePhase::Failed(safe_terminal_line(&error.to_string()));
+                }
+            }
+        }
+    }
+
     fn remove_session(&mut self, session: &SessionRef) {
         self.deleted_sessions.insert(session.to_string());
         self.remove_entry(session, None);
@@ -871,7 +886,7 @@ impl PickerState {
             }
         } else if matches!(
             value,
-            PreviewValue::Ready { complete, can_use_first_title: true, .. } if *complete || key.session.provider == Provider::Codex
+            PreviewValue::Ready { complete, source_provider, can_use_first_title: true, .. } if *complete || *source_provider == Provider::Codex
         ) {
             self.preview_titles.remove(&session_key).is_some()
         } else {
@@ -1250,6 +1265,7 @@ enum PreviewValue {
         preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
         complete: bool,
+        source_provider: Provider,
         can_use_first_title: bool,
         message_count_is_complete: bool,
     },
@@ -1688,16 +1704,12 @@ fn require_terminal(otherwise: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn pick_session(
+pub(super) fn pick_session(
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &crate::ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    initial_provider: Option<Provider>,
-    all_projects: bool,
     materialize: Option<CanMaterialize<'_>>,
-    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
@@ -1709,7 +1721,13 @@ pub fn pick_session(
     theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
-    let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    let target = args.target;
+    let mut state = PickerState::new(
+        Vec::new(),
+        current_project,
+        args.source_provider,
+        args.all_projects,
+    );
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
@@ -1763,30 +1781,17 @@ pub fn pick_session(
                     .unwrap_or(current_project)
                     .to_path_buf();
                 render_state.render(&state, target, &warnings, pending.len())?;
-                match delete_session(&session, Some(&workspace)) {
-                    Ok(()) => {
-                        state.remove_session(&session);
-                        state.delete_dialog = None;
-                        state.notice = Some(format!("Deleted source session {session}"));
-                    }
-                    Err(error) => {
-                        let message = safe_terminal_line(&error.to_string());
-                        if let Some(dialog) = &mut state.delete_dialog {
-                            dialog.phase = DeletePhase::Failed(message);
-                        }
-                    }
-                }
+                state.finish_delete(&session, delete_session(&session, Some(&workspace)));
                 render_state.invalidate();
                 dirty = true;
             }
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
-                target,
+                args,
                 available_targets,
                 new_session_targets,
                 materialize,
-                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1813,12 +1818,13 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &crate::ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
     materialize: Option<CanMaterialize<'_>>,
-    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
+    let target = args.target;
+    let requested_mode = args.mode;
     if state.new_session_selected() {
         if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
@@ -1873,18 +1879,22 @@ fn select_picker_row(
     )? {
         TargetOutcome::Selected(choice) => {
             // An imported row can carry another machine's workspace, so never resolve a network path.
-            let workspace_override = if project_path
-                .as_deref()
-                .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
-            {
-                None
-            } else {
-                match pick_workspace(&session, project_path.as_deref(), current_project)? {
-                    WorkspaceOutcome::Selected(path) => Some(path),
-                    WorkspaceOutcome::Back => return Ok(RowSelection::Back),
-                    WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
-                }
-            };
+            let workspace_override =
+                if session.provider == Provider::Codex && args.allow_workspace_mismatch {
+                    Some(std::env::current_dir().context("reading the chosen target directory")?)
+                } else if project_path.as_deref().is_some_and(|path| {
+                    (session.provider != Provider::Codex || path.is_absolute())
+                        && !omnis_core::may_reach_network(path)
+                        && path.is_dir()
+                }) {
+                    None
+                } else {
+                    match pick_workspace(&session, project_path.as_deref(), current_project)? {
+                        WorkspaceOutcome::Selected(path) => Some(path),
+                        WorkspaceOutcome::Back => return Ok(RowSelection::Back),
+                        WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+                    }
+                };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
                     source_revision,
@@ -3709,8 +3719,15 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], None, None)
-            .expect("row selection");
+        let selection = select_picker_row(
+            &state,
+            temporary.path(),
+            &crate::ResumeArgs::default(),
+            &[],
+            &[],
+            None,
+        )
+        .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
     }
@@ -3737,6 +3754,7 @@ mod tests {
                 continuation: None,
                 complete: false,
                 message_count_is_complete: false,
+                source_provider: Provider::Codex,
                 can_use_first_title: true,
             },
             &[],
@@ -3793,6 +3811,7 @@ mod tests {
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
             complete: false,
             message_count_is_complete: false,
@@ -3810,6 +3829,7 @@ mod tests {
             continuation: None,
             complete: false,
             message_count_is_complete: false,
+            source_provider: Provider::Codex,
             can_use_first_title: false,
         };
         state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
@@ -4025,6 +4045,7 @@ mod tests {
             continuation: None,
             complete: true,
             message_count_is_complete: true,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
         };
         assert!(state.remember_preview_title(&mut key, &preview, Some(revision), None));
@@ -4161,6 +4182,7 @@ mod tests {
             continuation: None,
             complete: true,
             message_count_is_complete: true,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
         };
         assert!(state.remember_preview_title(&mut old_key, &preview, None, None));
@@ -4752,6 +4774,7 @@ mod tests {
                     preview: Box::new(preview),
                     continuation: None,
                     complete: full_read,
+                    source_provider: Provider::Codex,
                     can_use_first_title: known_prefix,
                     message_count_is_complete: all_messages,
                 },
@@ -4810,6 +4833,7 @@ mod tests {
                 continuation: None,
                 complete: false,
                 message_count_is_complete: false,
+                source_provider: Provider::Codex,
                 can_use_first_title: true,
             },
             &[],
@@ -5089,6 +5113,7 @@ mod tests {
             continuation: None,
             complete: false,
             message_count_is_complete: false,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
         };
 
@@ -5103,6 +5128,51 @@ mod tests {
 
         assert!(line.contains("Fix pagination without changing the API"));
         assert!(!line.contains("session-id"));
+    }
+
+    #[test]
+    fn codex_assistant_opener_stays_in_the_preview_without_naming_the_session() {
+        let project = Path::new("/workspace");
+        let answer = "Scarlet Finch answer";
+        for (provider, source_provider, expected_title) in [
+            (Provider::Codex, Provider::Codex, "Untitled session"),
+            (Provider::Imported, Provider::Codex, "Untitled session"),
+            (Provider::Pi, Provider::Pi, answer),
+        ] {
+            let mut state = PickerState::new(
+                vec![session(provider, "session-id", project, None)],
+                project,
+                None,
+                false,
+            );
+            let mut preview = synthetic_preview(answer);
+            preview.first.as_mut().unwrap().role = HandoffRole::Assistant;
+            preview.latest.clone_from(&preview.first);
+            let value = PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                source_provider,
+                can_use_first_title: true,
+                complete: true,
+                message_count_is_complete: true,
+            };
+            let mut key = state.preview_key(&state.entries[0]);
+            assert!(state.remember_preview_title(&mut key, &value, None, None));
+            state.previews.insert(key, value, &[]);
+            let detail = selected_detail_lines(&state, 100, 40);
+            assert_eq!(detail[1].text, expected_title);
+            assert!(
+                detail
+                    .iter()
+                    .any(|line| line.text == "ONLY MESSAGE · ASSISTANT")
+            );
+            assert!(detail.iter().any(|line| line.text == answer));
+            state.query = "scarlet finch".to_owned();
+            assert_eq!(
+                state.visible_indices().len(),
+                usize::from(provider == Provider::Pi)
+            );
+        }
     }
 
     #[test]
@@ -5142,6 +5212,7 @@ mod tests {
             }),
             complete: true,
             message_count_is_complete: true,
+            source_provider: Provider::OpenCode,
             can_use_first_title: true,
         };
 

@@ -17,7 +17,7 @@ mod support;
 mod test_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -314,6 +314,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// Checks whether the name still matches the provider's index after a session read.
     fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
         self.native_session_name(id).confirms(name)
+    }
+
+    /// Returns the cached Codex sessions that their recorded rollout selections rule out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider's current selections cannot be checked.
+    fn unavailable_codex_rollouts(
+        &self,
+        _prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
     }
 
     /// Reads one provider-native session into canonical events.

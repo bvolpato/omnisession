@@ -1690,6 +1690,7 @@ pub(super) fn append_preview_lines(
 pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
     let PreviewValue::Ready {
         preview,
+        source_provider,
         can_use_first_title: true,
         ..
     } = preview
@@ -1699,6 +1700,7 @@ pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
     preview
         .first
         .as_ref()
+        .filter(|message| *source_provider != Provider::Codex || message.role == HandoffRole::User)
         .map(|message| compact_text(&message.text))
         .filter(|title| !title.is_empty())
 }

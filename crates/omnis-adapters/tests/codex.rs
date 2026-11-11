@@ -469,15 +469,23 @@ fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> a
         assert_eq!(result.rollback_title, expected, "{rows:?}");
     }
     let rows = [old(), rollback(1), message("user", "replacement")];
+    let mut legacy = header.clone();
+    legacy["payload"]["history_mode"] = json!("legacy");
+    assert_eq!(
+        rollback_title_read(&legacy, &rows, "")?.rollback_title,
+        Known(Some("replacement".to_owned()))
+    );
     for (field, value) in [
         ("history_mode", json!("paginated")),
+        ("history_mode", json!("default")),
+        ("history_mode", Value::Null),
         ("history_base", json!({"thread_id":"unavailable"})),
         (
             "forked_from_id",
             json!("11111111-1111-4111-8111-111111111111"),
         ),
     ] {
-        let mut ambiguous = header.clone();
+        let mut ambiguous = legacy.clone();
         ambiguous["payload"][field] = value;
         assert_eq!(
             rollback_title_read(&ambiguous, &rows, "")?.rollback_title,

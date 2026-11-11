@@ -6,15 +6,95 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::{
     CodexAdapter, CodexSession, ObservedRollout, UNAVAILABLE_ANCESTRY, records_history_base,
     rollout_file,
 };
-use crate::support::{BoundedLine, read_bounded_line_with_budget, string_at, validate_provider};
+use crate::support::{
+    BoundedLine, JsonLineSkips, read_bounded_line_with_budget, string_at, validate_provider,
+};
 use crate::{CodexWorkspaceProjection, IndexRead};
 
+pub(super) fn same_thread(selected: &str, owner: &str) -> bool {
+    selected == owner
+        || Uuid::parse_str(selected)
+            .ok()
+            .zip(Uuid::parse_str(owner).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum OwnedWorkspace {
+    #[default]
+    Absent,
+    Known(PathBuf),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct WorkspaceSettings {
+    owned: OwnedWorkspace,
+    pub(super) startup: Option<PathBuf>,
+    gaps: JsonLineSkips,
+}
+
+impl WorkspaceSettings {
+    pub(super) fn from_header(startup: Option<PathBuf>) -> Self {
+        Self {
+            startup,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn observe_gaps(&mut self, skipped: JsonLineSkips) {
+        if skipped.possible_settings > self.gaps.possible_settings
+            || (self.has_owned() && skipped.unclassified > self.gaps.unclassified)
+        {
+            self.owned = OwnedWorkspace::Unknown;
+            self.startup = None;
+        }
+        if skipped.foreign_settings > self.gaps.foreign_settings {
+            self.startup = None;
+        }
+        self.gaps = skipped;
+    }
+
+    pub(super) fn observe(&mut self, session: &str, record: &Value) {
+        let payload = &record["payload"];
+        if record["type"] != "event_msg" || payload["type"] != "thread_settings_applied" {
+            return;
+        }
+        let settings = &payload["thread_settings"];
+        // Native startup can offer the directory in a copied settings record.
+        if self.startup.as_deref() != settings["cwd"].as_str().map(Path::new) {
+            self.startup = None;
+        }
+        if payload["thread_id"]
+            .as_str()
+            .is_some_and(|owner| same_thread(session, owner))
+        {
+            self.owned = super::workspace_settings::saved_directory(settings)
+                .map_or(OwnedWorkspace::Unknown, OwnedWorkspace::Known);
+        }
+    }
+
+    pub(super) fn has_owned(&self) -> bool {
+        !matches!(self.owned, OwnedWorkspace::Absent)
+    }
+
+    pub(super) fn directory(&self, fallback: Option<PathBuf>) -> Option<PathBuf> {
+        match &self.owned {
+            OwnedWorkspace::Absent => fallback,
+            OwnedWorkspace::Known(path) => Some(path.clone()),
+            OwnedWorkspace::Unknown => None,
+        }
+    }
+}
+
 pub(super) struct WorkspaceScan {
+    pub(super) settings: WorkspaceSettings,
     pub(super) directory: Option<PathBuf>,
     pub(super) reconstruct_history: bool,
     rolled_back: bool,
@@ -23,6 +103,7 @@ pub(super) struct WorkspaceScan {
 impl WorkspaceScan {
     pub(super) fn new(directory: Option<&Path>) -> Self {
         Self {
+            settings: WorkspaceSettings::from_header(directory.map(Path::to_path_buf)),
             directory: directory.map(Path::to_path_buf),
             reconstruct_history: false,
             rolled_back: false,
@@ -36,7 +117,8 @@ impl WorkspaceScan {
         self.reconstruct_history = true;
     }
 
-    pub(super) fn observe(&mut self, record: &Value) -> Result<()> {
+    pub(super) fn observe(&mut self, session: &str, record: &Value) -> Result<()> {
+        self.settings.observe(session, record);
         if records_history_base(record) {
             self.directory = None;
             self.rolled_back = false;
@@ -103,19 +185,20 @@ impl CodexAdapter {
         let native = CodexSession::parse_with_observation(path, observed)?
             .filter(|native| native.id == session.id)
             .context("selected Codex rollout has a different session header")?;
-        native.read_unchanged(|native, _| Ok((native.effective_directory()?, native.project_path)))
+        native.read_unchanged(|native, _| native.effective_and_startup_directories())
     }
 }
 
 impl CodexSession {
-    fn effective_directory(&self) -> Result<Option<PathBuf>> {
+    fn effective_and_startup_directories(&self) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
         let workspace = self.scan_workspace()?;
-        if workspace.rolled_back {
+        let effective = if workspace.rolled_back && !workspace.settings.has_owned() {
             let (_, project, verified) = self.reconstructed_preview(rollout_file::LIMITS)?;
-            Ok(project.filter(|_| verified))
+            project.filter(|_| verified)
         } else {
-            Ok(workspace.directory)
-        }
+            workspace.directory
+        };
+        Ok((effective, workspace.settings.startup))
     }
 
     pub(super) fn scan_workspace(&self) -> Result<WorkspaceScan> {
@@ -124,6 +207,7 @@ impl CodexSession {
         let mut reader = BufReader::new(rollout_file::open(&self.path)?);
         let mut line = Vec::new();
         let mut workspace = WorkspaceScan::new(self.project_path.as_deref());
+        let mut skipped = JsonLineSkips::default();
         for _ in 0..limits.records {
             let Some((kind, bytes)) = read_bounded_line_with_budget(
                 &mut reader,
@@ -135,26 +219,37 @@ impl CodexSession {
                 break;
             };
             remaining -= bytes;
-            if matches!(kind, BoundedLine::Oversized) {
-                workspace.omit();
-                continue;
-            }
-            match rollout_file::workspace_record_kind(&line) {
-                rollout_file::WorkspaceRecord::Other => {}
-                rollout_file::WorkspaceRecord::Compacted => workspace.reconstruct_history = true,
-                rollout_file::WorkspaceRecord::Candidate => {
-                    if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                        workspace.observe(&record)?;
-                    } else {
-                        workspace.omit();
+            let oversized = matches!(kind, BoundedLine::Oversized);
+            if !oversized {
+                match rollout_file::workspace_record_kind(&line) {
+                    rollout_file::WorkspaceRecord::Other => continue,
+                    rollout_file::WorkspaceRecord::Compacted => {
+                        workspace.reconstruct_history = true;
+                        continue;
+                    }
+                    rollout_file::WorkspaceRecord::Candidate => {
+                        if let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                            workspace.observe(&self.id, &record)?;
+                            continue;
+                        }
                     }
                 }
             }
+            let previous = skipped.workspace_gaps();
+            skipped.observe(
+                rollout_file::workspace_gap(&line, oversized, Some(&self.id)),
+                oversized,
+            );
+            if skipped.workspace_gaps() > previous {
+                workspace.omit();
+            }
+            workspace.settings.observe_gaps(skipped);
         }
         ensure!(
             reader.fill_buf()?.is_empty(),
             "provider file exceeds safe record limit"
         );
+        workspace.directory = workspace.settings.directory(workspace.directory);
         Ok(workspace)
     }
 }

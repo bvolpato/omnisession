@@ -157,15 +157,9 @@ fn resume_from_snapshot(
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }
-    let current =
-        continuation_caller_directory(restore_source && source.provider == Provider::Codex)?;
-    let (project, matches) = resume_workspace(
-        &read,
-        request,
-        &current,
-        args.allow_workspace_mismatch,
-        restore_source,
-    )?;
+    let current = continuation_caller_directory(source.provider == Provider::Codex)?;
+    let (project, matches) =
+        resume_workspace(&read, request, &current, args.allow_workspace_mismatch)?;
     let context = ResumeContext {
         registry,
         args,
@@ -516,10 +510,9 @@ fn resume_workspace(
     request: &ResolvedResumeRequest,
     current: &Path,
     allow_workspace_mismatch: bool,
-    restore_source: bool,
 ) -> Result<(PathBuf, bool)> {
     let selection = request.picker_selection.as_ref();
-    if restore_source && request.source.provider == Provider::Codex {
+    if request.source.provider == Provider::Codex {
         let directory = super::verified_codex_directory(read);
         let target = match selection {
             Some(selection) => selected_native_workspace(selection, current)?,
@@ -1525,9 +1518,16 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
-    let workspace_warning = (handoff
-        && !source_workspace_matches_for_session(context.source, context.snapshot, context.project)?)
-        .then_some("# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n");
+    let workspace_warning = if !handoff {
+        None
+    } else if context.source.provider == Provider::Codex {
+        (!context.repository_matches).then_some(
+            "# Workspace verification\n\nOmniSession could not verify that the target workspace matches the source. Check the referenced paths before acting.\n\n",
+        )
+    } else {
+        (!source_workspace_matches_for_session(context.source, context.snapshot, context.project)?)
+            .then_some("# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n")
+    };
     let mut handoff_file = None;
     let launch_prompt = if handoff {
         if context.args.dry_run {
@@ -3109,13 +3109,10 @@ fn pick_resume_source(
     };
     session_picker::pick_session(
         &project,
-        args.target,
+        args,
         &runnable_targets,
         &new_session_targets,
-        args.source_provider,
-        args.all_projects,
         args.materialize_only.then_some(&can_copy),
-        args.mode,
         &DELETE_PROVIDERS,
         &|session, workspace| delete_native_session(registry, session, workspace),
     )

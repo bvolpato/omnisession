@@ -477,7 +477,10 @@ struct SnapshotFileStamp {
 
 impl SnapshotFileStamp {
     fn read(path: &Path) -> io::Result<Self> {
-        let metadata = path.metadata()?;
+        Self::from_metadata(&path.metadata()?)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
         Ok(Self {
             len: metadata.len(),
             modified: metadata.modified()?,
@@ -494,6 +497,31 @@ impl SnapshotFileStamp {
             },
         })
     }
+
+    fn has_precise_change_time(&self) -> bool {
+        #[cfg(unix)]
+        {
+            // Multiple writes can share a timestamp on a filesystem with millisecond resolution.
+            self.identity.1 != 0 && self.identity.3 % 1_000_000 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn copy_unchanged(&self, path: &Path, target: &Path) -> Result<bool> {
+        let mut source = match File::open(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            result => result?,
+        };
+        if *self != Self::from_metadata(&source.metadata()?)? {
+            return Ok(false);
+        }
+        let mut copy = File::create(target)?;
+        let bytes = io::copy(&mut (&mut source).take(self.len), &mut copy)?;
+        Ok(bytes == self.len && *self == Self::from_metadata(&source.metadata()?)?)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -503,17 +531,30 @@ struct SnapshotStamp {
 }
 
 impl SnapshotStamp {
-    fn read(root: &Path, database: &Path, max_bytes: u64) -> Result<Self> {
+    fn read(root: &Path, database: &Path, max_bytes: u64, stamped: bool) -> Result<Self> {
+        let wal = sidecar(database, "-wal");
+        let wal = if stamped {
+            anyhow::ensure!(
+                provider_file(root, database).as_deref() == Some(database),
+                "provider database changed during snapshot"
+            );
+            if let Some(journal) = optional_regular_file(&sidecar(database, "-journal"))? {
+                anyhow::ensure!(
+                    journal.len == 0,
+                    "provider SQLite rollback journal is active"
+                );
+            }
+            optional_regular_file(&wal)?
+        } else {
+            provider_file(root, &wal)
+                .map(|path| SnapshotFileStamp::read(&path))
+                .transpose()?
+        };
         let stamp = Self {
             database: SnapshotFileStamp::read(database)?,
-            wal: provider_file(root, &sidecar(database, "-wal"))
-                .map(|path| SnapshotFileStamp::read(&path))
-                .transpose()?,
+            wal,
         };
-        let bytes = stamp
-            .database
-            .len
-            .saturating_add(stamp.wal.as_ref().map_or(0, |wal| wal.len));
+        let bytes = stamp.bytes();
         if bytes > max_bytes {
             return Err(anyhow!(
                 "provider SQLite database and WAL exceed the {max_bytes}-byte snapshot limit"
@@ -521,12 +562,84 @@ impl SnapshotStamp {
         }
         Ok(stamp)
     }
+
+    fn bytes(&self) -> u64 {
+        self.database
+            .len
+            .saturating_add(self.wal.as_ref().map_or(0, |wal| wal.len))
+    }
+
+    fn has_precise_change_times(&self) -> bool {
+        self.database.has_precise_change_time()
+            && self
+                .wal
+                .as_ref()
+                .is_none_or(SnapshotFileStamp::has_precise_change_time)
+    }
+
+    fn copy_snapshot(
+        &self,
+        root: &Path,
+        database: &Path,
+        limits: SnapshotLimits,
+    ) -> Result<Option<SqliteSnapshot>> {
+        let directory = private_snapshot_directory()?;
+        ensure_snapshot_space(directory.path(), self.bytes(), limits.free_space_reserve)?;
+        let copy = directory.path().join("snapshot.sqlite");
+        if !self.database.copy_unchanged(database, &copy)? {
+            return Ok(None);
+        }
+        if let Some(wal) = &self.wal
+            && !wal.copy_unchanged(&sidecar(database, "-wal"), &sidecar(&copy, "-wal"))?
+        {
+            return Ok(None);
+        }
+        if *self != Self::read(root, database, limits.max_bytes, true)? {
+            return Ok(None);
+        }
+        open_snapshot(directory)
+    }
+}
+
+fn optional_regular_file(path: &Path) -> Result<Option<SnapshotFileStamp>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(SnapshotFileStamp::from_metadata(&meta)?)),
+        Ok(_) => Err(anyhow!("provider SQLite sidecar must be a regular file")),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Identifies a cacheable source database and WAL without opening either file.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct SqliteSourceStamp(Option<SnapshotStamp>);
+
+impl SqliteSourceStamp {
+    pub(crate) fn read(root: &Path, database: &Path) -> Option<Self> {
+        match fs::symlink_metadata(database) {
+            Ok(meta) if meta.is_file() && cfg!(unix) => {
+                let database = provider_file(root, database)?;
+                let limits = SnapshotLimits::from_environment().ok()?;
+                let stamp = SnapshotStamp::read(root, &database, limits.max_bytes, true).ok()?;
+                stamp
+                    .has_precise_change_times()
+                    .then_some(Self(Some(stamp)))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let wal = optional_regular_file(&sidecar(database, "-wal")).ok()?;
+                let journal = optional_regular_file(&sidecar(database, "-journal")).ok()?;
+                (wal.is_none() && journal.is_none_or(|file| file.len == 0)).then_some(Self(None))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CachedSnapshot {
     database: PathBuf,
     stamp: SnapshotStamp,
+    stamped: bool,
     snapshot: SqliteSnapshot,
 }
 
@@ -541,31 +654,66 @@ impl SqliteSnapshotCache {
         database: &Path,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        self.read_using(root, database, false, read)
+    }
+
+    /// Copies an unchanged database and WAL once when both files have precise Unix change times.
+    pub(crate) fn read_stamped<T>(
+        &self,
+        root: &Path,
+        database: &Path,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        self.read_using(root, database, true, read)
+    }
+
+    fn read_using<T>(
+        &self,
+        root: &Path,
+        database: &Path,
+        stamped: bool,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         let database = provider_file(root, database)
             .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
         let limits = SnapshotLimits::from_environment()?;
         // Unix change time detects same-size rewrites that preserve modification time.
-        if !cfg!(unix) {
+        if !cfg!(unix) && !stamped {
             return read(&sqlite_snapshot_with_limits(root, &database, limits)?.connection);
         }
         let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..3 {
-            let stamp = SnapshotStamp::read(root, &database, limits.max_bytes)?;
-            if let Some(snapshot) = cached
-                .as_ref()
-                .filter(|cached| cached.database == database && cached.stamp == stamp)
+            let stamp = SnapshotStamp::read(root, &database, limits.max_bytes, stamped)?;
+            let cacheable = cfg!(unix) && (!stamped || stamp.has_precise_change_times());
+            if cacheable
+                && let Some(snapshot) = cached.as_ref().filter(|cached| {
+                    cached.database == database
+                        && cached.stamp == stamp
+                        && cached.stamped == stamped
+                })
             {
                 return read(&snapshot.snapshot.connection);
             }
             *cached = None;
-            let snapshot = sqlite_snapshot_with_limits(root, &database, limits)?;
-            if stamp != SnapshotStamp::read(root, &database, limits.max_bytes)? {
+            let snapshot = if cacheable && stamped {
+                let Some(snapshot) = stamp.copy_snapshot(root, &database, limits)? else {
+                    continue;
+                };
+                snapshot
+            } else {
+                sqlite_snapshot_with_limits(root, &database, limits)?
+            };
+            if stamp != SnapshotStamp::read(root, &database, limits.max_bytes, stamped)? {
                 continue;
+            }
+            if !cacheable {
+                return read(&snapshot.connection);
             }
             let result = read(&snapshot.connection);
             *cached = Some(CachedSnapshot {
                 database,
                 stamp,
+                stamped,
                 snapshot,
             });
             return result;
@@ -624,7 +772,7 @@ fn sqlite_snapshot_with_limits(
         .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
     for _ in 0..3 {
         let before = sqlite_signature(root, &database, limits.max_bytes)?;
-        let directory = tempfile::tempdir()?;
+        let directory = private_snapshot_directory()?;
         ensure_snapshot_space(directory.path(), before.bytes, limits.free_space_reserve)?;
         let snapshot = directory.path().join("snapshot.sqlite");
         let source_wal = if before.wal.is_some() {
@@ -643,25 +791,43 @@ fn sqlite_snapshot_with_limits(
         if before != after || before != copied {
             continue;
         }
-        let Ok(connection) = Connection::open_with_flags(
-            snapshot,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
-            continue;
-        };
-        let integrity = connection
-            .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-            .unwrap_or_default();
-        if integrity != "ok" {
-            continue;
+        if let Some(snapshot) = open_snapshot(directory)? {
+            return Ok(snapshot);
         }
-        connection.pragma_update(None, "query_only", "ON")?;
-        return Ok(SqliteSnapshot {
-            connection,
-            _directory: directory,
-        });
     }
     Err(anyhow!("provider database changed during snapshot"))
+}
+
+fn private_snapshot_directory() -> io::Result<TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+    #[cfg(not(unix))]
+    tempfile::tempdir()
+}
+
+fn open_snapshot(directory: TempDir) -> Result<Option<SqliteSnapshot>> {
+    let Ok(connection) = Connection::open_with_flags(
+        directory.path().join("snapshot.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Ok(None);
+    };
+    let integrity = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .unwrap_or_default();
+    if integrity != "ok" {
+        return Ok(None);
+    }
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(Some(SqliteSnapshot {
+        connection,
+        _directory: directory,
+    }))
 }
 
 /// Hashes a database and its WAL after checking their combined size against the snapshot bound.
@@ -871,17 +1037,29 @@ fn visit_json_lines_with_offsets_and_limits(
     visit_json_reader(
         reader,
         limits,
-        |_| false,
+        |_, _| WorkspaceGap::Other,
         |location, record, _| visit(location, record),
     )
     .map(|(omissions, _)| omissions.oversized)
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum WorkspaceGap {
+    Other,
+    TurnOrRollback,
+    PossibleSettings,
+    ForeignSettings,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct JsonLineSkips {
     pub(crate) oversized: usize,
     pub(crate) malformed: usize,
-    matched_malformed: usize,
+    workspace_gaps: usize,
+    pub(crate) possible_settings: usize,
+    pub(crate) foreign_settings: usize,
+    pub(crate) unclassified: usize,
 }
 
 impl JsonLineSkips {
@@ -890,14 +1068,31 @@ impl JsonLineSkips {
     }
 
     pub(crate) fn workspace_gaps(self) -> usize {
-        self.oversized + self.matched_malformed
+        self.workspace_gaps
     }
 
-    fn parse(&mut self, line: &[u8], match_malformed: &impl Fn(&[u8]) -> bool) -> Option<Value> {
+    pub(crate) fn observe(&mut self, gap: WorkspaceGap, oversized: bool) {
+        self.oversized += usize::from(oversized);
+        self.malformed += usize::from(!oversized);
+        self.workspace_gaps += usize::from(
+            (oversized || gap != WorkspaceGap::Other) && gap != WorkspaceGap::ForeignSettings,
+        );
+        match gap {
+            WorkspaceGap::PossibleSettings => self.possible_settings += 1,
+            WorkspaceGap::ForeignSettings => self.foreign_settings += 1,
+            WorkspaceGap::Unclassified => self.unclassified += 1,
+            WorkspaceGap::TurnOrRollback | WorkspaceGap::Other => {}
+        }
+    }
+
+    fn parse(
+        &mut self,
+        line: &[u8],
+        classify: &impl Fn(&[u8], bool) -> WorkspaceGap,
+    ) -> Option<Value> {
         let record = serde_json::from_slice(line).ok();
         if record.is_none() && !line.iter().all(u8::is_ascii_whitespace) {
-            self.malformed += 1;
-            self.matched_malformed += usize::from(match_malformed(line));
+            self.observe(classify(line, false), false);
         }
         record
     }
@@ -907,7 +1102,7 @@ impl JsonLineSkips {
 pub(crate) fn visit_json_reader(
     reader: &mut impl BufRead,
     limits: JsonLinesLimits,
-    match_malformed: impl Fn(&[u8]) -> bool,
+    match_malformed: impl Fn(&[u8], bool) -> WorkspaceGap,
     mut visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
 ) -> Result<(JsonLineSkips, u64)> {
     let mut line = Vec::new();
@@ -937,7 +1132,7 @@ pub(crate) fn visit_json_reader(
             .checked_add(read)
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
-            BoundedLine::Oversized => omissions.oversized += 1,
+            BoundedLine::Oversized => omissions.observe(match_malformed(&line, true), true),
             BoundedLine::Complete => {
                 if let Some(record) = omissions.parse(&line, &match_malformed) {
                     visit(
@@ -1124,7 +1319,7 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
         sample_records,
         u64::MAX,
         MAX_TRANSCRIPT_LINE_SIZE,
-        |_| false,
+        |_, _| WorkspaceGap::Other,
     )?
     .records)
 }
@@ -1143,7 +1338,7 @@ pub(crate) fn json_lines_preview_with_omissions(
     sample_records: usize,
     prefix_bytes: u64,
     line_bytes: u64,
-    match_malformed: impl Fn(&[u8]) -> bool,
+    match_malformed: impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<JsonLinesPreview> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -1191,7 +1386,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         0,
         MAX_TRANSCRIPT_LINE_SIZE,
         &mut JsonLinesPreview::default(),
-        &|_| false,
+        &|_, _| WorkspaceGap::Other,
     )
 }
 
@@ -1201,7 +1396,7 @@ fn read_json_lines_tail(
     prefix_end: u64,
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
-    match_malformed: &impl Fn(&[u8]) -> bool,
+    match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<Vec<(u64, Value)>> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1238,7 +1433,9 @@ fn read_json_lines_tail(
         }
         offset += u64::try_from(read)?;
         if read as u64 > line_bytes {
-            preview.omissions.oversized += 1;
+            preview
+                .omissions
+                .observe(match_malformed(&line, true), true);
             continue;
         }
         if let Some(record) = preview.omissions.parse(&line, match_malformed) {
@@ -1271,7 +1468,7 @@ fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
         u64::MAX,
         MAX_TRANSCRIPT_LINE_SIZE,
         &mut preview,
-        &|_| false,
+        &|_, _| WorkspaceGap::Other,
     )?;
     Ok(preview.records)
 }
@@ -1283,7 +1480,7 @@ fn read_json_lines_prefix(
     byte_limit: u64,
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
-    match_malformed: &impl Fn(&[u8]) -> bool,
+    match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<u64> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1303,7 +1500,9 @@ fn read_json_lines_prefix(
         }
         consumed = end;
         match line_kind {
-            BoundedLine::Oversized => preview.omissions.oversized += 1,
+            BoundedLine::Oversized => preview
+                .omissions
+                .observe(match_malformed(&line, true), true),
             BoundedLine::Complete => {
                 if let Some(record) = preview.omissions.parse(&line, match_malformed) {
                     if preview.omissions.total() == 0 {
@@ -1628,6 +1827,21 @@ impl EventBuilder {
         if let Some(opener) = &mut self.rollback_opener {
             opener.gap = true;
         }
+    }
+
+    pub(crate) fn confirms_saved_local_opener(&self, title: &str) -> bool {
+        self.rollback_opener.as_ref().is_some_and(|opener| {
+            (!opener.gap
+                && opener
+                    .first_message
+                    .as_ref()
+                    .and_then(|(_, title)| title.as_deref())
+                    == Some(title))
+                || opener
+                    .withdrawn
+                    .hashes
+                    .contains(&crate::RollbackTitle::fingerprint(title))
+        })
     }
 
     pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
@@ -2100,6 +2314,88 @@ mod tests {
             .collect::<Vec<_>>();
         files.sort();
         files
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stamped_snapshot_reuses_the_copy_and_refreshes_on_a_wal_commit() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, db, writer) = wal_store();
+        let db = db.canonicalize()?;
+        let cache = super::SqliteSnapshotCache::default();
+        let read = || {
+            cache.read_stamped(root.path(), &db, |conn| {
+                let rows: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+                let path = Path::new(conn.path().expect("private database path"));
+                let directory = path.parent().expect("private copy directory");
+                assert_eq!(
+                    std::fs::metadata(directory)?.permissions().mode() & 0o077,
+                    0
+                );
+                Ok((rows, path.to_owned()))
+            })
+        };
+        let before = directory_bytes(root.path());
+        let first = read()?;
+        assert_eq!(first.0, 2);
+        let second = read()?;
+        if super::SnapshotStamp::read(root.path(), &db, u64::MAX, true)?.has_precise_change_times()
+        {
+            assert_eq!(first, second);
+        }
+        assert_eq!(directory_bytes(root.path()), before);
+
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(512))", [])?;
+        let written = directory_bytes(root.path());
+        let next = read()?;
+        assert_eq!(next.0, 3);
+        assert_ne!(first.1, next.1);
+        assert_eq!(directory_bytes(root.path()), written);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stamped_snapshot_rejects_a_changed_database_or_wal() -> anyhow::Result<()> {
+        use super::{SnapshotStamp, sidecar};
+
+        let (root, db, writer) = wal_store();
+        let db = db.canonicalize()?;
+        let limits = SnapshotLimits {
+            max_bytes: 256 * 1024,
+            free_space_reserve: 0,
+        };
+        let observe = || SnapshotStamp::read(root.path(), &db, limits.max_bytes, true);
+        let prior = observe()?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(512))", [])?;
+        assert!(prior.copy_snapshot(root.path(), &db, limits)?.is_none());
+
+        let with_wal = observe()?;
+        drop(writer);
+        let closed = observe()?;
+        assert!(with_wal.wal.is_some() && closed.wal.is_none());
+        assert!(with_wal.copy_snapshot(root.path(), &db, limits)?.is_none());
+
+        let copy = root.path().join("replacement");
+        std::fs::copy(&db, &copy)?;
+        std::fs::rename(copy, &db)?;
+        assert!(closed.copy_snapshot(root.path(), &db, limits)?.is_none());
+
+        let no_wal = observe()?;
+        let writer = rusqlite::Connection::open(&db)?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(512))", [])?;
+        assert!(no_wal.copy_snapshot(root.path(), &db, limits)?.is_none());
+        drop(writer);
+        std::os::unix::fs::symlink(&db, sidecar(&db, "-wal"))?;
+        assert!(observe().is_err());
+        assert!(super::SqliteSourceStamp::read(root.path(), &db).is_none());
+        std::fs::remove_file(sidecar(&db, "-wal"))?;
+        std::fs::write(sidecar(&db, "-journal"), b"pending transaction")?;
+        assert!(observe().is_err());
+        assert!(super::SqliteSourceStamp::read(root.path(), &db).is_none());
+        Ok(())
     }
 
     #[test]

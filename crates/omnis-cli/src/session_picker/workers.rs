@@ -16,7 +16,7 @@ use std::sync::{
 
 use anyhow::Context;
 use omnis_adapters::ProviderAdapter;
-use omnis_ir::SourceRevision;
+use omnis_ir::{SessionRef, SourceRevision};
 use omnis_store::{IndexedTrajectoryTitle, SelectedSessionObservation, TrajectorySourceGuard};
 
 use crate::{
@@ -403,9 +403,7 @@ pub(super) fn spawn_provider_update(
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
         let observed = if provider == Provider::Codex {
-            match Store::open_default()
-                .and_then(|store| store.indexed_sessions_for_provider(provider))
-            {
+            match Store::open_default().and_then(|store| store.observe_codex_catalog()) {
                 Ok(sessions) => Some(sessions),
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
@@ -616,11 +614,24 @@ impl<'a> PreviewWriter<'a> {
 
 fn record_preview(
     registry: &AdapterRegistry,
+    session: &SessionRef,
     writer: Option<&PreviewWriter<'_>>,
     previous_name: Option<String>,
     read: &mut omnis_adapters::IndexRead,
 ) -> anyhow::Result<PreviewMetadata> {
-    let session = &read.snapshot.session;
+    if session.provider == Provider::Imported {
+        let mut metadata = PreviewMetadata::default();
+        if let Some(writer) = writer {
+            metadata.indexed_title = crate::store_search_document(
+                writer.store,
+                session,
+                crate::SearchDocumentInput::Bundle(&read.snapshot),
+                None,
+                writer.guard,
+            )?;
+        }
+        return Ok(metadata);
+    }
     let revision = read.source_revision;
     let native = read.native_session.as_ref();
     let name_observation = search_index::native_codex_name(registry, session)?;
@@ -699,7 +710,7 @@ fn record_preview(
             writer.store,
             target,
             crate::SearchDocumentInput::Read(read, name_observation.as_ref()),
-            (session.provider != Provider::Imported).then_some(registry),
+            Some(registry),
             writer.guard,
         )?;
     }
@@ -747,7 +758,13 @@ fn preview_update(
             refresh_failed_cached_preview(registry, &key, changed, sender, refresh_codex);
         }
         read.map_or(PreviewValue::Unavailable, |mut read| {
-            match record_preview(registry, writer.as_ref(), provider_name, &mut read) {
+            match record_preview(
+                registry,
+                &key.session,
+                writer.as_ref(),
+                provider_name,
+                &mut read,
+            ) {
                 Ok(receipts) => metadata = receipts,
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!(
@@ -764,7 +781,8 @@ fn preview_update(
                     .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
                 preview: Box::new(session_preview(&snapshot)),
                 complete,
-                can_use_first_title: key.session.provider != Provider::Codex
+                source_provider: snapshot.session.provider,
+                can_use_first_title: snapshot.session.provider != Provider::Codex
                     || coverage != omnis_core::MessageCoverage::Unknown,
                 message_count_is_complete: coverage == omnis_core::MessageCoverage::Complete,
             }
@@ -991,5 +1009,60 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         event_count: session.event_count,
         source_path: None,
         source_revision: session.source_revision,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imported_preview_indexes_the_bundle_without_replacing_its_native_session()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let folder = temporary.path().join("sessions");
+        std::fs::create_dir(&folder)?;
+        let id = uuid::Uuid::new_v4();
+        let path = folder.join(format!("rollout-{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":id}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"bundle question"}}),
+            ),
+        )?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(temporary.path()));
+        let source = SessionRef::new(Provider::Codex, id.to_string());
+        let mut read = registry.index_session(&source, Some(&path), u64::MAX)?;
+        read.native_session = None;
+        read.source_revision = SourceRevision::default();
+        let store = Store::open(temporary.path().join("index.sqlite3"))?;
+        store.upsert_session_trajectory(
+            &source,
+            "local response",
+            read.snapshot.captured_at - chrono::Duration::days(1),
+            true,
+        )?;
+        let original = store.trajectory_index_state(&source)?;
+        let imported = crate::imported_session_ref(uuid::Uuid::new_v4());
+        let writer = PreviewWriter {
+            store: &store,
+            guard: TrajectorySourceGuard::NewerSource,
+            selected: None,
+        };
+        record_preview(&registry, &imported, Some(&writer), None, &mut read)?;
+
+        assert_eq!(store.trajectory_index_state(&source)?, original);
+        assert_eq!(
+            store.search_session_trajectories("local response", 2)?,
+            [source]
+        );
+        assert_eq!(
+            store.search_session_trajectories("bundle question", 2)?,
+            [imported]
+        );
+        Ok(())
     }
 }

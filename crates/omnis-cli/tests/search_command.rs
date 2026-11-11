@@ -15,6 +15,104 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn a_missing_current_rollout_revokes_only_its_cached_session_after_incomplete_discovery() {
+    let source = format!("codex:{CODEX_ID}");
+    for command in [
+        &["index", "--provider", "codex"][..],
+        &["show", &source],
+        &["show", CODEX_ID],
+        &["search", "Pagination", "--provider", "codex"],
+        &["search", "Pagination", "--no-index", "--provider", "codex"],
+    ] {
+        check_missing_current_rollout(command);
+    }
+}
+
+fn check_missing_current_rollout(command: &[&str]) {
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let day = codex.join("sessions/2026/01/02");
+    let original = day.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"));
+    let peer = day.join(format!(
+        "rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+    ));
+    let generation = "019f0000-0000-7000-8000-000000000093";
+    let current = day.join(format!(
+        "rollout-2026-01-02T00-00-00-{CODEX_ID}_{generation}.jsonl"
+    ));
+    let db = rusqlite::Connection::open(codex.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        rusqlite::params![CODEX_ID, original.to_str().unwrap()],
+    )
+    .unwrap();
+    fixture.index_codex();
+    let results = |query, mode| {
+        result_sessions(&fixture.search_json(&[
+            query,
+            mode,
+            "--all-projects",
+            "--provider",
+            "codex",
+        ]))
+    };
+    assert_eq!(
+        results("Pagination", "--cached"),
+        [format!("codex:{CODEX_ID}")]
+    );
+
+    fs::remove_file(&original).unwrap();
+    fs::remove_file(peer).unwrap();
+    let malformed =
+        day.join("rollout-2026-01-02T00-00-00-019f0000-0000-7000-8000-000000000094.jsonl");
+    fs::write(malformed, "{incomplete unrelated header").unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1, history_mode='paginated' WHERE id=?2",
+        rusqlite::params![current.to_str().unwrap(), CODEX_ID],
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .arg("--json")
+        .args(command)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.success(), command[0] != "show", "{command:?}");
+    if command[0] == "search" {
+        assert!(result_sessions(&serde_json::from_slice(&output.stdout).unwrap()).is_empty());
+    }
+    assert!(results("Pagination", "--cached").is_empty());
+    assert_eq!(
+        results("zebracorn", "--cached"),
+        [format!("codex:{OTHER_CODEX_ID}")]
+    );
+
+    write_jsonl(
+        &current,
+        &[
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
+              "history_mode":"paginated","cwd":fixture.workspace}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"item_completed","thread_id":CODEX_ID,
+              "turn_id":"restored","item":{"type":"AgentMessage","id":"answer","content":[
+                  {"type":"Text","text":"Restored cinnabar response"}]}}}),
+            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant",
+              "content":[{"type":"output_text","text":"Restored cinnabar response"}]}}),
+        ],
+    );
+    assert_eq!(fixture.index_codex()["indexed"], 1);
+    assert_eq!(
+        results("cinnabar", "--cached"),
+        [format!("codex:{CODEX_ID}")]
+    );
+    assert!(results("Pagination", "--cached").is_empty());
+    assert_eq!(fixture.index_codex()["stale"], 0);
+}
+
+#[test]
 fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
     for (direct_read, seconds_older) in [(false, 0), (true, 0), (true, 60)] {
         let fixture = Fixture::new();
@@ -442,7 +540,6 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
 #[test]
 fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     use omnis_ir::{Provider, SessionRef};
-    use omnis_store::Store;
 
     let fixture = Fixture::new();
     let codex = fixture.root.join("codex");
@@ -451,7 +548,7 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     let name = json!({"id": CODEX_ID, "thread_name": "Violet Quokka"});
     fs::write(&sidecar, name.to_string()).unwrap();
     fixture.index_codex();
-    let store = Store::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    let store = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
     let check = |official: Option<&str>, searchable: &str| {
         let output = fixture
             .command()
@@ -465,19 +562,17 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
         );
         let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(shown["title"].as_str(), official);
-        assert_eq!(
-            store
-                .indexed_session(&session)
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            official
-        );
-        assert_eq!(
-            store.trajectory_title(&session).unwrap().as_deref(),
-            Some(searchable)
-        );
+        let saved: (Option<String>, Option<String>) = store
+            .query_row(
+                "SELECT c.title, t.derived_title FROM session_index c
+                 JOIN session_trajectories t USING (provider, session_id)
+                 WHERE c.provider='codex' AND c.session_id=?1",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(saved.0.as_deref(), official);
+        assert_eq!(saved.1.as_deref(), Some(searchable));
     };
     let ambiguous = format!(
         "{}\n{{",
@@ -713,9 +808,30 @@ fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
 
 #[test]
 fn sampled_ordinary_rollback_replaces_a_previously_verified_title() {
+    assert_sampled_rollback_title(false);
+}
+
+#[test]
+fn sampled_legacy_rollback_repairs_a_title_cached_before_its_mode_was_recognized() {
+    assert_sampled_rollback_title(true);
+}
+
+fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     use std::io::{BufWriter, Write};
 
     let fixture = Fixture::new();
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    if old_legacy_cache {
+        let mut rows: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["payload"]["history_mode"] = json!("legacy");
+        write_jsonl(&path, &rows);
+    }
     let cached = |query: &str| {
         fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
     };
@@ -724,9 +840,6 @@ fn sampled_ordinary_rollback_replaces_a_previously_verified_title() {
         cached(CODEX_ID)["results"][0]["title"],
         "Tune the rate limiter backoff"
     );
-    let path = fixture.root.join(format!(
-        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
-    ));
     let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
     let pad = format!(
         "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}",
@@ -746,11 +859,51 @@ fn sampled_ordinary_rollback_replaces_a_previously_verified_title() {
     }
     drop(file.into_inner().unwrap());
     let original = fs::read(&path).unwrap();
+    if old_legacy_cache {
+        fixture.index_codex();
+        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        db.execute_batch(
+            "DROP TABLE codex_workspace_rechecks;
+             CREATE TABLE codex_workspace_rechecks(
+                 trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+                 source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
+        ).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE session_trajectories SET derived_title='Tune the rate limiter backoff',
+                 derived_title_is_verified=1,derived_title_is_local_opener=0
+                 WHERE provider='codex' AND session_id=?1 AND source_complete=0",
+                [CODEX_ID],
+            )
+            .unwrap(),
+            1,
+        );
+    }
 
+    if old_legacy_cache {
+        let pending = fixture.search_json(&["slowdown", "--provider", "codex"]);
+        assert!(result_sessions(&pending).is_empty());
+        assert!(
+            pending["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .unwrap()
+                        .contains("omni index --provider codex")
+                }),
+            "{pending}"
+        );
+        fixture.index_codex();
+    }
     let live = fixture.search_json(&["backoff", "--provider", "codex", "--show-text"]);
     assert!(result_sessions(&live).is_empty());
     assert!(result_sessions(&cached("backoff")).is_empty());
     let retained = cached("slowdown");
+    let scoped = fixture.search_json(&["slowdown", "--provider", "codex", "--show-text"]);
+    assert_eq!(scoped["results"][0]["title"], "Investigate latency instead");
     assert_eq!(
         retained["results"][0]["title"],
         "Investigate latency instead"
@@ -1583,6 +1736,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env("CODEX_SQLITE_HOME", self.root.join("codex"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
         #[cfg(unix)]

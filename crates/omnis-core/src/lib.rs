@@ -820,7 +820,10 @@ pub fn session_message_coverage(snapshot: &CanonicalSnapshot, full_read: bool) -
     let events = || snapshot.events.iter().filter(|event| !is_secret(event));
     let mut prefix_end = None::<u64>;
     let mut only_eof_markers = true;
+    let mut has_legacy_display = false;
     for event in events() {
+        has_legacy_display |= codex_display_marker(event)
+            && event.source.raw_record_type.as_deref() == Some("event_msg");
         if let Some(end) = codex_verified_prefix_end(snapshot, event) {
             prefix_end = Some(prefix_end.map_or(end, |previous| previous.min(end)));
             only_eof_markers &= end == event.sequence
@@ -848,6 +851,14 @@ pub fn session_message_coverage(snapshot: &CanonicalSnapshot, full_read: bool) -
     } else if !full_read && prefix_end.is_none() {
         return MessageCoverage::Unknown;
     }
+    let display_history = (snapshot.session.provider == Provider::Codex && has_legacy_display)
+        .then(|| visible_history(snapshot));
+    if let Some(gap) = display_history
+        .as_ref()
+        .and_then(|history| history.unattributed_codex_displays.first().copied())
+    {
+        prefix_end = Some(prefix_end.map_or(gap, |end| end.min(gap)));
+    }
     let first_checkpoint = events()
         .filter(|event| source_compaction_text(event).is_some())
         .map(|event| (event.sequence, event.event_id))
@@ -855,12 +866,18 @@ pub fn session_message_coverage(snapshot: &CanonicalSnapshot, full_read: bool) -
     if prefix_end.is_none() && first_checkpoint.is_none() {
         return MessageCoverage::Complete;
     }
-    if events().any(|event| {
+    let verified_opener = |event: &OmniEvent| {
         prefix_end.is_none_or(|end| event.sequence < end)
             && first_checkpoint
                 .is_none_or(|checkpoint| (event.sequence, event.event_id) < checkpoint)
             && is_preview_message(event)
-    }) {
+    };
+    let has_opener = if let Some(history) = display_history {
+        history.events.into_iter().any(verified_opener)
+    } else {
+        events().any(verified_opener)
+    };
+    if has_opener {
         MessageCoverage::VerifiedPrefix
     } else {
         MessageCoverage::Unknown
@@ -5600,15 +5617,10 @@ mod tests {
     #[test]
     fn legacy_codex_marker_uses_the_import_boundary() {
         let literal = super::CODEX_IMPORT_MARKER;
-        let display = |kind, text: &str| {
-            let mut item = event(0, kind, json!({"text": text}));
-            item.source.raw_record_type = Some("event_msg".to_owned());
-            item
-        };
-        let user = display(EventKind::MessageUser, "Question");
-        let marker = display(EventKind::MessageAssistant, literal);
-        let reply = display(EventKind::MessageAssistant, "Four.");
-        let mut native_reply = display(EventKind::MessageAssistant, "Later reply");
+        let user = legacy_display(EventKind::MessageUser, "Question");
+        let marker = legacy_display(EventKind::MessageAssistant, literal);
+        let reply = legacy_display(EventKind::MessageAssistant, "Four.");
+        let mut native_reply = legacy_display(EventKind::MessageAssistant, "Later reply");
         native_reply.source.raw_record_type = Some("response_item.message".to_owned());
         let mut native_literal = marker.clone();
         native_literal.source.raw_record_type = Some("response_item.message".to_owned());
@@ -5664,6 +5676,7 @@ mod tests {
                 false,
             ),
             // Older exports omitted usage, including from sessions that later resumed.
+            (vec![&user, &marker], vec![], true),
             (
                 vec![&user, &reply, &marker, &user, &native_reply],
                 vec!["Four.", "Later reply"],
@@ -5698,6 +5711,32 @@ mod tests {
         }
     }
 
+    fn legacy_display(kind: EventKind, text: &str) -> OmniEvent {
+        let mut item = event(0, kind, json!({"text": text}));
+        item.source.raw_record_type = Some("event_msg".to_owned());
+        item
+    }
+
+    #[test]
+    fn an_unattributed_display_cannot_supply_the_first_visible_message() {
+        let harness = legacy_display(
+            EventKind::MessageUser,
+            "<environment_context><cwd>/synthetic</cwd></environment_context>",
+        );
+        let snapshot = snapshot_with_events(vec![
+            harness,
+            OmniEvent {
+                sequence: 1,
+                ..legacy_display(EventKind::MessageAssistant, super::CODEX_IMPORT_MARKER)
+            },
+        ]);
+        assert!(super::session_message_search_title(&snapshot).is_none());
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            super::MessageCoverage::Unknown
+        );
+    }
+
     fn assert_legacy_codex_projection(
         events: Vec<&OmniEvent>,
         expected: &[&str],
@@ -5727,6 +5766,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(assistants, expected);
         assert_eq!(conversation.truncated, incomplete);
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            if !incomplete {
+                super::MessageCoverage::Complete
+            } else if snapshot.events.iter().any(super::reports_omitted_events) {
+                super::MessageCoverage::Unknown
+            } else {
+                super::MessageCoverage::VerifiedPrefix
+            }
+        );
         let markdown = render_markdown_export(&snapshot);
         let (_, tool_section) = markdown.split_once("## Historical Tool Activity").unwrap();
         assert_eq!(

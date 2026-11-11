@@ -304,6 +304,9 @@ fn failure_is_current(
 /// Whether a read failed only because a database was busy or a source changed while it was read,
 /// so a later pass can succeed even when the source time does not move.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
+    if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error) {
+        return true;
+    }
     error.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::Error>()
@@ -365,15 +368,23 @@ struct Pending {
     summary: IndexSummary,
 }
 
-fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+fn pending(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
-    let conflicts = if candidates
+    let (conflicts, deferred_names) = if candidates
         .iter()
         .any(|candidate| candidate.session.provider == Provider::Codex)
     {
-        store.conflicting_codex_catalog_rows()?
+        (
+            store.conflicting_codex_catalog_rows()?,
+            store.legacy_codex_name_retries()?,
+        )
     } else {
-        HashSet::new()
+        (HashSet::new(), HashMap::new())
     };
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
@@ -387,7 +398,9 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         let prior = states.get(&candidate.session);
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
-        if !needs_index_at(&candidate, revision, prior) {
+        let retry_name = deferred_names.get(&candidate.session) == Some(&revision)
+            && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Absent);
+        if !needs_index_at(&candidate, revision, prior) && !retry_name {
             if candidate.session.provider == Provider::Codex
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
@@ -467,7 +480,7 @@ fn observe_replacements(
         return Ok(observations);
     }
     let catalog = store
-        .indexed_sessions_for_provider(Provider::Codex)?
+        .observe_codex_catalog()?
         .into_iter()
         .map(|row| (row.session.clone(), row))
         .collect::<HashMap<_, _>>();
@@ -501,7 +514,7 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    let pending = pending(store, candidates, false)?;
+    let pending = pending(registry, store, candidates, false)?;
     restore_cached_sources(registry, store, pending.recovered)?;
     Ok(pending.summary)
 }
@@ -528,7 +541,7 @@ pub(crate) fn index_candidates(
         recovered,
         mut hidden,
         mut summary,
-    } = pending(store, candidates, retry_failed)?;
+    } = pending(registry, store, candidates, retry_failed)?;
     let observations = observe_replacements(store, &stale, &failures)?;
     hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
@@ -960,6 +973,34 @@ pub(crate) fn verified_name_coverage(
     }
 }
 
+fn legacy_opener_name(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    revision: SourceRevision,
+    prior: &str,
+    selected_path: impl Fn() -> Result<PathBuf>,
+) -> Result<Option<NativeSessionName>> {
+    let Some(name @ (NativeSessionName::Absent | NativeSessionName::Unknown)) =
+        native_codex_name(registry, session)?
+    else {
+        return Ok(None);
+    };
+    if !omnis_adapters::CodexAdapter::verify_legacy_local_opener(
+        &selected_path()?,
+        session,
+        revision,
+        prior,
+    )? {
+        return Ok(None);
+    }
+    selected_path()?;
+    anyhow::ensure!(
+        native_codex_name(registry, session)?.as_ref() == Some(&name),
+        omnis_store::StoreError::TrajectorySourceChanged
+    );
+    Ok(Some(name))
+}
+
 #[derive(Default)]
 pub(crate) struct IndexedTitle {
     pub(crate) current: Option<String>,
@@ -1054,7 +1095,9 @@ impl IndexedTitle {
             && (self.authoritative
                 || matches!(
                     self.local_opener,
-                    LocalOpenerEvidence::Current | LocalOpenerEvidence::VisiblePrefix
+                    LocalOpenerEvidence::Current
+                        | LocalOpenerEvidence::RecheckedCurrent
+                        | LocalOpenerEvidence::VisiblePrefix
                 ))
     }
 
@@ -1069,47 +1112,67 @@ impl IndexedTitle {
             self.uncertain_rollback,
             RollbackTitle::UnknownAfterWithdrawal(_)
         );
-        if !self.check_local_rollback && !uncertain {
-            return Ok(());
-        }
         let Some(file) = revision.file else {
             return Ok(());
         };
-        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
-            return Ok(());
-        };
-        let selected_path = || -> Result<PathBuf> {
+        let selected_path = |require_unnamed: bool| -> Result<PathBuf> {
             registry
                 .find_native_session(Provider::Codex, &session.id)?
                 .filter(|selected| {
-                    selected
-                        .source_revision
-                        .is_some_and(|selected| selected.matches_file_contents(revision))
+                    (!require_unnamed || selected.title.is_none())
+                        && selected
+                            .source_revision
+                            .is_some_and(|selected| selected.matches_file_contents(revision))
                 })
                 .and_then(|selected| selected.source_path)
                 .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
+        };
+        if (uncertain || self.local_opener == LocalOpenerEvidence::Current)
+            && let Some(prior) = store.legacy_codex_opener_candidate(session, file)?
+            && let Some(name) =
+                legacy_opener_name(registry, session, revision, &prior, || selected_path(true))?
+        {
+            self.withdrawn = Some(prior);
+            self.local_opener = if name == NativeSessionName::Unknown {
+                self.current = None;
+                self.authoritative = false;
+                LocalOpenerEvidence::DeferredLegacyName
+            } else if uncertain {
+                LocalOpenerEvidence::RecheckedWithdrawn
+            } else {
+                LocalOpenerEvidence::RecheckedCurrent
+            };
+            return Ok(());
+        }
+        if !self.check_local_rollback && !uncertain {
+            return Ok(());
+        }
+        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
+            return Ok(());
         };
         if uncertain {
             if self.uncertain_rollback.withdraws(&prior)
                 || (self.uncertain_rollback.needs_withdrawal_check(&prior)
                     && omnis_adapters::CodexAdapter::verify_earlier_opener_withdrawal(
-                        &selected_path()?,
+                        &selected_path(false)?,
                         session,
                         revision,
                         &prior,
                     )?)
             {
+                selected_path(false)?;
                 self.withdrawn = Some(prior);
                 self.local_opener = LocalOpenerEvidence::Withdrawn;
             }
             return Ok(());
         }
         if omnis_adapters::CodexAdapter::rollout_withdrew_search_title(
-            &selected_path()?,
+            &selected_path(false)?,
             session,
             revision,
             &prior,
         )? {
+            selected_path(false)?;
             self.withdrawn = Some(prior);
         }
         Ok(())

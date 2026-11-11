@@ -733,7 +733,7 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
 }
 
 #[test]
-fn archived_codex_with_unknown_workspace_requires_a_destination() {
+fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target() {
     use flate2::{Compression, write::GzEncoder};
 
     if !tools_available() {
@@ -759,29 +759,39 @@ fn archived_codex_with_unknown_workspace_requires_a_destination() {
         if indexed {
             assert!(run(&["index", "--provider", "codex"]).status.success());
         }
-        let blocked = run(&["fork", &reference, "--in", "codex", "--dry-run"]);
-        assert!(!blocked.status.success());
-        assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch"));
-        for args in [
-            vec!["inspect", &reference, "--target", "codex"],
-            vec![
-                "fork",
-                &reference,
-                "--in",
-                "codex",
-                "--allow-workspace-mismatch",
-                "--dry-run",
-            ],
-        ] {
-            let result = run(&args);
+        let task = run(&["task", "start", "unverified-archive", "--from", &reference]);
+        assert!(!task.status.success());
+        assert!(String::from_utf8_lossy(&task.stderr).contains("no verified workspace"));
+        for target in ["codex", "claude"] {
+            let blocked = run(&["fork", &reference, "--in", target, "--dry-run"]);
             assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
+                !blocked.status.success(),
+                "{target} accepted an unknown workspace"
             );
-            let output: Value = serde_json::from_slice(&result.stdout).unwrap();
-            let fidelity = output.get("fidelity").unwrap_or(&output);
-            assert_eq!(fidelity["repository_matches"], false);
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch")
+            );
+            for args in [
+                vec!["inspect", &reference, "--target", target],
+                vec![
+                    "fork",
+                    &reference,
+                    "--in",
+                    target,
+                    "--allow-workspace-mismatch",
+                    "--dry-run",
+                ],
+            ] {
+                let result = run(&args);
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+                let fidelity = output.get("fidelity").unwrap_or(&output);
+                assert_eq!(fidelity["repository_matches"], false, "{target}");
+            }
         }
     }
     assert_eq!(fs::read(source).unwrap(), bytes);

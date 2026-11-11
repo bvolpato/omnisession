@@ -1,6 +1,7 @@
 //! Read the physical representation of a Codex JSONL rollout without modifying the source.
 
 use std::{
+    cell::OnceCell,
     collections::VecDeque,
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read},
@@ -11,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 
-use super::workspace_check::WorkspaceScan;
+use super::workspace_check::{WorkspaceScan, same_thread};
+use super::workspace_damage::{self, DamagedWorkspace};
+use crate::support::WorkspaceGap;
 use crate::support::{
     JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
@@ -129,11 +132,22 @@ fn read_records_with_limits(
     limits: JsonLinesLimits,
     mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
+    let session = OnceCell::<Option<String>>::new();
     visit_json_reader(
         &mut BufReader::new(reader),
         limits,
-        workspace_record_candidate,
-        |_, record, skipped_before| visit(record, skipped_before),
+        |line, oversized| workspace_gap(line, oversized, session.get().and_then(Option::as_deref)),
+        |_, record, skipped_before| {
+            session.get_or_init(|| {
+                (record["type"] == "session_meta")
+                    .then(|| {
+                        crate::support::string_at(&record["payload"], &[&["id"], &["session_id"]])
+                    })
+                    .flatten()
+                    .map(str::to_owned)
+            });
+            visit(record, skipped_before)
+        },
     )
     .map(|(omissions, _)| omissions)
 }
@@ -156,8 +170,35 @@ pub(super) enum WorkspaceRecord {
     Other,
 }
 
-pub(super) fn workspace_record_candidate(line: &[u8]) -> bool {
-    matches!(workspace_record_kind(line), WorkspaceRecord::Candidate)
+pub(super) fn workspace_record_candidate(line: &[u8], oversized: bool) -> WorkspaceGap {
+    workspace_gap(line, oversized, None)
+}
+
+pub(super) fn workspace_gap(line: &[u8], oversized: bool, session: Option<&str>) -> WorkspaceGap {
+    let kind = if oversized {
+        workspace_damage::oversized_workspace_record(line)
+    } else {
+        workspace_damage::damaged_workspace_record(line)
+    };
+    match kind {
+        Some(DamagedWorkspace::TurnOrRollback) => WorkspaceGap::TurnOrRollback,
+        Some(DamagedWorkspace::PossibleSettings) => {
+            let owner =
+                field(line, "payload").and_then(|payload| string_field(payload, "thread_id"));
+            if session
+                .zip(owner.as_deref())
+                .is_some_and(|(selected, owner)| !same_thread(selected, owner))
+            {
+                WorkspaceGap::ForeignSettings
+            } else {
+                WorkspaceGap::PossibleSettings
+            }
+        }
+        // Later bytes can name saved settings even when the retained prefix ends inside a field.
+        Some(DamagedWorkspace::Unclassified) if oversized => WorkspaceGap::PossibleSettings,
+        Some(DamagedWorkspace::Unclassified) => WorkspaceGap::Unclassified,
+        None => WorkspaceGap::Other,
+    }
 }
 
 pub(super) fn workspace_record_kind(line: &[u8]) -> WorkspaceRecord {
@@ -215,6 +256,7 @@ pub(super) fn sample(
     path: &Path,
     budget: u64,
     creation_directory: Option<&Path>,
+    session: &str,
 ) -> Result<Sample> {
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
@@ -232,11 +274,12 @@ pub(super) fn sample(
     let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
-        workspace_record_candidate,
-        |loc, record, skipped_before| {
-            let ordinal = count + skipped_before.total();
+        |line, oversized| workspace_gap(line, oversized, Some(session)),
+        |loc, record, skipped| {
+            let ordinal = count + skipped.total();
             count += 1;
-            workspace.observe(&record)?;
+            workspace.settings.observe_gaps(skipped);
+            workspace.observe(session, &record)?;
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push(record);
                 if ordinal == prefix_records {
@@ -258,6 +301,7 @@ pub(super) fn sample(
             Ok(())
         },
     )?;
+    workspace.settings.observe_gaps(unreadable);
     if workspace.reconstruct_history || unreadable.workspace_gaps() > 0 {
         return Ok(Sample::Reconstruct);
     }
@@ -273,7 +317,7 @@ pub(super) fn sample(
         omitted: count - head.len(),
         prefix_records,
         unreadable,
-        directory: workspace.directory,
+        directory: workspace.settings.directory(workspace.directory),
         records: head,
     })
 }
