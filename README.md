@@ -61,9 +61,9 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 
 ### Continue any session in any agent
 
-- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. Every native import is verified by read-back, and a failure rolls back exactly what was created. [Supported agents](#supported-agents) lists each route and minimum version.
+- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. OmniSession reads each new session back before launch. If it can verify what a failed import created, it can roll back that session. [Supported agents](#supported-agents) lists each route and minimum version.
 - **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. It never quietly swaps the import you asked for.
-- **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
+- **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes use it automatically when the native import can safely fall back. If a submitted import can still publish a session, OmniSession prints the path to a private recovery file and any known target ID. Check that session before retrying.
 - **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out.
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
 - **Your own launch setups.** A [launch profile](docs/PROFILES.md) names a way to start an agent: extra arguments, environment changes such as a local gateway address, or a wrapper program. Profiles live in a local file, never in a repository, and appear in `omni` and `omni fork` next to the built-in agents.
@@ -95,7 +95,7 @@ omni search pagination --cached      # search without reading provider stores
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns, and known provider authentication files are never read. Redaction cannot prove every secret is absent, so review sensitive sessions before you transfer them.
 - **Task identity.** Workspace selection and exact session IDs decide task bindings. Recency does not.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
-- **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, or `omni fork` rolls back the generated target and exits without launching.
+- **Cancel before launch.** During a native import, `Ctrl+C` stops the launch and attempts to roll back the generated target. If an OpenCode worker can still publish it, OmniSession reports the target ID and retains the recovery file. If you interrupt an OpenCode 2 native fork, OmniSession removes the child ID returned by the provider and verifies its removal. If the provider did not return a child ID, check `opencode session list` before retrying.
 
 Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
 
@@ -170,7 +170,7 @@ The Windows installer verifies the release checksum, installs `omni`, and adds i
 
 - Windows packaging, installer, CLI, and synthetic-store checks run in native Windows CI. Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
 - Other agents do not declare cross-agent import on Windows. Picker targets without declared import continue through semantic handoff, while explicit `omni resume --in` still attempts native import.
-- `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, and native imports, and import helpers run on a hidden console of their own, so neither key reaches them.
+- `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, native imports, and OpenCode 2 forks. Provider probes and native import helpers run on a hidden console of their own.
 - Native Windows and WSL provider stores are not interchangeable.
 
 </details>
@@ -236,7 +236,7 @@ While the picker is open, it indexes conversation text for every discovered sess
 
 If a session remains unreadable, later index runs skip it until its source changes. Use `omni index --retry-failed` to try again. If an in-place restore preserves the operating system's file identity, size, and all available timestamps, use `omni show codex:<id>` to read the contents and refresh the cached text and workspace. This can apply to same-size restores on Windows that preserve the write time.
 
-If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. If a rollback removes the request that supplied a search title, a full index read can retire that title even when the fork's parent is unavailable. After an upgrade, cached search hides native Codex conversation text and derived titles indexed before the subagent visibility check. Run `omni index --provider codex` to rebuild them from available rollouts. Provider-assigned names and imported bundles remain searchable.
+If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. When a rollback removes the request that supplied a search title, indexing can retire the title even when the fork's parent is unavailable. After an upgrade, cached search hides native Codex text and derived titles from older readers until the source is read again. Run `omni index --provider codex` to rebuild them, including messages inherited by unchanged forks. Provider-assigned names and imported bundles remain searchable. If indexing cannot verify the previous search text for a large rollout, it keeps the usual head and tail. Use `omni show codex:<id>` to index the full rollout.
 
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 
@@ -256,7 +256,7 @@ omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
 ```
 
-- Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
+- Each run first indexes changed sessions in the current project. Use `--all-projects` to search every workspace. A live project search also checks recent Codex sessions that may have moved from another directory. It reports incomplete coverage if it reaches the scan limit. Run `omni index --provider codex` to index across workspaces. `--no-index` uses the existing search index.
 - `--cached` skips provider stores entirely: it searches the cached session list and the existing index, so results can include sessions changed or deleted since the last refresh. Run `omni index` to refresh.
 - Every word must match. Plain words match titles, folders, branches, and IDs fuzzily, and conversation text by prefix.
 - Words with inner punctuation, like `qwen3.8`, `feat/rate-limiter`, or `api_key`, match without gaps: as a substring of a title, folder, branch, or ID, and as adjacent words in conversation text. `qwen3.8` finds `qwen3-8`, but not `qwen3` and `8` far apart.
@@ -281,11 +281,17 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--materialize-only` creates and verifies a supported native target session without launching it.
 - `--dry-run` shows what would happen without launching.
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
-- Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
+- Transfers across different workspace roots require `--allow-workspace-mismatch`. If the old worktree has moved, this flag also lets an explicit native fork or resume use the current workspace.
 
 If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
 
+If a Codex source has no verified working directory, run the fork again from the directory where you want to continue and pass `--allow-workspace-mismatch`. This also applies when the new session opens in another agent.
+
+If a native cross-agent import or a Codex archive restore fails and its target may still exist or appear later, OmniSession keeps the private handoff and prints its path. A surviving session can still open the file linked in its imported history. If OmniSession reports a target session ID, check that session before retrying. You can also give the saved path to the next agent when you continue manually.
+
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
+
+If another command rebinds the same task branch while `omni switch` is running, the newer binding stays in place. A verified transfer still records the source and target sessions in its handoff history. A manual `omni task bind` only changes which existing session the branch selects. Its previous selections stay in the binding history.
 
 #### Permission modes
 
@@ -301,7 +307,7 @@ By default OmniSession passes no permission flags, so the target agent starts in
 - The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
 - Pi has no permission prompts to configure, and the IDEs take no launch flags, so they show no mode.
 - Oh My Pi offers `default` (no flags), `always-ask` (`--approval-mode always-ask`), `accept-edits` (`--approval-mode write`), and `yolo` (`--approval-mode yolo`). `always-ask` fails closed if the installed help cannot validate it.
-- OmniSession uses a mode only when the installed agent's `--help` lists its flag (and, where the help prints them, its value under that flag). An older agent steps down to the nearest mode it has, with a warning. The answer is cached per binary until the binary, OmniSession, or its mode definitions change; a probe that fails is never cached.
+- OmniSession uses a mode only when the agent's `--help` lists its flag and, where the help prints accepted values, the requested value. An older agent steps down to the nearest mode it has, with a warning. For launchers it can identify, OmniSession reuses complete help results for the same program, arguments, workspace, and environment. Updating the executable, OmniSession, or its mode definitions invalidates the result. A profile that replaces the launcher gets a fresh check each time.
 - `--mode` also preselects the mode on the target page and outranks `OMNI_MODE`. On a short terminal the page scrolls so the selected agent and its mode stay on screen.
 - The launch line says which mode runs, for example `Codex permission mode: auto (--approve-for-me)`. Transferred history is still untrusted context, so review a session before continuing it in `yolo`.
 
@@ -421,7 +427,17 @@ No. Provider stores are opened read-only, and a transfer writes a new session in
 OmniSession has no telemetry or hosted service. The release check contacts GitHub, and `OMNI_NO_UPDATE_CHECK=1` turns it off. An agent that continues a session receives the transferred history and keeps its own network behavior.
 
 **What carries over, and will tool calls run again?**
-Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits.
+Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits. For a portable bundle, inspection checks whether the target can import it or receive a handoff, even when the bundle came from the same agent.
+
+Inspection checks the permission mode that `resume` would use, including your `OMNI_MODE` preference. Use `omni inspect <session> --target <agent> --mode <mode>` to check an explicit override.
+
+Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`.
+
+Cursor Agent resumes the chat in its recorded folder, including a subdirectory of the current repository. For a Cursor IDE chat with readable history, open the recorded folder or saved workspace, then select the chat from Show Chat History. You can find a saved workspace from any of the local folders listed in its `.code-workspace` file. OmniSession opens the saved file from any member, including when the file is a symlink. If the file loses its `folders` array, Cursor opens it as a document. OmniSession then directs you to export the chat or continue in another agent. An exported Cursor bundle remains discoverable from its member folders after you import it. If you fork a chat from a saved `.code-workspace` while the picker is outside its member folders, the picker asks for a destination. Cursor IDE uses the exact folder you select, including a repository subdirectory or a symlink.
+
+Cursor IDE can assign a new workspace ID if you delete and recreate a folder at the same path. If the recorded ID no longer matches, use `omni export <session> --output chat.json` to recover the original chat history. If an older record has no verifiable workspace ID, OmniSession reports that limitation. Inspection and resume also flag missing or unreadable conversation records. If only a chat header survives or the composer contains unreadable JSON, use the same export command to save the remaining records.
+
+OmniSession v0.9.0 wrote some Cursor IDE conversations as SQLite BLOBs. Cursor cannot display those records. OmniSession can still export their messages or transfer them to another agent.
 
 **My agent is older than the version gate. What happens?**
 The native import cannot run. On a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel. Scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try.

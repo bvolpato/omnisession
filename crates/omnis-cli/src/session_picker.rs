@@ -30,8 +30,8 @@ use crossterm::{
 use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
-    HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, workspace_paths_match,
+    HandoffMessage, HandoffRole, SessionPreview, SessionWorkspaceMatcher, first_user_message_after,
+    safe_terminal_line, session_preview,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -41,7 +41,7 @@ use omnis_store::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    DELETE_PROVIDERS, PROVIDERS,
+    DELETE_PROVIDERS, PROVIDERS, ResumeArgs,
     fuzzy::{SearchFields, query_terms},
     launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
@@ -105,6 +105,7 @@ const PICKER_PROVIDERS: [Provider; 13] = [
 #[derive(Clone)]
 pub struct PickerSelection {
     pub session: SessionRef,
+    pub source_revision: Option<SourceRevision>,
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
     pub target: AgentTarget,
@@ -131,6 +132,7 @@ pub enum PickerOutcome {
     Resume(PickerSelection),
     ClipboardHandoff {
         session: SessionRef,
+        source_revision: Option<SourceRevision>,
     },
     Update {
         version: String,
@@ -147,6 +149,13 @@ struct PickerEntry {
 }
 
 impl PickerEntry {
+    fn provider_name(&self) -> Option<&str> {
+        self.session
+            .title
+            .as_deref()
+            .filter(|_| self.has_provider_title)
+    }
+
     fn source_revision(&self) -> Option<SourceRevision> {
         if self.session.session.provider != Provider::Codex {
             return None;
@@ -160,6 +169,20 @@ impl PickerEntry {
                     .is_some()
                     .then(SourceRevision::default)
             })
+    }
+
+    fn selected_source_revision(&self) -> Result<Option<SourceRevision>> {
+        let session = &self.session.session;
+        let verified =
+            |revision: &SourceRevision| revision.file.is_some() && revision.contents.is_some();
+        let revision = self.source_revision().filter(verified);
+        if session.provider != Provider::Codex || revision.is_some() {
+            return Ok(revision);
+        }
+        Ok(AdapterRegistry::with_local_adapters()
+            .find_native_session(Provider::Codex, &session.id)?
+            .and_then(|native| native.source_revision)
+            .filter(verified))
     }
 }
 
@@ -191,6 +214,7 @@ struct PickerState {
     visible_cache: RefCell<Option<VisibleCache>>,
     indexed_titles: HashMap<String, (SourceRevision, String)>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
+    workspace_updates: HashMap<SourceRevision, omnis_store::CodexWorkspaceUpdate>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
@@ -232,6 +256,15 @@ struct VisibleCache {
 }
 
 impl PickerState {
+    fn for_resume(current_project: &Path, args: &ResumeArgs) -> Self {
+        Self::new(
+            Vec::new(),
+            current_project,
+            args.source_provider,
+            args.all_projects,
+        )
+    }
+
     fn new(
         sessions: Vec<NativeSession>,
         current_project: &Path,
@@ -271,6 +304,7 @@ impl PickerState {
             visible_cache: RefCell::new(None),
             indexed_titles: HashMap::new(),
             preview_titles: HashMap::new(),
+            workspace_updates: HashMap::new(),
             index_progress: None,
             index_deadline: None,
             current_git_branch: workspace_git_branch(current_project),
@@ -481,6 +515,7 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -495,6 +530,7 @@ impl PickerState {
         self.forget_replaced_sources(&entries);
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -521,6 +557,73 @@ impl PickerState {
                 self.indexed_titles.remove(&entry.key);
                 self.preview_titles.remove(&entry.key);
                 self.previews.remove_session(&entry.session.session);
+            }
+        }
+    }
+
+    fn reconcile_discovered_names(
+        &mut self,
+        entries: &mut [PickerEntry],
+        names: Option<&workers::CatalogNames>,
+    ) {
+        let prior: HashMap<_, _> = names
+            .into_iter()
+            .flat_map(|names| {
+                names.inventory.observed.iter().filter_map(|row| {
+                    let name = names.inventory.observable_names.get(&row.session)?;
+                    Some((&row.session, (row.source_revision?, name)))
+                })
+            })
+            .collect();
+        for entry in entries {
+            let Some(revision) = entry
+                .source_revision()
+                .filter(|revision| revision.contents.is_some())
+            else {
+                continue;
+            };
+            let corroborated = names.and_then(|names| {
+                let assignment = names.prior_assignments.get(&entry.session.session.id)?;
+                names.inventory.corroborated_legacy_codex_name(
+                    &crate::indexed_session_metadata(&entry.session),
+                    assignment,
+                )
+            });
+            let observed_name = prior
+                .get(&entry.session.session)
+                .filter(|(source, _)| source.matches_file_contents(revision))
+                .map(|(_, name)| name.as_str())
+                .or(corroborated);
+            let current = self
+                .entry_positions
+                .get(&entry.key)
+                .map(|&i| &self.entries[i])
+                .filter(|old| old.source_revision() == Some(revision))
+                .filter(|old| {
+                    !(old.cached && old.provider_name().is_none() && corroborated.is_some())
+                });
+            let old_name = current.map_or(observed_name, PickerEntry::provider_name);
+            if (entry.provider_name().is_none() && names.is_none_or(|names| !names.complete))
+                || (current.is_some()
+                    && old_name != observed_name
+                    && entry.provider_name() != old_name)
+            {
+                entry.has_provider_title = old_name.is_some();
+                entry.session.title = old_name.map(str::to_owned);
+                entry.fields = SearchFields::new(&entry.session, None);
+            }
+            if old_name != entry.provider_name()
+                && old_name.is_some_and(|old_name| {
+                    self.indexed_titles
+                        .get(&entry.key)
+                        .is_some_and(|(source, title)| {
+                            *source == revision
+                                && omnis_core::compact_search_title(old_name).as_ref()
+                                    == Some(title)
+                        })
+                })
+            {
+                self.indexed_titles.remove(&entry.key);
             }
         }
     }
@@ -598,6 +701,21 @@ impl PickerState {
         };
         self.delete_dialog = Some(dialog);
         self.notice = None;
+    }
+
+    fn finish_delete(&mut self, session: &SessionRef, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                self.remove_session(session);
+                self.delete_dialog = None;
+                self.notice = Some(format!("Deleted source session {session}"));
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.delete_dialog {
+                    dialog.phase = DeletePhase::Failed(safe_terminal_line(&error.to_string()));
+                }
+            }
+        }
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
@@ -699,6 +817,70 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
+    fn remember_codex_workspaces(
+        &mut self,
+        updates: impl IntoIterator<Item = (SessionRef, omnis_store::CodexWorkspaceUpdate)>,
+    ) {
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let mut rows = Vec::new();
+        for (session, update) in updates {
+            let revision = match &update {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace.source_revision,
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(revision) => *revision,
+            };
+            self.workspace_updates
+                .insert(preview_revision(revision), update);
+            if let Some(index) = self.entry_positions.get(&session.to_string()) {
+                rows.push(*index);
+            }
+        }
+        if self.apply_verified_workspaces(rows) {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.query_changed();
+            self.restore_selection(selected);
+        }
+    }
+
+    fn apply_verified_workspaces(&mut self, rows: impl IntoIterator<Item = usize>) -> bool {
+        if self.workspace_updates.is_empty() {
+            return false;
+        }
+        let current_project = self.current_project.clone();
+        let mut matcher = SessionWorkspaceMatcher::new(&current_project);
+        let mut changed = false;
+        for index in rows {
+            let entry = &mut self.entries[index];
+            let Some(revision) = entry.source_revision() else {
+                continue;
+            };
+            let Some(workspace) = self.workspace_updates.get(&revision) else {
+                continue;
+            };
+            let corrected = match workspace {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => {
+                    entry.session.apply_codex_workspace(workspace)
+                }
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => {
+                    let had_scope =
+                        entry.session.project_path.is_some() || entry.session.git_branch.is_some();
+                    entry.session.project_path = None;
+                    entry.session.git_branch = None;
+                    had_scope
+                }
+            };
+            if corrected {
+                entry.current_workspace = entry
+                    .session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(entry.session.session.provider, path));
+                self.refresh_entry_title(index);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn remember_preview_title(
         &mut self,
         key: &mut PreviewKey,
@@ -739,7 +921,7 @@ impl PickerState {
             }
         } else if matches!(
             value,
-            PreviewValue::Ready { complete, can_use_first_title: true, .. } if *complete || key.session.provider == Provider::Codex
+            PreviewValue::Ready { complete, source_provider, can_use_first_title: true, .. } if *complete || *source_provider == Provider::Codex
         ) {
             self.preview_titles.remove(&session_key).is_some()
         } else {
@@ -753,6 +935,31 @@ impl PickerState {
             self.restore_selection(selected);
         }
         true
+    }
+
+    fn accepts_provider_name(&self, key: &PreviewKey, change: &ProviderNameChange) -> bool {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return false;
+        };
+        let entry = &self.entries[index];
+        let name = entry.provider_name().map(omnis_core::redact_secrets);
+        self.preview_key(entry) == *key && (name == change.previous || name == change.current)
+    }
+
+    fn remember_provider_name(&mut self, key: &PreviewKey, change: ProviderNameChange) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        if self.entries[index].provider_name() == change.current.as_deref() {
+            return;
+        }
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let entry = &mut self.entries[index];
+        entry.has_provider_title = change.current.is_some();
+        entry.session.title = change.current;
+        self.refresh_entry_title(index);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected);
     }
 
     fn remember_source_titles(&mut self, titles: impl IntoIterator<Item = IndexedTrajectoryTitle>) {
@@ -1034,11 +1241,12 @@ impl PickerState {
             .iter()
             .filter(|key| !self.previews.contains(key))
             .filter_map(|key| {
-                let index = self.entry_positions.get(&key.session.to_string())?;
+                let entry = &self.entries[*self.entry_positions.get(&key.session.to_string())?];
                 Some(PreviewRequest {
                     key: key.clone(),
-                    source_path: self.entries[*index].session.source_path.clone(),
-                    cached: self.entries[*index].cached,
+                    source_path: entry.session.source_path.clone(),
+                    cached: entry.cached,
+                    provider_name: entry.provider_name().map(omnis_core::redact_secrets),
                 })
             })
             .collect::<Vec<_>>();
@@ -1079,6 +1287,12 @@ struct PreviewRequest {
     key: PreviewKey,
     source_path: Option<PathBuf>,
     cached: bool,
+    provider_name: Option<String>,
+}
+
+struct ProviderNameChange {
+    previous: Option<String>,
+    current: Option<String>,
 }
 
 enum PreviewValue {
@@ -1086,7 +1300,9 @@ enum PreviewValue {
         preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
         complete: bool,
+        source_provider: Provider,
         can_use_first_title: bool,
+        message_count_is_complete: bool,
     },
     Unavailable,
 }
@@ -1335,13 +1551,13 @@ struct CachedPickerEntries {
 }
 
 fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let (sessions, titles) = store.cached_sessions_with_titles(None)?;
+    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
         .map(|row| (&row.session, preview_revision(row.source_revision)))
         .collect();
-    let sessions = sessions
+    let mut sessions = sessions
         .into_iter()
         .map(workers::native_session)
         .map(|mut session| {
@@ -1350,35 +1566,33 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             }
             session
         })
-        .collect();
-    let mut entries = picker_entries(sessions, current_project, true);
+        .collect::<Vec<_>>();
+    populate_approximate_updated_at(&mut sessions);
+    let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
-    let current_remote = std::cell::OnceCell::new();
-    for entry in entries.iter_mut().filter(|entry| {
-        entry.session.session.provider == Provider::Imported && !entry.current_workspace
-    }) {
-        let matches = (|| -> Result<bool> {
-            let bundle_id = crate::imported_bundle_id(&entry.session.session)?;
-            let bundle = crate::load_imported_bundle(store, bundle_id)?;
-            crate::source_workspace_matches_with_cache(
-                &entry.session.session,
-                &bundle.snapshot,
-                current_project,
-                &current_remote,
-            )
-        })();
-        match matches {
-            Ok(true) => {
-                entry.session.project_path = Some(current_project.to_path_buf());
-                entry.current_workspace = true;
-                entry.fields = SearchFields::new(&entry.session, None);
-            }
-            Ok(false) => {}
-            Err(error) => workers::record_picker_warning(
-                &mut warnings,
-                format!("{} workspace: {error:#}", entry.session.session),
-            ),
+    let mut paths = SessionWorkspaceMatcher::new(current_project);
+    let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
+    for mut session in sessions {
+        if session.session.provider != Provider::Imported {
+            entries.push(picker_entry(session, &mut paths, true));
+            continue;
         }
+        let current = match imports.matches(&session.session, session.project_path.as_deref()) {
+            Ok(crate::ImportedWorkspaceMatch::Recorded) => true,
+            Ok(crate::ImportedWorkspaceMatch::Relocated) => {
+                session.project_path = Some(current_project.to_path_buf());
+                true
+            }
+            Ok(crate::ImportedWorkspaceMatch::Other) => false,
+            Err(error) => {
+                workers::record_picker_warning(
+                    &mut warnings,
+                    format!("{} workspace: {error:#}", session.session),
+                );
+                false
+            }
+        };
+        entries.push(PickerEntry::new(session, current, true));
     }
     Ok(CachedPickerEntries {
         entries,
@@ -1392,7 +1606,7 @@ fn normalized_picker_entries(
     current_project: &Path,
     cached: bool,
 ) -> Vec<PickerEntry> {
-    let mut matcher = WorkspaceMatcher::new(current_project);
+    let mut matcher = SessionWorkspaceMatcher::new(current_project);
     sessions
         .into_iter()
         .map(|session| picker_entry(session, &mut matcher, cached))
@@ -1401,45 +1615,26 @@ fn normalized_picker_entries(
 
 fn picker_entry(
     session: NativeSession,
-    matcher: &mut WorkspaceMatcher,
+    matcher: &mut SessionWorkspaceMatcher<'_>,
     cached: bool,
 ) -> PickerEntry {
-    PickerEntry {
-        key: session.session.to_string(),
-        has_provider_title: session.title.is_some(),
-        current_workspace: session
-            .project_path
-            .as_deref()
-            .is_some_and(|path| matcher.matches(path)),
-        fields: SearchFields::new(&session, None),
-        session,
-        cached,
-    }
+    let current = session
+        .project_path
+        .as_deref()
+        .is_some_and(|path| matcher.matches(session.session.provider, path));
+    PickerEntry::new(session, current, cached)
 }
 
-struct WorkspaceMatcher {
-    current: PathBuf,
-    matches: HashMap<PathBuf, bool>,
-}
-
-impl WorkspaceMatcher {
-    fn new(current: &Path) -> Self {
+impl PickerEntry {
+    fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
         Self {
-            current: current.to_path_buf(),
-            matches: HashMap::new(),
+            key: session.session.to_string(),
+            has_provider_title: session.title.is_some(),
+            current_workspace,
+            fields: SearchFields::new(&session, None),
+            session,
+            cached,
         }
-    }
-
-    fn matches(&mut self, candidate: &Path) -> bool {
-        if candidate == self.current {
-            return true;
-        }
-        if let Some(matches) = self.matches.get(candidate) {
-            return *matches;
-        }
-        let matches = workspace_paths_match(candidate, &self.current);
-        self.matches.insert(candidate.to_path_buf(), matches);
-        matches
     }
 }
 
@@ -1523,16 +1718,12 @@ fn require_terminal(otherwise: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn pick_session(
+pub(super) fn pick_session(
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    initial_provider: Option<Provider>,
-    all_projects: bool,
     materialize: Option<CanMaterializeAt<'_>>,
-    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
@@ -1544,7 +1735,8 @@ pub fn pick_session(
     theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
-    let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    let target = args.target;
+    let mut state = PickerState::for_resume(current_project, args);
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
@@ -1598,30 +1790,17 @@ pub fn pick_session(
                     .unwrap_or(current_project)
                     .to_path_buf();
                 render_state.render(&state, target, &warnings, pending.len())?;
-                match delete_session(&session, Some(&workspace)) {
-                    Ok(()) => {
-                        state.remove_session(&session);
-                        state.delete_dialog = None;
-                        state.notice = Some(format!("Deleted source session {session}"));
-                    }
-                    Err(error) => {
-                        let message = safe_terminal_line(&error.to_string());
-                        if let Some(dialog) = &mut state.delete_dialog {
-                            dialog.phase = DeletePhase::Failed(message);
-                        }
-                    }
-                }
+                state.finish_delete(&session, delete_session(&session, Some(&workspace)));
                 render_state.invalidate();
                 dirty = true;
             }
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
-                target,
+                args,
                 available_targets,
                 new_session_targets,
                 materialize,
-                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1648,23 +1827,18 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
     materialize: Option<CanMaterializeAt<'_>>,
-    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
-        if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
+        if args.target.is_none()
+            && target_choices(TargetIntent::New, new_session_targets).is_empty()
+        {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(
-            target,
-            TargetIntent::New,
-            None,
-            new_session_targets,
-            requested_mode,
-        )? {
+        return match requested_target(args, TargetIntent::New, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.target(),
                 mode: choice.mode,
@@ -1680,44 +1854,63 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
+    let source_revision = entry.selected_source_revision()?;
+    if session.provider == Provider::Codex && source_revision.is_none() {
+        return Ok(RowSelection::Notice(
+            "The selected Codex rollout is no longer available.".to_owned(),
+        ));
+    }
     let project_path = entry.session.project_path.clone();
+    let caller_override = (session.provider == Provider::Codex && args.allow_workspace_mismatch)
+        .then(|| std::env::current_dir().context("reading the chosen target directory"))
+        .transpose()?;
+    let launch_project = caller_override
+        .as_deref()
+        .or(project_path.as_deref())
+        .unwrap_or(current_project);
     let can_copy = |source: &SessionRef, target| {
-        let launch_project = if state.all_projects {
-            project_path.as_deref().unwrap_or(current_project)
-        } else {
-            current_project
-        };
         materialize.is_some_and(|check| check(source, target, launch_project))
     };
-    let intent = if materialize.is_some() {
-        TargetIntent::Materialize(&session, &can_copy)
-    } else {
-        TargetIntent::Resume(&session)
+    let intent = match materialize {
+        Some(_) => TargetIntent::Materialize(&session, &can_copy),
+        None if args.fork => TargetIntent::Fork(&session),
+        None => TargetIntent::Resume(&session),
     };
     let preferred_target = crate::continuation_target_provider(&session)?;
-    match requested_target(
-        target,
-        intent,
-        Some(preferred_target),
-        available_targets,
-        requested_mode,
-    )? {
+    match requested_target(args, intent, Some(preferred_target), available_targets)? {
         TargetOutcome::Selected(choice) => {
-            // An imported row can carry another machine's workspace, so never resolve a network path.
-            let workspace_override = if project_path
-                .as_deref()
-                .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
-            {
-                None
+            let workspace_override = if caller_override.is_some() {
+                caller_override
             } else {
-                match pick_workspace(&session, project_path.as_deref(), current_project)? {
-                    WorkspaceOutcome::Selected(path) => Some(path),
-                    WorkspaceOutcome::Back => return Ok(RowSelection::Back),
-                    WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+                let reason = match workspace_picker_reason(
+                    session.provider,
+                    preferred_target,
+                    choice,
+                    project_path.as_deref(),
+                    current_project,
+                ) {
+                    Ok(reason) => reason,
+                    Err(error) => return Ok(RowSelection::Notice(error.to_string())),
+                };
+                if let Some(reason) = reason {
+                    match pick_workspace(
+                        &session,
+                        choice.provider,
+                        project_path.as_deref(),
+                        current_project,
+                        reason,
+                    )? {
+                        WorkspaceOutcome::Selected(path) => Some(path),
+                        WorkspaceOutcome::Back => return Ok(RowSelection::Back),
+                        WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+                    }
+                } else {
+                    None
                 }
             };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
+                    source_revision,
                     session,
                     project_path,
                     across_projects: state.all_projects,
@@ -1731,6 +1924,7 @@ fn select_picker_row(
         TargetOutcome::ClipboardHandoff => {
             Ok(RowSelection::Selected(PickerOutcome::ClipboardHandoff {
                 session,
+                source_revision,
             }))
         }
         TargetOutcome::Back => Ok(RowSelection::Back),
@@ -1739,25 +1933,27 @@ fn select_picker_row(
 }
 
 fn requested_target(
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
-    target.map_or_else(
-        || pick_target_for(intent, preferred_target, targets, requested_mode),
-        |target| {
-            // `--in` skipped the page, so `--mode` or the agent's default decides.
-            Ok(TargetOutcome::Selected(TargetChoice {
-                provider: target.provider,
-                profile: target.profile,
-                fork: matches!(intent, TargetIntent::Materialize(source, can_copy)
-                    if source.provider == target.provider && can_copy(source, target)),
-                mode: None,
-            }))
-        },
-    )
+    if let Some(target) = args.target {
+        // `--in` skips the target page. Launch uses `--mode` or the agent's default.
+        return Ok(TargetOutcome::Selected(TargetChoice {
+            provider: target.provider,
+            profile: target.profile,
+            fork: match intent {
+                TargetIntent::Fork(source) => source.provider == target.provider,
+                TargetIntent::Materialize(source, can_copy) => {
+                    source.provider == target.provider && can_copy(source, target)
+                }
+                _ => false,
+            },
+            mode: None,
+        }));
+    }
+    pick_target_for(intent, preferred_target, targets, args.mode, args.no_fork)
 }
 
 fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers) -> bool {
@@ -1874,17 +2070,55 @@ enum WorkspaceOutcome {
     Selected(PathBuf),
 }
 
+fn workspace_picker_reason(
+    source: Provider,
+    preferred_target: Provider,
+    choice: TargetChoice,
+    project_path: Option<&Path>,
+    current: &Path,
+) -> io::Result<Option<&'static str>> {
+    // An imported row can name another machine's workspace.
+    let stored = project_path
+        .filter(|path| source != Provider::Codex || path.is_absolute())
+        .filter(|path| !omnis_core::may_reach_network(path));
+    if preferred_target != Provider::CursorIde {
+        return Ok((!stored.is_some_and(Path::is_dir)).then_some("Saved workspace is unavailable."));
+    }
+    let reopen_cursor_chat =
+        source == Provider::CursorIde && !choice.fork && choice.provider == Provider::CursorIde;
+    let cursor_path = match stored
+        .map(omnis_core::local_cursor_workspace_path)
+        .transpose()
+    {
+        Ok(path) => path.flatten(),
+        Err(error) if reopen_cursor_chat => return Err(error),
+        Err(_) => None,
+    };
+    let reason = match cursor_path.as_deref() {
+        Some(path) if path.is_dir() => None,
+        Some(path) if path.is_file() => {
+            let can_use_saved = reopen_cursor_chat
+                || stored.is_some_and(|saved| omnis_core::cursor_workspace_matches(saved, current));
+            (!can_use_saved).then_some("Choose the folder to use for the target session.")
+        }
+        _ => Some("Saved workspace is unavailable."),
+    };
+    Ok(reason)
+}
+
 fn pick_workspace(
     source: &SessionRef,
+    target: Provider,
     original: Option<&Path>,
     current: &Path,
+    reason: &str,
 ) -> Result<WorkspaceOutcome> {
     let mut input = current.display().to_string();
     let mut message = String::new();
     let mut needs_render = true;
     loop {
         if needs_render {
-            render_workspace(source, original, &input, &message)?;
+            render_workspace(source, original, &input, &message, reason)?;
             needs_render = false;
         }
         let key = match event::read().context("reading workspace picker input")? {
@@ -1906,18 +2140,24 @@ fn pick_workspace(
             KeyCode::Esc => return Ok(WorkspaceOutcome::Back),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
                 let path = resolve_workspace_input(&input, current);
-                if !path.is_dir() {
-                    message.clear();
-                    message.push_str("Folder does not exist or is not a directory.");
-                    continue;
+                let folder = if target == Provider::CursorIde {
+                    omnis_core::cursor_launch_folder(&path)
+                } else if path.is_dir() {
+                    Some(
+                        path.canonicalize()
+                            .context("resolving selected workspace")?,
+                    )
+                } else {
+                    None
+                };
+                if let Some(folder) = folder {
+                    return Ok(WorkspaceOutcome::Selected(folder));
                 }
-                return path
-                    .canonicalize()
-                    .map(WorkspaceOutcome::Selected)
-                    .context("resolving selected workspace");
+                message.clear();
+                message.push_str("Folder does not exist or is not a directory.");
             }
             KeyCode::Tab => {
-                let completion = complete_directory_input(&input, current);
+                let completion = complete_directory_input(&input, current, target);
                 input = completion.value;
                 message = completion.message;
             }
@@ -1948,10 +2188,17 @@ struct PathCompletion {
     message: String,
 }
 
-fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
+fn complete_directory_input(input: &str, current: &Path, target: Provider) -> PathCompletion {
     let resolved = resolve_workspace_input(input, current);
+    let directory = |path: &Path| {
+        if target == Provider::CursorIde {
+            omnis_core::cursor_launch_folder(path)
+        } else {
+            path.is_dir().then(|| path.to_path_buf())
+        }
+    };
     let ends_with_separator = input.ends_with('/') || input.ends_with('\\');
-    if resolved.is_dir() && !ends_with_separator {
+    if !ends_with_separator && directory(&resolved).is_some() {
         return PathCompletion {
             value: format!("{}{MAIN_SEPARATOR}", resolved.display()),
             message: String::new(),
@@ -1971,14 +2218,15 @@ fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
                 .to_owned(),
         )
     };
-    let mut matches = fs::read_dir(&parent)
-        .ok()
+    let mut matches = directory(&parent)
+        .and_then(|folder| fs::read_dir(folder).ok())
         .into_iter()
         .flatten()
         .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&prefix))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with(&prefix) && directory(&entry.path()).is_some()).then_some(name)
+        })
         .collect::<Vec<_>>();
     matches.sort();
     let Some(first) = matches.first() else {
@@ -2054,6 +2302,7 @@ pub fn pick_fork_target(
         Some(preferred_target),
         targets,
         requested_mode,
+        false,
     )? {
         TargetOutcome::Selected(choice) => Ok(Some(PickedTarget::Agent {
             target: choice.target(),
@@ -2069,6 +2318,7 @@ fn pick_target_for(
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
+    no_fork: bool,
 ) -> Result<TargetOutcome> {
     if targets.is_empty() && intent.source().is_none() {
         bail!(
@@ -2076,6 +2326,9 @@ fn pick_target_for(
         );
     }
     let mut choices = target_choices(intent, targets);
+    if no_fork {
+        choices.retain(|choice| !choice.fork);
+    }
     seed_requested_mode(&mut choices, requested_mode);
     if choices.is_empty() && intent.source().is_none() {
         bail!("no runnable target agents support this action on the current platform");
@@ -2680,6 +2933,7 @@ fn render_workspace(
     original: Option<&Path>,
     input: &str,
     message: &str,
+    reason: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
@@ -2701,11 +2955,7 @@ fn render_workspace(
         &truncate(&format!("Source: {source}"), width),
     )?;
     queue!(frame, Print("\r\n\r\n"))?;
-    queue_styled(
-        &mut frame,
-        DetailStyle::Warning,
-        "Saved workspace is unavailable.",
-    )?;
+    queue_styled(&mut frame, DetailStyle::Warning, reason)?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(
         &mut frame,
@@ -2900,6 +3150,28 @@ mod tests {
 
     use super::*;
 
+    pub(super) fn codex_search_document(
+        text: &str,
+        updated_at: DateTime<Utc>,
+    ) -> omnis_store::TrajectoryDocument<'_> {
+        omnis_store::TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at: updated_at,
+            source_revision: SourceRevision::default(),
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            origin: omnis_store::SessionTrajectoryOrigin::Native,
+            derived_title: None,
+            title_is_verified: false,
+            local_opener: omnis_store::LocalOpenerEvidence::Unknown,
+            withdrawn_title: None,
+            title_authoritative: false,
+        }
+    }
+
     #[test]
     fn picker_cache_refresh_prunes_only_after_complete_discovery() {
         for complete in [false, true] {
@@ -2917,25 +3189,10 @@ mod tests {
                     ],
                 )
                 .expect("seed cached metadata");
-            let text = "synthetic unobserved history";
             store
                 .upsert_trajectory_document(
                     &omitted.session,
-                    &omnis_store::TrajectoryDocument {
-                        redacted_text: text,
-                        source_updated_at: Utc::now(),
-                        source_revision: omnis_ir::SourceRevision::default(),
-                        source_byte_count: text.len(),
-                        indexed_byte_count: text.len(),
-                        truncation_strategy: "none",
-                        source_complete: true,
-                        document_version: omnis_core::search_document_version(Provider::Codex),
-                        origin: omnis_store::SessionTrajectoryOrigin::Native,
-                        derived_title: None,
-                        title_is_verified: false,
-                        withdrawn_title: None,
-                        title_authoritative: false,
-                    },
+                    &codex_search_document("synthetic unobserved history", Utc::now()),
                 )
                 .expect("seed search history");
             observed.title = Some("Updated observed title".to_owned());
@@ -2944,6 +3201,11 @@ mod tests {
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 complete,
+                names: Some(std::sync::Arc::new(workers::CatalogNames {
+                    inventory: store.observe_codex_catalog_inventory().unwrap(),
+                    prior_assignments: HashMap::new(),
+                    complete: true,
+                })),
             }
             .persist(&store)
             .expect("persist picker discovery");
@@ -3546,10 +3808,44 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], None, None)
-            .expect("row selection");
+        let selection = select_picker_row(
+            &state,
+            temporary.path(),
+            &ResumeArgs::default(),
+            &[],
+            &[],
+            None,
+        )
+        .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
+    }
+
+    #[test]
+    fn explicit_fork_keeps_the_saved_workspace_member_as_its_destination() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let member = temporary.path().join("member");
+        let saved = temporary.path().join("multi.code-workspace");
+        fs::create_dir(&member).unwrap();
+        fs::write(&saved, r#"{"folders":[{"path":"member"}]}"#).unwrap();
+        let state = PickerState::new(
+            vec![session(Provider::CursorIde, "chat", &saved, Some("Chat"))],
+            &member,
+            None,
+            true,
+        );
+        let args = ResumeArgs {
+            target: Some(Provider::CursorIde.into()),
+            fork: true,
+            ..Default::default()
+        };
+
+        let selected = select_picker_row(&state, &member, &args, &[], &[], None).unwrap();
+        let RowSelection::Selected(PickerOutcome::Resume(selection)) = selected else {
+            panic!("expected the saved chat");
+        };
+        assert!(selection.fork);
+        assert!(selection.workspace_override.is_none());
     }
 
     #[test]
@@ -3573,6 +3869,8 @@ mod tests {
                 preview: Box::new(synthetic_preview("Start with cursor pagination.")),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
+                source_provider: Provider::Codex,
                 can_use_first_title: true,
             },
             &[],
@@ -3629,8 +3927,10 @@ mod tests {
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
             complete: false,
+            message_count_is_complete: false,
         };
         let mut previous = PreviewKey {
             source: Some(PreviewSource::Path(PathBuf::from(
@@ -3644,6 +3944,8 @@ mod tests {
             preview: Box::new(synthetic_preview("A later pagination request")),
             continuation: None,
             complete: false,
+            message_count_is_complete: false,
+            source_provider: Provider::Codex,
             can_use_first_title: false,
         };
         state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
@@ -3725,7 +4027,7 @@ mod tests {
             &worker,
             &request.key,
             request.source_path.as_deref(),
-            crate::search_index::FULL_READ_SOURCE_BYTES,
+            None,
             || {},
         )?;
         assert_eq!(
@@ -3741,24 +4043,13 @@ mod tests {
         drop(restored);
         let (refresh, notifications) = mpsc::sync_channel(1);
         assert!(
-            workers::read_picker_preview(
-                &worker,
-                &request.key,
-                Some(path),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || {}
-            )
-            .is_err()
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || {}).is_err()
         );
         assert!(notifications.try_recv().is_err());
         assert!(
-            workers::read_picker_preview(
-                &worker,
-                &request.key,
-                Some(path),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || refresh.try_send(()).unwrap()
-            )
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || refresh
+                .try_send(())
+                .unwrap())
             .is_err()
         );
         notifications.try_recv()?;
@@ -3794,26 +4085,153 @@ mod tests {
                 &registry,
                 &request(&home.path().join("old")),
                 None,
-                crate::search_index::FULL_READ_SOURCE_BYTES,
+                None,
                 || refresh.try_send(()).unwrap()
             )
             .is_err()
         );
         notifications.try_recv()?;
         assert!(
-            workers::read_picker_preview(
-                &registry,
-                &request(&current),
-                None,
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || refresh.try_send(()).unwrap()
-            )?
+            workers::read_picker_preview(&registry, &request(&current), None, None, || refresh
+                .try_send(())
+                .unwrap())?
             .source_revision
             .file
             .is_some()
         );
         assert!(notifications.try_recv().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_late_name_receipt_cannot_revert_the_current_provider_name() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Codex, "renamed", project, Some("Amber Heron"));
+        native.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native], project, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let name = |previous: &str, current: &str| ProviderNameChange {
+            previous: Some(previous.to_owned()),
+            current: Some(current.to_owned()),
+        };
+        let changed = name("Amber Heron", "Violet Quokka");
+        assert!(state.accepts_provider_name(&key, &changed));
+        state.remember_provider_name(&key, changed);
+        assert!(!state.accepts_provider_name(&key, &name("Amber Heron", "Amber Heron")));
+        state.query = "amberheron".to_owned();
+        assert!(state.visible_indices().is_empty());
+        state.query = "violetquokka".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn verified_workspaces_refilter_open_picker_rows_and_survive_late_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let project_a = root.path().join("creation");
+        let project_b = root.path().join("continuation");
+        fs::create_dir(&project_a).unwrap();
+        fs::create_dir(&project_b).unwrap();
+        let revision = SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..SourceRevision::default()
+        };
+        let mut header = session(
+            Provider::Codex,
+            "rollout",
+            &project_a,
+            Some("provider title"),
+        );
+        header.source_revision = Some(revision);
+        let update = omnis_store::CodexWorkspaceUpdate::Verified(omnis_store::CodexWorkspace {
+            source_revision: revision,
+            project_path: Some(project_b.clone()),
+            git_branch: None,
+        });
+        let mut state = PickerState::new(vec![header.clone()], &project_a, None, false);
+        assert_eq!(state.visible_indices().len(), 1);
+
+        let mut key = state.preview_key(&state.entries[0]);
+        let preview = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("First prompt from this rollout")),
+            continuation: None,
+            complete: true,
+            message_count_is_complete: true,
+            source_provider: Provider::Codex,
+            can_use_first_title: true,
+        };
+        assert!(state.remember_preview_title(&mut key, &preview, Some(revision), None));
+        state.query = "first prompt".to_owned();
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), 1);
+        state.all_projects = false;
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        state.select_newest_session();
+        let selected = state.selected_entry().unwrap();
+        assert_eq!(
+            selected.session.project_path.as_deref(),
+            Some(project_b.as_path())
+        );
+        assert!(selected.session.git_branch.is_none());
+        assert_eq!(selected.session.title.as_deref(), Some("provider title"));
+
+        state.remember_codex_workspaces([(
+            header.session.clone(),
+            omnis_store::CodexWorkspaceUpdate::Withdrawn(revision),
+        )]);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_b.as_path())
+        );
+
+        header.source_revision.as_mut().unwrap().contents = Some(uuid::Uuid::from_u128(3));
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        state.remember_codex_workspaces([(header.session.clone(), update)]);
+        assert!(state.visible_indices().is_empty());
+        state.query.clear();
+        state.all_projects = false;
+        state.select_newest_session();
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_a.as_path())
+        );
     }
 
     #[test]
@@ -3888,24 +4306,36 @@ mod tests {
                 .context("listed rollout")
         };
         let read_preview = |key: &PreviewKey| {
-            workers::read_picker_preview(
-                &registry,
-                key,
-                Some(&rollout),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || {},
-            )
+            workers::read_picker_preview(&registry, key, Some(&rollout), None, || {})
         };
         let mut state = PickerState::new(vec![selected()?], home.path(), None, true);
         let key = state.preview_key(&state.entries[0]);
-        let read = read_preview(&key)?;
-        let revision = read.source_revision;
-        let preview = PreviewValue::Ready {
-            preview: Box::new(session_preview(&read.snapshot)),
-            continuation: None,
-            complete: true,
-            can_use_first_title: true,
-        };
+        let (sender, receiver) = mpsc::channel();
+        let (refresh, _) = mpsc::sync_channel(1);
+        let store = Store::open(home.path().join("index.sqlite3"))?;
+        let preview = workers::preview_update(
+            &registry,
+            Some(&store),
+            PreviewRequest {
+                key: key.clone(),
+                source_path: Some(rollout.clone()),
+                cached: false,
+                provider_name: None,
+            },
+            &sender,
+            &refresh,
+        );
+        assert!(matches!(
+            preview,
+            PickerUpdate::Preview {
+                value: PreviewValue::Ready { .. },
+                ..
+            }
+        ));
+        let revision = store
+            .trajectory_index_state(&key.session)?
+            .context("preview indexed the selected rollout")?
+            .source_revision;
         let receipt = |source_revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
             session: key.session.clone(),
             title: title.map(str::to_owned),
@@ -3935,7 +4365,6 @@ mod tests {
         );
         assert_eq!(revision.file == current.source_revision.file, in_place);
         assert_ne!(revision.contents, current.source_revision.contents);
-        let (sender, receiver) = mpsc::channel();
         sender.send(PickerUpdate::Indexing(crate::search_index::IndexProgress {
             titles: vec![
                 receipt(current.source_revision, Some("Restored title")),
@@ -3944,12 +4373,7 @@ mod tests {
             ],
             ..Default::default()
         }))?;
-        sender.send(PickerUpdate::Preview {
-            key: key.clone(),
-            value: preview,
-            read_revision: Some(revision),
-            indexed_title: Some(Box::new(receipt(revision, None))),
-        })?;
+        sender.send(preview)?;
         receive_updates(
             &receiver,
             &mut state,
@@ -4525,6 +4949,45 @@ mod tests {
     }
 
     #[test]
+    fn a_single_excerpt_requires_complete_message_coverage_for_the_only_message_label() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        let key = state.preview_key(&state.entries[0]);
+        for (full_read, known_prefix, all_messages, label) in [
+            (true, true, true, "ONLY MESSAGE"),
+            (false, true, false, "FIRST MESSAGE"),
+            (true, true, false, "FIRST MESSAGE"),
+            (false, false, false, "AVAILABLE MESSAGE"),
+        ] {
+            let mut preview = synthetic_preview("Opening request");
+            preview.latest.clone_from(&preview.first);
+            state.previews.insert(
+                key.clone(),
+                PreviewValue::Ready {
+                    preview: Box::new(preview),
+                    continuation: None,
+                    complete: full_read,
+                    source_provider: Provider::Codex,
+                    can_use_first_title: known_prefix,
+                    message_count_is_complete: all_messages,
+                },
+                &[],
+            );
+            let lines = selected_detail_lines(&state, 100, 40);
+            let header = format!("{label} · USER");
+            assert!(lines.iter().any(|line| line.text == header));
+            let summary = &lines[2].text;
+            assert_eq!(summary.contains("1 message ·"), all_messages);
+            assert_eq!(summary.contains("1 message in preview ·"), !all_messages);
+        }
+    }
+
+    #[test]
     fn selected_detail_shows_first_and_latest_messages() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -4567,6 +5030,8 @@ mod tests {
                 }),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
+                source_provider: Provider::Codex,
                 can_use_first_title: true,
             },
             &[],
@@ -4603,7 +5068,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "LATEST MESSAGE · ASSISTANT")
+                .any(|line| line == "LATEST AVAILABLE MESSAGE · ASSISTANT")
         );
         assert!(lines.iter().any(|line| line.contains("patch is ready")));
     }
@@ -4845,6 +5310,8 @@ mod tests {
             }),
             continuation: None,
             complete: false,
+            message_count_is_complete: false,
+            source_provider: Provider::Codex,
             can_use_first_title: true,
         };
 
@@ -4859,6 +5326,51 @@ mod tests {
 
         assert!(line.contains("Fix pagination without changing the API"));
         assert!(!line.contains("session-id"));
+    }
+
+    #[test]
+    fn codex_assistant_opener_stays_in_the_preview_without_naming_the_session() {
+        let project = Path::new("/workspace");
+        let answer = "Scarlet Finch answer";
+        for (provider, source_provider, expected_title) in [
+            (Provider::Codex, Provider::Codex, "Untitled session"),
+            (Provider::Imported, Provider::Codex, "Untitled session"),
+            (Provider::Pi, Provider::Pi, answer),
+        ] {
+            let mut state = PickerState::new(
+                vec![session(provider, "session-id", project, None)],
+                project,
+                None,
+                false,
+            );
+            let mut preview = synthetic_preview(answer);
+            preview.first.as_mut().unwrap().role = HandoffRole::Assistant;
+            preview.latest.clone_from(&preview.first);
+            let value = PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                source_provider,
+                can_use_first_title: true,
+                complete: true,
+                message_count_is_complete: true,
+            };
+            let mut key = state.preview_key(&state.entries[0]);
+            assert!(state.remember_preview_title(&mut key, &value, None, None));
+            state.previews.insert(key, value, &[]);
+            let detail = selected_detail_lines(&state, 100, 40);
+            assert_eq!(detail[1].text, expected_title);
+            assert!(
+                detail
+                    .iter()
+                    .any(|line| line.text == "ONLY MESSAGE · ASSISTANT")
+            );
+            assert!(detail.iter().any(|line| line.text == answer));
+            state.query = "scarlet finch".to_owned();
+            assert_eq!(
+                state.visible_indices().len(),
+                usize::from(provider == Provider::Pi)
+            );
+        }
     }
 
     #[test]
@@ -4897,6 +5409,8 @@ mod tests {
                 text: "Fix the retry race after this fork".to_owned(),
             }),
             complete: true,
+            message_count_is_complete: true,
+            source_provider: Provider::OpenCode,
             can_use_first_title: true,
         };
 
@@ -5687,6 +6201,7 @@ mod tests {
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
                 complete: false,
+                names: None,
             }))
             .expect("send failure");
 
@@ -5729,6 +6244,7 @@ mod tests {
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
                 complete: true,
+                names: None,
                 result: Ok(picker_entries(
                     vec![session(
                         Provider::Claude,
@@ -6298,8 +6814,16 @@ agent = "codex"
         );
         assert_eq!(target.to_string(), "claude-local");
         // An `--in` choice skips the page and carries the same pair.
-        let requested = requested_target(Some(target), TargetIntent::New, None, &[], None)
-            .expect("requested target");
+        let requested = requested_target(
+            &ResumeArgs {
+                target: Some(target),
+                ..Default::default()
+            },
+            TargetIntent::New,
+            None,
+            &[],
+        )
+        .expect("requested target");
         let TargetOutcome::Selected(choice) = requested else {
             panic!("`--in` selects without a page");
         };
@@ -6437,7 +6961,7 @@ agent = "codex"
         fs::write(temporary.path().join("alphabet.txt"), "ignored").expect("create file");
         let input = temporary.path().join("alp").display().to_string();
 
-        let completion = complete_directory_input(&input, temporary.path());
+        let completion = complete_directory_input(&input, temporary.path(), Provider::Codex);
 
         assert_eq!(
             completion.value,

@@ -176,8 +176,8 @@ fn git_pointer(path: &Path, has_prefix: bool) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Project;
     use super::*;
-    use crate::codex::rollout_identity::sqlite_home::Project;
     use std::process::Command;
 
     #[cfg(windows)]

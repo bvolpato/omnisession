@@ -40,13 +40,7 @@ impl Position {
         adapter: &CodexAdapter,
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Option<(PathBuf, Value)>> {
-        let Some(path) = adapter.rollout_path_in(
-            &self.thread_id.to_string(),
-            rollout_identity::IdKind::Rollout,
-            catalog,
-            None,
-        )?
-        else {
+        let Some(path) = adapter.ancestor_path(&self.thread_id.to_string(), catalog)? else {
             return Ok(None);
         };
         let header = rollout_file::header(&path)?
@@ -228,9 +222,8 @@ impl HistoryBase {
                 result => result?,
             };
             if segment.is_none() && scope == HistoryScope::Visible {
-                let catalog = catalog.unwrap_or_else(|| {
-                    fallback.get_or_init(|| adapter.selector.listing(home, std::iter::empty()))
-                });
+                let catalog =
+                    catalog.unwrap_or_else(|| fallback.get_or_init(|| RolloutCatalog::new(home)));
                 segment =
                     copies::verified_copy(home, catalog, &path, pos, &mut budget, |alternate| {
                         let records = rollout_file::header(alternate)?;
@@ -485,7 +478,7 @@ impl Lineage {
         let catalog = if let Some(catalog) = catalog {
             catalog
         } else {
-            standalone = adapter.selector.listing(home, std::iter::empty());
+            standalone = RolloutCatalog::new(home);
             &standalone
         };
         let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;

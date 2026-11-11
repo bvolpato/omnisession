@@ -6,6 +6,7 @@ mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
+mod cursor_identity;
 mod grok;
 mod hermes;
 mod omp;
@@ -31,16 +32,27 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
+pub use cursor_identity::{
+    cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
+};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, canonicalize_opencode_export, fork_opencode_session_with_binary,
-    installed_opencode_model, installed_opencode_model_with_binary, is_opencode_v2,
-    opencode_command_args, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    OpenCodeAdapter, OpenCodeGeneration, bounded_opencode_json_output,
+    canonicalize_opencode_export, find_opencode_session_with_binary,
+    fork_opencode_session_with_binary, installed_opencode_model,
+    installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
+    read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
-pub use provider_process::provider_process;
+#[cfg(windows)]
+pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
+pub use provider_process::{
+    ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
+    bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
+    inherit_provider_probes, provider_process, with_provider_probes,
+};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +61,29 @@ pub struct ProviderInstallation {
     pub installed: bool,
     pub executable: Option<PathBuf>,
     pub data_root: Option<PathBuf>,
+}
+
+/// The provider name established by the latest readable name index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NativeSessionName {
+    Named(String),
+    /// A complete name index has no assignment for this session.
+    Absent,
+    /// The available index cannot establish this session's current name.
+    #[default]
+    Unknown,
+}
+
+impl NativeSessionName {
+    /// Checks whether the observed name agrees with the session metadata.
+    #[must_use]
+    pub fn confirms(&self, expected: Option<&str>) -> bool {
+        match self {
+            Self::Named(current) => expected == Some(current.as_str()),
+            Self::Absent => expected.is_none(),
+            Self::Unknown => false,
+        }
+    }
 }
 
 /// Metadata returned by session discovery. Transcript content is intentionally absent.
@@ -67,11 +102,103 @@ pub struct NativeSession {
     pub source_revision: Option<SourceRevision>,
 }
 
+/// The opener confirmed by a full ordinary Codex read or by reconstructing an applied rollback.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RollbackTitle {
+    #[default]
+    Unknown,
+    /// The source is an ordinary local session. Its opening title remains unconfirmed.
+    UnknownLocal,
+    /// An empty title means the surviving transcript has no eligible user opener.
+    Known(Option<String>),
+    /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
+    UnknownAfterWithdrawal(WithdrawnOpeners),
+}
+
+/// Bounded evidence about local opening titles removed before the first unreadable row.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WithdrawnOpeners {
+    hashes: Vec<[u8; 32]>,
+    overflowed: bool,
+}
+
+impl WithdrawnOpeners {
+    fn record(&mut self, hash: [u8; 32]) {
+        if !self.hashes.contains(&hash) {
+            if self.hashes.len() < 8 {
+                self.hashes.push(hash);
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+
+    fn reissued(&mut self, title: &str) {
+        if !self.hashes.is_empty() {
+            let hash = RollbackTitle::fingerprint(title);
+            self.hashes.retain(|previous| *previous != hash);
+        }
+    }
+
+    fn after_gap(&self) -> RollbackTitle {
+        if self.hashes.is_empty() && !self.overflowed {
+            RollbackTitle::UnknownLocal
+        } else {
+            RollbackTitle::UnknownAfterWithdrawal(self.clone())
+        }
+    }
+}
+
+impl RollbackTitle {
+    fn fingerprint(title: &str) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(title.as_bytes()).into()
+    }
+
+    /// Whether this reconstruction witnessed the saved opener being removed before a gap.
+    #[must_use]
+    pub fn withdraws(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.hashes.contains(&Self::fingerprint(title)))
+    }
+
+    /// Whether a single-title check can resolve an overflow in the bounded withdrawal history.
+    #[must_use]
+    pub fn needs_withdrawal_check(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.overflowed && !self.withdraws(title))
+    }
+}
+
+/// The effective workspace established independently of the amount of indexed conversation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CodexWorkspaceProjection {
+    #[default]
+    Unchecked,
+    /// No directory means the selected rollout establishes that its workspace is unknown.
+    Observed(Option<PathBuf>),
+}
+
+impl CodexWorkspaceProjection {
+    fn from_reconstruction(verified: bool, directory: Option<&Path>) -> Self {
+        if verified {
+            Self::Observed(
+                directory
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            )
+        } else {
+            Self::Unchecked
+        }
+    }
+}
+
 /// A canonical snapshot and the source state observed while building it.
 pub struct IndexRead {
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
+    pub rollback_title: RollbackTitle,
+    /// The workspace projection belongs to this read's source revision.
+    pub workspace_projection: CodexWorkspaceProjection,
     pub source_revision: SourceRevision,
     /// True when the read retained all available canonical events. The snapshot can still report missing history.
     pub source_complete: bool,
@@ -145,6 +272,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Finds candidates for live indexing in one project, including recorded workspace changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        Ok((self.list_sessions(Some(project))?, self.discovery_notes()))
+    }
+
     /// Finds session metadata by exact native ID.
     ///
     /// An exact ID is an explicit selection. Adapters whose listings hide sessions that the
@@ -170,18 +309,18 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(NativeResumeSupport::Direct)
     }
 
-    /// Checks whether a native launch in this directory selects the displayed session.
+    /// Resolves the local Codex database directory for a continuation. An existing ID must select the displayed session there.
     ///
     /// # Errors
     ///
     /// Returns an error if the adapter cannot resolve the launch configuration.
-    fn native_selects_session_at(
+    fn codex_continuation_sqlite_home(
         &self,
-        _session: &SessionRef,
+        _session: Option<&SessionRef>,
         _cwd: &Path,
         _overrides: &CodexLaunchOverrides,
-    ) -> Result<bool> {
-        Ok(true)
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// Non-fatal discovery observations from this adapter.
@@ -200,11 +339,32 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
-    /// Returns cached Codex sessions that their current state database entries rule out.
+    /// Returns whether a missing provider name confirms that the session has no name.
+    fn session_titles_are_complete(&self) -> bool {
+        false
+    }
+
+    /// Reads the latest name assignment for one session.
+    fn native_session_name(&self, _id: &str) -> NativeSessionName {
+        NativeSessionName::Unknown
+    }
+
+    /// Returns earlier readable assignments that can corroborate a saved name for the same rollout.
+    /// An unreadable later row prevents these assignments from establishing the current name.
+    fn prior_session_names(&self, _sessions: &[&NativeSession]) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    /// Checks whether the name still matches the provider's index after a session read.
+    fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
+        self.native_session_name(id).confirms(name)
+    }
+
+    /// Returns the cached Codex sessions that their recorded rollout selections rule out.
     ///
     /// # Errors
     ///
-    /// Returns an error if the current entries cannot be read.
+    /// Returns an error if the provider's current selections cannot be checked.
     fn unavailable_codex_rollouts(
         &self,
         _prior: &[(String, Option<SourceRevision>)],
@@ -293,6 +453,8 @@ pub trait ProviderAdapter: Send + Sync {
         };
         Ok(IndexRead {
             source_revision: SourceRevision::default(),
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
+            rollback_title: RollbackTitle::Unknown,
             native_session: None,
             snapshot,
             source_complete,

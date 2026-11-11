@@ -1,9 +1,8 @@
 use std::{
     collections::HashSet,
     env, fs,
-    io::{BufRead, BufReader, Read, Seek, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,14 +18,10 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::provider_compatibility::{MINIMUM_OMP_VERSION, MINIMUM_PI_VERSION};
 use crate::recovery::ImportSource;
-use crate::{
-    interrupt::{HelperProcess, wait_or_kill},
-    provider_compatibility::{MINIMUM_OMP_VERSION, MINIMUM_PI_VERSION},
-};
 
 const PI_SESSION_VERSION: u64 = 3;
-const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const MAX_DELETE_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_DELETE_HEADER_LINE_BYTES: u64 = 64 * 1024;
 
@@ -326,7 +321,7 @@ fn omp_title_slot(title: &str, timestamp: &str) -> Result<Value> {
 
 /// Validates Pi CLI version against Pi's documented v3 session format.
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary, Provider::Pi)?;
+    let version = crate::version_gate::installed_version(binary, Provider::Pi)?;
     if !is_supported_version(&version) {
         bail!(
             "Pi {version} is too old for native v{PI_SESSION_VERSION} import; supported versions: >= {MINIMUM_PI_VERSION}"
@@ -336,7 +331,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 pub fn ensure_omp_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary, Provider::OhMyPi)?;
+    let version = crate::version_gate::installed_version(binary, Provider::OhMyPi)?;
     if !crate::version_gate::is_release_at_least(&version, MINIMUM_OMP_VERSION) {
         bail!(
             "Oh My Pi {version} is too old for native v3 import; supported versions: >= {MINIMUM_OMP_VERSION}"
@@ -842,43 +837,6 @@ fn sync_directory(path: &Path) -> Result<()> {
         bail!("`{}` is not a directory", path.display());
     }
     Ok(())
-}
-
-fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
-    let name = crate::transfer::provider_name(provider);
-    let mut output = NamedTempFile::new().context("creating Pi version output buffer")?;
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output.reopen()?))
-        .stderr(Stdio::null())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Pi version")?
-    else {
-        bail!("{name} version probe timed out");
-    };
-    if !status.success() {
-        bail!("{name} version probe exited with status {status}");
-    }
-    if output.as_file().metadata()?.len() > MAX_VERSION_OUTPUT {
-        bail!("Pi version output exceeds safe limit");
-    }
-    output.as_file_mut().rewind()?;
-    let mut version = String::new();
-    output
-        .as_file_mut()
-        .take(MAX_VERSION_OUTPUT + 1)
-        .read_to_string(&mut version)?;
-    let normalized = if provider == Provider::OhMyPi {
-        version.trim().strip_prefix("omp/").unwrap_or(&version)
-    } else {
-        &version
-    };
-    crate::version_gate::find_version(normalized)
-        .with_context(|| format!("{name} returned an unrecognized version"))
 }
 
 #[cfg(test)]

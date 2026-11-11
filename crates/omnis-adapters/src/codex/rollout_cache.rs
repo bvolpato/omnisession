@@ -21,9 +21,10 @@ use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 8] = [
+const PARSER_SOURCES: [&[u8]; 9] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
+    include_bytes!("current_rollout.rs"),
     include_bytes!("rollout_cache.rs"),
     include_bytes!("history_base.rs"),
     include_bytes!("history_base/copies.rs"),
@@ -71,6 +72,7 @@ pub(super) fn default_path(codex_home: &Path) -> Option<PathBuf> {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ObservedRollout {
     pub(super) revision: SourceRevision,
+    pub(super) has_file_identity: bool,
     pub(super) stamp: Option<RolloutStamp>,
     pub(super) modified: Option<DateTime<Utc>>,
 }
@@ -84,19 +86,20 @@ impl ObservedRollout {
             canonical.as_os_str().as_encoded_bytes(),
         );
         #[cfg(windows)]
-        let (metadata, object) = {
+        let (metadata, object, has_file_identity) = {
             use std::os::windows::fs::MetadataExt;
             let handle = fs::File::open(&canonical).ok()?;
             let metadata = handle.metadata().ok()?;
-            let object = if let Ok(info) = winapi_util::file::information(&handle)
+            let (object, has_file_identity) = if let Ok(info) =
+                winapi_util::file::information(&handle)
                 && info.file_index() != 0
             {
-                [info.volume_serial_number(), info.file_index()]
+                ([info.volume_serial_number(), info.file_index()], true)
             } else {
                 // Some network filesystems expose a creation time but no file index.
-                [u64::MAX, metadata.creation_time()]
+                ([u64::MAX, metadata.creation_time()], false)
             };
-            (metadata, object)
+            (metadata, object, has_file_identity)
         };
         #[cfg(not(windows))]
         let metadata = fs::metadata(&canonical).ok()?;
@@ -104,19 +107,22 @@ impl ObservedRollout {
             return None;
         }
         #[cfg(unix)]
-        let object = {
+        let (object, has_file_identity) = {
             use std::os::unix::fs::MetadataExt;
-            [metadata.dev(), metadata.ino()]
+            ([metadata.dev(), metadata.ino()], metadata.ino() != 0)
         };
         #[cfg(any(unix, windows))]
         let file = Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened());
         #[cfg(not(any(unix, windows)))]
         let file = path_id;
+        #[cfg(not(any(unix, windows)))]
+        let has_file_identity = false;
         let mut stamp = RolloutStamp::new(&metadata);
         if let Some(stamp) = &mut stamp {
             stamp.file_id = Some(file);
         }
         Some(Self {
+            has_file_identity,
             modified: metadata.modified().ok().map(DateTime::<Utc>::from),
             stamp,
             revision: SourceRevision {
@@ -183,12 +189,13 @@ impl RolloutStamp {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RolloutHeader {
     pub(super) id: String,
+    pub(super) forked_from_id: Option<Uuid>,
     pub(super) project_path: Option<PathBuf>,
     pub(super) git_branch: Option<String>,
     pub(super) cli_version: Option<String>,
     pub(super) history_base: super::HistoryBase,
     pub(super) subagent_history_start: Option<u64>,
-    pub(super) is_paginated: bool,
+    pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }

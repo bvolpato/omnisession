@@ -196,9 +196,10 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         truncation_strategy: "none",
         source_complete: true,
         origin: SessionTrajectoryOrigin::Native,
-        document_version: omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
+        document_version: omnis_core::search_document_version(Provider::Codex),
         derived_title: None,
         title_is_verified: false,
+        local_opener: omnis_store::LocalOpenerEvidence::Unknown,
         withdrawn_title: None,
         title_authoritative: false,
     }

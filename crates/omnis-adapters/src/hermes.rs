@@ -111,6 +111,8 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
                 native_session: None,
                 source_revision: SourceRevision::default(),
                 snapshot: builder.snapshot(

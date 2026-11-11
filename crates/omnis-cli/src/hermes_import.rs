@@ -783,37 +783,43 @@ fn hermes_root() -> Result<PathBuf> {
 fn installed_version(binary: &Path) -> Result<String> {
     const SCRIPT: &str = include_str!("hermes_version.py");
     let runtime = resolve_hermes_runtime(binary)?;
-    let mut child = Command::new(&runtime.python)
+    let mut command = Command::new(&runtime.python);
+    command
         .args(["-I", "-S", "-B", "-c"])
         .arg(SCRIPT)
         .arg(&runtime.metadata_prefix)
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONHOME")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| {
-            format!(
-                "executing Hermes version probe through `{}`",
-                runtime.python.display()
-            )
-        })?;
-    // The probe starts Python and runs several `git` commands, so it needs more than one launch.
-    let Some(status) = wait_or_kill(&mut child, 2 * crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Hermes version")?
-    else {
-        bail!("Hermes version probe timed out");
-    };
-    let output = child.wait_with_output().context("reading Hermes version")?;
+        .stdin(Stdio::null());
+    let direct_script = runtime.direct_script.clone();
+    // The probe starts Python and runs several git commands, so allow time for both.
+    let output = crate::interrupt::with_provider_probes(|| {
+        omnis_adapters::bounded_provider_text_output(
+            &mut command,
+            2 * crate::version_gate::PROBE_TIMEOUT,
+            1024 * 1024,
+            Some(1024 * 1024),
+            move |text| version_from_metadata(text, direct_script.as_deref()).is_ok(),
+        )
+    })
+    .with_context(|| {
+        format!(
+            "checking Hermes version with `{}`",
+            runtime.python.display()
+        )
+    })?;
+    let status = output.status;
     if !status.success() {
         bail!(
             "Hermes version probe exited with status {status}: {}",
             redact_secrets(&String::from_utf8_lossy(&output.stderr))
         )
     }
-    let text = String::from_utf8(output.stdout).context("Hermes version was not UTF-8")?;
+    let text = std::str::from_utf8(&output.stdout).context("Hermes version was not UTF-8")?;
+    version_from_metadata(text, runtime.direct_script.as_deref())
+}
+
+fn version_from_metadata(text: &str, direct_script: Option<&Path>) -> Result<String> {
     let mut lines = text.lines();
     let version = lines
         .next()
@@ -822,20 +828,19 @@ fn installed_version(binary: &Path) -> Result<String> {
     let entry_point = lines
         .next()
         .filter(|entry_point| !entry_point.is_empty())
-        .context("Hermes metadata omitted its hermes console entry point")?
-        .to_owned();
-    let scripts_dirs = lines
-        .filter(|scripts_dir| !scripts_dir.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if scripts_dirs.is_empty() {
+        .context("Hermes metadata omitted its hermes console entry point")?;
+    let mut scripts_dirs = lines
+        .filter(|dir| !dir.is_empty())
+        .map(Path::new)
+        .peekable();
+    if scripts_dirs.peek().is_none() {
         bail!("Hermes metadata omitted its console-script directory")
     }
     if entry_point != HERMES_CONSOLE_ENTRY_POINT {
         bail!("Hermes launcher does not match its installed hermes entry point")
     }
-    if let Some(script) = runtime.direct_script {
-        let matches_selected_environment = scripts_dirs.iter().any(|scripts_dir| {
+    if let Some(script) = direct_script {
+        let matches_selected_environment = scripts_dirs.any(|scripts_dir| {
             fs::canonicalize(scripts_dir.join("hermes")).is_ok_and(|expected| script == expected)
         });
         if !matches_selected_environment {
@@ -1367,6 +1372,23 @@ printf args > {:?}; exit 64\n",
             "0.20.5"
         );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn metadata_requires_the_directory_containing_the_selected_console_script() {
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("hermes");
+        fs::write(&script, []).unwrap();
+        let selected = fs::canonicalize(script).unwrap();
+        let prefix = format!("0.20.5\n{HERMES_CONSOLE_ENTRY_POINT}\n");
+        let other = temporary.path().join("other");
+        let partial = format!("{prefix}{}\n", other.display());
+        assert!(version_from_metadata(&partial, Some(&selected)).is_err());
+        let complete = format!("{partial}{}\n", temporary.path().display());
+        assert_eq!(
+            version_from_metadata(&complete, Some(&selected)).unwrap(),
+            "0.20.5"
+        );
     }
 
     #[cfg(unix)]

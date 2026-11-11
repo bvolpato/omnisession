@@ -461,11 +461,13 @@ fn switching_the_configured_state_database_selects_its_current_generation() -> R
             ),
         )?;
         assert_eq!(
-            adapter.native_selects_session_at(
-                &session,
-                &nested,
-                &omnis_adapters::CodexLaunchOverrides::default()
-            )?,
+            adapter
+                .codex_continuation_sqlite_home(
+                    Some(&session),
+                    &nested,
+                    &omnis_adapters::CodexLaunchOverrides::default()
+                )?
+                .is_some(),
             agrees
         );
     }
@@ -477,11 +479,15 @@ fn switching_the_configured_state_database_selects_its_current_generation() -> R
         "UPDATE threads SET rollout_path = ?1",
         [selected.to_str().unwrap()],
     )?;
-    assert!(adapter.native_selects_session_at(
-        &session,
-        &nested,
-        &omnis_adapters::CodexLaunchOverrides::default()
-    )?);
+    assert!(
+        adapter
+            .codex_continuation_sqlite_home(
+                Some(&session),
+                &nested,
+                &omnis_adapters::CodexLaunchOverrides::default()
+            )?
+            .is_some()
+    );
 
     fs::write(config, "sqlite_home = 1234")?;
     let error = adapter.read_session(&session).unwrap_err();

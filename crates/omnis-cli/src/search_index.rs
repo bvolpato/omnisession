@@ -17,14 +17,16 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, IndexSessionReader, NativeSession};
+use omnis_adapters::{
+    AdapterRegistry, IndexRead, IndexSessionReader, NativeSession, NativeSessionName, RollbackTitle,
+};
 use omnis_core::{
-    SearchDocument, search_document_version, session_search_title,
-    session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
+    SearchDocument, search_document_version, session_message_prefix_is_known,
+    session_message_search_title, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    IndexedSession, IndexedTrajectoryTitle, MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+    IndexedSession, IndexedTrajectoryTitle, LocalOpenerEvidence, MAX_TRAJECTORY_WRITE_BATCH_BYTES,
     MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SelectedSessionObservation, SessionTrajectoryOrigin,
     Store, TrajectoryDocument, TrajectoryIndexFailure, TrajectoryIndexState, TrajectorySourceGuard,
 };
@@ -118,6 +120,15 @@ impl IndexCandidate {
         })
     }
 
+    fn can_prepare_in_worker(&self, guard: TrajectorySourceGuard) -> bool {
+        // Legacy projection checks need the store. Read a previously full, oversized rollout on the calling thread.
+        reads_transcript_file(self.session.provider)
+            && !needs_legacy_projection_check(guard, self.updated_at)
+            && (projection_read_budget(guard, self.updated_at, self.source_revision)
+                == FULL_READ_SOURCE_BYTES
+                || self.can_upgrade_preview())
+    }
+
     fn can_upgrade_preview(&self) -> bool {
         if matches!(self.session.provider, Provider::Hermes | Provider::Codex) {
             // The physical size does not measure the selected session's decoded history.
@@ -131,12 +142,13 @@ impl IndexCandidate {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct IndexProgress {
     pub(crate) indexed: usize,
     pub(crate) total: usize,
     pub(crate) failed: usize,
     pub(crate) titles: Vec<IndexedTrajectoryTitle>,
+    pub(crate) workspaces: Vec<(SessionRef, omnis_store::CodexWorkspaceUpdate)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -184,14 +196,13 @@ pub(crate) fn projection_read_budget(
     let TrajectorySourceGuard::Observed(Some(prior)) = guard else {
         return FULL_READ_SOURCE_BYTES;
     };
-    let same_revision = |old: Option<_>, new| old.zip(new).is_none_or(|(a, b)| a == b);
     if prior.source_complete
         && prior.document_version < search_document_version(Provider::Codex)
         && updated_at.is_some_and(|timestamp| {
             !source_time_changed(Provider::Codex, timestamp, prior.source_updated_at)
         })
-        && same_revision(prior.source_revision.file, revision.file)
-        && same_revision(prior.source_revision.contents, revision.contents)
+        && revision.contents.is_some()
+        && revision.matches_file_contents(prior.source_revision)
     {
         u64::MAX
     } else {
@@ -199,18 +210,63 @@ pub(crate) fn projection_read_budget(
     }
 }
 
-pub(crate) fn observe_source(
+fn needs_legacy_projection_check(
+    guard: TrajectorySourceGuard,
+    updated_at: Option<DateTime<Utc>>,
+) -> bool {
+    let TrajectorySourceGuard::Observed(Some(prior)) = guard else {
+        return false;
+    };
+    matches!(prior.document_version, 4 | 5)
+        && prior.source_complete
+        && prior.source_revision == SourceRevision::default()
+        && updated_at
+            .is_none_or(|time| !source_time_changed(Provider::Codex, time, prior.source_updated_at))
+}
+
+pub(crate) fn verify_legacy_search_read(
+    registry: &AdapterRegistry,
     store: &Store,
-    session: &SessionRef,
-) -> omnis_store::Result<TrajectorySourceGuard> {
-    if session.provider == Provider::Codex {
-        Ok(source_guard(
-            session.provider,
-            store.trajectory_index_state(session)?.as_ref(),
-        ))
-    } else {
-        Ok(TrajectorySourceGuard::NewerSource)
+    guard: TrajectorySourceGuard,
+    read: IndexRead,
+) -> Result<IndexRead> {
+    let session = &read.snapshot.session;
+    let time = read.snapshot.captured_at;
+    if read.source_complete
+        || session.provider != Provider::Codex
+        || read.source_revision.file.is_none()
+        || read.source_revision.contents.is_none()
+        || !needs_legacy_projection_check(guard, Some(time))
+    {
+        return Ok(read);
     }
+    let Some(hash) = store.legacy_codex_projection_hash(session, time)? else {
+        return Ok(read);
+    };
+    let selected_path = || -> Result<PathBuf> {
+        registry
+            .find_native_session(Provider::Codex, &session.id)?
+            .filter(|native| {
+                native
+                    .source_revision
+                    .is_some_and(|revision| revision.matches_file_contents(read.source_revision))
+            })
+            .and_then(|native| native.source_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "selected Codex rollout changed during legacy projection verification"
+                )
+            })
+    };
+    let path = selected_path()?;
+    let verified =
+        omnis_adapters::CodexAdapter::verify_legacy_search_projection(session, &path, &read, &hash);
+    anyhow::ensure!(
+        selected_path()? == path,
+        "selected Codex rollout changed during legacy projection verification"
+    );
+    // Keep the ordinary preview when the historical projection cannot be reproduced.
+    Ok(verified.ok().flatten().unwrap_or(read))
 }
 
 #[cfg(test)]
@@ -332,13 +388,16 @@ fn pending(
     retry_failed: bool,
 ) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
-    let conflicts = if candidates
+    let (conflicts, deferred_names) = if candidates
         .iter()
         .any(|candidate| candidate.session.provider == Provider::Codex)
     {
-        store.conflicting_codex_catalog_rows()?
+        (
+            store.conflicting_codex_catalog_rows()?,
+            store.legacy_codex_name_retries()?,
+        )
     } else {
-        HashSet::new()
+        (HashSet::new(), HashMap::new())
     };
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
@@ -372,7 +431,9 @@ fn pending(
             && prior
                 .and_then(|s| s.source_revision.missing_ancestor)
                 .is_some_and(|id| restored.contains(&id));
-        if !ancestor_restored && !needs_index_at(&candidate, revision, prior) {
+        let retry_name = deferred_names.get(&candidate.session) == Some(&revision)
+            && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Absent);
+        if !ancestor_restored && !retry_name && !needs_index_at(&candidate, revision, prior) {
             if candidate.session.provider == Provider::Codex
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
@@ -451,20 +512,22 @@ fn observe_replacements(
     {
         return Ok(observations);
     }
-    let catalog = store
-        .indexed_sessions_for_provider(Provider::Codex)?
-        .into_iter()
-        .map(|row| (row.session.clone(), row))
+    let inventory = store.observe_codex_catalog_inventory()?;
+    let catalog = inventory
+        .observed
+        .iter()
+        .map(|row| (&row.session, row))
         .collect::<HashMap<_, _>>();
     for (candidate, guard) in stale {
         let Some(metadata) = &candidate.metadata else {
             continue;
         };
-        if failures.contains_key(&candidate.session)
+        if inventory.legacy_codex_source(&candidate.session).is_some()
+            || failures.contains_key(&candidate.session)
             || matches!(guard, TrajectorySourceGuard::Observed(Some(prior)) if prior.source_revision.file != candidate.source_revision.file)
             || catalog
                 .get(&candidate.session)
-                .is_some_and(|stored| stored != metadata)
+                .is_some_and(|stored| *stored != metadata)
         {
             observations.insert(
                 candidate.session.clone(),
@@ -548,44 +611,41 @@ pub(crate) fn index_candidates(
         titles: hidden,
         ..IndexProgress::default()
     });
-    let mut titles = Vec::new();
+    let mut updates = IndexProgress::default();
     let mut last_report = Instant::now();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     let read_session = batch_session_reader(registry, &stale);
+    let prepare_read = |candidate: &IndexCandidate, guard, store: Option<&Store>| {
+        prepare_session(registry, candidate, guard, Some(&read_session), store)
+    };
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let read = |(candidate, guard): &(IndexCandidate, TrajectorySourceGuard)| {
-        prepare_session(registry, candidate, *guard, Some(&read_session))
-    };
-    let prepare = |item: &(IndexCandidate, TrajectorySourceGuard)| {
-        let (candidate, guard) = item;
-        let budget =
-            projection_read_budget(*guard, candidate.updated_at, candidate.source_revision);
-        // A previously full, oversized rollout can be read on the calling thread.
-        (reads_transcript_file(candidate.session.provider)
-            && (budget == FULL_READ_SOURCE_BYTES || candidate.can_upgrade_preview()))
-        .then(|| read(item))
-    };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
-        &prepare,
+        &|(candidate, guard)| {
+            candidate
+                .can_prepare_in_worker(*guard)
+                .then(|| prepare_read(candidate, *guard, None))
+        },
         |item, prepared| {
             let (candidate, guard) = item;
             if stop() {
-                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut updates);
                 summary.stopped = true;
                 return false;
             }
-            let prepared = prepared.unwrap_or_else(|| read(item)).and_then(|mut read| {
-                read.title.check_withdrawal(
-                    registry,
-                    store,
-                    &candidate.session,
-                    read.source_revision,
-                )?;
-                Ok(read)
-            });
+            let prepared = prepared
+                .unwrap_or_else(|| prepare_read(candidate, *guard, Some(store)))
+                .and_then(|mut read| {
+                    read.title.check_withdrawal(
+                        registry,
+                        store,
+                        &candidate.session,
+                        read.source_revision,
+                    )?;
+                    Ok(read)
+                });
             match prepared {
                 Ok(prepared) if observations.contains_key(&candidate.session) => {
                     publish_replacement(
@@ -594,7 +654,7 @@ pub(crate) fn index_candidates(
                         &prepared,
                         &observations[&candidate.session],
                         &mut summary,
-                        &mut titles,
+                        &mut updates,
                     );
                 }
                 Ok(prepared) => {
@@ -607,7 +667,7 @@ pub(crate) fn index_candidates(
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
                                 > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
                     {
-                        flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                        flush_batch(registry, store, &mut batch, &mut summary, &mut updates);
                         batch_bytes = 0;
                     }
                     batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
@@ -615,25 +675,27 @@ pub(crate) fn index_candidates(
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    titles.extend(candidate.record_failure(registry, store, *guard, &error));
+                    updates
+                        .titles
+                        .extend(candidate.record_failure(registry, store, *guard, &error));
                 }
             }
             if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                 || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
                 || last_report.elapsed() >= PROGRESS_INTERVAL
             {
-                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut updates);
                 batch_bytes = 0;
             }
             if last_report.elapsed() >= PROGRESS_INTERVAL {
-                report(progress(&summary, &mut titles));
+                report(progress(&summary, &mut updates));
                 last_report = Instant::now();
             }
             true
         },
     );
-    flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
-    report(progress(&summary, &mut titles));
+    flush_batch(registry, store, &mut batch, &mut summary, &mut updates);
+    report(progress(&summary, &mut updates));
     Ok(summary)
 }
 
@@ -643,13 +705,14 @@ fn publish_replacement(
     prepared: &PreparedIndex,
     observation: &SelectedSessionObservation,
     summary: &mut IndexSummary,
-    titles: &mut Vec<IndexedTrajectoryTitle>,
+    updates: &mut IndexProgress,
 ) {
     let session = &prepared.candidate.session;
     match publish_selected_read(registry, store, prepared, observation) {
         Ok(title) => {
             summary.indexed += 1;
-            titles.extend(title);
+            updates.titles.extend(title);
+            updates.record_workspace(prepared);
         }
         Err(error) => {
             summary.failed += 1;
@@ -687,11 +750,44 @@ fn publish_selected_read(
         .candidate
         .selected_codex(registry, revision)
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
-    store.upsert_selected_session_document_with_workspace(
-        &crate::indexed_session_metadata(&selected),
+    let name_observed = verified_name_coverage(read.native_name.as_ref(), Some(&selected))?;
+    let mut metadata = crate::indexed_session_metadata(&selected);
+    let history = corroborated_codex_name(
+        registry,
+        &selected,
+        revision,
+        &metadata,
         observation,
-        read.store_document(),
+        read.native_name.as_ref(),
+    );
+    let mut document = read.store_document();
+    let retained;
+    if let Some(current) = &observation.metadata
+        && current.source_revision == metadata.source_revision
+        && current.updated_at == metadata.updated_at
+        && current.title != metadata.title
+    {
+        if name_observed {
+            return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
+        }
+        metadata.title.clone_from(&current.title);
+        retained = metadata
+            .title
+            .as_deref()
+            .and_then(omnis_core::compact_search_title);
+        document.derived_title = retained.as_deref();
+        document.title_authoritative = retained.is_some();
+        document.title_is_verified = retained.is_some();
+        document.local_opener = LocalOpenerEvidence::Unknown;
+        document.withdrawn_title = None;
+    }
+    store.upsert_selected_session_document_with_name_history(
+        &metadata,
+        observation,
+        document,
         read.workspace.as_ref(),
+        name_observed,
+        history.as_ref().map(|prior| prior.assignment.as_str()),
     )?;
     Ok(store.indexed_trajectory_title(&read.candidate.session)?)
 }
@@ -825,7 +921,7 @@ fn flush_batch(
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
-    titles: &mut Vec<IndexedTrajectoryTitle>,
+    updates: &mut IndexProgress,
 ) {
     if batch.is_empty() {
         return;
@@ -841,11 +937,16 @@ fn flush_batch(
             )
         })
         .collect::<Vec<_>>();
-    let stored = store.upsert_observed_trajectory_documents_with_workspaces(&documents);
+    let names = batch
+        .iter()
+        .filter_map(|read| read.candidate.metadata.as_ref())
+        .collect::<Vec<_>>();
+    let stored = store.upsert_discovered_trajectory_documents(&documents, &names);
     if stored.is_ok() {
         summary.indexed += batch.len();
         for prepared in batch.drain(..) {
-            prepared.report_title(store, titles);
+            updates.record_workspace(&prepared);
+            prepared.report_title(store, &mut updates.titles);
         }
     } else {
         for mut prepared in batch.drain(..) {
@@ -868,6 +969,7 @@ fn flush_batch(
                         &selected,
                         TrajectorySourceGuard::Observed(observation.state),
                         None,
+                        Some(store),
                     )?;
                     read.title
                         .check_withdrawal(registry, store, session, read.source_revision)?;
@@ -881,7 +983,8 @@ fn flush_batch(
             }
             if stored.is_ok() {
                 summary.indexed += 1;
-                prepared.report_title(store, titles);
+                updates.record_workspace(&prepared);
+                prepared.report_title(store, &mut updates.titles);
             } else {
                 summary.failed += 1;
             }
@@ -889,13 +992,115 @@ fn flush_batch(
     }
 }
 
-fn progress(summary: &IndexSummary, titles: &mut Vec<IndexedTrajectoryTitle>) -> IndexProgress {
+impl IndexProgress {
+    pub(crate) fn processed(&self) -> usize {
+        self.indexed + self.failed
+    }
+
+    fn record_workspace(&mut self, prepared: &PreparedIndex) {
+        if let Some(workspace) = &prepared.workspace {
+            self.workspaces
+                .push((prepared.candidate.session.clone(), workspace.clone()));
+        }
+    }
+}
+
+fn progress(summary: &IndexSummary, updates: &mut IndexProgress) -> IndexProgress {
     IndexProgress {
-        indexed: summary.indexed + summary.failed,
+        indexed: summary.indexed,
         total: summary.stale,
         failed: summary.failed,
-        titles: std::mem::take(titles),
+        ..std::mem::take(updates)
     }
+}
+
+pub(crate) fn native_codex_name(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+) -> Result<Option<NativeSessionName>> {
+    (session.provider == Provider::Codex)
+        .then(|| {
+            registry
+                .adapter(Provider::Codex)
+                .map(|adapter| adapter.native_session_name(&session.id))
+        })
+        .transpose()
+}
+
+pub(crate) struct CorroboratedCodexName<'a> {
+    pub(crate) stored: &'a str,
+    pub(crate) assignment: String,
+}
+
+pub(crate) fn corroborated_codex_name<'a>(
+    registry: &AdapterRegistry,
+    native: &NativeSession,
+    revision: SourceRevision,
+    selected: &IndexedSession,
+    observation: &'a SelectedSessionObservation,
+    name: Option<&NativeSessionName>,
+) -> Option<CorroboratedCodexName<'a>> {
+    if name != Some(&NativeSessionName::Unknown)
+        || native.title.is_some()
+        || !native
+            .source_revision
+            .is_some_and(|source| source.matches_file_contents(revision))
+        || !observation.legacy_codex_name_candidate(selected)
+    {
+        return None;
+    }
+    let assignment = registry
+        .adapter(Provider::Codex)
+        .ok()?
+        .prior_session_names(&[native])
+        .remove(&native.session.id)?;
+    let stored = observation.corroborated_legacy_codex_name(selected, &assignment)?;
+    Some(CorroboratedCodexName { stored, assignment })
+}
+
+pub(crate) fn verified_name_coverage(
+    name: Option<&NativeSessionName>,
+    native: Option<&NativeSession>,
+) -> Result<bool> {
+    let (Some(name), Some(native)) = (name, native) else {
+        return Ok(false);
+    };
+    if name.confirms(native.title.as_deref()) {
+        Ok(true)
+    } else if *name == NativeSessionName::Unknown && native.title.is_none() {
+        Ok(false)
+    } else {
+        Err(omnis_store::StoreError::TrajectorySourceChanged.into())
+    }
+}
+
+fn legacy_opener_name(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    revision: SourceRevision,
+    prior: &omnis_store::LegacyCodexOpenerCandidate,
+    selected_path: impl Fn() -> Result<PathBuf>,
+) -> Result<Option<NativeSessionName>> {
+    let Some(name @ (NativeSessionName::Absent | NativeSessionName::Unknown)) =
+        native_codex_name(registry, session)?
+    else {
+        return Ok(None);
+    };
+    if !omnis_adapters::CodexAdapter::verify_legacy_local_opener(
+        &selected_path()?,
+        session,
+        revision,
+        &prior.title,
+        prior.requires_tool_catalog,
+    )? {
+        return Ok(None);
+    }
+    selected_path()?;
+    anyhow::ensure!(
+        native_codex_name(registry, session)?.as_ref() == Some(&name),
+        omnis_store::StoreError::TrajectorySourceChanged
+    );
+    Ok(Some(name))
 }
 
 #[derive(Default)]
@@ -903,6 +1108,8 @@ pub(crate) struct IndexedTitle {
     pub(crate) current: Option<String>,
     pub(crate) authoritative: bool,
     pub(crate) withdrawn: Option<String>,
+    pub(crate) local_opener: LocalOpenerEvidence,
+    uncertain_rollback: RollbackTitle,
     check_local_rollback: bool,
 }
 
@@ -911,10 +1118,52 @@ impl IndexedTitle {
         snapshot: &CanonicalSnapshot,
         full_read: bool,
         document: &SearchDocument,
+        rollback_title: &RollbackTitle,
+        native_name: Option<&NativeSessionName>,
     ) -> Self {
-        let authoritative = session_search_title_is_authoritative(snapshot, full_read);
-        let check_local_rollback = full_read
-            && !document.source_complete
+        let provider_name = match native_name {
+            Some(NativeSessionName::Named(name)) => Some(name.as_str()),
+            Some(_) => None,
+            None => snapshot.title.as_deref(),
+        };
+        if let Some(name) = provider_name.and_then(omnis_core::compact_search_title) {
+            return Self {
+                current: Some(name),
+                authoritative: true,
+                ..Self::default()
+            };
+        }
+        let authoritative = session_message_prefix_is_known(snapshot, full_read);
+        let local = match rollback_title {
+            RollbackTitle::Known(current) => Some(current.clone()),
+            RollbackTitle::UnknownLocal | RollbackTitle::UnknownAfterWithdrawal(_)
+                if authoritative =>
+            {
+                Some(session_message_search_title(snapshot))
+            }
+            _ => None,
+        };
+        if let Some(current) = local
+            && !current
+                .as_deref()
+                .is_some_and(|title| rollback_title.withdraws(title))
+        {
+            // A readable local opener can replace a provider name only after verified catalog removal.
+            let name_absent = matches!(native_name, Some(NativeSessionName::Absent));
+            return Self {
+                current,
+                authoritative: name_absent,
+                local_opener: LocalOpenerEvidence::Current,
+                ..Self::default()
+            };
+        }
+        if matches!(rollback_title, RollbackTitle::UnknownAfterWithdrawal(_)) {
+            return Self {
+                uncertain_rollback: rollback_title.clone(),
+                ..Self::default()
+            };
+        }
+        let check_local_rollback = !document.source_complete
             && !authoritative
             && snapshot.session.provider == Provider::Codex
             && snapshot.events.iter().any(|event| {
@@ -923,20 +1172,35 @@ impl IndexedTitle {
                     && event.source.native_session_id == snapshot.session.id
                     && event.payload["native_history_unverified"].as_bool() == Some(true)
             });
+        let unresolved_prefix = authoritative
+            && native_name.is_some_and(|name| !matches!(name, NativeSessionName::Absent));
         Self {
             current: if snapshot.session.provider == Provider::Codex && !authoritative {
                 None
             } else {
-                session_search_title(snapshot)
+                session_message_search_title(snapshot)
             },
-            authoritative,
+            authoritative: authoritative && !unresolved_prefix,
+            local_opener: if unresolved_prefix {
+                LocalOpenerEvidence::VisiblePrefix
+            } else {
+                LocalOpenerEvidence::Unknown
+            },
+            uncertain_rollback: RollbackTitle::Unknown,
             check_local_rollback,
             withdrawn: None,
         }
     }
 
     pub(crate) fn is_verified(&self) -> bool {
-        self.authoritative && self.current.is_some()
+        self.current.is_some()
+            && (self.authoritative
+                || matches!(
+                    self.local_opener,
+                    LocalOpenerEvidence::Current
+                        | LocalOpenerEvidence::RecheckedCurrent
+                        | LocalOpenerEvidence::VisiblePrefix
+                ))
     }
 
     pub(crate) fn check_withdrawal(
@@ -946,30 +1210,71 @@ impl IndexedTitle {
         session: &SessionRef,
         revision: SourceRevision,
     ) -> Result<()> {
-        if !self.check_local_rollback {
-            return Ok(());
-        }
+        let uncertain = matches!(
+            self.uncertain_rollback,
+            RollbackTitle::UnknownAfterWithdrawal(_)
+        );
         let Some(file) = revision.file else {
             return Ok(());
         };
-        let Some(prior) = store.withdrawable_trajectory_title(session, file)? else {
-            return Ok(());
+        let selected_path = |require_unnamed: bool| -> Result<PathBuf> {
+            registry
+                .find_native_session(Provider::Codex, &session.id)?
+                .filter(|selected| {
+                    (!require_unnamed || selected.title.is_none())
+                        && selected
+                            .source_revision
+                            .is_some_and(|selected| selected.matches_file_contents(revision))
+                })
+                .and_then(|selected| selected.source_path)
+                .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
         };
-        if Some(&prior) == self.current.as_ref() {
+        if (uncertain || self.local_opener == LocalOpenerEvidence::Current)
+            && let Some(prior) = store.legacy_codex_opener_candidate(session, file)?
+            && let Some(name) =
+                legacy_opener_name(registry, session, revision, &prior, || selected_path(true))?
+        {
+            self.withdrawn = Some(prior.title);
+            self.local_opener = if name == NativeSessionName::Unknown {
+                self.current = None;
+                self.authoritative = false;
+                LocalOpenerEvidence::DeferredLegacyName
+            } else if uncertain {
+                LocalOpenerEvidence::RecheckedWithdrawn
+            } else {
+                LocalOpenerEvidence::RecheckedCurrent
+            };
             return Ok(());
         }
-        let path = registry
-            .find_native_session(Provider::Codex, &session.id)?
-            .filter(|selected| {
-                selected
-                    .source_revision
-                    .is_some_and(|selected| selected.matches_file_contents(revision))
-            })
-            .and_then(|selected| selected.source_path)
-            .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+        if !self.check_local_rollback && !uncertain {
+            return Ok(());
+        }
+        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
+            return Ok(());
+        };
+        if uncertain {
+            if self.uncertain_rollback.withdraws(&prior)
+                || (self.uncertain_rollback.needs_withdrawal_check(&prior)
+                    && omnis_adapters::CodexAdapter::verify_earlier_opener_withdrawal(
+                        &selected_path(false)?,
+                        session,
+                        revision,
+                        &prior,
+                    )?)
+            {
+                selected_path(false)?;
+                self.withdrawn = Some(prior);
+                self.local_opener = LocalOpenerEvidence::Withdrawn;
+            }
+            return Ok(());
+        }
         if omnis_adapters::CodexAdapter::rollout_withdrew_search_title(
-            &path, session, revision, &prior,
+            &selected_path(false)?,
+            session,
+            revision,
+            &prior,
         )? {
+            selected_path(false)?;
             self.withdrawn = Some(prior);
         }
         Ok(())
@@ -977,7 +1282,7 @@ impl IndexedTitle {
 }
 
 struct PreparedIndex {
-    workspace: Option<omnis_store::CodexWorkspace>,
+    workspace: Option<omnis_store::CodexWorkspaceUpdate>,
     guard: TrajectorySourceGuard,
     candidate: IndexCandidate,
     document: SearchDocument,
@@ -986,6 +1291,7 @@ struct PreparedIndex {
     source_revision: SourceRevision,
     origin: SessionTrajectoryOrigin,
     title: IndexedTitle,
+    native_name: Option<NativeSessionName>,
 }
 
 impl PreparedIndex {
@@ -996,12 +1302,16 @@ impl PreparedIndex {
     }
 
     fn store(&self, store: &Store) -> omnis_store::Result<()> {
-        store.upsert_observed_trajectory_documents_with_workspaces(&[(
-            &self.candidate.session,
-            self.store_document(),
-            self.guard,
-            self.workspace.as_ref(),
-        )])
+        let names = self.candidate.metadata.iter().collect::<Vec<_>>();
+        store.upsert_discovered_trajectory_documents(
+            &[(
+                &self.candidate.session,
+                self.store_document(),
+                self.guard,
+                self.workspace.as_ref(),
+            )],
+            &names,
+        )
     }
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
@@ -1019,6 +1329,7 @@ impl PreparedIndex {
             withdrawn_title: self.title.withdrawn.as_deref(),
             title_is_verified: self.title.is_verified(),
             title_authoritative: self.title.authoritative,
+            local_opener: self.title.local_opener,
         }
     }
 }
@@ -1028,17 +1339,15 @@ fn prepare_session(
     candidate: &IndexCandidate,
     guard: TrajectorySourceGuard,
     reader: Option<&IndexSessionReader<'_>>,
+    store: Option<&Store>,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
-    let IndexRead {
-        native_session,
-        snapshot,
-        source_complete,
-        source_revision,
-    } = if imported {
+    let read = if imported {
         read_session(registry, &candidate.session).map(|snapshot| IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: RollbackTitle::Unknown,
+            workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             source_complete: true,
             source_revision: SourceRevision::default(),
         })
@@ -1055,9 +1364,29 @@ fn prepare_session(
     }?;
     if candidate.session.provider == Provider::Codex && candidate.source_revision.file.is_some() {
         anyhow::ensure!(
-            source_revision.matches_file_contents(candidate.source_revision),
+            read.source_revision
+                .matches_file_contents(candidate.source_revision),
             "selected Codex rollout changed during indexing"
         );
+    }
+    let IndexRead {
+        native_session,
+        rollback_title,
+        workspace_projection,
+        snapshot,
+        source_complete,
+        source_revision,
+    } = match store {
+        Some(store) => verify_legacy_search_read(registry, store, guard, read)?,
+        None => read,
+    };
+    let native_name = native_codex_name(registry, &candidate.session)?;
+    let name_observed = verified_name_coverage(native_name.as_ref(), native_session.as_ref())?;
+    if name_observed
+        && let (Some(discovered), Some(native)) = (&candidate.metadata, &native_session)
+        && discovered.title != native.title.as_deref().map(omnis_core::redact_secrets)
+    {
+        return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
     }
     let document = trajectory_search_document(&snapshot);
     // Codex reads the rollout's actual mtime again. Discovery may predate a restore.
@@ -1074,10 +1403,21 @@ fn prepare_session(
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let title = IndexedTitle::from_read(&snapshot, source_complete, &document);
+    let title = IndexedTitle::from_read(
+        &snapshot,
+        source_complete,
+        &document,
+        &rollback_title,
+        native_name.as_ref(),
+    );
     Ok(PreparedIndex {
         workspace: native_session.as_ref().and_then(|_| {
-            crate::verified_codex_workspace(&snapshot, source_revision, source_complete)
+            crate::codex_workspace_update(
+                &snapshot,
+                source_revision,
+                source_complete,
+                &workspace_projection,
+            )
         }),
         guard,
         candidate: candidate.clone(),
@@ -1087,6 +1427,7 @@ fn prepare_session(
         source_revision,
         origin,
         title,
+        native_name,
     })
 }
 
@@ -1115,7 +1456,8 @@ impl ProgressLine {
             Clear(ClearType::CurrentLine),
             Print(format!(
                 "Indexing changed sessions {}/{}…",
-                progress.indexed, progress.total
+                progress.processed(),
+                progress.total
             ))
         );
         let _ = stderr.flush();
@@ -1227,16 +1569,12 @@ mod tests {
     }
 
     #[test]
-    fn upgrading_a_full_index_preserves_coverage_for_the_same_rollout() {
+    fn only_matching_file_and_content_ids_allow_an_unbounded_projection_upgrade() {
         let time = Utc::now();
-        let old_file = SourceRevision {
+        let revision = SourceRevision {
             file: Some(uuid::Uuid::from_u128(1)),
-            contents: Some(uuid::Uuid::from_u128(3)),
+            contents: Some(uuid::Uuid::from_u128(2)),
             ..SourceRevision::default()
-        };
-        let other_file = SourceRevision {
-            file: Some(uuid::Uuid::from_u128(2)),
-            ..old_file
         };
         let budget = |stored, selected, updated_at| {
             projection_read_budget(
@@ -1244,22 +1582,37 @@ mod tests {
                     source_updated_at: time,
                     source_revision: stored,
                     source_complete: true,
-                    document_version: omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1,
+                    document_version: search_document_version(Provider::Codex) - 1,
                 })),
                 Some(updated_at),
                 selected,
             )
         };
-        assert_eq!(budget(SourceRevision::default(), old_file, time), u64::MAX);
-        assert_eq!(budget(old_file, old_file, time), u64::MAX);
-        assert_eq!(budget(old_file, other_file, time), FULL_READ_SOURCE_BYTES);
-        let changed = SourceRevision {
-            contents: Some(uuid::Uuid::from_u128(4)),
-            ..old_file
-        };
-        assert_eq!(budget(old_file, changed, time), FULL_READ_SOURCE_BYTES);
+        assert_eq!(budget(revision, revision, time), u64::MAX);
+        for other in [
+            SourceRevision::default(),
+            SourceRevision {
+                contents: None,
+                ..revision
+            },
+            SourceRevision {
+                file: None,
+                ..revision
+            },
+            SourceRevision {
+                contents: Some(uuid::Uuid::nil()),
+                ..revision
+            },
+            SourceRevision {
+                file: Some(uuid::Uuid::nil()),
+                ..revision
+            },
+        ] {
+            assert_eq!(budget(other, revision, time), FULL_READ_SOURCE_BYTES);
+            assert_eq!(budget(revision, other, time), FULL_READ_SOURCE_BYTES);
+        }
         assert_eq!(
-            budget(old_file, old_file, time - chrono::Duration::days(1)),
+            budget(revision, revision, time - chrono::Duration::seconds(1)),
             FULL_READ_SOURCE_BYTES
         );
     }
@@ -1529,6 +1882,7 @@ mod tests {
                     withdrawn_title: None,
                     title_is_verified: false,
                     title_authoritative: false,
+                    local_opener: omnis_store::LocalOpenerEvidence::Unknown,
                 },
             )
             .unwrap();
@@ -1674,11 +2028,14 @@ mod tests {
         };
         let (registry, original) = write_codex_rollout(&home, Some("oldneedle"), 1_800_100_000);
         index(&registry, &original);
-        let guard = observe_source(&store, &original[0].session).unwrap();
-        let delayed = prepare_session(&registry, &original[0], guard, None).unwrap();
+        let observed = store
+            .observe_selected_session(&original[0].session)
+            .unwrap();
+        let guard = source_guard(Provider::Codex, observed.state.as_ref());
+        let delayed = prepare_session(&registry, &original[0], guard, None, Some(&store)).unwrap();
 
         let (registry, restored) = write_codex_rollout(&home, Some("backupneedle"), 1_800_000_000);
-        let error = prepare_session(&registry, &original[0], guard, None)
+        let error = prepare_session(&registry, &original[0], guard, None, Some(&store))
             .err()
             .expect("discovery now refers to a replaced rollout");
         assert!(retryable_read_failure(&error));
@@ -1711,17 +2068,18 @@ mod tests {
             Err(omnis_store::StoreError::TrajectorySourceChanged)
         ));
         let mut recovered = IndexSummary::default();
-        let mut titles = Vec::new();
+        let mut updates = IndexProgress::default();
         flush_batch(
             &registry,
             &store,
             &mut vec![delayed],
             &mut recovered,
-            &mut titles,
+            &mut updates,
         );
         assert_eq!(recovered.indexed, 1);
         assert_eq!(
-            titles
+            updates
+                .titles
                 .into_iter()
                 .map(|entry| (entry.session, entry.title.unwrap()))
                 .collect::<Vec<_>>(),
@@ -1790,6 +2148,7 @@ mod tests {
                 source_complete: true,
                 source_revision: SourceRevision::default(),
                 origin: SessionTrajectoryOrigin::Native,
+                native_name: None,
                 title: IndexedTitle {
                     current: Some(id.to_owned()),
                     authoritative: true,
@@ -1799,20 +2158,21 @@ mod tests {
         };
         let mut batch = vec![prepared("first"), prepared("broken"), prepared("last")];
         let mut summary = IndexSummary::default();
-        let mut titles = Vec::new();
+        let mut updates = IndexProgress::default();
 
         flush_batch(
             &AdapterRegistry::new(),
             &store,
             &mut batch,
             &mut summary,
-            &mut titles,
+            &mut updates,
         );
 
         assert!(batch.is_empty());
         assert_eq!((summary.indexed, summary.failed), (2, 1));
         assert_eq!(
-            titles
+            updates
+                .titles
                 .into_iter()
                 .map(|entry| (entry.session, entry.title.unwrap()))
                 .collect::<Vec<_>>(),

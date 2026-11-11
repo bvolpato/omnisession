@@ -1,44 +1,30 @@
 //! Codex keeps the thread ID when a revert creates another physical rollout.
 
-mod sqlite_home;
-
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
-    fs,
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use omnis_ir::SourceRevision;
-use rusqlite::OptionalExtension;
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{CodexFileScan, CodexSession, ancestor_paths::AncestorPaths, rollout_file};
-use crate::support::{SqliteSnapshotCache, provider_file};
+use super::{
+    CodexFileScan, CodexSession,
+    ancestor_paths::AncestorPaths,
+    current_launch::{native_representation, same_native_copy},
+    current_rollout::{canonical_name, ids, timestamp},
+    rollout_file,
+};
+use crate::support::provider_file;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum IdKind {
     Thread,
     Rollout,
-}
-
-pub(super) fn ids(path: &Path) -> Option<(&str, &str)> {
-    let stem = rollout_file::jsonl_file_name(path)?.file_stem()?.to_str()?;
-    let split = stem.len().checked_sub(36)?;
-    let rollout = stem.get(split..)?;
-    Uuid::try_parse(rollout).ok()?;
-    // Legacy rollouts end in the thread ID. A revert appends "_<rollout ID>".
-    let thread = stem.get(..split)?.strip_suffix('_').and_then(|prefix| {
-        let thread = prefix.get(prefix.len().checked_sub(36)?..)?;
-        Uuid::try_parse(thread).ok().map(|_| thread)
-    });
-    Some((thread.unwrap_or(rollout), rollout))
 }
 
 pub(super) fn thread_id(path: &Path) -> Option<&str> {
@@ -49,7 +35,7 @@ pub(super) fn rollout_id(path: &Path) -> Option<&str> {
     ids(path).map(|(_, rollout)| rollout)
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum HistoryMode {
     Legacy,
@@ -64,14 +50,6 @@ impl HistoryMode {
     pub(super) fn is_paginated(value: &Value) -> bool {
         Self::read(value) == Some(Self::Paginated)
     }
-}
-
-fn native_header_mode(header: &Value) -> Option<HistoryMode> {
-    let meta = &header["payload"];
-    let mode = meta
-        .get("history_mode")
-        .map_or(Some(HistoryMode::Legacy), HistoryMode::read)?;
-    (mode != HistoryMode::Legacy || meta["history_base"].is_null()).then_some(mode)
 }
 
 pub(super) fn damaged_paginated_mode(header: &Value) -> bool {
@@ -135,27 +113,6 @@ pub(super) fn damaged_header_type(header: &Value) -> bool {
         )
 }
 
-fn timestamp(path: &Path) -> Option<&str> {
-    let name = rollout_file::jsonl_file_name(path)?
-        .to_str()?
-        .strip_prefix("rollout-")?;
-    let (date, suffix) = name.split_at_checked(19)?;
-    let suffix = suffix.strip_prefix('-')?.strip_suffix(".jsonl")?;
-    let (thread, rollout) = suffix.split_once('_').unwrap_or((suffix, suffix));
-    Uuid::try_parse(thread).ok()?;
-    Uuid::try_parse(rollout).ok()?;
-    chrono::NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H-%M-%S").ok()?;
-    Some(date)
-}
-
-pub(super) fn canonical_filename(path: &Path) -> bool {
-    timestamp(path).is_some()
-}
-
-fn native_rank(path: &Path) -> Option<(&str, Uuid)> {
-    timestamp(path).zip(rollout_id(path).and_then(|id| Uuid::try_parse(id).ok()))
-}
-
 fn native_filename(path: &Path) -> bool {
     rollout_file::representation_priority(path) > 0
         && path
@@ -166,163 +123,18 @@ fn native_filename(path: &Path) -> bool {
 
 #[derive(Debug, Default)]
 pub(super) struct RolloutSelector {
-    sqlite_home: sqlite_home::SqliteHome,
-    snapshot: SqliteSnapshotCache,
     immutable_paths: Mutex<HashMap<String, PathBuf>>,
 }
 
-#[derive(Debug)]
-pub(super) struct Unavailable(String);
-
-impl std::fmt::Display for Unavailable {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Unavailable {}
-
 impl RolloutSelector {
-    pub(super) fn from_env() -> Self {
-        Self {
-            sqlite_home: sqlite_home::SqliteHome::from_env(),
-            ..Self::default()
-        }
-    }
-
-    pub(super) fn listing<'a, 'id>(
-        &'a self,
-        home: &'a Path,
-        ids: impl IntoIterator<Item = &'id str>,
-    ) -> RolloutCatalog<'a> {
-        RolloutCatalog {
-            selector: self,
-            home,
-            ids: ids.into_iter().map(str::to_owned).collect(),
-            rows: OnceLock::new(),
-            fresh_scan: None,
-            ancestors: OnceLock::new(),
-        }
-    }
-
     pub(super) fn select<'a>(
-        &self,
         home: &Path,
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
         kind: IdKind,
     ) -> Result<Option<PathBuf>> {
         let candidates = Candidates::from_paths(home, paths, id, kind)?;
-        if kind == IdKind::Rollout {
-            return Ok(candidates.filesystem_choice(home, kind));
-        }
-        let rows = self.current_rows(home, std::iter::once(id))?;
-        candidates.resolve(home, id, rows.get(id), None)
-    }
-
-    pub(super) fn resume_selection(
-        &self,
-        home: &Path,
-        scan: &CodexFileScan,
-        id: &str,
-        fresh: bool,
-    ) -> Result<Option<(PathBuf, bool)>> {
-        let rows = self.current_rows(home, [id])?;
-        let current = rows.get(id);
-        let candidates = Candidates::from_paths(home, scan.paths(home, id), id, IdKind::Thread)?;
-        let mut path = candidates.resolve(home, id, current, None)?;
-        if path.is_none() {
-            path = self.find_exact(home, id, IdKind::Thread)?;
-        }
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        let fresh = fresh && scan.notes.is_empty() && !scan.indices(id).is_empty();
-        let native = Self::native_selects(home, scan, fresh, id, &path, current)?;
-        Ok(Some((path, native)))
-    }
-
-    fn native_selects(
-        home: &Path,
-        scan: &CodexFileScan,
-        fresh: bool,
-        id: &str,
-        selected: &Path,
-        current: Option<&SelectedRollout>,
-    ) -> Result<bool> {
-        if is_archived(home, selected) {
-            return Ok(false);
-        }
-        let Some(native) = native_representation(home, selected) else {
-            return Ok(false);
-        };
-        if !same_native_copy(&native, selected)? {
-            return Ok(false);
-        }
-        let Some((_, header)) = CodexSession::selected_header(selected, id)? else {
-            return Ok(false);
-        };
-        let Some(mode) = native_header_mode(&header) else {
-            return Ok(false);
-        };
-        if let Some(row) = current {
-            if row.archived
-                || row.paginated != Some(mode == HistoryMode::Paginated)
-                || (!row.canonical_name() && mode == HistoryMode::Paginated)
-            {
-                return Ok(false);
-            }
-            let Some(name) = rollout_file::jsonl_file_name(&row.path) else {
-                return Ok(false);
-            };
-            let plain = row.path.with_file_name(name);
-            if row.path.extension().is_some_and(|suffix| suffix == "gz")
-                || !managed_recording(home, &plain)
-                || (!plain.is_file()
-                    && !managed_recording(home, &plain.with_extension("jsonl.zst")))
-            {
-                return Ok(false);
-            }
-            if let Some(recorded) = native_representation(home, &row.path) {
-                return Ok(same_native_copy(&recorded, selected)?);
-            }
-            if row.paginated == Some(true)
-                || rollout_file::jsonl_file_name(&row.path)
-                    == rollout_file::jsonl_file_name(selected)
-            {
-                return Ok(false);
-            }
-        }
-        if !native_filename(selected) || scan.skipped_directories {
-            return Ok(false);
-        }
-        // Codex keeps the first file at the newest (timestamp, rollout ID). Plain JSONL
-        // hides a compressed sibling only in the same directory.
-        let selected_rank = native_rank(selected);
-        let agrees = |path: &Path| {
-            if !native_filename(path)
-                || !thread_id(path).is_some_and(|thread| thread.eq_ignore_ascii_case(id))
-                || native_rank(path) < selected_rank
-            {
-                return true;
-            }
-            native_representation(home, path)
-                .is_some_and(|candidate| same_native_copy(&candidate, selected).unwrap_or(false))
-        };
-        let active = home.join("sessions");
-        if fresh {
-            return Ok(scan
-                .files
-                .iter()
-                .filter(|path| path.starts_with(&active))
-                .all(|path| agrees(path)));
-        }
-        let mut agree = true;
-        let inventory = walk_roots([active], super::SCAN_LIMIT, |path| {
-            agree &= agrees(path);
-            Ok(())
-        })?;
-        Ok(agree && inventory.complete())
+        Ok(candidates.filesystem_choice(home, kind))
     }
 
     /// A filesystem fallback can locate a thread or immutable rollout after the listing fills up.
@@ -385,7 +197,7 @@ impl RolloutSelector {
 
     fn scan_exact(home: &Path, id: &str, kind: IdKind) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(home);
-        let inventory = visit_rollouts(home, |path| candidates.observe(path, id, kind, None))?;
+        let inventory = visit_rollouts(home, |path| candidates.observe(path, id, kind, false))?;
         let found = candidates.exact_choice(home, kind)?;
         if found.is_none() {
             inventory.require_access()?;
@@ -418,7 +230,7 @@ impl RolloutSelector {
                 {
                     *readable |= mode;
                     if candidates
-                        .observe(path, rollout, IdKind::Rollout, Some(mode))
+                        .observe(path, rollout, IdKind::Rollout, true)
                         .is_err()
                     {
                         // This immutable ID occurs under two different threads.
@@ -447,223 +259,28 @@ impl RolloutSelector {
         }
         Ok(available)
     }
-
-    fn current_rows<'a>(
-        &self,
-        home: &Path,
-        ids: impl IntoIterator<Item = &'a str>,
-    ) -> Result<HashMap<String, SelectedRollout>> {
-        self.rows_in(&self.sqlite_home.resolve(home)?, ids)
-    }
-
-    pub(super) fn unavailable(
-        &self,
-        home: &Path,
-        scan: &CodexFileScan,
-        prior: &[(String, Option<SourceRevision>)],
-    ) -> Result<HashSet<String>> {
-        let rows = self.current_rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
-        let catalog = self.listing(home, []);
-        let mut unavailable = HashSet::new();
-        for (id, revision) in prior {
-            let (Some(row), Some(file)) = (rows.get(id), revision.and_then(|source| source.file))
-            else {
-                continue;
-            };
-            // Older catalog entries do not record CODEX_HOME. Only retire a file observed in this home.
-            let matches = |path: &Path| super::CodexAdapter::index_file_id(path) == Some(file);
-            if !scan.paths(home, id).any(matches)
-                && matching_sibling(home, &row.path, matches).is_none()
-            {
-                continue;
-            }
-            match Candidates::new(home).resolve(home, id, Some(row), Some(&catalog)) {
-                Err(error) if error.is::<Unavailable>() => {
-                    unavailable.insert(id.clone());
-                }
-                Ok(Some(selected))
-                    if super::CodexAdapter::index_file_id(&selected)
-                        .is_some_and(|current| current != file) =>
-                {
-                    unavailable.insert(id.clone());
-                }
-                _ => {}
-            }
-        }
-        Ok(unavailable)
-    }
-
-    fn rows_in<'a>(
-        &self,
-        root: &Path,
-        ids: impl IntoIterator<Item = &'a str>,
-    ) -> Result<HashMap<String, SelectedRollout>> {
-        self.read_threads(root, |connection| {
-            let (has_mode, has_archived): (bool, bool) = connection.query_row(
-                "SELECT max(name='history_mode'), max(name='archived') FROM pragma_table_info('threads')", [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let mode = if has_mode {
-                "CASE history_mode WHEN 'legacy' THEN 0 WHEN 'paginated' THEN 1 END"
-            } else {
-                "0"
-            };
-            let archived = if has_archived { "archived IS NOT 0" } else { "0" };
-            let query = format!("SELECT rollout_path, {mode}, {archived} FROM threads WHERE id=?1");
-            let mut statement = connection.prepare(&query)?;
-            let mut selected = HashMap::new();
-            for id in ids {
-                let pointer = statement.query_row([id], |row| Ok(SelectedRollout {
-                    path: PathBuf::from(row.get::<_, String>(0)?),
-                    paginated: row.get(1)?,
-                    archived: row.get(2)?,
-                })).optional()?;
-                if let Some(pointer) = pointer {
-                    selected.insert(id.to_owned(), pointer);
-                }
-            }
-            Ok(selected)
-        })
-    }
-
-    fn read_threads<T: Default>(
-        &self,
-        root: &Path,
-        read: impl FnOnce(&rusqlite::Connection) -> Result<T>,
-    ) -> Result<T> {
-        let database = root.join("state_5.sqlite");
-        match fs::symlink_metadata(&database) {
-            Ok(meta) => anyhow::ensure!(
-                meta.is_file(),
-                "Codex state database must be a regular file"
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
-            Err(error) => return Err(error).context("locating the Codex state database"),
-        }
-        self.snapshot
-            .read(root, &database, |connection| {
-                let kind: Option<String> = connection
-                    .query_row(
-                        "SELECT type FROM sqlite_schema WHERE name='threads' COLLATE NOCASE",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(kind) = kind else {
-                    return Ok(T::default());
-                };
-                anyhow::ensure!(kind == "table", "Codex threads must be a table");
-                read(connection)
-            })
-            .context("reading the current Codex rollouts from the state database")
-    }
-
-    pub(super) fn custom_ids_for_listing(
-        &self,
-        home: &Path,
-        files: &[PathBuf],
-    ) -> Result<Vec<String>> {
-        let names: HashSet<_> = files
-            .iter()
-            .filter(|path| !canonical_filename(path))
-            .filter_map(|path| Some(path.with_file_name(rollout_file::jsonl_file_name(path)?)))
-            .collect();
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let canonical_home = home.canonicalize()?;
-        self.read_threads(&self.sqlite_home.resolve(home)?, |connection| {
-            let mut statement = connection.prepare("SELECT id, rollout_path FROM threads WHERE typeof(id)='text' AND typeof(rollout_path)='text'")?;
-            let mut rows = statement.query([])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                let recorded = Path::new(row.get_ref(1)?.as_str()?);
-                let Ok(relative) = recorded
-                    .strip_prefix(home)
-                    .or_else(|_| recorded.strip_prefix(&canonical_home))
-                else {
-                    continue;
-                };
-                let Some(name) = rollout_file::jsonl_file_name(recorded) else {
-                    continue;
-                };
-                if names.contains(&home.join(relative).with_file_name(name)) {
-                    let id = row.get_ref(0)?.as_str()?;
-                    if Uuid::parse_str(id).is_ok() {
-                        anyhow::ensure!(
-                            ids.len() < super::SCAN_LIMIT,
-                            "too many Codex state rows refer to the discovered custom rollout files"
-                        );
-                        ids.push(id.to_owned());
-                    }
-                }
-            }
-            Ok(ids)
-        })
-    }
-}
-
-impl super::CodexAdapter {
-    /// A different launch directory can select another generation of the same logical thread.
-    pub(crate) fn selected_state_agrees_at(
-        &self,
-        cwd: &Path,
-        session: &omnis_ir::SessionRef,
-        overrides: &crate::CodexLaunchOverrides,
-    ) -> Result<bool> {
-        let home = self
-            .codex_home
-            .as_deref()
-            .context("Codex home was not found")?;
-        let source = self.selector.sqlite_home.resolve(home)?;
-        let destination = self.selector.sqlite_home.resolve_in(home, cwd, overrides)?;
-        if source == destination || same_file::is_same_file(&source, &destination).unwrap_or(false)
-        {
-            return Ok(true);
-        }
-        let path = self.find_session_path(&session.id)?;
-        let rows = self.selector.rows_in(&destination, [&*session.id])?;
-        let (scan, cached) = self.session_scan(None);
-        let fresh = !cached && scan.notes.is_empty() && !scan.indices(&session.id).is_empty();
-        RolloutSelector::native_selects(
-            home,
-            &scan,
-            fresh,
-            &session.id,
-            &path,
-            rows.get(&session.id),
-        )
-    }
-}
-
-struct SelectedRollout {
-    path: PathBuf,
-    paginated: Option<bool>,
-    archived: bool,
-}
-
-impl SelectedRollout {
-    fn canonical_name(&self) -> bool {
-        recorded_file_name(&self.path).is_some_and(canonical_filename)
-    }
 }
 
 pub(super) struct RolloutCatalog<'a> {
-    selector: &'a RolloutSelector,
     home: &'a Path,
-    ids: HashSet<String>,
-    // Read one SQLite snapshot per listing, including when a restored singleton looks like a legacy thread.
-    rows: OnceLock<Result<HashMap<String, SelectedRollout>, String>>,
     pub(super) fresh_scan: Option<Arc<CodexFileScan>>,
     ancestors: OnceLock<Result<AncestorPaths, String>>,
 }
 
-impl RolloutCatalog<'_> {
+impl<'a> RolloutCatalog<'a> {
+    pub(super) fn new(home: &'a Path) -> Self {
+        Self {
+            home,
+            fresh_scan: None,
+            ancestors: OnceLock::new(),
+        }
+    }
+
     /// Check exact names once per indexing pass. A later batch can see restored rollouts.
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(self.home);
         let inventory = self.visit_physical(id, |path| {
-            candidates.observe(path, id, IdKind::Rollout, None)
+            candidates.observe(path, id, IdKind::Rollout, false)
         })?;
         let found = candidates.exact_choice(self.home, IdKind::Rollout)?;
         if found.is_none() {
@@ -678,7 +295,7 @@ impl RolloutCatalog<'_> {
         mut each: impl FnMut(&Path) -> Result<()>,
     ) -> Result<Inventory> {
         if let Some(scan) = &self.fresh_scan {
-            for path in scan.paths(self.home, id) {
+            for path in scan.ancestor_paths(self.home, id) {
                 each(path)?;
             }
             return Ok(Inventory::default());
@@ -697,64 +314,6 @@ impl RolloutCatalog<'_> {
             }
             Ok(())
         })
-    }
-
-    pub(super) fn select_listed<'a>(
-        &self,
-        paths: impl IntoIterator<Item = (&'a Path, bool)>,
-        id: &str,
-    ) -> Result<Option<PathBuf>> {
-        self.select(paths.into_iter().map(|(path, mode)| (path, Some(mode))), id)
-    }
-
-    pub(super) fn select_for_index<'a>(
-        &self,
-        paths: impl IntoIterator<Item = &'a Path>,
-        id: &str,
-    ) -> Result<Option<PathBuf>> {
-        self.select(paths.into_iter().map(|path| (path, None)), id)
-    }
-
-    fn select<'a>(
-        &self,
-        paths: impl IntoIterator<Item = (&'a Path, Option<bool>)>,
-        id: &str,
-    ) -> Result<Option<PathBuf>> {
-        if !self.ids.contains(id) {
-            return self.selector.select(
-                self.home,
-                paths.into_iter().map(|(path, _)| path),
-                id,
-                IdKind::Thread,
-            );
-        }
-        let mut candidates = Candidates::new(self.home);
-        for (path, paginated) in paths {
-            candidates.observe(path, id, IdKind::Thread, paginated)?;
-        }
-        let rows = self
-            .rows
-            .get_or_init(|| {
-                self.selector
-                    .current_rows(self.home, self.ids.iter().map(String::as_str))
-                    .map_err(|error| format!("{error:#}"))
-            })
-            .as_ref()
-            .map_err(|message| anyhow!("{message}"))?;
-        let current = rows.get(id);
-        if let (Some(best), Some(current)) = (&candidates.best, current)
-            && current.canonical_name()
-            && current
-                .paginated
-                .is_some_and(|mode| !mode || candidates.best_paginated)
-            && best.parent() == current.path.parent()
-            && rollout_file::jsonl_file_name(best).and_then(Path::file_name)
-                == rollout_file::jsonl_file_name(&current.path).and_then(Path::file_name)
-        {
-            // Both discovery and index reads have validated this candidate's header.
-            return Ok(candidates.best);
-        }
-        candidates.resolve(self.home, id, current, Some(self))
     }
 }
 
@@ -824,74 +383,6 @@ fn managed_recording(home: &Path, path: &Path) -> bool {
     true
 }
 
-// Restored state can contain an absolute path written by Codex on the other platform.
-fn recorded_file_name(path: &Path) -> Option<&Path> {
-    let text = path.to_str()?;
-    let windows = text.starts_with(r"\\")
-        || text.starts_with("//")
-        || matches!(text.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic());
-    let name = if windows {
-        text.rsplit(['/', '\\']).next()?
-    } else {
-        text.rsplit('/').next()?
-    };
-    (!name.contains('\\')).then(|| Path::new(name))
-}
-
-fn relocated_rollout(
-    home: &Path,
-    recorded: &Path,
-    id: &str,
-    paginated: bool,
-    catalog: Option<&RolloutCatalog<'_>>,
-) -> Result<Option<PathBuf>> {
-    let Some(recorded) = recorded_file_name(recorded) else {
-        return Ok(None);
-    };
-    if !canonical_filename(recorded) || thread_id(recorded) != Some(id) {
-        return Ok(None);
-    }
-    let name = rollout_file::jsonl_file_name(recorded);
-    let mut selected: Option<PathBuf> = None;
-    let mut digest = None;
-    let mut remaining = 64 * 1024 * 1024;
-    let rank = |path: &Path| {
-        (
-            !is_archived(home, path),
-            rollout_file::representation_priority(path),
-        )
-    };
-    let observe = |candidate: &Path| -> Result<()> {
-        if rollout_file::jsonl_file_name(candidate) != name
-            || !matching_header(candidate, id, paginated)
-        {
-            return Ok(());
-        }
-        if let Some(prior) = &selected {
-            let same_codec = prior.extension() == candidate.extension();
-            if !same_codec || !same_file::is_same_file(prior, candidate)? {
-                let expected = match digest {
-                    Some(value) => value,
-                    None => copy_digest(prior, &mut remaining)?,
-                };
-                if expected != copy_digest(candidate, &mut remaining)? {
-                    bail!(
-                        "conflicting local copies of the recorded Codex rollout for thread `{id}`"
-                    );
-                }
-                digest = Some(expected);
-            }
-            if (rank(prior), prior.as_path()) >= (rank(candidate), candidate) {
-                return Ok(());
-            }
-        }
-        selected = Some(candidate.to_owned());
-        Ok(())
-    };
-    visit_immutable_copies(home, rollout_id(recorded).unwrap_or(id), catalog, observe)?;
-    Ok(selected)
-}
-
 /// Visits managed copies of this physical rollout, including names beyond the discovery limit.
 pub(super) fn visit_immutable_copies(
     home: &Path,
@@ -913,42 +404,8 @@ pub(super) fn visit_immutable_copies(
     inventory.require_access()
 }
 
-fn copy_digest(path: &Path, remaining: &mut u64) -> Result<[u8; 32]> {
-    let before = super::rollout_cache::ObservedRollout::read(path)
-        .and_then(|observed| observed.stamp)
-        .context("verifying a relocated Codex rollout")?;
-    let encoded = fs::metadata(path)?.len();
-    if encoded > *remaining {
-        bail!("local copies of the recorded Codex rollout exceed the comparison limit");
-    }
-    let mut hash = Sha256::new();
-    let mut reader = rollout_file::open(path)?.take(*remaining + 1);
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut count = 0_u64;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-        count += read as u64;
-    }
-    *remaining = remaining
-        .checked_sub(count.max(encoded))
-        .context("local copies of the recorded Codex rollout exceed the comparison limit")?;
-    if super::rollout_cache::ObservedRollout::read(path).and_then(|observed| observed.stamp)
-        != Some(before)
-    {
-        bail!("a local copy of the recorded Codex rollout changed during comparison");
-    }
-    Ok(hash.finalize().into())
-}
-
-fn matching_header(path: &Path, id: &str, paginated: bool) -> bool {
-    matches!(
-        CodexSession::parse_metadata_path_result(path),
-        Ok(Some(session)) if session.id == id && (!paginated || session.is_paginated)
-    )
+fn matching_header(path: &Path, id: &str) -> bool {
+    matches!(CodexSession::parse_observed_metadata(path), Ok(Some(session)) if session.id == id)
 }
 
 // An unreadable or damaged parent can still constrain the choice of a backup. The lineage
@@ -989,73 +446,6 @@ fn immutable_mode(path: &Path) -> Result<Option<bool>> {
     )
 }
 
-fn selected_custom_file(
-    home: &Path,
-    current: &SelectedRollout,
-    id: &str,
-    paginated: bool,
-) -> Result<PathBuf> {
-    let missing = || {
-        Unavailable(format!(
-            "the selected Codex rollout is missing, incompatible, or ambiguous for thread `{id}`. Restore the file recorded by Codex before continuing."
-        ))
-    };
-    if !managed_recording(home, &current.path)
-        || (paginated
-            && !ids(&current.path).is_some_and(|(owner, rollout)| owner == id && rollout != id))
-    {
-        return Err(missing().into());
-    }
-    let name = rollout_file::jsonl_file_name(&current.path).ok_or_else(missing)?;
-    let plain = current.path.with_file_name(name);
-    let gzip = current.path.extension().is_some_and(|ext| ext == "gz");
-    let candidates = [
-        plain.clone(),
-        plain.with_extension("jsonl.zst"),
-        plain.with_extension("jsonl.gz"),
-    ];
-    for candidate in candidates
-        .iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "gz") == gzip)
-    {
-        if !managed_recording(home, candidate) {
-            return Err(missing().into());
-        }
-        match fs::symlink_metadata(candidate) {
-            Ok(meta) if meta.is_file() => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error)
-                    .context("checking the file selected by the Codex state database");
-            }
-            Ok(_) => return Err(missing().into()),
-        }
-        let path = managed_path(home, candidate).ok_or_else(missing)?;
-        let selected = CodexSession::selected_header(&path, id).map_err(|error| {
-            if error.is::<rollout_file::CompressedHeaderError>() {
-                error.context(missing())
-            } else {
-                error
-            }
-        })?;
-        let (_, header) = selected.ok_or_else(missing)?;
-        let mode = if paginated {
-            HistoryMode::Paginated
-        } else {
-            HistoryMode::Legacy
-        };
-        let payload = &header["payload"];
-        let owner = payload
-            .get("id")
-            .or_else(|| (!paginated).then(|| &payload["session_id"]));
-        if owner.and_then(Value::as_str) != Some(id) || native_header_mode(&header) != Some(mode) {
-            return Err(missing().into());
-        }
-        return Ok(path);
-    }
-    Err(missing().into())
-}
-
 fn matching_sibling(
     home: &Path,
     recorded: &Path,
@@ -1076,33 +466,12 @@ fn immutable_sibling(home: &Path, recorded: &Path) -> Option<PathBuf> {
     })
 }
 
-fn compatible_copy(home: &Path, recorded: &Path, id: &str, paginated: bool) -> Option<PathBuf> {
+fn compatible_copy(home: &Path, recorded: &Path, id: &str) -> Option<PathBuf> {
     if thread_id(recorded)? != id {
         return None;
     }
-    matching_sibling(home, recorded, |path| matching_header(path, id, paginated))
+    matching_sibling(home, recorded, |path| matching_header(path, id))
 }
-fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
-    Ok(candidate.extension() == selected.extension()
-        && same_file::is_same_file(candidate, selected)?)
-}
-
-fn native_representation(home: &Path, path: &Path) -> Option<PathBuf> {
-    let plain = path.with_file_name(rollout_file::jsonl_file_name(path)?);
-    managed_path(home, &plain).or_else(|| managed_path(home, &plain.with_extension("jsonl.zst")))
-}
-
-// Archive and unarchive preserve the full basename, including a revert's physical rollout ID.
-fn moved_recording(home: &Path, recorded: &Path) -> Option<PathBuf> {
-    if is_archived(home, recorded) {
-        return restored_basename(home, recorded);
-    }
-    Some(
-        home.join("archived_sessions")
-            .join(rollout_file::jsonl_file_name(recorded)?),
-    )
-}
-
 fn is_archived(home: &Path, path: &Path) -> bool {
     path.starts_with(home.join("archived_sessions"))
         || (!path.starts_with(home)
@@ -1131,7 +500,7 @@ fn restored_rollout(home: &Path, archived: &Path, kind: IdKind) -> Option<PathBu
     }
     let plain = restored_basename(home, archived)?;
     match kind {
-        IdKind::Thread => compatible_copy(home, &plain, thread_id(archived)?, false),
+        IdKind::Thread => compatible_copy(home, &plain, thread_id(archived)?),
         IdKind::Rollout => immutable_sibling(home, &plain),
     }
 }
@@ -1141,20 +510,21 @@ pub(super) fn provider_can_read_ancestors<'a>(
     scan: &CodexFileScan,
     sources: impl Iterator<Item = &'a Path>,
 ) -> Result<bool> {
+    let root = fs::canonicalize(home)?;
     let mut selected = HashMap::new();
     for path in sources {
         // Codex resolves an immutable reference from canonical filenames. It ignores gzip.
-        if !native_filename(path) || !canonical_filename(path) {
+        if !native_filename(path) || !canonical_name(path) {
             return Ok(false);
         }
-        let Some(native) = native_representation(home, path) else {
+        let Some(native) = native_representation(home, &root, path) else {
             return Ok(false);
         };
         let archived = is_archived(home, path);
         if !same_native_copy(&native, path)?
             || (archived
                 && restored_basename(home, path)
-                    .and_then(|name| native_representation(home, &name))
+                    .and_then(|name| native_representation(home, &root, &name))
                     .is_some())
         {
             return Ok(false);
@@ -1171,13 +541,15 @@ pub(super) fn provider_can_read_ancestors<'a>(
         };
         if readable
             && native_filename(candidate)
-            && canonical_filename(candidate)
+            && canonical_name(candidate)
             && (*archived || !is_archived(home, candidate))
-            && let Some(native) = native_representation(home, candidate)
         {
             // The first active match wins, followed by the first archive. Directory entry order
             // cannot distinguish two different files in the same root.
-            readable = same_native_copy(&native, source)?;
+            readable = match native_representation(home, &root, candidate) {
+                Some(native) => same_native_copy(&native, source)?,
+                None => false,
+            };
         }
         Ok(())
     };
@@ -1202,7 +574,6 @@ pub(super) fn provider_can_read_ancestors<'a>(
 struct Candidates {
     active: PathBuf,
     best: Option<PathBuf>,
-    best_paginated: bool,
     read_error: Option<anyhow::Error>,
 }
 
@@ -1211,7 +582,6 @@ impl Candidates {
         Self {
             active: home.join("sessions"),
             best: None,
-            best_paginated: false,
             read_error: None,
         }
     }
@@ -1224,49 +594,9 @@ impl Candidates {
     ) -> Result<Self> {
         let mut candidates = Self::new(home);
         for path in paths {
-            candidates.observe(path, id, kind, None)?;
+            candidates.observe(path, id, kind, false)?;
         }
         Ok(candidates)
-    }
-
-    fn resolve(
-        self,
-        home: &Path,
-        id: &str,
-        current: Option<&SelectedRollout>,
-        catalog: Option<&RolloutCatalog<'_>>,
-    ) -> Result<Option<PathBuf>> {
-        if let Some(current) = current {
-            let paginated = current
-                .paginated
-                .ok_or_else(|| Unavailable("the selected Codex rollout is missing, incompatible, or ambiguous because the state row declares an unsupported history mode".to_owned()))?;
-            if !current.canonical_name() {
-                return selected_custom_file(home, current, id, paginated).map(Some);
-            }
-            anyhow::ensure!(
-                recorded_file_name(&current.path).and_then(thread_id) == Some(id),
-                Unavailable("the selected Codex rollout is missing, incompatible, or ambiguous because the state row names a different thread".to_owned())
-            );
-            let managed = managed_recording(home, &current.path);
-            let path = if managed {
-                compatible_copy(home, &current.path, id, paginated).or_else(|| {
-                    let moved = moved_recording(home, &current.path)?;
-                    compatible_copy(home, &moved, id, paginated)
-                })
-            } else {
-                relocated_rollout(home, &current.path, id, paginated, catalog)?
-            };
-            if let Some(path) = path {
-                return Ok(Some(path));
-            }
-            if paginated || ids(&current.path).is_some_and(|(thread, rollout)| thread != rollout) {
-                return Err(Unavailable(format!(
-                    "the selected rollout for paginated Codex thread `{id}` is missing or invalid"
-                ))
-                .into());
-            }
-        }
-        Ok(self.filesystem_choice(home, IdKind::Thread))
     }
 
     fn exact_choice(self, home: &Path, kind: IdKind) -> Result<Option<PathBuf>> {
@@ -1283,13 +613,7 @@ impl Candidates {
             .map(|best| restored_rollout(home, &best, kind).unwrap_or(best))
     }
 
-    fn observe(
-        &mut self,
-        path: &Path,
-        id: &str,
-        kind: IdKind,
-        paginated: Option<bool>,
-    ) -> Result<()> {
+    fn observe(&mut self, path: &Path, id: &str, kind: IdKind, header_checked: bool) -> Result<()> {
         let Some((thread, rollout)) = ids(path) else {
             return Ok(());
         };
@@ -1303,54 +627,49 @@ impl Candidates {
         let mut other_owner = false;
         if let Some(best) = &self.best {
             other_owner = kind == IdKind::Rollout && thread_id(best) != Some(thread);
-            if !other_owner && self.compare(path, best) != Ordering::Greater {
+            if !other_owner
+                && rollout_priority(path, &self.active) <= rollout_priority(best, &self.active)
+            {
                 return Ok(());
             }
         }
-        let paginated = if let Some(mode) = paginated {
-            mode
-        } else {
-            let mode = match kind {
-                IdKind::Thread => CodexSession::parse_metadata_path_result(path)
-                    .map(|session| session.map(|session| session.is_paginated)),
-                IdKind::Rollout => immutable_mode(path),
+        if !header_checked {
+            let accepted = match kind {
+                IdKind::Thread => CodexSession::parse_observed_metadata(path)
+                    .map(|session| session.is_some_and(|session| session.id == thread)),
+                IdKind::Rollout => immutable_mode(path).map(|mode| mode.is_some()),
             };
-            match mode {
-                Ok(Some(mode)) => mode,
-                Ok(None) => return Ok(()),
+            match accepted {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
                 Err(error) => {
                     self.read_error.get_or_insert(error);
                     return Ok(());
                 }
             }
-        };
+        }
         if other_owner {
             bail!("Codex rollout ID `{id}` belongs to more than one thread");
         }
         self.best = Some(path.to_path_buf());
-        self.best_paginated = paginated;
         Ok(())
     }
+}
 
-    fn compare(&self, a: &Path, b: &Path) -> Ordering {
-        a.starts_with(&self.active)
-            .cmp(&b.starts_with(&self.active))
-            // Codex cannot open an external gzip copy. A revert still follows its rollout timestamp.
-            .then_with(|| {
-                let native_or_reverted = |path| {
-                    rollout_file::representation_priority(path) > 0
-                        || thread_id(path) != rollout_id(path)
-                };
-                native_or_reverted(a).cmp(&native_or_reverted(b))
-            })
-            .then_with(|| timestamp(a).cmp(&timestamp(b)))
-            .then_with(|| rollout_id(a).cmp(&rollout_id(b)))
-            .then_with(|| {
-                rollout_file::representation_priority(a)
-                    .cmp(&rollout_file::representation_priority(b))
-            })
-            .then_with(|| a.cmp(b))
-    }
+pub(super) fn rollout_priority<'a>(
+    path: &'a Path,
+    active: &Path,
+) -> (bool, bool, Option<&'a str>, Option<&'a str>, u8, &'a Path) {
+    let representation = rollout_file::representation_priority(path);
+    (
+        path.starts_with(active),
+        // Codex cannot open external gzip copies. A revert still follows its rollout timestamp.
+        representation > 0 || thread_id(path) != rollout_id(path),
+        timestamp(path),
+        rollout_id(path),
+        representation,
+        path,
+    )
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1470,6 +789,7 @@ fn visit_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     thread_local! {
         pub(super) static FULL_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1495,61 +815,50 @@ mod tests {
 
     #[test]
     fn native_fallback_checks_all_files_with_the_selected_native_rank() -> Result<()> {
-        for name in [
-            format!("rollout-2026-01-01T00-00-00-{THREAD}_{FIRST}.jsonl"),
-            format!("rollout-{THREAD}.jsonl"),
-        ] {
-            let home = tempfile::tempdir()?;
-            let first = home.path().join("sessions/2026/01/01");
-            let second = home.path().join("sessions/2026/01/02");
-            fs::create_dir_all(&first)?;
-            fs::create_dir_all(&second)?;
-            let plain = first.join(&name);
-            let compressed = second.join(&name).with_extension("jsonl.zst");
-            let header = serde_json::json!({"type":"session_meta","payload":{"id":THREAD}});
-            fs::write(&plain, header.to_string())?;
-            let select = |paths: &[&Path]| -> Result<(PathBuf, bool)> {
-                let scan = CodexFileScan {
-                    files: paths.iter().map(|p| p.to_path_buf()).collect(),
-                    ..Default::default()
-                };
-                RolloutSelector::default()
-                    .resume_selection(home.path(), &scan, THREAD, false)?
-                    .context("selected rollout")
-            };
-            assert!(select(&[&plain])?.1);
-            let frame = zstd::stream::encode_all(fs::File::open(&plain)?, 1)?;
-            fs::write(plain.with_extension("jsonl.zst"), &frame)?;
-            assert!(select(&[&plain])?.1);
-            fs::write(&compressed, frame)?;
-            // Discovery can predate the second copy or stop before its directory.
-            assert!(!select(&[&plain])?.1);
-            assert!(!select(&[&plain, &compressed])?.1);
-            for limit in [1, 10] {
-                let scan = super::super::scan_session_files(home.path(), limit);
-                assert!(
-                    !RolloutSelector::default()
-                        .resume_selection(home.path(), &scan, THREAD, true)?
-                        .unwrap()
-                        .1
-                );
-            }
-
-            let alias = second.join(&name);
-            fs::hard_link(&plain, &alias)?;
-            assert!(select(&[&plain, &alias, &compressed])?.1);
-            fs::remove_file(&alias)?;
-            let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
-            db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT)")?;
-            db.execute(
-                "INSERT INTO threads VALUES(?1, ?2)",
-                (THREAD, compressed.to_str()),
-            )?;
-            drop(db);
-            let (selected, native) = select(&[&plain, &compressed])?;
-            assert!(native);
-            assert!(same_file::is_same_file(selected, compressed)?);
-        }
+        let name = format!("rollout-2026-01-01T00-00-00-{THREAD}_{FIRST}.jsonl");
+        let home = tempfile::tempdir()?;
+        let first = home.path().join("sessions/2026/01/01");
+        let second = home.path().join("sessions/2026/01/02");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        let plain = first.join(&name);
+        let compressed = second.join(&name).with_extension("jsonl.zst");
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":THREAD,"history_mode":"paginated"}});
+        fs::write(&plain, header.to_string())?;
+        let select = || {
+            super::super::current_launch::filesystem_selects(
+                home.path(),
+                THREAD,
+                &plain,
+                None,
+                true,
+            )
+        };
+        assert!(select()?);
+        let frame = zstd::stream::encode_all(fs::File::open(&plain)?, 1)?;
+        fs::write(plain.with_extension("jsonl.zst"), &frame)?;
+        assert!(select()?);
+        fs::write(&compressed, frame)?;
+        assert!(!select()?);
+        let alias = second.join(&name);
+        fs::hard_link(&plain, &alias)?;
+        assert!(select()?);
+        fs::remove_file(&alias)?;
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )?;
+        db.execute(
+            "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+            (THREAD, compressed.to_str()),
+        )?;
+        drop(db);
+        let selected = super::super::current_rollout::CurrentRollouts::default()
+            .rows(home.path(), [THREAD])?[THREAD]
+            .resolve(home.path(), THREAD, [&*plain, &*compressed], true)?
+            .context("selected rollout")?;
+        assert!(selected.native);
+        assert!(same_file::is_same_file(selected.path, compressed)?);
         Ok(())
     }
 
@@ -1601,8 +910,7 @@ mod tests {
         let home = tempfile::tempdir()?;
         let directory = home.path().join("archived_sessions");
         let known = rollout(&directory, "2026-01-01T00-00-00", &format!("_{FIRST}"))?;
-        let selector = RolloutSelector::default();
-        let batch = selector.listing(home.path(), [THREAD]);
+        let batch = RolloutCatalog::new(home.path());
         std::thread::scope(|scope| -> Result<()> {
             let readers: Vec<_> = (0..12)
                 .map(|_| {
@@ -1623,7 +931,7 @@ mod tests {
         })?;
         let restored = rollout(&directory, "2026-01-02T00-00-00", &format!("_{SECOND}"))?;
         assert!(batch.find_unlisted_ancestor(SECOND)?.is_none());
-        let next_batch = selector.listing(home.path(), [THREAD]);
+        let next_batch = RolloutCatalog::new(home.path());
         assert_eq!(next_batch.find_unlisted_ancestor(SECOND)?, Some(restored));
         Ok(())
     }
@@ -1646,9 +954,8 @@ mod tests {
         };
         let archived = rollout(&archive, "2026-01-01T00-00-00", &format!("_{FIRST}"))?;
         let active = rollout(&home.path().join("sessions"), "2026-01-02T00-00-00", "")?;
-        let selector = RolloutSelector::default();
         for limit in [0, 1] {
-            let batch = selector.listing(home.path(), [THREAD]);
+            let batch = RolloutCatalog::new(home.path());
             assert!(
                 batch
                     .ancestors
@@ -1680,7 +987,7 @@ mod tests {
                 RolloutSelector::scan_exact(home.path(), FIRST, IdKind::Rollout)
             })
         };
-        let batch = selector.listing(home.path(), [THREAD]);
+        let batch = RolloutCatalog::new(home.path());
         assert_eq!(lookup()?, None);
         assert_eq!(batch.find_unlisted_ancestor(FIRST)?, None);
         let active = rollout(
@@ -1691,8 +998,7 @@ mod tests {
         assert_eq!(lookup()?.as_ref(), Some(&active));
         assert_eq!(batch.find_unlisted_ancestor(FIRST)?, None);
         assert_eq!(
-            selector
-                .listing(home.path(), [THREAD])
+            RolloutCatalog::new(home.path())
                 .find_unlisted_ancestor(FIRST)?
                 .as_ref(),
             Some(&active)
@@ -1758,10 +1064,7 @@ mod tests {
             "UPDATE threads SET rollout_path = ?1",
             [active.to_str().unwrap()],
         )?;
-        assert_eq!(
-            read()?.snapshot.workspace.current_dir,
-            Path::new("archived")
-        );
+        assert_eq!(read()?.snapshot.workspace.current_dir, Path::new("active"));
         let refreshed =
             adapter.index_batch(&[THREAD]).unwrap()(&session, Some(&archive), u64::MAX)?;
         assert_eq!(
@@ -1827,17 +1130,18 @@ mod tests {
             [THREAD, earlier.to_str().unwrap()],
         )?;
 
-        let selector = RolloutSelector::default();
-        let catalog = selector.listing(home.path(), [THREAD]);
-        let listed =
-            || catalog.select_listed([(earlier.as_path(), true), (later.as_path(), true)], THREAD);
-        let select = || {
-            selector.select(
-                home.path(),
-                [earlier.as_path(), later.as_path()],
-                THREAD,
-                IdKind::Thread,
-            )
+        let selector = super::super::current_rollout::CurrentRollouts::default();
+        let snapshot = selector.rows(home.path(), [THREAD])?;
+        let paths = [earlier.as_path(), later.as_path()];
+        let listed = || -> Result<Option<PathBuf>> {
+            Ok(snapshot[THREAD]
+                .resolve(home.path(), THREAD, paths, true)?
+                .map(|selected| selected.path))
+        };
+        let select = || -> Result<Option<PathBuf>> {
+            Ok(selector.rows(home.path(), [THREAD])?[THREAD]
+                .resolve(home.path(), THREAD, paths, true)?
+                .map(|selected| selected.path))
         };
         assert_eq!(select()?, Some(earlier.canonicalize()?));
         assert_eq!(listed()?, Some(earlier.canonicalize()?));
@@ -1853,18 +1157,13 @@ mod tests {
             &compressed,
             zstd::stream::encode_all(fs::File::open(&later)?, 1)?,
         )?;
-        fs::remove_file(later)?;
-        assert_eq!(
-            selector.select(home.path(), [earlier.as_path()], THREAD, IdKind::Thread)?,
-            Some(compressed.canonicalize()?)
-        );
+        fs::remove_file(&later)?;
+        assert_eq!(select()?, Some(compressed.canonicalize()?));
         fs::remove_file(compressed)?;
         assert!(
-            selector
-                .select(home.path(), [earlier.as_path()], THREAD, IdKind::Thread)
+            select()
                 .unwrap_err()
-                .to_string()
-                .contains("missing or invalid")
+                .is::<super::super::current_rollout::CurrentRolloutUnavailable>()
         );
         Ok(())
     }

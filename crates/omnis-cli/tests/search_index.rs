@@ -22,6 +22,72 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[cfg(unix)]
+#[test]
+fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let binary = root.path().join("opencode");
+    fs::write(
+        &binary,
+        r##"#!/bin/sh
+case "$*" in
+  --version) echo 1.18.18 ;;
+  *export*) echo '{"id":"ses_guide","updated_at":"2026-01-01T00:00:00Z","messages":[{"role":"assistant","text":"# AGENTS.md instructions for receiptguide"}]}' ;;
+  *) echo '[]' ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let session = SessionRef::new(Provider::OpenCode, "ses_guide");
+    fs::create_dir_all(&environment.state_root).unwrap();
+    let index = environment.state_root.join("store.sqlite3");
+    let store = Store::open(&index).unwrap();
+    let source_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    store
+        .upsert_session_trajectory(&session, "original question", source_time, true)
+        .unwrap();
+    let database = Connection::open(index).unwrap();
+    database
+        .execute("UPDATE session_trajectories SET document_version = 4", [])
+        .unwrap();
+    let matches = || {
+        store
+            .search_session_trajectories("receiptguide", 1)
+            .unwrap()
+    };
+    assert!(matches().is_empty());
+    let open = || {
+        let output = environment
+            .command()
+            .current_dir(root.path())
+            .env("OMNI_OPENCODE_BIN", &binary)
+            .args(["show", "opencode:ses_guide"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+    };
+    open();
+    assert_eq!(matches().first(), Some(&session));
+    let state = store.trajectory_index_states().unwrap()[&session];
+    assert_eq!(state.source_updated_at, source_time);
+    assert_eq!(state.document_version, omnis_core::SEARCH_DOCUMENT_VERSION);
+
+    database
+        .execute_batch(
+            "CREATE TRIGGER reject_reindex BEFORE INSERT ON session_trajectories
+             BEGIN SELECT RAISE(FAIL, 'unexpected reindex'); END;",
+        )
+        .unwrap();
+    open();
+}
+
 #[test]
 fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
     let temporary_directory = tempdir().expect("temporary directory");
@@ -535,14 +601,11 @@ fn assert_read_commands(
         .output()
         .expect("inspect imported source in reopened process");
     assert!(
-        inspected.status.success(),
-        "inspect imported source failed: {}",
-        String::from_utf8_lossy(&inspected.stderr)
+        !inspected.status.success(),
+        "the bundle needs an installed Codex to receive a handoff"
     );
-    let inspected: serde_json::Value =
-        serde_json::from_slice(&inspected.stdout).expect("inspect JSON");
-    assert_eq!(inspected["source"], "codex");
-    assert_eq!(inspected["target"], "codex");
+    assert!(String::from_utf8_lossy(&inspected.stderr).contains("OMNI_CODEX_BIN"));
+    assert!(inspected.stdout.is_empty());
 
     let exported_path = output_root.join("re-exported.json");
     let exported = environment
