@@ -235,8 +235,8 @@ fn sqlite_selected_revert_owns_the_public_thread_and_its_index_receipt() -> Resu
     let listed = adapter.list_sessions(None)?;
     assert_eq!(listed.len(), 1);
     let found = adapter.find_native_session(THREAD)?.unwrap();
-    let read = adapter.index_session(&session, Some(&original), u64::MAX)?;
-    let revision = CodexAdapter::index_file_revision(&selected).unwrap();
+    let read = adapter.read_full_index_at(&session, Some(&original))?;
+    let revision = omnis_adapters::source_file_revision(&selected).unwrap();
     let receipt = read.native_session.as_ref().unwrap();
     for entry in [&listed[0], &found, receipt] {
         assert_eq!(entry.session, session);

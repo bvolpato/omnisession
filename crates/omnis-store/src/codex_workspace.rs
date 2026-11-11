@@ -196,7 +196,7 @@ impl CodexWorkspace {
             // A preview can update a name while search keeps the full text and its verified workspace.
             if !write.source_complete
                 && write.document.origin == SessionTrajectoryOrigin::Native
-                && matches!(write.guard, TrajectorySourceGuard::Observed(_))
+                && matches!(write.guard, TrajectorySourceGuard::ObservedRevision(_))
                 && self.source_revision == revision
                 && transaction.query_row(
                     "SELECT EXISTS (

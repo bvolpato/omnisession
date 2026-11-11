@@ -159,7 +159,7 @@ pub(super) fn accept(
     if !deferred && !document.local_opener.rechecks_legacy_title() {
         return Ok(());
     }
-    let TrajectorySourceGuard::Observed(Some(observed)) = write.guard else {
+    let TrajectorySourceGuard::ObservedRevision(Some(observed)) = write.guard else {
         return Err(StoreError::TrajectorySourceChanged);
     };
     let incoming = document.source_revision;

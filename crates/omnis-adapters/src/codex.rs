@@ -21,10 +21,10 @@ use crate::{
     CodexWorkspaceProjection, EnvChange, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
     NativeSession, NativeSessionName, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
-        EventBuilder, JsonLineSkips, JsonLinesPreview, MAX_PREVIEW_TAIL_SIZE,
-        MAX_STREAMED_TRANSCRIPT_LINE_SIZE, json_lines_preview_with_omissions, omitted_images_text,
-        parse_timestamp, paths_match, provider_executable, provider_file, sort_sessions, string_at,
-        validate_provider, value_at, visit_index_json_lines_with_gaps,
+        EventBuilder, JsonLineSkips, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        json_lines_preview_with_omissions, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, provider_file, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines_with_gaps,
     },
 };
 
@@ -246,6 +246,16 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Returns the verified treatment of a leading tilde in `CODEX_SQLITE_HOME` for this Codex release.
+    #[must_use]
+    pub fn expands_sqlite_env_tilde(version: &str) -> Option<bool> {
+        match version {
+            "0.137.0" => Some(false),
+            "0.167.1" => Some(true),
+            _ => None,
+        }
+    }
+
     /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
     ///
     /// # Errors
@@ -374,6 +384,7 @@ impl CodexAdapter {
                 workspace_projection,
                 snapshot,
                 source_complete: document.source_complete,
+                provider_limited: read.provider_limited,
                 source_revision: read.source_revision,
                 native_session: read.native_session.clone(),
             }))
@@ -472,6 +483,14 @@ impl CodexAdapter {
             listing: Arc::default(),
             titles: Arc::default(),
         }
+    }
+
+    /// Selects existing threads from the SQLite directory used for the native import.
+    #[must_use]
+    pub fn for_import(codex_home: &Path, sqlite_home: &Path) -> Self {
+        let mut adapter = Self::with_root(codex_home);
+        adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
+        adapter
     }
 
     fn discover_session_scan(&self) -> CodexFileScan {
@@ -1861,6 +1880,7 @@ impl CodexSession {
             rollback_title,
             workspace_projection,
             source_complete,
+            provider_limited: false,
             source_revision,
         })
     }
@@ -1890,14 +1910,10 @@ impl CodexSession {
                     directory,
                 } => {
                     let events = self.events_from_preview(
-                        JsonLinesPreview {
-                            records,
-                            omissions: unreadable,
-                            sampled: omitted > 0,
-                            prefix_records,
-                        },
+                        records,
+                        prefix_records,
+                        unreadable,
                         Some(omitted),
-                        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
                     );
                     (events, directory, false, true)
                 }
@@ -1915,6 +1931,7 @@ impl CodexSession {
             rollback_title,
             snapshot,
             source_complete,
+            provider_limited: false,
             source_revision: SourceRevision::default(),
         })
     }
@@ -2010,23 +2027,28 @@ impl CodexSession {
         if preview.omissions.workspace_gaps() > 0 {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
-        let events = self.events_from_preview(preview, None, MAX_STREAMED_TRANSCRIPT_LINE_SIZE);
+        let events = self.events_from_preview(
+            preview.records,
+            preview.prefix_records,
+            preview.omissions,
+            (!preview.sampled).then_some(0),
+        );
         Ok((events, directory, true))
     }
 
     fn events_from_preview(
         &self,
-        preview: JsonLinesPreview,
+        records: Vec<Value>,
+        prefix_records: usize,
+        omissions: JsonLineSkips,
         omitted: Option<usize>,
-        line_limit: u64,
     ) -> EventBuilder {
         let mut builder = self.event_builder();
         let mut last_visible = None;
-        let unread_ancestor = preview.records.iter().any(records_history_base);
+        let unread_ancestor = records.iter().any(records_history_base);
         if !self.is_subagent
-            && preview.prefix_records > 0
-            && preview
-                .records
+            && prefix_records > 0
+            && records
                 .iter()
                 .enumerate()
                 .all(|(i, record)| ordinary_rollback_record(record, i == 0))
@@ -2034,8 +2056,8 @@ impl CodexSession {
             builder.track_rollback_opener(false);
             builder.note_rollback_history_gap();
         }
-        let mut records = preview.records.into_iter();
-        for record in records.by_ref().take(preview.prefix_records) {
+        let mut records = records.into_iter();
+        for record in records.by_ref().take(prefix_records) {
             push_record(&mut builder, &record, &mut last_visible);
         }
         let prefix_end = builder.checkpoint();
@@ -2046,16 +2068,16 @@ impl CodexSession {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
         builder.push_json_line_omissions(
-            preview.omissions,
-            line_limit,
+            omissions,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             Some(prefix_end),
             self.updated_at,
         );
         self.finish_preview_prefix(
             &mut builder,
-            if preview.sampled { omitted } else { Some(0) },
+            omitted,
             prefix_end,
-            preview.omissions.total() == 0 && !unread_ancestor,
+            omissions.total() == 0 && !unread_ancestor,
         );
         builder
     }
@@ -2951,6 +2973,14 @@ impl ProviderAdapter for CodexAdapter {
             native.preview(session)
         })
         .map(|(snapshot, _, _)| snapshot)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, u64::MAX)
     }
 
     fn index_session(

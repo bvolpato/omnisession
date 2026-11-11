@@ -12,7 +12,8 @@ mod cache;
 
 const MIGRATION: &str = "codex_home_from_saved_rollout_headers";
 const CANDIDATES: &str = "SELECT c.provider,c.session_id,c.title,c.project_path,c.git_branch,
-    c.created_at,c.updated_at,c.updated_at_approximate,c.event_count,c.source_file_id,c.source_contents_id,
+    c.created_at,c.updated_at,c.updated_at_approximate,c.event_count,c.source_updated_submillis,
+    c.source_file_id,c.source_contents_id,
     c.indexed_at,CASE WHEN d.id IS NOT NULL THEN json_array(d.id,d.source_updated_at,d.indexed_at,
         hex(d.content_hash),hex(d.source_file_id),hex(d.source_contents_id),d.document_version) END
     FROM session_index c LEFT JOIN session_trajectories d ON d.provider=c.provider AND d.session_id=c.session_id
@@ -31,8 +32,8 @@ impl Candidate {
     fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             metadata: indexed_session_from_row(row)?,
-            indexed_at: row.get(11)?,
-            document: row.get(12)?,
+            indexed_at: row.get(12)?,
+            document: row.get(13)?,
         })
     }
 }

@@ -130,10 +130,13 @@ pub(super) fn require_continuation_args(args: &[String], built_in: bool) -> Resu
 
 pub(crate) fn pin_local_server(
     adapter: &dyn omnis_adapters::ProviderAdapter,
+    target: crate::launch_profile::AgentTarget,
     session: Option<&omnis_ir::SessionRef>,
     plan: &mut omnis_adapters::LaunchPlan,
 ) -> Result<bool> {
-    let Some(home) = selected_sqlite_home(adapter, session, plan)? else {
+    let Some(home) =
+        selected_sqlite_home(adapter, session, target.codex_option_plan(plan)?.as_ref())?
+    else {
         return Ok(false);
     };
     let index = match session {
@@ -222,11 +225,7 @@ fn codex_expands_env_tilde(plan: &LaunchPlan) -> Option<bool> {
         omnis_ir::Provider::Codex,
     )
     .ok()?;
-    match version.as_str() {
-        "0.137.0" => Some(false),
-        "0.167.1" => Some(true),
-        _ => None,
-    }
+    omnis_adapters::CodexAdapter::expands_sqlite_env_tilde(&version)
 }
 
 pub(crate) fn launch_directory(plan: &LaunchPlan) -> Result<PathBuf> {

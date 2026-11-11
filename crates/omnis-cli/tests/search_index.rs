@@ -138,6 +138,83 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
 }
 
 #[test]
+fn imported_documents_refresh_at_their_source_providers_version() {
+    let temporary = tempdir().unwrap();
+    let environment = TestEnvironment::new(temporary.path(), temporary.path().to_owned());
+    let path = temporary.path().join("bundle.json");
+    let providers = [Provider::OhMyPi, Provider::Pi, Provider::Claude];
+    let mut locators = Vec::new();
+    for provider in providers {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.session.provider = provider;
+        for event in &mut snapshot.events {
+            event.source.provider = provider;
+        }
+        let bundle_id = Uuid::new_v4();
+        let bundle = PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.into(),
+                bundle_id,
+                created_at: snapshot.captured_at,
+                source: snapshot.session.clone(),
+                event_count: snapshot.events.len(),
+                redactions: Vec::new(),
+            },
+            snapshot,
+            fidelity: None,
+        };
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert_import_succeeds(&environment, &path, "seed imported locator");
+        locators.push(SessionRef::new(Provider::Imported, bundle_id.to_string()));
+    }
+    let database = environment.state_root.join("store.sqlite3");
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET document_version = 4, derived_title = 'Old title'
+         WHERE provider = 'imported'",
+            [],
+        )
+        .unwrap();
+    let shown = environment
+        .command()
+        .args(["show", &locators[0].to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let indexed = environment
+        .command()
+        .args(["--json", "index", "--provider", "imported"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let expected = providers[1..]
+        .iter()
+        .filter(|&&provider| omnis_core::search_document_version(provider) > 4)
+        .count();
+    assert_eq!(summary["stale"], expected);
+    assert_eq!(summary["indexed"], expected);
+    let store = Store::open(&database).unwrap();
+    for (provider, locator) in providers.into_iter().zip(&locators) {
+        let version = omnis_core::search_document_version(provider);
+        let state = store.trajectory_index_state(locator).unwrap().unwrap();
+        assert_eq!(state.document_version, version);
+        assert!(state.source_complete);
+        let title = store.trajectory_title(locator).unwrap().unwrap();
+        assert_eq!(title == "Old title", version == 4);
+    }
+}
+
+#[test]
 fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
     let temporary_directory = tempdir().expect("temporary directory");
     let workspace = temporary_directory.path().join("workspace");
