@@ -1643,7 +1643,13 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
     fs::create_dir(&linked_bin).unwrap();
     let linked_command = linked_bin.join("codex");
     std::os::unix::fs::symlink(&primary, &linked_command).unwrap();
-    for route in [visible.join("codex"), linked_command] {
+    let dispatcher = fixture.root.join("multicall");
+    fs::copy(&primary, &dispatcher).unwrap();
+    let shims = fixture.root.join("shims");
+    fs::create_dir(&shims).unwrap();
+    let shim = shims.join("codex");
+    std::os::unix::fs::symlink(&dispatcher, &shim).unwrap();
+    for route in [visible.join("codex"), linked_command, shim] {
         fixture.write_profiles(&format!(
             "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
             json!(route)

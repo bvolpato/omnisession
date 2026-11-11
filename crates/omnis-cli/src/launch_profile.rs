@@ -665,7 +665,9 @@ impl AgentTarget {
         if let Some(provider) = provider.as_deref()
             && (program == provider
                 || (program.file_name() == provider.file_name()
-                    && program.canonicalize().ok().as_deref() == Some(provider)))
+                    && program.canonicalize().is_ok_and(|resolved| {
+                        provider.canonicalize().is_ok_and(|path| path == resolved)
+                    })))
         {
             return Ok(true);
         }

@@ -61,8 +61,9 @@ fn resolve_real_binary(provider: Provider, excluded_directory: &Path) -> Result<
         if !override_path.is_absolute() {
             bail!("{variable} must contain an absolute executable path");
         }
-        let binary = validate_real_binary(&override_path, excluded_directory, &current_exe)
-            .with_context(|| format!("validating {variable}"))?;
+        let binary =
+            validated_provider_command(provider, &override_path, excluded_directory, &current_exe)
+                .with_context(|| format!("validating {variable}"))?;
         if provider == Provider::CursorCli && !cursor_agent_binary_name_matches(&binary) {
             bail!("{variable} does not identify a Cursor Agent executable");
         }
@@ -79,7 +80,7 @@ fn resolve_real_binary(provider: Provider, excluded_directory: &Path) -> Result<
         }
         for candidate in executable_candidates(&directory, command_name) {
             if let Ok(candidate) =
-                validate_real_binary(&candidate, excluded_directory, &current_exe)
+                validated_provider_command(provider, &candidate, excluded_directory, &current_exe)
             {
                 return Ok(candidate);
             }
@@ -511,6 +512,21 @@ pub(super) fn runnable_target_providers() -> Vec<Provider> {
                 }
         })
         .collect()
+}
+
+fn validated_provider_command(
+    provider: Provider,
+    invocation: &Path,
+    excluded_directory: &Path,
+    current_exe: &Path,
+) -> Result<PathBuf> {
+    let executable = validate_real_binary(invocation, excluded_directory, current_exe)?;
+    // A Codex dispatcher can select its command from the name used to invoke it.
+    if provider == Provider::Codex {
+        Ok(std::path::absolute(invocation)?)
+    } else {
+        Ok(executable)
+    }
 }
 
 fn validate_real_binary(
