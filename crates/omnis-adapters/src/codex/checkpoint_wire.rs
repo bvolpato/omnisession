@@ -132,7 +132,7 @@ fn previous_settings(settings: &Value) -> bool {
     )
 }
 
-fn turn_attribution(attribution: &Value) -> bool {
+pub(super) fn turn_attribution(attribution: &Value) -> bool {
     fields(
         attribution,
         &[
@@ -242,7 +242,7 @@ pub(super) fn message_part(part: &Value) -> bool {
     }
 }
 
-fn output(value: &Value) -> bool {
+pub(super) fn output(value: &Value) -> bool {
     value.is_string()
         || array(value, |part| match part["type"].as_str() {
             Some("input_text") => part["text"].is_string(),

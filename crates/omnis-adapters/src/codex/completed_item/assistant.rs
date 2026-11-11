@@ -31,7 +31,7 @@ pub(in super::super) fn valid(item: &Value) -> bool {
         && optional(&item["questions"], |value| array(value, question))
 }
 
-fn question(value: &Value) -> bool {
+pub(in super::super) fn question(value: &Value) -> bool {
     value.as_object().is_none_or(|map| {
         map.keys()
             .all(|k| matches!(k.as_str(), "title" | "options"))
@@ -44,7 +44,7 @@ fn question(value: &Value) -> bool {
     )
 }
 
-fn citation(value: &Value) -> bool {
+pub(in super::super) fn citation(value: &Value) -> bool {
     fields(
         value,
         &[

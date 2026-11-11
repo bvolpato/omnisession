@@ -157,3 +157,197 @@ fn an_unterminated_display_stays_pending_and_damaged_middle_lines_do_not_take_it
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
     }
 }
+
+#[test]
+fn a_damaged_plan_cannot_replace_the_visible_proposal_or_claim_its_public_ordinal() {
+    let prior = stamped(
+        turn_item(
+            "turn",
+            &json!({"type":"Plan","id":"plan","text":"original proposal"}),
+        ),
+        1,
+    );
+    let mut invalid = json!({"type":"Plan","id":"plan"});
+    let repaired = stamped(
+        json!({"type":"event_msg","payload":["item_completed",SESSION_ID,"turn",["Plan","plan","updated proposal"],null,0]}),
+        2,
+    );
+    for text in [None, Some(Value::Null), Some(7.into())] {
+        if let Some(text) = text {
+            invalid["text"] = text;
+        }
+        let broken = stamped(turn_item("turn", &invalid), 2);
+        for (tail, expected) in [
+            (vec![], "original proposal"),
+            (vec![repaired.clone()], "updated proposal"),
+        ] {
+            for preview in [false, true] {
+                let results = read_with_history_mode(
+                    [prior.clone(), broken.clone()]
+                        .into_iter()
+                        .chain(tail.clone())
+                        .collect(),
+                    preview,
+                    Some("paginated"),
+                )
+                .unwrap();
+                assert_eq!(visible_text(&results), [expected]);
+                let loss = results
+                    .events
+                    .iter()
+                    .find(|e| {
+                        e.source.raw_record_type.as_deref()
+                            == Some("omnisession.codex_invalid_message")
+                    })
+                    .unwrap();
+                assert_eq!(loss.payload["omitted_events"], 1);
+                assert!(!omnis_core::trajectory_search_document(&results).source_complete);
+            }
+        }
+    }
+}
+
+#[test]
+fn published_items_can_be_revised_at_an_empty_turn_or_item_id() {
+    let plan = |turn, id, text| turn_item(turn, &json!({"type":"Plan","id":id,"text":text}));
+    let assistant = |text| {
+        let content = json!([{"type":"Text","text":text}]);
+        turn_item(
+            "turn",
+            &json!({"type":"AgentMessage","id":"","content":content}),
+        )
+    };
+    let snap = read_with_history_mode(
+        vec![
+            plan("turn", "first", "original"),
+            plan("turn", "", "other item"),
+            plan("", "first", "other turn"),
+            plan("", "first", "revised turn"),
+            page_user("turn", "", "superseded request"),
+            assistant("superseded answer"),
+            page_user("turn", "", ""),
+            assistant(""),
+        ],
+        false,
+        Some("paginated"),
+    )
+    .unwrap();
+    let conversation = omnis_core::import_conversation(&snap);
+    let active: Vec<_> = conversation
+        .messages
+        .iter()
+        .map(|m| m.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect();
+    assert_eq!(active, ["original", "other item", "revised turn"]);
+    assert!(!conversation.truncated);
+}
+
+#[test]
+fn a_documentary_event_must_decode_to_reserve_its_public_position() {
+    let prior = stamped(page_user("turn", "id", "original request"), 1);
+    let revised = stamped(page_user("turn", "id", "updated request"), 2);
+    for (wire, expected) in [
+        (json!({"type":"user_message"}), "updated request"),
+        (
+            json!({"type":"token_count","rate_limits":17}),
+            "updated request",
+        ),
+        (
+            json!({"type":"token_count","rate_limits":{}}),
+            "original request",
+        ),
+        (
+            json!({"type":"task_started","turn_id":"turn","collaboration_mode_kind":"future"}),
+            "updated request",
+        ),
+        (
+            json!({"type":"task_started","turn_id":"turn","collaboration_mode_kind":"pair_programming"}),
+            "original request",
+        ),
+        (
+            json!({"type":"agent_message","message":null}),
+            "updated request",
+        ),
+        (
+            json!({"type":"user_message","message":"documentary only","text_elements":null}),
+            "updated request",
+        ),
+        (
+            json!({"type":"agent_message","message":"documentary only","phase":"unknown"}),
+            "updated request",
+        ),
+        (
+            json!({"type":"user_message","message":""}),
+            "original request",
+        ),
+        (
+            json!(["agent_message", "documentary only"]),
+            "original request",
+        ),
+    ] {
+        let row = stamped(json!({"type":"event_msg","payload":wire}), 2);
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(
+                vec![prior.clone(), row.clone(), revised.clone()],
+                preview,
+                Some("paginated"),
+            )
+            .unwrap();
+            assert_eq!(visible_text(&snapshot), [expected]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete && !search.text.contains("documentary only"));
+        }
+    }
+}
+
+#[test]
+fn an_undecoded_documentary_ordinal_only_limits_the_display_when_another_record_contests_it() {
+    let question = |text, ordinal| stamped(page_user("turn", "id", text), ordinal);
+    let opaque = [
+        event("future_status", json!({"private":"documentary payload"})),
+        turn_item(
+            "turn",
+            &json!({"type":"FutureItem","id":"opaque","private":"documentary payload"}),
+        ),
+        json!({"type":"world_state","payload":{"future":"documentary payload"}}),
+    ];
+    for source in &opaque {
+        for (ordinal, expected, contested) in [(2, "published", true), (3, "revision", false)] {
+            for preview in [false, true] {
+                let prefix = vec![
+                    question("published", 1),
+                    stamped(source.clone(), 2),
+                    question("revision", ordinal),
+                ];
+                let snapshot =
+                    read_with_history_mode(prefix.clone(), preview, Some("paginated")).unwrap();
+                assert_eq!(visible_text(&snapshot), [expected]);
+                let notice = snapshot.events.iter().find(|e| {
+                    e.source.raw_record_type.as_deref() == Some("omnisession.codex_rollout_line")
+                });
+                assert_eq!(notice.is_some(), contested);
+                if let Some(notice) = notice {
+                    assert_eq!(notice.payload["contested_ordinal"], true);
+                    assert_eq!(notice.payload["omitted_events"], 1);
+                    assert!(!notice.payload.to_string().contains("documentary payload"));
+                }
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert_eq!(search.source_complete, !contested);
+                if contested {
+                    assert!(!search.text.contains("revision"));
+                    let resolved = read_with_history_mode(
+                        prefix
+                            .into_iter()
+                            .chain([question("confirmed tail", 3)])
+                            .collect(),
+                        preview,
+                        Some("paginated"),
+                    )
+                    .unwrap();
+                    assert_eq!(visible_text(&resolved), ["confirmed tail"]);
+                }
+            }
+        }
+    }
+}

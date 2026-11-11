@@ -1491,13 +1491,19 @@ impl CodexHistory {
             }
         }
         if self.rollout_lines.skipped > 0 || self.rollout_lines.gap {
+            let reason = if self.rollout_lines.contested {
+                "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
+            } else {
+                "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+            };
             builder.push(
                 EventKind::ProviderEvent,
                 json!({
                     "omitted_events": self.rollout_lines.skipped,
                     "ordinal_gap": self.rollout_lines.gap,
+                    "contested_ordinal": self.rollout_lines.contested,
                     "native_history_unverified": true,
-                    "reason": "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+                    "reason": reason
                 }),
                 None,
                 ReplayPolicy::HistoricalOnly,
@@ -2301,10 +2307,10 @@ fn is_implicit_turn(id: &str) -> bool {
 impl CodexItems {
     fn can_publish_empty(&self, kind: &EventKind) -> bool {
         match kind {
-            EventKind::MessageAssistant => self.identity.scoped(true).is_some(),
-            EventKind::MessageUser => {
-                self.update.is_some() && self.identity.scoped(false).is_some()
+            EventKind::MessageAssistant => {
+                self.update.is_some() || self.identity.scoped(true).is_some()
             }
+            EventKind::MessageUser => self.update.is_some(),
             _ => false,
         }
     }
@@ -2346,9 +2352,7 @@ impl CodexItems {
         if payload["type"] != "item_completed" {
             return push_response_item(builder, payload, timestamp, self);
         }
-        if !turn.is_empty()
-            && !id.is_empty()
-            && payload["item"]["type"] == "Plan"
+        if payload["item"]["type"] == "Plan"
             && let Some(text) = payload["item"]["text"].as_str()
         {
             self.push_plan(builder, turn, id, text, timestamp);
