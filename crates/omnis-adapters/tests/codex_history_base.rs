@@ -1896,3 +1896,74 @@ fn rollback_counts_numbered_requests_after_an_unplaced_turn_start() -> anyhow::R
     }
     Ok(())
 }
+
+#[test]
+fn anchored_control_runs_preserve_complete_turns_and_apply_withdrawals_in_order()
+-> anyhow::Result<()> {
+    for (count, expected) in [
+        (0, &["A", "B", "C", "leaf"][..]),
+        (1, &["A", "C", "leaf"][..]),
+        (2, &["C", "leaf"][..]),
+    ] {
+        let home = tempfile::tempdir()?;
+        let start = |n| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_started","thread_id":PARENT,"turn_id":format!("turn-{n}")}});
+        let done = |n, t| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("turn-{t}")}});
+        let token = |n| json!({"ordinal":n,"type":"event_msg","payload":{"type":"token_count"}});
+        let rows = [
+            header(PARENT, 0, None),
+            start(1),
+            turn(2, "user", "A"),
+            done(3, 1),
+            start(4),
+            token(5),
+            turn(6, "user", "B"),
+            done(7, 4),
+            json!({"ordinal":8,"type":"event_msg","payload":{"type":"thread_rolled_back","thread_id":PARENT,"num_turns":count}}),
+            token(9),
+            start(10),
+            turn(11, "user", "C"),
+            done(12, 10),
+        ];
+        let parent = write(
+            home.path(),
+            "sessions",
+            PARENT,
+            PARENT,
+            "2026-01-01T00-00-00",
+            &rows,
+        );
+        write(
+            home.path(),
+            "sessions",
+            CHILD,
+            CHILD,
+            "2026-01-01T00-00-00",
+            &[
+                header(CHILD, 13, Some(bookmark(PARENT, &rows))),
+                turn(14, "user", "leaf"),
+            ],
+        );
+        for indices in [&[4][..], &[8], &[4, 8], &[4, 5], &[8, 9], &[4, 5, 8, 9]] {
+            let mut damaged = encoded(&rows);
+            for index in indices {
+                damaged = damaged.replace(
+                    &format!("\"ordinal\":{index},"),
+                    &format!("\"ordinaX\":{index},"),
+                );
+            }
+            fs::write(&parent, damaged)?;
+            check_parent_messages(home.path(), expected, true)?;
+        }
+        let malformed = encoded(&rows)
+            .replace("\"ordinal\":2,", "!ordinal\":2,")
+            .replace("\"ordinal\":4,", "\"ordinaX\":4,");
+        fs::write(&parent, malformed)?;
+        let later: &[&str] = if count == 0 {
+            &["B", "C", "leaf"]
+        } else {
+            &["C", "leaf"]
+        };
+        check_parent_messages(home.path(), later, true)?;
+    }
+    Ok(())
+}

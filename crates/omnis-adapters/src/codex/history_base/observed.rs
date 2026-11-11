@@ -88,6 +88,16 @@ fn restore_field(record: &mut Value, other: &Value, key: &str, allow_missing: bo
     true
 }
 
+fn matches_with_archived_ordinal(mut record: Value, archived: &Value) -> bool {
+    if !archived["ordinal"].is_u64() {
+        return false;
+    }
+    if record.get("ordinal").is_some_and(Value::is_null) {
+        record["ordinal"] = archived["ordinal"].clone();
+    }
+    restore_field(&mut record, archived, "ordinal", true) && record == *archived
+}
+
 fn one_saved_payload(header: &Value, owner: &str) -> bool {
     let Some(fields) = header.as_object() else {
         return false;
@@ -142,7 +152,7 @@ pub(in crate::codex) fn matching_header(mut first: Value, other: &Value) -> bool
             return false;
         }
     }
-    restore_field(&mut first, other, "ordinal", true) && first == *other
+    matches_with_archived_ordinal(first, other)
 }
 
 /// A complete copy can repair split JSON lines only if every surviving byte agrees.
@@ -231,7 +241,7 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
     let mut previous = other["ordinal"].as_u64();
     loop {
         match preferred.next() {
-            Ok(Row::Record(mut record)) => {
+            Ok(Row::Record(record)) => {
                 let Some(ordinal) = record["ordinal"].as_u64() else {
                     if record.get("type").is_none() && record.get("payload").is_none() {
                         return Ok(agreeing_fragments(
@@ -244,13 +254,7 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
                     let Ok(Row::Record(candidate)) = archive.next() else {
                         return Ok(false);
                     };
-                    if record.get("ordinal").is_some_and(Value::is_null) {
-                        record["ordinal"] = candidate["ordinal"].clone();
-                    }
-                    if !candidate["ordinal"].is_u64()
-                        || !restore_field(&mut record, &candidate, "ordinal", true)
-                        || record != candidate
-                    {
+                    if !matches_with_archived_ordinal(record, &candidate) {
                         return Ok(false);
                     }
                     previous = candidate["ordinal"].as_u64();

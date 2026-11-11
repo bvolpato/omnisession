@@ -683,7 +683,7 @@ struct Segment {
     visible_start: Option<VisibleStart>,
     subagent: Option<u64>,
     verified_revision: Option<omnis_ir::SourceRevision>,
-    recover_after_damage: bool,
+    recovery: Option<RecoveryPlan>,
     path: PathBuf,
     start: u64,
     position: Position,
@@ -759,7 +759,7 @@ impl Segment {
             visible_start,
             subagent,
             verified_revision: None,
-            recover_after_damage: false,
+            recovery: None,
             path: path.to_owned(),
             start,
             position,
@@ -863,7 +863,7 @@ impl std::fmt::Display for FailedAncestors {
 }
 
 #[derive(Debug)]
-struct DamagedPrefixes(Vec<(usize, &'static str)>);
+struct DamagedPrefixes(Vec<(usize, &'static str, Option<RecoveryPlan>)>);
 
 impl std::fmt::Display for DamagedPrefixes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -927,7 +927,7 @@ impl Lineage {
             return Err(error);
         };
         // Only segments newer than an unrecoverable gap can contribute to the projection.
-        for &(index, reason) in damage.0.iter().rev() {
+        for &(index, reason, ref plan) in damage.0.iter().rev() {
             if let Some(verified) = self.segments[index].verified_copy(
                 home,
                 catalog(),
@@ -937,8 +937,11 @@ impl Lineage {
                 self.segments[index] = verified;
             } else {
                 let segment = &mut self.segments[index];
-                segment.recover_after_damage = matches!(reason, MALFORMED_ROWS | MISSING_ORDINAL);
-                self.first_available = if segment.recover_after_damage {
+                segment.recovery.clone_from(plan);
+                if let Some(plan) = plan {
+                    segment.verified_revision = plan.revision;
+                }
+                self.first_available = if segment.recovery.is_some() {
                     index
                 } else {
                     index + 1
@@ -1073,8 +1076,9 @@ impl Lineage {
             }?;
             match prefix {
                 PrefixRead::Complete(count) => skipped += count,
+                PrefixRead::Partial(reason, plan) => damage.push((index, reason, Some(plan))),
                 PrefixRead::Damaged(reason) => {
-                    damage.push((index, reason));
+                    damage.push((index, reason, None));
                 }
             }
         }
@@ -1118,6 +1122,7 @@ fn access_denied(error: &anyhow::Error) -> bool {
 enum PrefixRead {
     Complete(usize),
     Damaged(&'static str),
+    Partial(&'static str, RecoveryPlan),
 }
 
 /// A bookmark counts uncompressed bytes, including line terminators. Check its exclusive ordinal
@@ -1126,24 +1131,30 @@ fn read_prefix(
     segment: &Segment,
     visit: &mut dyn FnMut(Value, usize) -> Result<()>,
 ) -> Result<PrefixRead> {
-    let valid_revision = || {
-        segment.verified_revision.is_none_or(|expected| {
-            CodexAdapter::index_file_revision(&segment.path) == Some(expected)
-        })
-    };
+    let revision = CodexAdapter::index_file_revision(&segment.path);
     ensure!(
-        valid_revision(),
+        segment
+            .verified_revision
+            .is_none_or(|expected| Some(expected) == revision),
         "selected alternate Codex source rollout changed"
     );
     let mut source = match rollout_file::open(&segment.path) {
         Err(error) if access_denied(&error) => return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE)),
         result => result?,
     };
-    let projection = read_prefix_from(segment, &mut source, visit)?;
-    ensure!(
-        valid_revision(),
-        "selected alternate Codex source rollout changed"
-    );
+    let mut projection = read_prefix_from(segment, &mut source, visit)?;
+    if let PrefixRead::Partial(_, plan) = &mut projection {
+        let Some(revision) = revision else {
+            return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE));
+        };
+        plan.revision = Some(revision);
+    }
+    if segment.verified_revision.is_some() || matches!(projection, PrefixRead::Partial(..)) {
+        ensure!(
+            CodexAdapter::index_file_revision(&segment.path) == revision,
+            "selected Codex source rollout changed during projection"
+        );
+    }
     Ok(projection)
 }
 
@@ -1157,6 +1168,105 @@ fn unreadable_prefix(path: &Path, error: std::io::Error) -> Result<PrefixRead> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct RecoveryPlan {
+    revision: Option<omnis_ir::SourceRevision>,
+    // Each interval records the first row, exclusive end row, and ordinal of the first row.
+    controls: Vec<(usize, usize, u64)>,
+    prefix_end: usize,
+    discard_through: usize,
+}
+
+impl RecoveryPlan {
+    fn ordinal(&self, row: usize) -> Option<u64> {
+        let index = self.controls.partition_point(|&(_, end, _)| end <= row);
+        let &(first, _, ordinal) = self.controls.get(index)?;
+        ordinal.checked_add(u64::try_from(row.checked_sub(first)?).ok()?)
+    }
+}
+
+#[derive(Default)]
+struct SequenceEvidence {
+    plan: RecoveryPlan,
+    anchor: Option<(usize, u64)>,
+    last_row: usize,
+    controls: bool,
+    pending_rollback: usize,
+    complete: usize,
+    first_gap: Option<usize>,
+}
+
+impl SequenceEvidence {
+    fn gap(&mut self) {
+        self.first_gap.get_or_insert(self.complete);
+    }
+
+    fn unknown(&mut self, row: usize) {
+        self.gap();
+        self.controls = false;
+        self.plan.discard_through = row;
+    }
+
+    fn anchor(&mut self, row: usize, ordinal: u64) {
+        if let Some((previous, position)) = self.anchor.replace((row, ordinal))
+            && previous + 1 < row
+        {
+            if self.controls
+                && self.last_row + 1 == row
+                && ordinal.checked_sub(position) == u64::try_from(row - previous).ok()
+            {
+                self.plan.controls.push((previous + 1, row, position + 1));
+            } else {
+                self.gap();
+                self.plan.discard_through = self.plan.discard_through.max(self.pending_rollback);
+            }
+        }
+        self.controls = true;
+        self.pending_rollback = 0;
+    }
+
+    fn observe(&mut self, path: &Path, record: &Value, row: usize, hidden: bool) {
+        if let Some(ordinal) = record["ordinal"].as_u64() {
+            self.anchor(row, ordinal);
+            if !hidden && is_owned_completion(record, path) {
+                self.complete = row;
+            }
+        } else {
+            let rollback = is_owned_rollback(record, path);
+            self.controls &= self.last_row + 1 == row
+                && !hidden
+                && (is_owned_turn_start(record, path)
+                    || rollback
+                    || is_owned_completion(record, path)
+                    || (record["type"] == "event_msg"
+                        && record["payload"]["type"] == "token_count"
+                        && owned_event(record, path)));
+            if !hidden && rollback {
+                self.pending_rollback = row;
+            }
+        }
+        self.last_row = row;
+    }
+
+    fn finish(mut self, end_row: usize, end_ordinal: u64) -> RecoveryPlan {
+        self.anchor(end_row, end_ordinal);
+        self.plan.prefix_end = self.first_gap.unwrap_or(usize::MAX);
+        self.plan
+    }
+}
+
+fn is_owned_completion(record: &Value, path: &Path) -> bool {
+    record["type"] == "event_msg"
+        && matches!(
+            record["payload"]["type"].as_str(),
+            Some("task_complete" | "turn_complete")
+        )
+        && record["payload"]["turn_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        && owned_event(record, path)
+}
+
 struct PrefixCursor {
     next: u64,
     max_reserved_gap: u64,
@@ -1164,8 +1274,7 @@ struct PrefixCursor {
     damage: Option<&'static str>,
     visible: bool,
     damaged_preamble_settings: bool,
-    last_numbered: Option<(usize, u64)>,
-    pending_turn_start: Option<Value>,
+    evidence: SequenceEvidence,
 }
 
 impl PrefixCursor {
@@ -1175,52 +1284,10 @@ impl PrefixCursor {
             max_reserved_gap: 0,
             malformed: false,
             damage: None,
-            visible: !segment.recover_after_damage,
+            visible: segment.recovery.is_none(),
             damaged_preamble_settings: false,
-            last_numbered: None,
-            pending_turn_start: None,
+            evidence: SequenceEvidence::default(),
         }
-    }
-
-    fn visit_record(
-        &mut self,
-        segment: &Segment,
-        start: VisibleStart,
-        record: Value,
-        row: usize,
-        visit: &mut dyn FnMut(Value) -> Result<()>,
-    ) -> Result<()> {
-        let ordinal = record["ordinal"].as_u64();
-        let mut anchored = self.pending_turn_start.take();
-        if let Some((last_row, last_ordinal)) = self.last_numbered {
-            // Both neighboring rows must place the start at a single visible source ordinal.
-            if last_row + 2 != row || last_ordinal.checked_add(2) != ordinal || ordinal.is_none() {
-                anchored = None;
-            }
-            if segment.recover_after_damage
-                && ordinal.is_none()
-                && last_row + 1 == row
-                && last_ordinal.checked_add(1) == Some(self.next)
-                && !start.hides_row(row)
-                && start.ordinal().is_none_or(|begin| self.next >= begin)
-                && is_owned_turn_start(&record, &segment.path)
-            {
-                self.pending_turn_start = Some(record.clone());
-            }
-        }
-        if let Some(ordinal) = ordinal {
-            self.last_numbered = Some((row, ordinal));
-        }
-        if let Some(turn_start) = anchored {
-            self.visible = true;
-            self.damage = None;
-            self.malformed = false;
-            visit(turn_start)?;
-        }
-        if self.observe(segment, start, &record, row)? {
-            visit(record)?;
-        }
-        Ok(())
     }
 
     fn observe(
@@ -1232,19 +1299,23 @@ impl PrefixCursor {
     ) -> Result<bool> {
         let hidden = start.hides_parsed_row(row, record);
         let preamble = start.hides_row(row);
-        let ordinal = segment.record_ordinal(
+        let inferred = segment.recovery.as_ref().and_then(|plan| plan.ordinal(row));
+        let ordinal = inferred.or(segment.record_ordinal(
             record,
             self.next,
             self.max_reserved_gap,
             self.malformed,
             hidden,
-        )?;
+        )?);
+        if segment.recovery.is_none() {
+            self.evidence.observe(&segment.path, record, row, hidden);
+        }
         if let Some(ordinal) = ordinal {
             self.next = ordinal;
             self.max_reserved_gap = 0;
             if !hidden
-                && segment.recover_after_damage
-                && self.damage.is_some()
+                && segment.recovery.is_some()
+                && (self.damage.is_some() || inferred.is_some())
                 && (is_owned_turn_start(record, &segment.path)
                     || (self.damaged_preamble_settings && !preamble))
                 && start.ordinal().is_none_or(|begin| ordinal >= begin)
@@ -1268,11 +1339,21 @@ impl PrefixCursor {
                 self.max_reserved_gap = self.max_reserved_gap.max(first.saturating_sub(self.next));
             }
         }
+        let completed_prefix = segment
+            .recovery
+            .as_ref()
+            .is_some_and(|plan| row <= plan.prefix_end);
+        let permitted = segment.recovery.as_ref().is_none_or(|plan| {
+            row > plan.discard_through
+                && (record["payload"]["type"] != "thread_rolled_back"
+                    || owned_event(record, &segment.path))
+        });
         let include = !hidden
-            && self.visible
+            && permitted
+            && (self.visible || completed_prefix)
             && (self.damage.is_none()
                 || (ordinal.is_some()
-                    && segment.recover_after_damage
+                    && segment.recovery.is_some()
                     && is_owned_rollback(record, &segment.path)))
             && self.next > segment.start
             && start.ordinal().is_none_or(|begin| self.next >= begin);
@@ -1369,15 +1450,16 @@ fn read_prefix_from(
                         // The next verified ordinal anchors the suffix inside this byte bookmark.
                         cursor.malformed = true;
                         if !visible_start.hides_row(row) {
+                            cursor.evidence.unknown(row);
                             cursor.damaged_preamble_settings = false;
                             cursor.damage = Some(MALFORMED_ROWS);
                         }
                         continue;
                     }
                 };
-                cursor.visit_record(segment, visible_start, record, row, &mut |record| {
-                    visit(record, skipped)
-                })?;
+                if cursor.observe(segment, visible_start, &record, row)? {
+                    visit(record, skipped)?;
+                }
             }
         }
     }
@@ -1386,10 +1468,16 @@ fn read_prefix_from(
     } else {
         position.confirm_end(cursor.next, cursor.max_reserved_gap)?;
     }
-    if segment.recover_after_damage {
+    if segment.recovery.is_some() {
         return Ok(PrefixRead::Complete(skipped));
     }
-    Ok(cursor
-        .damage
-        .map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))
+    Ok(match cursor.damage {
+        Some(reason) => PrefixRead::Partial(
+            reason,
+            cursor
+                .evidence
+                .finish(row + 1, position.end_ordinal_exclusive),
+        ),
+        None => PrefixRead::Complete(skipped),
+    })
 }

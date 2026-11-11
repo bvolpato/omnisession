@@ -178,14 +178,7 @@ impl WorkspaceProbe<'_> {
         let workspace = if let Some(raw) =
             projected.filter(|raw| matches!(raw.history_base, HistoryBase::Prefix(_)))
         {
-            let mut lineage =
-                raw.lineage(self.adapter, HistoryScope::Visible, Some(&self.catalog))?;
-            lineage.project(self.adapter, Some(&self.catalog), |lineage| {
-                let (_, workspace, verified) = raw.canonical_events_with(lineage, |visit| {
-                    rollout_file::read_records(bytes.as_slice(), visit)
-                })?;
-                Ok(workspace.filter(|_| verified))
-            })?
+            self.referenced_workspace(raw, &bytes)?
         } else {
             Self::leaf_workspace(session, projected, &bytes)?
         };
@@ -198,6 +191,32 @@ impl WorkspaceProbe<'_> {
             "Codex rollout changed during workspace search"
         );
         Ok(workspace)
+    }
+
+    fn referenced_workspace(&self, raw: &CodexSession, bytes: &[u8]) -> Result<Option<PathBuf>> {
+        // The latest settings for this thread survive conversation rollback and take precedence
+        // over every ancestor. Decode the visible leaf first, including gaps after the settings.
+        let mut settings = super::workspace_check::WorkspaceSettings::default();
+        let skipped = raw.visible_leaf()?.visit_leaf(
+            &raw.id,
+            |visit| rollout_file::read_records(bytes, visit),
+            |record, skipped| {
+                settings.observe_gaps(skipped);
+                settings.observe(&raw.id, &record);
+                Ok(())
+            },
+        )?;
+        settings.observe_gaps(skipped);
+        if settings.has_owned() {
+            return Ok(settings.directory(None));
+        }
+
+        let mut lineage = raw.lineage(self.adapter, HistoryScope::Visible, Some(&self.catalog))?;
+        lineage.project(self.adapter, Some(&self.catalog), |lineage| {
+            let (_, workspace, verified) = raw
+                .canonical_events_with(lineage, |visit| rollout_file::read_records(bytes, visit))?;
+            Ok(workspace.filter(|_| verified))
+        })
     }
 
     fn leaf_workspace(

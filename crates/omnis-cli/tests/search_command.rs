@@ -925,6 +925,72 @@ fn project_search_follows_the_surviving_workspace_in_a_fork_prefix() {
     );
     fixture.index_codex();
     assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
+
+    check_large_fork_leaf_settings(
+        &path(CODEX_ID),
+        &folders[1],
+        || write_child(35),
+        || search(&folders[1]),
+    );
+}
+
+fn check_large_fork_leaf_settings(
+    path: &Path,
+    target: &Path,
+    write_child: impl Fn(),
+    search: impl Fn() -> Value,
+) {
+    use std::io::Write;
+
+    let settings = |owner, model: Value| {
+        json!({"type":"event_msg","ordinal":37,"payload":{
+        "type":"thread_settings_applied","thread_id":owner,"thread_settings":{
+            "cwd":target,"model":model,"model_provider_id":"synthetic","approval_policy":"never",
+            "approvals_reviewer":"user","permission_profile":{"type":"disabled"},
+            "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}}}})
+    };
+    let started = json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"later"}});
+    let moved = json!({"type":"turn_context","payload":{"cwd":target}});
+    let prompt =
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"later turn"}});
+    let rollback =
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+    for (records, found) in [
+        (vec![settings(OTHER_CODEX_ID, json!("fixture"))], false),
+        (vec![settings(CODEX_ID, Value::Null)], false),
+        (
+            vec![started.clone(), moved, prompt.clone(), rollback.clone()],
+            false,
+        ),
+        (
+            vec![
+                started,
+                prompt,
+                settings(CODEX_ID, json!("fixture")),
+                rollback,
+            ],
+            true,
+        ),
+        (
+            vec![
+                settings(CODEX_ID, json!("fixture")),
+                settings(CODEX_ID, Value::Null),
+            ],
+            false,
+        ),
+    ] {
+        write_child();
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        for (index, mut event) in records.into_iter().enumerate() {
+            event["ordinal"] = json!(37 + index);
+            writeln!(file, "{event}").unwrap();
+        }
+        drop(file);
+        assert_eq!(
+            result_sessions(&search()).contains(&format!("codex:{CODEX_ID}")),
+            found
+        );
+    }
 }
 
 #[test]

@@ -1037,7 +1037,7 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
         json!({"type":"event_msg","ordinal":3,"payload":{"type":"task_complete","turn_id":"one"}}),
     ];
     let mut base = bookmark(PARENT, &parent);
-    base["end_byte_offset"] = json!(base["end_byte_offset"].as_u64().unwrap() + 3);
+    base["end_byte_offset"] = json!(base["end_byte_offset"].as_u64().unwrap() + 6);
     write(
         &dir,
         &format!("2026-01-02T00-00-00-{REVERT}"),
@@ -1049,9 +1049,16 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
     let path = dir.join(format!("rollout-{parent_name}.jsonl"));
     let copy = archive.join(path.file_name().unwrap());
     write(&dir, &parent_name, &parent)?;
-    let original = fs::read_to_string(&path)?.replace("\"ordinal\":1,", "\"ordinal\":1   ,");
+    let original = fs::read_to_string(&path)?
+        .replace("\"ordinal\":0,", "\"ordinal\":0   ,")
+        .replace("\"ordinal\":1,", "\"ordinal\":1   ,");
     fs::create_dir_all(&archive)?;
-    for damage in ["joined", "split and truncated", "null ordinal"] {
+    for damage in [
+        "joined",
+        "split and truncated",
+        "null request ordinal",
+        "null header ordinal",
+    ] {
         let mut damaged = original.as_bytes().to_vec();
         if damage == "joined" {
             let delimiter = original.match_indices('\n').nth(1).unwrap().0;
@@ -1061,10 +1068,12 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
             damaged[split] = b'\n';
             damaged.truncate(damaged.len() - parent[3].to_string().len() - 1);
         } else {
-            let start = std::str::from_utf8(&damaged)?
-                .find("\"ordinal\":1")
-                .unwrap()
-                + "\"ordinal\":".len();
+            let field = if damage == "null header ordinal" {
+                "\"ordinal\":0"
+            } else {
+                "\"ordinal\":1"
+            };
+            let start = std::str::from_utf8(&damaged)?.find(field).unwrap() + "\"ordinal\":".len();
             damaged[start..start + 4].copy_from_slice(b"null");
         }
         fs::write(&path, damaged)?;
