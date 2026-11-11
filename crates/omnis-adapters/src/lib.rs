@@ -168,6 +168,8 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Physical file whose ownership was checked, independent of display metadata.
+    pub ownership_revision: Option<SourceRevision>,
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
@@ -395,6 +397,7 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            ownership_revision: None,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,
             native_session: None,

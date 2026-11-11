@@ -492,6 +492,7 @@ pub(super) fn read_picker_preview(
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
+            ownership_revision: None,
             native_session: None,
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -555,13 +556,7 @@ fn checked_picker_preview(
     let Some((store, guard, observed)) = writer else {
         return Ok(read);
     };
-    let failure = observed.as_ref().and_then(|row| row.failure);
-    if key.session.provider == Provider::Grok
-        && !read.source_complete
-        && failure.is_some_and(|failed| failed.matches_file_revision(read.source_revision))
-    {
-        anyhow::bail!("the selected Grok source requires a complete read after its rejection");
-    }
+    search_index::check_grok_preview(store, &read, observed.as_ref().and_then(|row| row.failure))?;
     let read = search_index::verify_legacy_search_read(registry, store, *guard, read)?;
     if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
         anyhow::ensure!(
@@ -617,6 +612,12 @@ fn preview_update(
                 .as_ref()
                 .filter(|native| native.session.provider == Provider::Grok)
                 .map(crate::indexed_session_metadata);
+            let writer = writer.map(|(store, guard, mut observation)| {
+                if let Some(observed) = &mut observation {
+                    observed.ownership_revision = read.ownership_revision;
+                }
+                (store, guard, observation)
+            });
             if let Some((store, guard, observation)) = writer
                 && let Err(error) = crate::store_search_document(
                     store,

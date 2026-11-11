@@ -38,10 +38,52 @@ pub struct GrokAdapter {
 /// The selected Grok source failed a checked read. A summary conflict identifies the provider root without selecting a log.
 #[derive(Debug)]
 pub struct GrokReadRejection {
+    pub updates: Option<SourceRevision>,
     pub revision: SourceRevision,
     pub updated_at: Option<DateTime<Utc>>,
     /// Original read error, including any transient filesystem cause.
     pub cause: anyhow::Error,
+}
+
+#[derive(Debug)]
+enum GrokHistoryError {
+    ForeignOwner,
+    Missing(String),
+}
+
+impl std::fmt::Display for GrokHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForeignOwner => f.write_str("Grok updates contain a different session ID"),
+            Self::Missing(id) => write!(
+                f,
+                "Grok session `{id}` declares history but has no readable updates"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GrokHistoryError {}
+
+fn checked_history_error(
+    cause: anyhow::Error,
+    revision: SourceRevision,
+    updates: Option<SourceRevision>,
+    updated_at: Option<DateTime<Utc>>,
+) -> anyhow::Error {
+    let Some(issue) = cause.downcast_ref::<GrokHistoryError>() else {
+        return cause;
+    };
+    let updates = matches!(issue, GrokHistoryError::ForeignOwner)
+        .then_some(updates)
+        .flatten();
+    GrokReadRejection {
+        updates,
+        revision,
+        updated_at,
+        cause,
+    }
+    .into()
 }
 
 impl std::fmt::Display for GrokReadRejection {
@@ -104,6 +146,19 @@ impl GrokAdapter {
         Some(fs::metadata(file).ok()?.len())
     }
 
+    /// Identifies the physical update log independently of catalog and summary metadata.
+    #[must_use]
+    pub fn updates_revision(summary: &Path) -> Option<SourceRevision> {
+        let directory = summary.parent()?;
+        let updates = provider_file(directory, &directory.join("updates.jsonl"))?;
+        let file = path_id(summary);
+        Some(SourceRevision {
+            file: Some(file),
+            contents: Some(SnapshotFileStamp::read(&updates).ok()?.revision(file)),
+            ..SourceRevision::default()
+        })
+    }
+
     fn summaries(&self) -> Vec<PathBuf> {
         self.sessions_root
             .as_deref()
@@ -114,6 +169,7 @@ impl GrokAdapter {
 
     fn unavailable(&self, cause: anyhow::Error) -> anyhow::Error {
         GrokReadRejection {
+            updates: None,
             revision: SourceRevision {
                 file: self.sessions_root.as_deref().map(path_id),
                 ..SourceRevision::default()
@@ -228,11 +284,26 @@ impl GrokAdapter {
         {
             return Ok(checked.support);
         }
-        let support = native_update_headers(&updates, id, expected_updates)?;
+        let support = native_update_headers(&updates, id, expected_updates);
         anyhow::ensure!(
             SnapshotFileStamp::read(&updates)? == before,
             "selected Grok source changed during native ownership verification"
         );
+        let support = support.map_err(|cause| {
+            let metadata = self.resolved_metadata(id, summary, path, None);
+            let file = path_id(path);
+            let log = SourceRevision {
+                file: Some(file),
+                contents: Some(before.revision(file)),
+                ..SourceRevision::default()
+            };
+            checked_history_error(
+                cause,
+                metadata.source_revision(path),
+                Some(log),
+                metadata.updated_at,
+            )
+        })?;
         *self
             .checked_updates
             .lock()
@@ -349,7 +420,7 @@ impl GrokAdapter {
                     record
                         .pointer("/params/sessionId")
                         .is_none_or(|owner| owner.as_str() == Some(&session.id)),
-                    "Grok updates contain a different session ID"
+                    GrokHistoryError::ForeignOwner
                 );
                 read_any = true;
                 if record
@@ -384,10 +455,7 @@ impl GrokAdapter {
             }
         }
         if !read_any && declared_message_count(summary) > 0 {
-            anyhow::bail!(
-                "Grok session `{}` declares history but has no readable updates",
-                session.id
-            );
+            return Err(GrokHistoryError::Missing(session.id.clone()).into());
         }
         updates.finish(&mut builder);
         if !sampled && let Some(expected) = metadata.expected_updates {
@@ -516,7 +584,7 @@ fn native_update_headers(
                 .as_ref()
                 .and_then(|params| params.session_id.as_deref())
                 .is_none_or(|owner| owner == id),
-            "Grok updates contain a different session ID"
+            GrokHistoryError::ForeignOwner
         );
         if header.legacy_kind.is_none()
             && header.params.is_none_or(|params| params.update.is_none())
@@ -1298,19 +1366,37 @@ impl ProviderAdapter for GrokAdapter {
         validate_provider(session, Provider::Grok)?;
         let (summary, path, metadata) = self.resolved_summary(&session.id, listed_path)?;
         let source_revision = metadata.source_revision(&path);
-        let source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
-        let snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete);
+        let ownership_revision = Self::updates_revision(&path);
+        let mut source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
+        let mut snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete);
+        if full_read_bytes != u64::MAX
+            && source_complete
+            && snapshot
+                .as_ref()
+                .is_err_and(anyhow::Error::is::<crate::support::TranscriptReadLimit>)
+        {
+            source_complete = false;
+            snapshot = self.snapshot(session, &summary, &path, &metadata, false);
+        }
+        anyhow::ensure!(
+            Self::updates_revision(&path) == ownership_revision,
+            "selected Grok source changed during its read"
+        );
         let native = metadata.into_session(session.id.clone(), path);
         anyhow::ensure!(
             native.source_revision == Some(source_revision),
             "selected Grok source changed during its read"
         );
-        let snapshot = snapshot.map_err(|cause| GrokReadRejection {
-            revision: source_revision,
-            updated_at: native.updated_at,
-            cause,
+        let snapshot = snapshot.map_err(|cause| {
+            checked_history_error(
+                cause,
+                source_revision,
+                ownership_revision,
+                native.updated_at,
+            )
         })?;
         Ok(IndexRead {
+            ownership_revision,
             snapshot,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,

@@ -435,8 +435,15 @@ pub(super) fn requires_import_for_native_resume(
     }
     match registry
         .adapter(target.provider)?
-        .native_resume_support(source)?
-    {
+        .native_resume_support(source)
+        .inspect_err(|error| {
+            if source.provider == Provider::Grok
+                && let Err(cause) =
+                    crate::search_index::reject_cached_grok_preflight(registry, source, error)
+            {
+                eprintln!("warning: local trajectory index refresh: {cause}");
+            }
+        })? {
         omnis_adapters::NativeResumeSupport::Direct => Ok(false),
         omnis_adapters::NativeResumeSupport::ImportOnly => Ok(true),
         omnis_adapters::NativeResumeSupport::Since(minimum) => {

@@ -607,6 +607,17 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     }
     assert!(cached("tangerinecobalt").is_empty());
 
+    let mut renamed = summary.clone();
+    renamed["generated_title"] = json!("Renamed while the update log was unchanged");
+    fs::write(replacement.join("summary.json"), renamed.to_string()).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::write(replacement.join("summary.json"), "{").unwrap();
+    index(false);
+    fs::write(replacement.join("summary.json"), summary.to_string()).unwrap();
+    index(true);
+    assert!(cached("tangerinecobalt").is_empty());
+
     let displaced = json!({"info":{"id":other,"cwd":fixture.workspace},"num_messages":1});
     fs::write(replacement.join("summary.json"), displaced.to_string()).unwrap();
     write_jsonl(

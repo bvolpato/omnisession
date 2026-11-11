@@ -149,6 +149,7 @@ fn full_index_read(
         Ok(read)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            ownership_revision: None,
             native_session: None,
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -192,18 +193,15 @@ impl IndexedSessionReader for AdapterRegistry {
                 eprintln!("warning: local trajectory index write: {error}");
             }
         })?;
-        if session.provider == Provider::Grok
-            && !read.source_complete
-            && let Ok((_, _, Some(observed))) = &cache
-            && observed
-                .failure
-                .is_some_and(|failure| failure.matches_file_revision(read.source_revision))
-        {
-            bail!("the selected Grok source requires a complete read after its rejection");
+        if let Ok((store, _, Some(observed))) = &cache {
+            search_index::check_grok_preview(store, &read, observed.failure)?;
         }
         let snapshot = &read.snapshot;
         match cache {
-            Ok((store, prior, observation)) => {
+            Ok((store, prior, mut observation)) => {
+                if let Some(observed) = &mut observation {
+                    observed.ownership_revision = read.ownership_revision;
+                }
                 let current = prior.is_some_and(|state| {
                     state.source_complete
                         && state.source_revision == read.source_revision
@@ -240,7 +238,10 @@ impl IndexedSessionReader for AdapterRegistry {
                         observed.metadata.as_ref() != Some(selected) || observed.failure.is_some()
                     },
                 );
-                if (!current || session.provider == Provider::Codex || selected_changed)
+                if (!current
+                    || session.provider == Provider::Codex
+                    || selected_changed
+                    || store.grok_updates_rejected(session, read.ownership_revision)?)
                     && let Err(error) = store_search_document(
                         &store,
                         selected.as_ref().zip(observation.as_ref()).map_or(

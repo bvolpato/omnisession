@@ -282,6 +282,7 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                ownership_revision: None,
                 rollback_title,
                 workspace_projection,
                 snapshot,
@@ -1673,6 +1674,7 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            ownership_revision: None,
             native_session,
             snapshot,
             rollback_title,
@@ -1733,6 +1735,7 @@ impl CodexSession {
         );
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
+            ownership_revision: None,
             native_session: None,
             workspace_projection,
             rollback_title,

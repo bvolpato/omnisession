@@ -29,6 +29,7 @@ mod codex_title_recheck;
 use codex_title_recheck::schedule_legacy_codex_title_proofs;
 mod codex_workspace;
 pub use codex_workspace::{CodexWorkspace, CodexWorkspaceIndex, CodexWorkspaceUpdate};
+mod grok_updates;
 
 pub mod search_query;
 
@@ -551,7 +552,10 @@ impl SelectedMetadata<'_> {
 }
 
 /// The document and catalog state before an explicit selected-source read.
+#[derive(Clone)]
 pub struct SelectedSessionObservation {
+    /// Independent physical update log observed with a Grok read.
+    pub ownership_revision: Option<SourceRevision>,
     pub state: Option<TrajectoryIndexState>,
     pub metadata: Option<IndexedSession>,
     pub failure: Option<TrajectoryIndexFailure>,
@@ -926,6 +930,20 @@ impl Store {
     /// Returns an error when state-root creation, validation, or store initialization fails.
     pub fn open_default() -> Result<Self> {
         Self::open_state_root(&state_root()?)
+    }
+
+    /// Opens the existing default store without creating a state directory for a dry run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing store cannot be opened.
+    pub fn open_existing_default() -> Result<Option<Self>> {
+        let root = state_root()?;
+        if root.join(DATABASE_FILE_NAME).is_file() {
+            Self::open_state_root(&root).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Creates, selects, and optionally binds a task in one transaction.
@@ -1618,6 +1636,7 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = connection.transaction().map_err(database_error)?;
         let observation = SelectedSessionObservation {
+            ownership_revision: None,
             state: cached_trajectory_state(&transaction, session)?,
             metadata: cached_session(&transaction, session)?,
             failure: cached_index_failure(&transaction, session)?,
@@ -2142,8 +2161,27 @@ impl Store {
         observed_metadata: Option<&IndexedSession>,
         failure: Option<TrajectoryIndexFailure>,
     ) -> Result<()> {
+        self.restore_indexed_source_with_log(selected, expected, observed_metadata, failure, None)
+    }
+
+    /// Restores an unchanged cached source if its selected physical update log is still eligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a concurrent writer changed the selection or the log is rejected.
+    pub fn restore_indexed_source_with_log(
+        &self,
+        selected: &IndexedSession,
+        expected: TrajectoryIndexState,
+        observed_metadata: Option<&IndexedSession>,
+        failure: Option<TrajectoryIndexFailure>,
+        ownership_revision: Option<SourceRevision>,
+    ) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        if grok_updates::rejected(&transaction, &selected.session, ownership_revision)? {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
         if !selected
             .source_revision
             .is_some_and(|revision| revision.matches_file_contents(expected.source_revision))
@@ -2242,6 +2280,12 @@ impl Store {
         for write in prepared {
             if let Some(metadata) = selected_metadata {
                 metadata.check(&transaction, write.session, &write.content_hash)?;
+                grok_updates::check_publication(
+                    &transaction,
+                    write.session,
+                    metadata.observation.ownership_revision,
+                    write.document.source_complete,
+                )?;
             }
             write
                 .guard
@@ -2660,6 +2704,9 @@ impl Store {
                 || cached_index_failure(&transaction, session)? != observed.failure
             {
                 return Err(StoreError::TrajectorySourceChanged);
+            }
+            if let Some(log) = observed.ownership_revision {
+                grok_updates::record(&transaction, session, log)?;
             }
         } else {
             guard.check(&transaction, session, None)?;
@@ -3663,6 +3710,7 @@ fn ensure_session_index_columns(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
+    grok_updates::initialize(transaction)?;
     transaction
         .execute_batch(
             "

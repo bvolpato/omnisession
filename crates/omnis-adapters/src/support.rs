@@ -443,6 +443,17 @@ pub(crate) fn store_is_missing(path: &Path) -> bool {
 }
 
 #[derive(Debug)]
+pub(crate) struct TranscriptReadLimit(&'static str);
+
+impl std::fmt::Display for TranscriptReadLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TranscriptReadLimit {}
+
+#[derive(Debug)]
 pub(crate) struct SqliteSnapshot {
     pub(crate) connection: Connection,
     _directory: TempDir,
@@ -1061,7 +1072,7 @@ fn visit_json_lines_with_offsets_and_limits(
 ) -> Result<JsonLineSkips> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
-        return Err(anyhow!("provider file exceeds safe streaming limit"));
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
     }
     reader.seek(SeekFrom::Start(0))?;
     visit_json_reader(
@@ -1142,7 +1153,7 @@ pub(crate) fn visit_json_reader(
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
-                return Err(anyhow!("provider file exceeds safe record limit"));
+                return Err(TranscriptReadLimit("provider file exceeds safe record limit").into());
             }
             return Ok((omissions, offset));
         }
