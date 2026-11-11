@@ -14,6 +14,68 @@ const CODEX_ID: &str = "44444444-4444-4444-8444-444444444444";
 const CODEX_SUBAGENT_ID: &str = "55555555-5555-4555-8555-555555555555";
 
 #[test]
+fn claude_progress_records_do_not_hide_the_final_reply() {
+    use std::io::{BufWriter, Write};
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let mut writer = BufWriter::new(fs::File::create(source).unwrap());
+    let user = uuid::Uuid::from_u128(1);
+    let reply = uuid::Uuid::from_u128(2);
+    writeln!(
+        writer,
+        r#"{{"type":"user","uuid":"{user}","parentUuid":null,"message":{{"content":"request"}}}}"#
+    )
+    .unwrap();
+    writeln!(writer, r#"{{"type":"assistant","uuid":"{reply}","parentUuid":"{user}","message":{{"content":"working"}}}}"#).unwrap();
+    let mut parent = reply;
+    for sequence in 3..100_004 {
+        let id = uuid::Uuid::from_u128(sequence);
+        writeln!(
+            writer,
+            r#"{{"type":"progress","uuid":"{id}","parentUuid":"{parent}"}}"#
+        )
+        .unwrap();
+        parent = id;
+    }
+    writeln!(writer, r#"{{"type":"assistant","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1","parentUuid":"{parent}","message":{{"content":"finished"}}}}"#).unwrap();
+    writer.flush().unwrap();
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for snapshot in [
+        adapter.read_session(&session),
+        adapter.preview_session(&session),
+    ] {
+        let snapshot = snapshot.expect("progress-heavy Claude session");
+        let texts = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["request", "working", "finished"]);
+    }
+}
+
+#[test]
+fn claude_reports_malformed_records_and_an_incomplete_tail() {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    fs::write(source, b"{\"type\":\"user\",\"message\":{\"content\":\"question\"}}\nnot-json\n \t\r\n{\"type\":\"assistant\",\"message\":{\"content\":").unwrap();
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for snapshot in [
+        adapter.read_session(&session),
+        adapter.preview_session(&session),
+    ] {
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.events[0].payload["text"], "question");
+        let notice = &snapshot.events.last().unwrap().payload;
+        assert_eq!(notice["omitted_events"], 2);
+        assert_eq!(notice["incomplete_final_record"], true);
+    }
+}
+
+#[test]
 fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
     let fixture = include_bytes!("fixtures/claude-session.jsonl");
     let temporary = TempDir::new().expect("temporary directory");
@@ -52,7 +114,7 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
         .expect("Claude read");
     let after = fs::read(&source).expect("fixture after read");
     assert_eq!(before, after);
-    assert_eq!(snapshot.events.len(), 5);
+    assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
     let metadata = snapshot
         .events
         .iter()

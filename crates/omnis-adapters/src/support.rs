@@ -25,12 +25,12 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const MAX_PROVIDER_RECORDS: usize = 100_000;
-const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_RECORDS: usize = 100_000;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -1004,7 +1004,7 @@ fn visit_index_json_lines_with_limits(
     Ok(scan)
 }
 
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     Complete,
     Oversized,
 }
@@ -1021,7 +1021,7 @@ fn read_bounded_line(
 }
 
 /// Reads one bounded line without consuming bytes beyond the transcript file budget.
-fn read_bounded_line_with_budget(
+pub(crate) fn read_bounded_line_with_budget(
     reader: &mut impl BufRead,
     line_limit: u64,
     file_budget: u64,

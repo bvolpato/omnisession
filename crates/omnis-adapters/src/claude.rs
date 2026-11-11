@@ -1,3 +1,6 @@
+mod branch;
+mod input;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -19,11 +22,9 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles, json_lines_preview,
-        nested_files_matching, omitted_images_text, parse_timestamp, paths_match,
-        provider_executable, provider_file, provider_root, sample_files_concurrently,
+        EventBuilder, ProviderFiles, nested_files_matching, omitted_images_text, parse_timestamp,
+        paths_match, provider_executable, provider_file, provider_root, sample_files_concurrently,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
-        visit_json_lines,
     },
 };
 
@@ -283,6 +284,7 @@ struct ClaudeEvent {
 }
 
 struct ClaudeRecord {
+    branch: branch::Parent,
     parent: Option<Uuid>,
     events: Range<usize>,
 }
@@ -414,7 +416,7 @@ impl TranscriptSample {
         if need_workspace {
             sample.scan_workspace_head()?;
         } else {
-            sample.read_head_titles(buffer)?;
+            sample.read_head_metadata(buffer)?;
         }
         Ok(sample)
     }
@@ -448,26 +450,26 @@ impl TranscriptSample {
         Ok(())
     }
 
-    /// Observes title records among the complete records in the first 16 KiB.
-    fn read_head_titles(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
+    /// Reads complete records from the first 16 KiB.
+    fn read_head_metadata(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
         read_window(
             &mut self.file,
             0,
             self.length.min(TITLE_HEAD_BYTES as u64),
             buffer,
         )?;
-        // The tail then starts on a record boundary.
-        let complete = buffer
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |end| end + 1);
-        observe_titles(&mut self.titles, &buffer[..complete]);
+        let complete = if buffer.len() as u64 == self.length {
+            buffer.len()
+        } else {
+            memchr::memrchr(b'\n', buffer).map_or(0, |end| end + 1)
+        };
+        self.observe_sample(&buffer[..complete]);
         self.head_end = complete as u64;
         Ok(())
     }
 
-    /// Observes title records in the last 64 KiB that the head did not cover.
-    fn read_tail_titles(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
+    /// Reads complete records from the last 64 KiB that the head did not cover.
+    fn read_tail_metadata(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
         let start = self
             .length
             .saturating_sub(TITLE_TAIL_BYTES as u64)
@@ -486,8 +488,25 @@ impl TranscriptSample {
         } else {
             &buffer[..]
         };
-        observe_titles(&mut self.titles, records);
+        self.observe_sample(records);
         Ok(())
+    }
+
+    fn observe_sample(&mut self, mut records: &[u8]) {
+        observe_titles(&mut self.titles, records);
+        // Branches can change. Read the last valid branch in the sampled records.
+        while let Some(position) = memmem::rfind(records, b"\"gitBranch\"") {
+            let start = memchr::memrchr(b'\n', &records[..position]).map_or(0, |index| index + 1);
+            let end = memchr::memchr(b'\n', &records[position..])
+                .map_or(records.len(), |index| position + index);
+            if let Ok(record) = serde_json::from_slice::<Value>(&records[start..end])
+                && let Some(branch) = string_at(&record, &[&["gitBranch"]])
+            {
+                self.workspace.git_branch = Some(branch.to_owned());
+                break;
+            }
+            records = &records[..start];
+        }
     }
 }
 
@@ -707,6 +726,7 @@ fn claude_session_metadata(record: &Value) -> Option<Value> {
 
 #[derive(Default)]
 struct ClaudeTranscript {
+    branch: branch::Branch,
     metadata: ClaudeMetadata,
     titles: TitleCandidates,
     events: Vec<ClaudeEvent>,
@@ -744,13 +764,24 @@ impl ClaudeTranscript {
                 compaction_preserved_context(record, &self.records).transpose();
         }
         let start = self.events.len();
-        push_events(&mut self.events, &mut self.responses, record);
+        if record["type"] != "progress" {
+            push_events(&mut self.events, &mut self.responses, record);
+        }
+        let branch = self.branch.observe(
+            record,
+            &self.records,
+            self.preserved_context
+                .as_ref()
+                .and_then(|p| p.as_ref().ok()),
+            start..self.events.len(),
+        );
         if let Some(id) = record
             .get("uuid")
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok())
         {
             let record = ClaudeRecord {
+                branch,
                 parent: record
                     .get("parentUuid")
                     .and_then(Value::as_str)
@@ -763,7 +794,7 @@ impl ClaudeTranscript {
         }
     }
 
-    fn restore_preserved_context(&mut self) -> Result<()> {
+    fn restore_preserved_context(&mut self, order: &mut Vec<usize>) -> Result<()> {
         let Some(preserved) = self.preserved_context.take() else {
             return Ok(());
         };
@@ -794,6 +825,8 @@ impl ClaudeTranscript {
         }
         let mut seen = HashSet::new();
         let mut selected = Vec::new();
+        let tip = self.branch.retained_tip();
+        let mut retained_end = None;
         for id in preserved.records {
             if !seen.insert(id) {
                 return Err(anyhow!("retained compaction context repeats a record"));
@@ -819,28 +852,32 @@ impl ClaudeTranscript {
                 }
                 selected.push(index);
             }
+            if tip == Some(id) {
+                retained_end = Some(selected.len());
+            }
         }
-        let insertion = anchor.events.end - selected.len();
-        if selected.is_empty() {
-            return Ok(());
+        if !selected.is_empty() {
+            let selected_set: HashSet<_> = selected.iter().copied().collect();
+            if order.contains(&anchor.events.start) {
+                order.retain(|index| !selected_set.contains(index));
+                let insertion = order
+                    .iter()
+                    .rposition(|index| anchor.events.contains(index))
+                    .expect("validated compaction anchor")
+                    + 1;
+                if let Some(end) = retained_end {
+                    selected.truncate(end);
+                }
+                order.splice(insertion..insertion, selected);
+            }
         }
-        let mut slots = std::mem::take(&mut self.events)
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
-        let retained = selected
-            .into_iter()
-            .map(|index| slots[index].take().expect("validated retained event index"))
-            .collect::<Vec<_>>();
-        self.events = slots.into_iter().flatten().collect();
-        self.events.splice(insertion..insertion, retained);
         Ok(())
     }
 
     fn snapshot(
         mut self,
         session: &SessionRef,
-        oversized_records: usize,
+        coverage: input::InputCoverage,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         if !self.has_records {
             return Err(anyhow!(
@@ -854,7 +891,18 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        let preservation_error = self.restore_preserved_context().err();
+        let preservation_error = if self.branch.forked() || self.preserved_context.is_some() {
+            let mut order = self.branch.event_order(&self.events);
+            let error = self.restore_preserved_context(&mut order).err();
+            let mut slots = self.events.into_iter().map(Some).collect::<Vec<_>>();
+            self.events = order
+                .into_iter()
+                .map(|i| slots[i].take().expect("unique Claude event index"))
+                .collect();
+            error
+        } else {
+            None
+        };
         // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
         drop(self.responses);
         let metadata = self.metadata;
@@ -870,7 +918,17 @@ impl ClaudeTranscript {
                 event.event_id,
             );
         }
-        builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
+        coverage.report(&mut builder, metadata.updated_at);
+        if self.branch.missing_ancestor() {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true, "reason": "Claude's active conversation references a missing parent"}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.missing_parent".to_owned()),
+                None,
+            );
+        }
         if let Some(error) = preservation_error {
             builder.push(
                 EventKind::ProviderEvent,
@@ -926,13 +984,9 @@ impl ProviderAdapter for ClaudeAdapter {
                 };
                 let indexed = history.sessions.get(id);
                 let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
-                let fallback = sample
-                    .as_mut()
-                    .map(|sample| std::mem::take(&mut sample.workspace))
-                    .unwrap_or_default();
                 let project_path = indexed
                     .map(|entry| entry.project.clone())
-                    .or(fallback.project_path);
+                    .or_else(|| sample.as_mut()?.workspace.project_path.take());
                 if project.is_some_and(|project| {
                     project_path
                         .as_deref()
@@ -944,10 +998,14 @@ impl ProviderAdapter for ClaudeAdapter {
                     .as_mut()
                     .and_then(|sample| {
                         // Head titles still apply when the tail cannot be read.
-                        let _ = sample.read_tail_titles(&mut buffer);
+                        let _ = sample.read_tail_metadata(&mut buffer);
                         std::mem::take(&mut sample.titles).title()
                     })
                     .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
+                let fallback = sample
+                    .as_mut()
+                    .map(|sample| std::mem::take(&mut sample.workspace))
+                    .unwrap_or_default();
                 let created_at = indexed
                     .and_then(|entry| entry.created_at)
                     .or(fallback.created_at);
@@ -992,13 +1050,8 @@ impl ProviderAdapter for ClaudeAdapter {
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
         let path = self.session_path(&session.id, source_path)?;
-        let mut transcript = ClaudeTranscript::default();
-        let oversized_records =
-            visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
-                transcript.observe(&record);
-                Ok(())
-            })?;
-        transcript.snapshot(session, oversized_records)
+        let (transcript, coverage) = input::read(&path, false)?;
+        transcript.snapshot(session, coverage)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1010,15 +1063,10 @@ impl ProviderAdapter for ClaudeAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
-        const SAMPLE_RECORDS: usize = 1_024;
         validate_provider(session, Provider::Claude)?;
         let path = self.session_path(&session.id, source_path)?;
-        let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
-        let mut transcript = ClaudeTranscript::default();
-        for record in records {
-            transcript.observe(&record);
-        }
-        transcript.snapshot(session, 0)
+        let (transcript, coverage) = input::read(&path, true)?;
+        transcript.snapshot(session, coverage)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1050,7 +1098,7 @@ impl ProviderAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeAdapter, ClaudeTranscript};
+    use super::{ClaudeAdapter, ClaudeTranscript, input::InputCoverage};
     use crate::ProviderAdapter;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
     use serde_json::json;
@@ -1067,7 +1115,7 @@ mod tests {
         transcript_from_records(records)
             .snapshot(
                 &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                0,
+                InputCoverage::default(),
             )
             .expect("synthetic Claude snapshot")
     }
@@ -1156,7 +1204,7 @@ mod tests {
         let error = transcript
             .snapshot(
                 &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                0,
+                InputCoverage::default(),
             )
             .expect_err("sidechain sessions cannot be resumed");
         assert!(error.to_string().contains("is a sidechain"));
@@ -1182,6 +1230,159 @@ mod tests {
         assert_eq!(
             events[0].payload["text"],
             "Current objective: finish synthetic migration"
+        );
+    }
+
+    #[test]
+    fn rewind_follows_the_active_branch_through_progress_and_parallel_results() {
+        let id = |i| uuid::Uuid::from_u128(i);
+        let message = |i, parent: Option<u128>, role: &str, content| json!({"type": role, "uuid": id(i), "parentUuid": parent.map(id), "message": {"role":role, "content":content}});
+        let mut first_call = message(
+            2,
+            Some(1),
+            "assistant",
+            json!([{"type":"tool_use","id":"a","name":"Read"}]),
+        );
+        first_call["message"]["id"] = json!("parallel");
+        let mut second_call = message(
+            3,
+            Some(2),
+            "assistant",
+            json!([{"type":"tool_use","id":"b","name":"Read"}]),
+        );
+        second_call["message"]["id"] = json!("parallel");
+        let records = vec![
+            message(1, None, "user", json!("Shared task")),
+            first_call,
+            second_call,
+            message(
+                4,
+                Some(2),
+                "user",
+                json!([{"type":"tool_result","tool_use_id":"a","content":"first"}]),
+            ),
+            message(
+                5,
+                Some(3),
+                "user",
+                json!([{"type":"tool_result","tool_use_id":"b","content":"second"}]),
+            ),
+            message(6, Some(4), "assistant", json!("Shared reply")),
+            message(7, Some(6), "user", json!("Discarded request")),
+            message(8, Some(7), "assistant", json!("Discarded reply")),
+            json!({"type":"progress","uuid":id(9),"parentUuid":id(6)}),
+            message(10, Some(9), "user", json!("Replacement request")),
+        ];
+        let snapshot = snapshot_from_records(&records);
+        let items = snapshot
+            .events
+            .iter()
+            .map(|event| {
+                event.payload["text"]
+                    .as_str()
+                    .or(event.payload["id"].as_str())
+                    .or(event.payload["content"].as_str())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            [
+                "Shared task",
+                "a",
+                "b",
+                "second",
+                "first",
+                "Shared reply",
+                "Replacement request"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_parent_does_not_import_an_unrelated_exchange() {
+        let id = |n| uuid::Uuid::from_u128(n);
+        let records = [
+            json!({"uuid":id(1),"type":"user","message":{"content":"Unrelated exchange"}}),
+            json!({"uuid":id(2),"parentUuid":id(42),"type":"progress"}),
+            json!({"uuid":id(3),"parentUuid":id(2),"type":"user","message":{"content":"Keep this request"}}),
+            json!({"type":"assistant","message":{"content":"Legacy reply without a parent field"}}),
+        ];
+        let snapshot = snapshot_from_records(&records);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload["text"].as_str())
+                .collect::<Vec<_>>(),
+            ["Keep this request", "Legacy reply without a parent field"]
+        );
+        assert_eq!(
+            snapshot.events.last().unwrap().payload["native_history_unverified"],
+            true
+        );
+    }
+
+    #[test]
+    fn rewinding_to_a_compacted_suffix_keeps_the_summary_and_selected_turns() {
+        let id = |n| uuid::Uuid::from_u128(n);
+        let message = |n, parent, role: &str, text: &str| {
+            json!({
+                "uuid":id(n),"parentUuid":id(parent),"type":role,"message":{"role":role,"content":text}
+            })
+        };
+        let records = [
+            json!({"uuid":id(1),"parentUuid":null,"type":"user","message":{"content":"Initial task"}}),
+            message(2, 1, "assistant", "Retained reply"),
+            json!({"uuid":id(3),"type":"system","subtype":"compact_boundary","logicalParentUuid":id(2),
+                "compactMetadata":{"preservedMessages":{"anchorUuid":id(4),"uuids":[id(2)]}}}),
+            json!({"uuid":id(4),"parentUuid":id(3),"type":"user","isCompactSummary":true,"message":{"content":"Summary"}}),
+            message(5, 2, "user", "Discarded question"),
+            message(6, 5, "assistant", "Discarded answer"),
+            message(7, 2, "user", "Replacement question"),
+        ];
+        let snapshot = snapshot_from_records(&records);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| event.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Initial task",
+                "Summary",
+                "Retained reply",
+                "Replacement question"
+            ]
+        );
+    }
+
+    #[test]
+    fn rewinding_into_the_middle_of_a_retained_suffix_discards_its_old_tail() {
+        let id = |n| uuid::Uuid::from_u128(n);
+        let records = [
+            json!({"uuid":id(1),"parentUuid":null,"type":"user","message":{"content":"Original task"}}),
+            json!({"uuid":id(2),"parentUuid":id(1),"type":"assistant","message":{"content":"First result"}}),
+            json!({"uuid":id(3),"parentUuid":id(2),"type":"user","message":{"content":"Abandoned follow-up"}}),
+            json!({"uuid":id(4),"type":"system","subtype":"compact_boundary","logicalParentUuid":id(3),
+                "compactMetadata":{"preservedMessages":{"anchorUuid":id(5),"uuids":[id(2),id(3)]}}}),
+            json!({"uuid":id(5),"parentUuid":id(4),"type":"user","isCompactSummary":true,"message":{"content":"Summary"}}),
+            json!({"uuid":id(6),"parentUuid":id(2),"type":"progress"}),
+            json!({"uuid":id(7),"parentUuid":id(6),"type":"user","message":{"content":"Replacement follow-up"}}),
+        ];
+        let snapshot = snapshot_from_records(&records);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload["text"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Original task",
+                "Summary",
+                "First result",
+                "Replacement follow-up"
+            ]
         );
     }
 
@@ -1434,7 +1635,7 @@ mod tests {
         let snapshot = transcript_from_records(&records)
             .snapshot(
                 &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-                0,
+                InputCoverage::default(),
             )
             .expect("Claude snapshot");
 
@@ -1469,7 +1670,7 @@ mod tests {
         ];
         let session = SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         let snapshot = transcript_from_records(&records)
-            .snapshot(&session, 0)
+            .snapshot(&session, InputCoverage::default())
             .expect("nonadjacent response chunks");
 
         assert_eq!(snapshot.events.len(), 5);
