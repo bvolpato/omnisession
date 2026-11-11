@@ -244,6 +244,9 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
                     let Ok(Row::Record(candidate)) = archive.next() else {
                         return Ok(false);
                     };
+                    if record.get("ordinal").is_some_and(Value::is_null) {
+                        record["ordinal"] = candidate["ordinal"].clone();
+                    }
                     if !candidate["ordinal"].is_u64()
                         || !restore_field(&mut record, &candidate, "ordinal", true)
                         || record != candidate

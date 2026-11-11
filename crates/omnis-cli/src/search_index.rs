@@ -90,7 +90,12 @@ impl IndexCandidate {
         {
             return None;
         }
+        let ancestor_revisions = omnis_adapters::CodexAdapter::failed_index_ancestors(error);
+        if confirm_index_ancestors(registry, ancestor_revisions).is_err() {
+            return None;
+        }
         let failure = TrajectoryIndexFailure {
+            ancestor_revisions: ancestor_revisions.to_vec(),
             source_updated_at: self.updated_at,
             source_file: revision.file,
             source_contents: revision.contents,
@@ -424,13 +429,15 @@ fn pending(
         .map_or_else(HashSet::new, |adapter| {
             adapter.available_index_sources(&missing)
         });
-    let changed_ancestry = changed_codex_ancestors(registry, store, &candidates)?;
+    let (changed_documents, changed_failures) =
+        changed_index_ancestors(registry, store, &candidates, &failures)?;
     for candidate in candidates {
         let ancestry_changed = candidate.session.provider == Provider::Codex
-            && changed_ancestry.contains(&candidate.session.id);
+            && changed_documents.contains(&candidate.session.id);
         let prior = states.get(&candidate.session);
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
+        let failure_changed = changed_failures.contains(&candidate.session);
         let ancestor_restored = candidate.session.provider == Provider::Codex
             && prior
                 .filter(|state| state.ancestor_stamp.is_none())
@@ -439,6 +446,7 @@ fn pending(
         let retry_name = deferred_names.get(&candidate.session) == Some(&revision)
             && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Absent);
         if !ancestry_changed
+            && !failure_changed
             && !ancestor_restored
             && !retry_name
             && !needs_index_at(&candidate, revision, prior)
@@ -449,12 +457,12 @@ fn pending(
                     || failure
                         .is_some_and(|failure| !failure_is_current(&candidate, revision, failure)))
             {
-                recovered.push((candidate, *prior, failure.copied()));
+                recovered.push((candidate, *prior, failure.cloned()));
             }
             continue;
         }
         if !retry_failed
-            && !ancestry_changed
+            && !failure_changed
             && failure.is_some_and(|failure| failure_is_current(&candidate, revision, failure))
         {
             summary.failed_skipped += 1;
@@ -483,22 +491,48 @@ pub(crate) fn changed_codex_ancestors(
     store: &Store,
     candidates: &[IndexCandidate],
 ) -> Result<HashSet<String>> {
+    Ok(changed_index_ancestors(registry, store, candidates, &HashMap::new())?.0)
+}
+
+fn changed_index_ancestors(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: &[IndexCandidate],
+    failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
+) -> Result<(HashSet<String>, HashSet<SessionRef>)> {
     let sessions: HashSet<_> = candidates
         .iter()
         .filter(|candidate| candidate.session.provider == Provider::Codex)
         .map(|candidate| candidate.session.id.as_str())
         .collect();
     if sessions.is_empty() {
-        return Ok(HashSet::new());
+        return Ok((HashSet::new(), HashSet::new()));
     }
     let mut stored = store.codex_index_ancestors()?;
     stored.retain(|id, _| sessions.contains(id.as_str()));
-    let revisions = current_ancestor_revisions(registry, stored.values().map(Vec::as_slice));
-    Ok(stored
+    let relevant_failures = failures.iter().filter(|(session, failure)| {
+        session.provider == Provider::Codex
+            && sessions.contains(session.id.as_str())
+            && !failure.ancestor_revisions.is_empty()
+    });
+    let revisions = current_ancestor_revisions(
+        registry,
+        stored.values().map(Vec::as_slice).chain(
+            relevant_failures
+                .clone()
+                .map(|(_, failure)| failure.ancestor_revisions.as_slice()),
+        ),
+    );
+    let changed_failures = relevant_failures
+        .filter(|(_, failure)| !ancestors_match(&failure.ancestor_revisions, &revisions))
+        .map(|(session, _)| session.clone())
+        .collect();
+    let changed_documents = stored
         .into_iter()
         .filter(|(_, sources)| !ancestors_match(sources, &revisions))
         .map(|(session, _)| session)
-        .collect())
+        .collect();
+    Ok((changed_documents, changed_failures))
 }
 
 fn current_ancestor_revisions<'a>(
@@ -787,16 +821,16 @@ fn publish_replacement(
         }
         Err(error) => {
             summary.failed += 1;
-            if let Some(failure) = observation.failure
+            if let Some(failure) = &observation.failure
                 && !matches!(
                     error.downcast_ref::<omnis_store::StoreError>(),
                     Some(omnis_store::StoreError::TrajectorySourceChanged)
                 )
             {
                 if observation.state.is_none() {
-                    let _ = store.clear_observed_trajectory_index_failure(session, &failure);
+                    let _ = store.clear_observed_trajectory_index_failure(session, failure);
                 } else {
-                    let _ = store.retry_observed_trajectory_index_failure(session, &failure);
+                    let _ = store.retry_observed_trajectory_index_failure(session, failure);
                 }
             }
         }
@@ -1815,6 +1849,7 @@ mod tests {
     fn recorded_failures_cover_unchanged_sources_and_lasting_errors_only() {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_file: None,
             source_contents: None,
             source_updated_at: Some(now),
@@ -1846,7 +1881,7 @@ mod tests {
             SourceRevision::default(),
             &TrajectoryIndexFailure {
                 source_updated_at: None,
-                ..failure
+                ..failure.clone()
             }
         ));
         assert!(!failure_is_current(
@@ -2575,7 +2610,7 @@ mod tests {
     fn unchanged_children_reindex_when_their_ancestor_copies_change() -> Result<()> {
         let root = tempfile::tempdir()?;
         let sessions = root.path().join("sessions");
-        fs::create_dir(&sessions)?;
+        fs::create_dir_all(sessions.join("unrelated/a/b/c/d/e"))?;
         let parent = uuid::Uuid::from_u128(1);
         let child = uuid::Uuid::from_u128(2);
         let cycle = uuid::Uuid::from_u128(3);
@@ -2584,15 +2619,16 @@ mod tests {
             json!({"type":"session_meta","ordinal":ordinal,"payload":{"id":id,
                 "history_mode":"paginated","history_base":base}})
         };
-        let message = json!({"type":"response_item","ordinal":1,"payload":{"type":"message",
+        let message = json!({"type":"response_item","ordinal":2,"payload":{"type":"message",
             "role":"user","content":[{"type":"input_text","text":"inheritedneedle"}]}});
         let inherited = format!(
-            "{}\n{message}\n",
-            header(parent, 0, serde_json::Value::Null)
+            "{}\n{}\n{message}\n",
+            header(parent, 0, serde_json::Value::Null),
+            json!({"ordinal":1,"type":"turn_context","payload":{"cwd":"/synthetic"}})
         );
-        let base = |id| json!({"thread_id":id,"end_ordinal_exclusive":2,"end_byte_offset":inherited.len()});
-        fs::write(file(child), format!("{}\n", header(child, 2, base(parent))))?;
-        fs::write(file(cycle), format!("{}\n", header(cycle, 2, base(cycle))))?;
+        let base = |id| json!({"thread_id":id,"end_ordinal_exclusive":3,"end_byte_offset":inherited.len()});
+        fs::write(file(child), format!("{}\n", header(child, 3, base(parent))))?;
+        fs::write(file(cycle), format!("{}\n", header(cycle, 3, base(cycle))))?;
 
         let mut registry = AdapterRegistry::new();
         registry.register(CodexAdapter::with_root(root.path()));
@@ -2649,6 +2685,19 @@ mod tests {
         assert!(!inherited_hit()?);
         fs::write(&archive, &inherited)?;
         assert_eq!(pass()?.indexed, 1);
+        assert!(inherited_hit()?);
+        assert_eq!(pass()?.stale, 0);
+        fs::remove_file(&archive)?;
+        fs::write(
+            file(parent),
+            inherited.replace(r#""ordinal":1"#, r#""ordinal":8"#),
+        )?;
+        assert_eq!(pass()?.failed, 1);
+        let unchanged = pass()?;
+        assert_eq!((unchanged.stale, unchanged.failed_skipped), (0, 1));
+        fs::write(file(parent), &inherited)?;
+        let repaired = pass()?;
+        assert_eq!((repaired.indexed, repaired.failed_skipped), (1, 0));
         assert!(inherited_hit()?);
         assert_eq!(pass()?.stale, 0);
         Ok(())

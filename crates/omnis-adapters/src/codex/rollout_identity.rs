@@ -311,11 +311,17 @@ impl<'a> RolloutCatalog<'a> {
             copies.push(revision);
             Ok(())
         });
-        if !inventory.is_ok_and(Inventory::complete) {
+        let Ok(inventory) = inventory else {
             return Uuid::nil();
-        }
+        };
         copies.sort_unstable();
-        let bytes: Vec<_> = copies.into_iter().flat_map(Uuid::into_bytes).collect();
+        let mut bytes: Vec<_> = copies.into_iter().flat_map(Uuid::into_bytes).collect();
+        if !inventory.complete() {
+            bytes.extend([
+                u8::from(inventory.limited),
+                u8::from(inventory.inaccessible),
+            ]);
+        }
         Uuid::new_v5(&id, &bytes)
     }
 

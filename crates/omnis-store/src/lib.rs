@@ -643,7 +643,7 @@ impl SelectedMetadata<'_> {
         if update_catalog {
             write_indexed_session(transaction, self.selected)?;
         }
-        if let Some(failure) = self.observation.failure {
+        if let Some(failure) = &self.observation.failure {
             clear_observed_failure(transaction, &self.selected.session, failure)?;
         }
         Ok(())
@@ -789,10 +789,13 @@ pub struct TrajectoryDocument<'a> {
 
 impl TrajectoryDocument<'_> {
     fn encoded_ancestor_revisions(&self) -> Option<Vec<u8>> {
-        (!self.ancestor_revisions.is_empty()).then(|| {
-            serde_json::to_vec(self.ancestor_revisions).expect("UUID pairs serialize as strings")
-        })
+        encode_ancestors(self.ancestor_revisions)
     }
+}
+
+fn encode_ancestors(revisions: &[(Uuid, Uuid)]) -> Option<Vec<u8>> {
+    (!revisions.is_empty())
+        .then(|| serde_json::to_vec(revisions).expect("UUID pairs serialize as strings"))
 }
 
 fn ancestor_stamp(encoded: Option<&[u8]>) -> Option<Uuid> {
@@ -886,8 +889,10 @@ pub struct TrajectorySelection {
 
 /// A session whose source could not be read for indexing, recorded so later passes can skip it
 /// until the source or the search document version changes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexFailure {
+    /// Ancestor rollouts consulted before the read failed.
+    pub ancestor_revisions: Vec<(Uuid, Uuid)>,
     /// File that failed to read, when the provider identifies the selected rollout.
     pub source_file: Option<Uuid>,
     /// Contents revision of the failed file, when the provider supplies one.
@@ -2659,7 +2664,7 @@ impl Store {
         }
         write_indexed_session(&transaction, selected)?;
         if let Some(failure) = failure {
-            clear_observed_failure(&transaction, &selected.session, failure)?;
+            clear_observed_failure(&transaction, &selected.session, &failure)?;
         }
         transaction.commit().map_err(database_error)
     }
@@ -3097,7 +3102,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, document_version, source_file_id, source_contents_id
+                "SELECT provider, session_id, source_updated_at, document_version, source_file_id, source_contents_id, ancestor_revisions
                  FROM trajectory_index_failures",
             )
             .map_err(database_error)?;
@@ -3169,12 +3174,12 @@ impl Store {
         transaction
             .execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at, source_file_id, source_contents_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     provider, session_id, source_updated_at, document_version, failed_at, source_file_id, source_contents_id, ancestor_revisions
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (provider, session_id) DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
                      document_version = excluded.document_version,
-                     failed_at = excluded.failed_at,
+                     failed_at = excluded.failed_at, ancestor_revisions = excluded.ancestor_revisions,
                      source_file_id = excluded.source_file_id, source_contents_id = excluded.source_contents_id",
                 params![
                     session.provider.to_string(),
@@ -3187,6 +3192,7 @@ impl Store {
                     now_timestamp(),
                     failure.source_file.map(Uuid::into_bytes),
                     failure.source_contents.map(Uuid::into_bytes),
+                    encode_ancestors(&failure.ancestor_revisions),
                 ],
             )
             .map_err(database_error)?;
@@ -3204,7 +3210,7 @@ impl Store {
         failure: &TrajectoryIndexFailure,
     ) -> Result<()> {
         validate_session_ref(session)?;
-        clear_observed_failure(&self.connection.borrow(), session, *failure)
+        clear_observed_failure(&self.connection.borrow(), session, failure)
     }
 
     /// Allows the indexer to retry a failed source while its revision still hides the old text.
@@ -3221,7 +3227,7 @@ impl Store {
         update_observed_failure(
             &self.connection.borrow(),
             session,
-            *failure,
+            failure,
             "UPDATE trajectory_index_failures SET document_version = 0",
         )
     }
@@ -5057,6 +5063,7 @@ fn ensure_trajectory_source_revision_columns(transaction: &Transaction<'_>) -> R
         ("session_trajectories", "missing_ancestor_id"),
         ("session_trajectories", "ancestor_revisions"),
         ("session_trajectories", "source_contents_id"),
+        ("trajectory_index_failures", "ancestor_revisions"),
         ("trajectory_index_failures", "source_file_id"),
         ("trajectory_index_failures", "source_contents_id"),
     ] {
@@ -5082,7 +5089,7 @@ fn cached_index_failure(
 ) -> Result<Option<TrajectoryIndexFailure>> {
     connection
         .query_row(
-            "SELECT source_updated_at, document_version, source_file_id, source_contents_id
+            "SELECT source_updated_at, document_version, source_file_id, source_contents_id, ancestor_revisions
              FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2",
             params![session.provider.to_string(), session.id],
             |row| trajectory_failure_from_row(row, 0),
@@ -5095,7 +5102,21 @@ fn trajectory_failure_from_row(
     row: &rusqlite::Row<'_>,
     column: usize,
 ) -> rusqlite::Result<TrajectoryIndexFailure> {
+    let ancestor_revisions = row
+        .get::<_, Option<Vec<u8>>>(column + 4)?
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column + 4,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(TrajectoryIndexFailure {
+        ancestor_revisions,
         source_updated_at: optional_timestamp_from_row(row, column)?,
         document_version: row.get(column + 1)?,
         source_file: row
@@ -5110,7 +5131,7 @@ fn trajectory_failure_from_row(
 fn clear_observed_failure(
     connection: &Connection,
     session: &SessionRef,
-    failure: TrajectoryIndexFailure,
+    failure: &TrajectoryIndexFailure,
 ) -> Result<()> {
     update_observed_failure(
         connection,
@@ -5123,7 +5144,7 @@ fn clear_observed_failure(
 fn update_observed_failure(
     connection: &Connection,
     session: &SessionRef,
-    failure: TrajectoryIndexFailure,
+    failure: &TrajectoryIndexFailure,
     action: &'static str,
 ) -> Result<()> {
     connection
@@ -5131,7 +5152,7 @@ fn update_observed_failure(
             &format!(
                 "{action} WHERE provider = ?1 AND session_id = ?2
                  AND source_updated_at IS ?3 AND document_version = ?4
-                 AND source_file_id IS ?5 AND source_contents_id IS ?6"
+                 AND source_file_id IS ?5 AND source_contents_id IS ?6 AND ancestor_revisions IS ?7"
             ),
             params![
                 session.provider.to_string(),
@@ -5141,7 +5162,8 @@ fn update_observed_failure(
                     .map(|time| time.timestamp_millis()),
                 failure.document_version,
                 failure.source_file.map(Uuid::into_bytes),
-                failure.source_contents.map(Uuid::into_bytes)
+                failure.source_contents.map(Uuid::into_bytes),
+                encode_ancestors(&failure.ancestor_revisions)
             ],
         )
         .map_err(database_error)?;
@@ -7774,6 +7796,7 @@ mod tests {
                 .unwrap();
         }
         let failure = super::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_updated_at: Some(time),
             source_file: revision.file,
             source_contents: revision.contents,
@@ -10205,6 +10228,7 @@ mod tests {
         ));
         let before_failure = observe();
         let failure = super::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_updated_at: Some(time),
             source_file: revision(1).file,
             source_contents: revision(1).contents,
@@ -10489,6 +10513,7 @@ mod tests {
         ));
 
         let failure = super::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_updated_at: Some(time),
             source_file: first.file,
             source_contents: first.contents,
@@ -10505,7 +10530,7 @@ mod tests {
         let current = store.trajectory_index_state(&session).unwrap();
         let changed_failure = super::TrajectoryIndexFailure {
             source_contents: next.contents,
-            ..failure
+            ..failure.clone()
         };
         store
             .record_observed_trajectory_index_failure(
@@ -10519,7 +10544,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.trajectory_index_failure(&session).unwrap(),
-            Some(changed_failure)
+            Some(changed_failure.clone())
         );
         store
             .clear_observed_trajectory_index_failure(&session, &changed_failure)
@@ -10537,6 +10562,7 @@ mod tests {
             .index_search_fixture(&session, "retiredmarker", time)
             .unwrap();
         let failed = super::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_updated_at: Some(time),
             source_file: Some(Uuid::from_u128(1)),
             source_contents: Some(Uuid::from_u128(2)),
@@ -10546,7 +10572,7 @@ mod tests {
             .record_trajectory_index_failure(&session, &failed)
             .unwrap();
         let obsolete = super::TrajectoryIndexFailure {
-            source_contents: Some(Uuid::from_u128(3)),
+            ancestor_revisions: vec![(Uuid::from_u128(3), Uuid::from_u128(4))],
             ..failed
         };
         store
@@ -10554,7 +10580,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.trajectory_index_failure(&session).unwrap(),
-            Some(failed)
+            Some(failed.clone())
         );
         store
             .retry_observed_trajectory_index_failure(&session, &failed)
@@ -10634,6 +10660,7 @@ mod tests {
             .upsert_session_trajectory(&session, "searchable marker", time, true)
             .expect("document");
         let mut failure = super::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_updated_at: Some(time),
             source_file: None,
             source_contents: None,

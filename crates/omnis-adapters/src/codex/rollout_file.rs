@@ -1,7 +1,7 @@
 //! Read the physical representation of a Codex JSONL rollout without modifying the source.
 
 use std::{
-    cell::OnceCell,
+    cell::{Cell, OnceCell},
     collections::VecDeque,
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read},
@@ -57,8 +57,61 @@ fn physical_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+// Resolving one fork can open several rollouts while selecting and verifying archival copies.
+// Charge all reads on the synchronous discovery thread to the same search budget.
+thread_local! {
+    static SEARCH_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(super) fn within_search_budget<T>(
+    remaining: &mut u64,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEARCH_BYTES.set(self.0);
+        }
+    }
+    let _restore = Restore(SEARCH_BYTES.replace(Some(*remaining)));
+    let result = run();
+    *remaining = SEARCH_BYTES.get().expect("active search budget");
+    anyhow::ensure!(*remaining != 0, "workspace search budget exhausted");
+    result
+}
+
+struct SearchReader<R>(R);
+
+impl<R: Read> Read for SearchReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = SEARCH_BYTES.get().expect("active search budget");
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if remaining == 0 {
+            return Err(std::io::Error::other("workspace search budget exhausted"));
+        }
+        let limit = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let count = self.0.read(&mut buf[..limit])?;
+        SEARCH_BYTES.set(Some(remaining - count as u64));
+        Ok(count)
+    }
+}
+
 pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
-    decoder(path, physical_file(path)?)
+    let file = physical_file(path)?;
+    if let Some(remaining) = SEARCH_BYTES.get() {
+        if compressed(path) {
+            // A decoder can consume a large encoded stream before it returns any output.
+            let encoded = file.metadata()?.len();
+            SEARCH_BYTES.set(Some(remaining.saturating_sub(encoded)));
+            anyhow::ensure!(encoded < remaining, "workspace search budget exhausted");
+        }
+        return Ok(Box::new(SearchReader(decoder(path, file)?)));
+    }
+    decoder(path, file)
 }
 
 fn decoder(path: &Path, file: File) -> Result<Box<dyn Read>> {
@@ -85,7 +138,7 @@ impl std::fmt::Display for CompressedHeaderError {
 }
 
 pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
-    if !compressed(path) {
+    if !compressed(path) && SEARCH_BYTES.get().is_none() {
         return json_lines_prefix(path, 1);
     }
     // Listing thousands of archives should consume only their first line.

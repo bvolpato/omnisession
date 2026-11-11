@@ -835,6 +835,99 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
 }
 
 #[test]
+fn project_search_follows_the_surviving_workspace_in_a_fork_prefix() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let path = |id| {
+        fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{id}.jsonl"
+        ))
+    };
+    let header = |id, ordinal| {
+        json!({"type":"session_meta","ordinal":ordinal,
+        "payload":{"id":id,"cwd":fixture.workspace,"history_mode":"paginated"}})
+    };
+    let folders = ["a", "b", "c"].map(|name| fixture.root.join(name));
+    for folder in &folders {
+        fs::create_dir(folder).unwrap();
+    }
+    let set_workspace = |folder: &Path| {
+        write_jsonl(
+            &path(OTHER_CODEX_ID),
+            &[
+                header(OTHER_CODEX_ID, 0),
+                json!({"type":"turn_context","ordinal":1,"payload":{"cwd":folder}}),
+            ],
+        );
+    };
+    let write_child = |cutoff| {
+        let mut child = header(CODEX_ID, cutoff);
+        child["payload"]["history_base"] = json!({"thread_id":OTHER_CODEX_ID,
+            "end_byte_offset":path(OTHER_CODEX_ID).metadata().unwrap().len(),"end_ordinal_exclusive":cutoff});
+        write_jsonl(
+            &path(CODEX_ID),
+            &[
+                child,
+                json!({"type":"event_msg","ordinal":cutoff+1,
+            "payload":{"type":"agent_message","message":"inheritedworkspaceprobe"}}),
+            ],
+        );
+    };
+    set_workspace(&folders[0]);
+    write_child(2);
+    let search = |folder: &Path| {
+        fixture.search_json(&[
+            "--provider",
+            "codex",
+            "--project",
+            folder.to_str().unwrap(),
+            "inheritedworkspaceprobe",
+        ])
+    };
+    let child_ref = format!("codex:{CODEX_ID}");
+    assert_eq!(result_sessions(&search(&folders[0])), [child_ref.as_str()]);
+    set_workspace(&folders[1]);
+    fixture.index_codex();
+    let warm = search(&folders[1]);
+    assert_eq!(result_sessions(&warm), [child_ref.as_str()]);
+    assert_eq!(warm["index"]["indexed"], 0);
+    assert!(result_sessions(&search(&folders[0])).is_empty());
+    set_workspace(&folders[2]);
+    assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
+    assert!(result_sessions(&search(&folders[1])).is_empty());
+
+    // A cold project search has a bounded read budget for the entire ancestor prefix.
+    let mut parent = fs::OpenOptions::new()
+        .append(true)
+        .open(path(OTHER_CODEX_ID))
+        .unwrap();
+    let padding = " ".repeat(128 * 1024);
+    for ordinal in 2..35 {
+        writeln!(
+            parent,
+            "{}{padding}",
+            json!({"type":"event_msg","ordinal":ordinal,
+            "payload":{"type":"token_count"}})
+        )
+        .unwrap();
+    }
+    drop(parent);
+    write_child(35);
+    let bounded = search(&folders[2]);
+    assert!(result_sessions(&bounded).is_empty());
+    assert!(
+        bounded["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("could not check"))
+    );
+    fixture.index_codex();
+    assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
+}
+
+#[test]
 fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() {
     use std::io::Write;
     let reference = format!("codex:{CODEX_ID}");

@@ -1854,3 +1854,45 @@ fn unplaced_owned_settings_before_abort_preserve_the_child_and_detached_leaf() -
     }
     Ok(())
 }
+
+#[test]
+fn rollback_counts_numbered_requests_after_an_unplaced_turn_start() -> anyhow::Result<()> {
+    for (count, expected) in [
+        (1, &["A", "A reply", "leaf"][..]),
+        (2, &["leaf"][..]),
+        (0, &["A", "A reply", "B", "B reply", "leaf"][..]),
+    ] {
+        let home = tempfile::tempdir()?;
+        let start = |id| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+        let mut a = start("A");
+        a["ordinal"] = json!(2);
+        let rows = [
+            header(PARENT, 0, None),
+            json!({"type":"event_msg","payload":{"type":"token_count"}}),
+            a,
+            turn(3, "user", "A"),
+            turn(4, "assistant", "A reply"),
+            start("B"),
+            turn(6, "user", "B"),
+            turn(7, "assistant", "B reply"),
+            json!({"ordinal":8,"type":"event_msg","payload":{"type":"task_complete","turn_id":"B"}}),
+            json!({"ordinal":9,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+        ];
+        let day = "sessions/2026/01/01";
+        let stamp = "2026-01-01T00-00-00";
+        write(home.path(), day, PARENT, PARENT, stamp, &rows);
+        write(
+            home.path(),
+            day,
+            CHILD,
+            CHILD,
+            stamp,
+            &[
+                header(CHILD, 10, Some(bookmark(PARENT, &rows))),
+                turn(11, "user", "leaf"),
+            ],
+        );
+        check_parent_messages(home.path(), expected, true)?;
+    }
+    Ok(())
+}

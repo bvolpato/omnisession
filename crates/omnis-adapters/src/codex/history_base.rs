@@ -337,7 +337,7 @@ impl HistoryBase {
                 }
                 Err(error) => {
                     let Some(reason) = source_unavailable(&error) else {
-                        return Err(error);
+                        return Err(FailedAncestors::attach(error, &ancestor_revisions));
                     };
                     missing_rollout = Some(pos.thread_id);
                     break Some(reason);
@@ -358,12 +358,15 @@ impl HistoryBase {
                     missing_rollout = Some(pos.thread_id);
                     break Some(INACCESSIBLE_SOURCE);
                 }
-                result => result?,
+                result => {
+                    result.map_err(|error| FailedAncestors::attach(error, &ancestor_revisions))?
+                }
             };
             if segment.is_none() && scope == HistoryScope::Visible {
                 let catalog =
                     catalog.unwrap_or_else(|| fallback.get_or_init(|| RolloutCatalog::new(home)));
-                segment = Segment::from_verified_copy(home, catalog, &path, pos, &mut budget)?;
+                segment = Segment::from_verified_copy(home, catalog, &path, pos, &mut budget)
+                    .map_err(|error| FailedAncestors::attach(error, &ancestor_revisions))?;
             }
             let Some(segment) = segment else {
                 missing_rollout = Some(pos.thread_id);
@@ -834,6 +837,32 @@ pub(super) struct Lineage {
 }
 
 #[derive(Debug)]
+pub(super) struct FailedAncestors {
+    pub(super) revisions: Vec<(Uuid, Uuid)>,
+    message: String,
+}
+
+impl FailedAncestors {
+    pub(super) fn attach(error: anyhow::Error, revisions: &[(Uuid, Uuid)]) -> anyhow::Error {
+        if revisions.is_empty() {
+            error
+        } else {
+            let message = error.to_string();
+            error.context(Self {
+                revisions: revisions.to_vec(),
+                message,
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for FailedAncestors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Debug)]
 struct DamagedPrefixes(Vec<(usize, &'static str)>);
 
 impl std::fmt::Display for DamagedPrefixes {
@@ -1135,6 +1164,8 @@ struct PrefixCursor {
     damage: Option<&'static str>,
     visible: bool,
     damaged_preamble_settings: bool,
+    last_numbered: Option<(usize, u64)>,
+    pending_turn_start: Option<Value>,
 }
 
 impl PrefixCursor {
@@ -1146,7 +1177,50 @@ impl PrefixCursor {
             damage: None,
             visible: !segment.recover_after_damage,
             damaged_preamble_settings: false,
+            last_numbered: None,
+            pending_turn_start: None,
         }
+    }
+
+    fn visit_record(
+        &mut self,
+        segment: &Segment,
+        start: VisibleStart,
+        record: Value,
+        row: usize,
+        visit: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        let ordinal = record["ordinal"].as_u64();
+        let mut anchored = self.pending_turn_start.take();
+        if let Some((last_row, last_ordinal)) = self.last_numbered {
+            // Both neighboring rows must place the start at a single visible source ordinal.
+            if last_row + 2 != row || last_ordinal.checked_add(2) != ordinal || ordinal.is_none() {
+                anchored = None;
+            }
+            if segment.recover_after_damage
+                && ordinal.is_none()
+                && last_row + 1 == row
+                && last_ordinal.checked_add(1) == Some(self.next)
+                && !start.hides_row(row)
+                && start.ordinal().is_none_or(|begin| self.next >= begin)
+                && is_owned_turn_start(&record, &segment.path)
+            {
+                self.pending_turn_start = Some(record.clone());
+            }
+        }
+        if let Some(ordinal) = ordinal {
+            self.last_numbered = Some((row, ordinal));
+        }
+        if let Some(turn_start) = anchored {
+            self.visible = true;
+            self.damage = None;
+            self.malformed = false;
+            visit(turn_start)?;
+        }
+        if self.observe(segment, start, &record, row)? {
+            visit(record)?;
+        }
+        Ok(())
     }
 
     fn observe(
@@ -1301,9 +1375,9 @@ fn read_prefix_from(
                         continue;
                     }
                 };
-                if cursor.observe(segment, visible_start, &record, row)? {
-                    visit(record, skipped)?;
-                }
+                cursor.visit_record(segment, visible_start, record, row, &mut |record| {
+                    visit(record, skipped)
+                })?;
             }
         }
     }

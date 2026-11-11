@@ -364,6 +364,14 @@ impl CodexAdapter {
             || error.is::<current_rollout::CurrentRolloutUnconfirmed>()
     }
 
+    /// Returns the ancestor revisions observed before a Codex index read failed.
+    #[must_use]
+    pub fn failed_index_ancestors(error: &anyhow::Error) -> &[(Uuid, Uuid)] {
+        error
+            .downcast_ref::<history_base::FailedAncestors>()
+            .map_or(&[], |failure| failure.revisions.as_slice())
+    }
+
     /// Identifies a rollout file across appends and distinguishes same-path replacements.
     #[must_use]
     pub fn index_file_id(path: &Path) -> Option<Uuid> {
@@ -1009,7 +1017,10 @@ impl CodexAdapter {
             } else {
                 native.index(session, full_read_bytes, revision)?
             };
-            read.observe_inherited_workspace(&selected_path)?;
+            read.observe_inherited_workspace(&selected_path)
+                .map_err(|error| {
+                    history_base::FailedAncestors::attach(error, &read.ancestor_revisions)
+                })?;
             Ok(read)
         });
         if changed {
@@ -2213,9 +2224,12 @@ impl CodexSession {
         let catalog =
             catalog.unwrap_or_else(|| standalone.get_or_init(|| RolloutCatalog::new(home)));
         let mut lineage = self.lineage(adapter, HistoryScope::Visible, Some(catalog))?;
-        let (events, project, retained_all, workspace_verified) =
-            lineage.project(adapter, Some(catalog), |lineage| {
+        let (events, project, retained_all, workspace_verified) = lineage
+            .project(adapter, Some(catalog), |lineage| {
                 self.index_lineage(lineage, budget)
+            })
+            .map_err(|error| {
+                history_base::FailedAncestors::attach(error, &lineage.ancestor_revisions)
             })?;
         anyhow::ensure!(
             lineage
@@ -3439,7 +3453,7 @@ impl ProviderAdapter for CodexAdapter {
         let home = self.codex_home.as_deref()?;
         let (scan, cached) = self.session_scan(None);
         let mut catalog = RolloutCatalog::new(home);
-        if !cached && scan.notes.is_empty() {
+        if !cached && scan.notes.is_empty() && !scan.skipped_directories {
             catalog.fresh_scan = Some(scan);
         }
         Some(Box::new(move |session, hint, budget| {

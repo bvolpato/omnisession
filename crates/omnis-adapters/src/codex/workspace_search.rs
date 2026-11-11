@@ -1,7 +1,8 @@
 use super::{
-    CodexAdapter, CodexHistory, CodexSession, EventBuilder, MAX_PREVIEW_TAIL_SIZE, NativeSession,
-    Provider, TOOL_COMPACTION_RECORD_INTERVAL, live_rollout_path, paths_match, rollout_file,
-    sort_sessions, string_at,
+    CodexAdapter, CodexHistory, CodexSession, EventBuilder, HistoryBase, HistoryScope,
+    MAX_PREVIEW_TAIL_SIZE, NativeSession, Provider, RolloutCatalog,
+    TOOL_COMPACTION_RECORD_INTERVAL, live_rollout_path, paths_match, rollout_file, sort_sessions,
+    string_at,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -56,10 +57,6 @@ impl CodexAdapter {
             return (sessions, 0);
         }
         sort_sessions(&mut unknown);
-        let mut probe = WorkspaceProbe {
-            files_left: 64,
-            bytes_left: 4 * MAX_PREVIEW_TAIL_SIZE,
-        };
         let hints = self
             .use_workspace_index
             .then(|| omnis_store::CodexWorkspace::refresh_hints().ok())
@@ -73,9 +70,29 @@ impl CodexAdapter {
             sort_sessions(&mut sessions);
             return (sessions, unknown.len());
         };
+        let mut probe = WorkspaceProbe {
+            adapter: self,
+            home,
+            canonical: &canonical,
+            catalog: RolloutCatalog::new(home),
+            files_left: 64,
+            bytes_left: 4 * MAX_PREVIEW_TAIL_SIZE,
+        };
         let mut unchecked = 0;
         for session in unknown {
             let raw = projected.get(session.session.id.as_str()).copied();
+            if raw.is_some()
+                && let Some(revision) = session.source_revision
+                && let Some(workspace) = revision
+                    .file
+                    .and_then(|file| workspaces.verified.get(&file))
+                && revision.matches_file_contents(workspace.source_revision)
+                && in_project(workspace.project_path.as_deref())
+            {
+                // Indexing checks the ancestor revisions before the workspace enters the results.
+                sessions.push(session);
+                continue;
+            }
             if raw.is_none()
                 && let Some(revision) = session.source_revision
                 && !workspaces.needs_recheck(revision)
@@ -87,7 +104,7 @@ impl CodexAdapter {
                 sessions.push(session);
                 continue;
             }
-            match probe.read(&session, raw, home, &canonical) {
+            match probe.read(&session, raw) {
                 Ok(Some(workspace)) if in_project(Some(&workspace)) => {
                     sessions.push(session);
                 }
@@ -103,44 +120,52 @@ impl CodexAdapter {
 }
 
 // A project search checks only a bounded number of unverified foreign files, newest first.
-struct WorkspaceProbe {
+struct WorkspaceProbe<'a> {
+    adapter: &'a CodexAdapter,
+    home: &'a Path,
+    canonical: &'a Path,
+    catalog: RolloutCatalog<'a>,
     files_left: usize,
     bytes_left: u64,
 }
 
-impl WorkspaceProbe {
+impl WorkspaceProbe<'_> {
     fn read(
         &mut self,
         session: &NativeSession,
         projected: Option<&CodexSession>,
-        home: &Path,
-        canonical: &Path,
     ) -> Result<Option<PathBuf>> {
         ensure!(
             self.files_left > 0 && self.bytes_left > 0,
             "workspace search budget exhausted"
         );
         self.files_left -= 1;
+        let limit = self.bytes_left.min(MAX_PREVIEW_TAIL_SIZE);
+        let mut remaining = limit;
+        let result = rollout_file::within_search_budget(&mut remaining, || {
+            self.read_workspace(session, projected, limit)
+        });
+        self.bytes_left -= limit - remaining;
+        result
+    }
+
+    fn read_workspace(
+        &self,
+        session: &NativeSession,
+        projected: Option<&CodexSession>,
+        limit: u64,
+    ) -> Result<Option<PathBuf>> {
         let path = session
             .source_path
             .as_deref()
             .context("missing rollout path")?;
-        let limit = self.bytes_left.min(MAX_PREVIEW_TAIL_SIZE);
         ensure!(
-            live_rollout_path(home, canonical, path) && fs::metadata(path)?.len() <= limit,
+            live_rollout_path(self.home, self.canonical, path)
+                && fs::metadata(path)?.len() <= limit,
             "rollout exceeds workspace search budget or moved"
         );
         let mut bytes = Vec::new();
-        let read = rollout_file::open(path)?
-            .take(limit + 1)
-            .read_to_end(&mut bytes);
-        let used = u64::try_from(bytes.len())?;
-        self.bytes_left = self.bytes_left.saturating_sub(used);
-        read?;
-        ensure!(
-            used <= limit,
-            "decoded rollout exceeds workspace search budget"
-        );
+        rollout_file::open(path)?.read_to_end(&mut bytes)?;
         // A foreign header alone cannot establish the requested directory.
         if session.project_path.is_some()
             && memchr::memmem::find(&bytes, b"turn_context").is_none()
@@ -150,6 +175,36 @@ impl WorkspaceProbe {
         {
             return Ok(None);
         }
+        let workspace = if let Some(raw) =
+            projected.filter(|raw| matches!(raw.history_base, HistoryBase::Prefix(_)))
+        {
+            let mut lineage =
+                raw.lineage(self.adapter, HistoryScope::Visible, Some(&self.catalog))?;
+            lineage.project(self.adapter, Some(&self.catalog), |lineage| {
+                let (_, workspace, verified) = raw.canonical_events_with(lineage, |visit| {
+                    rollout_file::read_records(bytes.as_slice(), visit)
+                })?;
+                Ok(workspace.filter(|_| verified))
+            })?
+        } else {
+            Self::leaf_workspace(session, projected, &bytes)?
+        };
+        ensure!(
+            session
+                .source_revision
+                .is_some_and(|expected| expected.contents.is_some()
+                    && CodexAdapter::index_file_revision(path)
+                        .is_some_and(|actual| actual.matches_file_contents(expected))),
+            "Codex rollout changed during workspace search"
+        );
+        Ok(workspace)
+    }
+
+    fn leaf_workspace(
+        session: &NativeSession,
+        projected: Option<&CodexSession>,
+        bytes: &[u8],
+    ) -> Result<Option<PathBuf>> {
         let mut history = CodexHistory::new(None);
         let mut builder = EventBuilder::new(Provider::Codex, &session.session.id);
         builder.plan_preview(None);
@@ -159,7 +214,7 @@ impl WorkspaceProbe {
             .unwrap_or_default();
         let skipped = lineage.visit_leaf(
             &session.session.id,
-            |visit| rollout_file::read_records(bytes.as_slice(), visit),
+            |visit| rollout_file::read_records(bytes, visit),
             |record, skipped| {
                 history.settings.observe_gaps(skipped);
                 history.observe_workspace_gaps(skipped.workspace_gaps());
@@ -195,14 +250,6 @@ impl WorkspaceProbe {
                     .workspace_record
                     .is_some_and(|position| position > 1),
             "inherited workspace may be unavailable"
-        );
-        ensure!(
-            session
-                .source_revision
-                .is_some_and(|expected| expected.contents.is_some()
-                    && CodexAdapter::index_file_revision(path)
-                        .is_some_and(|actual| actual.matches_file_contents(expected))),
-            "Codex rollout changed during workspace search"
         );
         Ok(history.settings.directory(history.project_path))
     }

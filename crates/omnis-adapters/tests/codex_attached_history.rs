@@ -1022,7 +1022,7 @@ fn an_inherited_abort_preserves_only_the_childs_owned_workspace() -> Result<()> 
 }
 
 #[test]
-fn a_detached_fork_recovers_joined_or_truncated_records_only_from_an_agreeing_copy() -> Result<()> {
+fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Result<()> {
     let home = tempfile::tempdir()?;
     let dir = home.path().join("sessions");
     let archive = home.path().join("archived_sessions");
@@ -1036,32 +1036,40 @@ fn a_detached_fork_recovers_joined_or_truncated_records_only_from_an_agreeing_co
         reply,
         json!({"type":"event_msg","ordinal":3,"payload":{"type":"task_complete","turn_id":"one"}}),
     ];
+    let mut base = bookmark(PARENT, &parent);
+    base["end_byte_offset"] = json!(base["end_byte_offset"].as_u64().unwrap() + 3);
     write(
         &dir,
         &format!("2026-01-02T00-00-00-{REVERT}"),
         &[
-            header(REVERT, 4, Some(bookmark(PARENT, &parent)), false),
+            header(REVERT, 4, Some(base), false),
             message(5, "detached request"),
         ],
     )?;
     let path = dir.join(format!("rollout-{parent_name}.jsonl"));
     let copy = archive.join(path.file_name().unwrap());
-    for (joined, truncated) in [(true, false), (false, true)] {
-        write(&dir, &parent_name, &parent)?;
-        let mut damaged = fs::read(&path)?;
-        if joined {
-            let delimiter = parent[0].to_string().len() + 1 + parent[1].to_string().len();
+    write(&dir, &parent_name, &parent)?;
+    let original = fs::read_to_string(&path)?.replace("\"ordinal\":1,", "\"ordinal\":1   ,");
+    fs::create_dir_all(&archive)?;
+    for damage in ["joined", "split and truncated", "null ordinal"] {
+        let mut damaged = original.as_bytes().to_vec();
+        if damage == "joined" {
+            let delimiter = original.match_indices('\n').nth(1).unwrap().0;
             damaged[delimiter] = b' ';
-        } else {
+        } else if damage == "split and truncated" {
             let split = std::str::from_utf8(&damaged)?.find("input_text").unwrap() + "input".len();
             damaged[split] = b'\n';
-        }
-        if truncated {
             damaged.truncate(damaged.len() - parent[3].to_string().len() - 1);
+        } else {
+            let start = std::str::from_utf8(&damaged)?
+                .find("\"ordinal\":1")
+                .unwrap()
+                + "\"ordinal\":".len();
+            damaged[start..start + 4].copy_from_slice(b"null");
         }
         fs::write(&path, damaged)?;
         for agrees in [true, false] {
-            write(&archive, &parent_name, &parent)?;
+            fs::write(&copy, &original)?;
             if !agrees {
                 fs::write(
                     &copy,
@@ -1078,11 +1086,7 @@ fn a_detached_fork_recovers_joined_or_truncated_records_only_from_an_agreeing_co
                 .collect();
             assert!(texts.contains(&"detached request"));
             assert!(!texts.contains(&"forged response"));
-            assert_eq!(
-                texts.contains(&"parent request"),
-                agrees,
-                "joined={joined} truncated={truncated}"
-            );
+            assert_eq!(texts.contains(&"parent request"), agrees, "{damage}");
             assert_eq!(texts.contains(&"parent response"), agrees);
         }
     }
