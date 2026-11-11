@@ -1519,11 +1519,19 @@ impl Branch {
         }
         let occurrence = self.opaque_record(parent)?;
         let summary = self.latest_attachment_checkpoint(compactions)?;
+        let checkpoint = &compactions.by_summary[&summary];
         let retained = if compactions.contains(summary, occurrence.uuid, records) {
             // An explicit entry establishes its own position even when its old parent is missing.
             occurrence.uuid
+        } else if parent.source.is_some()
+            && parent.node == parent.source
+            && occurrence.header_count <= checkpoint.header
+            && !duplicates.contains(&occurrence.uuid)
+        {
+            // Progress preserves the original attachment's conversation parent. Returning to
+            // that removed attachment resumes after the checkpoint's retained messages.
+            checkpoint.retained_tail?
         } else {
-            let checkpoint = &compactions.by_summary[&summary];
             let marker = if matches!(checkpoint.markers, super::markers::Markers::None) {
                 None
             } else {

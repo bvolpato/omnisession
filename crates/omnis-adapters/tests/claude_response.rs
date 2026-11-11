@@ -738,18 +738,26 @@ fn a_retained_root_directory_only_supplies_its_position_to_children_written_afte
 
 #[test]
 fn a_request_returning_to_an_omitted_directory_keeps_the_whole_retained_list() {
-    for kept_directory in [true, false] {
+    for (kept_directory, through_progress) in [(true, false), (false, false), (false, true)] {
         let mut rows = vec![
             message(1, 0, "user", json!("Original task")),
             directory_attachment(30, 1),
-            message(2, 1, "assistant", json!("Retained reply")),
         ];
+        if through_progress {
+            rows.push(opaque(31, 30, "progress"));
+        }
+        rows.push(message(2, 1, "assistant", json!("Retained reply")));
         rows.extend(compaction(
             3,
             2,
             if kept_directory { &[1, 30, 2] } else { &[1, 2] },
         ));
-        rows.push(message(11, 30, "user", json!("New request")));
+        rows.push(message(
+            11,
+            if through_progress { 31 } else { 30 },
+            "user",
+            json!("New request"),
+        ));
         let expected: &[&str] = if kept_directory {
             &["Summary 3", "Original task", "New request"]
         } else {
@@ -766,13 +774,45 @@ fn a_request_returning_to_an_omitted_directory_keeps_the_whole_retained_list() {
             assert_eq!(
                 handoff_messages(&active),
                 expected,
-                "kept={kept_directory}, preview={preview}"
+                "kept={kept_directory}, progress={through_progress}, preview={preview}"
             );
             assert!(!active.truncated);
             let search = omnis_core::trajectory_search_document(&snapshot);
             assert!(search.source_complete);
             for text in [&search.text, &recovery_text(&snapshot)] {
                 assert_eq!(text.contains("Retained reply"), !kept_directory);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_omitted_directory_keeps_the_checkpoint_tail_after_an_independent_root() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        directory_attachment(30, 1),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    base.extend(compaction(3, 2, &[2]));
+    for intervening_root in [false, true] {
+        let mut rows = base.clone();
+        if intervening_root {
+            rows.push(message(10, 0, "user", json!("Independent root")));
+        }
+        rows.push(message(11, 30, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 3", "Retained reply", "New request"],
+                "independent={intervening_root}, preview={preview}"
+            );
+            assert!(!active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert!(text.contains("Retained reply") && !text.contains("Independent root"));
             }
         }
     }
