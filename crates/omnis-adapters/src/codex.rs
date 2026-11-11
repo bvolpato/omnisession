@@ -236,6 +236,16 @@ impl CodexAdapter {
     fn build_listing(&self) -> CodexListing {
         let scan = self.session_scan();
         let title_index = self.title_index();
+        let ids: Vec<_> = scan
+            .files
+            .iter()
+            .filter_map(|path| path_uuid(path))
+            .collect();
+        let names = self
+            .codex_home
+            .as_deref()
+            .map(|home| self.gui_names.read(home, ids.iter().map(String::as_str)))
+            .unwrap_or_default();
         let mut cache = self
             .rollout_cache
             .as_deref()
@@ -253,11 +263,15 @@ impl CodexAdapter {
                         subagents += 1;
                         continue;
                     }
-                    let replace = sessions
+                    // The scan visits active rollouts before archives. A verified database
+                    // pointer takes precedence over that order.
+                    if names
                         .get(&session.id)
-                        .is_none_or(|current| session.updated_at > current.updated_at);
-                    if replace {
+                        .is_some_and(|row| row.matches_path(path))
+                    {
                         sessions.insert(session.id.clone(), session);
+                    } else {
+                        sessions.entry(session.id.clone()).or_insert(session);
                     }
                 }
                 Ok(None) => skipped_metadata += 1,
@@ -272,7 +286,9 @@ impl CodexAdapter {
         if let Some(cache) = cache {
             cache.save();
         }
-        self.assign_titles(sessions.values_mut());
+        for session in sessions.values_mut() {
+            session.title = self.rollout_title(&session.id, &session.path, &names);
+        }
         let sessions = sessions.into_values().collect::<Vec<_>>();
         let mut notes = listing_notes(
             scan,

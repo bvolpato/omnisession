@@ -716,47 +716,55 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         home.path().join("session_index.jsonl"),
         json!({"id":SESSION_ID,"thread_name":"Original name"}).to_string(),
     )?;
-    fs::File::open(&original)?.set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&original)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
     let mut warm = CodexAdapter::with_root(home.path()).list_sessions(None)?;
     assert_eq!(warm[0].title.as_deref(), Some("Original name"));
     warm[0].source_path = None;
     let duplicate = rollout("duplicate", "/two")?;
-    let check = || -> anyhow::Result<()> {
+    let check = |expected_path: &Path, project: &str, title: Option<&str>| -> anyhow::Result<()> {
         let adapter = CodexAdapter::with_root(home.path());
-        assert_eq!(adapter.list_sessions(None)?[0].title, None);
+        assert_eq!(adapter.list_sessions(None)?[0].title.as_deref(), title);
         let mut cached = warm.clone();
         adapter.refresh_session_titles(&mut cached);
-        assert_eq!(cached[0].title, None);
+        assert_eq!(cached[0].title.as_deref(), title);
         let preview = adapter.preview_session(&cached[0].session)?;
         assert_eq!(preview.title, cached[0].title);
-        assert_eq!(preview.workspace.current_dir, Path::new("/two"));
+        assert_eq!(preview.workspace.current_dir, Path::new(project));
         assert_eq!(
             cached[0].project_path.as_ref(),
             Some(&preview.workspace.current_dir)
         );
         assert_eq!(
             cached[0].source_path.as_ref().unwrap().canonicalize()?,
-            duplicate
+            expected_path
         );
         Ok(())
     };
-    check()?;
+    check(&original, "/one", None)?;
     let state = home.path().join("alternate");
     fs::create_dir(&state)?;
     fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
     let db = rusqlite::Connection::open(state.join("state_5.sqlite"))?;
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
-    check()?;
+    check(&original, "/one", None)?;
     db.execute(
         "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,'Private opener','Private opener')",
         rusqlite::params![SESSION_ID, original.to_str()],
     )?;
-    check()?;
+    check(&original, "/one", None)?;
     db.execute(
         "UPDATE threads SET history_mode='paginated', name='SQLite original name'",
         [],
     )?;
-    check()?;
+    check(&original, "/one", Some("SQLite original name"))?;
+    db.execute(
+        "UPDATE threads SET rollout_path=?1, name='SQLite second name'",
+        [duplicate.to_str()],
+    )?;
+    check(&duplicate, "/two", Some("SQLite second name"))?;
     drop(db);
     fs::remove_file(state.join("state_5.sqlite"))?;
     fs::remove_file(duplicate)?;
@@ -772,5 +780,47 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
     let preview = adapter.preview_session(&warm[0].session)?;
     assert_eq!(preview.title, warm[0].title);
     assert_eq!(preview.workspace.current_dir, Path::new("/one"));
+    Ok(())
+}
+
+#[test]
+fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let file = format!("rollout-{SESSION_ID}.jsonl");
+    let write = |directory: &str, project: &str, replies: &[&str]| -> anyhow::Result<_> {
+        let dir = home.path().join(directory);
+        fs::create_dir(&dir)?;
+        let path = dir.join(&file);
+        let mut text =
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":project}}).to_string();
+        for reply in replies {
+            text.push('\n');
+            text.push_str(&json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":reply}]}}).to_string());
+        }
+        fs::write(&path, text)?;
+        Ok(path)
+    };
+    let active = write("sessions", "/active", &["First reply", "Final reply"])?;
+    let mut cached = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    cached[0].source_path = None;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&active)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+    write("archived_sessions", "/archive", &["First reply"])?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    adapter.refresh_session_titles(&mut cached);
+    for row in [&listed[0], &cached[0]] {
+        assert_eq!(row.source_path.as_ref(), Some(&active));
+        assert_eq!(row.project_path.as_deref(), Some(Path::new("/active")));
+    }
+    for snapshot in [
+        adapter.read_session(&cached[0].session)?,
+        adapter.preview_session(&cached[0].session)?,
+    ] {
+        assert_eq!(snapshot.workspace.current_dir, Path::new("/active"));
+        assert!(serde_json::to_string(&snapshot.events)?.contains("Final reply"));
+    }
     Ok(())
 }
