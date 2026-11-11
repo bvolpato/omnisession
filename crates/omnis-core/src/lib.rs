@@ -46,7 +46,9 @@ const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
+/// Codex appends this display message after importing a thread.
+pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -795,6 +797,23 @@ pub fn session_search_title_is_authoritative(
 /// The reader records the sequence where its verified prefix ends.
 #[must_use]
 pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: bool) -> bool {
+    session_message_coverage(snapshot, full_read) != MessageCoverage::Unknown
+}
+
+/// Which visible messages the reader can verify from the source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageCoverage {
+    /// A gap may precede the first retained message.
+    Unknown,
+    /// The opening message is known, but later messages may be missing.
+    VerifiedPrefix,
+    /// The read accounts for every visible message.
+    Complete,
+}
+
+/// Determines whether the source covers the opening message and the complete message count.
+#[must_use]
+pub fn session_message_coverage(snapshot: &CanonicalSnapshot, full_read: bool) -> MessageCoverage {
     let events = || snapshot.events.iter().filter(|event| !is_secret(event));
     let mut prefix_end = None::<u64>;
     let mut only_eof_markers = true;
@@ -807,7 +826,7 @@ pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: 
                 && event.payload["prefix_complete"].as_bool() == Some(true)
                 && omitted_history(event).is_none();
         } else if omitted_history(event) == Some(OmittedHistory::MayIncludeMessages) {
-            return false;
+            return MessageCoverage::Unknown;
         }
     }
     // Only the EOF marker can occupy the final sequence.
@@ -824,34 +843,41 @@ pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: 
     if reached_eof {
         prefix_end = None;
     } else if !full_read && prefix_end.is_none() {
-        return false;
+        return MessageCoverage::Unknown;
     }
     let first_checkpoint = events()
         .filter(|event| source_compaction_text(event).is_some())
         .map(|event| (event.sequence, event.event_id))
         .min();
     if prefix_end.is_none() && first_checkpoint.is_none() {
-        return true;
+        return MessageCoverage::Complete;
     }
-    events().any(|event| {
+    if events().any(|event| {
         prefix_end.is_none_or(|end| event.sequence < end)
             && first_checkpoint
                 .is_none_or(|checkpoint| (event.sequence, event.event_id) < checkpoint)
             && is_preview_message(event)
-    })
+    }) {
+        MessageCoverage::VerifiedPrefix
+    } else {
+        MessageCoverage::Unknown
+    }
 }
 
 fn codex_verified_prefix_end(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<u64> {
+    let record_type = event.source.raw_record_type.as_deref()?;
     if event.kind != EventKind::ProviderEvent
         || event.replay_policy != ReplayPolicy::HistoricalOnly
         || snapshot.session.provider != Provider::Codex
         || event.source.provider != Provider::Codex
         || event.source.native_session_id != snapshot.session.id
-        || reports_unverified_messages(event)
+        || reports_unsupported_text(event)
+        || (record_type != "omnisession.preview_limit"
+            && event.payload["native_history_unverified"].as_bool() == Some(true))
     {
         return None;
     }
-    match event.source.raw_record_type.as_deref()? {
+    match record_type {
         "omnisession.codex_preview_prefix"
         | "omnisession.preview_limit"
         | "omnisession.record_size_limit" => {}
@@ -947,7 +973,7 @@ fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
         _ => return None,
     };
     let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-    (!is_harness_envelope(&text)).then_some(HandoffMessage { role, text })
+    (!is_user_harness_envelope(event, &text)).then_some(HandoffMessage { role, text })
 }
 
 fn is_preview_message(event: &OmniEvent) -> bool {
@@ -963,8 +989,9 @@ fn is_preview_message(event: &OmniEvent) -> bool {
     else {
         return false;
     };
-    if preview_harness_envelope_prefix(text)
-        .is_some_and(|prefix| prefix.len() <= SESSION_PREVIEW_CHARACTER_LIMIT)
+    if event.kind == EventKind::MessageUser
+        && harness_envelope_prefix(text)
+            .is_some_and(|prefix| prefix.len() <= SESSION_PREVIEW_CHARACTER_LIMIT)
     {
         return false;
     }
@@ -1055,7 +1082,7 @@ pub fn first_user_message_after(
             return None;
         }
         let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-        if is_harness_envelope(&text) {
+        if is_user_harness_envelope(event, &text) {
             return None;
         }
         Some(HandoffMessage {
@@ -1131,8 +1158,11 @@ fn trajectory_search_document_with_limits(
     let mut source_byte_count = 0_usize;
     let mut included_events = 0_usize;
     let mut event_truncated = false;
-    let events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    let VisibleHistory {
+        events,
+        source_incomplete,
+        ..
+    } = visible_history(snapshot);
 
     for event in events {
         let Some(event_text) = search_event_text(event, event_edge_limit) else {
@@ -1196,7 +1226,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
             }
             let text =
                 text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
-            if is_harness_envelope(&text) {
+            if is_user_harness_envelope(event, &text) {
                 return None;
             }
             text
@@ -1371,19 +1401,15 @@ impl HeadTailText {
     }
 }
 
-/// Returns whether the text is a recognized harness instruction or transcript boundary.
+fn is_user_harness_envelope(event: &OmniEvent, text: &str) -> bool {
+    event.kind == EventKind::MessageUser && is_harness_envelope(text)
+}
+
+/// Returns whether a user message contains a recognized harness instruction or transcript boundary.
 #[must_use]
 pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
-    text.starts_with("# AGENTS.md instructions")
-        || text.starts_with("<environment_context>")
-        || text.starts_with("<permissions instructions>")
-        || text.starts_with("<collaboration_mode>")
-        || text.starts_with("<apps_instructions>")
-        || text.starts_with("<plugins_instructions>")
-        || text.starts_with("<skills_instructions>")
-        || text.starts_with("<recommended_plugins>")
-        || text == "<EXTERNAL SESSION IMPORTED>"
+    harness_envelope_prefix(text).is_some()
         || is_import_boundary(text)
         || matches!(
             text,
@@ -1391,7 +1417,7 @@ pub fn is_harness_envelope(text: &str) -> bool {
         )
 }
 
-fn preview_harness_envelope_prefix(text: &str) -> Option<&'static str> {
+fn harness_envelope_prefix(text: &str) -> Option<&'static str> {
     const PREFIXES: &[&str] = &[
         "# AGENTS.md instructions",
         "<environment_context>",
@@ -1660,7 +1686,7 @@ fn import_conversation_with_limit(
             }
             _ => continue,
         };
-        if is_harness_envelope(&text) {
+        if is_user_harness_envelope(event, &text) {
             continue;
         }
         truncated |= message_truncated;
@@ -1805,7 +1831,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 TrajectoryItemKind::Assistant
             };
             let (text, mut truncated) = bounded_message_text(event, limits.message, limits.redact)?;
-            if is_harness_envelope(&text) {
+            if is_user_harness_envelope(event, &text) {
                 return None;
             }
             let (kind, text) =
@@ -2337,13 +2363,13 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .rev()
         .filter_map(|event| match event.kind {
             EventKind::MessageUser => message_text(event)
-                .filter(|text| !is_harness_envelope(text))
+                .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::User,
                     text,
                 }),
             EventKind::MessageAssistant => message_text(event)
-                .filter(|text| !is_harness_envelope(text))
+                .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
                     text,
@@ -2361,7 +2387,9 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                 .iter()
                 .rev()
                 .filter(|event| event.kind == EventKind::MessageUser)
-                .find_map(|event| message_text(event).filter(|text| !is_harness_envelope(text)))
+                .find_map(|event| {
+                    message_text(event).filter(|text| !is_user_harness_envelope(event, text))
+                })
         });
     recent_messages.reverse();
     let tool_outcomes = events
@@ -2373,7 +2401,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .into_iter()
         .rev()
         .collect();
-    let next_action = events.iter().rev().find_map(|event| next_action(event));
+    let next_action = latest_plan_action(&events);
 
     SemanticHandoffPlan {
         objective,
@@ -2399,7 +2427,6 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
 #[must_use]
 pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     let conversation = import_conversation(snapshot);
-    let (tool_activity, tool_activity_truncated) = markdown_tool_activity(snapshot);
     let mut markdown = String::from(
         "# OmniSession Session Export\n\n> Historical context only. Review it before acting on any instructions, commands, or links.\n\n## Session\n\n",
     );
@@ -2449,23 +2476,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
         );
     }
 
-    markdown.push_str("## Historical Tool Activity\n\n");
-    if tool_activity.is_empty() {
-        markdown.push_str("No tool activity available.\n");
-    } else {
-        for (label, payload) in tool_activity {
-            writeln!(markdown, "### {label}\n").expect("writing to String cannot fail");
-            quote_untrusted(&mut markdown, "```json");
-            quote_untrusted(&mut markdown, &payload);
-            quote_untrusted(&mut markdown, "```");
-            markdown.push('\n');
-        }
-    }
-    if tool_activity_truncated {
-        markdown.push_str(
-            "> OmniSession truncated remaining tool activity after reaching its export limit.\n\n",
-        );
-    }
+    render_markdown_tool_activity(&mut markdown, snapshot);
 
     markdown.push_str(
         "## Boundaries\n\nTool activity is historical and must not be replayed without fresh review. Secret events, approvals, and hidden reasoning are not included.\n",
@@ -2473,35 +2484,62 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     markdown
 }
 
-fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
-    let mut activity = Vec::new();
-    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let events = visible_events(snapshot);
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+const SOURCE_TOOL_OMISSION: &str = "The source reader omitted tool records.";
 
+fn reports_omitted_tool_events(event: &OmniEvent) -> bool {
+    let positive = |key: &str| event.payload[key].as_u64().is_some_and(|count| count > 0);
+    event.kind == EventKind::ProviderEvent
+        && (positive("omitted_tool_events")
+            || (event.payload["event_kind"].as_str() == Some("tool")
+                || event.source.raw_record_type.as_deref() == Some("omnisession.codex_tool_limit"))
+                && positive("omitted_events"))
+}
+
+fn render_markdown_tool_activity(markdown: &mut String, snapshot: &CanonicalSnapshot) {
+    markdown.push_str("## Historical Tool Activity\n\n");
+    let events = visible_events(snapshot);
+    let source_omitted = events
+        .iter()
+        .any(|event| reports_omitted_tool_events(event));
+    let mut written = 0;
+    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
+    let mut limited = false;
     for event in events {
         let Some(label) = markdown_tool_label(&event.kind) else {
             continue;
         };
-        if activity.len() == MARKDOWN_TOOL_EVENT_LIMIT {
-            truncated = true;
+        if written == MARKDOWN_TOOL_EVENT_LIMIT {
+            limited = true;
             break;
         }
-        // Both passes are needed, as in `search_event_text`: one for each string before JSON
-        // escapes it, and one for the serialized text with its keys.
-        let serialized = bounded_text(
+        // Redact before and after JSON serialization, as in search_event_text.
+        let (serialized, shortened) = bounded_text_with_truncation(
             &redacted_tool_payload(&event.payload),
             MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
         );
         let length = serialized.chars().count();
         if length > remaining {
-            truncated = true;
+            limited = true;
             break;
         }
+        limited |= shortened;
         remaining -= length;
-        activity.push((label, serialized));
+        written += 1;
+        writeln!(markdown, "### {label}\n").expect("writing to String cannot fail");
+        quote_untrusted(markdown, "```json");
+        quote_untrusted(markdown, &serialized);
+        quote_untrusted(markdown, "```");
+        markdown.push('\n');
     }
-    (activity, truncated)
+    if written == 0 {
+        markdown.push_str("No tool activity available.\n");
+    }
+    if source_omitted {
+        writeln!(markdown, "> {SOURCE_TOOL_OMISSION}\n").expect("writing to String cannot fail");
+    }
+    if limited {
+        markdown.push_str("> OmniSession shortened or omitted tool activity to fit the Markdown export limits.\n\n");
+    }
 }
 
 fn markdown_tool_label(kind: &EventKind) -> Option<&'static str> {
@@ -2654,22 +2692,124 @@ pub fn safe_terminal_line(input: &str) -> String {
         .collect()
 }
 
+struct VisibleHistory<'a> {
+    events: Vec<&'a OmniEvent>,
+    source_incomplete: bool,
+    unattributed_codex_displays: Vec<u64>,
+}
+
 fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
+    visible_history(snapshot).events
+}
+
+fn visible_history(snapshot: &CanonicalSnapshot) -> VisibleHistory<'_> {
     let mut events = snapshot
         .events
         .iter()
         .filter(|event| !is_secret(event))
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.sequence, event.event_id));
-    events
+    let unattributed_codex_displays = if snapshot.session.provider == Provider::Codex {
+        remove_legacy_codex_displays(&mut events, &snapshot.session.id)
+    } else {
+        Vec::new()
+    };
+    let source_incomplete = !unattributed_codex_displays.is_empty()
+        || events.iter().any(|event| reports_omitted_events(event));
+    VisibleHistory {
+        events,
+        source_incomplete,
+        unattributed_codex_displays,
+    }
+}
+
+fn codex_display_marker(event: &OmniEvent) -> bool {
+    event.kind == EventKind::MessageAssistant
+        && event.payload["text"].as_str() == Some(CODEX_IMPORT_MARKER)
+}
+
+/// Removes the provider's notification or returns the sequence numbers of unresolved display records.
+fn remove_legacy_codex_displays(events: &mut Vec<&OmniEvent>, session_id: &str) -> Vec<u64> {
+    if events
+        .first()
+        .is_none_or(|event| event.kind != EventKind::MessageUser)
+    {
+        return Vec::new();
+    }
+    // The old reader kept each imported message's display event and dropped its response
+    // item. A native response item or tool record ends this possible import prefix.
+    let prefix_len = events
+        .iter()
+        .take_while(|event| {
+            matches!(
+                event.kind,
+                EventKind::MessageUser | EventKind::MessageAssistant
+            ) && event.source.provider == Provider::Codex
+                && event.source.native_session_id == session_id
+                && event.source.raw_record_type.as_deref() == Some("event_msg")
+                && event.replay_policy == ReplayPolicy::Contextual
+        })
+        .count();
+    let prefix = &events[..prefix_len];
+    if !prefix.iter().any(|event| codex_display_marker(event)) {
+        return Vec::new();
+    }
+    if let Some(usage) = events.get(prefix_len)
+        && usage.kind == EventKind::ProviderEvent
+        && usage.source.provider == Provider::Codex
+        && usage.source.native_session_id == session_id
+        && usage.source.raw_record_type.as_deref() == Some("omnisession.session_metadata")
+        && usage.replay_policy == ReplayPolicy::HistoricalOnly
+    {
+        // Since v0.8.35 the reader retains Codex's cumulative usage after its single
+        // import notification. The importer counts tokens only after an assistant reply.
+        if usage.payload["model"].is_string()
+            || usage.payload["reasoning_mode"].is_string()
+            || usage.payload["token_usage"].as_str() == Some("incremental")
+        {
+            return Vec::new();
+        }
+        if usage.payload["token_usage"].as_str() == Some("cumulative")
+            && let Some(total) = usage.payload["total_tokens"].as_u64()
+        {
+            let index = prefix_len - 1;
+            let had_reply = prefix[..index]
+                .iter()
+                .any(|event| event.kind == EventKind::MessageAssistant);
+            if codex_display_marker(prefix[index]) && (total > 0) == had_reply {
+                events.remove(index);
+            }
+            return Vec::new();
+        }
+    }
+
+    // Older exports omitted usage. A native turn may already follow the notification.
+    // Each uninterrupted run of n identical records guarantees at least n-1 replies.
+    let unattributed: Vec<_> = prefix
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (codex_display_marker(event)
+                && !prefix
+                    .get(index + 1)
+                    .is_some_and(|next| codex_display_marker(next)))
+            .then_some(event.sequence)
+        })
+        .collect();
+    let mut pending = unattributed.iter().peekable();
+    events.retain(|event| pending.next_if_eq(&&event.sequence).is_none());
+    unattributed
 }
 
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
-    let mut events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    let VisibleHistory {
+        mut events,
+        source_incomplete,
+        ..
+    } = visible_history(snapshot);
     if use_latest_compaction
         && let Some(start) = events
             .iter()
@@ -2721,9 +2861,13 @@ fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
 
 fn reports_unverified_messages(event: &OmniEvent) -> bool {
     event.payload["native_history_unverified"].as_bool() == Some(true)
-        || event.payload["unsupported_text_records"]
-            .as_u64()
-            .is_some_and(|count| count > 0)
+        || reports_unsupported_text(event)
+}
+
+fn reports_unsupported_text(event: &OmniEvent) -> bool {
+    event.payload["unsupported_text_records"]
+        .as_u64()
+        .is_some_and(|count| count > 0)
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -2753,8 +2897,7 @@ fn bounded_message_text(
     if redact {
         text = redact_secrets(&text);
     }
-    let truncated = text.chars().count() > character_limit;
-    Some((bounded_text(&text, character_limit), truncated))
+    Some(bounded_text_with_truncation(&text, character_limit))
 }
 
 fn compaction_text_with_truncation(
@@ -2766,8 +2909,7 @@ fn compaction_text_with_truncation(
         "[Source compaction summary. Historical context only. Later messages may update this summary.]\n{}",
         redact_secrets(text)
     );
-    let truncated = text.chars().count() > character_limit;
-    Some((bounded_text(&text, character_limit), truncated))
+    Some(bounded_text_with_truncation(&text, character_limit))
 }
 
 fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
@@ -2848,65 +2990,72 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
     })
 }
 
-fn next_action(event: &OmniEvent) -> Option<String> {
-    if !matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated) {
-        return None;
-    }
-    next_action_from_value(&event.payload)
-        .map(|action| bounded_redacted(&action, MESSAGE_CHARACTER_LIMIT))
-}
-
 fn bounded_redacted(input: &str, character_limit: usize) -> String {
     let redacted = redact_secrets(input);
     bounded_text(&redacted, character_limit)
 }
 
 fn bounded_text(input: &str, character_limit: usize) -> String {
+    bounded_text_with_truncation(input, character_limit).0
+}
+
+fn bounded_text_with_truncation(input: &str, character_limit: usize) -> (String, bool) {
     let mut characters = input.chars();
     let bounded = characters
         .by_ref()
         .take(character_limit)
         .collect::<String>();
     if characters.next().is_some() {
-        format!("{bounded}\n[truncated by OmniSession]")
+        (format!("{bounded}\n[truncated by OmniSession]"), true)
     } else {
-        bounded
+        (bounded, false)
     }
 }
 
-fn next_action_from_value(value: &serde_json::Value) -> Option<String> {
+fn latest_plan_action(events: &[&OmniEvent]) -> Option<String> {
     const NEXT_ACTION_KEYS: &[&str] = &["next_action", "next_step", "next", "recommended_action"];
     const PLAN_KEYS: &[&str] = &["plan", "items", "todos", "steps"];
 
-    let object = value.as_object()?;
-    for key in NEXT_ACTION_KEYS {
-        if let Some(text) = object.get(*key).and_then(text_from_value) {
-            return Some(text);
+    for event in events
+        .iter()
+        .rev()
+        .filter(|event| matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated))
+    {
+        let mut actions = NEXT_ACTION_KEYS
+            .iter()
+            .filter_map(|key| event.payload.get(*key));
+        if let Some(action) = actions.clone().find_map(text_from_value_ref) {
+            return (!action.trim().is_empty())
+                .then(|| bounded_redacted(action, MESSAGE_CHARACTER_LIMIT));
         }
-    }
-    for key in PLAN_KEYS {
-        let Some(items) = object.get(*key).and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for item in items {
-            let Some(item) = item.as_object() else {
-                continue;
-            };
-            let completed = item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| matches!(status, "completed" | "done"));
-            if completed {
-                continue;
-            }
-            for key in ["step", "task", "text", "title", "content"] {
-                if let Some(text) = item.get(key).and_then(text_from_value) {
-                    return Some(text);
-                }
-            }
+        let mut lists = PLAN_KEYS
+            .iter()
+            .filter_map(|key| event.payload.get(*key)?.as_array())
+            .peekable();
+        if lists.peek().is_some() {
+            // An empty or completed list supersedes every earlier snapshot.
+            return lists
+                .flatten()
+                .find_map(pending_plan_item)
+                .map(|action| bounded_redacted(action, MESSAGE_CHARACTER_LIMIT));
+        }
+        if actions.any(serde_json::Value::is_null) {
+            return None;
         }
     }
     None
+}
+
+fn pending_plan_item(item: &serde_json::Value) -> Option<&str> {
+    if matches!(
+        item.get("status").and_then(serde_json::Value::as_str),
+        Some("completed" | "done")
+    ) {
+        return None;
+    }
+    ["step", "task", "text", "title", "content"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(text_from_value_ref))
 }
 
 fn text_from_payload(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -3640,6 +3789,10 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
         (
             "omnisession.codex_compacted",
             "This transfer could not reconstruct a Codex compaction checkpoint.",
+        ),
+        (
+            "omnisession.codex_malformed_records",
+            "Some Codex rollout records contained invalid JSON and could not be read.",
         ),
     ]
     .into_iter()
@@ -4805,7 +4958,7 @@ mod tests {
 
         let preview = session_preview(&snapshot);
 
-        assert_eq!(preview.message_count, 9);
+        assert_eq!(preview.message_count, 10);
         assert_eq!(preview.message_count, expected.len());
         assert_eq!(preview.first, expected.first().cloned());
         assert_eq!(preview.latest, expected.last().cloned());
@@ -5071,6 +5224,10 @@ mod tests {
             notice,
         ]);
         assert!(session_search_title(&snapshot).is_none());
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            super::MessageCoverage::Complete
+        );
         assert!(super::session_search_title_is_authoritative(
             &snapshot, true
         ));
@@ -5139,6 +5296,11 @@ mod tests {
                 json!({"omitted_events": 1, "prefix_end_sequence": 3}),
             ),
             (
+                false,
+                "omnisession.preview_limit",
+                json!({"native_history_unverified": true, "prefix_end_sequence": 3}),
+            ),
+            (
                 true,
                 "omnisession.record_size_limit",
                 json!({"omitted_events": 1, "prefix_end_sequence": 3}),
@@ -5157,8 +5319,9 @@ mod tests {
                 snapshot.events.len()
                     - usize::from(record_type == "omnisession.codex_preview_prefix")
             );
-            assert!(
-                super::session_message_prefix_is_known(&snapshot, full_read),
+            assert_eq!(
+                super::session_message_coverage(&snapshot, full_read),
+                super::MessageCoverage::VerifiedPrefix,
                 "{record_type}"
             );
             snapshot.events.push(event(
@@ -5170,7 +5333,14 @@ mod tests {
                 &snapshot, full_read
             ));
             snapshot.events.pop();
-            snapshot.events.last_mut().unwrap().payload["prefix_end_sequence"] = 2.into();
+            let notice = snapshot.events.last_mut().unwrap();
+            notice.payload["unsupported_text_records"] = 1.into();
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            let notice = snapshot.events.last_mut().unwrap();
+            notice.payload["unsupported_text_records"] = 0.into();
+            notice.payload["prefix_end_sequence"] = 2.into();
             assert!(!super::session_message_prefix_is_known(
                 &snapshot, full_read
             ));
@@ -5218,7 +5388,10 @@ mod tests {
             notice,
         ]);
         assert!(session_search_title(&snapshot).is_none());
-        assert!(super::session_message_prefix_is_known(&snapshot, false));
+        assert_eq!(
+            super::session_message_coverage(&snapshot, false),
+            super::MessageCoverage::Complete
+        );
 
         let mut positioned_gap = event(
             1,
@@ -5374,6 +5547,8 @@ mod tests {
         assert!(!markdown.contains("opaque-secret-value"));
         assert!(markdown.contains("[REDACTED: SENSITIVE_FIELD]"));
         assert!(markdown.contains("[truncated by OmniSession]"));
+        assert!(markdown.contains("tool activity to fit the Markdown export limits"));
+        assert!(!markdown.contains("source reader omitted tool records"));
         assert!(markdown.contains("Tool activity is historical"));
     }
 
@@ -5420,7 +5595,168 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codex_marker_uses_the_import_boundary() {
+        let literal = super::CODEX_IMPORT_MARKER;
+        let display = |kind, text: &str| {
+            let mut item = event(0, kind, json!({"text": text}));
+            item.source.raw_record_type = Some("event_msg".to_owned());
+            item
+        };
+        let user = display(EventKind::MessageUser, "Question");
+        let marker = display(EventKind::MessageAssistant, literal);
+        let reply = display(EventKind::MessageAssistant, "Four.");
+        let mut native_reply = display(EventKind::MessageAssistant, "Later reply");
+        native_reply.source.raw_record_type = Some("response_item.message".to_owned());
+        let mut native_literal = marker.clone();
+        native_literal.source.raw_record_type = Some("response_item.message".to_owned());
+        let usage = |total| {
+            let mut item = event(
+                0,
+                EventKind::ProviderEvent,
+                json!({"token_usage":"cumulative", "total_tokens":total}),
+            );
+            item.source.raw_record_type = Some("omnisession.session_metadata".to_owned());
+            item
+        };
+        let mut native_usage = usage(321);
+        native_usage.payload["model"] = json!("recorded-model");
+        let omission = event(0, EventKind::ProviderEvent, json!({"omitted_events":1}));
+        for (events, expected, incomplete) in [
+            // The only notification follows the final imported reply, across user turns.
+            (
+                vec![&user, &marker, &user, &reply, &marker, &usage(23)],
+                vec![literal, "Four."],
+                false,
+            ),
+            (
+                vec![&user, &marker, &marker, &usage(9)],
+                vec![literal],
+                false,
+            ),
+            // A resumed native reply can also be followed by cumulative usage.
+            (
+                vec![
+                    &user,
+                    &reply,
+                    &marker,
+                    &usage(4),
+                    &user,
+                    &marker,
+                    &usage(321),
+                ],
+                vec!["Four.", literal],
+                false,
+            ),
+            // An import containing only a user message reports zero tokens.
+            (vec![&user, &marker, &usage(0)], vec![], false),
+            (vec![&user, &marker, &usage(100)], vec![literal], false),
+            (
+                vec![&user, &reply, &marker, &usage(0)],
+                vec!["Four.", literal],
+                false,
+            ),
+            (
+                vec![&user, &reply, &marker, &native_usage],
+                vec!["Four.", literal],
+                false,
+            ),
+            // Older exports omitted usage, including from sessions that later resumed.
+            (
+                vec![&user, &reply, &marker, &user, &native_reply],
+                vec!["Four.", "Later reply"],
+                true,
+            ),
+            (
+                vec![
+                    &user,
+                    &reply,
+                    &marker,
+                    &user,
+                    &native_literal,
+                    &user,
+                    &marker,
+                ],
+                vec!["Four.", literal, literal],
+                true,
+            ),
+            (
+                vec![&user, &marker, &user, &reply, &marker],
+                vec!["Four."],
+                true,
+            ),
+            (vec![&user, &marker, &marker], vec![literal], true),
+            (
+                vec![&user, &reply, &marker, &usage(4), &omission],
+                vec!["Four."],
+                true,
+            ),
+        ] {
+            assert_legacy_codex_projection(events, &expected, incomplete);
+        }
+    }
+
+    fn assert_legacy_codex_projection(
+        events: Vec<&OmniEvent>,
+        expected: &[&str],
+        incomplete: bool,
+    ) {
+        let literal = super::CODEX_IMPORT_MARKER;
+        let user_count = events
+            .iter()
+            .filter(|event| event.kind == EventKind::MessageUser)
+            .count();
+        let events = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let mut item = event.clone();
+                item.sequence = index as u64;
+                item
+            })
+            .collect();
+        let snapshot = snapshot_with_events(events);
+        let conversation = import_conversation(&snapshot);
+        let assistants = conversation
+            .messages
+            .iter()
+            .filter(|message| message.role == HandoffRole::Assistant)
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(assistants, expected);
+        assert_eq!(conversation.truncated, incomplete);
+        let markdown = render_markdown_export(&snapshot);
+        let (_, tool_section) = markdown.split_once("## Historical Tool Activity").unwrap();
+        assert_eq!(
+            tool_section.split_once("## Boundaries").unwrap().0.trim(),
+            "No tool activity available."
+        );
+        assert_eq!(
+            markdown.contains("retained recent context after source omissions"),
+            incomplete
+        );
+        assert_eq!(import_trajectory(&snapshot).truncated, incomplete);
+        assert_eq!(
+            session_preview(&snapshot).message_count,
+            user_count + expected.len()
+        );
+        let document = trajectory_search_document(&snapshot);
+        let literals = expected.iter().filter(|text| **text == literal).count();
+        assert_eq!(document.source_complete, !incomplete);
+        assert_eq!(document.text.matches(literal).count(), literals);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert_eq!(
+            recovery.contains("missing or unverified history"),
+            incomplete
+        );
+        let conversation = recovery.split_once("## Available conversation").unwrap().1;
+        assert_eq!(conversation.matches(literal).count(), literals);
+    }
+
+    #[test]
     fn imports_exclude_harness_envelopes_without_stripping_message_markup() {
+        let guide = "# AGENTS.md instructions for demo\n\nUse <result>preserved</result>";
         let snapshot = snapshot_with_events(vec![
             event(
                 0,
@@ -5437,11 +5773,7 @@ mod tests {
                 EventKind::MessageUser,
                 json!({"text": "Explain <widget>markup</widget>"}),
             ),
-            event(
-                3,
-                EventKind::MessageAssistant,
-                json!({"text": "Use <result>preserved</result>"}),
-            ),
+            event(3, EventKind::MessageAssistant, json!({"text": guide})),
         ]);
 
         let conversation = import_conversation(&snapshot);
@@ -5452,13 +5784,25 @@ mod tests {
             conversation.messages[0].text,
             "Explain <widget>markup</widget>"
         );
-        assert_eq!(
-            conversation.messages[1].text,
-            "Use <result>preserved</result>"
-        );
+        assert_eq!(conversation.messages[1].text, guide);
         assert_eq!(trajectory.items.len(), 2);
         assert_eq!(trajectory.items[0].text, conversation.messages[0].text);
         assert_eq!(trajectory.items[1].text, conversation.messages[1].text);
+        assert_eq!(
+            readback_trajectory(&snapshot).unwrap().items,
+            trajectory.items
+        );
+        assert_eq!(session_preview(&snapshot).latest.unwrap().text, guide);
+        assert!(trajectory_search_document(&snapshot).text.contains(guide));
+        assert_eq!(
+            super::plan_semantic_handoff(&snapshot).recent_messages,
+            conversation.messages
+        );
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("> # AGENTS.md instructions for demo"));
+        assert!(!recovery.contains("synthetic rules"));
     }
 
     #[test]
@@ -6323,10 +6667,9 @@ mod tests {
             search_document.truncation_strategy,
             SearchTruncationStrategy::SourceIncomplete
         );
-        assert!(
-            render_markdown_export(&snapshot)
-                .contains("truncated remaining tool activity after reaching its export limit")
-        );
+        let markdown = render_markdown_export(&snapshot);
+        assert!(markdown.contains("source reader omitted tool records"));
+        assert!(!markdown.contains("Markdown export limits"));
     }
 
     #[test]
@@ -6423,6 +6766,48 @@ mod tests {
         )]);
 
         assert!(render_semantic_handoff(&snapshot).contains("> Run focused checks."));
+    }
+
+    #[test]
+    fn handoffs_use_the_latest_recognized_plan() {
+        for (latest, expected) in [
+            (
+                json!({"plan": [{"status": "completed", "content": "Write the guide"}]}),
+                None,
+            ),
+            (json!({"todos": []}), None),
+            (json!({"next_action": null}), None),
+            (
+                json!({"items": [{"status": "pending", "task": "Publish the guide"}]}),
+                Some("Publish the guide"),
+            ),
+            (
+                json!({"unknown_field": "Future update"}),
+                Some("Write the guide"),
+            ),
+        ] {
+            let snapshot = snapshot_with_events(vec![
+                event(
+                    1,
+                    EventKind::PlanUpdated,
+                    json!({"next_step": "Write the guide"}),
+                ),
+                event(2, EventKind::TodoUpdated, latest),
+            ]);
+            assert_eq!(
+                super::plan_semantic_handoff(&snapshot)
+                    .next_action
+                    .as_deref(),
+                expected
+            );
+            let mut recovery = Vec::new();
+            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            let action = recovery
+                .split_once("## Last recorded plan item\n\n")
+                .and_then(|(_, body)| body.lines().next()?.strip_prefix("> "));
+            assert_eq!(action, expected);
+        }
     }
 
     fn git(repo: &Path, args: &[&str]) {

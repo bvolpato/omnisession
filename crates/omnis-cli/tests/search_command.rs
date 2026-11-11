@@ -98,6 +98,153 @@ fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
 }
 
 #[test]
+fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    for (from_creation, query) in [
+        (true, "plumworkspacereply"),
+        (false, "plumworkspacereply"),
+        (true, "saffroncreationbranch"),
+    ] {
+        let fixture = Fixture::new();
+        let moved = fixture.root.join("other-workspace");
+        let path = fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        fs::remove_file(&path).unwrap();
+        let mut writer = GzEncoder::new(
+            fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
+            Compression::fast(),
+        );
+        for record in [
+            json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}}),
+            json!({"type":"turn_context","payload":{"cwd":moved}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"plumworkspacereply"}]}}),
+        ] {
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.finish().unwrap();
+        let project = if from_creation {
+            &fixture.workspace
+        } else {
+            &moved
+        };
+        let search = |cwd: &Path, term: &str, extra: &[&str]| {
+            let output = fixture
+                .command()
+                .current_dir(cwd)
+                .args(["--json", "search", "--provider", "codex", term])
+                .args(extra)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+        assert!(
+            result_sessions(&search(project, "plumworkspacereply", &["--no-index"])).is_empty()
+        );
+        let live = search(project, query, &[]);
+        let session = format!("codex:{CODEX_ID}");
+        assert_eq!(
+            result_sessions(&live).contains(&session),
+            !from_creation,
+            "{live}"
+        );
+        if !from_creation {
+            assert_eq!(live["results"][0]["project_path"], moved.to_str().unwrap());
+        }
+        for (cwd, expected) in [(&fixture.workspace, false), (&moved, true)] {
+            let hits = search(
+                &fixture.workspace,
+                "plumworkspacereply",
+                &["--project", cwd.to_str().unwrap(), "--no-index"],
+            );
+            assert_eq!(
+                result_sessions(&hits).contains(&session),
+                expected,
+                "{hits}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scoped_search_can_recheck_a_stamped_full_document_beyond_the_cold_probe_limit() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let project = fixture.root.join("other-workspace");
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    let mut file = fs::File::options().append(true).open(path).unwrap();
+    let padding =
+        json!({"type":"event_msg","payload":{"type":"token_count","padding":"x".repeat(8192)}});
+    for _ in 0..600 {
+        writeln!(file, "{padding}").unwrap();
+    }
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":project}})
+    )
+    .unwrap();
+    drop(file);
+    let session = format!("codex:{CODEX_ID}");
+    assert!(
+        fixture
+            .command()
+            .args(["--json", "show", &session])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    for valid_stamp in [true, false] {
+        // Recreate the version-5 catalog that preceded the verified-workspace table.
+        assert_eq!(
+            db.execute(
+                "UPDATE session_trajectories SET document_version=5 WHERE provider='codex' AND session_id=?1 AND source_complete=1",
+                [CODEX_ID],
+            ).unwrap(),
+            1
+        );
+        db.execute("DROP TABLE codex_indexed_workspaces", [])
+            .unwrap();
+        if !valid_stamp {
+            db.execute("UPDATE session_index SET source_contents_id=randomblob(16) WHERE provider='codex' AND session_id=?1",[CODEX_ID]).unwrap();
+        }
+        let hits = fixture.search_json(&[
+            "Pagination",
+            "--provider",
+            "codex",
+            "--project",
+            project.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            result_sessions(&hits).contains(&session),
+            valid_stamp,
+            "{hits}"
+        );
+        if !valid_stamp {
+            assert!(
+                hits["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().contains("could not check"))
+            );
+        }
+    }
+}
+
+#[test]
 fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
@@ -301,6 +448,92 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
         }
         assert!(result_sessions(&search("backoff", true)).is_empty());
         assert!(search(CODEX_ID, true)["results"][0]["title"].is_null());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+}
+
+#[test]
+fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let initial_title = "Tune the rate limiter backoff";
+    for (gzip, repeated_later) in [(false, false), (true, false), (false, true)] {
+        let fixture = Fixture::new();
+        fixture.add_missing_ancestor();
+        let plain = fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        let mut source = fs::read(&plain).unwrap();
+        let pad = format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}\n",
+            " ".repeat(1024 * 1024)
+        );
+        for _ in 0..16 {
+            source.extend_from_slice(pad.as_bytes());
+        }
+        fs::remove_file(&plain).unwrap();
+        let path = if gzip {
+            plain.with_extension("jsonl.gz")
+        } else {
+            plain
+        };
+        let append = |bytes: &[u8]| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            if gzip {
+                let mut encoder = GzEncoder::new(file, Compression::fast());
+                encoder.write_all(bytes).unwrap();
+                encoder.finish().unwrap();
+            } else {
+                file.write_all(bytes).unwrap();
+            }
+        };
+        append(&source);
+        let search = |query: &str| {
+            fixture.search_json(&["--provider", "codex", "--show-text", "--cached", query])
+        };
+        fixture.index_codex();
+        assert!(search(CODEX_ID)["results"][0]["title"].is_null());
+        // Older indexers used the first local turn as a title when the parent was missing.
+        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE session_trajectories SET derived_title = ?1
+                 WHERE provider = 'codex' AND session_id = ?2
+                   AND derived_title IS NULL AND NOT derived_title_is_verified",
+                [initial_title, CODEX_ID],
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
+        assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
+
+        append(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n");
+        if repeated_later {
+            let new_opener = format!("New opener {}", "x".repeat(5 * 1024 * 1024));
+            for text in [new_opener.as_str(), initial_title] {
+                let row = json!({"type":"response_item","payload":{"type":"message","role":"user",
+                    "content":[{"type":"input_text","text":text}]}});
+                append(format!("{row}\n").as_bytes());
+            }
+        }
+        let original = fs::read(&path).unwrap();
+        let live = fixture.search_json(&["--provider", "codex", "--show-text", "backoff"]);
+        for results in [live, search("backoff")] {
+            if repeated_later {
+                assert_eq!(results["results"][0]["match"], "conversation");
+                assert_eq!(results["results"][0]["coverage"], "preview");
+            } else {
+                assert!(result_sessions(&results).is_empty());
+            }
+        }
+        assert!(search(CODEX_ID)["results"][0]["title"].is_null());
+        assert_eq!(fixture.index_codex()["indexed"], 0);
         assert_eq!(fs::read(path).unwrap(), original);
     }
 }
@@ -818,6 +1051,67 @@ fn no_index_searches_only_what_is_already_indexed() {
         .output()
         .expect("run blank search");
     assert!(!rejected.status.success());
+}
+
+#[test]
+fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
+    use std::io::{BufWriter, Write};
+
+    let fixture = Fixture::new();
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    let header = json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace}});
+    let padding = json!({"type":"event_msg","payload":{"type":"token_count","info":null,"padding":"x".repeat(8192)}}).to_string();
+    let write = |middle| {
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "{header}").unwrap();
+        for marker in [middle, "Visible tail"] {
+            for _ in 0..1152 {
+                writeln!(writer, "{padding}").unwrap();
+            }
+            let row = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":marker}]}});
+            writeln!(writer, "{row}").unwrap();
+        }
+        writer.flush().unwrap();
+    };
+    write("Bronzekestrel");
+    let modified = path.metadata().unwrap().modified().unwrap();
+    let shown = fixture
+        .command()
+        .args(["show", &format!("codex:{CODEX_ID}")])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    fixture.index_codex();
+    let store_path = fixture.root.join("state/store.sqlite3");
+    let db = rusqlite::Connection::open(store_path).unwrap();
+    let hit = |word| {
+        !result_sessions(&fixture.search_json(&[word, "--cached", "--provider", "codex"]))
+            .is_empty()
+    };
+    for substituted in [false, true] {
+        db.execute(
+            "UPDATE session_trajectories SET document_version=4, source_file_id=NULL, source_contents_id=NULL WHERE session_id=?1",
+            [CODEX_ID],
+        ).unwrap();
+        if substituted {
+            write("Topazjackdaw");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        assert_eq!(fixture.index_codex()["indexed"], 1);
+        assert_eq!(hit("Bronzekestrel"), !substituted);
+        assert!(!hit("Topazjackdaw"));
+        assert!(hit("Visible"));
+        assert_eq!(fixture.index_codex()["stale"], 0);
+    }
 }
 
 fn result_sessions(value: &Value) -> Vec<String> {

@@ -127,7 +127,7 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         .expect("Codex read");
     assert_eq!(snapshot.workspace.current_dir, Path::new("/workspace/new"));
     assert_eq!(snapshot.events.len(), 6);
-    let omission = snapshot.events.last().expect("malformed record notice");
+    let omission = snapshot.events.last().expect("malformed row notice");
     assert_eq!(
         omission.source.raw_record_type.as_deref(),
         Some("omnisession.codex_malformed_records")

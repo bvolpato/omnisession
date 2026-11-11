@@ -63,6 +63,30 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn external_import_marker_keeps_the_authored_reply() {
+    let marker = omnis_core::CODEX_IMPORT_MARKER;
+    let quoted = format!(" {marker} ");
+    let snapshot = read_records(vec![
+        message("user", "Repeat the import marker"),
+        event("agent_message", json!({"message": marker})),
+        message("assistant", marker),
+        event("agent_message", json!({"message": marker})),
+        event("agent_message", json!({"message": quoted})),
+        message("assistant", &quoted),
+    ])
+    .unwrap();
+
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert_eq!(conversation.messages.len(), 3);
+    assert_eq!(
+        conversation.messages[1].role,
+        omnis_core::HandoffRole::Assistant
+    );
+    assert_eq!(conversation.messages[1].text, marker);
+    assert_eq!(conversation.messages[2].text, quoted);
+}
+
+#[test]
 fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");
@@ -310,6 +334,10 @@ fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> any
             false,
         ),
         (vec![saved(), rolled_back(0)], false),
+        (
+            vec![saved(), rolled_back(1), message("user", "Saved title")],
+            false,
+        ),
         (
             vec![
                 saved(),
@@ -637,6 +665,29 @@ fn codex_prefix_ends_at_the_first_skipped_source_record() {
 }
 
 #[test]
+fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_middle() {
+    let padding = event("token_count", json!({"padding":"x".repeat(64 * 1024)})).to_string();
+    for known_opener in [true, false] {
+        let mut records = Vec::new();
+        if known_opener {
+            records.push(message("user", "recorded opening").to_string());
+        }
+        records.extend(std::iter::repeat_n("{}".to_owned(), 1_024));
+        records.push(message("user", "request in unread middle").to_string());
+        records.extend(std::iter::repeat_n(padding.clone(), 80));
+        records.push(message("user", "later request").to_string());
+        let preview = read_records_with_preview(records, true).unwrap();
+        assert!(!visible_text(&preview).contains(&"request in unread middle"));
+        assert_eq!(
+            omnis_core::session_message_prefix_is_known(&preview, false),
+            known_opener
+        );
+        assert!(!omnis_core::trajectory_search_document(&preview).source_complete);
+        assert!(omnis_core::import_conversation(&preview).truncated);
+    }
+}
+
+#[test]
 fn codex_preview_certifies_absence_only_after_reading_through_eof() {
     let metadata = event("token_count", json!({"padding": "x".repeat(4_500)})).to_string();
     for trailing_oversized in [false, true] {
@@ -741,6 +792,93 @@ fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
         writer.finish().unwrap()
     } else {
         zstd::stream::encode_all(contents, 1).unwrap()
+    }
+}
+
+#[test]
+fn codex_reports_malformed_rows_without_losing_readable_history() {
+    for extension in ["jsonl", "jsonl.zst", "jsonl.gz"] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(format!("rollout-{SESSION_ID}.{extension}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/fixture"}});
+        for (damaged, opener_before_gap) in [(false, true), (true, true), (true, false)] {
+            let unreadable = if damaged {
+                "{invalid private fragment}\n"
+            } else {
+                ""
+            };
+            let ending = if damaged {
+                "{\"type\":\"response_item\""
+            } else {
+                ""
+            };
+            let contents = format!(
+                "{header}\n{}{}\n \t\r\n{}{}\n{ending}",
+                if opener_before_gap { "" } else { unreadable },
+                message("user", "opening"),
+                if opener_before_gap { unreadable } else { "" },
+                message("assistant", "readable reply")
+            );
+            let bytes = match extension {
+                "jsonl" => contents.into_bytes(),
+                extension => encode_rollout(
+                    contents.as_bytes(),
+                    extension.strip_prefix("jsonl.").unwrap(),
+                ),
+            };
+            fs::write(&path, &bytes).unwrap();
+            let adapter = CodexAdapter::with_root(home.path());
+            let full = adapter
+                .index_session(&session, Some(&path), u64::MAX)
+                .unwrap();
+            assert!(full.source_complete, "all physical bytes were inspected");
+            if damaged {
+                let notice = full
+                    .snapshot
+                    .events
+                    .iter()
+                    .find(|event| event.payload["malformed_records"] == 2)
+                    .unwrap();
+                assert_eq!(
+                    notice.payload["prefix_end_sequence"],
+                    u64::from(opener_before_gap)
+                );
+            }
+            for snapshot in [
+                full.snapshot,
+                adapter.read_session_at(&session, Some(&path)).unwrap(),
+                adapter.preview_session(&session).unwrap(),
+                adapter
+                    .index_session(&session, Some(&path), 1)
+                    .unwrap()
+                    .snapshot,
+            ] {
+                assert_eq!(visible_text(&snapshot), ["opening", "readable reply"]);
+                assert_eq!(
+                    omnis_core::session_message_prefix_is_known(&snapshot, true),
+                    opener_before_gap
+                );
+                let missing = snapshot
+                    .events
+                    .iter()
+                    .find_map(|event| event.payload["malformed_records"].as_u64());
+                assert_eq!(missing, damaged.then_some(2));
+                assert_eq!(
+                    omnis_core::trajectory_search_document(&snapshot).source_complete,
+                    !damaged
+                );
+                assert_eq!(omnis_core::import_trajectory(&snapshot).truncated, damaged);
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                let recovery = std::str::from_utf8(&recovery).unwrap();
+                assert_eq!(recovery.contains("contained invalid JSON"), damaged);
+                assert!(!recovery.contains("invalid private fragment"));
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 }
 

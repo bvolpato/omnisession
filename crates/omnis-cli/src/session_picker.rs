@@ -105,6 +105,7 @@ const PICKER_PROVIDERS: [Provider; 13] = [
 #[derive(Clone)]
 pub struct PickerSelection {
     pub session: SessionRef,
+    pub source_revision: Option<SourceRevision>,
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
     pub target: AgentTarget,
@@ -147,6 +148,13 @@ struct PickerEntry {
 }
 
 impl PickerEntry {
+    fn provider_name(&self) -> Option<&str> {
+        self.session
+            .title
+            .as_deref()
+            .filter(|_| self.has_provider_title)
+    }
+
     fn source_revision(&self) -> Option<SourceRevision> {
         if self.session.session.provider != Provider::Codex {
             return None;
@@ -191,6 +199,7 @@ struct PickerState {
     visible_cache: RefCell<Option<VisibleCache>>,
     indexed_titles: HashMap<String, (SourceRevision, String)>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
+    workspace_updates: HashMap<SourceRevision, omnis_store::CodexWorkspaceUpdate>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
@@ -271,6 +280,7 @@ impl PickerState {
             visible_cache: RefCell::new(None),
             indexed_titles: HashMap::new(),
             preview_titles: HashMap::new(),
+            workspace_updates: HashMap::new(),
             index_progress: None,
             index_deadline: None,
             current_git_branch: workspace_git_branch(current_project),
@@ -481,6 +491,7 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -495,6 +506,7 @@ impl PickerState {
         self.forget_replaced_sources(&entries);
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -521,6 +533,62 @@ impl PickerState {
                 self.indexed_titles.remove(&entry.key);
                 self.preview_titles.remove(&entry.key);
                 self.previews.remove_session(&entry.session.session);
+            }
+        }
+    }
+
+    fn reconcile_discovered_names(
+        &mut self,
+        entries: &mut [PickerEntry],
+        names: Option<&workers::CatalogNames>,
+    ) {
+        let prior: HashMap<_, _> = names
+            .into_iter()
+            .flat_map(|names| names.observed.iter())
+            .map(|row| (&row.session, row))
+            .collect();
+        for entry in entries {
+            let Some(revision) = entry
+                .source_revision()
+                .filter(|revision| revision.contents.is_some())
+            else {
+                continue;
+            };
+            let observed = prior.get(&entry.session.session).filter(|row| {
+                row.source_revision
+                    .is_some_and(|source| source.matches_file_contents(revision))
+            });
+            let current = self
+                .entry_positions
+                .get(&entry.key)
+                .map(|&i| &self.entries[i])
+                .filter(|old| old.source_revision() == Some(revision));
+            let old_name = current.map_or_else(
+                || observed.and_then(|row| row.title.as_deref()),
+                PickerEntry::provider_name,
+            );
+            let observed_name = observed.and_then(|row| row.title.as_deref());
+            if (entry.provider_name().is_none() && names.is_none_or(|names| !names.complete))
+                || (current.is_some()
+                    && old_name != observed_name
+                    && entry.provider_name() != old_name)
+            {
+                entry.has_provider_title = old_name.is_some();
+                entry.session.title = old_name.map(str::to_owned);
+                entry.fields = SearchFields::new(&entry.session, None);
+            }
+            if old_name != entry.provider_name()
+                && old_name.is_some_and(|old_name| {
+                    self.indexed_titles
+                        .get(&entry.key)
+                        .is_some_and(|(source, title)| {
+                            *source == revision
+                                && omnis_core::compact_search_title(old_name).as_ref()
+                                    == Some(title)
+                        })
+                })
+            {
+                self.indexed_titles.remove(&entry.key);
             }
         }
     }
@@ -699,6 +767,69 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
+    fn remember_codex_workspaces(
+        &mut self,
+        updates: impl IntoIterator<Item = (SessionRef, omnis_store::CodexWorkspaceUpdate)>,
+    ) {
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let mut rows = Vec::new();
+        for (session, update) in updates {
+            let revision = match &update {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace.source_revision,
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(revision) => *revision,
+            };
+            self.workspace_updates
+                .insert(preview_revision(revision), update);
+            if let Some(index) = self.entry_positions.get(&session.to_string()) {
+                rows.push(*index);
+            }
+        }
+        if self.apply_verified_workspaces(rows) {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.query_changed();
+            self.restore_selection(selected);
+        }
+    }
+
+    fn apply_verified_workspaces(&mut self, rows: impl IntoIterator<Item = usize>) -> bool {
+        if self.workspace_updates.is_empty() {
+            return false;
+        }
+        let mut matcher = WorkspaceMatcher::new(&self.current_project);
+        let mut changed = false;
+        for index in rows {
+            let entry = &mut self.entries[index];
+            let Some(revision) = entry.source_revision() else {
+                continue;
+            };
+            let Some(workspace) = self.workspace_updates.get(&revision) else {
+                continue;
+            };
+            let corrected = match workspace {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => {
+                    entry.session.apply_codex_workspace(workspace)
+                }
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => {
+                    let had_scope =
+                        entry.session.project_path.is_some() || entry.session.git_branch.is_some();
+                    entry.session.project_path = None;
+                    entry.session.git_branch = None;
+                    had_scope
+                }
+            };
+            if corrected {
+                entry.current_workspace = entry
+                    .session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(path));
+                self.refresh_entry_title(index);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn remember_preview_title(
         &mut self,
         key: &mut PreviewKey,
@@ -753,6 +884,31 @@ impl PickerState {
             self.restore_selection(selected);
         }
         true
+    }
+
+    fn accepts_provider_name(&self, key: &PreviewKey, change: &ProviderNameChange) -> bool {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return false;
+        };
+        let entry = &self.entries[index];
+        let name = entry.provider_name().map(omnis_core::redact_secrets);
+        self.preview_key(entry) == *key && (name == change.previous || name == change.current)
+    }
+
+    fn remember_provider_name(&mut self, key: &PreviewKey, change: ProviderNameChange) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        if self.entries[index].provider_name() == change.current.as_deref() {
+            return;
+        }
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let entry = &mut self.entries[index];
+        entry.has_provider_title = change.current.is_some();
+        entry.session.title = change.current;
+        self.refresh_entry_title(index);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected);
     }
 
     fn remember_source_titles(&mut self, titles: impl IntoIterator<Item = IndexedTrajectoryTitle>) {
@@ -1034,11 +1190,12 @@ impl PickerState {
             .iter()
             .filter(|key| !self.previews.contains(key))
             .filter_map(|key| {
-                let index = self.entry_positions.get(&key.session.to_string())?;
+                let entry = &self.entries[*self.entry_positions.get(&key.session.to_string())?];
                 Some(PreviewRequest {
                     key: key.clone(),
-                    source_path: self.entries[*index].session.source_path.clone(),
-                    cached: self.entries[*index].cached,
+                    source_path: entry.session.source_path.clone(),
+                    cached: entry.cached,
+                    provider_name: entry.provider_name().map(omnis_core::redact_secrets),
                 })
             })
             .collect::<Vec<_>>();
@@ -1079,6 +1236,12 @@ struct PreviewRequest {
     key: PreviewKey,
     source_path: Option<PathBuf>,
     cached: bool,
+    provider_name: Option<String>,
+}
+
+struct ProviderNameChange {
+    previous: Option<String>,
+    current: Option<String>,
 }
 
 enum PreviewValue {
@@ -1087,6 +1250,7 @@ enum PreviewValue {
         continuation: Option<HandoffMessage>,
         complete: bool,
         can_use_first_title: bool,
+        message_count_is_complete: bool,
     },
     Unavailable,
 }
@@ -1708,6 +1872,9 @@ fn select_picker_row(
             };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
+                    source_revision: entry
+                        .source_revision()
+                        .filter(|revision| revision.file.is_some() && revision.contents.is_some()),
                     session,
                     project_path,
                     across_projects: state.all_projects,
@@ -2920,6 +3087,12 @@ mod tests {
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 complete,
+                names: Some(std::sync::Arc::new(workers::CatalogNames {
+                    observed: store
+                        .indexed_sessions_for_provider(Provider::Codex)
+                        .unwrap(),
+                    complete: true,
+                })),
             }
             .persist(&store)
             .expect("persist picker discovery");
@@ -3549,6 +3722,7 @@ mod tests {
                 preview: Box::new(synthetic_preview("Start with cursor pagination.")),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
                 can_use_first_title: true,
             },
             &[],
@@ -3607,6 +3781,7 @@ mod tests {
             continuation: None,
             can_use_first_title: true,
             complete: false,
+            message_count_is_complete: false,
         };
         let mut previous = PreviewKey {
             source: Some(PreviewSource::Path(PathBuf::from(
@@ -3620,6 +3795,7 @@ mod tests {
             preview: Box::new(synthetic_preview("A later pagination request")),
             continuation: None,
             complete: false,
+            message_count_is_complete: false,
             can_use_first_title: false,
         };
         state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
@@ -3701,7 +3877,7 @@ mod tests {
             &worker,
             &request.key,
             request.source_path.as_deref(),
-            crate::search_index::FULL_READ_SOURCE_BYTES,
+            None,
             || {},
         )?;
         assert_eq!(
@@ -3717,24 +3893,13 @@ mod tests {
         drop(restored);
         let (refresh, notifications) = mpsc::sync_channel(1);
         assert!(
-            workers::read_picker_preview(
-                &worker,
-                &request.key,
-                Some(path),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || {}
-            )
-            .is_err()
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || {}).is_err()
         );
         assert!(notifications.try_recv().is_err());
         assert!(
-            workers::read_picker_preview(
-                &worker,
-                &request.key,
-                Some(path),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || refresh.try_send(()).unwrap()
-            )
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || refresh
+                .try_send(())
+                .unwrap())
             .is_err()
         );
         notifications.try_recv()?;
@@ -3770,26 +3935,152 @@ mod tests {
                 &registry,
                 &request(&home.path().join("old")),
                 None,
-                crate::search_index::FULL_READ_SOURCE_BYTES,
+                None,
                 || refresh.try_send(()).unwrap()
             )
             .is_err()
         );
         notifications.try_recv()?;
         assert!(
-            workers::read_picker_preview(
-                &registry,
-                &request(&current),
-                None,
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-                || refresh.try_send(()).unwrap()
-            )?
+            workers::read_picker_preview(&registry, &request(&current), None, None, || refresh
+                .try_send(())
+                .unwrap())?
             .source_revision
             .file
             .is_some()
         );
         assert!(notifications.try_recv().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_late_name_receipt_cannot_revert_the_current_provider_name() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Codex, "renamed", project, Some("Amber Heron"));
+        native.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native], project, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let name = |previous: &str, current: &str| ProviderNameChange {
+            previous: Some(previous.to_owned()),
+            current: Some(current.to_owned()),
+        };
+        let changed = name("Amber Heron", "Violet Quokka");
+        assert!(state.accepts_provider_name(&key, &changed));
+        state.remember_provider_name(&key, changed);
+        assert!(!state.accepts_provider_name(&key, &name("Amber Heron", "Amber Heron")));
+        state.query = "amberheron".to_owned();
+        assert!(state.visible_indices().is_empty());
+        state.query = "violetquokka".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn verified_workspaces_refilter_open_picker_rows_and_survive_late_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let project_a = root.path().join("creation");
+        let project_b = root.path().join("continuation");
+        fs::create_dir(&project_a).unwrap();
+        fs::create_dir(&project_b).unwrap();
+        let revision = SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..SourceRevision::default()
+        };
+        let mut header = session(
+            Provider::Codex,
+            "rollout",
+            &project_a,
+            Some("provider title"),
+        );
+        header.source_revision = Some(revision);
+        let update = omnis_store::CodexWorkspaceUpdate::Verified(omnis_store::CodexWorkspace {
+            source_revision: revision,
+            project_path: Some(project_b.clone()),
+            git_branch: None,
+        });
+        let mut state = PickerState::new(vec![header.clone()], &project_a, None, false);
+        assert_eq!(state.visible_indices().len(), 1);
+
+        let mut key = state.preview_key(&state.entries[0]);
+        let preview = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("First prompt from this rollout")),
+            continuation: None,
+            complete: true,
+            message_count_is_complete: true,
+            can_use_first_title: true,
+        };
+        assert!(state.remember_preview_title(&mut key, &preview, Some(revision), None));
+        state.query = "first prompt".to_owned();
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), 1);
+        state.all_projects = false;
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        state.select_newest_session();
+        let selected = state.selected_entry().unwrap();
+        assert_eq!(
+            selected.session.project_path.as_deref(),
+            Some(project_b.as_path())
+        );
+        assert!(selected.session.git_branch.is_none());
+        assert_eq!(selected.session.title.as_deref(), Some("provider title"));
+
+        state.remember_codex_workspaces([(
+            header.session.clone(),
+            omnis_store::CodexWorkspaceUpdate::Withdrawn(revision),
+        )]);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_b.as_path())
+        );
+
+        header.source_revision.as_mut().unwrap().contents = Some(uuid::Uuid::from_u128(3));
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        state.remember_codex_workspaces([(header.session.clone(), update)]);
+        assert!(state.visible_indices().is_empty());
+        state.query.clear();
+        state.all_projects = false;
+        state.select_newest_session();
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_a.as_path())
+        );
     }
 
     #[test]
@@ -3855,6 +4146,7 @@ mod tests {
             preview: Box::new(synthetic_preview("Archived title")),
             continuation: None,
             complete: true,
+            message_count_is_complete: true,
             can_use_first_title: true,
         };
         assert!(state.remember_preview_title(&mut old_key, &preview, None, None));
@@ -4423,6 +4715,44 @@ mod tests {
     }
 
     #[test]
+    fn a_single_excerpt_requires_complete_message_coverage_for_the_only_message_label() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        let key = state.preview_key(&state.entries[0]);
+        for (full_read, known_prefix, all_messages, label) in [
+            (true, true, true, "ONLY MESSAGE"),
+            (false, true, false, "FIRST MESSAGE"),
+            (true, true, false, "FIRST MESSAGE"),
+            (false, false, false, "AVAILABLE MESSAGE"),
+        ] {
+            let mut preview = synthetic_preview("Opening request");
+            preview.latest.clone_from(&preview.first);
+            state.previews.insert(
+                key.clone(),
+                PreviewValue::Ready {
+                    preview: Box::new(preview),
+                    continuation: None,
+                    complete: full_read,
+                    can_use_first_title: known_prefix,
+                    message_count_is_complete: all_messages,
+                },
+                &[],
+            );
+            let lines = selected_detail_lines(&state, 100, 40);
+            let header = format!("{label} · USER");
+            assert!(lines.iter().any(|line| line.text == header));
+            let summary = &lines[2].text;
+            assert_eq!(summary.contains("1 message ·"), all_messages);
+            assert_eq!(summary.contains("1 message in preview ·"), !all_messages);
+        }
+    }
+
+    #[test]
     fn selected_detail_shows_first_and_latest_messages() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -4465,6 +4795,7 @@ mod tests {
                 }),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
                 can_use_first_title: true,
             },
             &[],
@@ -4501,7 +4832,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "LATEST MESSAGE · ASSISTANT")
+                .any(|line| line == "LATEST AVAILABLE MESSAGE · ASSISTANT")
         );
         assert!(lines.iter().any(|line| line.contains("patch is ready")));
     }
@@ -4743,6 +5074,7 @@ mod tests {
             }),
             continuation: None,
             complete: false,
+            message_count_is_complete: false,
             can_use_first_title: true,
         };
 
@@ -4795,6 +5127,7 @@ mod tests {
                 text: "Fix the retry race after this fork".to_owned(),
             }),
             complete: true,
+            message_count_is_complete: true,
             can_use_first_title: true,
         };
 
@@ -5585,6 +5918,7 @@ mod tests {
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
                 complete: false,
+                names: None,
             }))
             .expect("send failure");
 
@@ -5627,6 +5961,7 @@ mod tests {
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
                 complete: true,
+                names: None,
                 result: Ok(picker_entries(
                     vec![session(
                         Provider::Claude,

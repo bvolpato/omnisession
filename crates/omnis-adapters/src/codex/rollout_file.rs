@@ -70,11 +70,26 @@ pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     Ok(serde_json::from_slice(&line).ok().into_iter().collect())
 }
 
-const LIMITS: JsonLinesLimits = JsonLinesLimits {
+pub(super) const LIMITS: JsonLinesLimits = JsonLinesLimits {
     file_bytes: MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     records: usize::MAX,
     line_bytes: MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
 };
+
+// Checking old search text is optional. Bound the decoded work of each verification pass.
+pub(super) const LEGACY_PROJECTION_LIMITS: JsonLinesLimits = JsonLinesLimits {
+    file_bytes: 64 * 1024 * 1024,
+    records: 100_000,
+    ..LIMITS
+};
+
+pub(super) fn visit_with_limits(
+    path: &Path,
+    limits: JsonLinesLimits,
+    visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    read_records_with_limits(open(path)?, limits, visit)
+}
 
 pub(super) fn visit(
     path: &Path,
@@ -83,35 +98,38 @@ pub(super) fn visit(
     read_records(open(path)?, visit)
 }
 
-/// Returns whether every decoded byte belonged to a record the visitor accepted.
+/// Returns whether every nonblank record could be read and the visitor accepted it.
 pub(super) fn visit_all_records(
     path: &Path,
     mut visit: impl FnMut(Value) -> Result<bool>,
 ) -> Result<bool> {
-    let mut delivered_bytes = 0;
-    let (_, decoded_bytes) = visit_json_reader(
-        &mut BufReader::new(open(path)?),
-        LIMITS,
-        |location, record, _| {
-            if visit(record)? {
-                delivered_bytes += location.length;
-            }
+    let mut accepted = true;
+    let (omissions, _) =
+        visit_json_reader(&mut BufReader::new(open(path)?), LIMITS, |_, record, _| {
+            accepted &= visit(record)?;
             Ok(())
-        },
-    )?;
-    Ok(delivered_bytes == decoded_bytes)
+        })?;
+    Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
 }
 
 pub(super) fn read_records(
     reader: impl Read,
+    visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    read_records_with_limits(reader, LIMITS, visit)
+}
+
+fn read_records_with_limits(
+    reader: impl Read,
+    limits: JsonLinesLimits,
     mut visit: impl FnMut(Value, usize) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     visit_json_reader(
         &mut BufReader::new(reader),
-        LIMITS,
+        limits,
         |_, record, skipped_before| visit(record, skipped_before),
     )
-    .map(|(skipped, _)| skipped)
+    .map(|(omissions, _)| omissions)
 }
 
 pub(super) enum Sample {
@@ -119,7 +137,7 @@ pub(super) enum Sample {
     Edges {
         records: Vec<Value>,
         omitted: usize,
-        /// Number of leading records retained without a gap.
+        unreadable: JsonLineSkips,
         prefix_records: usize,
     },
     Reconstruct,
@@ -141,7 +159,7 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
     let mut count = 0;
     let mut prefix_records = 0;
     let mut reconstruct = false;
-    let (skipped, bytes) = visit_json_reader(
+    let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
         |loc, record, skipped_before| {
@@ -185,8 +203,9 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
         }
     }
     Ok(Sample::Edges {
+        omitted: count - head.len(),
         prefix_records,
-        omitted: count + skipped.total() - head.len(),
+        unreadable,
         records: head,
     })
 }

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -19,7 +20,8 @@ use crate::{
     ProviderInstallation,
     support::{
         EventBuilder, JsonLineSkips, JsonLinesPreview, MAX_PREVIEW_TAIL_SIZE,
-        json_lines_preview_with_prefix, omitted_images_text, parse_timestamp, paths_match,
+        MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE,
+        json_lines_preview_with_omissions, omitted_images_text, parse_timestamp, paths_match,
         provider_executable, provider_file, provider_root, sort_sessions, string_at,
         validate_provider, value_at, visit_index_json_lines,
     },
@@ -27,6 +29,7 @@ use crate::{
 
 mod rollout_cache;
 mod rollout_file;
+mod workspace_search;
 
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 
@@ -102,12 +105,41 @@ fn select_rollout<'a>(
 struct CodexListing {
     sessions: Vec<CodexSession>,
     notes: Vec<String>,
+    names: Arc<TitleIndex>,
 }
 
 #[derive(Debug, Default)]
 struct TitleIndex {
     titles: HashMap<String, String>,
     notes: Vec<String>,
+    complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TitleIndexSource {
+    Missing,
+    Unavailable,
+    File(RolloutStamp),
+}
+
+impl TitleIndexSource {
+    fn observe(home: &Path, path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                RolloutStamp::new(&meta).map_or(Self::Unavailable, Self::File)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && home.is_dir() => {
+                Self::Missing
+            }
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedTitleIndex {
+    source: TitleIndexSource,
+    index: Arc<TitleIndex>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +150,7 @@ pub struct CodexAdapter {
     rollout_cache: Option<PathBuf>,
     session_scan: Arc<Mutex<Option<Arc<CodexFileScan>>>>,
     listing: Arc<OnceLock<CodexListing>>,
-    titles: Arc<OnceLock<TitleIndex>>,
+    titles: Arc<Mutex<Option<CachedTitleIndex>>>,
 }
 
 impl CodexAdapter {
@@ -132,6 +164,55 @@ impl CodexAdapter {
     #[must_use]
     pub fn index_file_revision(path: &Path) -> Option<SourceRevision> {
         Some(ObservedRollout::read(path)?.revision)
+    }
+
+    /// Checks a legacy search document against the currently selected rollout with bounded memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source changes during the check or cannot be read.
+    pub fn verify_legacy_search_projection(
+        session: &SessionRef,
+        path: &Path,
+        read: &IndexRead,
+        expected_hash: &[u8],
+    ) -> Result<Option<IndexRead>> {
+        validate_provider(session, Provider::Codex)?;
+        if read.source_complete || read.source_revision.contents.is_none() {
+            return Ok(None);
+        }
+        let observed = ObservedRollout::read(path)
+            .filter(|observed| {
+                observed
+                    .revision
+                    .matches_file_contents(read.source_revision)
+            })
+            .context("selected Codex rollout changed before verifying its previous search text")?;
+        let native = CodexSession::parse_with_observation(path, observed)?
+            .filter(|native| native.id == session.id && read.snapshot.session == *session)
+            .context("selected Codex rollout has a different session header")?;
+        native.read_unchanged(|native, _| {
+            let (events, project) =
+                native.reconstructed_preview(rollout_file::LEGACY_PROJECTION_LIMITS)?;
+            let branch = native.branch_at(project.as_deref());
+            let snapshot = events.snapshot(
+                session.clone(),
+                read.snapshot.title.clone(),
+                project,
+                branch,
+                read.snapshot.captured_at,
+            );
+            let document = omnis_core::trajectory_search_document(&snapshot);
+            if Sha256::digest(document.text.as_bytes())[..] != *expected_hash {
+                return Ok(None);
+            }
+            Ok(Some(IndexRead {
+                snapshot,
+                source_complete: document.source_complete,
+                source_revision: read.source_revision,
+                native_session: read.native_session.clone(),
+            }))
+        })
     }
 
     /// Checks whether an applied rollback removed the local opener that supplied a saved title.
@@ -239,51 +320,77 @@ impl CodexAdapter {
         (Arc::clone(scan), reused)
     }
 
-    fn title_index(&self) -> &TitleIndex {
-        self.titles.get_or_init(|| {
-            let Some(home) = self.codex_home.as_deref() else {
-                return TitleIndex::default();
-            };
-            let Some(path) = provider_file(home, &home.join("session_index.jsonl")) else {
-                return TitleIndex::default();
-            };
-            let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
-            let mut position = 0_usize;
-            let scan = visit_index_json_lines(&path, |row| {
-                position += 1;
-                let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
-                else {
-                    return;
-                };
-                let Some(title) = string_at(&row, &[&["thread_name"]]) else {
-                    return;
-                };
-                let updated_at = parse_timestamp(row.get("updated_at"));
-                let replace = rows
-                    .get(id)
-                    .is_none_or(|(current_time, current_position, _)| {
-                        updated_at > *current_time
-                            || (updated_at == *current_time && position > *current_position)
-                    });
-                if replace {
-                    rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
-                }
-            });
-            let notes = match scan {
-                Ok(scan) => scan.notes("Codex session_index.jsonl"),
-                Err(error) => vec![format!(
-                    "Codex session_index.jsonl could not be read: {}.",
-                    compact_discovery_error(&error)
-                )],
-            };
+    fn title_index(&self) -> Arc<TitleIndex> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Arc::default();
+        };
+        let path = home.join("session_index.jsonl");
+        let mut cache = self
+            .titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = TitleIndexSource::observe(home, &path);
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.source == source) {
+            return Arc::clone(&cached.index);
+        }
+        let index = Arc::new(if matches!(source, TitleIndexSource::File(_)) {
+            provider_file(home, &path)
+                .map_or_else(TitleIndex::default, |path| Self::read_title_index(&path))
+        } else {
             TitleIndex {
-                titles: rows
-                    .into_iter()
-                    .map(|(id, (_, _, title))| (id, title))
-                    .collect(),
-                notes,
+                complete: source == TitleIndexSource::Missing,
+                ..TitleIndex::default()
             }
-        })
+        });
+        if TitleIndexSource::observe(home, &path) != source {
+            return Arc::default();
+        }
+        *cache = Some(CachedTitleIndex {
+            source,
+            index: Arc::clone(&index),
+        });
+        index
+    }
+
+    fn read_title_index(path: &Path) -> TitleIndex {
+        let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
+        let mut position = 0_usize;
+        let scan = visit_index_json_lines(path, |row| {
+            position += 1;
+            let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
+            else {
+                return;
+            };
+            let Some(title) = string_at(&row, &[&["thread_name"]]) else {
+                return;
+            };
+            let updated_at = parse_timestamp(row.get("updated_at"));
+            let replace = rows
+                .get(id)
+                .is_none_or(|(current_time, current_position, _)| {
+                    updated_at > *current_time
+                        || (updated_at == *current_time && position > *current_position)
+                });
+            if replace {
+                rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
+            }
+        });
+        let valid = scan.as_ref().is_ok_and(|scan| scan.malformed_records == 0);
+        let notes = match scan {
+            Ok(scan) => scan.notes("Codex session_index.jsonl"),
+            Err(error) => vec![format!(
+                "Codex session_index.jsonl could not be read: {}.",
+                compact_discovery_error(&error)
+            )],
+        };
+        TitleIndex {
+            titles: rows
+                .into_iter()
+                .map(|(id, (_, _, title))| (id, title))
+                .collect(),
+            complete: valid && notes.is_empty(),
+            notes,
+        }
     }
 
     fn listing(&self) -> &CodexListing {
@@ -340,7 +447,11 @@ impl CodexAdapter {
                 .as_deref(),
         );
         notes.extend(title_index.notes.iter().cloned());
-        CodexListing { sessions, notes }
+        CodexListing {
+            sessions,
+            notes,
+            names: title_index,
+        }
     }
 
     fn find_session(&self, id: &str, source_path: Option<&Path>) -> Result<CodexSession> {
@@ -497,11 +608,31 @@ impl CodexAdapter {
     }
 }
 
+impl NativeSession {
+    /// Applies the surviving Codex workspace when it belongs to this exact file revision.
+    /// Returns whether the project or branch changed.
+    pub fn apply_codex_workspace(&mut self, workspace: &omnis_store::CodexWorkspace) -> bool {
+        if self.session.provider == Provider::Codex
+            && self.source_revision.is_some_and(|revision| {
+                revision.contents.is_some()
+                    && revision.matches_file_contents(workspace.source_revision)
+            })
+            && (self.project_path != workspace.project_path
+                || self.git_branch != workspace.git_branch)
+        {
+            self.project_path.clone_from(&workspace.project_path);
+            self.git_branch.clone_from(&workspace.git_branch);
+            return true;
+        }
+        false
+    }
+}
+
 fn apply_verified_workspace(
     session: &mut NativeSession,
     workspaces: &HashMap<Uuid, omnis_store::CodexWorkspace>,
     cached_header: bool,
-) {
+) -> bool {
     if let Some(revision) = session.source_revision
         && let Some(workspace) = revision.file.and_then(|file| workspaces.get(&file))
         && revision.matches_file_contents(workspace.source_revision)
@@ -512,9 +643,10 @@ fn apply_verified_workspace(
                 .and_then(CodexAdapter::index_file_revision)
                 .is_some_and(|current| current.matches_file_contents(revision)))
     {
-        session.project_path.clone_from(&workspace.project_path);
-        session.git_branch.clone_from(&workspace.git_branch);
+        session.apply_codex_workspace(workspace);
+        return true;
     }
+    false
 }
 
 impl Default for CodexAdapter {
@@ -1005,7 +1137,7 @@ impl CodexSession {
             }
             Ok(true)
         })?;
-        Ok(complete && withdrew)
+        Ok(complete && withdrew && !opener.is_some_and(|(_, matches)| matches))
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
@@ -1032,9 +1164,9 @@ impl CodexSession {
     ) -> Result<(EventBuilder, CodexHistory)> {
         let mut unread_ancestor = false;
         let mut first_gap = None;
-        let skipped = read(&mut |record, skipped_before| {
-            if skipped_before > 0 {
-                first_gap.get_or_insert_with(|| builder.checkpoint());
+        let unreadable = read(&mut |record, skipped_before| {
+            if skipped_before > 0 && first_gap.is_none() {
+                first_gap = Some(builder.checkpoint());
             }
             unread_ancestor |= records_history_base(&record);
             history.push(&mut builder, &record)?;
@@ -1047,12 +1179,12 @@ impl CodexSession {
             }
             Ok(())
         })?;
-        let prefix_end_sequence = first_gap.unwrap_or_else(|| builder.checkpoint());
+        let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
         history.source_prefix_end = if unread_ancestor || history.omitted_events > 0 {
             Some(0)
         } else {
-            (skipped.total() > 0).then_some(prefix_end_sequence)
+            (unreadable.total() > 0).then_some(prefix_end)
         };
         if history.omitted_events > 0 {
             builder.push(
@@ -1083,14 +1215,10 @@ impl CodexSession {
                 None,
             );
         }
-        builder.push_positioned_oversized_record_notice(
-            skipped.oversized,
-            Some(prefix_end_sequence),
-            self.updated_at,
-        );
-        builder.push_codex_malformed_record_notice(
-            skipped.malformed,
-            prefix_end_sequence,
+        builder.push_json_line_omissions(
+            unreadable,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            Some(prefix_end),
             self.updated_at,
         );
         if unread_ancestor {
@@ -1126,7 +1254,7 @@ impl CodexSession {
                 .snapshot);
         }
         if contains_rollback_marker(&self.path)? {
-            let (events, project_path) = self.reconstructed_preview()?;
+            let (events, project_path) = self.reconstructed_preview(rollout_file::LIMITS)?;
             let branch = self.branch_at(project_path.as_deref());
             return Ok(events.snapshot(
                 session.clone(),
@@ -1184,21 +1312,24 @@ impl CodexSession {
                 (events, project, true)
             }
             rollout_file::Sample::Reconstruct => {
-                let (events, project) = self.reconstructed_preview()?;
+                let (events, project) = self.reconstructed_preview(rollout_file::LIMITS)?;
                 (events, project, false)
             }
             rollout_file::Sample::Edges {
                 records,
                 omitted,
+                unreadable,
                 prefix_records,
             } => {
                 let events = self.events_from_preview(
                     JsonLinesPreview {
                         records,
+                        omissions: unreadable,
+                        sampled: omitted > 0,
                         prefix_records,
-                        reached_end_without_gap: omitted == 0,
                     },
-                    omitted,
+                    Some(omitted),
+                    MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
                 );
                 (events, self.project_path.clone(), false)
             }
@@ -1213,7 +1344,10 @@ impl CodexSession {
         })
     }
 
-    fn reconstructed_preview(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+    fn reconstructed_preview(
+        &self,
+        limits: crate::support::JsonLinesLimits,
+    ) -> Result<(EventBuilder, Option<PathBuf>)> {
         let stamp = || fs::metadata(&self.path).map(|metadata| RolloutStamp::new(&metadata));
         let before = stamp()?;
         let per_edge = usize::try_from(MAX_PREVIEW_TAIL_SIZE)?;
@@ -1222,7 +1356,7 @@ impl CodexSession {
         let ((selected, omitted, prefix_end), workspace_record, source_prefix_end) = {
             let (plan, history) =
                 self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                    rollout_file::visit(&self.path, visit)
+                    rollout_file::visit_with_limits(&self.path, limits, visit)
                 })?;
             (
                 plan.select_preview(rollout_file::SAMPLE_RECORDS, per_edge),
@@ -1237,7 +1371,7 @@ impl CodexSession {
         let mut position = 0_usize;
         let (mut events, history) =
             self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                rollout_file::visit(&self.path, |record, skipped_before| {
+                rollout_file::visit_with_limits(&self.path, limits, |record, skipped_before| {
                     position += 1;
                     if workspace_record == Some(position) {
                         project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
@@ -1258,7 +1392,7 @@ impl CodexSession {
         events.finish_preview(expected)?;
         self.finish_preview_prefix(
             &mut events,
-            omitted,
+            Some(omitted),
             source_prefix_end.map_or(prefix_end, |end| end.min(prefix_end)),
             source_prefix_end.is_none(),
         );
@@ -1267,18 +1401,21 @@ impl CodexSession {
 
     fn preview_events(&self) -> Result<EventBuilder> {
         const SAMPLE_RECORDS: usize = 1_024;
-        Ok(self.events_from_preview(
-            json_lines_preview_with_prefix(&self.path, SAMPLE_RECORDS)?,
-            0,
-        ))
+        let preview = json_lines_preview_with_omissions(&self.path, SAMPLE_RECORDS)?;
+        Ok(self.events_from_preview(preview, None, MAX_TRANSCRIPT_LINE_SIZE))
     }
 
-    fn events_from_preview(&self, sample: JsonLinesPreview, omitted: usize) -> EventBuilder {
+    fn events_from_preview(
+        &self,
+        preview: JsonLinesPreview,
+        omitted: Option<usize>,
+        line_limit: u64,
+    ) -> EventBuilder {
         let mut builder = self.event_builder();
-        let mut last_visible: Option<(EventKind, String, &'static str)> = None;
-        let unread_ancestor = sample.records.iter().any(records_history_base);
-        let mut records = sample.records.into_iter();
-        for record in records.by_ref().take(sample.prefix_records) {
+        let mut last_visible = None;
+        let unread_ancestor = preview.records.iter().any(records_history_base);
+        let mut records = preview.records.into_iter();
+        for record in records.by_ref().take(preview.prefix_records) {
             push_record(&mut builder, &record, &mut last_visible);
         }
         let prefix_end = builder.checkpoint();
@@ -1288,11 +1425,17 @@ impl CodexSession {
         if unread_ancestor {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
+        builder.push_json_line_omissions(
+            preview.omissions,
+            line_limit,
+            Some(prefix_end),
+            self.updated_at,
+        );
         self.finish_preview_prefix(
             &mut builder,
-            omitted,
+            if preview.sampled { omitted } else { Some(0) },
             prefix_end,
-            sample.reached_end_without_gap && !unread_ancestor,
+            preview.omissions.total() == 0 && !unread_ancestor,
         );
         builder
     }
@@ -1300,22 +1443,28 @@ impl CodexSession {
     fn finish_preview_prefix(
         &self,
         builder: &mut EventBuilder,
-        omitted: usize,
+        omitted: Option<usize>,
         prefix_end: u64,
-        reached_end_without_gap: bool,
+        complete: bool,
     ) {
-        if omitted == 0 {
-            builder.push_codex_preview_prefix(prefix_end, reached_end_without_gap, self.updated_at);
-        } else {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"omitted_events": omitted, "prefix_end_sequence": prefix_end}),
-                self.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.preview_limit".to_owned()),
-                None,
-            );
+        if omitted == Some(0) {
+            builder.push_codex_preview_prefix(prefix_end, complete, self.updated_at);
+            return;
         }
+        let mut payload = json!({"prefix_end_sequence": prefix_end});
+        if let Some(count) = omitted {
+            payload["omitted_events"] = count.into();
+        } else {
+            payload["native_history_unverified"] = true.into();
+        }
+        builder.push(
+            EventKind::ProviderEvent,
+            payload,
+            self.updated_at,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.preview_limit".to_owned()),
+            None,
+        );
     }
 
     fn event_builder(&self) -> EventBuilder {
@@ -1858,6 +2007,11 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    // The import notification has no response item. A literal reply with the same
+    // text has one, so let the response item supply its role and content.
+    if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
+        return false;
+    }
     let images = ["images", "local_images"]
         .into_iter()
         .filter_map(|field| payload.get(field).and_then(Value::as_array))
@@ -1921,28 +2075,34 @@ impl ProviderAdapter for CodexAdapter {
         self.codex_home.as_deref().is_some_and(Path::is_dir) && self.listing().notes.is_empty()
     }
 
+    fn session_titles_are_complete(&self) -> bool {
+        let current = self.title_index();
+        current.complete
+            && self
+                .listing
+                .get()
+                .is_none_or(|listing| Arc::ptr_eq(&listing.names, &current))
+    }
+
+    fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
+        let index = self.title_index();
+        (name.is_some() || index.complete) && index.titles.get(id).map(String::as_str) == name
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let workspaces = self
-            .use_workspace_index
-            .then(|| omnis_store::CodexWorkspace::read_index(None).ok())
-            .flatten()
-            .unwrap_or_default();
-        let cached_header = self.listing.get().is_some();
-        let mut sessions = Vec::new();
-        for raw in self.sessions() {
-            let mut session = raw.native_session();
-            apply_verified_workspace(&mut session, &workspaces, cached_header);
-            if project.is_none_or(|project| {
-                session
-                    .project_path
-                    .as_deref()
-                    .is_some_and(|recorded| paths_match(recorded, project))
-            }) {
-                sessions.push(session);
-            }
+        Ok(self.list_project_candidates(project, false).0)
+    }
+
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let (sessions, unchecked) = self.list_project_candidates(Some(project), true);
+        let mut notes = self.discovery_notes();
+        if unchecked > 0 {
+            notes.push(format!("Codex could not check {unchecked} other-workspace rollout(s) for a directory change within this search. Run `omni index --provider codex` to refresh their workspaces."));
         }
-        sort_sessions(&mut sessions);
-        Ok(sessions)
+        Ok((sessions, notes))
     }
 
     /// Reads the one matching rollout, so subagent threads that listings hide stay reachable.
@@ -2052,6 +2212,36 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use proptest::prelude::*;
+
+    #[test]
+    fn a_long_lived_adapter_rechecks_renamed_and_unreadable_name_indexes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let id = "019f0000-0000-7000-8000-000000000001";
+        let adapter = CodexAdapter::with_root(home.path());
+        let path = home.path().join("session_index.jsonl");
+        assert!(adapter.confirms_session_title(id, None));
+        for name in ["Amber Heron", "Violet Quokka"] {
+            fs::write(
+                &path,
+                serde_json::json!({"id": id, "thread_name": name}).to_string(),
+            )?;
+            assert!(adapter.confirms_session_title(id, Some(name)));
+            assert!(!adapter.confirms_session_title(id, None));
+        }
+        adapter.list_sessions(None)?;
+        fs::write(&path, "{\n")?;
+        assert!(!adapter.confirms_session_title(id, None));
+        fs::write(&path, " \t\r\n")?;
+        assert!(adapter.confirms_session_title(id, None));
+        assert!(!adapter.session_titles_are_complete());
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(!adapter.confirms_session_title(id, Some("Violet Quokka")));
+        assert!(!adapter.confirms_session_title(id, None));
+        fs::remove_dir(&path)?;
+        assert!(adapter.confirms_session_title(id, None));
+        Ok(())
+    }
 
     #[test]
     fn scan_session_files_reports_truncation_and_unreadable_roots() {

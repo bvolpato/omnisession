@@ -1227,35 +1227,25 @@ pub(super) fn selected_detail_lines(
     };
     let key = state.preview_key(entry);
     let preview = state.previews.get(&key);
-    let (ready_preview, preview_complete) = match preview {
+    let (ready_preview, preview_complete, message_count_is_complete) = match preview {
         Some(PreviewValue::Ready {
-            preview, complete, ..
-        }) => (Some(preview.as_ref()), *complete),
-        _ => (None, false),
+            preview,
+            complete,
+            message_count_is_complete,
+            ..
+        }) => (
+            Some(preview.as_ref()),
+            *complete,
+            *message_count_is_complete,
+        ),
+        _ => (None, false, false),
     };
     let title = display_title(&entry.session, preview);
     let location = session_location(state, entry, ready_preview);
-    let cache_state = if entry.cached { " · indexed" } else { "" };
-    let activity = match preview {
-        Some(PreviewValue::Ready { preview, .. }) if preview.message_count > 0 => {
-            format!(" · {} messages", preview.message_count)
-        }
-        _ if entry.session.event_count > 0 => {
-            format!(" · {} events", entry.session.event_count)
-        }
-        _ => String::new(),
-    };
     let mut lines = vec![
         detail_line("SELECTED SESSION", DetailStyle::Accent),
         detail_line(title, DetailStyle::Strong),
-        detail_line(
-            format!(
-                "{}{activity} · {}{cache_state}",
-                entry.session.session.provider,
-                session_relative_time(&entry.session),
-            ),
-            DetailStyle::Muted,
-        ),
+        session_activity_line(entry, preview),
     ];
     if let Some(trajectory_match) = state.trajectory_match(entry) {
         append_search_match(&mut lines, trajectory_match, &state.query, width, 6);
@@ -1268,7 +1258,14 @@ pub(super) fn selected_detail_lines(
             can_use_first_title,
             ..
         }) => {
-            append_preview_lines(&mut lines, preview, *can_use_first_title, width, height);
+            append_preview_lines(
+                &mut lines,
+                preview,
+                *can_use_first_title,
+                message_count_is_complete,
+                width,
+                height,
+            );
         }
         Some(PreviewValue::Unavailable) => {
             lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
@@ -1283,6 +1280,7 @@ pub(super) fn selected_detail_lines(
             &mut lines,
             preview,
             preview_complete,
+            message_count_is_complete,
             entry.session.event_count,
             width,
             usize::MAX,
@@ -1293,10 +1291,46 @@ pub(super) fn selected_detail_lines(
     lines
 }
 
+fn session_activity_line(entry: &PickerEntry, preview: Option<&PreviewValue>) -> DetailLine {
+    let event_count = entry.session.event_count;
+    let activity = match preview {
+        Some(PreviewValue::Ready {
+            preview,
+            message_count_is_complete,
+            ..
+        }) if preview.message_count > 0 => {
+            format!(
+                " · {}",
+                preview_message_count(preview.message_count, *message_count_is_complete)
+            )
+        }
+        _ if event_count > 0 => {
+            format!(" · {event_count} events")
+        }
+        _ => String::new(),
+    };
+    let cache_state = if entry.cached { " · indexed" } else { "" };
+    detail_line(
+        format!(
+            "{}{activity} · {}{cache_state}",
+            entry.session.session.provider,
+            session_relative_time(&entry.session),
+        ),
+        DetailStyle::Muted,
+    )
+}
+
+fn preview_message_count(count: usize, complete: bool) -> String {
+    let unit = if count == 1 { "message" } else { "messages" };
+    let scope = if complete { "" } else { " in preview" };
+    format!("{} {unit}{scope}", grouped_number(count))
+}
+
 pub(super) fn append_session_metadata(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     preview_complete: bool,
+    message_count_is_complete: bool,
     discovered_event_count: usize,
     width: usize,
     height: usize,
@@ -1306,8 +1340,8 @@ pub(super) fn append_session_metadata(
     }
     let event_count = discovered_event_count.max(preview.event_count);
     let trajectory = format!(
-        "{} messages · {} tools · {event_count} events",
-        grouped_number(preview.message_count),
+        "{} · {} tools · {event_count} events",
+        preview_message_count(preview.message_count, message_count_is_complete),
         grouped_number(preview.tool_event_count),
     );
     lines.push(detail_line(String::new(), DetailStyle::Normal));
@@ -1600,6 +1634,7 @@ pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     can_use_first_title: bool,
+    message_count_is_complete: bool,
     width: usize,
     height: usize,
 ) {
@@ -1616,10 +1651,19 @@ pub(super) fn append_preview_lines(
         "FIRST AVAILABLE MESSAGE"
     };
     match (&preview.first, &preview.latest) {
-        (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
+        (None, _) => lines.push(detail_line(
+            if message_count_is_complete {
+                "No visible messages"
+            } else {
+                "No visible messages in preview"
+            },
+            DetailStyle::Muted,
+        )),
         (Some(first), Some(_)) if preview.message_count == 1 => {
-            let label = if can_use_first_title {
+            let label = if message_count_is_complete {
                 "ONLY MESSAGE"
+            } else if can_use_first_title {
+                "FIRST MESSAGE"
             } else {
                 "AVAILABLE MESSAGE"
             };
@@ -1630,7 +1674,12 @@ pub(super) fn append_preview_lines(
             if height >= 15 {
                 lines.push(detail_line(String::new(), DetailStyle::Normal));
             }
-            append_message_excerpt(lines, "LATEST MESSAGE", latest, width, excerpt_lines);
+            let latest_label = if message_count_is_complete {
+                "LATEST MESSAGE"
+            } else {
+                "LATEST AVAILABLE MESSAGE"
+            };
+            append_message_excerpt(lines, latest_label, latest, width, excerpt_lines);
         }
         (Some(first), None) => {
             append_message_excerpt(lines, first_label, first, width, excerpt_lines);

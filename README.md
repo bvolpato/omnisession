@@ -236,7 +236,7 @@ While the picker is open, it indexes conversation text for every discovered sess
 
 If a session remains unreadable, later index runs skip it until its source changes. Use `omni index --retry-failed` to try again. If an in-place restore preserves the operating system's file identity, size, and all available timestamps, use `omni show codex:<id>` to read the contents and refresh the cached text and workspace. This can apply to same-size restores on Windows that preserve the write time.
 
-If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. If a rollback removes the request that supplied a search title, a full index read can retire that title even when the fork's parent is unavailable. After an upgrade, live indexing refreshes older entries that lack this evidence. `omni search --cached` uses the previously saved data.
+If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. When a rollback removes the request that supplied a search title, indexing can retire the title even when the fork's parent is unavailable. After an upgrade, live indexing checks older entries. If it cannot verify the previous search text for a large rollout, it keeps the usual head and tail. Use `omni show codex:<id>` to index the full rollout. `omni search --cached` uses the previously saved data.
 
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 
@@ -256,7 +256,7 @@ omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
 ```
 
-- Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
+- Each run first indexes changed sessions in the current project. Use `--all-projects` to search every workspace. A live project search also checks recent Codex sessions that may have moved from another directory. It reports incomplete coverage if it reaches the scan limit. Run `omni index --provider codex` to index across workspaces. `--no-index` uses the existing search index.
 - `--cached` skips provider stores entirely: it searches the cached session list and the existing index, so results can include sessions changed or deleted since the last refresh. Run `omni index` to refresh.
 - Every word must match. Plain words match titles, folders, branches, and IDs fuzzily, and conversation text by prefix.
 - Words with inner punctuation, like `qwen3.8`, `feat/rate-limiter`, or `api_key`, match without gaps: as a substring of a title, folder, branch, or ID, and as adjacent words in conversation text. `qwen3.8` finds `qwen3-8`, but not `qwen3` and `8` far apart.

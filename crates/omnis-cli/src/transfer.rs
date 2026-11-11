@@ -537,10 +537,17 @@ fn resume_native_without_snapshot(
                 },
             )
             .with_context(|| format!("planning resume for `{}`", request.source))?;
-        (
-            with_launch_mode(request.agent_target().launch(plan)?, mode_args),
-            None,
-        )
+        let plan = match &request.picker_selection {
+            Some(selection) if request.target == Provider::Codex => {
+                picked_codex_launch(registry, selection, request.agent_target(), plan, |file| {
+                    omnis_store::CodexWorkspace::read_index(Some(file))
+                        .ok()?
+                        .remove(&file)
+                })?
+            }
+            _ => request.agent_target().launch(plan)?,
+        };
+        (with_launch_mode(plan, mode_args), None)
     };
 
     if json_output || args.dry_run {
@@ -794,6 +801,101 @@ pub(super) fn selected_native_workspace(
     } else {
         current.to_path_buf()
     })
+}
+
+fn picked_codex_launch(
+    registry: &AdapterRegistry,
+    selection: &session_picker::PickerSelection,
+    target: AgentTarget,
+    mut plan: LaunchPlan,
+    cached_workspace: impl FnOnce(uuid::Uuid) -> Option<omnis_store::CodexWorkspace>,
+) -> Result<LaunchPlan> {
+    let project = plan
+        .cwd
+        .as_deref()
+        .context("native launch has no workspace")?;
+    let selected = registry
+        .find_native_session(Provider::Codex, &selection.session.id)?
+        .context("selected Codex session is no longer listed")?;
+    let revision = selected
+        .source_revision
+        .context("selected Codex rollout has no source revision")?;
+    anyhow::ensure!(
+        revision.file.is_some()
+            && revision.contents.is_some()
+            && selection
+                .source_revision
+                .is_none_or(|shown| shown.matches_file_contents(revision)),
+        "selected Codex rollout changed during discovery"
+    );
+    let cached = revision.file.and_then(cached_workspace);
+    let (workspace, startup) = picked_codex_directories(revision, cached, || {
+        registry.index_session(
+            &selection.session,
+            selected.source_path.as_deref(),
+            u64::MAX,
+        )
+    })?;
+    if selection.workspace_override.is_none() {
+        let workspace = workspace.context("selected session has no verified workspace")?;
+        anyhow::ensure!(
+            !omnis_core::may_reach_network(&workspace)
+                && workspace_paths_match(&workspace, project),
+            "selected session workspace changed during discovery"
+        );
+    }
+    let startup_matches = startup.as_deref().is_some_and(|startup| {
+        startup.as_os_str() == project.as_os_str()
+            || (startup.is_absolute()
+                && !omnis_core::may_reach_network(startup)
+                && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == project))
+    });
+    let native_args = std::mem::take(&mut plan.args);
+    let mut plan = target.launch(plan)?;
+    if (selection.workspace_override.is_some() || !startup_matches)
+        && !plan
+            .args
+            .iter()
+            .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
+    {
+        plan.args.extend(["--cd".to_owned(), ".".to_owned()]);
+    }
+    plan.args.extend(native_args);
+    anyhow::ensure!(
+        !requires_import_for_native_resume(registry, &selection.session, target)?,
+        "selected Codex rollout no longer supports a native launch"
+    );
+    let selected = registry.find_native_session(Provider::Codex, &selection.session.id)?;
+    anyhow::ensure!(
+        selected
+            .and_then(|session| session.source_revision)
+            .is_some_and(|live| live.matches_file_contents(revision)),
+        "selected Codex rollout changed before launch"
+    );
+    Ok(plan)
+}
+
+fn picked_codex_directories(
+    revision: omnis_ir::SourceRevision,
+    cached: Option<omnis_store::CodexWorkspace>,
+    read: impl FnOnce() -> Result<omnis_adapters::IndexRead>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    if let Some(workspace) =
+        cached.filter(|workspace| workspace.source_revision.matches_file_contents(revision))
+    {
+        return Ok((workspace.project_path, None));
+    }
+    let read = read()?;
+    anyhow::ensure!(
+        read.source_revision.matches_file_contents(revision),
+        "selected Codex rollout changed during the workspace read"
+    );
+    let workspace = crate::verified_codex_workspace(&read.snapshot, revision, read.source_complete)
+        .and_then(|workspace| workspace.project_path);
+    let native = read
+        .native_session
+        .context("selected Codex session is no longer listed")?;
+    Ok((workspace, native.project_path))
 }
 
 fn selected_workspace(
@@ -2988,6 +3090,147 @@ mod tests {
     };
     use crate::launch_profile::{self, LaunchProfile};
     use omnis_adapters::EnvChange;
+
+    #[test]
+    fn picker_reads_the_rollout_only_when_its_workspace_receipt_is_missing_or_stale() {
+        let revision = omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::from_u128(11)),
+            contents: Some(uuid::Uuid::from_u128(12)),
+            missing_ancestor: None,
+        };
+        let effective = PathBuf::from("verified-workspace");
+        let receipt = omnis_store::CodexWorkspace {
+            source_revision: revision,
+            project_path: Some(effective.clone()),
+            git_branch: None,
+        };
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            anyhow::bail!("full rollout read")
+        };
+        assert_eq!(
+            super::picked_codex_directories(revision, Some(receipt.clone()), read).unwrap(),
+            (Some(effective), None)
+        );
+        assert_eq!(reads.get(), 0);
+        let changed = omnis_ir::SourceRevision {
+            contents: Some(uuid::Uuid::from_u128(13)),
+            ..revision
+        };
+        let replaced = omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::from_u128(14)),
+            ..revision
+        };
+        for (live, cached) in [
+            (revision, None),
+            (changed, Some(receipt.clone())),
+            (replaced, Some(receipt)),
+        ] {
+            let error = super::picked_codex_directories(live, cached, read).unwrap_err();
+            assert_eq!(error.to_string(), "full rollout read");
+        }
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn native_picker_launch_verifies_the_selected_codex_rollout_and_workspace() -> anyhow::Result<()>
+    {
+        use std::fs;
+
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("codex");
+        let sessions = home.join("sessions/2026/01/01");
+        let first = root.path().join("first");
+        let last = root.path().join("last");
+        for directory in [&sessions, &first, &last] {
+            fs::create_dir_all(directory)?;
+        }
+        let id = "019f0000-0000-7000-8000-000000000001";
+        let path = sessions.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+        let rows = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":first}}),
+            serde_json::json!({"type":"turn_context","payload":{"cwd":last}}),
+        );
+        fs::write(&path, &rows)?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(&home));
+        let mut selection = super::session_picker::PickerSelection {
+            session: SessionRef::new(Provider::Codex, id),
+            source_revision: omnis_adapters::CodexAdapter::index_file_revision(&path),
+            project_path: Some(first.clone()),
+            across_projects: false,
+            target: Provider::Codex.into(),
+            fork: false,
+            mode: None,
+            workspace_override: None,
+        };
+        let launch = |selection: &super::session_picker::PickerSelection| {
+            let cwd = super::selected_native_workspace(selection, &first)?;
+            let plan = registry.launch_plan(
+                &selection.session,
+                &super::LaunchTarget {
+                    cwd: Some(cwd),
+                    fork: false,
+                    prompt: None,
+                },
+            )?;
+            super::picked_codex_launch(&registry, selection, selection.target, plan, |_| None)
+        };
+        let error = launch(&selection).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workspace changed during discovery")
+        );
+        selection.across_projects = true;
+        selection.project_path = Some(last.clone());
+        let plan = launch(&selection)?;
+        assert_eq!(plan.cwd, Some(omnis_core::canonicalize_path(&last)?));
+        assert_eq!(plan.args, ["--cd", ".", "resume", id]);
+
+        selection.project_path = Some(root.path().join("missing"));
+        selection.workspace_override = Some(first.clone());
+        let plan = launch(&selection)?;
+        assert_eq!(plan.cwd, Some(omnis_core::canonicalize_path(&first)?));
+        assert_eq!(plan.args, ["--cd", ".", "resume", id]);
+
+        selection.target = AgentTarget {
+            provider: Provider::Codex,
+            profile: Some(
+                &profiles(
+                    "[profiles.pinned]\nagent = \"codex\"\nargs = [\"-C\", \"profile-workdir\"]",
+                )[0],
+            ),
+        };
+        assert_eq!(
+            launch(&selection)?.args,
+            ["-C", "profile-workdir", "resume", id]
+        );
+
+        let replacement = root.path().join("replacement.jsonl");
+        fs::write(&replacement, &rows)?;
+        fs::remove_file(&path)?;
+        fs::rename(replacement, &path)?;
+        let error = launch(&selection).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rollout changed during discovery")
+        );
+        let archive = home.join("archived_sessions");
+        fs::create_dir(&archive)?;
+        fs::rename(&path, archive.join(path.file_name().unwrap()))?;
+        selection.source_revision = None;
+        let error = launch(&selection).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer supports a native launch")
+        );
+        Ok(())
+    }
 
     #[test]
     fn clipboard_picker_dry_run_does_not_read_or_export_the_session() {

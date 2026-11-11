@@ -35,12 +35,13 @@ pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, canonicalize_opencode_export, fork_opencode_session_with_binary,
-    installed_opencode_model, installed_opencode_model_with_binary, is_opencode_v2,
-    opencode_command_args, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    OpenCodeAdapter, bounded_opencode_json_output, canonicalize_opencode_export,
+    find_opencode_session_with_binary, fork_opencode_session_with_binary, installed_opencode_model,
+    installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
+    read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
-pub use provider_process::provider_process;
+pub use provider_process::{bounded_provider_output, provider_process};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +132,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Finds candidates for live indexing in one project, including recorded workspace changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        Ok((self.list_sessions(Some(project))?, self.discovery_notes()))
+    }
+
     /// Finds session metadata by exact native ID.
     ///
     /// An exact ID is an explicit selection. Adapters whose listings hide sessions that the
@@ -169,6 +182,16 @@ pub trait ProviderAdapter: Send + Sync {
     /// Return false for bounded, incomplete, or structurally unverified listings. An omitted
     /// session can be treated as deleted only after complete discovery. The default preserves it.
     fn discovery_is_complete(&self) -> bool {
+        false
+    }
+
+    /// Returns whether a missing provider name confirms that the session has no name.
+    fn session_titles_are_complete(&self) -> bool {
+        false
+    }
+
+    /// Checks whether the name still matches the provider's index after a session read.
+    fn confirms_session_title(&self, _id: &str, _name: Option<&str>) -> bool {
         false
     }
 
