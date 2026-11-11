@@ -803,7 +803,9 @@ impl Branch {
         {
             parent.node = Some(summary);
             parent.suffix = Some(tip);
-            parent.missing_ancestor = self.nodes[summary].missing_ancestor;
+            // The retained position is verified even if the attachment's older history is incomplete.
+            parent.missing_ancestor = self.nodes[summary].missing_ancestor
+                || (parent.opaque.is_some() && parent.missing_ancestor);
         }
         if parent.unverified.is_none() {
             parent.unverified = parent
@@ -996,6 +998,9 @@ impl Branch {
         {
             let detached =
                 self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
+            if detached.is_some() {
+                parent.suffix = None;
+            }
             self.opaque_records.push(OpaqueRecord {
                 uuid,
                 parent: parent.opaque,
@@ -1057,6 +1062,21 @@ impl Branch {
         compactions: &Compactions,
     ) -> Option<OpaqueReturn> {
         let id = super::record_uuid(record, "parentUuid")?;
+        // Returning directly to an omitted child can use the retained tail. A new
+        // attachment written under that child must establish its own timestamp link.
+        if let Some(summary) = self.latest_attachment_checkpoint(compactions)
+            && parent.node == Some(summary)
+            && parent.suffix.is_some()
+            && let Some(opaque) = self.opaque_record(parent)
+            && opaque.header_count <= compactions.by_summary[&summary].header
+            && !duplicates.contains(&opaque.uuid)
+            && !compactions.contains(summary, opaque.uuid, records)
+        {
+            return Some(OpaqueReturn {
+                cutoff: summary,
+                anchor: self.timed_attachment_anchor(summary, record, parent, duplicates),
+            });
+        }
         let prior = self.opaque_record(parent).and_then(|r| r.detached);
         // A verified timestamp at the current checkpoint supersedes a cutoff inherited
         // through any number of earlier conversation or attachment records.
@@ -1521,6 +1541,14 @@ impl Branch {
         compactions: &Compactions,
     ) -> Option<(usize, Uuid)> {
         if self.ever_retained.is_empty() || duplicates.contains(&id) {
+            return None;
+        }
+        // A new link cannot reach past the occurrence at which its parent was removed.
+        // A subsequent checkpoint may explicitly retain this link and establish a new position.
+        if let Some(opaque) = self.opaque_record(parent)
+            && let Some(detached) = opaque.detached
+            && Some(detached.cutoff) == self.latest_attachment_checkpoint(compactions)
+        {
             return None;
         }
         if let Some(retained) =

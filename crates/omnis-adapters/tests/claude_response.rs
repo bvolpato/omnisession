@@ -684,7 +684,15 @@ fn a_retained_directory_with_a_user_parent_keeps_its_checkpoint_position() {
 fn a_retained_root_directory_only_supplies_its_position_to_children_written_after_compaction() {
     let mut root = directory_attachment(30, 0);
     root["parentUuid"] = Value::Null;
-    for before in [false, true] {
+    let full = &["Summary 3", "Retained reply", "New request"][..];
+    let summary = &["Summary 3", "New request"][..];
+    let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    for (before, new_link_delay, expected) in [
+        (false, None, summary),
+        (true, None, full),
+        (true, Some(13), &["New request"][..]),
+        (true, Some(1), summary),
+    ] {
         let child = directory_attachment(31, 30);
         let mut rows = vec![root.clone()];
         if before {
@@ -695,28 +703,34 @@ fn a_retained_root_directory_only_supplies_its_position_to_children_written_afte
             message(2, 1, "assistant", json!("Retained reply")),
         ]);
         rows.extend(compaction(3, 2, &[30, 2]));
+        let boundary = rows.len();
         if !before {
             rows.push(child);
         }
-        rows.push(message(11, 31, "user", json!("New request")));
-        let expected: &[&str] = if before {
-            &["Summary 3", "Retained reply", "New request"]
+        let parent = if new_link_delay.is_some() {
+            rows.push(directory_attachment(32, 31));
+            32
         } else {
-            &["Summary 3", "New request"]
+            31
         };
+        rows.push(message(11, parent, "user", json!("New request")));
+        if let Some(delay) = new_link_delay {
+            for (i, row) in rows.iter_mut().enumerate() {
+                let seconds = i64::try_from(i).unwrap() + if i >= boundary { delay - 1 } else { 0 };
+                row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
+                row["isSidechain"] = json!(false);
+            }
+        }
         for preview in [false, true] {
+            let case = (before, new_link_delay, preview);
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
-            assert_eq!(
-                handoff_messages(&active),
-                expected,
-                "before={before}, preview={preview}"
-            );
-            assert!(!active.truncated);
+            assert_eq!(handoff_messages(&active), expected, "{case:?}");
+            assert_eq!(active.truncated, new_link_delay.is_some(), "{case:?}");
             let search = omnis_core::trajectory_search_document(&snapshot);
-            assert!(search.source_complete);
+            assert_eq!(search.source_complete, new_link_delay.is_none(), "{case:?}");
             for text in [&search.text, &recovery_text(&snapshot)] {
-                assert_eq!(text.contains("Retained reply"), before);
+                assert_eq!(text.contains("Retained reply"), before, "{case:?}");
             }
         }
     }
@@ -727,23 +741,29 @@ fn a_retained_directory_with_a_missing_parent_still_identifies_its_verified_chec
     let mut rows = vec![
         message(1, 0, "user", json!("Original task")),
         directory_attachment(30, 90),
+        directory_attachment(31, 30),
         message(2, 1, "assistant", json!("Retained reply")),
     ];
     rows.extend(compaction(3, 2, &[2, 30]));
     rows.push(message(10, 0, "user", json!("Independent root")));
-    rows.push(message(11, 30, "user", json!("New request")));
-    for preview in [false, true] {
-        let snapshot = read_session(&rows, preview);
-        let active = import_trajectory(&snapshot);
-        assert_eq!(
-            handoff_messages(&active),
-            ["Summary 3", "Retained reply", "New request"]
-        );
-        let search = omnis_core::trajectory_search_document(&snapshot);
-        let recovery = recovery_text(&snapshot);
-        assert!(recovery.contains("Summary 3"));
-        for text in [&search.text, &recovery] {
-            assert!(text.contains("Retained reply") && !text.contains("Independent root"));
+    for parent in [30, 31] {
+        let mut rows = rows.clone();
+        rows.push(message(11, parent, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 3", "Retained reply", "New request"]
+            );
+            assert!(active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            let recovery = recovery_text(&snapshot);
+            assert!(recovery.contains("Summary 3"));
+            for text in [&search.text, &recovery] {
+                assert!(text.contains("Retained reply") && !text.contains("Independent root"));
+            }
         }
     }
 }

@@ -84,10 +84,9 @@ impl MarkerPaths {
     ) {
         let parent = raw_parent.filter(|p| p.order < record.order);
         self.paths.push(parent.map(|p| p.order));
-        let first_depth = if !record.branch.transparent
-            || record.branch.missing_ancestor
-            || (record.parent.is_some() && parent.is_none())
-        {
+        // A missing parent ends the known path above this record. It does not
+        // erase the observed links between this record and its later children.
+        let first_depth = if !record.branch.transparent {
             None
         } else if let Some(p) =
             parent.filter(|p| p.branch.transparent && p.branch.source == record.branch.source)
