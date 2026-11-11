@@ -58,25 +58,6 @@ pub use source_file::source_file_revision;
 pub use support::TranscriptReadLimit;
 pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
 
-/// Verifies a visible catalog row and its selected history in the configured Antigravity store.
-#[must_use]
-pub fn selected_antigravity_search_session(
-    session: &SessionRef,
-    path: &Path,
-) -> Option<NativeSession> {
-    match session.provider {
-        Provider::Antigravity => AntigravityAdapter::default()
-            .selected_session_at(&session.id, path)
-            .ok()
-            .flatten(),
-        Provider::AntigravityDesktop => AntigravityDesktopAdapter::default()
-            .selected_session_at(&session.id, path)
-            .ok()
-            .flatten(),
-        _ => None,
-    }
-}
-
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderInstallation {
@@ -262,6 +243,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// They must not include transcript content.
     fn discovery_notes(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Returns the canonical home whose native catalog this adapter uses for discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured home cannot be resolved.
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// Whether the last listing observed every eligible session across all projects.
@@ -461,6 +451,15 @@ impl AdapterRegistry {
     #[must_use]
     pub fn get(&self, provider: Provider) -> Option<&dyn ProviderAdapter> {
         self.adapters.get(&provider).map(Box::as_ref)
+    }
+
+    /// Returns the selected native home for providers with home-specific catalog caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolution error for an inaccessible or invalid native home.
+    pub fn discovery_cache_home(&self, provider: Provider) -> Result<Option<PathBuf>> {
+        Ok(self.adapter(provider)?.discovery_cache_home()?)
     }
 
     /// Returns registered provider adapter.

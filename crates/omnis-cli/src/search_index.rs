@@ -78,20 +78,9 @@ impl IndexCandidate {
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > FULL_READ_SOURCE_BYTES)
     }
 
-    fn file_matches(&self, revision: SourceRevision, registry: Option<&AdapterRegistry>) -> bool {
-        self.source_path.as_deref().is_some_and(|path| {
-            selected_file_matches(
-                &self.session,
-                path,
-                revision,
-                self.catalog.as_ref(),
-                registry,
-            )
-        })
-    }
-
-    pub(crate) fn record_failure(
+    fn record_failure(
         &self,
+        registry: &AdapterRegistry,
         store: &Store,
         guard: TrajectorySourceGuard,
     ) -> omnis_store::Result<()> {
@@ -105,41 +94,68 @@ impl IndexCandidate {
                 source_contents: self.source_revision.contents,
             },
             guard,
-            |_, revision| self.file_matches(revision, None),
+            |session, revision| {
+                selected_file_matches(
+                    registry,
+                    session,
+                    self.source_path.as_deref(),
+                    revision,
+                    guard,
+                    self.catalog.as_ref(),
+                )
+            },
         )
     }
 }
 
 pub(crate) fn selected_file_matches(
+    registry: &AdapterRegistry,
     session: &SessionRef,
-    path: &Path,
+    path: Option<&Path>,
     revision: SourceRevision,
+    guard: TrajectorySourceGuard,
     catalog: Option<&IndexedSession>,
-    registry: Option<&AdapterRegistry>,
 ) -> bool {
-    if matches!(
+    let Some(path) = path else { return false };
+    let antigravity = matches!(
         session.provider,
         Provider::Antigravity | Provider::AntigravityDesktop
-    ) {
-        let selected = if let Some(registry) = registry {
-            registry.adapter(session.provider).ok().and_then(|adapter| {
-                adapter
-                    .selected_session_at(&session.id, path)
-                    .ok()
-                    .flatten()
-            })
-        } else {
-            omnis_adapters::selected_antigravity_search_session(session, path)
-        };
-        return selected.is_some_and(|live| {
-            live.source_revision
-                .is_some_and(|observed| revision.matches_file_contents(observed))
-                && catalog
-                    .is_some_and(|expected| crate::indexed_session_metadata(&live) == *expected)
-        });
+    );
+    if antigravity || guard.has_competing_file(revision.file) {
+        // The provider can select an earlier file again while a reader has its duplicate open.
+        return registry
+            .adapter(session.provider)
+            .and_then(|adapter| adapter.selected_session_at(&session.id, path))
+            .is_ok_and(|native| {
+                native.is_some_and(|native| {
+                    native
+                        .source_revision
+                        .is_some_and(|source| source.matches_file_contents(revision))
+                        && (!antigravity
+                            || catalog.is_some_and(|expected| {
+                                crate::indexed_session_metadata(&native) == *expected
+                            }))
+                })
+            });
     }
     omnis_adapters::source_file_revision(path)
         .is_some_and(|current| current.matches_file_contents(revision))
+}
+
+/// Records a structural failure against the exact file examined by the full native reader.
+pub(crate) fn record_strict_read_failure<'read>(
+    registry: &AdapterRegistry,
+    store: &Store,
+    guard: TrajectorySourceGuard,
+    error: &'read anyhow::Error,
+) -> omnis_store::Result<Option<&'read NativeSession>> {
+    let Some(invalid) = error.downcast_ref::<omnis_adapters::InvalidPiTree>() else {
+        return Ok(None);
+    };
+    let candidate = IndexCandidate::from_session(&invalid.source)
+        .ok_or(omnis_store::StoreError::InvalidSessionReference)?;
+    candidate.record_failure(registry, store, guard)?;
+    Ok(Some(&invalid.source))
 }
 
 pub(crate) fn indexed_title(
@@ -323,8 +339,8 @@ fn read_budget(
     prior: Option<&TrajectoryIndexState>,
     failure: Option<&TrajectoryIndexFailure>,
 ) -> ReadBudget {
-    let retry_full =
-        failure.is_some_and(|failed| failed.matches_file_revision(candidate.source_revision));
+    // A rejected duplicate may disappear before a retry selects the original file.
+    let retry_full = failure.is_some() && candidate.source_revision.contents.is_some();
     // Read the full source when upgrading a document from a full or provider-limited read.
     let full = retry_full
         || prior.is_some_and(|state| {
@@ -594,18 +610,18 @@ pub(crate) fn index_candidates(
                 Err(error) => {
                     summary.failed += 1;
                     // Best effort: an unrecorded failure is only read again on the next pass.
-                    if !retryable_read_failure(&error)
-                        && !error.is::<omnis_adapters::TranscriptReadLimit>()
-                    {
-                        let recorded = candidate.record_failure(store, *guard);
-                        if matches!(
-                            recorded,
-                            Err(omnis_store::StoreError::TrajectorySourceChanged)
-                        ) && error.is::<omnis_adapters::InvalidPiTree>()
-                        {
+                    match record_strict_read_failure(registry, store, *guard, &error) {
+                        Err(omnis_store::StoreError::TrajectorySourceChanged) => {
                             // A preview may have won the write while the full reader rejected the file.
                             let _ = confirm_failed_file(registry, store, candidate);
                         }
+                        Ok(None)
+                            if !retryable_read_failure(&error)
+                                && !error.is::<omnis_adapters::TranscriptReadLimit>() =>
+                        {
+                            let _ = candidate.record_failure(registry, store, *guard);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -776,7 +792,7 @@ fn flush_batch(
             batch
                 .iter()
                 .find(|prepared| prepared.candidate.session == *session)
-                .is_some_and(|prepared| prepared.candidate.file_matches(revision, Some(registry)))
+                .is_some_and(|prepared| prepared.file_matches(registry, revision))
         })
     {
         summary.indexed += indexed;
@@ -785,7 +801,7 @@ fn flush_batch(
         }
     } else {
         for mut prepared in batch.drain(..) {
-            let mut stored = prepared.store(store);
+            let mut stored = prepared.store(registry, store);
             if matches!(
                 stored,
                 Err(omnis_store::StoreError::TrajectorySourceChanged)
@@ -794,7 +810,7 @@ fn flush_batch(
                 // the restored file or the file it replaced.
                 if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
                     prepared = fresh;
-                    stored = prepared.store(store);
+                    stored = prepared.store(registry, store);
                 }
             }
             if let Ok(indexed) = stored {
@@ -828,7 +844,7 @@ fn confirm_failed_file(
                 invalid.source.source_revision == Some(candidate.source_revision)
             })
     {
-        candidate.record_failure(store, guard)?;
+        record_strict_read_failure(registry, store, guard, &error)?;
     }
     Ok(())
 }
@@ -871,6 +887,9 @@ fn reread_after_conflict(
             store.trajectory_index_failure(session)?.as_ref(),
         ),
     )
+    .inspect_err(|error| {
+        let _ = record_strict_read_failure(registry, store, guard, error);
+    })
 }
 
 fn progress(
@@ -907,24 +926,41 @@ impl PreparedIndex {
     ) {
         if let Ok(mut records) = store.trajectory_title_records(Some(&self.candidate.session))
             && let Some(record) = records.remove(&self.candidate.session)
-            && (record.title.is_some() || record.verified_at.is_some())
+            && (record.title.is_some()
+                || record.verified_at.is_some()
+                || (record.source_revision.contents.is_some()
+                    && matches!(
+                        self.candidate.session.provider,
+                        Provider::Antigravity | Provider::AntigravityDesktop
+                    )))
         {
             titles.push((self.candidate.session, record));
         }
     }
 
-    fn store(&self, store: &Store) -> omnis_store::Result<usize> {
+    fn file_matches(&self, registry: &AdapterRegistry, revision: SourceRevision) -> bool {
+        selected_file_matches(
+            registry,
+            &self.candidate.session,
+            self.candidate.source_path.as_deref(),
+            revision,
+            self.guard,
+            self.candidate.catalog.as_ref(),
+        )
+    }
+
+    fn store(&self, registry: &AdapterRegistry, store: &Store) -> omnis_store::Result<usize> {
         if let Some(metadata) = &self.verified_metadata {
             return store.upsert_verified_session_document_checked(
                 metadata,
                 self.store_document(),
                 self.guard,
-                |_, revision| self.candidate.file_matches(revision, None),
+                |_, revision| self.file_matches(registry, revision),
             );
         }
         store.upsert_observed_trajectory_documents_checked(
             &[(&self.candidate.session, self.store_document(), self.guard)],
-            |_, revision| self.candidate.file_matches(revision, None),
+            |_, revision| self.file_matches(registry, revision),
         )
     }
 
@@ -1033,7 +1069,7 @@ fn prepare_session(
             .as_ref()
             .filter(|_| {
                 source_revision.file.is_some()
-                    && matches!(guard, TrajectorySourceGuard::Verified(_))
+                    && matches!(guard, TrajectorySourceGuard::Verified { .. })
             })
             .map(crate::indexed_session_metadata),
         candidate: selected,
@@ -1555,7 +1591,7 @@ mod tests {
                 let guard = store.observe_verified_session(&first.session).unwrap();
                 IndexCandidate::from_session(&first)
                     .unwrap()
-                    .record_failure(&store, guard)
+                    .record_failure(&registry, &store, guard)
                     .unwrap();
                 failed.set(first.source_revision);
             };
@@ -1592,6 +1628,98 @@ mod tests {
                 "{checkpoint}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn withdrawing_a_failed_duplicate_restores_the_original_full_search_document() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("sessions");
+        fs::create_dir(&root)?;
+        let header = json!({"type":"session","version":3,"id":"same","cwd":temp.path()});
+        let request = json!({"type":"message","id":"task","parentId":null,
+            "message":{"role":"user","content":"retainedoriginalneedle"}});
+        let original_dir = root.join("later");
+        fs::create_dir(&original_dir)?;
+        let file = original_dir.join("session.jsonl");
+        let padding = format!(
+            "{{\"type\":\"synthetic-padding\",\"text\":\"{}\"}}\n",
+            "x".repeat(65536)
+        );
+        let mut writer = std::io::BufWriter::new(File::create(&file)?);
+        writeln!(writer, "{header}")?;
+        for _ in 0..128 {
+            writer.write_all(padding.as_bytes())?;
+        }
+        writeln!(writer, "{request}")?;
+        for _ in 0..128 {
+            writer.write_all(padding.as_bytes())?;
+        }
+        writer.flush()?;
+        assert!(file.metadata()?.len() > FULL_READ_SOURCE_BYTES);
+        let store = Store::open(temp.path().join("state.db"))?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::PiAdapter::with_root(&root));
+        let selected = || -> Result<IndexCandidate> {
+            let native = registry.find_native_session(Provider::Pi, "same")?.unwrap();
+            Ok(IndexCandidate::from_session(&native).unwrap())
+        };
+        let original = selected()?;
+        let guard = store.observe_verified_session(&original.session)?;
+        let full = ReadBudget {
+            bytes: u64::MAX,
+            prior_search_bytes: None,
+        };
+        prepare_session(&registry, &original, guard, full)?.store(&registry, &store)?;
+        let duplicate_dir = root.join("first");
+        fs::create_dir(&duplicate_dir)?;
+        let duplicate = duplicate_dir.join("session.jsonl");
+        let mut broken = request;
+        broken["parentId"] = json!("missing");
+        fs::write(&duplicate, format!("{header}\n{broken}\n"))?;
+        let index = |retry| {
+            index_candidates(
+                &registry,
+                &store,
+                vec![selected()?],
+                retry,
+                &|| false,
+                &mut |_| {},
+            )
+        };
+        assert_eq!(index(false)?.failed, 1);
+        assert_eq!(index(false)?.failed_skipped, 1);
+        assert!(
+            store
+                .search_session_trajectories("retainedoriginalneedle", 1)?
+                .is_empty()
+        );
+
+        let withdrawn = temp.path().join("withdrawn");
+        fs::rename(&duplicate_dir, &withdrawn)?;
+        let guard = store.observe_verified_session(&original.session)?;
+        let delayed = prepare_session(&registry, &original, guard, full)?;
+        fs::rename(&withdrawn, &duplicate_dir)?;
+        assert!(matches!(
+            delayed.store(&registry, &store),
+            Err(omnis_store::StoreError::TrajectorySourceChanged)
+        ));
+        assert!(store.trajectory_index_failure(&original.session)?.is_some());
+
+        fs::remove_file(duplicate)?;
+        assert_eq!(index(false)?.failed, 0);
+        assert!(store.trajectory_index_failure(&original.session)?.is_none());
+        assert!(
+            store
+                .trajectory_index_state(&original.session)?
+                .unwrap()
+                .source_complete
+        );
+        assert_eq!(
+            store.search_session_trajectories("retainedoriginalneedle", 1)?,
+            [original.session]
+        );
+        assert_eq!(index(true)?.stale, 0);
         Ok(())
     }
 
@@ -1636,7 +1764,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .store(&store)
+                    .store(&registry, &store)
                     .unwrap();
                     assert!(
                         !store
@@ -1699,7 +1827,7 @@ mod tests {
                 prior_search_bytes: None,
             },
         )?
-        .store(&store)?;
+        .store(&registry, &store)?;
 
         let document = store.trajectory_index_state(session)?.unwrap();
         assert!(!document.source_complete && !document.provider_limited);
@@ -1813,7 +1941,9 @@ mod tests {
             true,
             (source_time.unwrap(), read.source_revision),
             guard,
-            read.native_session.as_ref(),
+            read.native_session
+                .as_ref()
+                .map(|native| (&registry, native)),
         )?;
         assert_eq!(store.trajectory_title(&session)?.as_deref(), Some("bravo"));
 

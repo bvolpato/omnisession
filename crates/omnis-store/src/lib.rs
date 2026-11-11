@@ -283,7 +283,6 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             WHEN excluded.provider IN ('antigravity', 'antigravity-desktop')
                 AND excluded.origin = 'native' AND excluded.source_file_id IS NOT NULL
                 AND excluded.document_version > session_trajectories.document_version
-                AND (excluded.source_complete OR excluded.provider_limited)
                 THEN excluded.derived_title
             -- A new OMP reader must verify names guessed by an older sample.
             WHEN excluded.provider = 'omp'
@@ -633,7 +632,10 @@ pub enum TrajectorySourceGuard {
     /// The indexed document observed before reading a source whose update time can repeat.
     ObservedDocument(Option<[u8; 32]>),
     /// The document and catalog observed before opening one native session.
-    Verified([u8; 32]),
+    Verified {
+        state: [u8; 32],
+        known_files: [Option<Uuid>; 3],
+    },
 }
 
 impl TrajectorySourceGuard {
@@ -653,6 +655,12 @@ impl TrajectorySourceGuard {
             )
     }
 
+    /// Whether the stored document, catalog, or failure identifies another physical file for this session.
+    #[must_use]
+    pub fn has_competing_file(self, file: Option<Uuid>) -> bool {
+        matches!((self, file), (Self::Verified { known_files, .. }, Some(file)) if known_files.into_iter().flatten().any(|known| known != file))
+    }
+
     fn check(
         self,
         transaction: &Transaction<'_>,
@@ -668,8 +676,8 @@ impl TrajectorySourceGuard {
                     Err(StoreError::TrajectorySourceChanged)
                 };
             }
-            Self::Verified(expected) => {
-                return if expected == verified_session_state(transaction, session)? {
+            Self::Verified { .. } => {
+                return if self == verified_session_state(transaction, session)? {
                     Ok(())
                 } else {
                     Err(StoreError::TrajectorySourceChanged)
@@ -890,7 +898,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         if !matches!(
             self.session.provider,
             Provider::Antigravity | Provider::AntigravityDesktop
-        ) || !matches!(self.guard, TrajectorySourceGuard::Verified(_))
+        ) || !matches!(self.guard, TrajectorySourceGuard::Verified { .. })
         {
             return Ok(None);
         }
@@ -1039,7 +1047,7 @@ fn validate_selected_catalog(
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
         || !TrajectorySourceGuard::uses_verified_catalog(session.provider)
-        || !matches!(guard, TrajectorySourceGuard::Verified(_))
+        || !matches!(guard, TrajectorySourceGuard::Verified { .. })
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete
             || (document.source_revision.file.is_some()
@@ -1073,7 +1081,10 @@ fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Opt
         .map_err(database_error)
 }
 
-fn verified_session_state(connection: &Connection, session: &SessionRef) -> Result<[u8; 32]> {
+fn verified_session_state(
+    connection: &Connection,
+    session: &SessionRef,
+) -> Result<TrajectorySourceGuard> {
     observed_file_state(connection, session, None).map(|(state, _)| state)
 }
 
@@ -1081,37 +1092,41 @@ fn observed_file_state(
     connection: &Connection,
     session: &SessionRef,
     file: Option<Uuid>,
-) -> Result<([u8; 32], bool)> {
+) -> Result<(TrajectorySourceGuard, bool)> {
     // A restored file can reuse its modification time. Observe content, coverage and catalog
     // together so another full reader cannot restore an obsolete title or workspace.
     let sql = format!(
         "SELECT json_array(?1, ?2, ({DOCUMENT_RECEIPT_SQL}),
-            (SELECT json_array(title, project_path, git_branch, created_at, updated_at,
-                 updated_at_approximate, event_count, source_updated_submillis,
-                 hex(source_file_id), hex(source_contents_id))
-             FROM session_index WHERE provider = ?1 AND session_id = ?2),
-            (SELECT json_array(source_updated_at, source_updated_submillis, document_version,
-                 hex(source_file_id), hex(source_contents_id))
-             FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2)),
-         CASE WHEN ?3 IS NULL THEN 0 ELSE EXISTS (
-           SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2 AND source_file_id != ?3
-           UNION ALL SELECT 1 FROM session_index WHERE provider = ?1 AND session_id = ?2 AND source_file_id != ?3
-           UNION ALL SELECT 1 FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2
-             AND source_contents_id IS NOT NULL AND source_file_id != ?3) END"
+            CASE WHEN catalog.provider IS NOT NULL THEN json_array(catalog.title, catalog.project_path,
+                catalog.git_branch, catalog.created_at, catalog.updated_at, catalog.updated_at_approximate,
+                catalog.event_count, catalog.source_updated_submillis, hex(catalog.source_file_id),
+                hex(catalog.source_contents_id)) END,
+            CASE WHEN failed.provider IS NOT NULL THEN json_array(failed.source_updated_at,
+                failed.source_updated_submillis, failed.document_version, hex(failed.source_file_id),
+                hex(failed.source_contents_id)) END),
+            doc.source_file_id, catalog.source_file_id,
+            CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END
+         FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
+         LEFT JOIN session_trajectories AS doc USING (provider, session_id)
+         LEFT JOIN session_index AS catalog USING (provider, session_id)
+         LEFT JOIN trajectory_index_failures AS failed USING (provider, session_id)"
     );
-    let (state, conflict): (String, bool) = connection
+    let guard = connection
         .prepare_cached(&sql)
         .map_err(database_error)?
-        .query_row(
-            params![
-                session.provider.to_string(),
-                session.id,
-                file.map(Uuid::into_bytes)
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            let state: String = row.get(0)?;
+            Ok(TrajectorySourceGuard::Verified {
+                state: Sha256::digest(state.as_bytes()).into(),
+                known_files: [
+                    optional_uuid(row, 1)?,
+                    optional_uuid(row, 2)?,
+                    optional_uuid(row, 3)?,
+                ],
+            })
+        })
         .map_err(database_error)?;
-    Ok((Sha256::digest(state.as_bytes()).into(), conflict))
+    Ok((guard, guard.has_competing_file(file)))
 }
 
 fn matches_catalog_row(connection: &Connection, metadata: &IndexedSession) -> Result<bool> {
@@ -2007,29 +2022,67 @@ impl Store {
         timestamp.map(timestamp_from_db).transpose()
     }
 
-    /// Checks for old search results or declared history that an earlier reader never indexed.
+    /// Returns the last completed provider-wide discovery for this reader and native home.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stored index versions cannot be read.
-    pub fn has_outdated_search_index(&self, provider: Provider, version: u32) -> Result<bool> {
-        self.connection
+    /// Returns an error when the completed check cannot be read.
+    pub fn completed_discovery_at(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let milliseconds = self
+            .connection
             .borrow()
             .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM session_index AS catalog
-                    LEFT JOIN session_trajectories AS document USING (provider, session_id)
-                    LEFT JOIN trajectory_index_failures AS failure USING (provider, session_id)
-                    WHERE catalog.provider = ?1
-                      AND (document.document_version IS NOT NULL OR failure.document_version IS NOT NULL
-                           OR (catalog.event_count > 0 AND catalog.source_file_id IS NULL))
-                      AND coalesce(document.document_version, 0) < ?2
-                      AND coalesce(failure.document_version, 0) < ?2
-                )",
-                params![provider.to_string(), version],
+                "SELECT lease.checked_at FROM session_index_reader_checks AS lease
+             JOIN session_index_discovery_results USING (provider, reader_version, attempt_id)
+             WHERE provider = ?1 AND reader_version = ?2 AND source_home = ?3 AND succeeded = 1",
+                params![
+                    provider.to_string(),
+                    version,
+                    home.as_os_str().as_encoded_bytes()
+                ],
                 |row| row.get(0),
             )
-            .map_err(database_error)
+            .optional()
+            .map_err(database_error)?;
+        milliseconds.map(timestamp_from_db).transpose()
+    }
+
+    /// Records a completed provider-wide read. A newer discovery can supersede an older reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the check cannot be published atomically.
+    pub fn record_completed_discovery(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let attempt = Uuid::new_v4().into_bytes();
+        let accepted = transaction.execute(
+            "INSERT INTO session_index_reader_checks(provider,reader_version,source_home,checked_at,attempt_id)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(provider,reader_version) DO UPDATE SET source_home=excluded.source_home,
+               checked_at=excluded.checked_at, attempt_id=excluded.attempt_id
+             WHERE session_index_reader_checks.checked_at < ?6",
+            params![provider.to_string(), version, home.as_os_str().as_encoded_bytes(), now_timestamp(), attempt, started_at.timestamp_millis()],
+        ).map_err(database_error)?;
+        if accepted != 0 {
+            transaction.execute(
+                "INSERT INTO session_index_discovery_results(provider,reader_version,attempt_id,succeeded) VALUES (?1,?2,?3,1)
+                 ON CONFLICT(provider,reader_version) DO UPDATE SET attempt_id=excluded.attempt_id,succeeded=1",
+                params![provider.to_string(), version, attempt],
+            ).map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
     }
 
     /// Records a provider-store check without replacing its last valid snapshot.
@@ -2492,7 +2545,6 @@ impl Store {
     pub fn observe_verified_session(&self, session: &SessionRef) -> Result<TrajectorySourceGuard> {
         validate_session_ref(session)?;
         verified_session_state(&self.connection.borrow(), session)
-            .map(TrajectorySourceGuard::Verified)
     }
 
     /// Captures the session state and checks whether its stored sources name a different file.
@@ -2507,7 +2559,6 @@ impl Store {
     ) -> Result<(TrajectorySourceGuard, bool)> {
         validate_session_ref(session)?;
         observed_file_state(&self.connection.borrow(), session, Some(file))
-            .map(|(state, conflict)| (TrajectorySourceGuard::Verified(state), conflict))
     }
 
     /// Publishes the native catalog and search document from the same selected source.
@@ -3372,11 +3423,6 @@ impl Store {
                     indexed_at INTEGER NOT NULL
                 ) WITHOUT ROWID;
 
-                CREATE TABLE IF NOT EXISTS session_index_checks (
-                    provider TEXT PRIMARY KEY,
-                    checked_at INTEGER NOT NULL
-                ) WITHOUT ROWID;
-
                 CREATE TABLE IF NOT EXISTS trajectory_index_failures (
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL CHECK (length(session_id) > 0),
@@ -3389,6 +3435,7 @@ impl Store {
                 ",
             )
             .map_err(database_error)?;
+        initialize_discovery_checks(&transaction)?;
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
@@ -3929,6 +3976,36 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
             "ALTER TABLE session_index
              ADD COLUMN updated_at_approximate INTEGER NOT NULL DEFAULT 0
              CHECK (updated_at_approximate IN (0, 1));",
+        )
+        .map_err(database_error)
+}
+
+fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_index_checks (
+            provider TEXT PRIMARY KEY,
+            checked_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS session_index_reader_checks (
+            provider TEXT NOT NULL,
+            reader_version INTEGER NOT NULL,
+            source_home BLOB NOT NULL,
+            checked_at INTEGER NOT NULL,
+            attempt_id BLOB NOT NULL,
+            PRIMARY KEY (provider, reader_version)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS session_index_discovery_results (
+            provider TEXT NOT NULL,
+            reader_version INTEGER NOT NULL,
+            attempt_id BLOB NOT NULL,
+            succeeded INTEGER NOT NULL CHECK (succeeded IN (0, 1)),
+            PRIMARY KEY (provider, reader_version),
+            FOREIGN KEY (provider, reader_version)
+                REFERENCES session_index_reader_checks(provider, reader_version) ON DELETE CASCADE
+        ) WITHOUT ROWID;",
         )
         .map_err(database_error)
 }
@@ -6124,18 +6201,46 @@ mod tests {
     }
 
     #[test]
+    fn discovery_check_applies_only_to_the_completed_reader_and_home() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let provider = Provider::Antigravity;
+        let a = directory.path().join("first");
+        let b = directory.path().join("second");
+        let start = Utc::now();
+        let read = |version, home: &Path| {
+            store
+                .completed_discovery_at(provider, version, home)
+                .unwrap()
+        };
+        let publish = |home: &Path, started| {
+            store
+                .record_completed_discovery(provider, 6, home, started)
+                .unwrap();
+        };
+
+        assert_eq!(read(6, &a), None);
+        publish(&a, start);
+        let first = read(6, &a).unwrap();
+        assert_eq!(read(5, &a), None);
+        assert_eq!(read(6, &b), None);
+        publish(&b, start - chrono::Duration::seconds(1));
+        assert_eq!(read(6, &a), Some(first));
+        assert_eq!(read(6, &b), None);
+        publish(&b, first + chrono::Duration::milliseconds(1));
+        assert!(read(6, &b).is_some());
+        assert_eq!(read(6, &a), None);
+    }
+
+    #[test]
     fn antigravity_search_upgrade_preserves_full_history_until_a_full_read() {
         let directory = tempdir().unwrap();
         let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
         let time = Utc::now();
         let later = time + chrono::Duration::seconds(1);
         for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
-            let mut listing = indexed_session(provider, "history", "History");
+            let listing = indexed_session(provider, "history", "History");
             store.upsert_indexed_session(&listing).unwrap();
-            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
-            listing.event_count = 2;
-            store.upsert_indexed_session(&listing).unwrap();
-            assert!(store.has_outdated_search_index(provider, 6).unwrap());
             let session = listing.session;
             let searchable = |text: &str| {
                 store
@@ -6153,7 +6258,6 @@ mod tests {
             store
                 .record_trajectory_index_failure(&session, &failure)
                 .unwrap();
-            assert!(store.has_outdated_search_index(provider, 6).unwrap());
             let write =
                 |text: &str, document_version, source_updated_at, source_complete, strategy| {
                     store
@@ -6191,7 +6295,6 @@ mod tests {
                 write("preview", 6, preview_time, false, "none");
                 let state = &store.trajectory_index_states().unwrap()[&session];
                 assert_eq!(state.document_version, 5);
-                assert!(store.has_outdated_search_index(provider, 6).unwrap());
                 assert!(searchable("middleword"));
             }
             if provider == Provider::Antigravity {
@@ -6220,7 +6323,6 @@ mod tests {
             }
             let state = &store.trajectory_index_states().unwrap()[&session];
             assert_eq!(state.document_version, 6);
-            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
             assert!(state.source_complete);
             assert!(searchable("upgradedword"));
         }

@@ -213,6 +213,10 @@ impl ProviderAdapter for AntigravityAdapter {
         Provider::Antigravity
     }
 
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        crate::support::discovery_home(self.root.as_deref())
+    }
+
     fn probe(&self) -> ProviderInstallation {
         let executable = provider_executable(Provider::Antigravity);
         let data_root = self.root.clone().filter(|root| root.is_dir());

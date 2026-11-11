@@ -151,10 +151,8 @@ impl IndexedSessionReader for AdapterRegistry {
                         continue;
                     }
                     if let Ok((_, guard)) = &observed
-                        && let Some(invalid) = error.downcast_ref::<omnis_adapters::InvalidPiTree>()
-                        && let Some(candidate) =
-                            search_index::IndexCandidate::from_session(&invalid.source)
-                        && let Err(write_error) = candidate.record_failure(&store, *guard)
+                        && let Err(write_error) =
+                            search_index::record_strict_read_failure(self, &store, *guard, &error)
                     {
                         if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
                             retry = false;
@@ -200,7 +198,7 @@ impl IndexedSessionReader for AdapterRegistry {
                     true,
                     (source_time, read.source_revision),
                     guard,
-                    read.native_session.as_ref(),
+                    read.native_session.as_ref().map(|native| (self, native)),
                 )
             {
                 if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
@@ -234,7 +232,7 @@ fn store_search_document(
     full_read: bool,
     source: (chrono::DateTime<Utc>, SourceRevision),
     guard: TrajectorySourceGuard,
-    native_session: Option<&NativeSession>,
+    native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
     let (source_updated_at, source_revision) = source;
     let origin = if session.provider == Provider::Imported {
@@ -261,12 +259,17 @@ fn store_search_document(
     let rewritten = if source_revision.file.is_some()
         || TrajectorySourceGuard::uses_file_time(session.provider)
     {
-        let native = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
+        let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
         let metadata = indexed_session_metadata(native);
-        let verify = |selected: &SessionRef, expected: SourceRevision| {
-            native.source_path.as_deref().is_some_and(|path| {
-                search_index::selected_file_matches(selected, path, expected, Some(&metadata), None)
-            })
+        let verify = |session: &SessionRef, expected: SourceRevision| {
+            search_index::selected_file_matches(
+                registry,
+                session,
+                native.source_path.as_deref(),
+                expected,
+                guard,
+                Some(&metadata),
+            )
         };
         store.upsert_verified_session_document_checked(&metadata, document, guard, verify)?
     } else {
@@ -355,6 +358,41 @@ fn index_with_interrupt(
         &|| interrupt.requested(),
         &mut |update| progress.update(&update),
     )
+}
+
+struct DiscoveryCheck {
+    provider: Provider,
+    home: PathBuf,
+    started_at: chrono::DateTime<Utc>,
+}
+
+impl DiscoveryCheck {
+    fn capture(registry: &AdapterRegistry, provider: Provider) -> Result<Option<Self>> {
+        let started_at = Utc::now();
+        Ok(registry.discovery_cache_home(provider)?.map(|home| Self {
+            provider,
+            home,
+            started_at,
+        }))
+    }
+
+    fn verify(&self, registry: &AdapterRegistry) -> Result<()> {
+        anyhow::ensure!(
+            registry.discovery_cache_home(self.provider)?.as_ref() == Some(&self.home),
+            "native home changed during discovery"
+        );
+        Ok(())
+    }
+
+    fn publish(&self, registry: &AdapterRegistry, store: &Store) -> Result<()> {
+        self.verify(registry)?;
+        Ok(store.record_completed_discovery(
+            self.provider,
+            omnis_core::search_document_version(self.provider),
+            &self.home,
+            self.started_at,
+        )?)
+    }
 }
 
 struct DiscoveredCatalog {
@@ -510,7 +548,14 @@ fn discover_sessions(
         let handles = providers
             .into_iter()
             .map(|provider| {
-                let observation = cache.map(|store| store.observe_session_catalog(provider));
+                let observation = cache.map(|store| {
+                    let check = if project.is_none() {
+                        DiscoveryCheck::capture(registry, provider)
+                    } else {
+                        Ok(None)
+                    };
+                    (store.observe_session_catalog(provider), check)
+                });
                 (
                     provider,
                     observation,
@@ -538,8 +583,20 @@ fn discover_sessions(
             .collect::<Vec<_>>()
     });
     for (provider, observation, mut result) in discovered {
-        if let (Some(store), Some(observed)) = (cache, observation) {
-            result = cache_provider_discovery(registry, store, provider, project, observed, result);
+        if let (Some(store), Some((observed, check))) = (cache, observation) {
+            result = check.and_then(|check| {
+                if let Some(check) = &check {
+                    check.verify(registry)?;
+                }
+                let (found, notes) =
+                    cache_provider_discovery(registry, store, provider, project, observed, result)?;
+                if notes.is_empty()
+                    && let Some(check) = check
+                {
+                    check.publish(registry, store)?;
+                }
+                Ok((found, notes))
+            });
         }
         match result {
             Ok((found, notes)) => {

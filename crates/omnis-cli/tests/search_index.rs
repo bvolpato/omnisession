@@ -176,7 +176,7 @@ fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog(
     index
         .execute_batch(
             "DROP TRIGGER preserve_chunks;
-        UPDATE session_trajectories SET document_version=4, source_file_id=NULL,
+        UPDATE session_trajectories SET document_version=4, source_complete=0, source_file_id=NULL,
             source_contents_id=NULL, derived_title='retiredlabel';",
         )
         .unwrap();
@@ -186,7 +186,9 @@ fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog(
     Connection::open(histories.join(format!("{id}.db")))
         .unwrap()
         .execute_batch(
-            "DELETE FROM steps WHERE idx=0;
+            "CREATE TABLE native_padding (data BLOB);
+            INSERT INTO native_padding VALUES (zeroblob(17825792));
+            DELETE FROM steps WHERE idx=0;
             UPDATE steps SET step_payload=x'080fa2010e0a0c726573746f726564776f7264' WHERE idx=1;",
         )
         .unwrap();

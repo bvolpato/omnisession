@@ -55,6 +55,49 @@ pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Optio
     Some(root)
 }
 
+pub(crate) fn discovery_home(root: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    root.map(|path| resolve_discovery_home(&std::path::absolute(path)?, &mut 40))
+        .transpose()
+}
+
+fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut resolved = loop {
+        match ancestor.canonicalize() {
+            Ok(physical) => break physical,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // A missing target can leave a readable symlink anywhere below the last existing ancestor.
+    for component in path.strip_prefix(ancestor).unwrap().components() {
+        let child = resolved.join(component);
+        match child.canonicalize() {
+            Ok(physical) => resolved = physical,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if component == std::path::Component::ParentDir {
+                    resolved.pop();
+                    continue;
+                }
+                match fs::read_link(&child) {
+                    Ok(target) => {
+                        *remaining_links = remaining_links.checked_sub(1).ok_or_else(|| {
+                            io::Error::other("too many symlinks in provider home")
+                        })?;
+                        resolved = resolve_discovery_home(&resolved.join(target), remaining_links)?;
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => resolved = child,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {

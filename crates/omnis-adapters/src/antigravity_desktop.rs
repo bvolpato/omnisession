@@ -127,6 +127,10 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         Provider::AntigravityDesktop
     }
 
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        crate::support::discovery_home(self.root.as_deref())
+    }
+
     fn probe(&self) -> ProviderInstallation {
         let data_root = self
             .root
