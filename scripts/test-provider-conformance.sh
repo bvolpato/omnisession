@@ -33,7 +33,7 @@ require_binary() {
         printf 'error: %s requires %s or %s\n' "$command_name conformance" "$variable" "$command_name" >&2
         exit 1
     fi
-    declare -gx "$variable=$binary"
+    export "$variable=$binary"
 }
 
 version_stub() {
@@ -58,7 +58,7 @@ ensure_version_stub() {
     fi
     local path
     path=$(version_stub "$name" "$(compatibility_value "$provider" minimum_version)")
-    declare -gx "$variable=$path"
+    export "$variable=$path"
 }
 
 ensure_cursor_ide_stub() {
@@ -164,9 +164,19 @@ case "$mode" in
             installed_ten_by_ten_cross_provider_matrix -- --ignored --exact --nocapture
         ;;
     replies)
-        cargo build --locked --package omnisession-cli
-        target_directory=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
-        uv run scripts/test-provider-replies.py "$target_directory/debug/omni" "$OMNI_TEST_CODEX_BIN" "$OMNI_TEST_CLAUDE_BIN"
+        omni_binary=$(
+            cargo build --locked --package omnisession-cli --bin omni --message-format=json-render-diagnostics |
+                python3 -c '
+import json, sys
+paths = [
+    artifact["executable"] for artifact in map(json.loads, sys.stdin)
+    if artifact.get("executable") and artifact["target"]["name"] == "omni"
+]
+if len(paths) != 1:
+    sys.exit("expected Cargo to report one omni executable")
+print(paths[0])'
+        )
+        uv run scripts/test-provider-replies.py "$omni_binary" "$OMNI_TEST_CODEX_BIN" "$OMNI_TEST_CLAUDE_BIN"
         ;;
     adapters)
         cargo test --locked --package omnisession-adapters --tests
