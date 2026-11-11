@@ -1481,7 +1481,13 @@ fn select_picker_row(
                 } else {
                     "Saved workspace is unavailable."
                 };
-                match pick_workspace(&session, project_path.as_deref(), current_project, reason)? {
+                match pick_workspace(
+                    &session,
+                    choice.provider,
+                    project_path.as_deref(),
+                    current_project,
+                    reason,
+                )? {
                     WorkspaceOutcome::Selected(path) => Some(path),
                     WorkspaceOutcome::Back => return Ok(RowSelection::Back),
                     WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
@@ -1638,6 +1644,7 @@ enum WorkspaceOutcome {
 
 fn pick_workspace(
     source: &SessionRef,
+    target: Provider,
     original: Option<&Path>,
     current: &Path,
     reason: &str,
@@ -1669,15 +1676,21 @@ fn pick_workspace(
             KeyCode::Esc => return Ok(WorkspaceOutcome::Back),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
                 let path = resolve_workspace_input(&input, current);
-                if !path.is_dir() {
-                    message.clear();
-                    message.push_str("Folder does not exist or is not a directory.");
-                    continue;
+                let folder = if target == Provider::CursorIde {
+                    omnis_core::cursor_launch_folder(&path)
+                } else if path.is_dir() {
+                    Some(
+                        path.canonicalize()
+                            .context("resolving selected workspace")?,
+                    )
+                } else {
+                    None
+                };
+                if let Some(folder) = folder {
+                    return Ok(WorkspaceOutcome::Selected(folder));
                 }
-                return path
-                    .canonicalize()
-                    .map(WorkspaceOutcome::Selected)
-                    .context("resolving selected workspace");
+                message.clear();
+                message.push_str("Folder does not exist or is not a directory.");
             }
             KeyCode::Tab => {
                 let completion = complete_directory_input(&input, current);

@@ -80,6 +80,18 @@ pub fn local_cursor_workspace_path(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(read_local_workspace(path)?.map(|workspace| workspace.physical))
 }
 
+/// Returns a local folder as Cursor will name it in a workspace URI. A symlink keeps its own ID.
+#[must_use]
+pub fn cursor_launch_folder(path: &Path) -> Option<PathBuf> {
+    let folder = normalized_local(path)?;
+    #[cfg(windows)]
+    let folder = folder
+        .to_str()
+        .and_then(crate::ordinary_windows_path)
+        .map_or(folder, PathBuf::from);
+    resolve_local_path(&folder)?.is_dir().then_some(folder)
+}
+
 fn read_local_workspace(path: &Path) -> io::Result<Option<LocalWorkspace>> {
     let Some(physical) = resolve_local_path(path) else {
         return Ok(None);

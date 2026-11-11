@@ -127,7 +127,8 @@ fn build_with_roots(
     if !cwd.is_absolute() {
         bail!("Cursor IDE native import requires an absolute workspace path");
     }
-    let cwd = fs::canonicalize(cwd).context("canonicalizing Cursor IDE target workspace")?;
+    let cwd = omnis_core::cursor_launch_folder(cwd)
+        .context("Cursor IDE native import requires an available local destination folder")?;
     let metadata_root =
         fs::canonicalize(metadata_root).context("canonicalizing Cursor IDE metadata directory")?;
     let database = safe_database_path(&metadata_root)?;
@@ -2006,7 +2007,7 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
         else {
             continue;
         };
-        if fs::canonicalize(recorded).is_ok_and(|recorded| recorded == cwd) {
+        if recorded == cwd {
             let id = entry
                 .file_name()
                 .to_str()
@@ -2223,6 +2224,37 @@ mod tests {
             exact_workspace_id(&root, &workspace).expect("resolved workspace record"),
             native
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn import_uses_the_same_linked_folder_as_the_ide_launcher() {
+        let fixture = fixture_store();
+        let folder = fixture.workspace.canonicalize().expect("workspace");
+        let linked = folder.with_file_name("linked");
+        std::os::unix::fs::symlink(&folder, &linked).expect("linked workspace");
+        let snapshot = fixture_snapshot(&folder);
+        let import =
+            build_with_root(&snapshot, &linked, fixture.root.clone()).expect("plan linked import");
+        assert_eq!(
+            import.workspace_id,
+            cursor_workspace_id(&linked).expect("linked ID")
+        );
+        assert_ne!(
+            import.workspace_id,
+            cursor_workspace_id(&folder).expect("physical ID")
+        );
+        assert!(!opens_imported_chat(&import));
+        let args = launch_args(&linked, &import.target).expect("folder launch");
+        assert_eq!(
+            args[1],
+            native_path::file_uri(&linked).expect("linked folder URI")
+        );
+        materialize_store(&import).expect("write the synthetic chat");
+        let reopened = CursorIdeAdapter::with_root(&fixture.root)
+            .read_session(&import.target)
+            .expect("read the stored chat");
+        assert_eq!(reopened.workspace.root, linked);
     }
 
     fn assert_mutation_waits<F>(metadata_root: &Path, configured_locks: &Path, mutation: F)

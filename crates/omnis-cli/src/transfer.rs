@@ -876,6 +876,10 @@ fn selected_workspace(
     selection: &session_picker::PickerSelection,
 ) -> Result<PathBuf> {
     if let Some(chosen) = &selection.workspace_override {
+        if selection.target.provider == Provider::CursorIde {
+            return omnis_core::cursor_launch_folder(chosen)
+                .context("the selected Cursor IDE destination is not an available local folder");
+        }
         return Ok(workspace_root(chosen)?);
     }
     let listed = omnis_core::canonicalize_path(

@@ -4201,6 +4201,16 @@ mod tests {
         let current = tempfile::tempdir().expect("current workspace");
         let current_path = omnis_core::canonicalize_path(current.path()).expect("current path");
         let chosen_path = omnis_core::canonicalize_path(chosen.path()).expect("chosen path");
+        let service = chosen_path.join("service");
+        std::fs::create_dir(&service).expect("destination directory");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&chosen_path)
+                .status()
+                .expect("initialize destination repository")
+                .success()
+        );
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),
@@ -4227,7 +4237,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(chosen_path.clone()),
+            workspace_override: Some(service.clone()),
         };
 
         assert_eq!(
@@ -4250,7 +4260,22 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            omnis_core::canonicalize_path(chosen.path()).expect("chosen path")
+            chosen_path
+        );
+        let cursor = PickerSelection {
+            target: Provider::CursorIde.into(),
+            ..selection
+        };
+        assert_eq!(
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                false,
+                Some(&cursor)
+            )
+            .expect("selected Cursor IDE folder"),
+            service
         );
     }
 

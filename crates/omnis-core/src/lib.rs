@@ -4,8 +4,8 @@ mod cursor_workspace;
 mod recovery;
 
 pub use cursor_workspace::{
-    SessionWorkspaceMatcher, cursor_workspace_matches, local_cursor_workspace_path,
-    session_workspace_matches,
+    SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
+    local_cursor_workspace_path, session_workspace_matches,
 };
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
@@ -3344,7 +3344,7 @@ pub fn build_cursor_workspace_report(
     repository_matches: bool,
 ) -> FidelityReport {
     let mut missing = false;
-    let mut missing_composer = false;
+    let mut composer_issue = None;
     let mut unverified = false;
     let mut has_messages = false;
     let mut blob_composer = false;
@@ -3371,9 +3371,20 @@ pub fn build_cursor_workspace_report(
             {
                 match event.payload["reason"].as_str() {
                     Some("missing_bubble") => missing = true,
-                    Some("missing_composer_data") => {
+                    Some("missing_cursor_disk_kv_table" | "missing_composer_data") => {
                         missing = true;
-                        missing_composer = true;
+                        composer_issue = Some(
+                            "The original composer is missing from the local Cursor IDE store.",
+                        );
+                    }
+                    Some("invalid_composer_data") => {
+                        unverified = true;
+                        composer_issue = Some("The original composer contains unreadable JSON.");
+                    }
+                    Some("missing_full_conversation_headers") => {
+                        unverified = true;
+                        composer_issue =
+                            Some("OmniSession could not verify the saved composer format.");
                     }
                     _ => unverified = true,
                 }
@@ -3423,14 +3434,14 @@ pub fn build_cursor_workspace_report(
         );
     }
     if blob_composer {
+        composer_issue = Some("The original composer is unavailable in Cursor IDE.");
         report.warnings.push("Cursor IDE cannot load this chat because its composer JSON is stored as a SQLite BLOB. Use `omni export` to recover records OmniSession can read.".to_owned());
     } else if blob_bubbles {
         report.warnings.push("Cursor IDE cannot load conversation records stored as SQLite BLOBs. Use `omni export` to recover records OmniSession can read.".to_owned());
     }
-    report.entries.push(cursor_chat_selection(
-        &snapshot.session.id,
-        blob_composer || missing_composer,
-    ));
+    report
+        .entries
+        .push(cursor_chat_selection(&snapshot.session.id, composer_issue));
     report
 }
 
@@ -3460,9 +3471,9 @@ fn cursor_tool_fidelity(stored_as_blob: bool, incomplete: bool) -> FidelityEntry
     }
 }
 
-fn cursor_chat_selection(id: &str, unavailable_composer: bool) -> FidelityEntry {
-    let detail = if unavailable_composer {
-        "The original composer is unavailable in Cursor IDE. Use `omni export` to recover the records OmniSession can read.".to_owned()
+fn cursor_chat_selection(id: &str, composer_issue: Option<&str>) -> FidelityEntry {
+    let detail = if let Some(reason) = composer_issue {
+        format!("{reason} Use `omni export` to recover the records OmniSession can read.")
     } else {
         format!(
             "Select `{}` from Show Chat History in Cursor IDE.",

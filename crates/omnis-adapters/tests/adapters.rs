@@ -474,6 +474,45 @@ fn cursor_ide_recovers_messages_from_blob_json_that_the_ide_cannot_load() {
 }
 
 #[test]
+fn cursor_ide_distinguishes_missing_storage_from_unreadable_composer_json() {
+    use omnis_ir::FidelityStatus;
+
+    let temporary = TempDir::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    for (change, feature, expected) in [
+        (
+            "UPDATE cursorDiskKV SET value='{' WHERE key='composerData:root-composer'",
+            "Unverified native conversation records",
+            FidelityStatus::Unsupported,
+        ),
+        (
+            "DROP TABLE cursorDiskKV",
+            "Missing native conversation records",
+            FidelityStatus::Omitted,
+        ),
+    ] {
+        connection.execute_batch(change).unwrap();
+        let snapshot = adapter.read_session(&session).unwrap();
+        let report = omnis_core::build_cursor_workspace_report(&snapshot, true);
+        let entry = |name| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.feature == name)
+                .unwrap()
+        };
+        assert_eq!(entry(feature).status, expected);
+        let guidance = entry("Exact chat selection").detail.as_deref().unwrap();
+        assert!(guidance.contains("omni export"), "{guidance}");
+        assert!(!guidance.contains("Show Chat History"), "{guidance}");
+    }
+}
+
+#[test]
 fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace-a");
