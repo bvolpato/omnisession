@@ -200,6 +200,18 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Returns cached Codex sessions that their current state database entries rule out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current entries cannot be read.
+    fn unavailable_codex_rollouts(
+        &self,
+        _prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
+
     /// Reads one provider-native session into canonical events.
     ///
     /// # Errors

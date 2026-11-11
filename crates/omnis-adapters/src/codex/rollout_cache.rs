@@ -77,7 +77,7 @@ pub(super) struct ObservedRollout {
 
 impl ObservedRollout {
     pub(super) fn read(path: &Path) -> Option<Self> {
-        super::rollout_identity::ids(path)?;
+        super::rollout_file::jsonl_file_name(path)?;
         let canonical = fs::canonicalize(path).ok()?;
         let path_id = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,

@@ -527,7 +527,7 @@ fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result
 }
 
 #[test]
-fn a_damaged_parent_history_mode_requires_an_archive_matching_its_messages() -> anyhow::Result<()> {
+fn a_damaged_parent_header_requires_an_archive_matching_its_messages() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     let day = "sessions/2026/01/01";
     let stamp = "2026-01-01T00-00-00";
@@ -546,8 +546,6 @@ fn a_damaged_parent_history_mode_requires_an_archive_matching_its_messages() -> 
         stamp,
         &parent,
     );
-    let damaged = encoded(&parent).replace("history_mode", "history_mnde");
-    fs::write(&active, &damaged)?;
     let adapter = CodexAdapter::with_root(home.path());
     let child = SessionRef::new(Provider::Codex, CHILD);
     let check = |expected: &[&str], partial: bool| -> anyhow::Result<()> {
@@ -573,14 +571,27 @@ fn a_damaged_parent_history_mode_requires_an_archive_matching_its_messages() -> 
         );
         Ok(())
     };
-    fs::write(
-        &archive,
-        encoded(&parent).replace("source request", "forged request"),
-    )?;
+    let intact = encoded(&parent);
+    for damaged in [
+        intact.replacen("history_mode", "history_mnde", 1),
+        intact.replacen(r#""type":"session_meta""#, r#""tyqe":"session_meta""#, 1),
+        intact.replacen("session_meta", "session_meua", 1),
+        intact.replacen(r#""payload":{"#, r#""qayload":{"#, 1),
+    ] {
+        fs::write(&active, &damaged)?;
+        fs::write(&archive, intact.replace("source request", "forged request"))?;
+        check(&["child request"], true)?;
+        fs::write(&archive, &intact)?;
+        check(&["source request", "child request"], false)?;
+        assert_eq!(fs::read_to_string(&active)?, damaged);
+    }
+    let mut ambiguous = parent.clone();
+    let meta = ambiguous[0].as_object_mut().unwrap();
+    let payload = meta.remove("payload").unwrap();
+    meta.insert("first".into(), payload.clone());
+    meta.insert("second".into(), payload);
+    fs::write(&active, encoded(&ambiguous))?;
     check(&["child request"], true)?;
-    fs::write(&archive, encoded(&parent))?;
-    check(&["source request", "child request"], false)?;
-    assert_eq!(fs::read_to_string(&active)?, damaged);
     assert_eq!(fs::read_to_string(&leaf)?, encoded(&leaf_rows));
     Ok(())
 }
@@ -765,6 +776,55 @@ fn a_missing_data_ordinal_requires_agreement_with_the_rows_in_the_parent() -> an
             .contains("ordinal")
     );
     assert_eq!(fs::read_to_string(&leaf)?, encoded(&child));
+    Ok(())
+}
+
+#[test]
+fn a_missing_subagent_ordinal_can_cover_reserved_positions() -> anyhow::Result<()> {
+    for has_next in [false, true] {
+        let home = tempfile::tempdir()?;
+        let (root, day, stamp) = (home.path(), "sessions/2026/01/01", "2026-01-01T00-00-00");
+        let mut meta = header(PARENT, 0, None);
+        meta["payload"]["subagent_history_start_ordinal"] = 4.into();
+        let mut parent = vec![
+            meta,
+            turn(1, "user", "copied ask"),
+            turn(2, "assistant", "copied answer"),
+            turn(4, "user", "local ask"),
+        ];
+        let mut expected = vec!["local ask"];
+        if has_next {
+            parent.push(turn(5, "assistant", "local reply"));
+            expected.push("local reply");
+        }
+        expected.push("child");
+        let end = if has_next { 6 } else { 5 };
+        let mut child = [
+            header(CHILD, end, Some(bookmark(PARENT, &parent))),
+            turn(end + 1, "user", "child"),
+        ];
+        let preferred = write(root, day, PARENT, PARENT, stamp, &parent);
+        let archive = write(root, "archived_sessions", PARENT, PARENT, stamp, &parent);
+        let leaf = write(root, day, CHILD, CHILD, stamp, &child);
+        let original = encoded(&parent);
+        let key = "\"ordinal\":4,";
+        let missing = original.replace(key, &" ".repeat(key.len()));
+        fs::write(&preferred, &missing)?;
+        check_parent_messages(root, &expected, false)?;
+        fs::write(&archive, original.replace("local ask", "other ask"))?;
+        check_parent_messages(root, &["child"], true)?;
+        fs::remove_file(archive)?;
+        check_parent_messages(root, &["child"], true)?;
+
+        // Even the largest legal reservation cannot reach this cutoff.
+        child[0]["payload"]["history_base"]["end_ordinal_exclusive"] = (end + 1).into();
+        child[0]["ordinal"] = (end + 1).into();
+        child[1]["ordinal"] = (end + 2).into();
+        fs::write(leaf, encoded(&child))?;
+        let error = read(root, false).unwrap_err();
+        assert!(error.to_string().contains("cutoffs disagree"), "{error:#}");
+        assert_eq!(fs::read_to_string(preferred)?, missing);
+    }
     Ok(())
 }
 

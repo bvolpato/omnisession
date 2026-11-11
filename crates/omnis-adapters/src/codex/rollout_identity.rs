@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use omnis_ir::SourceRevision;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::Value;
@@ -48,7 +49,7 @@ pub(super) fn rollout_id(path: &Path) -> Option<&str> {
     ids(path).map(|(_, rollout)| rollout)
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum HistoryMode {
     Legacy,
@@ -65,10 +66,73 @@ impl HistoryMode {
     }
 }
 
+fn native_header_mode(header: &Value) -> Option<HistoryMode> {
+    let meta = &header["payload"];
+    let mode = meta
+        .get("history_mode")
+        .map_or(Some(HistoryMode::Legacy), HistoryMode::read)?;
+    (mode != HistoryMode::Legacy || meta["history_base"].is_null()).then_some(mode)
+}
+
 pub(super) fn damaged_paginated_mode(header: &Value) -> bool {
     // Codex writes numeric ordinals only in paginated rollouts.
     let mode = &header["payload"]["history_mode"];
     header["ordinal"].is_u64() && HistoryMode::read(mode).is_none()
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) enum HeaderIdentity {
+    Unique,
+    Ambiguous,
+}
+
+pub(super) fn header_identity(header: &Value, thread: &str) -> Option<HeaderIdentity> {
+    if let Some(payload) = header.get("payload") {
+        return (payload["id"].as_str() == Some(thread)).then_some(HeaderIdentity::Unique);
+    }
+    if header["type"] != "session_meta" || !header["ordinal"].is_u64() {
+        return None;
+    }
+    let mut count = 0;
+    let mut matches_thread = false;
+    for value in header.as_object()?.values() {
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if HistoryMode::is_paginated(&value["history_mode"]) && Uuid::try_parse(id).is_ok() {
+            count += 1;
+            matches_thread |= id == thread;
+        }
+    }
+    matches_thread.then_some(if count == 1 {
+        HeaderIdentity::Unique
+    } else {
+        HeaderIdentity::Ambiguous
+    })
+}
+
+pub(super) fn damaged_header_type(header: &Value) -> bool {
+    // A body record's declared type takes precedence over extra metadata-like fields.
+    header["ordinal"].is_u64()
+        && HistoryMode::is_paginated(&header["payload"]["history_mode"])
+        && !matches!(
+            header["type"].as_str(),
+            Some(
+                "session_meta"
+                    | "dynamic_tools_updated"
+                    | "response_item"
+                    | "inter_agent_communication"
+                    | "inter_agent_communication_metadata"
+                    | "compacted"
+                    | "turn_context"
+                    | "token_usage_record"
+                    | "world_state"
+                    | "security_risk_score"
+                    | "retained_context"
+                    | "event_msg"
+                    | "realtime_item"
+            )
+        )
 }
 
 fn timestamp(path: &Path) -> Option<&str> {
@@ -106,6 +170,17 @@ pub(super) struct RolloutSelector {
     snapshot: SqliteSnapshotCache,
     immutable_paths: Mutex<HashMap<String, PathBuf>>,
 }
+
+#[derive(Debug)]
+pub(super) struct Unavailable(String);
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unavailable {}
 
 impl RolloutSelector {
     pub(super) fn from_env() -> Self {
@@ -184,7 +259,19 @@ impl RolloutSelector {
         if !same_native_copy(&native, selected)? {
             return Ok(false);
         }
+        let Some((_, header)) = CodexSession::selected_header(selected, id)? else {
+            return Ok(false);
+        };
+        let Some(mode) = native_header_mode(&header) else {
+            return Ok(false);
+        };
         if let Some(row) = current {
+            if row.archived
+                || row.paginated != Some(mode == HistoryMode::Paginated)
+                || (!row.canonical_name() && mode == HistoryMode::Paginated)
+            {
+                return Ok(false);
+            }
             let Some(name) = rollout_file::jsonl_file_name(&row.path) else {
                 return Ok(false);
             };
@@ -199,7 +286,7 @@ impl RolloutSelector {
             if let Some(recorded) = native_representation(home, &row.path) {
                 return Ok(same_native_copy(&recorded, selected)?);
             }
-            if row.paginated
+            if row.paginated == Some(true)
                 || rollout_file::jsonl_file_name(&row.path)
                     == rollout_file::jsonl_file_name(selected)
             {
@@ -369,46 +456,150 @@ impl RolloutSelector {
         self.rows_in(&self.sqlite_home.resolve(home)?, ids)
     }
 
+    pub(super) fn unavailable(
+        &self,
+        home: &Path,
+        scan: &CodexFileScan,
+        prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        let rows = self.current_rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
+        let catalog = self.listing(home, []);
+        let mut unavailable = HashSet::new();
+        for (id, revision) in prior {
+            let (Some(row), Some(file)) = (rows.get(id), revision.and_then(|source| source.file))
+            else {
+                continue;
+            };
+            // Older catalog entries do not record CODEX_HOME. Only retire a file observed in this home.
+            let matches = |path: &Path| super::CodexAdapter::index_file_id(path) == Some(file);
+            if !scan.paths(home, id).any(matches)
+                && matching_sibling(home, &row.path, matches).is_none()
+            {
+                continue;
+            }
+            match Candidates::new(home).resolve(home, id, Some(row), Some(&catalog)) {
+                Err(error) if error.is::<Unavailable>() => {
+                    unavailable.insert(id.clone());
+                }
+                Ok(Some(selected))
+                    if super::CodexAdapter::index_file_id(&selected)
+                        .is_some_and(|current| current != file) =>
+                {
+                    unavailable.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(unavailable)
+    }
+
     fn rows_in<'a>(
         &self,
         root: &Path,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, SelectedRollout>> {
-        let Some(database) = provider_file(root, &root.join("state_5.sqlite")) else {
-            return Ok(HashMap::new());
-        };
+        self.read_threads(root, |connection| {
+            let (has_mode, has_archived): (bool, bool) = connection.query_row(
+                "SELECT max(name='history_mode'), max(name='archived') FROM pragma_table_info('threads')", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mode = if has_mode {
+                "CASE history_mode WHEN 'legacy' THEN 0 WHEN 'paginated' THEN 1 END"
+            } else {
+                "0"
+            };
+            let archived = if has_archived { "archived IS NOT 0" } else { "0" };
+            let query = format!("SELECT rollout_path, {mode}, {archived} FROM threads WHERE id=?1");
+            let mut statement = connection.prepare(&query)?;
+            let mut selected = HashMap::new();
+            for id in ids {
+                let pointer = statement.query_row([id], |row| Ok(SelectedRollout {
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    paginated: row.get(1)?,
+                    archived: row.get(2)?,
+                })).optional()?;
+                if let Some(pointer) = pointer {
+                    selected.insert(id.to_owned(), pointer);
+                }
+            }
+            Ok(selected)
+        })
+    }
+
+    fn read_threads<T: Default>(
+        &self,
+        root: &Path,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        let database = root.join("state_5.sqlite");
+        match fs::symlink_metadata(&database) {
+            Ok(meta) => anyhow::ensure!(
+                meta.is_file(),
+                "Codex state database must be a regular file"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+            Err(error) => return Err(error).context("locating the Codex state database"),
+        }
         self.snapshot
             .read(root, &database, |connection| {
-                // Older state databases predate paginated history.
-                let has_history_mode: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads')
-                                   WHERE name = 'history_mode')",
-                    [],
-                    |row| row.get(0),
-                )?;
-                let query = if has_history_mode {
-                    "SELECT rollout_path, history_mode = 'paginated' FROM threads WHERE id = ?1"
-                } else {
-                    "SELECT rollout_path, 0 FROM threads WHERE id = ?1"
+                let kind: Option<String> = connection
+                    .query_row(
+                        "SELECT type FROM sqlite_schema WHERE name='threads' COLLATE NOCASE",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(kind) = kind else {
+                    return Ok(T::default());
                 };
-                let mut statement = connection.prepare(query)?;
-                let mut selected = HashMap::new();
-                for id in ids {
-                    let pointer = statement
-                        .query_row([id], |row| {
-                            Ok(SelectedRollout {
-                                path: PathBuf::from(row.get::<_, String>(0)?),
-                                paginated: row.get(1)?,
-                            })
-                        })
-                        .optional()?;
-                    if let Some(pointer) = pointer {
-                        selected.insert(id.to_owned(), pointer);
-                    }
-                }
-                Ok(selected)
+                anyhow::ensure!(kind == "table", "Codex threads must be a table");
+                read(connection)
             })
             .context("reading the current Codex rollouts from the state database")
+    }
+
+    pub(super) fn custom_ids_for_listing(
+        &self,
+        home: &Path,
+        files: &[PathBuf],
+    ) -> Result<Vec<String>> {
+        let names: HashSet<_> = files
+            .iter()
+            .filter(|path| !canonical_filename(path))
+            .filter_map(|path| Some(path.with_file_name(rollout_file::jsonl_file_name(path)?)))
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let canonical_home = home.canonicalize()?;
+        self.read_threads(&self.sqlite_home.resolve(home)?, |connection| {
+            let mut statement = connection.prepare("SELECT id, rollout_path FROM threads WHERE typeof(id)='text' AND typeof(rollout_path)='text'")?;
+            let mut rows = statement.query([])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                let recorded = Path::new(row.get_ref(1)?.as_str()?);
+                let Ok(relative) = recorded
+                    .strip_prefix(home)
+                    .or_else(|_| recorded.strip_prefix(&canonical_home))
+                else {
+                    continue;
+                };
+                let Some(name) = rollout_file::jsonl_file_name(recorded) else {
+                    continue;
+                };
+                if names.contains(&home.join(relative).with_file_name(name)) {
+                    let id = row.get_ref(0)?.as_str()?;
+                    if Uuid::parse_str(id).is_ok() {
+                        anyhow::ensure!(
+                            ids.len() < super::SCAN_LIMIT,
+                            "too many Codex state rows refer to the discovered custom rollout files"
+                        );
+                        ids.push(id.to_owned());
+                    }
+                }
+            }
+            Ok(ids)
+        })
     }
 }
 
@@ -447,7 +638,14 @@ impl super::CodexAdapter {
 
 struct SelectedRollout {
     path: PathBuf,
-    paginated: bool,
+    paginated: Option<bool>,
+    archived: bool,
+}
+
+impl SelectedRollout {
+    fn canonical_name(&self) -> bool {
+        recorded_file_name(&self.path).is_some_and(canonical_filename)
+    }
 }
 
 pub(super) struct RolloutCatalog<'a> {
@@ -545,7 +743,10 @@ impl RolloutCatalog<'_> {
             .map_err(|message| anyhow!("{message}"))?;
         let current = rows.get(id);
         if let (Some(best), Some(current)) = (&candidates.best, current)
-            && (!current.paginated || candidates.best_paginated)
+            && current.canonical_name()
+            && current
+                .paginated
+                .is_some_and(|mode| !mode || candidates.best_paginated)
             && best.parent() == current.path.parent()
             && rollout_file::jsonl_file_name(best).and_then(Path::file_name)
                 == rollout_file::jsonl_file_name(&current.path).and_then(Path::file_name)
@@ -753,20 +954,106 @@ fn matching_header(path: &Path, id: &str, paginated: bool) -> bool {
 // An unreadable or damaged parent can still constrain the choice of a backup. The lineage
 // reader compares the surviving rows before it can accept a different physical file.
 fn immutable_mode(path: &Path) -> Result<Option<bool>> {
-    match CodexSession::observed_header(path) {
-        Ok(header) => Ok(header.and_then(|(session, record)| {
-            (session.is_paginated || damaged_paginated_mode(&record))
-                .then_some(session.is_paginated)
-        })),
+    let revision = super::CodexAdapter::index_file_revision(path);
+    let records = match rollout_file::header(path) {
+        Ok(records) => records,
         Err(error)
             if error
                 .downcast_ref::<io::Error>()
                 .is_some_and(|e| e.kind() == io::ErrorKind::PermissionDenied) =>
         {
-            Ok(Some(false))
+            return Ok(Some(false));
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    anyhow::ensure!(
+        revision.is_some() && super::CodexAdapter::index_file_revision(path) == revision,
+        "selected Codex rollout changed during header lookup"
+    );
+    let Some(header) = records.first() else {
+        return Ok(None);
+    };
+    let Some(thread) = thread_id(path) else {
+        return Ok(None);
+    };
+    if header_identity(header, thread).is_none() {
+        return Ok(None);
     }
+    if header.get("payload").is_none() || damaged_header_type(header) {
+        return Ok(Some(false));
+    }
+    let paginated = HistoryMode::is_paginated(&header["payload"]["history_mode"]);
+    Ok(
+        (header["type"] == "session_meta" && (paginated || damaged_paginated_mode(header)))
+            .then_some(paginated),
+    )
+}
+
+fn selected_custom_file(
+    home: &Path,
+    current: &SelectedRollout,
+    id: &str,
+    paginated: bool,
+) -> Result<PathBuf> {
+    let missing = || {
+        Unavailable(format!(
+            "the selected Codex rollout is missing, incompatible, or ambiguous for thread `{id}`. Restore the file recorded by Codex before continuing."
+        ))
+    };
+    if !managed_recording(home, &current.path)
+        || (paginated
+            && !ids(&current.path).is_some_and(|(owner, rollout)| owner == id && rollout != id))
+    {
+        return Err(missing().into());
+    }
+    let name = rollout_file::jsonl_file_name(&current.path).ok_or_else(missing)?;
+    let plain = current.path.with_file_name(name);
+    let gzip = current.path.extension().is_some_and(|ext| ext == "gz");
+    let candidates = [
+        plain.clone(),
+        plain.with_extension("jsonl.zst"),
+        plain.with_extension("jsonl.gz"),
+    ];
+    for candidate in candidates
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "gz") == gzip)
+    {
+        if !managed_recording(home, candidate) {
+            return Err(missing().into());
+        }
+        match fs::symlink_metadata(candidate) {
+            Ok(meta) if meta.is_file() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .context("checking the file selected by the Codex state database");
+            }
+            Ok(_) => return Err(missing().into()),
+        }
+        let path = managed_path(home, candidate).ok_or_else(missing)?;
+        let selected = CodexSession::selected_header(&path, id).map_err(|error| {
+            if error.is::<rollout_file::CompressedHeaderError>() {
+                error.context(missing())
+            } else {
+                error
+            }
+        })?;
+        let (_, header) = selected.ok_or_else(missing)?;
+        let mode = if paginated {
+            HistoryMode::Paginated
+        } else {
+            HistoryMode::Legacy
+        };
+        let payload = &header["payload"];
+        let owner = payload
+            .get("id")
+            .or_else(|| (!paginated).then(|| &payload["session_id"]));
+        if owner.and_then(Value::as_str) != Some(id) || native_header_mode(&header) != Some(mode) {
+            return Err(missing().into());
+        }
+        return Ok(path);
+    }
+    Err(missing().into())
 }
 
 fn matching_sibling(
@@ -950,22 +1237,33 @@ impl Candidates {
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Option<PathBuf>> {
         if let Some(current) = current {
+            let paginated = current
+                .paginated
+                .ok_or_else(|| Unavailable("the selected Codex rollout is missing, incompatible, or ambiguous because the state row declares an unsupported history mode".to_owned()))?;
+            if !current.canonical_name() {
+                return selected_custom_file(home, current, id, paginated).map(Some);
+            }
+            anyhow::ensure!(
+                recorded_file_name(&current.path).and_then(thread_id) == Some(id),
+                Unavailable("the selected Codex rollout is missing, incompatible, or ambiguous because the state row names a different thread".to_owned())
+            );
             let managed = managed_recording(home, &current.path);
             let path = if managed {
-                compatible_copy(home, &current.path, id, current.paginated).or_else(|| {
+                compatible_copy(home, &current.path, id, paginated).or_else(|| {
                     let moved = moved_recording(home, &current.path)?;
-                    compatible_copy(home, &moved, id, current.paginated)
+                    compatible_copy(home, &moved, id, paginated)
                 })
             } else {
-                relocated_rollout(home, &current.path, id, current.paginated, catalog)?
+                relocated_rollout(home, &current.path, id, paginated, catalog)?
             };
             if let Some(path) = path {
                 return Ok(Some(path));
             }
-            if current.paginated {
-                bail!(
+            if paginated || ids(&current.path).is_some_and(|(thread, rollout)| thread != rollout) {
+                return Err(Unavailable(format!(
                     "the selected rollout for paginated Codex thread `{id}` is missing or invalid"
-                );
+                ))
+                .into());
             }
         }
         Ok(self.filesystem_choice(home, IdKind::Thread))

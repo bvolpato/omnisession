@@ -52,6 +52,20 @@ const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
+/// First native Codex search projection that checks the visible subagent history boundary.
+pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 10;
+
+/// Returns the search document generation written by the current native provider reader.
+#[must_use]
+pub const fn search_document_version(provider: Provider) -> u32 {
+    match provider {
+        Provider::Codex if SEARCH_DOCUMENT_VERSION < CODEX_DISPLAY_DOCUMENT_VERSION => {
+            CODEX_DISPLAY_DOCUMENT_VERSION
+        }
+        _ => SEARCH_DOCUMENT_VERSION,
+    }
+}
+
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",

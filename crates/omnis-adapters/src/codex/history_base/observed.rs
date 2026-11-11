@@ -90,8 +90,29 @@ fn matching_header(mut first: Value, other: &Value) -> bool {
     if first == *other {
         return true;
     }
-    if first["type"] != "session_meta" || !other["ordinal"].is_u64() {
+    if other["type"] != "session_meta" || !other["ordinal"].is_u64() {
         return false;
+    }
+    if first.get("payload").is_none() {
+        let Some(id) = other["payload"]["id"].as_str() else {
+            return false;
+        };
+        if super::rollout_identity::header_identity(&first, id)
+            != Some(super::rollout_identity::HeaderIdentity::Unique)
+            || !restore_field(&mut first, other, "payload")
+        {
+            return false;
+        }
+    }
+    if first["type"] != "session_meta" {
+        if !super::rollout_identity::damaged_header_type(&first) {
+            return false;
+        }
+        if first.get("type").is_some() {
+            first["type"] = other["type"].clone();
+        } else if !restore_field(&mut first, other, "type") {
+            return false;
+        }
     }
     if super::rollout_identity::damaged_paginated_mode(&first)
         && (!super::HistoryMode::is_paginated(&other["payload"]["history_mode"])

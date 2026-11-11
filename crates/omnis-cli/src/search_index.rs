@@ -19,7 +19,7 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, IndexSessionReader, NativeSession};
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title,
+    SearchDocument, search_document_version, session_search_title,
     session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
@@ -74,6 +74,14 @@ impl IndexCandidate {
         error: &anyhow::Error,
     ) -> Option<IndexedTrajectoryTitle> {
         let revision = self.source_revision;
+        if self.session.provider == Provider::Codex
+            && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error)
+        {
+            if let Err(error) = crate::remove_unavailable_session(registry, store, &self.session) {
+                eprintln!("warning: local trajectory index write: {error}");
+            }
+            return None;
+        }
         if retryable_read_failure(error)
             || (self.session.provider == Provider::Codex
                 && self.selected_codex(registry, revision).is_none())
@@ -84,7 +92,7 @@ impl IndexCandidate {
             source_updated_at: self.updated_at,
             source_file: revision.file,
             source_contents: revision.contents,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(self.session.provider),
         };
         store
             .record_observed_trajectory_index_failure(&self.session, &failure, guard)
@@ -178,7 +186,7 @@ pub(crate) fn projection_read_budget(
     };
     let same_revision = |old: Option<_>, new| old.zip(new).is_none_or(|(a, b)| a == b);
     if prior.source_complete
-        && prior.document_version < SEARCH_DOCUMENT_VERSION
+        && prior.document_version < search_document_version(Provider::Codex)
         && updated_at.is_some_and(|timestamp| {
             !source_time_changed(Provider::Codex, timestamp, prior.source_updated_at)
         })
@@ -220,7 +228,7 @@ fn needs_index_at(
     };
     revision.file != state.source_revision.file
         || revision.contents != state.source_revision.contents
-        || state.document_version < SEARCH_DOCUMENT_VERSION
+        || state.document_version < search_document_version(candidate.session.provider)
         || candidate.updated_at.is_some_and(|updated_at| {
             source_time_changed(
                 candidate.session.provider,
@@ -242,7 +250,7 @@ fn failure_is_current(
 ) -> bool {
     revision.file == failure.source_file
         && revision.contents == failure.source_contents
-        && failure.document_version >= SEARCH_DOCUMENT_VERSION
+        && failure.document_version >= search_document_version(candidate.session.provider)
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
                 updated_at.timestamp_millis() == failed_source.timestamp_millis()
@@ -253,6 +261,9 @@ fn failure_is_current(
 /// Whether a read failed only because a database was busy or a source changed while it was read,
 /// so a later pass can succeed even when the source time does not move.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
+    if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error) {
+        return true;
+    }
     error.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::Error>()
@@ -1003,7 +1014,7 @@ impl PreparedIndex {
             source_complete: self.source_complete,
             source_revision: self.source_revision,
             origin: self.origin,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(self.candidate.session.provider),
             derived_title: self.title.current.as_deref(),
             withdrawn_title: self.title.withdrawn.as_deref(),
             title_is_verified: self.title.is_verified(),
@@ -1220,6 +1231,7 @@ mod tests {
         let time = Utc::now();
         let old_file = SourceRevision {
             file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(3)),
             ..SourceRevision::default()
         };
         let other_file = SourceRevision {
@@ -1232,7 +1244,7 @@ mod tests {
                     source_updated_at: time,
                     source_revision: stored,
                     source_complete: true,
-                    document_version: 0,
+                    document_version: omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1,
                 })),
                 Some(updated_at),
                 selected,
@@ -1241,6 +1253,11 @@ mod tests {
         assert_eq!(budget(SourceRevision::default(), old_file, time), u64::MAX);
         assert_eq!(budget(old_file, old_file, time), u64::MAX);
         assert_eq!(budget(old_file, other_file, time), FULL_READ_SOURCE_BYTES);
+        let changed = SourceRevision {
+            contents: Some(uuid::Uuid::from_u128(4)),
+            ..old_file
+        };
+        assert_eq!(budget(old_file, changed, time), FULL_READ_SOURCE_BYTES);
         assert_eq!(
             budget(old_file, old_file, time - chrono::Duration::days(1)),
             FULL_READ_SOURCE_BYTES
@@ -1254,7 +1271,7 @@ mod tests {
             source_updated_at: now,
             source_revision: SourceRevision::default(),
             source_complete: true,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
         let mut small = candidate(Some(now), None);
         small.session.provider = Provider::Claude;
@@ -1299,7 +1316,7 @@ mod tests {
             source_updated_at: now,
             source_revision: candidate(Some(now), Some(path.clone())).source_revision,
             source_complete: false,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(!needs_index(
@@ -1340,7 +1357,7 @@ mod tests {
             source_file: None,
             source_contents: None,
             source_updated_at: Some(now),
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(failure_is_current(

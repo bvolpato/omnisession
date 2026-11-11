@@ -43,16 +43,13 @@ impl Dataset {
     fn create(document_count: usize) -> Self {
         let dataset = Self::empty();
         let store = dataset.open();
-        let source_updated_at = benchmark_timestamp();
 
         for index in 0..document_count {
             let session = SessionRef::new(Provider::Codex, format!("benchmark-{index}"));
             store
-                .upsert_session_trajectory(
+                .upsert_trajectory_document(
                     &session,
-                    &synthetic_document(index),
-                    source_updated_at,
-                    true,
+                    &trajectory_document(&synthetic_document(index)),
                 )
                 .expect("index synthetic trajectory");
         }
@@ -199,7 +196,7 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         truncation_strategy: "none",
         source_complete: true,
         origin: SessionTrajectoryOrigin::Native,
-        document_version: 1,
+        document_version: omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
         derived_title: None,
         title_is_verified: false,
         withdrawn_title: None,
@@ -233,15 +230,13 @@ fn synthetic_head_tail_document() -> String {
 
 fn index_head_tail_document(store: &Store, document: &str) {
     store
-        .upsert_session_trajectory_document(
+        .upsert_trajectory_document(
             &SessionRef::new(Provider::Codex, "ten-mib-head-tail"),
-            document,
-            benchmark_timestamp(),
-            HEAD_TAIL_INDEXED_BYTES + 2 * MEBIBYTE,
-            HEAD_TAIL_INDEXED_BYTES,
-            "document_head_tail",
-            true,
-            SessionTrajectoryOrigin::Native,
+            &TrajectoryDocument {
+                source_byte_count: HEAD_TAIL_INDEXED_BYTES + 2 * MEBIBYTE,
+                truncation_strategy: "document_head_tail",
+                ..trajectory_document(document)
+            },
         )
         .expect("index ten MiB head-tail document");
 }

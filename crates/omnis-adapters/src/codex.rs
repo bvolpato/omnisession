@@ -128,6 +128,12 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Returns whether the selected rollout could be identified as missing or incompatible.
+    #[must_use]
+    pub fn is_current_rollout_unavailable(error: &anyhow::Error) -> bool {
+        error.is::<rollout_identity::Unavailable>()
+    }
+
     /// A leaf rollout cannot supply the history stored in an unresolved ancestor.
     #[must_use]
     pub fn has_unavailable_ancestry(snapshot: &omnis_ir::CanonicalSnapshot) -> bool {
@@ -299,7 +305,10 @@ impl CodexAdapter {
             unreadable_files += 1;
             first_unreadable.get_or_insert_with(|| compact_discovery_error(error));
         };
-        for siblings in physical_rollouts(&scan.files).into_values() {
+        for ((_, name), siblings) in physical_rollouts(&scan.files) {
+            if rollout_identity::thread_id(name).is_none() {
+                continue;
+            }
             for path in siblings {
                 match listed_session(path, cache.as_mut()) {
                     Ok(Some(session)) => {
@@ -315,6 +324,14 @@ impl CodexAdapter {
             }
         }
         if let Some(home) = &self.codex_home {
+            match self.selector.custom_ids_for_listing(home, &scan.files) {
+                Ok(ids) => {
+                    for id in ids {
+                        by_thread.entry(id).or_default();
+                    }
+                }
+                Err(error) => unreadable(&error),
+            }
             let catalog = self
                 .selector
                 .listing(home, by_thread.keys().map(String::as_str));
@@ -330,7 +347,7 @@ impl CodexAdapter {
                     if let Some(session) = versions.into_iter().find(|s| s.path == path) {
                         return Ok(Some(session));
                     }
-                    listed_session(&path, cache.as_mut())
+                    Ok(CodexSession::selected_header(&path, &id)?.map(|(session, _)| session))
                 });
                 match result {
                     Ok(Some(mut session)) if !session.is_subagent => {
@@ -366,8 +383,7 @@ impl CodexAdapter {
     }
 
     fn read_metadata(&self, id: &str, path: &Path) -> Result<CodexSession> {
-        let mut session = CodexSession::parse_metadata_path_result(path)?
-            .filter(|session| session.id == id)
+        let (mut session, _) = CodexSession::selected_header(path, id)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
         if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
@@ -906,18 +922,29 @@ impl CodexSession {
     }
 
     fn observed_header(path: &Path) -> Result<Option<(Self, Value)>> {
+        let Some(id) = rollout_identity::thread_id(path) else {
+            return Ok(None);
+        };
+        Self::selected_header(path, id)
+    }
+
+    fn selected_header(path: &Path, id: &str) -> Result<Option<(Self, Value)>> {
         let observed = ObservedRollout::read(path)
             .context("selected Codex rollout changed during header lookup")?;
-        Self::header_with_observation(path, observed)
+        Self::header_with_observation(path, observed, id)
     }
 
     fn parse_with_observation(path: &Path, observed: ObservedRollout) -> Result<Option<Self>> {
-        Ok(Self::header_with_observation(path, observed)?.map(|(session, _)| session))
+        let Some(id) = rollout_identity::thread_id(path) else {
+            return Ok(None);
+        };
+        Ok(Self::header_with_observation(path, observed, id)?.map(|(session, _)| session))
     }
 
     fn header_with_observation(
         path: &Path,
         observed: ObservedRollout,
+        expected: &str,
     ) -> Result<Option<(Self, Value)>> {
         let records = rollout_file::header(path)?;
         anyhow::ensure!(
@@ -925,7 +952,7 @@ impl CodexSession {
             "selected Codex rollout changed during header lookup"
         );
         Ok(records.into_iter().next().and_then(|header| {
-            Self::parse_metadata_record(path.to_path_buf(), &header, observed)
+            Self::parse_metadata_record(path.to_path_buf(), &header, observed, expected)
                 .map(|session| (session, header))
         }))
     }
@@ -934,6 +961,7 @@ impl CodexSession {
         path: PathBuf,
         record: &Value,
         observed: ObservedRollout,
+        expected: &str,
     ) -> Option<Self> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
@@ -941,7 +969,10 @@ impl CodexSession {
         let payload = record.get("payload")?;
         let id = string_at(payload, &[&["id"], &["session_id"]])?;
         Uuid::parse_str(id).ok()?;
-        if rollout_identity::thread_id(&path) != Some(id) {
+        if id != expected
+            || (rollout_identity::thread_id(&path) != Some(id)
+                && rollout_identity::canonical_filename(&path))
+        {
             return None;
         }
         let history_base = HistoryBase::from_header(&path, record);
@@ -1038,8 +1069,8 @@ impl CodexSession {
         cached_header: bool,
     ) -> NativeSession {
         let mut session = self.native_session();
-        // A leaf file alone cannot identify an inherited workspace across changes to its ancestors.
-        if !self.history_base.is_some()
+        // A file stamp alone does not prove which inherited or copied turns supplied the workspace.
+        if !self.needs_visible_projection()
             && let Some(revision) = self.observed_revision
             && let Some(workspace) = revision.file.and_then(|file| workspaces.get(&file))
             && revision.matches_file_contents(workspace.source_revision)
@@ -2139,6 +2170,20 @@ impl ProviderAdapter for CodexAdapter {
         self.codex_home.as_deref().is_some_and(Path::is_dir) && self.listing().notes.is_empty()
     }
 
+    fn unavailable_codex_rollouts(
+        &self,
+        prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        let Some(home) = self.codex_home.as_deref().filter(|path| path.is_dir()) else {
+            return Ok(HashSet::new());
+        };
+        if prior.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let (scan, _) = self.session_scan(None);
+        self.selector.unavailable(home, &scan, prior)
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let workspaces = self
             .use_workspace_index
@@ -2170,14 +2215,12 @@ impl ProviderAdapter for CodexAdapter {
         let Some(path) = self.session_path(id)? else {
             return Ok(None);
         };
-        let Some(mut session) =
-            CodexSession::parse_metadata_path_result(&path)?.filter(|session| session.id == id)
-        else {
+        let Some((mut session, _)) = CodexSession::selected_header(&path, id)? else {
             return Ok(None);
         };
         session.title = self.title_index().titles.get(id).cloned();
         if self.use_workspace_index
-            && !session.history_base.is_some()
+            && !session.needs_visible_projection()
             && let Some(file) = session.observed_revision.and_then(|revision| revision.file)
             && let Ok(workspaces) = omnis_store::CodexWorkspace::read_index(Some(file))
         {
@@ -2210,8 +2253,11 @@ impl ProviderAdapter for CodexAdapter {
         if !provider_selects_path {
             return Ok(NativeResumeSupport::ImportOnly);
         }
-        let (native, header) = CodexSession::observed_header(&path)?
+        let (native, header) = CodexSession::selected_header(&path, &session.id)?
             .context("Codex rollout has invalid session metadata")?;
+        if native.subagent_history_start.is_some() && !native.is_paginated {
+            return Ok(NativeResumeSupport::ImportOnly);
+        }
         if native.is_paginated
             && (!header["payload"]["cwd"].is_string()
                 || !rollout_identity::canonical_filename(&path))
@@ -2492,6 +2538,49 @@ mod tests {
             listed_projects(),
             [Some(PathBuf::from("/workspace/renamed-longer"))]
         );
+    }
+
+    #[test]
+    fn indexed_workspace_cannot_restore_a_subagents_copied_directory() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let sessions = home.path().join("sessions");
+        fs::create_dir(&sessions)?;
+        let id = "019a3b1c-0000-7000-8000-000000000001";
+        let path = sessions.join(format!("rollout-2026-09-15T10-00-00-{id}.jsonl"));
+        for (mode_key, cutoff, expected) in [
+            ("history_mode", None, "/copied"),
+            ("history_mode", Some(3), "/creation"),
+            ("history_mxde", Some(3), "/creation"),
+        ] {
+            let header = json!({"type":"session_meta","ordinal":0,"payload":{
+                "id":id,"cwd":"/creation",(mode_key):"paginated","subagent_history_start_ordinal":cutoff
+            }});
+            let turn =
+                |n, cwd: &str| json!({"type":"turn_context","ordinal":n,"payload":{"cwd":cwd}});
+            fs::write(
+                &path,
+                format!("{header}\n{}\n{}\n", turn(1, "/copied"), turn(3, "/local")),
+            )?;
+            let session = CodexSession::parse_metadata_path_result(&path)?.unwrap();
+            let revision = session.observed_revision.unwrap();
+            let cached = omnis_store::CodexWorkspace {
+                source_revision: revision,
+                project_path: Some(PathBuf::from("/copied")),
+                git_branch: None,
+            };
+            let cache = HashMap::from([(revision.file.unwrap(), cached)]);
+            assert_eq!(
+                session
+                    .indexed_workspace(&cache, true)
+                    .project_path
+                    .as_deref(),
+                Some(Path::new(expected))
+            );
+            let adapter = CodexAdapter::with_root(home.path());
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            assert_eq!(snapshot.workspace.current_dir, Path::new("/local"));
+        }
+        Ok(())
     }
 
     #[test]

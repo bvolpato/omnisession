@@ -61,7 +61,12 @@ fn assert_selected(home: &Path, chosen: &Path, hint: &Path, text: &str) -> Resul
 fn assert_unavailable(home: &Path, abandoned: &Path) -> Result<()> {
     let adapter = CodexAdapter::with_root(home);
     let session = SessionRef::new(Provider::Codex, THREAD);
-    assert!(adapter.list_sessions(None)?.is_empty());
+    assert!(
+        adapter
+            .list_sessions(None)?
+            .iter()
+            .all(|row| row.session != session)
+    );
     assert!(adapter.find_native_session(THREAD).ok().flatten().is_none());
     assert!(adapter.read_session(&session).is_err());
     assert!(adapter.preview_session(&session).is_err());
@@ -120,7 +125,14 @@ fn damaged_active_zstd_header_does_not_hide_a_readable_archived_rollout() -> Res
         "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
         [THREAD, backup.to_str().unwrap()],
     )?;
-    assert_selected(home.path(), &backup, &backup, "restored conversation")?;
+    assert_unavailable(home.path(), &backup)?;
+    let physical = active.join(format!("backup-{THREAD}_{SELECTED}.jsonl"));
+    fs::rename(&backup, &physical)?;
+    db.execute(
+        "UPDATE threads SET rollout_path=?1",
+        [physical.to_str().unwrap()],
+    )?;
+    assert_selected(home.path(), &physical, &physical, "restored conversation")?;
     Ok(())
 }
 
@@ -474,5 +486,122 @@ fn switching_the_configured_state_database_selects_its_current_generation() -> R
     fs::write(config, "sqlite_home = 1234")?;
     let error = adapter.read_session(&session).unwrap_err();
     assert!(format!("{error:#}").contains("sqlite_home"));
+    Ok(())
+}
+
+#[test]
+fn a_database_selected_custom_legacy_file_requires_its_recorded_owner() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().canonicalize()?;
+    let active = home.join("sessions/2026/01/01");
+    fs::create_dir_all(&active)?;
+    let manual = active.join("import.jsonl");
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let source = rollout("selected legacy text").replace("\"paginated\"", "\"legacy\"");
+    fs::write(&manual, &source)?;
+    assert!(
+        CodexAdapter::with_root(&home)
+            .list_sessions(None)?
+            .is_empty()
+    );
+
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1,?2,'legacy')",
+        [THREAD, manual.to_str().unwrap()],
+    )?;
+    let adapter = CodexAdapter::with_root(&home);
+    assert_eq!(
+        adapter.list_sessions(None)?[0].source_path.as_ref(),
+        Some(&manual)
+    );
+    assert_eq!(
+        adapter.native_resume_support(&session)?,
+        NativeResumeSupport::Direct
+    );
+
+    let stale = home
+        .join("archived_sessions")
+        .join(format!("rollout-2025-01-01T00-00-00-{THREAD}.jsonl"));
+    fs::create_dir_all(stale.parent().unwrap())?;
+    fs::write(&stale, rollout("retired generation"))?;
+    let read = adapter.index_session(&session, Some(&stale), u64::MAX)?;
+    assert!(
+        read.snapshot
+            .events
+            .iter()
+            .any(|event| event.payload["text"] == "selected legacy text")
+    );
+    fs::write(&manual, source.replace(THREAD, ABANDONED))?;
+    assert_unavailable(&home, &stale)?;
+    let prior = CodexAdapter::index_file_revision(&stale).unwrap();
+    let adapter = CodexAdapter::with_root(&home);
+    assert!(
+        adapter
+            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(prior))])?
+            .contains(THREAD)
+    );
+    let other_home = tempfile::tempdir()?;
+    let other = other_home.path().join(stale.file_name().unwrap());
+    fs::copy(&stale, &other)?;
+    let foreign_source = CodexAdapter::index_file_revision(&other).unwrap();
+    assert!(
+        adapter
+            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(foreign_source))])?
+            .is_empty()
+    );
+    let foreign = active.join(format!("rollout-2026-01-01T00-00-00-{ABANDONED}.jsonl"));
+    fs::rename(&manual, &foreign)?;
+    db.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+        [foreign.to_str().unwrap(), THREAD],
+    )?;
+    assert_unavailable(&home, &stale)?;
+    assert_eq!(
+        CodexAdapter::with_root(&home).list_sessions(None)?[0]
+            .session
+            .id,
+        ABANDONED
+    );
+    Ok(())
+}
+
+#[test]
+fn only_a_supported_flat_header_can_resume_as_legacy() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let active = home.join("sessions/2026/01/01");
+    fs::create_dir_all(&active)?;
+    let path = active.join(format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"));
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    for (declared, support) in [
+        (json!({}), NativeResumeSupport::Direct),
+        (
+            json!({"history_mode":"future"}),
+            NativeResumeSupport::ImportOnly,
+        ),
+        (
+            json!({"history_mode":null}),
+            NativeResumeSupport::ImportOnly,
+        ),
+        (
+            json!({"history_mode":"legacy","history_base":{"thread_id":SELECTED,"end_ordinal_exclusive":1,"end_byte_offset":100}}),
+            NativeResumeSupport::ImportOnly,
+        ),
+    ] {
+        let mut payload = declared;
+        payload["id"] = json!(THREAD);
+        fs::write(
+            &path,
+            format!("{}\n", json!({"type":"session_meta","payload":payload})),
+        )?;
+        assert_eq!(
+            CodexAdapter::with_root(home).native_resume_support(&session)?,
+            support
+        );
+    }
     Ok(())
 }

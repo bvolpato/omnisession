@@ -37,7 +37,11 @@ toml.workspace = true
 wait-timeout.workspace = true
 zstd.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+
 [target.'cfg(windows)'.dependencies]
+dunce.workspace = true
 known-folders.workspace = true
 winapi-util.workspace = true
 winreg.workspace = true

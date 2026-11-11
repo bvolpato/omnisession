@@ -21,6 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 ctrlc = "3.5"
 directories = "6.0"
+dunce = "1.0.5"
 flate2 = "1.1"
 fs2 = "0.4"
 hex = "0.4"
@@ -28,6 +29,7 @@ known-folders = "1.4.2"
 # Safe Rust only: the decoder reads bytes from the local store, which another program could change.
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 md-5 = "0.11"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFPreferences", "CFString"] }
 prost = "0.14"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 rusqlite = { version = "0.41", features = ["bundled", "chrono"] }

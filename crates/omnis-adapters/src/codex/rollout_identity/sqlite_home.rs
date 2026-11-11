@@ -20,6 +20,8 @@ use super::super::rollout_cache::RolloutStamp;
 pub(super) struct SqliteHome {
     environment: Option<PathBuf>,
     system_config: Option<PathBuf>,
+    #[cfg(any(target_os = "macos", test))]
+    macos_preference_is_forced: Option<fn(&str, &str) -> bool>,
     #[cfg(windows)]
     use_system_registry: bool,
     config: Mutex<HashMap<PathBuf, CachedConfig>>,
@@ -77,6 +79,8 @@ impl SqliteHome {
         Self {
             environment,
             system_config: Some(system_config_path()),
+            #[cfg(target_os = "macos")]
+            macos_preference_is_forced: Some(policy::macos_preference_is_forced),
             #[cfg(windows)]
             use_system_registry: true,
             ..Self::default()
@@ -93,6 +97,10 @@ impl SqliteHome {
         cwd: &Path,
         overrides: &CodexLaunchOverrides,
     ) -> Result<PathBuf> {
+        #[cfg(any(target_os = "macos", test))]
+        if let Some(is_forced) = self.macos_preference_is_forced {
+            policy::check_macos_preferences(is_forced)?;
+        }
         let managed = self.legacy_managed_config()?;
         let settings = merge_settings(
             self.settings(home, overrides.profile.as_deref())?,

@@ -2917,12 +2917,25 @@ mod tests {
                     ],
                 )
                 .expect("seed cached metadata");
+            let text = "synthetic unobserved history";
             store
-                .upsert_session_trajectory(
+                .upsert_trajectory_document(
                     &omitted.session,
-                    "synthetic unobserved history",
-                    Utc::now(),
-                    true,
+                    &omnis_store::TrajectoryDocument {
+                        redacted_text: text,
+                        source_updated_at: Utc::now(),
+                        source_revision: omnis_ir::SourceRevision::default(),
+                        source_byte_count: text.len(),
+                        indexed_byte_count: text.len(),
+                        truncation_strategy: "none",
+                        source_complete: true,
+                        document_version: omnis_core::search_document_version(Provider::Codex),
+                        origin: omnis_store::SessionTrajectoryOrigin::Native,
+                        derived_title: None,
+                        title_is_verified: false,
+                        withdrawn_title: None,
+                        title_authoritative: false,
+                    },
                 )
                 .expect("seed search history");
             observed.title = Some("Updated observed title".to_owned());

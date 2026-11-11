@@ -264,7 +264,7 @@ fn attached_child_is_fully_visible_even_when_its_parent_model_context_is_missing
 #[test]
 fn subagents_and_their_detached_forks_show_only_local_turns() -> Result<()> {
     let home = tempfile::tempdir()?;
-    let dir = home.path().join("sessions");
+    let dir = home.path().join("sessions/2026/01/02");
     let mut meta = header(CHILD, 0, None, false);
     meta["payload"]["subagent_history_start_ordinal"] = json!(4);
     let copied = [
@@ -276,45 +276,116 @@ fn subagents_and_their_detached_forks_show_only_local_turns() -> Result<()> {
     let name = format!("2026-01-02T00-00-00-{CHILD}");
     write(&dir, &name, &copied)?;
     let path = dir.join(format!("rollout-{name}.jsonl"));
-    fs::write(
-        path.with_extension("jsonl.zst"),
-        zstd::stream::encode_all(fs::read(&path)?.as_slice(), 1)?,
-    )?;
-    fs::remove_file(path)?;
+    let intact = fs::read_to_string(&path)?;
+    let damaged = intact.replacen("history_mode", "history_mxde", 1);
+    fs::remove_file(&path)?;
     let mut fork = header(REVERT, 5, Some(bookmark(CHILD, &copied)), false);
     fork["payload"]["forked_from_id"] = json!(CHILD);
     write(
-        &dir,
+        &home.path().join("sessions/2026/01/03"),
         &format!("2026-01-03T00-00-00-{REVERT}"),
         &[fork, message(6, "fork request")],
     )?;
 
-    let adapter = CodexAdapter::with_root(home.path());
-    for (id, expected) in [
-        (CHILD, vec!["subagent request"]),
-        (REVERT, vec!["subagent request", "fork request"]),
-    ] {
-        let session = SessionRef::new(Provider::Codex, id);
-        for snapshot in [
-            adapter.read_session(&session)?,
-            adapter.preview_session(&session)?,
-            adapter.index_session(&session, None, 1)?.snapshot,
-        ] {
-            let text: Vec<_> = snapshot
-                .events
-                .iter()
-                .filter_map(|event| event.payload["text"].as_str())
-                .collect();
-            assert_eq!(text, expected);
-            assert!(omnis_core::session_message_prefix_is_known(&snapshot, true));
-            let report = fidelity_report_for_snapshot(&snapshot, Provider::Claude, true);
-            assert!(
-                report
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("omits that copied context"))
-            );
+    for (mode_damaged, has_archive) in [(false, false), (true, false), (true, true)] {
+        let body = if mode_damaged { &damaged } else { &intact };
+        fs::write(
+            path.with_extension("jsonl.zst"),
+            zstd::stream::encode_all(body.as_bytes(), 1)?,
+        )?;
+        if has_archive {
+            write(&home.path().join("archived_sessions"), &name, &copied)?;
         }
+        let adapter = CodexAdapter::with_root(home.path());
+        let child = SessionRef::new(Provider::Codex, CHILD);
+        if !has_archive {
+            let native = if mode_damaged {
+                NativeResumeSupport::ImportOnly
+            } else {
+                NativeResumeSupport::Since("0.167.0")
+            };
+            assert_eq!(adapter.native_resume_support(&child)?, native);
+        }
+        for id in [CHILD, REVERT] {
+            let session = SessionRef::new(Provider::Codex, id);
+            let unread_parent = id == REVERT && mode_damaged && !has_archive;
+            let expected: &[&str] = if id == CHILD {
+                &["subagent request"]
+            } else if unread_parent {
+                &["fork request"]
+            } else {
+                &["subagent request", "fork request"]
+            };
+            for snapshot in [
+                adapter.read_session(&session)?,
+                adapter.preview_session(&session)?,
+                adapter.index_session(&session, None, 1)?.snapshot,
+                adapter.index_session(&session, None, u64::MAX)?.snapshot,
+            ] {
+                let text: Vec<_> = snapshot
+                    .events
+                    .iter()
+                    .filter_map(|event| event.payload["text"].as_str())
+                    .collect();
+                assert_eq!(
+                    text, expected,
+                    "{id}, damaged={mode_damaged}, archive={has_archive}"
+                );
+                assert!(!serde_json::to_string(&snapshot)?.contains("copied parent"));
+                assert_eq!(
+                    CodexAdapter::has_unavailable_ancestry(&snapshot),
+                    unread_parent
+                );
+                if !unread_parent {
+                    assert!(omnis_core::session_message_prefix_is_known(&snapshot, true));
+                    let report = fidelity_report_for_snapshot(&snapshot, Provider::Claude, true);
+                    assert!(
+                        report
+                            .warnings
+                            .iter()
+                            .any(|w| w.contains("omits that copied context"))
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_subagent_cutoff_does_not_hide_messages_in_legacy_history() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    let mut meta = header(CHILD, 0, None, false);
+    meta["payload"]["subagent_history_start_ordinal"] = json!(4);
+    meta["payload"]["history_mode"] = json!("legacy");
+    let mut rows = [
+        meta,
+        message(1, "first request"),
+        message(4, "last request"),
+    ];
+    for no_ordinals in [false, true] {
+        if no_ordinals {
+            rows[0]["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("history_mode");
+            for row in &mut rows {
+                row.as_object_mut().unwrap().remove("ordinal");
+            }
+        }
+        write(
+            &home.path().join("sessions"),
+            &format!("2026-01-02T00-00-00-{CHILD}"),
+            &rows,
+        )?;
+        let snapshot = CodexAdapter::with_root(home.path()).read_session(&session)?;
+        let text: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter_map(|e| e.payload["text"].as_str())
+            .collect();
+        assert_eq!(text, ["first request", "last request"]);
     }
     Ok(())
 }

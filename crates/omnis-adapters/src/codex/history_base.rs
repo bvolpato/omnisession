@@ -53,6 +53,12 @@ impl Position {
             .into_iter()
             .next()
             .context("missing Codex source rollout header")?;
+        ensure!(
+            (header["type"] == "session_meta" || rollout_identity::damaged_header_type(&header))
+                && rollout_identity::thread_id(&path)
+                    .is_some_and(|id| rollout_identity::header_identity(&header, id).is_some()),
+            "Codex referenced an incompatible source rollout"
+        );
         Ok(Some((path, header)))
     }
 
@@ -99,7 +105,8 @@ impl VisibleStart {
 /// A paginated subagent can store copied model context between its header and its own first turn.
 pub(super) fn subagent_history_start(header: &Value) -> Option<u64> {
     let meta = &header["payload"];
-    if !HistoryMode::is_paginated(&meta["history_mode"]) {
+    // Codex writes header ordinals only for paginated history. Keep the cutoff if the mode is damaged.
+    if HistoryMode::read(&meta["history_mode"]) == Some(HistoryMode::Legacy) {
         return None;
     }
     let first = header["ordinal"].as_u64()?.saturating_add(1);
@@ -202,11 +209,6 @@ impl HistoryBase {
                     break Some(reason);
                 }
             };
-            ensure!(
-                meta["type"] == "session_meta"
-                    && meta["payload"]["id"].as_str() == rollout_identity::thread_id(&path),
-                "Codex referenced an incompatible source rollout"
-            );
             // A restored file can have the right ID but predate the migration that created this bookmark.
             let damaged_mode = rollout_identity::damaged_paginated_mode(&meta);
             if !HistoryMode::is_paginated(&meta["payload"]["history_mode"]) && !damaged_mode {
@@ -240,7 +242,11 @@ impl HistoryBase {
             }
             let Some(segment) = segment else {
                 missing_rollout = Some(pos.thread_id);
-                break Some(if damaged_mode {
+                let incomplete_header =
+                    meta.get("payload").is_none() || meta["type"] != "session_meta";
+                break Some(if incomplete_header {
+                    "Codex referenced an incomplete source session header"
+                } else if damaged_mode {
                     "Codex referenced a source header without a verifiable history mode"
                 } else {
                     "Codex referenced a source header without a verifiable ordinal"
@@ -360,7 +366,7 @@ impl Segment {
         let Some(start) = position.source_start(header)? else {
             return Ok(None);
         };
-        if rollout_identity::damaged_paginated_mode(header) {
+        if header["type"] != "session_meta" || rollout_identity::damaged_paginated_mode(header) {
             return Ok(None);
         }
         let base = HistoryBase::from_header(path, header);
@@ -382,7 +388,25 @@ impl Segment {
         }))
     }
 
-    fn record_ordinal(&self, record: &Value, expected: u64) -> Result<Option<u64>> {
+    fn record_ordinal(
+        &self,
+        record: &Value,
+        expected: u64,
+        max_reserved_gap: u64,
+        malformed: bool,
+    ) -> Result<Option<u64>> {
+        if malformed {
+            // A broken separator can join or split rows. Later ordinals must still follow earlier
+            // records and stay inside the bookmark.
+            let index = record["ordinal"].as_u64();
+            ensure!(
+                index
+                    .is_none_or(|ordinal| ordinal >= expected
+                        && ordinal < self.position.end_ordinal_exclusive),
+                "Codex history_base source ordinal is inconsistent"
+            );
+            return Ok(index);
+        }
         if expected > self.start && record["type"].is_string() && record.get("ordinal").is_none() {
             return Ok(None);
         }
@@ -392,7 +416,8 @@ impl Segment {
         // A copied subagent prefix can reserve ordinals without a record at each one.
         if expected > self.start
             && ordinal > expected
-            && self.subagent.is_some_and(|first| ordinal <= first)
+            && (ordinal - expected <= max_reserved_gap
+                || self.subagent.is_some_and(|first| ordinal <= first))
         {
             ensure!(
                 ordinal < self.position.end_ordinal_exclusive,
@@ -647,6 +672,7 @@ fn read_prefix_from(
     let position = segment.position;
     let mut remaining = position.end_byte_offset;
     let mut next = start;
+    let mut max_reserved_gap = 0;
     let mut skipped = 0;
     let mut malformed = false;
     let mut damage = None;
@@ -705,21 +731,19 @@ fn read_prefix_from(
                         continue;
                     }
                 };
-                if malformed {
-                    // A broken separator can join or split rows. A later readable ordinal still
-                    // cannot go backwards or fall outside the saved interval.
-                    let Some(ordinal) = record["ordinal"].as_u64() else {
-                        remaining -= length;
-                        continue;
-                    };
-                    ensure!(
-                        ordinal >= next && ordinal < position.end_ordinal_exclusive,
-                        "Codex history_base source ordinal is inconsistent"
-                    );
+                if let Some(ordinal) =
+                    segment.record_ordinal(&record, next, max_reserved_gap, malformed)?
+                {
                     next = ordinal;
-                } else if let Some(ordinal) = segment.record_ordinal(&record, next)? {
-                    next = ordinal;
+                    max_reserved_gap = 0;
+                } else if malformed {
+                    remaining -= length;
+                    continue;
                 } else {
+                    // A missing ordinal can span reserved positions up to the first local subagent item.
+                    if let Some(first) = segment.subagent {
+                        max_reserved_gap = max_reserved_gap.max(first.saturating_sub(next));
+                    }
                     damage = Some(MISSING_ORDINAL);
                 }
                 if damage.is_none()
@@ -734,7 +758,9 @@ fn read_prefix_from(
         remaining -= length;
     }
     ensure!(
-        malformed || next == position.end_ordinal_exclusive,
+        malformed
+            || (next..=next.saturating_add(max_reserved_gap))
+                .contains(&position.end_ordinal_exclusive),
         "Codex history_base byte and ordinal cutoffs disagree"
     );
     Ok(damage.map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))

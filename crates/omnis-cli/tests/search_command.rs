@@ -15,6 +15,79 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn live_checks_retire_only_the_codex_rollout_that_sqlite_invalidated() {
+    let source = format!("codex:{CODEX_ID}");
+    for command in [
+        &["index", "--provider", "codex"][..],
+        &["show", &source],
+        &["show", CODEX_ID],
+        &["search", "Pagination", "--provider", "codex"],
+        &["search", "Pagination", "--provider", "codex", "--no-index"],
+    ] {
+        let fixture = Fixture::new();
+        let home = fixture.root.join("codex");
+        let day = home.join("sessions/2026/01/02");
+        let original = day.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"));
+        let selected = day.join("restored.jsonl");
+        fixture.index_codex();
+        let cached = |query: &str| {
+            result_sessions(&fixture.search_json(&[
+                query,
+                "--provider",
+                "codex",
+                "--cached",
+                "--all-projects",
+            ]))
+        };
+
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+            [CODEX_ID, selected.to_str().unwrap()],
+        )
+        .unwrap();
+        fs::remove_file(day.join(format!(
+            "rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(cached("Pagination"), [source.as_str()]);
+
+        let output = fixture
+            .command()
+            .arg("--json")
+            .args(command)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), command[0] != "show", "{command:?}");
+        if command[0] == "search" {
+            assert!(result_sessions(&serde_json::from_slice(&output.stdout).unwrap()).is_empty());
+        }
+        assert!(cached("Pagination").is_empty(), "{command:?}");
+        assert_eq!(cached("zebracorn"), [format!("codex:{OTHER_CODEX_ID}")]);
+
+        let restored = fs::read_to_string(&original)
+            .unwrap()
+            .replace("Pagination", "Cinnabar");
+        fs::write(&selected, restored).unwrap();
+        assert!(
+            fixture
+                .command()
+                .args(["show", &source])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(cached("Cinnabar"), [source.as_str()]);
+        assert!(cached("Pagination").is_empty());
+    }
+}
+
+#[test]
 fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
     for (direct_read, seconds_older) in [(false, 0), (true, 0), (true, 60)] {
         let fixture = Fixture::new();
