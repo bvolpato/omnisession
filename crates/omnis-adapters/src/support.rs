@@ -1415,6 +1415,10 @@ impl EventBuilder {
         self.next_sequence
     }
 
+    pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
+        self.events.drain(..)
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
         if let Some(preview) = &mut self.preview {
             preview.outline.truncate(

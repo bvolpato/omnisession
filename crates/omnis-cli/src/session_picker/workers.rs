@@ -2,11 +2,10 @@ use super::{
     AdapterRegistry, CachedPickerEntries, Command, DateTime, HandoffRecord, HashSet,
     IndexedSession, LATEST_RELEASE_URL, NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path,
     PathBuf, PickerEntry, PickerState, PreviewKey, PreviewRequest, PreviewSource, PreviewValue,
-    Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionTrajectoryOrigin,
-    SessionTrajectorySearchPage, Stdio, Store, SyncSender, TRAJECTORY_SEARCH_LIMIT,
-    TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env, first_user_message_after,
-    mpsc, normalized_picker_entries, populate_approximate_updated_at, preview_revision,
-    session_preview, thread,
+    Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionTrajectorySearchPage, Stdio,
+    Store, SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque,
+    cached_picker_entries, env, first_user_message_after, mpsc, normalized_picker_entries,
+    populate_approximate_updated_at, preview_revision, session_preview, thread,
 };
 
 use std::sync::{
@@ -407,13 +406,14 @@ pub(super) fn read_picker_preview(
     registry: &AdapterRegistry,
     key: &PreviewKey,
     source_path: Option<&Path>,
+    projection_budget: u64,
 ) -> anyhow::Result<omnis_adapters::IndexRead> {
     let session = &key.session;
     if session.provider == Provider::Codex {
         let budget = if key.continuation_after.is_some() {
             u64::MAX
         } else {
-            search_index::FULL_READ_SOURCE_BYTES
+            projection_budget
         };
         let read = registry.index_session(session, source_path, budget)?;
         let revision = preview_revision(read.source_revision);
@@ -452,6 +452,13 @@ pub(super) fn read_picker_preview(
             source_complete: false,
             source_revision: SourceRevision::default(),
         })
+}
+
+fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySourceGuard>) -> u64 {
+    let revision = key.source.as_ref().and_then(PreviewSource::revision);
+    guard.map_or(search_index::FULL_READ_SOURCE_BYTES, |guard| {
+        search_index::projection_read_budget(guard, key.updated_at, revision.unwrap_or_default())
+    })
 }
 
 pub(super) fn spawn_preview_updates(
@@ -500,7 +507,12 @@ pub(super) fn spawn_preview_updates(
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let read = read_picker_preview(&registry, &key, source_path.as_deref());
+                    let read = read_picker_preview(
+                        &registry,
+                        &key,
+                        source_path.as_deref(),
+                        preview_read_budget(&key, writer.map(|(_, guard)| guard)),
+                    );
                     read.map_or(PreviewValue::Unavailable, |read| {
                         if read.source_revision.file.is_some() {
                             read_revision = Some(preview_revision(read.source_revision));
@@ -510,15 +522,14 @@ pub(super) fn spawn_preview_updates(
                         if let Some((store, guard)) = writer
                             && let Err(error) = crate::store_search_document(
                                 store,
-                                &key.session,
+                                read.native_session.as_ref().map_or(
+                                    crate::SearchDocumentTarget::Session(&key.session),
+                                    crate::SearchDocumentTarget::VisibleNative,
+                                ),
                                 &snapshot,
                                 complete,
                                 read.source_revision,
-                                if imported {
-                                    SessionTrajectoryOrigin::ImportedBundle
-                                } else {
-                                    SessionTrajectoryOrigin::Native
-                                },
+                                (!imported).then_some(&registry),
                                 guard,
                             )
                         {

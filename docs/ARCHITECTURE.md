@@ -39,6 +39,8 @@ When discovery is incomplete or unverified, `omni index` and the picker update t
 
 Workspace matching uses canonical paths and repository fingerprints ([RFC 002](rfcs/002-workspace-identity.md)). Provider SQLite stores are read with `query_only`, and snapshot-based adapters copy available WAL files into private temporary storage. Redaction covers recognized credential fields and patterns and cannot prove every secret is absent; see [SECURITY.md](../SECURITY.md#redaction-and-handoffs).
 
+A full Codex read saves the surviving workspace alongside the search document for that file revision. Discovery applies this workspace before filtering by project. For a fork with missing parent history, indexing can check whether a rollback removed the local turn that supplied the previous search title. The check uses the same file revision and redaction rules as the search document.
+
 On Linux and macOS, Hermes reuses one validated private SQLite snapshot within an adapter instance. Each read checks the database and WAL sizes, timestamps, and file identities, including Unix change time. A changed, replaced, or missing source invalidates the cached snapshot. The snapshot size limit applies to cached reads too. Cloned adapters share the snapshot and serialize access to it. Other platforms make a fresh snapshot for each read.
 
 ## Transfers

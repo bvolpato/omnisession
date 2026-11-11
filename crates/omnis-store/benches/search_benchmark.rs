@@ -201,6 +201,8 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         origin: SessionTrajectoryOrigin::Native,
         document_version: 1,
         derived_title: None,
+        title_is_verified: false,
+        withdrawn_title: None,
     }
 }
 

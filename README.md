@@ -236,6 +236,8 @@ While the picker is open, it indexes conversation text for every discovered sess
 
 If a session remains unreadable, later index runs skip it until its source changes. Use `omni index --retry-failed` to try again. If an in-place restore preserves the operating system's file identity, size, and all available timestamps, use `omni show codex:<id>` to read the contents and refresh the cached text and workspace. This can apply to same-size restores on Windows that preserve the write time.
 
+If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. If a rollback removes the request that supplied a search title, a full index read can retire that title even when the fork's parent is unavailable. After an upgrade, live indexing refreshes older entries that lack this evidence. `omni search --cached` uses the previously saved data.
+
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 
 If the picker looks empty, `omni doctor` reports this-workspace vs all-workspace counts and any discovery notes. Press `Tab` for every workspace, or list without the current-project filter:

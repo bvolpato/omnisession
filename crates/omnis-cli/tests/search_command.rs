@@ -98,6 +98,112 @@ fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
 }
 
 #[test]
+fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let name = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let source = fixture.root.join("codex/sessions/2026/01/02").join(&name);
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir(&archive).unwrap();
+    let archived = archive.join(name);
+    fs::rename(&source, &archived).unwrap();
+    let original = fs::read(&archived).unwrap();
+    fixture.index_codex();
+
+    let active = source.with_extension("jsonl.gz");
+    let restored = fixture.root.join("restored-workspace");
+    let replacement = fixture.root.join("replacement-workspace");
+    fs::create_dir(&restored).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    let session = format!("codex:{CODEX_ID}");
+    let run_json = |args: &[&str]| {
+        let output = fixture.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    for (workspace, marker) in [
+        (&restored, "cinnabarreply"),
+        (&replacement, "turquoisereply"),
+    ] {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        for row in [
+            json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,
+                "git":{"branch":"creation-branch"}}}),
+            json!({"type":"turn_context","payload":{"cwd":workspace}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":marker}]}}),
+        ] {
+            writeln!(encoder, "{row}").unwrap();
+        }
+        let bytes = encoder.finish().unwrap();
+        let mut staged = tempfile::NamedTempFile::new_in(active.parent().unwrap()).unwrap();
+        staged.write_all(&bytes).unwrap();
+        staged.persist(&active).unwrap();
+
+        if workspace == &restored {
+            let shown = run_json(&["show", &session]);
+            assert_eq!(
+                shown["workspace"]["current_dir"],
+                workspace.to_str().unwrap()
+            );
+            assert!(shown["workspace"]["git"]["branch"].is_null());
+        } else {
+            let listed = run_json(&[
+                "list",
+                "--provider",
+                "codex",
+                "--project",
+                restored.to_str().unwrap(),
+            ]);
+            assert!(listed["sessions"].as_array().unwrap().is_empty());
+            assert_eq!(fixture.index_codex()["indexed"], 1);
+        }
+
+        let index = fixture.index_codex();
+        assert_eq!(index["stale"], 0);
+        assert_eq!(index["indexed"], 0);
+        for project in [&fixture.workspace, &restored, &replacement] {
+            let expected = project == workspace;
+            let project = project.to_str().unwrap();
+            let listed = run_json(&["list", "--provider", "codex", "--project", project]);
+            let row = listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session"]["id"] == CODEX_ID);
+            assert_eq!(row.is_some(), expected, "list in {project}");
+            if let Some(row) = row {
+                assert!(row["git_branch"].is_null());
+            }
+            for mode in ["--no-index", "--cached"] {
+                let hits = fixture.search_json(&[
+                    marker,
+                    "--provider",
+                    "codex",
+                    "--project",
+                    project,
+                    mode,
+                ]);
+                assert_eq!(
+                    result_sessions(&hits).contains(&session),
+                    expected,
+                    "{mode} search in {project}"
+                );
+            }
+        }
+        assert_eq!(fs::read(&active).unwrap(), bytes);
+        assert_eq!(fs::read(&archived).unwrap(), original);
+    }
+}
+
+#[test]
 fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
     use omnis_ir::{Provider, SessionRef};
     use omnis_store::{SessionTrajectoryOrigin, Store, TrajectoryDocument};
@@ -123,6 +229,8 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
                 origin: SessionTrajectoryOrigin::Native,
                 document_version: state.document_version,
                 derived_title: None,
+                withdrawn_title: None,
+                title_is_verified: false,
             },
         )
         .unwrap();
@@ -144,6 +252,56 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         result_sessions(&fixture.search_json(&["unchanged", "--cached"])),
         [session.to_string()]
     );
+}
+
+#[test]
+fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() {
+    use std::io::Write;
+    let reference = format!("codex:{CODEX_ID}");
+    for show_first in [false, true] {
+        let fixture = Fixture::new();
+        fixture.add_missing_ancestor();
+        fixture.index_codex();
+        let search = |word, cached| {
+            let mut args = vec!["--provider", "codex", "--show-text", word];
+            if cached {
+                args.push("--cached");
+            }
+            fixture.search_json(&args)
+        };
+        assert_eq!(
+            result_sessions(&search("backoff", true)),
+            [reference.as_str()]
+        );
+        let path = fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})
+        )
+        .unwrap();
+        let original = fs::read(&path).unwrap();
+        if show_first {
+            let shown = fixture
+                .command()
+                .args(["show", &reference])
+                .output()
+                .unwrap();
+            assert!(
+                shown.status.success(),
+                "{}",
+                String::from_utf8_lossy(&shown.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&shown.stdout).contains("backoff"));
+        } else {
+            assert!(result_sessions(&search("backoff", false)).is_empty());
+        }
+        assert!(result_sessions(&search("backoff", true)).is_empty());
+        assert!(search(CODEX_ID, true)["results"][0]["title"].is_null());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
 }
 
 #[test]

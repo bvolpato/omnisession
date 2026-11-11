@@ -35,8 +35,8 @@ use omnis_core::{
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin,
-    SessionTrajectorySearchPage, Store, TrajectorySelection,
+    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
+    TrajectorySelection,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -3557,8 +3557,12 @@ mod tests {
         picker.refresh_preview_window(1);
         picker.preview_deadline = Some(Instant::now());
         let request = picker.due_preview_request().unwrap().pop().unwrap();
-        let read =
-            workers::read_picker_preview(&worker, &request.key, request.source_path.as_deref())?;
+        let read = workers::read_picker_preview(
+            &worker,
+            &request.key,
+            request.source_path.as_deref(),
+            crate::search_index::FULL_READ_SOURCE_BYTES,
+        )?;
         assert_eq!(
             session_preview(&read.snapshot).first.unwrap().text,
             "current conversation"
@@ -3590,14 +3594,24 @@ mod tests {
             state.preview_key(&state.entries[0])
         };
         assert!(
-            workers::read_picker_preview(&registry, &request(&home.path().join("old")), None)
-                .is_err()
+            workers::read_picker_preview(
+                &registry,
+                &request(&home.path().join("old")),
+                None,
+                crate::search_index::FULL_READ_SOURCE_BYTES
+            )
+            .is_err()
         );
         assert!(
-            workers::read_picker_preview(&registry, &request(&current), None)?
-                .source_revision
-                .file
-                .is_some()
+            workers::read_picker_preview(
+                &registry,
+                &request(&current),
+                None,
+                crate::search_index::FULL_READ_SOURCE_BYTES
+            )?
+            .source_revision
+            .file
+            .is_some()
         );
         Ok(())
     }

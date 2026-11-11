@@ -195,11 +195,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         &snapshot,
                         read.source_complete,
                         read.source_revision,
-                        if session.provider == Provider::Imported {
-                            SessionTrajectoryOrigin::ImportedBundle
-                        } else {
-                            SessionTrajectoryOrigin::Native
-                        },
+                        (session.provider != Provider::Imported).then_some(self),
                         search_index::source_guard(session.provider, prior.as_ref()),
                     )
                 {
@@ -212,8 +208,26 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
+fn verified_codex_workspace(
+    snapshot: &CanonicalSnapshot,
+    revision: SourceRevision,
+    source_complete: bool,
+) -> Option<omnis_store::CodexWorkspace> {
+    (source_complete
+        && snapshot.session.provider == Provider::Codex
+        && revision.file.is_some()
+        && revision.contents.is_some())
+    .then(|| omnis_store::CodexWorkspace {
+        source_revision: revision,
+        project_path: (!snapshot.workspace.current_dir.as_os_str().is_empty())
+            .then(|| snapshot.workspace.current_dir.clone()),
+        git_branch: snapshot.workspace.git.branch.clone(),
+    })
+}
+
 enum SearchDocumentTarget<'a> {
     Session(&'a SessionRef),
+    VisibleNative(&'a NativeSession),
     Selected(
         &'a IndexedSession,
         &'a omnis_store::SelectedSessionObservation,
@@ -233,11 +247,17 @@ fn store_search_document<'a>(
     snapshot: &CanonicalSnapshot,
     source_complete: bool,
     source_revision: SourceRevision,
-    origin: SessionTrajectoryOrigin,
+    native_registry: Option<&AdapterRegistry>,
     guard: TrajectorySourceGuard,
-) -> omnis_store::Result<Option<String>> {
+) -> Result<Option<String>> {
     let document = trajectory_search_document(snapshot);
-    let derived_title = omnis_core::session_search_title(snapshot);
+    let mut title = search_index::IndexedTitle::from_read(snapshot, source_complete, &document);
+    let origin = if let Some(registry) = native_registry {
+        title.check_withdrawal(registry, store, &snapshot.session, source_revision)?;
+        SessionTrajectoryOrigin::Native
+    } else {
+        SessionTrajectoryOrigin::ImportedBundle
+    };
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at: snapshot.captured_at,
@@ -248,19 +268,37 @@ fn store_search_document<'a>(
         source_revision,
         origin,
         document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
-        derived_title: derived_title.as_deref(),
+        derived_title: title.current.as_deref(),
+        withdrawn_title: title.withdrawn.as_deref(),
+        title_is_verified: title.verified,
     };
     let session = match target.into() {
         SearchDocumentTarget::Session(session) => {
             store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
             session
         }
+        SearchDocumentTarget::VisibleNative(native) => {
+            let workspace = verified_codex_workspace(snapshot, source_revision, source_complete);
+            store.upsert_observed_trajectory_documents_with_workspaces(&[(
+                &native.session,
+                document,
+                guard,
+                workspace.as_ref(),
+            )])?;
+            &native.session
+        }
         SearchDocumentTarget::Selected(selected, observed) => {
-            store.upsert_selected_session_document(selected, observed, document)?;
+            let workspace = verified_codex_workspace(snapshot, source_revision, source_complete);
+            store.upsert_selected_session_document_with_workspace(
+                selected,
+                observed,
+                document,
+                workspace.as_ref(),
+            )?;
             &selected.session
         }
     };
-    store.trajectory_title(session)
+    Ok(store.trajectory_title(session)?)
 }
 
 fn build_search_index(
@@ -2553,7 +2591,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         &bundle.snapshot,
         true,
         SourceRevision::default(),
-        SessionTrajectoryOrigin::ImportedBundle,
+        None,
         TrajectorySourceGuard::NewerSource,
     )
     .context("indexing imported bundle trajectory")?;

@@ -112,6 +112,7 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    use_workspace_index: bool,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
     session_scan: Arc<Mutex<Option<Arc<CodexFileScan>>>>,
@@ -132,6 +133,34 @@ impl CodexAdapter {
         Some(ObservedRollout::read(path)?.revision)
     }
 
+    /// Checks whether an applied rollback removed the local opener that supplied a saved title.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected rollout changes or cannot be read.
+    pub fn rollout_withdrew_search_title(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior_title: &str,
+    ) -> Result<bool> {
+        validate_provider(session, Provider::Codex)?;
+        anyhow::ensure!(
+            path_uuid(path).as_deref() == Some(session.id.as_str()),
+            "selected Codex rollout path has a different session ID"
+        );
+        if revision.contents.is_none() {
+            return Ok(false);
+        }
+        let observed = ObservedRollout::read(path)
+            .filter(|observed| observed.revision.matches_file_contents(revision))
+            .context("selected Codex rollout changed before checking its search title")?;
+        let native = CodexSession::parse_with_observation(path, observed)?
+            .filter(|native| native.id == session.id)
+            .context("selected Codex rollout has a different session header")?;
+        native.read_unchanged(|native, _| native.withdrew_search_title(prior_title))
+    }
+
     /// The decoded size of a compressed rollout can differ from its filesystem metadata.
     #[must_use]
     pub fn is_compressed_rollout(path: &Path) -> bool {
@@ -142,6 +171,7 @@ impl CodexAdapter {
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
         Self {
             codex_home: Some(codex_home.into()),
+            use_workspace_index: false,
             rollout_cache: None,
             session_scan: Arc::default(),
             listing: Arc::default(),
@@ -466,12 +496,33 @@ impl CodexAdapter {
     }
 }
 
+fn apply_verified_workspace(
+    session: &mut NativeSession,
+    workspaces: &HashMap<Uuid, omnis_store::CodexWorkspace>,
+    cached_header: bool,
+) {
+    if let Some(revision) = session.source_revision
+        && let Some(workspace) = revision.file.and_then(|file| workspaces.get(&file))
+        && revision.matches_file_contents(workspace.source_revision)
+        && (!cached_header
+            || session
+                .source_path
+                .as_deref()
+                .and_then(CodexAdapter::index_file_revision)
+                .is_some_and(|current| current.matches_file_contents(revision)))
+    {
+        session.project_path.clone_from(&workspace.project_path);
+        session.git_branch.clone_from(&workspace.git_branch);
+    }
+}
+
 impl Default for CodexAdapter {
     fn default() -> Self {
         let codex_home = provider_root("CODEX_HOME", &[".codex"]);
         Self {
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             codex_home,
+            use_workspace_index: true,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
@@ -912,6 +963,50 @@ impl CodexSession {
         }
     }
 
+    fn withdrew_search_title(&self, prior_title: &str) -> Result<bool> {
+        let mut builder = self.event_builder();
+        let mut history = CodexHistory::preview();
+        let mut opener: Option<(u64, bool)> = None;
+        let mut withdrew = false;
+        let complete = rollout_file::visit_all_records(&self.path, |record| {
+            if history.records_seen == 0 {
+                anyhow::ensure!(
+                    record["type"] == "session_meta"
+                        && string_at(&record, &[&["payload", "id"], &["payload", "session_id"]])
+                            == Some(self.id.as_str()),
+                    "selected Codex rollout has a different session header"
+                );
+            }
+            // An unknown record or an unreconstructed compaction can change the visible opener.
+            if !matches!(
+                record["type"].as_str(),
+                Some("session_meta" | "turn_context" | "response_item" | "event_msg")
+            ) {
+                return Ok(false);
+            }
+            let rollback = history.push(&mut builder, &record)?;
+            if let Some(boundary) = rollback
+                && let Some((_, matched)) = opener.take_if(|(sequence, _)| *sequence >= boundary)
+            {
+                withdrew |= matched;
+            }
+            let events = builder.drain_events();
+            if opener.is_none() {
+                opener = omnis_core::search_title_opener_from_messages(events.as_slice())
+                    .map(|(sequence, title)| (sequence, title.as_deref() == Some(prior_title)));
+            }
+            drop(events);
+            if history
+                .records_seen
+                .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
+            {
+                history.compact(&mut builder);
+            }
+            Ok(true)
+        })?;
+        Ok(complete && withdrew)
+    }
+
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
         self.canonical_events_with(|visit| rollout_file::visit(&self.path, visit))
     }
@@ -984,14 +1079,21 @@ impl CodexSession {
         Ok((builder, history))
     }
 
+    fn branch_at(&self, project: Option<&Path>) -> Option<String> {
+        (project == self.project_path.as_deref())
+            .then(|| self.git_branch.clone())
+            .flatten()
+    }
+
     fn read(self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let (events, project_path) = self.canonical_events()?;
+        let branch = self.branch_at(project_path.as_deref());
         Ok(events.snapshot(
             session.clone(),
             self.title,
             project_path,
-            self.git_branch,
+            branch,
             captured_at,
         ))
     }
@@ -1005,11 +1107,12 @@ impl CodexSession {
         }
         if contains_rollback_marker(&self.path)? {
             let (events, project_path) = self.reconstructed_preview()?;
+            let branch = self.branch_at(project_path.as_deref());
             return Ok(events.snapshot(
                 session.clone(),
                 self.title,
                 project_path,
-                self.git_branch,
+                branch,
                 captured_at,
             ));
         }
@@ -1079,13 +1182,8 @@ impl CodexSession {
                 (events, self.project_path.clone(), false)
             }
         };
-        let snapshot = events.snapshot(
-            session.clone(),
-            self.title,
-            project,
-            self.git_branch,
-            captured_at,
-        );
+        let branch = self.branch_at(project.as_deref());
+        let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
             native_session: None,
             snapshot,
@@ -1231,7 +1329,7 @@ impl CodexHistory {
         }
     }
 
-    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<()> {
+    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
         self.records_seen += 1;
         let record_type = record.get("type").and_then(Value::as_str);
         let event_type = (record_type == Some("event_msg"))
@@ -1241,6 +1339,7 @@ impl CodexHistory {
             let count = record["payload"]["num_turns"]
                 .as_u64()
                 .context("Codex rollback marker has no valid num_turns")?;
+            let mut truncated = None;
             if count > 0 {
                 let retained = self
                     .turns
@@ -1250,6 +1349,7 @@ impl CodexHistory {
                     let checkpoint = self.turns.remove(retained);
                     self.turns.truncate(retained);
                     builder.truncate_from(checkpoint.sequence);
+                    truncated = Some(checkpoint.sequence);
                     self.project_path = checkpoint.project_path;
                     self.workspace_record = checkpoint.workspace_record;
                     self.tool_events = checkpoint.tool_events;
@@ -1258,7 +1358,7 @@ impl CodexHistory {
                 self.last_visible = None;
                 self.pending_turn = None;
             }
-            return Ok(());
+            return Ok(truncated);
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
             self.pending_turn = Some(self.checkpoint(builder));
@@ -1297,7 +1397,7 @@ impl CodexHistory {
         {
             self.tool_events += 1;
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -1765,17 +1865,24 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        let workspaces = self
+            .use_workspace_index
+            .then(|| omnis_store::CodexWorkspace::read_index(None).ok())
+            .flatten()
+            .unwrap_or_default();
+        let cached_header = self.listing.get().is_some();
         let mut sessions = Vec::new();
-        for session in self.sessions() {
-            if project.is_some_and(|project| {
+        for raw in self.sessions() {
+            let mut session = raw.native_session();
+            apply_verified_workspace(&mut session, &workspaces, cached_header);
+            if project.is_none_or(|project| {
                 session
                     .project_path
                     .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, project))
+                    .is_some_and(|recorded| paths_match(recorded, project))
             }) {
-                continue;
+                sessions.push(session);
             }
-            sessions.push(session.native_session());
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -1791,7 +1898,14 @@ impl ProviderAdapter for CodexAdapter {
         };
         let mut session = selected.session;
         session.title = self.title_index().titles.get(id).cloned();
-        Ok(Some(session.native_session()))
+        let mut native = session.native_session();
+        if self.use_workspace_index
+            && let Some(file) = native.source_revision.and_then(|revision| revision.file)
+            && let Ok(workspaces) = omnis_store::CodexWorkspace::read_index(Some(file))
+        {
+            apply_verified_workspace(&mut native, &workspaces, false);
+        }
+        Ok(Some(native))
     }
 
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {

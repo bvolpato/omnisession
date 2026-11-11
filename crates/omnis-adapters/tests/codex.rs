@@ -297,6 +297,124 @@ fn codex_rollback_crossing_compaction_does_not_resurrect_discarded_output() {
 }
 
 #[test]
+fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(format!("rollout-{SESSION_ID}.jsonl"));
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let rolled_back = |turns: u64| event("thread_rolled_back", json!({"num_turns":turns}));
+    let saved = || message("user", "Saved   title");
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID, "history_base":{"session_id":"11111111-1111-4111-8111-111111111111"}}});
+    let cases = [
+        (
+            vec![saved(), message("user", "later"), rolled_back(1)],
+            false,
+        ),
+        (vec![saved(), rolled_back(0)], false),
+        (
+            vec![
+                saved(),
+                message("user", "later"),
+                rolled_back(1),
+                rolled_back(1),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                rolled_back(u64::MAX),
+                message("user", "replacement"),
+            ],
+            true,
+        ),
+        (
+            vec![message("user", "earlier"), saved(), rolled_back(1)],
+            false,
+        ),
+        (
+            vec![message("assistant", "preface"), saved(), rolled_back(1)],
+            false,
+        ),
+        (
+            vec![
+                message("user", "first"),
+                rolled_back(1),
+                saved(),
+                rolled_back(1),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                json!({"type":"compacted","payload":{}}),
+                rolled_back(1),
+            ],
+            false,
+        ),
+    ];
+    for (records, expected) in cases {
+        let mut rows = vec![header.to_string()];
+        rows.extend(records.iter().map(ToString::to_string));
+        fs::write(&path, rows.join("\n"))?;
+        let revision = CodexAdapter::index_file_revision(&path).unwrap();
+        assert_eq!(
+            CodexAdapter::rollout_withdrew_search_title(&path, &source, revision, "Saved title")?,
+            expected,
+            "{records:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_rollback_title_evidence_requires_a_verified_complete_stream() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(format!("rollout-{SESSION_ID}.jsonl.gz"));
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let write = |extra: &str| -> anyhow::Result<()> {
+        let mut file =
+            flate2::write::GzEncoder::new(fs::File::create(&path)?, flate2::Compression::fast());
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID}})
+        )?;
+        writeln!(file, "{}", message("user", "saved"))?;
+        writeln!(
+            file,
+            "{}",
+            event("thread_rolled_back", json!({"num_turns":1}))
+        )?;
+        file.write_all(extra.as_bytes())?;
+        file.finish()?;
+        Ok(())
+    };
+    write("")?;
+    let first = CodexAdapter::index_file_revision(&path).unwrap();
+    assert!(CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, first, "saved"
+    )?);
+    let unverified = omnis_ir::SourceRevision {
+        contents: None,
+        ..first
+    };
+    assert!(!CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, unverified, "saved"
+    )?);
+    let other = SessionRef::new(Provider::Codex, "11111111-1111-4111-8111-111111111111");
+    assert!(CodexAdapter::rollout_withdrew_search_title(&path, &other, first, "saved").is_err());
+    write("{broken record\n")?;
+    let current = CodexAdapter::index_file_revision(&path).unwrap();
+    assert!(CodexAdapter::rollout_withdrew_search_title(&path, &source, first, "saved").is_err());
+    assert!(!CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, current, "saved"
+    )?);
+    Ok(())
+}
+
+#[test]
 fn codex_rollback_handles_zero_excess_and_consecutive_rollbacks() {
     let snapshot = read_records(vec![
         message("user", "# AGENTS.md instructions for /workspace/original\n\n<INSTRUCTIONS>Project context</INSTRUCTIONS>"),

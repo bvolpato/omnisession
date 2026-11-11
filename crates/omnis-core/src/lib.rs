@@ -734,17 +734,39 @@ pub struct SessionPreview {
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    let title = snapshot
+    if let Some(title) = snapshot
         .title
-        .clone()
+        .as_deref()
         .filter(|title| !title.trim().is_empty())
-        .or_else(|| {
-            // Only the first message is needed, so later messages are never redacted.
-            preview_messages(snapshot)
-                .next()
-                .filter(|message| message.role == HandoffRole::User)
-                .map(|message| message.text)
-        })?;
+    {
+        return compact_search_title(title);
+    }
+    let events = visible_events(snapshot);
+    title_opener(events).and_then(|(_, title)| title)
+}
+
+/// Returns the first visible message's sequence and its redacted title, if it provides one.
+/// The input must follow the provider's projection order.
+#[must_use]
+pub fn search_title_opener_from_messages(events: &[OmniEvent]) -> Option<(u64, Option<String>)> {
+    title_opener(events.iter().filter(|event| !is_secret(event)))
+}
+
+fn title_opener<'a>(
+    events: impl IntoIterator<Item = &'a OmniEvent>,
+) -> Option<(u64, Option<String>)> {
+    events.into_iter().find_map(|event| {
+        let message = preview_message(event)?;
+        let title = (message.role == HandoffRole::User)
+            .then(|| compact_search_title(&message.text))
+            .flatten();
+        Some((event.sequence, title))
+    })
+}
+
+/// Redacts and shortens a provider name or visible message for the search index.
+#[must_use]
+pub fn compact_search_title(title: &str) -> Option<String> {
     let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = redact_secrets(&safe_terminal_line(&compact))
         .chars()
@@ -810,6 +832,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
 
 /// Visible user and assistant messages in order, redacted and bounded for preview. Each message
 /// is built only when the iterator reaches it.
+#[cfg(test)]
 fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = HandoffMessage> + '_ {
     visible_events(snapshot)
         .into_iter()
@@ -1247,7 +1270,9 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+/// Returns whether the text is a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -2558,7 +2583,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
         && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
             || ["omitted_events", "unsupported_text_records"]

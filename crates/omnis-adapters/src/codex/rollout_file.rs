@@ -80,6 +80,25 @@ pub(super) fn visit(path: &Path, visit: impl FnMut(Value) -> Result<()>) -> Resu
     read_records(open(path)?, visit)
 }
 
+/// Returns whether every decoded byte belonged to a record the visitor accepted.
+pub(super) fn visit_all_records(
+    path: &Path,
+    mut visit: impl FnMut(Value) -> Result<bool>,
+) -> Result<bool> {
+    let mut delivered_bytes = 0;
+    let (_, decoded_bytes) = visit_json_reader(
+        &mut BufReader::new(open(path)?),
+        LIMITS,
+        |location, record| {
+            if visit(record)? {
+                delivered_bytes += location.length;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(delivered_bytes == decoded_bytes)
+}
+
 pub(super) fn read_records(
     reader: impl Read,
     mut visit: impl FnMut(Value) -> Result<()>,
