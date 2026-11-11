@@ -4480,6 +4480,8 @@ mod tests {
                 first: None,
                 latest: None,
                 message_count: 0,
+                tool_event_count: 1,
+                event_count: 3,
                 ..synthetic_preview("unused")
             };
             state.previews.insert(
@@ -4497,6 +4499,7 @@ mod tests {
             assert_eq!(contains("Message count unknown"), !complete);
             assert_eq!(contains("No visible messages"), complete);
             assert_eq!(contains("0 messages"), complete);
+            assert_eq!(contains("1 tool · 3 events"), !complete);
         }
     }
 

@@ -451,7 +451,7 @@ impl GrokAdapter {
         path: &Path,
         metadata: &GrokMetadata,
         full: bool,
-    ) -> Result<CanonicalSnapshot> {
+    ) -> Result<(CanonicalSnapshot, bool)> {
         const SAMPLE_RECORDS: usize = 1_024;
         let root = self
             .sessions_root
@@ -536,7 +536,7 @@ impl GrokAdapter {
             MAX_TRANSCRIPT_LINE_SIZE
         };
         builder.push_json_line_omissions(omissions, line_limit, None, metadata.updated_at);
-        Ok(builder.snapshot(
+        let snapshot = builder.snapshot(
             session.clone(),
             metadata.title.clone(),
             metadata.project_path.clone(),
@@ -551,7 +551,8 @@ impl GrokAdapter {
                         .map(Into::into)
                 })
                 .unwrap_or_else(Utc::now),
-        ))
+        );
+        Ok((snapshot, full || (!sampled && omissions.total() == 0)))
     }
 }
 
@@ -1453,15 +1454,14 @@ impl ProviderAdapter for GrokAdapter {
         let (summary, path, metadata) = self.resolved_summary(&session.id, listed_path)?;
         let source_revision = metadata.source_revision(&path);
         let ownership_revision = Self::updates_revision(&path);
-        let mut source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
-        let mut snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete);
+        let full = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
+        let mut snapshot = self.snapshot(session, &summary, &path, &metadata, full);
         let provider_limited = full_read_bytes != u64::MAX
-            && source_complete
+            && full
             && snapshot
                 .as_ref()
                 .is_err_and(anyhow::Error::is::<crate::support::TranscriptReadLimit>);
         if provider_limited {
-            source_complete = false;
             snapshot = self.snapshot(session, &summary, &path, &metadata, false);
         }
         anyhow::ensure!(
@@ -1473,7 +1473,7 @@ impl ProviderAdapter for GrokAdapter {
             native.source_revision == Some(source_revision),
             "selected Grok source changed during its read"
         );
-        let snapshot = snapshot.map_err(|cause| {
+        let (snapshot, source_complete) = snapshot.map_err(|cause| {
             checked_history_error(
                 cause,
                 source_revision,
@@ -1487,7 +1487,7 @@ impl ProviderAdapter for GrokAdapter {
             snapshot,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,
-            source_complete,
+            source_complete: source_complete && !provider_limited,
             source_revision,
             native_session: Some(native),
         })
@@ -1805,6 +1805,27 @@ mod tests {
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].title.as_deref(), Some("Current title"));
         assert!(current[0].source_path.is_some());
+    }
+
+    #[test]
+    fn grok_preview_covers_a_metadata_only_log_read_to_eof() {
+        let root = tempfile::tempdir().unwrap();
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id":SESSION_ID,"num_messages":1}),
+            &[
+                json!({"params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"available_commands_update"}}}),
+            ],
+        );
+        let adapter = GrokAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        assert!(
+            adapter
+                .index_session(&session, None, 0)
+                .unwrap()
+                .source_complete
+        );
     }
 
     #[test]
