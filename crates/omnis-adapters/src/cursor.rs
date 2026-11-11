@@ -759,7 +759,7 @@ impl CursorIdeAdapter {
         provider_file(root, &root.join("globalStorage").join("state.vscdb"))
     }
 
-    fn workspace_paths(&self) -> HashMap<String, PathBuf> {
+    fn workspace_paths(&self) -> HashMap<String, CursorWorkspaceLocation> {
         let Some(root) = self.metadata_root.as_deref() else {
             return HashMap::new();
         };
@@ -784,8 +784,8 @@ impl CursorIdeAdapter {
                 let candidate = entry.path().join("workspace.json");
                 let path = provider_file(root, &candidate)?;
                 let value = read_json(&path).ok()?;
-                let uri = string_at(&value, &[&["folder"], &["workspace"]])?;
-                Some((id, file_uri_path(uri).unwrap_or_else(|| PathBuf::from(uri))))
+                let location = CursorWorkspaceLocation::parse(&value, "folder", "workspace")?;
+                Some((id, location))
             })
             .collect()
     }
@@ -831,10 +831,48 @@ const MAX_CURSOR_IDE_HEADERS: usize = 100_000;
 const MAX_CURSOR_IDE_RECORD_SIZE: usize = 16 * 1024 * 1024;
 const MAX_CURSOR_IDE_TRAJECTORY_BYTES: usize = 128 * 1024 * 1024;
 
+struct CursorWorkspaceLocation {
+    path: Option<PathBuf>,
+    kind: &'static str,
+}
+
+impl CursorWorkspaceLocation {
+    fn parse(value: &Value, folder_key: &str, file_key: &str) -> Option<Self> {
+        let (kind, uri) = match (value.get(folder_key), value.get(file_key)) {
+            (Some(uri), None) => ("folder", uri),
+            (None, Some(uri)) => ("workspace", uri),
+            (Some(_), Some(_)) => {
+                return Some(Self {
+                    path: None,
+                    kind: "ambiguous",
+                });
+            }
+            (None, None) => return None,
+        };
+        Some(Self {
+            path: local_workspace_uri(uri),
+            kind,
+        })
+    }
+}
+
+fn workspace_ids_conflict(row_id: Option<&str>, declarations: [Option<&Value>; 2]) -> bool {
+    let mut expected = row_id;
+    for value in declarations.into_iter().flatten().filter(|v| !v.is_null()) {
+        let Some(id) = value.as_str() else {
+            return true;
+        };
+        if expected.replace(id).is_some_and(|previous| previous != id) {
+            return true;
+        }
+    }
+    false
+}
+
 fn cursor_ide_headers(
     transaction: &Transaction<'_>,
     database: &Path,
-    workspace_paths: &HashMap<String, PathBuf>,
+    workspace_paths: &HashMap<String, CursorWorkspaceLocation>,
 ) -> Result<Vec<CursorIdeHeader>> {
     if !table_exists(transaction, "composerHeaders")? {
         return Ok(Vec::new());
@@ -866,21 +904,22 @@ fn cursor_ide_headers(
         let id = row.get::<_, String>(0)?;
         let declared_composer_id = value.get("composerId").cloned();
         let row_workspace_id = row.get::<_, Option<String>>(1)?;
-        let declared_workspace_id = value.get("workspaceId").cloned();
+        let identifier = value.get("workspaceIdentifier").unwrap_or(&Value::Null);
+        let selector = CursorWorkspaceLocation::parse(identifier, "uri", "configPath");
+        let selector_id = identifier.get("id").cloned();
+        let declared_workspace_id = value.get("workspaceId").or(selector_id.as_ref()).cloned();
         let mapped_workspace = row_workspace_id
             .as_ref()
-            .and_then(|workspace_id| workspace_paths.get(workspace_id))
-            .cloned();
-        let workspace_identity_conflict = match declared_workspace_id.as_ref() {
-            Some(Value::String(header_id)) => row_workspace_id
-                .as_ref()
-                .is_some_and(|row_id| row_id != header_id),
-            Some(Value::Null) | None => false,
-            Some(_) => true,
-        };
-        let declared_workspace = workspace_path(&value);
-        let project_path = if mapped_workspace.is_some() {
-            mapped_workspace.clone()
+            .and_then(|workspace_id| workspace_paths.get(workspace_id));
+        let workspace_identity_conflict = workspace_ids_conflict(
+            row_workspace_id.as_deref(),
+            [declared_workspace_id.as_ref(), selector_id.as_ref()],
+        );
+        let declared_workspace = selector
+            .as_ref()
+            .map_or_else(|| workspace_path(&value), |selector| selector.path.clone());
+        let project_path = if let Some(location) = mapped_workspace {
+            location.path.clone()
         } else if workspace_identity_conflict {
             None
         } else {
@@ -895,7 +934,7 @@ fn cursor_ide_headers(
                 "workspaceId".to_owned(),
                 Value::String(workspace_id.clone()),
             );
-            if let Some(path) = mapped_workspace.as_ref() {
+            if let Some(path) = mapped_workspace.and_then(|location| location.path.as_ref()) {
                 object.insert(
                     "workspacePath".to_owned(),
                     Value::String(path.to_string_lossy().into_owned()),
@@ -906,7 +945,7 @@ fn cursor_ide_headers(
         insert_integer(object, "lastUpdatedAt", row.get(3)?);
         insert_boolean(object, "isArchived", row.get(4)?);
         insert_boolean(object, "isSubagent", row.get(5)?);
-        if let Some(header) = CursorIdeHeader::parse(
+        if let Some(mut header) = CursorIdeHeader::parse(
             &value,
             database,
             project_path,
@@ -914,6 +953,21 @@ fn cursor_ide_headers(
             declared_workspace_id.as_ref(),
             declared_composer_id.as_ref(),
         ) {
+            if let Some(workspace_id) = row_workspace_id
+                .as_deref()
+                .or_else(|| selector_id.as_ref().and_then(Value::as_str))
+            {
+                header.metadata["workspace_id"] = Value::from(workspace_id);
+            }
+            if let Some(location) = mapped_workspace.or(selector.as_ref()) {
+                header.metadata["workspace_kind"] = Value::from(location.kind);
+                if location.path.is_none() {
+                    header.metadata["workspace_unavailable"] = Value::Bool(true);
+                }
+            }
+            if mapped_workspace.is_none() && workspace_identity_conflict {
+                header.metadata["workspace_unavailable"] = Value::Bool(true);
+            }
             headers.push(header);
         }
     }
@@ -1429,49 +1483,32 @@ fn unsupported_cursor_ide_event(
 }
 
 fn workspace_path(value: &Value) -> Option<PathBuf> {
-    if let Some(path) = string_at(
-        value,
-        &[
-            &["workspacePath"],
-            &["projectPath"],
-            &["cwd"],
-            &["workspace", "path"],
-            &["workspace", "folder"],
-            &["workspace", "rootPath"],
-            &["workspaceUri", "fsPath"],
-            &["workspaceUri", "path"],
-            &["workspace", "uri", "fsPath"],
-            &["workspace", "uri", "path"],
-            &["workspaceIdentifier", "uri", "fsPath"],
-            &["workspaceIdentifier", "uri", "path"],
-        ],
-    ) {
-        return Some(PathBuf::from(path));
-    }
-    let uri = string_at(
-        value,
-        &[
-            &["workspaceUri"],
-            &["workspaceURI"],
-            &["workspace", "uri"],
-            &["workspaceUris", "0"],
-            &["workspaceIdentifier", "uri", "external"],
-        ],
-    )
-    .or_else(|| {
-        let first = value
-            .get("workspaceUris")
-            .and_then(Value::as_array)
-            .and_then(|uris| uris.first())?;
-        first
-            .as_str()
-            .or_else(|| string_at(first, &[&["fsPath"], &["path"]]))
-    })?;
-    file_uri_path(uri)
+    let fields: &[&[&str]] = &[
+        &["workspacePath"],
+        &["projectPath"],
+        &["cwd"],
+        &["workspace", "path"],
+        &["workspace", "folder"],
+        &["workspace", "rootPath"],
+        &["workspaceUri"],
+        &["workspaceURI"],
+        &["workspace", "uri"],
+    ];
+    fields
+        .iter()
+        .find_map(|field| local_workspace_uri(value_at(value, &[field])?))
+        .or_else(|| local_workspace_uri(value.get("workspaceUris")?.as_array()?.first()?))
 }
 
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
+    let absolute = encoded.starts_with('/');
+    #[cfg(windows)]
+    let absolute =
+        absolute || (encoded.as_bytes().get(1) == Some(&b':') && Path::new(encoded).is_absolute());
+    if !absolute || encoded.starts_with("//") || encoded.contains(['?', '#']) {
+        return None;
+    }
     let decoded = percent_decode(encoded)?;
     #[cfg(target_os = "windows")]
     let decoded = decoded
@@ -1480,6 +1517,36 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
         .unwrap_or(&decoded)
         .to_owned();
     Some(PathBuf::from(decoded))
+}
+
+fn local_workspace_uri(uri: &Value) -> Option<PathBuf> {
+    let path = if let Some(text) = uri.as_str() {
+        if text.starts_with("file:") {
+            file_uri_path(text)?
+        } else {
+            PathBuf::from(text)
+        }
+    } else {
+        if uri
+            .get("scheme")
+            .is_some_and(|s| s.as_str() != Some("file"))
+            || uri.get("authority").is_some_and(|a| a.as_str() != Some(""))
+        {
+            return None;
+        }
+        if let Some(external) = uri.get("external") {
+            file_uri_path(external.as_str()?)?
+        } else {
+            let text = string_at(uri, &[&["fsPath"], &["path"]])?;
+            #[cfg(windows)]
+            let text = text
+                .strip_prefix('/')
+                .filter(|s| s.as_bytes().get(1) == Some(&b':'))
+                .unwrap_or(text);
+            PathBuf::from(text)
+        }
+    };
+    (path.is_absolute() && !omnis_core::may_reach_network(&path)).then_some(path)
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -1566,15 +1633,16 @@ impl ProviderAdapter for CursorIdeAdapter {
         if store_is_missing(&root.join("globalStorage").join("state.vscdb")) {
             return Ok(Vec::new());
         }
+        let mut matcher = project.map(omnis_core::SessionWorkspaceMatcher::new);
         let mut sessions = self
             .headers()?
             .into_iter()
             .filter(|header| {
-                project.is_none_or(|project| {
+                matcher.as_mut().is_none_or(|matcher| {
                     header
                         .project_path
                         .as_deref()
-                        .is_some_and(|recorded| paths_match(recorded, project))
+                        .is_some_and(|recorded| matcher.matches(Provider::CursorIde, recorded))
                 })
             })
             .map(CursorIdeHeader::into_native)

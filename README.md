@@ -429,7 +429,9 @@ Inspection checks the permission mode that `resume` would use, including your `O
 
 Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`.
 
-Cursor Agent resumes the chat in its recorded folder, including a subdirectory of the current repository. Cursor IDE opens the recorded folder or `.code-workspace` file. Select the chat from Show Chat History. If the local Cursor IDE store is missing messages, `inspect` and `resume` report the omission.
+Cursor Agent resumes the chat in its recorded folder, including a subdirectory of the current repository. For a Cursor IDE chat, open the recorded folder or saved workspace, then select the chat from Show Chat History. You can find a saved workspace from any of the local folders listed in its `.code-workspace` file. OmniSession opens that file even when you run the command from a different member folder.
+
+Cursor IDE can assign a new workspace ID if you delete and recreate a folder at the same path. If the recorded ID no longer matches, use `omni export <session> --output chat.json` to recover the original chat history. If an older record has no verifiable workspace ID, OmniSession reports that limitation. Inspection and resume also flag missing or unreadable conversation records.
 
 **My agent is older than the version gate. What happens?**
 The native import cannot run. On a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel. Scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try.

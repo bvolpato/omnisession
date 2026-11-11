@@ -1,7 +1,12 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
+mod cursor_workspace;
 mod recovery;
 
+pub use cursor_workspace::{
+    SessionWorkspaceMatcher, cursor_workspace_matches, local_cursor_workspace_path,
+    session_workspace_matches,
+};
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
 use std::{

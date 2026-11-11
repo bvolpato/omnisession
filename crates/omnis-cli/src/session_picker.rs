@@ -30,8 +30,8 @@ use crossterm::{
 use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
-    HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    HandoffMessage, HandoffRole, SessionPreview, SessionWorkspaceMatcher, first_user_message_after,
+    safe_terminal_line, session_preview, trajectory_search_document,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -1164,7 +1164,7 @@ fn normalized_picker_entries(
     current_project: &Path,
     cached: bool,
 ) -> Vec<PickerEntry> {
-    let mut matcher = WorkspaceMatcher::new(current_project);
+    let mut matcher = SessionWorkspaceMatcher::new(current_project);
     sessions
         .into_iter()
         .map(|session| picker_entry(session, &mut matcher, cached))
@@ -1173,7 +1173,7 @@ fn normalized_picker_entries(
 
 fn picker_entry(
     session: NativeSession,
-    matcher: &mut WorkspaceMatcher,
+    matcher: &mut SessionWorkspaceMatcher<'_>,
     cached: bool,
 ) -> PickerEntry {
     PickerEntry {
@@ -1181,36 +1181,10 @@ fn picker_entry(
         current_workspace: session
             .project_path
             .as_deref()
-            .is_some_and(|path| matcher.matches(path)),
+            .is_some_and(|path| matcher.matches(session.session.provider, path)),
         fields: SearchFields::new(&session, None),
         session,
         cached,
-    }
-}
-
-struct WorkspaceMatcher {
-    current: PathBuf,
-    matches: HashMap<PathBuf, bool>,
-}
-
-impl WorkspaceMatcher {
-    fn new(current: &Path) -> Self {
-        Self {
-            current: current.to_path_buf(),
-            matches: HashMap::new(),
-        }
-    }
-
-    fn matches(&mut self, candidate: &Path) -> bool {
-        if candidate == self.current {
-            return true;
-        }
-        if let Some(matches) = self.matches.get(candidate) {
-            return *matches;
-        }
-        let matches = workspace_paths_match(candidate, &self.current);
-        self.matches.insert(candidate.to_path_buf(), matches);
-        matches
     }
 }
 
@@ -1468,17 +1442,33 @@ fn select_picker_row(
         requested_mode,
     )? {
         TargetOutcome::Selected(choice) => {
-            // An imported row can carry another machine's workspace, so never resolve a network path.
-            let workspace_override = if project_path.as_deref().is_some_and(|path| {
-                !omnis_core::may_reach_network(path)
-                    && (path.is_dir()
-                        || (!choice.fork
-                            && session.provider == choice.target().provider
-                            && crate::transfer::is_cursor_workspace_file(session.provider, path)))
-            }) {
+            // An imported row can name another machine's workspace.
+            let stored = project_path
+                .as_deref()
+                .filter(|path| !omnis_core::may_reach_network(path));
+            let cursor_path = stored
+                .filter(|_| session.provider == Provider::CursorIde)
+                .and_then(omnis_core::local_cursor_workspace_path);
+            let workspace_file = cursor_path.as_deref().is_some_and(Path::is_file);
+            let has_workspace = if session.provider == Provider::CursorIde {
+                cursor_path.as_deref().is_some_and(Path::is_dir)
+                    || workspace_file
+                        && ((!choice.fork && choice.target().provider == Provider::CursorIde)
+                            || stored.is_some_and(|path| {
+                                omnis_core::cursor_workspace_matches(path, current_project)
+                            }))
+            } else {
+                stored.is_some_and(Path::is_dir)
+            };
+            let workspace_override = if has_workspace {
                 None
             } else {
-                match pick_workspace(&session, project_path.as_deref(), current_project)? {
+                let reason = if workspace_file {
+                    "Choose the folder to use for the target session."
+                } else {
+                    "Saved workspace is unavailable."
+                };
+                match pick_workspace(&session, project_path.as_deref(), current_project, reason)? {
                     WorkspaceOutcome::Selected(path) => Some(path),
                     WorkspaceOutcome::Back => return Ok(RowSelection::Back),
                     WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
@@ -1640,13 +1630,14 @@ fn pick_workspace(
     source: &SessionRef,
     original: Option<&Path>,
     current: &Path,
+    reason: &str,
 ) -> Result<WorkspaceOutcome> {
     let mut input = current.display().to_string();
     let mut message = String::new();
     let mut needs_render = true;
     loop {
         if needs_render {
-            render_workspace(source, original, &input, &message)?;
+            render_workspace(source, original, &input, &message, reason)?;
             needs_render = false;
         }
         let key = match event::read().context("reading workspace picker input")? {
@@ -2446,6 +2437,7 @@ fn render_workspace(
     original: Option<&Path>,
     input: &str,
     message: &str,
+    reason: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
@@ -2467,11 +2459,7 @@ fn render_workspace(
         &truncate(&format!("Source: {source}"), width),
     )?;
     queue!(frame, Print("\r\n\r\n"))?;
-    queue_styled(
-        &mut frame,
-        DetailStyle::Warning,
-        "Saved workspace is unavailable.",
-    )?;
+    queue_styled(&mut frame, DetailStyle::Warning, reason)?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(
         &mut frame,

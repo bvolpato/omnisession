@@ -491,6 +491,60 @@ fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
 }
 
 #[test]
+fn cursor_ide_checks_the_native_workspace_key_from_the_composer_row() {
+    let root = TempDir::new().unwrap();
+    let workspace = root.path().join("workspace");
+    let database = create_cursor_ide_fixture(root.path(), &workspace);
+    let adapter = CursorIdeAdapter::with_root(root.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let snapshot = || adapter.read_session(&session).unwrap();
+    let check = |path: &Path| omnis_adapters::validate_cursor_workspace_identity(&snapshot(), path);
+    assert!(!check(&workspace).unwrap());
+
+    let id = omnis_adapters::cursor_workspace_id(&workspace).unwrap();
+    let storage = root.path().join("workspaceStorage");
+    fs::rename(storage.join("ws-fixture"), storage.join(&id)).unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE composerHeaders SET workspaceId=?1", [&id])
+        .unwrap();
+    assert!(check(&workspace).unwrap());
+    let other = root.path().join("other");
+    fs::create_dir(&other).unwrap();
+    assert!(check(&other).is_err());
+
+    let config = root.path().join("Team.code-workspace");
+    fs::write(&config, r#"{"folders":[]}"#).unwrap();
+    assert!(check(&config).is_err());
+    let file_key = omnis_adapters::cursor_workspace_id(&config).unwrap();
+    fs::rename(&config, root.path().join("previous.code-workspace")).unwrap();
+    fs::write(&config, r#"{"folders":[{"path":"workspace"}]}"#).unwrap();
+    assert_eq!(
+        omnis_adapters::cursor_workspace_id(&config).unwrap(),
+        file_key
+    );
+    connection
+        .execute("UPDATE composerHeaders SET workspaceId=NULL", [])
+        .unwrap();
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "workspaceIdentifier": {"id":file_key,"configPath":{"scheme":"file","path":config}}
+        }),
+    );
+    assert_eq!(snapshot().workspace.root, config);
+    assert!(check(&config).unwrap());
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "workspaceIdentifier": {"id":id,"uri":{"scheme":"vscode-remote","authority":"synthetic","path":workspace}}
+        }),
+    );
+    assert!(snapshot().workspace.root.as_os_str().is_empty());
+    assert!(check(&workspace).is_err());
+}
+
+#[test]
 fn cursor_ide_uses_header_workspace_path_when_storage_mapping_is_missing() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace");

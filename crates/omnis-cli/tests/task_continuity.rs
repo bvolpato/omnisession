@@ -8,6 +8,9 @@ use std::{
 use omnis_ir::PortableBundle;
 use serde_json::{Value, json};
 
+#[path = "task_continuity/cursor_workspace.rs"]
+mod cursor_workspace;
+
 #[cfg(unix)]
 #[path = "task_continuity/probe_signals.rs"]
 mod probe_signals;
@@ -798,6 +801,15 @@ fn a_worker_holding_version_or_model_stdout_does_not_disable_native_import() {
 }
 
 #[cfg(unix)]
+fn has_warning(report: &Value, text: &str) -> bool {
+    report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains(text))
+}
+
+#[cfg(unix)]
 #[test]
 fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
     use std::os::unix::fs::PermissionsExt;
@@ -831,14 +843,15 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
 
     let desktop = root.join("Cursor.AppImage");
     let source = format!("cursor-ide:{SESSION_ID}");
-    let run = |args: &[&str]| {
-        command(root, &repo)
+    let run_at = |cwd: &Path, args: &[&str]| {
+        command(root, cwd)
             .env("CURSOR_IDE_HOME", &cursor)
             .env("OMNI_CURSOR_IDE_BIN", &desktop)
             .args(args)
             .output()
             .unwrap()
     };
+    let run = |args: &[&str]| run_at(&repo, args);
     let inspect = ["--json", "inspect", &source];
     let resume = ["--json", "resume", &source, "--dry-run"];
     for output in [run(&inspect), run(&resume)] {
@@ -851,14 +864,21 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
     let report: Value = serde_json::from_slice(&run(&inspect).stdout).unwrap();
     let resumed: Value = serde_json::from_slice(&run(&resume).stdout).unwrap();
     assert_eq!(report["mode"], "open_workspace");
+    assert!(has_warning(&report, "no verifiable Cursor workspace ID"));
     assert_eq!(report, resumed["fidelity"]);
     assert_eq!(resumed["exact_chat_selection"], false);
     let selected = omnis_core::canonicalize_path(&workspace).unwrap();
     assert_eq!(resumed["launch"]["args"], json!([workspace]));
     assert_eq!(resumed["launch"]["cwd"], json!(selected));
 
-    let workspace_file = workspace.join("multi.code-workspace");
-    fs::write(&workspace_file, r#"{"folders":[{"path":"."}]}"#).unwrap();
+    let container = root.join("configs");
+    let physical = root.join("backing/nested");
+    fs::create_dir(&container).unwrap();
+    fs::create_dir_all(&physical).unwrap();
+    let saved = physical.join("team.code-workspace");
+    fs::write(&saved, r#"{"folders":[{"path":"../repo/nested"}]}"#).unwrap();
+    let workspace_file = container.join("selected.code-workspace");
+    std::os::unix::fs::symlink(&saved, &workspace_file).unwrap();
     let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
     database
         .execute(
@@ -869,7 +889,25 @@ fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
     drop(database);
     let opened: Value = serde_json::from_slice(&run(&resume).stdout).unwrap();
     assert_eq!(opened["launch"]["args"], json!([workspace_file]));
-    assert_eq!(opened["launch"]["cwd"], json!(selected));
+    assert_eq!(
+        opened["launch"]["cwd"],
+        json!(omnis_core::canonicalize_path(&physical).unwrap())
+    );
+    assert_eq!(opened["fidelity"]["repository_matches"], true);
+    assert!(!run_at(&container, &inspect).status.success());
+    let other = run_at(
+        &container,
+        &[
+            "--json",
+            "resume",
+            &source,
+            "--dry-run",
+            "--allow-workspace-mismatch",
+        ],
+    );
+    let other: Value = serde_json::from_slice(&other.stdout).unwrap();
+    assert_eq!(other["launch"], opened["launch"]);
+    assert_eq!(other["fidelity"]["repository_matches"], false);
     assert_eq!(
         opened["fidelity"],
         serde_json::from_slice::<Value>(&run(&inspect).stdout).unwrap()
@@ -1176,13 +1214,7 @@ fn cursor_ide_reports_missing_and_unverified_chat_records() {
             entries.values().any(|e| e["status"] == "omitted"),
             status == "omitted"
         );
-        assert!(
-            inspected["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|w| w.as_str().unwrap().contains(warning))
-        );
+        assert!(has_warning(&inspected, warning));
     }
 }
 

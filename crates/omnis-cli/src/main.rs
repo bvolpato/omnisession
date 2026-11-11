@@ -3,7 +3,6 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
-    ffi::OsString,
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -385,21 +384,16 @@ fn cached_search_sessions(
         Some(provider) => store.indexed_sessions_for_provider(provider)?,
         None => store.indexed_sessions()?,
     };
-    // Keep network path spellings distinct, as workspace_paths_match does.
-    let mut workspace_matches = HashMap::<OsString, bool>::new();
+    let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
         .filter(|session| session.session.provider != Provider::Imported)
         .filter(|session| {
             args.all_projects
-                || session.project_path.as_deref().is_some_and(|path| {
-                    if let Some(&matches) = workspace_matches.get(path.as_os_str()) {
-                        return matches;
-                    }
-                    let matches = workspace_paths_match(path, project);
-                    workspace_matches.insert(path.as_os_str().to_owned(), matches);
-                    matches
-                })
+                || session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(session.session.provider, path))
         })
         .map(|session| NativeSession {
             session: session.session,
@@ -1882,13 +1876,13 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
             None,
         )?
     } else {
-        let matches = workspace_state_matches(&snapshot.workspace, &current)?;
+        let matches = transfer::transfer_workspace_matches(source.provider, &snapshot, &current)?;
         (current, matches)
     };
     transfer::launch_mode_args(
         target,
         args.mode,
-        transfer::cursor_working_directory(target.provider, &project),
+        &transfer::cursor_working_directory(target.provider, &project)?,
         true,
     )?;
     inspect_report(
@@ -1912,11 +1906,9 @@ fn inspect_report(
     let target = agent.provider;
     if source == target {
         if target == Provider::CursorIde {
-            transfer::cursor_ide_workspace_plan(project)?;
-            return Ok(omnis_core::build_cursor_workspace_report(
-                snapshot,
-                repository_matches,
-            ));
+            let (_, report) =
+                transfer::cursor_ide_continuation(snapshot, project, repository_matches)?;
+            return Ok(report);
         }
         let plan = registry.launch_plan(
             &snapshot.session,
@@ -2259,7 +2251,7 @@ fn source_workspace_matches_with_cache(
     project: &Path,
     current_remote: &OnceCell<Option<String>>,
 ) -> Result<bool> {
-    if source_workspace_matches(snapshot, project) {
+    if omnis_core::session_workspace_matches(session.provider, &snapshot.workspace.root, project) {
         return Ok(true);
     }
     if session.provider != Provider::Imported
@@ -2737,10 +2729,6 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
 
 fn current_project() -> Result<PathBuf> {
     workspace_root(std::env::current_dir()?).context("resolving current workspace")
-}
-
-fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
-    workspace_paths_match(&source.workspace.root, project)
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {

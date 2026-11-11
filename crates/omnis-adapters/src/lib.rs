@@ -6,6 +6,7 @@ mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
+mod cursor_identity;
 mod grok;
 mod hermes;
 mod omp;
@@ -31,6 +32,9 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
+pub use cursor_identity::{
+    cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
+};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;

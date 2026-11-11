@@ -16,9 +16,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 #[cfg(not(target_os = "windows"))]
 use directories::BaseDirs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use md5::Md5;
-use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
+use omnis_adapters::{CursorIdeAdapter, ProviderAdapter, cursor_workspace_id};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
 };
@@ -1961,7 +1959,7 @@ fn validate_cursor_directory(path: &Path, metadata_root: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn exact_workspace_id(_metadata_root: &Path, cwd: &Path) -> Result<String> {
-    linux_workspace_id(cwd)
+    cursor_workspace_id(cwd)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2018,74 +2016,41 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
             matches.push(id);
         }
     }
+    let native_id = cursor_workspace_id(cwd)?;
+    if matches.contains(&native_id) {
+        return Ok(native_id);
+    }
+    if matches
+        .iter()
+        .all(|id| omnis_adapters::is_cursor_workspace_id(id))
+    {
+        matches.clear();
+    }
     match matches.as_slice() {
         [id] => Ok(id.clone()),
         #[cfg(target_os = "macos")]
-        [] => unopened_workspace_id(cwd),
+        [] => Ok(native_id),
         #[cfg(not(target_os = "macos"))]
         [] => bail!(
             "Cursor IDE has no workspace metadata matching `{}`",
             cwd.display()
         ),
-        _ => {
-            // Aliased folder URIs leave duplicate records; Cursor opens the one keyed by path and birth time.
-            if let Some(id) = native_workspace_id(cwd).filter(|id| matches.contains(id)) {
-                return Ok(id);
-            }
-            bail!(
-                "Cursor IDE has multiple workspace records matching `{}`",
-                cwd.display()
-            )
-        }
+        _ => bail!(
+            "Cursor IDE has multiple workspace records matching `{}`",
+            cwd.display()
+        ),
     }
 }
 
 // Cursor writes no workspace record until a folder is first opened; derive the key it will assign.
 #[cfg(target_os = "macos")]
 fn unopened_workspace_id(cwd: &Path) -> Result<String> {
-    native_workspace_id(cwd).with_context(|| {
+    cursor_workspace_id(cwd).with_context(|| {
         format!(
             "Cursor IDE has no workspace metadata matching `{}` and cannot derive its workspace key",
             cwd.display()
         )
     })
-}
-
-#[cfg(target_os = "linux")]
-fn linux_workspace_id(cwd: &Path) -> Result<String> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(cwd).context("reading Cursor IDE target workspace metadata")?;
-    let mut digest = Md5::new();
-    digest.update(cwd.as_os_str().as_bytes());
-    digest.update(metadata.ino().to_string().as_bytes());
-    Ok(hex::encode(digest.finalize()))
-}
-
-#[cfg(target_os = "macos")]
-fn native_workspace_id(cwd: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let created = fs::metadata(cwd)
-        .and_then(|metadata| metadata.created())
-        .ok()?;
-    let millis = birth_millis(created.duration_since(std::time::UNIX_EPOCH).ok()?);
-    let mut digest = Md5::new();
-    digest.update(cwd.as_os_str().as_bytes());
-    digest.update(millis.to_string().as_bytes());
-    Some(hex::encode(digest.finalize()))
-}
-
-// Cursor hashes Node's `fs.Stats.birthtime`, which rounds to the nearest millisecond.
-#[cfg(any(target_os = "macos", test))]
-fn birth_millis(created: Duration) -> u128 {
-    (created.as_nanos() + 500_000) / 1_000_000
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn native_workspace_id(_cwd: &Path) -> Option<String> {
-    None
 }
 
 fn workspace_uri(cwd: &Path) -> Result<Value> {
@@ -2154,7 +2119,7 @@ fn default_cursor_ide_root() -> Option<PathBuf> {
 pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Result<()> {
     fs::create_dir_all(workspace)?;
     #[cfg(target_os = "linux")]
-    let workspace_id = linux_workspace_id(workspace)?;
+    let workspace_id = cursor_workspace_id(workspace)?;
     #[cfg(not(target_os = "linux"))]
     let workspace_id = "cursor-ide-fixture".to_owned();
     fs::create_dir_all(metadata_root.join("globalStorage"))?;
@@ -2189,7 +2154,7 @@ pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{path::PathBuf, sync::Arc};
 
     use chrono::Utc;
     use omnis_ir::{
@@ -2215,15 +2180,19 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn cursor_workspace_birth_time_rounds_to_nearest_millisecond() {
+    fn a_restored_folder_does_not_write_into_its_previous_workspace_storage() {
+        let fixture = fixture_store();
+        let storage = fixture.root.join("workspaceStorage");
+        let previous = "00000000000000000000000000000000";
+        fs::rename(storage.join("cursor-ide-fixture"), storage.join(previous)).unwrap();
+        let workspace = fs::canonicalize(&fixture.workspace).unwrap();
+        let current = cursor_workspace_id(&workspace).unwrap();
+        assert_ne!(current, previous);
         assert_eq!(
-            birth_millis(Duration::from_nanos(1_769_474_943_049_534_497)),
-            1_769_474_943_050
-        );
-        assert_eq!(
-            birth_millis(Duration::from_nanos(1_769_474_943_049_499_999)),
-            1_769_474_943_049
+            exact_workspace_id(&fixture.root, &workspace).unwrap(),
+            current
         );
     }
 
@@ -2236,7 +2205,7 @@ mod tests {
         fs::create_dir(&workspace).expect("workspace directory");
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
-        let native = native_workspace_id(&workspace).expect("native workspace key");
+        let native = cursor_workspace_id(&workspace).expect("native workspace key");
         for (id, folder) in [(native.as_str(), &workspace), ("aliased", &alias)] {
             let record = root.join("workspaceStorage").join(id);
             fs::create_dir_all(&record).expect("workspace record");
@@ -3491,7 +3460,7 @@ mod tests {
 
         assert_eq!(
             import.workspace_id,
-            linux_workspace_id(&unopened).expect("Cursor Linux workspace ID")
+            cursor_workspace_id(&unopened).expect("Cursor Linux workspace ID")
         );
         materialize_store(&import).expect("materialize unopened workspace import");
         assert!(
@@ -3519,7 +3488,7 @@ mod tests {
             .expect("canonical fixture root")
             .join("workspace-never-opened-in-cursor");
         fs::create_dir(&unopened).expect("unopened workspace");
-        let native = native_workspace_id(&unopened).expect("Cursor macOS workspace ID");
+        let native = cursor_workspace_id(&unopened).expect("Cursor macOS workspace ID");
         let snapshot = fixture_snapshot(&unopened);
         let import = build_with_root(&snapshot, &unopened, fixture.root.clone())
             .expect("build unopened Cursor IDE workspace import");
