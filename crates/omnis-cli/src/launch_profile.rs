@@ -641,14 +641,16 @@ impl AgentTarget {
         let Some(program) = self.own_program()? else {
             return Ok(true);
         };
-        let Ok(provider) = crate::provider_launch::resolved_provider_binary(self.provider) else {
-            return Ok(false);
-        };
-        if program == provider {
+        if let Ok(provider) = crate::provider_launch::resolved_provider_binary(self.provider)
+            && (program == provider
+                || crate::provider_launch::same_executable(&program, &provider).with_context(
+                    || format!("checking the executable of launch profile `{self}`"),
+                )?)
+        {
             return Ok(true);
         }
-        same_file::is_same_file(program, provider)
-            .with_context(|| format!("checking the executable of launch profile `{self}`"))
+        Ok(self.provider == Provider::Codex
+            && crate::provider_launch::is_codex_package_entrypoint(&program))
     }
 
     /// The file that a run executes when the profile replaces the agent's command, or `None`

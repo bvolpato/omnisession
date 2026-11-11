@@ -384,12 +384,20 @@ fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> 
     }
 }
 
+fn is_main_record(record: &Value) -> bool {
+    record["isSidechain"] != true && record["teamName"].as_str().is_none()
+}
+
 impl ClaudeMetadata {
     fn observe(&mut self, record: &Value) {
-        if let Some(cwd) = string_at(record, &[&["cwd"]]) {
+        if is_main_record(record)
+            && let Some(cwd) = string_at(record, &[&["cwd"]])
+        {
             self.project_path = Some(PathBuf::from(cwd));
         }
-        if let Some(branch) = string_at(record, &[&["gitBranch"]]) {
+        if is_main_record(record)
+            && let Some(branch) = string_at(record, &[&["gitBranch"]])
+        {
             self.git_branch = Some(branch.to_owned());
         }
         let timestamp = parse_timestamp(record.get("timestamp"));
@@ -742,8 +750,7 @@ impl ClaudeTranscript {
         self.has_records = true;
         self.metadata.observe(record);
         self.titles.observe(record);
-        let main_record = record.get("isSidechain").and_then(Value::as_bool) != Some(true)
-            && record.get("teamName").and_then(Value::as_str).is_none();
+        let main_record = is_main_record(record);
         if matches!(
             record.get("type").and_then(Value::as_str),
             Some("user" | "assistant")
@@ -1021,7 +1028,7 @@ impl ProviderAdapter for ClaudeAdapter {
                     }
                 };
                 has_records = true;
-                let main = record["isSidechain"] != true && record["teamName"].as_str().is_none();
+                let main = is_main_record(&record);
                 if matches!(record["type"].as_str(), Some("assistant" | "user")) {
                     has_conversation = true;
                     has_main_conversation |= main;

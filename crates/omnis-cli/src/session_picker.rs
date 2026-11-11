@@ -112,6 +112,7 @@ pub struct PickerSelection {
     /// Permission mode chosen on the target page.
     pub mode: Option<ModeKind>,
     pub workspace_override: Option<PathBuf>,
+    pub source_workspace_unverified: bool,
 }
 
 /// Target page answer for `omni fork`.
@@ -1643,6 +1644,8 @@ fn select_picker_row(
                     fork: choice.fork,
                     mode: choice.mode,
                     workspace_override,
+                    source_workspace_unverified: verification
+                        == WorkspaceVerification::ConfirmDestination,
                 },
             )))
         }

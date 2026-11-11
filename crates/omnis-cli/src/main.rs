@@ -4204,6 +4204,7 @@ mod tests {
                 fork: false,
                 mode: None,
                 workspace_override: None,
+                source_workspace_unverified: false,
             }),
         };
 
@@ -4240,6 +4241,7 @@ mod tests {
             fork: false,
             mode: None,
             workspace_override: Some(chosen.path().to_path_buf()),
+            source_workspace_unverified: false,
         };
 
         assert_eq!(
@@ -4305,6 +4307,7 @@ mod tests {
             fork: false,
             mode: None,
             workspace_override: Some(service.clone()),
+            source_workspace_unverified: false,
         };
 
         assert_eq!(

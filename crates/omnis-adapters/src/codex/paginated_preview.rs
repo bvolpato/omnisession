@@ -389,7 +389,7 @@ mod tests {
         let stale = message(json!([["text", "earlier revision"]]));
         let mut contested = message(json!([["text", "contested revision"]]));
         let mut documentary = json!({"timestamp":DATE,"type":"event_msg","payload":{
-            "type":"token_count","rate_limits":{"primary":{"private":"metadata"}}}});
+            "type":"token_count","rate_limits":{"primary":{"used_percent":25.0}}}});
         let mut resumed = message(json!([["text", "post-gap caption"]]));
         resumed["payload"][3][1] = "final".into();
         let mut model = json!({"type":"response_item","timestamp":DATE,"payload":{"type":"message","role":"user",
@@ -449,9 +449,8 @@ mod tests {
                 expected.insert(0, ("omnisession.preview_limit", 1));
             }
             assert_eq!(omissions, expected);
-            assert!(events.iter().any(
-                |e| e.payload["ordinal_gap"] == true && e.payload["contested_ordinal"] == true
-            ));
+            assert!(events.iter().any(|e| e.payload["ordinal_gap"] == true
+                && e.payload["contested_ordinal"] == unfamiliar));
         }
     }
 }

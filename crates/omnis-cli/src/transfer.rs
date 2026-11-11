@@ -131,9 +131,17 @@ fn resume_from_snapshot(
         (project, None)
     };
     let project = profile_workspace(request.agent_target(), &process_directory, args)?;
-    let matches = match cursor_match {
-        Some(matches) => matches,
-        None => transfer_repository_matches(source, &snapshot, &project)?,
+    let matches = if request
+        .picker_selection
+        .as_ref()
+        .is_some_and(|selection| selection.source_workspace_unverified)
+    {
+        false
+    } else {
+        match cursor_match {
+            Some(matches) => matches,
+            None => transfer_repository_matches(source, &snapshot, &project)?,
+        }
     };
     let mode_args = if args.materialize_only {
         Vec::new()
@@ -413,7 +421,10 @@ pub(super) fn resume_project(
     allow_workspace_mismatch: bool,
     selection: Option<&session_picker::PickerSelection>,
 ) -> Result<PathBuf> {
-    if let Some(selection) = selection.filter(|selection| selection.workspace_override.is_some()) {
+    if let Some(selection) = selection.filter(|selection| {
+        selection.workspace_override.is_some()
+            || (source.provider == Provider::Claude && selection.across_projects)
+    }) {
         return selected_workspace(snapshot, selection);
     }
     if allow_workspace_mismatch || source_workspace_matches_for_session(source, snapshot, current)?
@@ -814,7 +825,13 @@ fn native_launch_workspace(
                     .is_some_and(|saved| same_launch_directory(saved, &project))
         });
     let effective_directory = profile_workspace(request.agent_target(), &project, args)?;
-    let repository_matches = if effective_directory.as_os_str() == project.as_os_str() {
+    let repository_matches = if request
+        .picker_selection
+        .as_ref()
+        .is_some_and(|selection| selection.source_workspace_unverified)
+    {
+        false
+    } else if effective_directory.as_os_str() == project.as_os_str() {
         repository_matches
     } else {
         recorded.is_some_and(|source| workspace_paths_match(source, &effective_directory))
