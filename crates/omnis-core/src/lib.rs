@@ -1556,73 +1556,41 @@ fn import_conversation_with_limit(
     let (events, source_incomplete) = visible_import_events(snapshot, true);
     let mut truncated = source_incomplete;
     let mut candidates = Vec::new();
-    let has_compaction = events
-        .first()
-        .is_some_and(|event| source_compaction_text(event).is_some());
-
+    let mut summary = None;
     for event in events {
-        let (role, text, message_truncated) = match event.kind {
-            EventKind::MessageUser | EventKind::MessageAssistant => {
-                let role = if event.kind == EventKind::MessageUser {
-                    HandoffRole::User
-                } else {
-                    HandoffRole::Assistant
-                };
-                let Some((text, message_truncated)) =
-                    message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
-                else {
-                    continue;
-                };
-                (role, text, message_truncated)
+        let (role, text, message_truncated) = if let Some((text, shortened)) =
+            compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
+        {
+            summary = Some(candidates.len());
+            (HandoffRole::Assistant, text, shortened)
+        } else {
+            let role = match event.kind {
+                EventKind::MessageUser => HandoffRole::User,
+                EventKind::MessageAssistant => HandoffRole::Assistant,
+                _ => continue,
+            };
+            let Some((text, shortened)) =
+                message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
+            else {
+                continue;
+            };
+            if is_harness_envelope(&text) {
+                continue;
             }
-            EventKind::CompactionCreated => {
-                let Some((text, message_truncated)) =
-                    compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
-                else {
-                    continue;
-                };
-                (HandoffRole::Assistant, text, message_truncated)
-            }
-            _ => continue,
+            (role, text, shortened)
         };
-        if is_harness_envelope(&text) {
-            continue;
-        }
         truncated |= message_truncated;
         candidates.push(HandoffMessage { role, text });
     }
-
-    let anchor = has_compaction.then(|| candidates[0].clone());
-    let mut remaining = history_character_limit;
-    if let Some(anchor) = &anchor {
-        let length = anchor.text.chars().count();
-        if length <= remaining {
-            remaining -= length;
-        } else {
-            truncated = true;
-        }
-    }
-
-    let tail_start = usize::from(anchor.is_some());
-    let mut recent = Vec::new();
-    for message in candidates[tail_start..].iter().rev() {
-        let length = message.text.chars().count();
-        if length > remaining {
-            truncated = true;
-            break;
-        }
-        remaining -= length;
-        recent.push(message.clone());
-    }
-    recent.reverse();
-
-    let mut messages = Vec::with_capacity(recent.len() + usize::from(anchor.is_some()));
-    if let Some(anchor) =
-        anchor.filter(|anchor| anchor.text.chars().count() <= history_character_limit)
-    {
-        messages.push(anchor);
-    }
-    messages.extend(recent);
+    let (indices, _) = retained_import_indices(
+        candidates.len(),
+        summary,
+        history_character_limit,
+        usize::MAX,
+        |i| (candidates[i].text.chars().count(), false),
+        &mut truncated,
+    );
+    let messages = indices.into_iter().map(|i| candidates[i].clone()).collect();
 
     ImportConversation {
         messages,
@@ -1722,6 +1690,22 @@ struct ImportCandidate {
 }
 
 fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
+    if (event.kind == EventKind::CompactionCreated || limits.redact)
+        && let Some((text, truncated)) = compaction_text_with_truncation(event, limits.message)
+    {
+        return Some((
+            ImportCandidate {
+                item: TrajectoryItem {
+                    kind: TrajectoryItemKind::Assistant,
+                    text,
+                    timestamp: event.timestamp,
+                    tool: None,
+                },
+                is_compaction: true,
+            },
+            truncated,
+        ));
+    }
     match event.kind {
         EventKind::MessageUser | EventKind::MessageAssistant => {
             let kind = if event.kind == EventKind::MessageUser {
@@ -1754,21 +1738,6 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     is_compaction: false,
-                },
-                truncated,
-            ))
-        }
-        EventKind::CompactionCreated => {
-            let (text, truncated) = compaction_text_with_truncation(event, limits.message)?;
-            Some((
-                ImportCandidate {
-                    item: TrajectoryItem {
-                        kind: TrajectoryItemKind::Assistant,
-                        text,
-                        timestamp: event.timestamp,
-                        tool: None,
-                    },
-                    is_compaction: true,
                 },
                 truncated,
             ))
@@ -2076,9 +2045,9 @@ fn collect_import_candidates(
     let mut candidates = Vec::new();
     let mut latest_compaction = None;
     let reverse_candidates = item_limits.redact
-        && !events
-            .iter()
-            .any(|event| event.kind == EventKind::CompactionCreated);
+        && !events.iter().any(|event| {
+            event.kind == EventKind::CompactionCreated || positioned_codex_summary(event).is_some()
+        });
     let mut candidate_remaining = history_character_limit;
     let mut candidate_tools = 0;
     if reverse_candidates {
@@ -2117,6 +2086,52 @@ fn collect_import_candidates(
     (candidates, truncated, latest_compaction)
 }
 
+// Reserve the summary first, then retain the newest items that fit. Its position in a
+// Codex replacement can be between messages, so return all indices in source order.
+fn retained_import_indices(
+    count: usize,
+    summary: Option<usize>,
+    mut remaining: usize,
+    tool_limit: usize,
+    item_size: impl Fn(usize) -> (usize, bool),
+    truncated: &mut bool,
+) -> (Vec<usize>, usize) {
+    let retained_summary = summary.filter(|&i| {
+        let length = item_size(i).0;
+        if length <= remaining {
+            remaining -= length;
+            true
+        } else {
+            *truncated = true;
+            false
+        }
+    });
+    let mut indices = Vec::new();
+    let mut tools = 0;
+    for i in (0..count).rev() {
+        if Some(i) == summary {
+            continue;
+        }
+        let (length, is_tool) = item_size(i);
+        if is_tool && tools >= tool_limit {
+            *truncated = true;
+            continue;
+        }
+        if length > remaining {
+            *truncated = true;
+            break;
+        }
+        remaining -= length;
+        tools += usize::from(is_tool);
+        indices.push(i);
+    }
+    indices.reverse();
+    if let Some(i) = retained_summary {
+        indices.insert(indices.partition_point(|&other| other < i), i);
+    }
+    (indices, remaining)
+}
+
 fn import_trajectory_with_limits(
     snapshot: &CanonicalSnapshot,
     history_character_limit: usize,
@@ -2129,69 +2144,53 @@ fn import_trajectory_with_limits(
         tool_event_limit,
         item_limits,
     );
-    let start = latest_compaction.unwrap_or(0);
-    truncated |= !item_limits.redact && start > 0;
-    let anchor = latest_compaction.map(|_| candidates[start].item.clone());
-    let mut remaining = history_character_limit;
-    let mut anchor_retained = false;
-    if let Some(anchor) = &anchor {
-        let length = anchor.text.chars().count();
-        if length > remaining {
-            truncated = true;
-        } else {
-            remaining -= length;
-            anchor_retained = true;
-        }
-    }
+    let start = if item_limits.redact {
+        0
+    } else {
+        latest_compaction.unwrap_or(0)
+    };
+    truncated |= start > 0;
+    let candidates = &candidates[start..];
+    let summary = latest_compaction.map(|i| i - start);
+    let (mut indices, mut remaining) = retained_import_indices(
+        candidates.len(),
+        summary,
+        history_character_limit,
+        tool_event_limit,
+        |i| {
+            let item = &candidates[i].item;
+            (
+                item.text.chars().count(),
+                item.kind == TrajectoryItemKind::Tool,
+            )
+        },
+        &mut truncated,
+    );
 
-    let tail_start = start + usize::from(anchor.is_some());
-    let mut recent = Vec::new();
-    let mut tool_events = 0;
-    for candidate in candidates[tail_start..].iter().rev() {
-        if candidate.item.kind == TrajectoryItemKind::Tool && tool_events >= tool_event_limit {
-            truncated = true;
-            continue;
-        }
-        let length = candidate.item.text.chars().count();
-        if length > remaining {
-            truncated = true;
-            break;
-        }
-        remaining -= length;
-        if candidate.item.kind == TrajectoryItemKind::Tool {
-            tool_events += 1;
-        }
-        recent.push(candidate.item.clone());
-    }
-    recent.reverse();
-
-    let mut items =
-        Vec::with_capacity(recent.len() + usize::from(anchor_retained) + usize::from(truncated));
-    if anchor_retained {
-        items.push(anchor.expect("retained compaction anchor exists"));
-    }
-    items.extend(recent);
-
+    let notice_length = IMPORT_OMISSION_NOTICE.chars().count();
     if truncated {
-        let notice = TrajectoryItem {
+        while notice_length > remaining {
+            let remove_at = usize::from(summary.is_some() && indices.first() == summary.as_ref());
+            let Some(&i) = indices.get(remove_at) else {
+                break;
+            };
+            remaining += candidates[i].item.text.chars().count();
+            indices.remove(remove_at);
+        }
+    }
+    let mut items = Vec::with_capacity(indices.len() + usize::from(truncated));
+    if truncated && notice_length <= remaining {
+        items.push(TrajectoryItem {
             kind: TrajectoryItemKind::Assistant,
             text: IMPORT_OMISSION_NOTICE.to_owned(),
             timestamp: None,
             tool: None,
-        };
-        let notice_length = notice.text.chars().count();
-        while notice_length > remaining && items.len() > usize::from(anchor_retained) {
-            let remove_at = usize::from(anchor_retained);
-            let removed = items.remove(remove_at);
-            remaining += removed.text.chars().count();
-        }
-        if notice_length <= remaining {
-            items.insert(0, notice);
-        }
+        });
     }
+    items.extend(indices.into_iter().map(|i| candidates[i].item.clone()));
 
     validate_native_tools(&mut items, snapshot.session.provider);
-    tool_events = items
+    let tool_events = items
         .iter()
         .filter(|item| item.kind == TrajectoryItemKind::Tool)
         .count();
@@ -2601,6 +2600,14 @@ fn visible_import_events(
             .rposition(|event| source_compaction_text(event).is_some())
     {
         events.drain(..start);
+        // The adapter records the boundary before the replacement and its local summary in order.
+        if events[0].source.provider == Provider::Codex
+            && events[1..]
+                .iter()
+                .any(|event| positioned_codex_summary(event).is_some())
+        {
+            events.remove(0);
+        }
     }
     (events, source_incomplete)
 }
@@ -2658,13 +2665,29 @@ fn compaction_text_with_truncation(
     event: &OmniEvent,
     character_limit: usize,
 ) -> Option<(String, bool)> {
-    let text = source_compaction_text(event)?;
+    let text = source_compaction_text(event).or_else(|| positioned_codex_summary(event))?;
     let text = format!(
         "[Source compaction summary. Historical context only. Later messages may update this summary.]\n{}",
         redact_secrets(text)
     );
     let truncated = text.chars().count() > character_limit;
     Some((bounded_text(&text, character_limit), truncated))
+}
+
+fn positioned_codex_summary(event: &OmniEvent) -> Option<&str> {
+    if event.kind != EventKind::MessageAssistant
+        || event.source.provider != Provider::Codex
+        || event.source.raw_record_type.as_deref() != Some("compacted.summary")
+        || event.replay_policy != ReplayPolicy::Contextual
+        || is_secret(event)
+    {
+        return None;
+    }
+    event
+        .payload
+        .get("text")?
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
@@ -5795,6 +5818,69 @@ mod tests {
                 .iter()
                 .all(|message| !message.text.contains("obsolete pre-compaction request"))
         );
+    }
+
+    #[test]
+    fn positioned_codex_summary_survives_import_limits_in_source_order() {
+        let mut summary = event(
+            3,
+            EventKind::MessageAssistant,
+            json!({"text": "Real summary"}),
+        );
+        summary.source.raw_record_type = Some("compacted.summary".to_owned());
+        let long_answer = "x".repeat(300);
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "Superseded request"}),
+            ),
+            compaction(1, Provider::Codex, "Compaction boundary"),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Retained request"}),
+            ),
+            summary,
+            event(4, EventKind::MessageAssistant, json!({"text": long_answer})),
+            event(5, EventKind::MessageUser, json!({"text": "Latest request"})),
+        ]);
+        for (limit, expected) in [
+            (
+                1_024,
+                vec![
+                    "Retained request",
+                    "Real summary",
+                    long_answer.as_str(),
+                    "Latest request",
+                ],
+            ),
+            (250, vec!["Real summary", "Latest request"]),
+        ] {
+            let conversation = import_conversation_with_limit(&snapshot, limit);
+            let trajectory = import_trajectory_with_limits(&snapshot, limit, 0, SOURCE_ITEM_LIMITS);
+            assert_eq!(conversation.truncated, limit == 250);
+            assert_eq!(trajectory.truncated, limit == 250);
+            for texts in [
+                conversation
+                    .messages
+                    .iter()
+                    .map(|item| &item.text)
+                    .collect::<Vec<_>>(),
+                trajectory
+                    .items
+                    .iter()
+                    .map(|item| &item.text)
+                    .collect::<Vec<_>>(),
+            ] {
+                let actual = texts
+                    .into_iter()
+                    .filter(|text| text.as_str() != IMPORT_OMISSION_NOTICE)
+                    .map(|text| text.lines().last().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

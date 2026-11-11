@@ -64,12 +64,99 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 
 #[test]
 fn changed_turn_directory_does_not_inherit_creation_git() {
-    let context = json!({"type":"turn_context","payload":{"cwd":"/workspace/elsewhere"}});
+    let padding = json!({"type":"event_msg","payload":{"note":"x".repeat(2_048)}}).to_string();
+    let context = r#"{"type":"turn_\u0063ontext","payload":{"cwd":"/workspace/elsewhere"}}"#;
+    let records: Vec<_> = std::iter::repeat_n(padding.as_str(), 1_025)
+        .chain([context])
+        .chain(std::iter::repeat_n(padding.as_str(), 1_025))
+        .collect();
     for preview in [false, true] {
-        let snapshot = read_records_with_preview(vec![&context], preview).unwrap();
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
         assert_eq!(snapshot.workspace.root, Path::new("/workspace/elsewhere"));
         assert_eq!(snapshot.workspace.git, omnis_ir::GitState::default());
     }
+}
+
+#[test]
+fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace/initial"}})
+    )
+    .unwrap();
+    writeln!(file, "{}", json!({"type":"turn_context","payload":{"cwd":"/workspace/unreadable","padding":"x".repeat(16*1024*1024)}})).unwrap();
+    writeln!(file, "{}", message("assistant", "A recent reply")).unwrap();
+
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let preview = adapter.preview_session(&session).unwrap();
+    assert_eq!(visible_text(&preview), ["A recent reply"]);
+    assert!(preview.workspace.root.as_os_str().is_empty());
+    assert!(
+        adapter
+            .read_session(&session)
+            .unwrap()
+            .workspace
+            .root
+            .as_os_str()
+            .is_empty()
+    );
+    assert!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .is_none()
+    );
+
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":"/workspace/recovered"}})
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns": 0}))
+    )
+    .unwrap();
+    let directory = Path::new("/workspace/recovered");
+    assert_eq!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .as_deref(),
+        Some(directory)
+    );
+    assert_eq!(
+        adapter.preview_session(&session).unwrap().workspace.root,
+        directory
+    );
+    writeln!(
+        file,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns": "unknown"}))
+    )
+    .unwrap();
+    assert!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .is_none()
+    );
 }
 
 #[test]
@@ -622,5 +709,172 @@ fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
         event("thread_rolled_back", json!({"num_turns": 1})),
     ])
     .expect("context fragment classification");
+    assert!(visible_text(&snapshot).is_empty());
+}
+
+#[test]
+fn partial_checkpoint_rollback_removes_only_discarded_requests() {
+    let checkpoint = json!({"type":"compacted","payload":{"message":"","replacement_history":[
+        message("user", "Kept request")["payload"],
+        message("assistant", "Kept reply")["payload"],
+        message("user", "Discarded request")["payload"],
+        message("assistant", "Discarded reply")["payload"],
+    ]}});
+    for original in [
+        vec![event("task_started", json!({"turn_id": "pending"}))],
+        vec![json!({"type":"turn_context","payload":{"cwd":"/workspace/pending"}})],
+        vec![message("user", "Kept request")],
+        vec![message("user", "Discarded request")],
+    ] {
+        let mut records = original;
+        records.extend([
+            checkpoint.clone(),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ]);
+        let snapshot = read_records(records.clone()).unwrap();
+        let active = omnis_core::import_conversation(&snapshot);
+        assert!(active.messages.iter().any(|m| m.text == "Kept request"));
+        assert!(active.messages.iter().any(|m| m.text == "Kept reply"));
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("Discarded")
+        );
+        records.extend([
+            event("thread_rolled_back", json!({"num_turns":1})),
+            message("user", "Fresh request"),
+        ]);
+        assert_eq!(
+            visible_text(&read_records(records).unwrap()),
+            ["Fresh request"]
+        );
+    }
+}
+
+#[test]
+fn legacy_compaction_keeps_real_requests_then_the_latest_summary() {
+    let snapshot = read_records(vec![
+        message("user", "Initial request"),
+        message("assistant", "Original reply"),
+        message(
+            "user",
+            "<environment_context>Local setup</environment_context>",
+        ),
+        json!({"type":"compacted","payload":{"message":"First summary"}}),
+        message("user", "Follow-up request"),
+        event("user_message", json!({"message":"Follow-up request"})),
+        json!({"type":"compacted","payload":{"message":"Latest summary"}}),
+        message("assistant", "Final reply"),
+    ])
+    .unwrap();
+    let active = omnis_core::import_conversation(&snapshot);
+    let trajectory = omnis_core::import_trajectory(&snapshot);
+    for texts in [
+        active
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        trajectory.items.iter().map(|i| i.text.as_str()).collect(),
+    ] {
+        let visible: Vec<_> = texts
+            .into_iter()
+            .filter(|t| !t.contains("Codex replaced"))
+            .map(|t| t.lines().last().unwrap())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "Initial request",
+                "Follow-up request",
+                "Latest summary",
+                "Final reply"
+            ]
+        );
+    }
+    assert!(!active.truncated);
+    assert!(!trajectory.truncated);
+}
+
+#[test]
+fn repeated_legacy_compactions_apply_the_native_user_budget_only_to_the_active_window() {
+    let long = format!("start{}end", "界".repeat(30_000));
+    let checkpoint = json!({"type":"compacted","payload":{"message":"Current summary"}});
+    let mut records = vec![
+        message("user", "Older request"),
+        message("user", &long),
+        message("user", "Last request"),
+    ];
+    records.extend(std::iter::repeat_n(checkpoint, 8));
+    let snapshot = read_records(records).unwrap();
+    let replayed = snapshot
+        .events
+        .iter()
+        .filter(|e| e.source.raw_record_type.as_deref() == Some("compacted.user"))
+        .map(|e| e.payload["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let [trimmed, latest] = replayed.as_slice() else {
+        panic!("expected only the active projected requests")
+    };
+    assert!(trimmed.starts_with("start") && trimmed.ends_with("end"));
+    assert!(trimmed.contains("tokens truncated") && trimmed.len() <= 80_032);
+    assert_eq!(*latest, "Last request");
+    assert!(
+        snapshot
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+}
+
+#[test]
+fn a_request_with_the_summary_text_keeps_its_role() {
+    let ordinary = message("user", "Identical text")["payload"].clone();
+    let mut tagged = ordinary.clone();
+    tagged["internal_chat_message_metadata_passthrough"] =
+        json!({"content_item_kinds":["compaction.summary"]});
+    for (replacement, roles) in [
+        (
+            vec![tagged, ordinary.clone()],
+            [EventKind::MessageAssistant, EventKind::MessageUser],
+        ),
+        (
+            vec![ordinary.clone(), ordinary],
+            [EventKind::MessageUser, EventKind::MessageAssistant],
+        ),
+    ] {
+        let snapshot = read_records(vec![json!({"type":"compacted","payload":{"message":"Identical text", "replacement_history":replacement}})]).unwrap();
+        let observed: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| e.payload["text"] == "Identical text")
+            .map(|e| e.kind.clone())
+            .collect();
+        assert_eq!(observed, roles);
+    }
+}
+
+#[test]
+fn rollback_of_a_natively_shortened_replacement_removes_its_original_turn() {
+    let quoted_notice = "Earlier output said …2 tokens truncated…";
+    let prefix = format!(
+        "{quoted_notice}{}",
+        "a".repeat(40_000 - quoted_notice.len())
+    );
+    let suffix = "z".repeat(40_000);
+    let original = format!("{prefix}lost{suffix}");
+    let checkpoint = json!({"type":"compacted","payload":{"message":"A summary","replacement_history":[{
+        "type":"message","role":"user","content":[
+            {"type":"input_text","text":prefix},
+            {"type":"input_text","text":"…1 tokens truncated…"},
+            {"type":"input_text","text":suffix}
+        ]
+    }]}});
+    let snapshot = read_records(vec![
+        message("user", &original),
+        checkpoint,
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ])
+    .unwrap();
     assert!(visible_text(&snapshot).is_empty());
 }

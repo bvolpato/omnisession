@@ -165,6 +165,67 @@ fn bind_replaces_a_deleted_prior_session() {
 }
 
 #[test]
+fn codex_native_launch_uses_the_surviving_turn_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let initial = root.join("initial");
+    let moved = root.join("moved");
+    let sessions = root.join("codex/sessions");
+    for dir in [&initial, &moved, &sessions] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let rollout = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let mut records = vec![
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":initial,
+            "git":{"commit_hash":"0000000000000000000000000000000000000000"}}}),
+    ];
+    for (directory, message) in [(&initial, "Original turn"), (&moved, "Moved turn")] {
+        records.push(json!({"type":"event_msg","payload":{"type":"task_started"}}));
+        records.push(json!({"type":"turn_context","payload":{"cwd":directory}}));
+        records
+            .push(json!({"type":"event_msg","payload":{"type":"user_message","message":message}}));
+    }
+    let write = |records: &[Value]| {
+        let lines = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout, lines).unwrap();
+    };
+    let source = format!("codex:{SESSION_ID}");
+    let fork = |directory: &Path, expected: bool| {
+        let inspected =
+            successful_json(command(root, directory).args(["--json", "inspect", &source]));
+        let plan = successful_json(command(root, directory).args([
+            "--json",
+            "fork",
+            &source,
+            "--in",
+            "codex",
+            "--dry-run",
+        ]));
+        assert_eq!(
+            plan["launch"]["cwd"],
+            json!(omnis_core::canonicalize_path(directory).unwrap())
+        );
+        assert_eq!(plan["fidelity"]["repository_matches"], expected);
+        assert_eq!(inspected["repository_matches"], expected);
+    };
+    write(&records);
+    fork(&moved, true);
+    let wrong = command(root, &initial)
+        .args(["--json", "fork", &source, "--in", "codex", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("differs from current"));
+    records.push(json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}));
+    write(&records);
+    fork(&initial, false);
+}
+
+#[test]
 fn codex_repository_matches_its_recorded_remote_and_commit() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

@@ -1453,7 +1453,13 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
-    let project_path = entry.session.project_path.clone();
+    let project_path = match state.previews.get(&state.preview_key(&entry.session)) {
+        Some(PreviewValue::Ready { preview, .. }) if session.provider == Provider::Codex => preview
+            .workspace_root
+            .clone()
+            .or_else(|| entry.session.project_path.clone()),
+        _ => entry.session.project_path.clone(),
+    };
     let targets = available_targets
         .iter()
         .copied()

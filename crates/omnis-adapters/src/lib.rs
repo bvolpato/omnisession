@@ -96,6 +96,12 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// Workspace evidence for a session whose active directory can change between turns.
+pub struct NativeWorkspace {
+    pub directory: Option<PathBuf>,
+    pub git: GitState,
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
@@ -135,12 +141,12 @@ pub trait ProviderAdapter: Send + Sync {
             .find(|session| session.session.id == id))
     }
 
-    /// Reads Git evidence from session headers for native resume or fork.
+    /// Reads the effective workspace when it can differ from the discovery metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error when the provider exposes this metadata but the header cannot be read.
-    fn recorded_git_state(&self, _session: &SessionRef) -> Result<Option<GitState>> {
+    /// Returns an error when the provider cannot determine the effective directory.
+    fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
         Ok(None)
     }
 

@@ -441,22 +441,7 @@ fn resume_native_without_snapshot(
         bail!("`--materialize-only` requires a supported cross-provider native import");
     }
     let current = current_project()?;
-    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
-        let project = selected_native_workspace(selection, &current)?;
-        let repository_matches = workspace_paths_match(&project, &current);
-        (project, repository_matches)
-    } else {
-        explicit_native_workspace(registry, request, args, &current)?
-    };
-    let repository_matches = if repository_matches
-        && let Some(git) = registry
-            .adapter(request.source.provider)?
-            .recorded_git_state(&request.source)?
-    {
-        omnis_core::recorded_git_matches(&git, &project, Some(request.source.provider))?
-    } else {
-        repository_matches
-    };
+    let (project, repository_matches) = native_launch_workspace(registry, request, args, &current)?;
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
     } else {
@@ -695,25 +680,56 @@ fn record_native_fork_lineage(
     Ok(())
 }
 
-fn explicit_native_workspace(
+fn native_launch_workspace(
     registry: &AdapterRegistry,
     request: &ResolvedResumeRequest,
     args: &ResumeArgs,
     current: &Path,
 ) -> Result<(PathBuf, bool)> {
-    let session = registry
-        .find_native_session(request.source.provider, &request.source.id)?
-        .with_context(|| format!("finding `{}` metadata", request.source))?;
-    let recorded = session
-        .project_path
-        .context("source session has no recorded workspace")?;
-    let recorded = workspace_root(&recorded).context("resolving source session workspace")?;
-    if workspace_paths_match(&recorded, current) {
-        return Ok((current.to_path_buf(), true));
+    let workspace = registry
+        .adapter(request.source.provider)?
+        .native_workspace(&request.source)?;
+    let recorded = if let Some(workspace) = &workspace {
+        workspace.directory.clone()
+    } else if let Some(selection) = &request.picker_selection {
+        selection.project_path.clone()
+    } else {
+        registry
+            .find_native_session(request.source.provider, &request.source.id)?
+            .with_context(|| format!("finding `{}` metadata", request.source))?
+            .project_path
+    };
+    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
+        let project = selected_native_workspace(selection, recorded.as_deref(), current)?;
+        let matches = if workspace.is_some() {
+            recorded
+                .as_deref()
+                .is_some_and(|path| workspace_paths_match(path, &project))
+        } else {
+            workspace_paths_match(&project, current)
+        };
+        (project, matches)
+    } else {
+        explicit_native_workspace(recorded.as_deref(), args, current)?
+    };
+    let repository_matches = if repository_matches && let Some(workspace) = workspace {
+        omnis_core::recorded_git_matches(&workspace.git, &project, Some(request.source.provider))?
+    } else {
+        repository_matches
+    };
+    Ok((project, repository_matches))
+}
+
+fn explicit_native_workspace(
+    recorded: Option<&Path>,
+    args: &ResumeArgs,
+    current: &Path,
+) -> Result<(PathBuf, bool)> {
+    let matches = recorded.is_some_and(|path| workspace_paths_match(path, current));
+    if matches || args.allow_workspace_mismatch {
+        return Ok((current.to_path_buf(), matches));
     }
-    if args.allow_workspace_mismatch {
-        return Ok((current.to_path_buf(), false));
-    }
+    let recorded = recorded.context("source session has no verified workspace; use `--allow-workspace-mismatch` to choose the current workspace")?;
     bail!(
         "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
         safe_terminal_line(&recorded.display().to_string()),
@@ -723,15 +739,24 @@ fn explicit_native_workspace(
 
 pub(super) fn selected_native_workspace(
     selection: &session_picker::PickerSelection,
+    recorded: Option<&Path>,
     current: &Path,
 ) -> Result<PathBuf> {
     let chosen = selection.workspace_override.as_deref();
-    let listed = omnis_core::canonicalize_path(
-        chosen
-            .or(selection.project_path.as_deref())
-            .context("selected session has no recorded workspace")?,
-    )
-    .context("selected session workspace no longer exists")?;
+    let directory = chosen
+        .or(recorded)
+        .context("selected session has no recorded workspace")?;
+    if chosen.is_none()
+        && (omnis_core::may_reach_network(directory)
+            || selection
+                .project_path
+                .as_deref()
+                .is_some_and(|shown| !workspace_paths_match(shown, directory)))
+    {
+        bail!("selected session workspace changed during discovery");
+    }
+    let listed = omnis_core::canonicalize_path(directory)
+        .context("selected session workspace no longer exists")?;
     let selected = workspace_root(listed)?;
     if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
     {

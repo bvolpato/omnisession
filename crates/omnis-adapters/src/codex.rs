@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
     io::{ErrorKind, Read},
@@ -15,12 +16,15 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    LaunchPlan, LaunchTarget, NativeSession, NativeWorkspace, ProviderAdapter,
+    ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
+        EventBuilder, MAX_PREVIEW_TAIL_SIZE, MAX_PROVIDER_RECORDS,
+        MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
         omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
         provider_root, sort_sessions, string_at, validate_provider, value_at,
-        visit_index_json_lines, visit_streamed_json_lines,
+        visit_filtered_streamed_json_lines, visit_index_json_lines, visit_json_lines_tail,
+        visit_streamed_json_lines,
     },
 };
 
@@ -35,6 +39,7 @@ const MAX_CANONICAL_EVENTS: usize = 100_000;
 const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;
 const MAX_TOOL_ARRAY_ITEMS: usize = 256;
 const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
+const COMPACT_USER_TOKEN_LIMIT: usize = 20_000;
 
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
@@ -565,6 +570,12 @@ fn path_uuid(path: &Path) -> Option<String> {
     Uuid::parse_str(id).ok().map(|_| id.to_owned())
 }
 
+struct RolloutWorkspace {
+    directory: Option<PathBuf>,
+    rolled_back: bool,
+    recent_records: Option<VecDeque<Value>>,
+}
+
 #[derive(Debug)]
 struct CodexSession {
     id: String,
@@ -696,6 +707,7 @@ impl CodexSession {
                 }
                 Ok(())
             })?;
+        history.restore_legacy_users(&mut builder);
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -727,7 +739,101 @@ impl CodexSession {
             );
         }
         builder.push_oversized_record_notice(oversized_records, self.updated_at);
-        Ok((builder, history.project_path))
+        let directory = if oversized_records > 0 {
+            self.recent_workspace(false)?.directory
+        } else {
+            history.project_path
+        };
+        Ok((builder, directory))
+    }
+
+    fn workspace_metadata(&self, for_preview: bool) -> Result<RolloutWorkspace> {
+        let size = fs::metadata(&self.path)?.len();
+        if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE
+            || (!for_preview && size > MAX_PREVIEW_TAIL_SIZE)
+        {
+            let recent = self.recent_workspace(for_preview)?;
+            if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE || recent.directory.is_some() {
+                return Ok(recent);
+            }
+        }
+        let mut directory = self.project_path.clone();
+        let mut rolled_back = false;
+        let oversized = visit_filtered_streamed_json_lines(
+            &self.path,
+            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+            workspace_record_filter(),
+            |record| {
+                match record["type"].as_str() {
+                    Some("turn_context") => {
+                        if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
+                            directory = Some(PathBuf::from(cwd));
+                        }
+                    }
+                    Some("event_msg") if record["payload"]["type"] == "thread_rolled_back" => {
+                        rolled_back |= record["payload"]["num_turns"].as_u64() != Some(0);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
+        if oversized > 0 {
+            return self.recent_workspace(for_preview);
+        }
+        Ok(RolloutWorkspace {
+            directory,
+            rolled_back,
+            recent_records: None,
+        })
+    }
+
+    fn recent_workspace(&self, keep_preview: bool) -> Result<RolloutWorkspace> {
+        // A later turn_context establishes the directory even when an earlier record was unreadable.
+        let mut directory = None;
+        let mut records = VecDeque::new();
+        let is_metadata = workspace_record_filter();
+        visit_json_lines_tail(
+            &self.path,
+            MAX_PREVIEW_TAIL_SIZE,
+            |line| keep_preview || is_metadata(line),
+            |_, record| {
+                if record["type"] == "event_msg"
+                    && record["payload"]["type"] == "thread_rolled_back"
+                {
+                    if record["payload"]["num_turns"].as_u64() != Some(0) {
+                        records.clear();
+                        directory = None;
+                    }
+                } else {
+                    if record["type"] == "turn_context"
+                        && let Some(cwd) = string_at(&record, &[&["payload", "cwd"]])
+                    {
+                        directory = Some(PathBuf::from(cwd));
+                    }
+                    if keep_preview {
+                        if records.len() == 1_024 {
+                            records.pop_front();
+                        }
+                        records.push_back(record);
+                    }
+                }
+            },
+        )?;
+        Ok(RolloutWorkspace {
+            directory,
+            rolled_back: false,
+            recent_records: keep_preview.then_some(records),
+        })
+    }
+
+    fn git_at(&self, directory: Option<&Path>) -> GitState {
+        // Codex records Git only for the creation directory.
+        if directory.is_some() && directory == self.project_path.as_deref() {
+            self.git.clone()
+        } else {
+            GitState::default()
+        }
     }
 
     fn snapshot(
@@ -737,8 +843,7 @@ impl CodexSession {
         project_path: Option<PathBuf>,
         captured_at: DateTime<Utc>,
     ) -> CanonicalSnapshot {
-        // Codex captures Git at creation. A later turn can run in another repository.
-        let same_directory = project_path.is_some() && project_path == self.project_path;
+        let git = self.git_at(project_path.as_deref());
         let mut snapshot = events.snapshot(
             session.clone(),
             self.title.clone(),
@@ -746,9 +851,7 @@ impl CodexSession {
             None,
             captured_at,
         );
-        if same_directory {
-            snapshot.workspace.git = self.git.clone();
-        }
+        snapshot.workspace.git = git;
         snapshot
     }
 
@@ -759,6 +862,7 @@ impl CodexSession {
         for record in json_lines_preview(&self.path, SAMPLE_RECORDS)? {
             history.push(&mut builder, &record)?;
         }
+        history.restore_legacy_users(&mut builder);
         Ok((builder, history.project_path))
     }
 
@@ -778,7 +882,12 @@ struct TurnCheckpoint {
 struct CodexHistory {
     project_path: Option<PathBuf>,
     last_visible: Option<(EventKind, String, &'static str)>,
-    turns: Vec<TurnCheckpoint>,
+    // Logical order can differ from file order when a checkpoint supplies missing requests.
+    turns: Vec<u64>,
+    next_turn: u64,
+    checkpoints: Vec<(u64, TurnCheckpoint)>,
+    // Each entry identifies a genuine user message in the canonical event stream.
+    requests: Vec<(u64, u64)>,
     pending_turn: Option<TurnCheckpoint>,
     tool_events: usize,
     omitted_tool_events: usize,
@@ -791,6 +900,9 @@ impl CodexHistory {
             project_path,
             last_visible: None,
             turns: Vec::new(),
+            next_turn: 0,
+            checkpoints: Vec::new(),
+            requests: Vec::new(),
             pending_turn: None,
             tool_events: 0,
             omitted_tool_events: 0,
@@ -803,7 +915,69 @@ impl CodexHistory {
         self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
         self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
-        self.turns.drain(..excess);
+        if excess > 0 {
+            let evicted: HashSet<_> = self.turns.drain(..excess).collect();
+            self.requests.retain(|(_, id)| !evicted.contains(id));
+        }
+        let first = builder
+            .events()
+            .first()
+            .map_or(builder.checkpoint(), |e| e.sequence);
+        let stale = self
+            .requests
+            .partition_point(|(sequence, _)| *sequence < first);
+        self.requests.drain(..stale);
+        let stale = self
+            .checkpoints
+            .partition_point(|(_, point)| point.sequence < first);
+        let excess = self.checkpoints.len().saturating_sub(MAX_CANONICAL_EVENTS);
+        self.checkpoints
+            .drain(..excess.max(stale.saturating_sub(1)));
+    }
+
+    fn new_turn(&mut self) -> u64 {
+        let id = self.next_turn;
+        self.next_turn += 1;
+        id
+    }
+
+    fn rollback(&mut self, builder: &mut EventBuilder, count: u64) {
+        let keep = self
+            .turns
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+        let discarded: HashSet<_> = self.turns.drain(keep..).collect();
+        if discarded.is_empty() {
+            return;
+        }
+        let mut ranges = Vec::new();
+        let mut removed_tools = 0;
+        let mut points = std::mem::take(&mut self.checkpoints).into_iter().peekable();
+        while let Some((id, mut point)) = points.next() {
+            if discarded.contains(&id) {
+                if ranges.is_empty() {
+                    self.project_path = point.project_path;
+                }
+                let (end, tools) = points
+                    .peek()
+                    .map_or((builder.checkpoint(), self.tool_events), |(_, next)| {
+                        (next.sequence, next.tool_events)
+                    });
+                ranges.push(point.sequence..end);
+                removed_tools += tools - point.tool_events;
+            } else {
+                point.tool_events -= removed_tools;
+                self.checkpoints.push((id, point));
+            }
+        }
+        let survives = |sequence: u64| {
+            let index = ranges.partition_point(|r| r.end <= sequence);
+            ranges.get(index).is_none_or(|r| sequence < r.start)
+        };
+        builder.retain_events(|e| survives(e.sequence));
+        self.tool_events -= removed_tools;
+        self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
+        self.requests.retain(|(sequence, _)| survives(*sequence));
     }
 
     fn checkpoint(&self, builder: &EventBuilder) -> TurnCheckpoint {
@@ -824,18 +998,7 @@ impl CodexHistory {
                 .as_u64()
                 .context("Codex rollback marker has no valid num_turns")?;
             if count > 0 {
-                let retained = self
-                    .turns
-                    .len()
-                    .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
-                if retained < self.turns.len() {
-                    let checkpoint = self.turns.remove(retained);
-                    self.turns.truncate(retained);
-                    builder.truncate_from(checkpoint.sequence);
-                    self.project_path = checkpoint.project_path;
-                    self.tool_events = checkpoint.tool_events;
-                    self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
-                }
+                self.rollback(builder, count);
                 self.last_visible = None;
                 self.pending_turn = None;
             }
@@ -870,8 +1033,13 @@ impl CodexHistory {
         }
         let checkpoint = self.checkpoint(builder);
         if push_record(builder, record, &mut self.last_visible) {
-            self.turns
-                .push(self.pending_turn.take().unwrap_or(checkpoint));
+            let id = self.new_turn();
+            self.turns.push(id);
+            if builder.checkpoint() > checkpoint.sequence {
+                self.requests.push((builder.checkpoint() - 1, id));
+            }
+            self.checkpoints
+                .push((id, self.pending_turn.take().unwrap_or(checkpoint)));
         } else if record_type == Some("response_item")
             && record["payload"]["type"] != "message"
             && builder.checkpoint() > checkpoint.sequence
@@ -888,6 +1056,7 @@ impl CodexHistory {
             .as_str()
             .filter(|text| !text.trim().is_empty());
         let history = payload["replacement_history"].as_array();
+        let legacy = payload["replacement_history"].is_null();
         let items = history.map_or(&[][..], Vec::as_slice);
         let opaque = items.iter().any(|item| {
             matches!(
@@ -895,18 +1064,12 @@ impl CodexHistory {
                 Some("compaction" | "context_compaction" | "compaction_summary")
             )
         });
-        let has_summary = summary.is_some()
-            || items
-                .iter()
-                .any(|item| replacement_summary(item, None).is_some());
+        let positioned_summary = replacement_summary_index(items, summary);
+        let has_summary = positioned_summary.is_some() || summary.is_some();
 
         // A replacement is a new context window. Earlier events remain available for recovery.
         let boundary = summary
-            .filter(|text| {
-                !items
-                    .iter()
-                    .any(|item| replacement_summary(item, summary) == Some(text))
-            })
+            .filter(|_| !legacy && positioned_summary.is_none())
             .unwrap_or(
                 "Codex replaced the preceding conversation with a compacted context window.",
             );
@@ -916,39 +1079,63 @@ impl CodexHistory {
             json!({"summary": boundary}),
             timestamp,
             ReplayPolicy::Contextual,
-            Some("compacted".to_owned()),
+            Some(
+                if legacy {
+                    "compacted.legacy"
+                } else {
+                    "compacted"
+                }
+                .to_owned(),
+            ),
             None,
         );
-        // In a checkpoint-only rollout the retained requests supply the rollback boundaries.
-        // In a full rollout the original turns already have checkpoints.
-        let checkpoint_only = self.turns.is_empty() && self.pending_turn.is_none();
-        let mut first_turn = Some(start);
         let replacement_start = builder.checkpoint();
+        let mut replacement = Vec::new();
         self.last_visible = None;
         for (index, item) in items.iter().enumerate() {
             if index != 0 && index.is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL) {
                 self.compact(builder);
             }
-            if let Some(text) = replacement_summary(item, summary) {
+            let selected = positioned_summary == Some(index);
+            if let Some(text) = replacement_summary(item, summary.filter(|_| selected)) {
                 builder.push(
                     EventKind::MessageAssistant,
                     json!({"text": text}),
                     timestamp,
                     ReplayPolicy::Contextual,
-                    Some("compacted.summary".to_owned()),
+                    Some(
+                        if selected {
+                            "compacted.summary"
+                        } else {
+                            "response_item.message"
+                        }
+                        .to_owned(),
+                    ),
                     None,
                 );
                 continue;
             }
             let checkpoint = self.checkpoint(builder);
             let user_turn = push_response_item(builder, item, timestamp, &mut self.last_visible);
-            if user_turn && checkpoint_only {
-                self.turns.push(first_turn.take().unwrap_or(checkpoint));
+            if user_turn && builder.checkpoint() > checkpoint.sequence {
+                replacement.push((builder.checkpoint() - 1, checkpoint));
             } else if item["type"] != "message" && builder.checkpoint() > checkpoint.sequence {
                 self.tool_events += 1;
             }
         }
-        let missing_summary = !has_summary && (opaque || builder.checkpoint() == replacement_start);
+        self.register_replacement(builder, start, replacement);
+        if let Some(text) = summary.filter(|_| legacy) {
+            builder.push(
+                EventKind::MessageAssistant,
+                json!({"text":text}),
+                timestamp,
+                ReplayPolicy::Contextual,
+                Some("compacted.summary".to_owned()),
+                None,
+            );
+        }
+        let missing_summary =
+            !has_summary && (legacy || opaque || builder.checkpoint() == replacement_start);
         if missing_summary || (history.is_none() && !payload["replacement_history"].is_null()) {
             builder.push(
                 EventKind::ProviderEvent,
@@ -962,6 +1149,239 @@ impl CodexHistory {
         }
         self.last_visible = None;
     }
+
+    fn request_id(&self, sequence: u64) -> Option<u64> {
+        let index = self
+            .requests
+            .binary_search_by_key(&sequence, |(seq, _)| *seq)
+            .ok()?;
+        Some(self.requests[index].1)
+    }
+
+    fn restore_legacy_users(&self, builder: &mut EventBuilder) {
+        let events = builder.events();
+        let Some(end) = events
+            .iter()
+            .rposition(|e| e.kind == EventKind::CompactionCreated)
+        else {
+            return;
+        };
+        if events[end].source.raw_record_type.as_deref() != Some("compacted.legacy") {
+            return;
+        }
+        let start = events[..end]
+            .iter()
+            .rposition(explicit_compaction)
+            .map_or(0, |i| i + 1);
+        let mut users = VecDeque::new();
+        let mut tokens = 0;
+        for e in &events[start..=end] {
+            if e.kind == EventKind::CompactionCreated {
+                trim_legacy_users(&mut users, &mut tokens);
+            } else if self.request_id(e.sequence).is_some()
+                && let Some(text) = e.payload["text"].as_str()
+            {
+                users.push_back((e.event_id, Cow::Borrowed(text)));
+                tokens += text.len().div_ceil(4);
+            }
+        }
+        let timestamp = events[end].timestamp;
+        let retained: Vec<_> = users
+            .into_iter()
+            .map(|(id, text)| (id, text.into_owned()))
+            .collect();
+        // Older checkpoints retain their summaries and original requests for recovery.
+        // Emit copies only for the last surviving window after all rollbacks have been applied.
+        builder.insert_after(end, |builder| {
+            for (id, text) in retained {
+                builder.push(
+                    EventKind::MessageUser,
+                    json!({"text":text}),
+                    timestamp,
+                    ReplayPolicy::Contextual,
+                    Some("compacted.user".to_owned()),
+                    Some(id),
+                );
+            }
+        });
+    }
+
+    fn register_replacement(
+        &mut self,
+        builder: &EventBuilder,
+        start: TurnCheckpoint,
+        replacement: Vec<(u64, TurnCheckpoint)>,
+    ) {
+        if replacement.is_empty() {
+            return;
+        }
+        let events = builder.events();
+        let before = events.partition_point(|e| e.sequence < start.sequence);
+        let mut originals: HashMap<&str, Vec<(u64, u64)>> = HashMap::new();
+        for e in events[..before]
+            .iter()
+            .rev()
+            .take_while(|e| !explicit_compaction(e))
+        {
+            if let Some(id) = self.request_id(e.sequence)
+                && let Some(text) = e.payload["text"].as_str()
+            {
+                originals.entry(text).or_default().push((e.sequence, id));
+            }
+        }
+        // Work backward so the newest repeated requests match the newest surviving turns.
+        let mut before = start.sequence;
+        let mut owners = Vec::with_capacity(replacement.len());
+        for (sequence, _) in replacement.iter().rev() {
+            let matched = events
+                .binary_search_by_key(sequence, |e| e.sequence)
+                .ok()
+                .and_then(|i| events[i].payload["text"].as_str())
+                .and_then(|text| {
+                    if let Some(positions) = originals.get(text) {
+                        let skip = positions.partition_point(|(seq, _)| *seq >= before);
+                        if let Some(point) = positions.get(skip) {
+                            return Some(*point);
+                        }
+                    }
+                    (*sequence == replacement[0].0)
+                        .then(|| shortened_request_origin(text, before, &originals))
+                        .flatten()
+                });
+            if let Some((sequence, _)) = matched {
+                before = sequence;
+            }
+            owners.push(matched.map(|(_, id)| id));
+        }
+        owners.reverse();
+        if owners.iter().all(Option::is_some) {
+            self.requests.extend(
+                replacement
+                    .into_iter()
+                    .zip(owners)
+                    .map(|((seq, _), id)| (seq, id.unwrap())),
+            );
+            return;
+        }
+
+        // Some original turns are missing. Use the replacement for their boundaries and
+        // associate copies of known requests with the same turn in both parts of the file.
+        let mut previous = std::mem::take(&mut self.turns).into_iter();
+        let mut missing = Vec::new();
+        let mut window_start = Some(self.pending_turn.take().unwrap_or(start));
+        for ((sequence, point), matched) in replacement.into_iter().zip(owners) {
+            let id = if let Some(id) = matched {
+                self.turns
+                    .extend(previous.by_ref().take_while(|old| *old != id));
+                self.turns.append(&mut missing);
+                self.turns.push(id);
+                id
+            } else {
+                let id = self.new_turn();
+                missing.push(id);
+                id
+            };
+            self.requests.push((sequence, id));
+            self.checkpoints
+                .push((id, window_start.take().unwrap_or(point)));
+        }
+        self.turns.extend(previous);
+        self.turns.append(&mut missing);
+    }
+}
+
+fn explicit_compaction(event: &omnis_ir::OmniEvent) -> bool {
+    event.kind == EventKind::CompactionCreated
+        && event.source.raw_record_type.as_deref() != Some("compacted.legacy")
+}
+
+fn trim_legacy_users(users: &mut VecDeque<(Uuid, Cow<'_, str>)>, tokens: &mut usize) {
+    // Codex retains 20,000 approximate tokens and replaces the middle of the oldest partial request.
+    while *tokens > COMPACT_USER_TOKEN_LIMIT {
+        let Some((_, text)) = users.front_mut() else {
+            break;
+        };
+        let size = text.len().div_ceil(4);
+        let other = *tokens - size;
+        if other >= COMPACT_USER_TOKEN_LIMIT {
+            users.pop_front();
+            *tokens = other;
+            continue;
+        }
+        let (prefix, suffix) = retained_user_edges(text, COMPACT_USER_TOKEN_LIMIT - other);
+        let marker = format!("…{} tokens truncated…", *tokens - COMPACT_USER_TOKEN_LIMIT);
+        if text[prefix.len()..text.len() - suffix.len()] != marker {
+            *text = Cow::Owned(format!("{prefix}{marker}{suffix}"));
+        }
+        *tokens = other + text.len().div_ceil(4);
+        break;
+    }
+}
+
+fn retained_user_edges(text: &str, tokens: usize) -> (&str, &str) {
+    let half = 2 * tokens;
+    let mut left = half;
+    let mut right = text.len() - half;
+    while !text.is_char_boundary(left) {
+        left -= 1;
+    }
+    while !text.is_char_boundary(right) {
+        right += 1;
+    }
+    (&text[..left], &text[right..])
+}
+
+fn shortened_request_origin(
+    text: &str,
+    before: u64,
+    originals: &HashMap<&str, Vec<(u64, u64)>>,
+) -> Option<(u64, u64)> {
+    let (prefix, count, suffix) =
+        text.match_indices(" tokens truncated…")
+            .find_map(|(offset, end)| {
+                let (prefix, count) = text[..offset].rsplit_once('…')?;
+                let suffix = &text[offset + end.len()..];
+                let count: usize = count.parse().ok()?;
+                // The two retained halves have the same byte budget. UTF-8 boundaries can differ by three bytes.
+                (count > 0 && prefix.len().abs_diff(suffix.len()) <= 3)
+                    .then_some((prefix, count, suffix))
+            })?;
+    // Match the exact head and tail produced by Codex. Newer rollouts store the notice
+    // in its own text block, which the visible projection joins with a newline on each side.
+    originals
+        .iter()
+        .filter_map(|(source, positions)| {
+            let kept = source.len().div_ceil(4).checked_sub(count)?;
+            if !(1..=COMPACT_USER_TOKEN_LIMIT).contains(&kept) {
+                return None;
+            }
+            let (left, right) = retained_user_edges(source, kept);
+            if left.is_empty() && right.is_empty() {
+                return None;
+            }
+            if (prefix == left && suffix == right)
+                || (prefix.strip_suffix('\n') == Some(left)
+                    && suffix.strip_prefix('\n') == Some(right))
+            {
+                let skip = positions.partition_point(|(seq, _)| *seq >= before);
+                return positions.get(skip).copied();
+            }
+            None
+        })
+        .max()
+}
+
+fn replacement_summary_index(items: &[Value], summary: Option<&str>) -> Option<usize> {
+    items
+        .iter()
+        .rposition(|item| replacement_summary(item, None).is_some())
+        .or_else(|| {
+            summary.and_then(|text| {
+                items
+                    .iter()
+                    .rposition(|item| replacement_summary(item, Some(text)) == Some(text))
+            })
+        })
 }
 
 /// Local compaction stores its summary as a user message at its position in the replacement.
@@ -983,6 +1403,19 @@ fn replacement_summary<'a>(item: &'a Value, summary: Option<&str>) -> Option<&'a
     let kinds = &item["internal_chat_message_metadata_passthrough"]["content_item_kinds"];
     (!text.trim().is_empty() && (Some(text) == summary || kinds[0] == "compaction.summary"))
         .then_some(text)
+}
+
+fn workspace_record_filter() -> impl Fn(&[u8]) -> bool {
+    let cwd = memchr::memmem::Finder::new(b"turn_context");
+    let rollback = memchr::memmem::Finder::new(b"thread_rolled_back");
+    let escape = memchr::memmem::Finder::new(b"\\u00");
+    move |line| {
+        cwd.find(line).is_some()
+            || rollback.find(line).is_some()
+            || escape
+                .find_iter(line)
+                .any(|index| escapes_ascii_letter(line.get(index + 4..index + 6)))
+    }
 }
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
@@ -1470,18 +1903,53 @@ impl ProviderAdapter for CodexAdapter {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session_metadata(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        if contains_rollback_marker(&native.path)? {
+        // A sampled preview can miss a directory change between its prefix and tail.
+        let workspace = if fs::metadata(&native.path)?.len() < MAX_PROVIDER_RECORDS as u64 {
+            RolloutWorkspace {
+                directory: None,
+                rolled_back: contains_rollback_marker(&native.path)?,
+                recent_records: None,
+            }
+        } else {
+            native.workspace_metadata(true)?
+        };
+        if let Some(records) = workspace.recent_records {
+            let mut events = native.event_builder();
+            let mut history = CodexHistory::new(None);
+            for record in records {
+                history.push(&mut events, &record)?;
+            }
+            history.restore_legacy_users(&mut events);
+            events.push(EventKind::ProviderEvent,
+                json!({"omitted_events":1, "reason":"Only the recent complete Codex records were available"}),
+                Some(captured_at), ReplayPolicy::HistoricalOnly, Some("omnisession.preview_limit".to_owned()), None);
+            return Ok(native.snapshot(session, events, workspace.directory, captured_at));
+        }
+        if workspace.rolled_back {
             let (mut events, project_path) = native.canonical_events()?;
             events.retain_preview_events(PREVIEW_EVENTS, captured_at);
             return Ok(native.snapshot(session, events, project_path, captured_at));
         }
         let (events, project_path) = native.preview_events()?;
-        Ok(native.snapshot(session, events, project_path, captured_at))
+        Ok(native.snapshot(
+            session,
+            events,
+            workspace.directory.or(project_path),
+            captured_at,
+        ))
     }
 
-    fn recorded_git_state(&self, session: &SessionRef) -> Result<Option<GitState>> {
+    fn native_workspace(&self, session: &SessionRef) -> Result<Option<NativeWorkspace>> {
         validate_provider(session, Provider::Codex)?;
-        Ok(Some(self.find_session_metadata(&session.id)?.git))
+        let native = self.find_session_metadata(&session.id)?;
+        let workspace = native.workspace_metadata(false)?;
+        let directory = if workspace.rolled_back {
+            native.canonical_events()?.1
+        } else {
+            workspace.directory
+        };
+        let git = native.git_at(directory.as_deref());
+        Ok(Some(NativeWorkspace { directory, git }))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

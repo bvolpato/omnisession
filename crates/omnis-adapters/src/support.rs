@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const MAX_PROVIDER_RECORDS: usize = 100_000;
-const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_RECORDS: usize = 100_000;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
@@ -810,7 +810,12 @@ pub(crate) fn visit_json_lines_with_offsets(
     file_limit: u64,
     visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+    visit_json_lines_with_offsets_and_limits(
+        reader,
+        JsonLinesLimits::streamed(file_limit),
+        |_| true,
+        visit,
+    )
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -847,13 +852,24 @@ pub(crate) fn visit_streamed_json_lines(
     file_limit: u64,
     visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_limits(
-        path,
+    visit_filtered_streamed_json_lines(path, file_limit, |_| true, visit)
+}
+
+/// Checks a complete bounded line before decoding its JSON.
+pub(crate) fn visit_filtered_streamed_json_lines(
+    path: &Path,
+    file_limit: u64,
+    include: impl FnMut(&[u8]) -> bool,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(File::open(path)?),
         JsonLinesLimits {
             records: usize::MAX,
             ..JsonLinesLimits::streamed(file_limit)
         },
-        visit,
+        include,
+        |_, record| visit(record),
     )
 }
 
@@ -872,14 +888,18 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
-        visit(record)
-    })
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        limits,
+        |_| true,
+        |_, record| visit(record),
+    )
 }
 
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
+    mut include: impl FnMut(&[u8]) -> bool,
     mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
@@ -916,7 +936,9 @@ fn visit_json_lines_with_offsets_and_limits(
         match line_kind {
             BoundedLine::Oversized => oversized_records += 1,
             BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
+                if include(&line)
+                    && let Ok(record) = serde_json::from_slice(&line)
+                {
                     visit(
                         JsonLineLocation {
                             offset: line_offset,
@@ -1090,6 +1112,30 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
 }
 
 fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
+    let mut records = VecDeque::with_capacity(limit);
+    visit_json_lines_tail(
+        path,
+        MAX_TRANSCRIPT_LINE_SIZE,
+        |_| true,
+        |offset, record| {
+            if limit > 0 {
+                if records.len() == limit {
+                    records.pop_front();
+                }
+                records.push_back((offset, record));
+            }
+        },
+    )?;
+    Ok(records.into_iter().collect())
+}
+
+/// Visits complete records in the bounded suffix, in source order.
+pub(crate) fn visit_json_lines_tail(
+    path: &Path,
+    line_limit: u64,
+    mut include: impl FnMut(&[u8]) -> bool,
+    mut visit: impl FnMut(u64, Value),
+) -> Result<()> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1100,10 +1146,8 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
     let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
     let mut offset = start;
     if start > 0 {
-        let mut partial = Vec::new();
-        offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
-    let mut records = VecDeque::with_capacity(limit);
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1113,20 +1157,14 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
             break;
         }
         offset += u64::try_from(read)?;
-        // Previews skip oversized records the way streamed reads do.
-        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
-            continue;
-        }
-        if let Ok(record) = serde_json::from_slice(&line)
-            && limit > 0
+        if read as u64 <= line_limit
+            && include(&line)
+            && let Ok(record) = serde_json::from_slice(&line)
         {
-            if records.len() == limit {
-                records.pop_front();
-            }
-            records.push_back((line_offset, record));
+            visit(line_offset, record);
         }
     }
-    Ok(records.into_iter().collect())
+    Ok(())
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
@@ -1293,8 +1331,27 @@ impl EventBuilder {
         self.next_sequence
     }
 
-    pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
-        self.events.retain(|event| event.sequence < checkpoint);
+    pub(crate) fn events(&self) -> &[OmniEvent] {
+        &self.events
+    }
+
+    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
+        self.events.retain(keep);
+    }
+
+    /// Inserts projected events after a surviving source record and keeps source IDs stable.
+    pub(crate) fn insert_after(&mut self, index: usize, add: impl FnOnce(&mut Self)) {
+        let mut tail = self.events.split_off(index + 1);
+        let first_sequence = self.events[index].sequence + 1;
+        add(self);
+        let inserted = &mut self.events[index + 1..];
+        for event in &mut tail {
+            event.sequence += inserted.len() as u64;
+        }
+        for (sequence, event) in (first_sequence..).zip(inserted) {
+            event.sequence = sequence;
+        }
+        self.events.extend(tail);
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {

@@ -2242,9 +2242,15 @@ fn source_workspace_matches_with_cache(
         let remote = workspace_remote_fingerprints(project)?;
         current_remote.get_or_init(|| remote)
     };
-    Ok(current
-        .as_ref()
-        .is_some_and(|remote| remote.matches(recorded, Some(snapshot.session.provider))))
+    let Some(remote) = current else {
+        return Ok(false);
+    };
+    Ok(remote.matches_relocated(
+        recorded,
+        snapshot.session.provider,
+        snapshot.workspace.git.head.as_deref(),
+        project,
+    )?)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -4041,7 +4047,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_workspace_override_replaces_missing_recorded_path() {
+    fn picker_rejects_changed_workspaces_and_honors_an_explicit_override() {
         let chosen = tempfile::tempdir().expect("chosen workspace");
         let current = tempfile::tempdir().expect("current workspace");
         let selection = PickerSelection {
@@ -4055,9 +4061,23 @@ mod tests {
         };
 
         assert_eq!(
-            selected_native_workspace(&selection, current.path()).expect("selected workspace"),
+            selected_native_workspace(
+                &selection,
+                selection.project_path.as_deref(),
+                current.path()
+            )
+            .expect("selected workspace"),
             omnis_core::canonicalize_path(chosen.path()).expect("canonical workspace")
         );
+        let stale = PickerSelection {
+            project_path: Some(chosen.path().to_path_buf()),
+            across_projects: true,
+            workspace_override: None,
+            ..selection
+        };
+        let error =
+            selected_native_workspace(&stale, Some(current.path()), current.path()).unwrap_err();
+        assert!(error.to_string().contains("changed during discovery"));
     }
 
     #[test]
