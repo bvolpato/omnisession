@@ -999,6 +999,57 @@ impl ProviderAdapter for ClaudeAdapter {
         Ok(sessions)
     }
 
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        let session = &listed.session;
+        validate_provider(session, Provider::Claude)?;
+        let path = self.find_session(&session.id)?;
+        let mut workspace: Option<PathBuf> = None;
+        let mut uncertain = false;
+        let mut has_records = false;
+        let mut has_conversation = false;
+        let mut has_main_conversation = false;
+        let skipped = crate::support::visit_streamed_json_records_with_offsets(
+            &mut BufReader::new(File::open(path)?),
+            crate::support::MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+            |_, line| {
+                let record = match line {
+                    crate::support::JsonlRecord::Complete(value)
+                    | crate::support::JsonlRecord::Unterminated(value) => value,
+                    crate::support::JsonlRecord::Malformed => {
+                        uncertain = true;
+                        return Ok(());
+                    }
+                };
+                has_records = true;
+                let main = record["isSidechain"] != true && record["teamName"].as_str().is_none();
+                if matches!(record["type"].as_str(), Some("assistant" | "user")) {
+                    has_conversation = true;
+                    has_main_conversation |= main;
+                }
+                if main && let Some(directory) = string_at(&record, &[&["cwd"]]) {
+                    let directory = Path::new(directory);
+                    // Restored or rewound branches can name different folders. The user
+                    // must choose the destination when the transcript does not agree.
+                    if let Some(previous) = &workspace {
+                        uncertain |= previous.as_os_str() != directory.as_os_str();
+                    } else {
+                        workspace = Some(directory.to_owned());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        anyhow::ensure!(
+            has_records,
+            "Claude session `{session}` contains no valid records"
+        );
+        anyhow::ensure!(
+            !has_conversation || has_main_conversation,
+            "Claude session `{session}` is a sidechain and cannot be resumed directly"
+        );
+        Ok(workspace.filter(|path| !uncertain && skipped == 0 && path.is_absolute()))
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         self.read_session_at(session, None)
     }

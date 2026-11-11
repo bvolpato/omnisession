@@ -176,6 +176,22 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Checks workspace evidence for a session the user selected from a provider listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected session cannot be identified or read.
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        if let Some(workspace) = self.native_workspace(&listed.session)? {
+            return Ok(workspace.directory);
+        }
+        let live = self
+            .find_native_session_with_project(&listed.session.id, listed.project_path.as_deref())?
+            .filter(|session| session.session == listed.session)
+            .ok_or_else(|| anyhow!("the provider did not return the selected session"))?;
+        Ok(live.project_path)
+    }
+
     /// Non-fatal discovery observations from this adapter.
     ///
     /// Notes may be computed during the first `list_sessions` call and reused.

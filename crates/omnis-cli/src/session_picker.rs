@@ -433,7 +433,7 @@ impl PickerState {
         &mut self,
         registry: &AdapterRegistry,
         current_project: &Path,
-    ) -> Result<()> {
+    ) -> Result<WorkspaceVerification> {
         let Some(entry) =
             self.selected_entry()
                 .filter(|entry| match entry.session.session.provider {
@@ -442,17 +442,22 @@ impl PickerState {
                     _ => entry.cached,
                 })
         else {
-            return Ok(());
+            return Ok(WorkspaceVerification::Ready);
         };
         let source = &entry.session.session;
-        let project_path =
-            verified_picker_workspace(registry, &entry.session).with_context(|| {
+        let project_path = registry
+            .adapter(source.provider)?
+            .selected_workspace(&entry.session)
+            .with_context(|| {
                 format!("Could not verify the workspace for session `{source}` by exact ID")
             })?;
+        if source.provider == Provider::Claude && project_path.is_none() {
+            return Ok(WorkspaceVerification::ConfirmDestination);
+        }
         if project_path.as_deref().map(Path::as_os_str)
             == entry.session.project_path.as_deref().map(Path::as_os_str)
         {
-            return Ok(());
+            return Ok(WorkspaceVerification::Ready);
         }
         let updated = NativeSession {
             project_path,
@@ -1284,27 +1289,6 @@ fn cached_picker_entries(
     Ok((entries, warnings))
 }
 
-fn verified_picker_workspace(
-    registry: &AdapterRegistry,
-    cached: &NativeSession,
-) -> Result<Option<PathBuf>> {
-    let source = &cached.session;
-    let adapter = registry.adapter(source.provider)?;
-    if source.provider == Provider::Claude {
-        // Restoring a transcript can leave this UUID's old workspace in history.jsonl.
-        let directory = adapter.read_session(source)?.workspace.current_dir;
-        return Ok(directory.is_absolute().then_some(directory));
-    }
-    if let Some(workspace) = adapter.native_workspace(source)? {
-        return Ok(workspace.directory);
-    }
-    let live = adapter
-        .find_native_session_with_project(&source.id, cached.project_path.as_deref())?
-        .filter(|session| &session.session == source)
-        .context("the provider did not return the selected session")?;
-    Ok(live.project_path)
-}
-
 fn normalized_picker_entries(
     sessions: Vec<NativeSession>,
     current_project: &Path,
@@ -1537,6 +1521,12 @@ pub(super) fn pick_session(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceVerification {
+    Ready,
+    ConfirmDestination,
+}
+
 enum RowSelection {
     Back,
     Cancel,
@@ -1583,11 +1573,14 @@ fn select_picker_row(
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(args, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => {
-            if let Err(error) = state.verify_selected_workspace(registry, current_project) {
-                return Ok(RowSelection::Notice(safe_terminal_line(&format!(
-                    "{error:#}"
-                ))));
-            }
+            let verification = match state.verify_selected_workspace(registry, current_project) {
+                Ok(verification) => verification,
+                Err(error) => {
+                    return Ok(RowSelection::Notice(safe_terminal_line(&format!(
+                        "{error:#}"
+                    ))));
+                }
+            };
             // An imported row can name another machine's workspace.
             let stored = project_path
                 .as_deref()
@@ -1617,10 +1610,14 @@ fn select_picker_row(
             } else {
                 stored.is_some_and(Path::is_dir)
             };
-            let workspace_override = if has_workspace {
+            let workspace_override = if has_workspace
+                && verification == WorkspaceVerification::Ready
+            {
                 None
             } else {
-                let reason = if workspace_file {
+                let reason = if verification == WorkspaceVerification::ConfirmDestination {
+                    "The transcript does not establish a workspace. Confirm the destination folder."
+                } else if workspace_file {
                     "Choose the folder to use for the target session."
                 } else {
                     "Saved workspace is unavailable."
@@ -5477,8 +5474,53 @@ mod tests {
         let duplicate = projects.join("second-copy");
         fs::create_dir(&duplicate).unwrap();
         fs::write(duplicate.join(format!("{id}.jsonl")), record.to_string()).unwrap();
-        let error = verified_picker_workspace(&registry, &cached).unwrap_err();
+        let error = registry
+            .adapter(Provider::Claude)
+            .unwrap()
+            .selected_workspace(&cached)
+            .unwrap_err();
         assert!(error.to_string().contains("multiple transcripts"));
+    }
+
+    #[test]
+    fn claude_workspace_verification_keeps_the_listing_and_confirms_missing_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "44444444-4444-4444-8444-444444444444";
+        let workspace = root.path().join("workspace");
+        let path = root.path().join(format!("{id}.jsonl"));
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::ClaudeAdapter::with_root(root.path()));
+        let listed = session(Provider::Claude, id, &workspace, None);
+        let mut state = PickerState::new(vec![listed], &workspace, None, false);
+        fs::write(&path, r#"{"type":"user","message":{"content":"Hello"}}"#).unwrap();
+        assert_eq!(
+            state
+                .verify_selected_workspace(&registry, &workspace)
+                .unwrap(),
+            WorkspaceVerification::ConfirmDestination
+        );
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_ref(),
+            Some(&workspace)
+        );
+
+        let record = serde_json::json!({"type":"user", "cwd":workspace});
+        let sidechain =
+            serde_json::json!({"type":"assistant", "isSidechain":true, "cwd":root.path()});
+        let mut transcript = format!("{record}\n").repeat(100_001);
+        transcript.push_str(&sidechain.to_string());
+        fs::write(&path, transcript).unwrap();
+        assert_eq!(
+            state
+                .verify_selected_workspace(&registry, &workspace)
+                .unwrap(),
+            WorkspaceVerification::Ready
+        );
     }
 
     #[cfg(unix)]
