@@ -98,6 +98,78 @@ fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
 }
 
 #[test]
+fn index_saves_the_workspace_from_a_large_rollback_while_search_text_stays_sampled() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let moved = fixture.root.join("other-workspace");
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    fs::remove_file(&path).unwrap();
+    let mut writer = GzEncoder::new(
+        fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
+        Compression::fast(),
+    );
+    let user =
+        |text: &str| json!({"type":"event_msg","payload":{"type":"user_message","message":text}});
+    let context = |cwd: &Path| json!({"type":"turn_context","payload":{"cwd":cwd}});
+    for record in [
+        json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace}}),
+        context(&fixture.workspace),
+        user("opening request"),
+        context(&moved),
+        user("second turn"),
+        json!({"type":"event_msg","payload":{"type":"agent_message","message":"Amethystlarch surviving reply"}}),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    let padding = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"fixture","output":"a".repeat(64_000)}}).to_string();
+    for _ in 0..268 {
+        writeln!(writer, "{padding}").unwrap();
+    }
+    for record in [
+        context(&fixture.workspace),
+        user("temporary third turn"),
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    writer.finish().unwrap();
+    fixture.index_codex();
+    for cached in [false, true] {
+        for (project, expected) in [(&fixture.workspace, false), (&moved, true)] {
+            let mut args = vec![
+                "Amethystlarch",
+                "--show-text",
+                "--provider",
+                "codex",
+                "--project",
+                project.to_str().unwrap(),
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            let results = fixture.search_json(&args);
+            assert_eq!(
+                result_sessions(&results).contains(&format!("codex:{CODEX_ID}")),
+                expected,
+                "{results}"
+            );
+            if expected {
+                assert_eq!(results["results"][0]["coverage"], "preview");
+                assert_eq!(
+                    results["results"][0]["project_path"],
+                    moved.to_str().unwrap()
+                );
+            }
+        }
+    }
+    assert_eq!(fixture.index_codex()["indexed"], 0);
+}
+
+#[test]
 fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
@@ -378,11 +450,12 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
                 derived_title: None,
                 withdrawn_title: None,
                 title_is_verified: false,
+                local_opener: omnis_store::LocalOpenerEvidence::Unknown,
             },
         )
         .unwrap();
     assert_eq!(
-        result_sessions(&fixture.search_json(&["Superseded", "--cached"])),
+        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"])),
         [session.to_string()]
     );
     assert!(
@@ -394,9 +467,12 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
             .status
             .success()
     );
-    assert!(result_sessions(&fixture.search_json(&["Superseded", "--cached"])).is_empty());
+    assert!(
+        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"]))
+            .is_empty()
+    );
     assert_eq!(
-        result_sessions(&fixture.search_json(&["unchanged", "--cached"])),
+        result_sessions(&fixture.search_json(&["unchanged", "--cached", "--all-projects"])),
         [session.to_string()]
     );
 }
@@ -410,7 +486,7 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
         fixture.add_missing_ancestor();
         fixture.index_codex();
         let search = |word, cached| {
-            let mut args = vec!["--provider", "codex", "--show-text", word];
+            let mut args = vec!["--provider", "codex", "--show-text", "--all-projects", word];
             if cached {
                 args.push("--cached");
             }
@@ -493,7 +569,14 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
         };
         append(&source);
         let search = |query: &str| {
-            fixture.search_json(&["--provider", "codex", "--show-text", "--cached", query])
+            fixture.search_json(&[
+                "--provider",
+                "codex",
+                "--show-text",
+                "--cached",
+                "--all-projects",
+                query,
+            ])
         };
         fixture.index_codex();
         assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
@@ -508,7 +591,13 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
             }
         }
         let original = fs::read(&path).unwrap();
-        let live = fixture.search_json(&["--provider", "codex", "--show-text", "backoff"]);
+        let live = fixture.search_json(&[
+            "--provider",
+            "codex",
+            "--show-text",
+            "--all-projects",
+            "backoff",
+        ]);
         for results in [live, search("backoff")] {
             if repeated_later {
                 assert_eq!(results["results"][0]["match"], "conversation");
@@ -521,6 +610,55 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
         assert_eq!(fixture.index_codex()["indexed"], 0);
         assert_eq!(fs::read(path).unwrap(), original);
     }
+}
+
+#[test]
+fn sampled_ordinary_rollback_replaces_a_previously_verified_title() {
+    use std::io::{BufWriter, Write};
+
+    let fixture = Fixture::new();
+    let cached = |query: &str| {
+        fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
+    };
+    fixture.index_codex();
+    assert_eq!(
+        cached(CODEX_ID)["results"][0]["title"],
+        "Tune the rate limiter backoff"
+    );
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
+    let pad = format!(
+        "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}",
+        " ".repeat(1024 * 1024)
+    );
+    for _ in 0..16 {
+        writeln!(file, "{pad}").unwrap();
+    }
+    for row in [
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"Investigate latency instead"}]}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"Queue delay explains the slowdown"}]}}),
+    ] {
+        writeln!(file, "{row}").unwrap();
+    }
+    drop(file.into_inner().unwrap());
+    let original = fs::read(&path).unwrap();
+
+    let live = fixture.search_json(&["backoff", "--provider", "codex", "--show-text"]);
+    assert!(result_sessions(&live).is_empty());
+    assert!(result_sessions(&cached("backoff")).is_empty());
+    let retained = cached("slowdown");
+    assert_eq!(
+        retained["results"][0]["title"],
+        "Investigate latency instead"
+    );
+    assert_eq!(retained["results"][0]["coverage"], "preview");
+    assert_eq!(fixture.index_codex()["stale"], 0);
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -802,7 +940,16 @@ fn a_fully_read_fork_with_missing_history_stays_partial_without_reindexing() {
         let first = fixture.index_codex();
         assert_eq!(first["indexed"], if direct_read { 1 } else { 2 });
         assert_eq!(fixture.index_codex()["indexed"], 0);
-        let cached = fixture.search_json(&["unchanged", "--provider", "codex", "--cached"]);
+        let project = fixture.search_json(&["unchanged", "--provider", "codex", "--cached"]);
+        assert!(result_sessions(&project).is_empty());
+        let cached = fixture.search_json(&[
+            "unchanged",
+            "--provider",
+            "codex",
+            "--cached",
+            "--all-projects",
+        ]);
+        assert_eq!(cached["results"][0].get("project_path"), Some(&Value::Null));
         assert_eq!(cached["results"][0]["coverage"], "preview");
     }
 }

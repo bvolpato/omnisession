@@ -132,6 +132,7 @@ pub enum PickerOutcome {
     Resume(PickerSelection),
     ClipboardHandoff {
         session: SessionRef,
+        source_revision: Option<SourceRevision>,
     },
     Update {
         version: String,
@@ -1659,6 +1660,20 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
+    let mut source_revision = entry
+        .source_revision()
+        .filter(|revision| revision.file.is_some() && revision.contents.is_some());
+    if session.provider == Provider::Codex && source_revision.is_none() {
+        source_revision = AdapterRegistry::with_local_adapters()
+            .find_native_session(Provider::Codex, &session.id)?
+            .and_then(|native| native.source_revision)
+            .filter(|revision| revision.file.is_some() && revision.contents.is_some());
+        if source_revision.is_none() {
+            return Ok(RowSelection::Notice(
+                "The selected Codex rollout is no longer available.".to_owned(),
+            ));
+        }
+    }
     let project_path = entry.session.project_path.clone();
     let intent = materialize.map_or(TargetIntent::Resume(&session), |can_copy| {
         TargetIntent::Materialize(&session, can_copy)
@@ -1687,9 +1702,7 @@ fn select_picker_row(
             };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
-                    source_revision: entry
-                        .source_revision()
-                        .filter(|revision| revision.file.is_some() && revision.contents.is_some()),
+                    source_revision,
                     session,
                     project_path,
                     across_projects: state.all_projects,
@@ -1703,6 +1716,7 @@ fn select_picker_row(
         TargetOutcome::ClipboardHandoff => {
             Ok(RowSelection::Selected(PickerOutcome::ClipboardHandoff {
                 session,
+                source_revision,
             }))
         }
         TargetOutcome::Back => Ok(RowSelection::Back),

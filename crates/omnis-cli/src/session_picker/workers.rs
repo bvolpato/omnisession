@@ -428,10 +428,21 @@ pub(super) fn read_picker_preview(
                     .as_ref()
                     .context("cached Codex preview has no verified catalog metadata")?;
                 let effective = &read.snapshot.workspace.current_dir;
-                let workspace = if effective.as_os_str().is_empty() {
-                    header.project_path.as_deref()
-                } else {
-                    Some(effective.as_path())
+                let workspace = match &read.workspace_projection {
+                    omnis_adapters::CodexWorkspaceProjection::Observed(project) => {
+                        project.as_deref()
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked
+                        if !effective.as_os_str().is_empty() =>
+                    {
+                        Some(effective.as_path())
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked if read.source_complete => {
+                        None
+                    }
+                    omnis_adapters::CodexWorkspaceProjection::Unchecked => {
+                        header.project_path.as_deref()
+                    }
                 };
                 anyhow::ensure!(
                     workspace.map(Path::as_os_str) == expected.as_deref().map(Path::as_os_str),
@@ -443,13 +454,15 @@ pub(super) fn read_picker_preview(
         return Ok(read);
     }
     if session.provider == Provider::Imported || key.continuation_after.is_some() {
-        return full_index_read(registry, session);
+        return full_index_read(registry, session, None);
     }
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             source_complete: false,
             source_revision: SourceRevision::default(),
         })
@@ -511,12 +524,16 @@ fn preview_update(
             if read.source_revision.file.is_some() {
                 read_revision = Some(preview_revision(read.source_revision));
             }
-            let snapshot = read.snapshot;
+            let snapshot = &read.snapshot;
             let complete = read.source_complete;
             if read.native_session.is_some() {
-                workspace =
-                    crate::codex_workspace_update(&snapshot, read.source_revision, complete)
-                        .map(Box::new);
+                workspace = crate::codex_workspace_update(
+                    snapshot,
+                    read.source_revision,
+                    complete,
+                    &read.workspace_projection,
+                )
+                .map(Box::new);
             }
             if let Some((store, guard)) = writer
                 && let Err(error) = crate::store_search_document(
@@ -525,9 +542,7 @@ fn preview_update(
                         crate::SearchDocumentTarget::Session(&key.session),
                         crate::SearchDocumentTarget::VisibleNative,
                     ),
-                    &snapshot,
-                    complete,
-                    read.source_revision,
+                    crate::SearchDocumentInput::Read(&read),
                     (!imported).then_some(registry),
                     guard,
                 )
@@ -540,8 +555,8 @@ fn preview_update(
             PreviewValue::Ready {
                 continuation: key
                     .continuation_after
-                    .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
-                preview: Box::new(session_preview(&snapshot)),
+                    .and_then(|handoff_at| first_user_message_after(snapshot, handoff_at)),
+                preview: Box::new(session_preview(snapshot)),
                 complete,
             }
         })

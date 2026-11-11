@@ -35,10 +35,11 @@ pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, bounded_opencode_json_output, canonicalize_opencode_export,
-    find_opencode_session_with_binary, fork_opencode_session_with_binary, installed_opencode_model,
+    OpenCodeAdapter, OpenCodeGeneration, bounded_opencode_json_output,
+    canonicalize_opencode_export, find_opencode_session_with_binary,
+    fork_opencode_session_with_binary, installed_opencode_model,
     installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
-    read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
 pub use provider_process::{bounded_provider_output, provider_process};
@@ -68,11 +69,101 @@ pub struct NativeSession {
     pub source_revision: Option<SourceRevision>,
 }
 
+/// The opener confirmed by a full ordinary Codex read or by reconstructing an applied rollback.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RollbackTitle {
+    #[default]
+    Unknown,
+    /// An empty title means the surviving transcript has no eligible user opener.
+    Known(Option<String>),
+    /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
+    UnknownAfterWithdrawal(WithdrawnOpeners),
+}
+
+/// Bounded evidence about local opening titles removed before the first unreadable row.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WithdrawnOpeners {
+    hashes: Vec<[u8; 32]>,
+    overflowed: bool,
+}
+
+impl WithdrawnOpeners {
+    fn record(&mut self, hash: [u8; 32]) {
+        if !self.hashes.contains(&hash) {
+            if self.hashes.len() < 8 {
+                self.hashes.push(hash);
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+
+    fn reissued(&mut self, title: &str) {
+        if !self.hashes.is_empty() {
+            let hash = RollbackTitle::fingerprint(title);
+            self.hashes.retain(|previous| *previous != hash);
+        }
+    }
+
+    fn after_gap(&self) -> RollbackTitle {
+        if self.hashes.is_empty() && !self.overflowed {
+            RollbackTitle::Unknown
+        } else {
+            RollbackTitle::UnknownAfterWithdrawal(self.clone())
+        }
+    }
+}
+
+impl RollbackTitle {
+    fn fingerprint(title: &str) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(title.as_bytes()).into()
+    }
+
+    /// Whether this reconstruction witnessed the saved opener being removed before a gap.
+    #[must_use]
+    pub fn withdraws(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.hashes.contains(&Self::fingerprint(title)))
+    }
+
+    /// Whether a single-title check can resolve an overflow in the bounded withdrawal history.
+    #[must_use]
+    pub fn needs_withdrawal_check(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.overflowed && !self.withdraws(title))
+    }
+}
+
+/// The effective workspace established independently of the amount of indexed conversation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CodexWorkspaceProjection {
+    #[default]
+    Unchecked,
+    /// No directory means the selected rollout establishes that its workspace is unknown.
+    Observed(Option<PathBuf>),
+}
+
+impl CodexWorkspaceProjection {
+    fn from_reconstruction(verified: bool, directory: Option<&Path>) -> Self {
+        if verified {
+            Self::Observed(
+                directory
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            )
+        } else {
+            Self::Unchecked
+        }
+    }
+}
+
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
+    pub rollback_title: RollbackTitle,
+    /// The workspace projection belongs to this read's source revision.
+    pub workspace_projection: CodexWorkspaceProjection,
     pub source_complete: bool,
     pub source_revision: SourceRevision,
 }
@@ -254,6 +345,8 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
+            rollback_title: RollbackTitle::Unknown,
             native_session: None,
             snapshot,
             source_complete,

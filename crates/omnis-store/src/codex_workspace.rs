@@ -3,10 +3,14 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use omnis_ir::{Provider, SessionRef, SourceRevision};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, Transaction, params};
 use uuid::Uuid;
 
 use crate::{DATABASE_FILE_NAME, Result, StoreError, database_error, reject_symlink, state_root};
+
+const UNCERTAIN_LEGACY_SOURCE: &str =
+    "(NOT t.source_complete OR t.truncation_strategy GLOB 'source_incomplete*'
+    OR t.truncation_strategy IN ('legacy_unknown','legacy_bounded'))";
 
 /// A workspace and branch read from the selected rollout revision.
 #[derive(Debug, Clone)]
@@ -21,20 +25,26 @@ pub struct CodexWorkspace {
 pub enum CodexWorkspaceUpdate {
     /// The reader verified the effective workspace.
     Verified(CodexWorkspace),
-    /// A full read found unreadable records that invalidate the previous workspace.
+    /// A full read found unreadable records. The workspace for this revision is unknown.
     Withdrawn(SourceRevision),
 }
 
 impl CodexWorkspace {
-    /// Reads verified workspaces without walking or opening any provider rollouts.
+    /// Reads workspace observations without opening any provider rollouts.
+    /// A present entry with no project path means this revision has an unknown workspace.
     ///
     /// # Errors
     ///
     /// Returns an error if the workspace index does not exist or cannot be read.
     pub fn read_index(file: Option<Uuid>) -> Result<HashMap<Uuid, Self>> {
-        let mut sql = "SELECT source_file_id, source_contents_id, project_path, git_branch FROM codex_indexed_workspaces".to_owned();
+        let mut sql = format!("SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch
+            FROM codex_indexed_workspaces w JOIN session_trajectories t ON t.id=w.trajectory_id
+            WHERE (t.document_version <> 6 OR NOT {UNCERTAIN_LEGACY_SOURCE}
+                OR t.source_file_id IS NOT w.source_file_id OR t.source_contents_id IS NOT w.source_contents_id OR EXISTS (
+                SELECT 1 FROM pragma_table_info('session_trajectories')
+                WHERE name='derived_title_is_local_opener'))");
         if file.is_some() {
-            sql.push_str(" WHERE source_file_id=?1");
+            sql.push_str(" AND w.source_file_id=?1");
         }
         let filter = file.map(Uuid::into_bytes);
         Self::read_rows(&sql, rusqlite::params_from_iter(filter.as_slice()))
@@ -92,6 +102,7 @@ impl CodexWorkspace {
         session: &SessionRef,
         revision: SourceRevision,
         content_hash: &[u8],
+        require_full_source: bool,
     ) -> Result<()> {
         if session.provider != Provider::Codex
             || !self.source_revision.matches_file_contents(revision)
@@ -113,9 +124,10 @@ impl CodexWorkspace {
              SELECT id,source_file_id,source_contents_id,?4,?5 FROM session_trajectories
              WHERE provider='codex' AND session_id=?1 AND origin='native'
                AND source_file_id=?2 AND source_contents_id IS ?3 AND content_hash=?6
+               AND (NOT ?7 OR source_complete)
              ON CONFLICT(trajectory_id) DO UPDATE SET source_file_id=excluded.source_file_id,
                 source_contents_id=excluded.source_contents_id,project_path=excluded.project_path,git_branch=excluded.git_branch",
-            params![session.id, file, contents, project_path, self.git_branch, content_hash]
+            params![session.id, file, contents, project_path, self.git_branch, content_hash, require_full_source]
         ).map_err(database_error)?;
         if saved == 0 {
             return Err(StoreError::TrajectorySourceChanged);
@@ -128,51 +140,6 @@ impl CodexWorkspace {
         ).map_err(database_error)?;
         Ok(())
     }
-}
-
-pub(super) fn withdraw(
-    transaction: &Transaction<'_>,
-    session: &SessionRef,
-    revision: SourceRevision,
-    evidence: SourceRevision,
-    content_hash: &[u8],
-) -> Result<()> {
-    if session.provider != Provider::Codex || !evidence.matches_file_contents(revision) {
-        return Err(StoreError::TrajectorySourceChanged);
-    }
-    let file = revision.file.map(Uuid::into_bytes);
-    let contents = revision
-        .contents
-        .ok_or(StoreError::TrajectorySourceChanged)?
-        .into_bytes();
-    let trajectory: i64 = transaction
-        .query_row(
-            "SELECT id FROM session_trajectories
-             WHERE provider='codex' AND session_id=?1 AND origin='native' AND source_complete
-               AND source_file_id=?2 AND source_contents_id=?3 AND content_hash=?4",
-            params![session.id, file, contents, content_hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(database_error)?
-        .ok_or(StoreError::TrajectorySourceChanged)?;
-    transaction
-        .execute(
-            "UPDATE session_index AS c SET project_path=NULL, git_branch=NULL
-             WHERE c.provider='codex' AND c.session_id=?4 AND c.source_file_id=?2 AND c.source_contents_id=?3
-               AND EXISTS (SELECT 1 FROM codex_indexed_workspaces w WHERE w.trajectory_id=?1
-                   AND w.source_file_id=?2 AND w.source_contents_id=?3 AND w.project_path IS c.project_path)",
-            params![trajectory, file, contents, session.id],
-        )
-        .map_err(database_error)?;
-    transaction
-        .execute(
-            "DELETE FROM codex_indexed_workspaces
-             WHERE trajectory_id=?1 AND source_file_id=?2 AND source_contents_id=?3",
-            params![trajectory, file, contents],
-        )
-        .map_err(database_error)?;
-    Ok(())
 }
 
 pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
@@ -199,5 +166,28 @@ pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
         WHERE t.document_version=5 AND t.provider='codex' AND t.origin='native' AND t.source_complete
           AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL;",
         )
+        .map_err(database_error)
+}
+
+/// Rechecks version 6 documents whose workspace or opening message the reader could misidentify.
+pub(super) fn recheck_legacy_projections(transaction: &Transaction<'_>) -> Result<()> {
+    let stamped = "t.provider='codex' AND t.origin='native' AND t.document_version=6
+                   AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL";
+    let affected = format!(
+        "{stamped} AND ({UNCERTAIN_LEGACY_SOURCE} OR (t.derived_title IS NOT NULL AND t.derived_title_is_local_opener IS NOT 0))"
+    );
+    transaction
+        .execute_batch(&format!(
+            "DELETE FROM codex_indexed_workspaces AS w WHERE EXISTS (
+                 SELECT 1 FROM session_trajectories t WHERE t.id=w.trajectory_id
+                   AND t.source_file_id=w.source_file_id AND t.source_contents_id=w.source_contents_id
+                   AND {stamped} AND {UNCERTAIN_LEGACY_SOURCE});
+             UPDATE trajectory_index_failures AS f SET document_version=5
+             WHERE f.provider='codex' AND f.document_version=6 AND EXISTS (
+                 SELECT 1 FROM session_trajectories t WHERE t.session_id=f.session_id
+                   AND t.source_file_id=f.source_file_id AND t.source_contents_id=f.source_contents_id
+                   AND t.source_updated_at IS f.source_updated_at AND {affected});
+             UPDATE session_trajectories AS t SET document_version=5 WHERE {affected};"
+        ))
         .map_err(database_error)
 }

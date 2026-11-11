@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
-    ProviderInstallation,
+    CodexWorkspaceProjection, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
+    NativeSession, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
         EventBuilder, JsonLineSkips, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
         MAX_TRANSCRIPT_LINE_SIZE, json_lines_preview_with_omissions, omitted_images_text,
@@ -28,6 +28,7 @@ use crate::{
 
 mod rollout_cache;
 mod rollout_file;
+mod workspace_check;
 mod workspace_search;
 
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
@@ -162,8 +163,18 @@ impl CodexAdapter {
             .filter(|native| native.id == session.id && read.snapshot.session == *session)
             .context("selected Codex rollout has a different session header")?;
         native.read_unchanged(|native, _| {
-            let (events, project) =
+            let (events, project, workspace_reconstructed) =
                 native.reconstructed_preview(rollout_file::LEGACY_PROJECTION_LIMITS)?;
+            let workspace_projection = match &read.workspace_projection {
+                CodexWorkspaceProjection::Unchecked => {
+                    CodexWorkspaceProjection::from_reconstruction(
+                        workspace_reconstructed,
+                        project.as_deref(),
+                    )
+                }
+                observed @ CodexWorkspaceProjection::Observed(_) => observed.clone(),
+            };
+            let rollback_title = events.rollback_title();
             let branch = native.branch_at(project.as_deref());
             let snapshot = events.snapshot(
                 session.clone(),
@@ -177,6 +188,8 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                rollback_title,
+                workspace_projection,
                 snapshot,
                 source_complete: document.source_complete,
                 source_revision: read.source_revision,
@@ -196,6 +209,40 @@ impl CodexAdapter {
         revision: SourceRevision,
         prior_title: &str,
     ) -> Result<bool> {
+        Self::verify_selected_title(path, session, revision, |native| {
+            native.withdrew_search_title(prior_title)
+        })
+    }
+
+    /// Checks one saved title when an ordinary rollout withdrew more openers than the receipt retains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected rollout changes or cannot be read.
+    pub fn verify_earlier_opener_withdrawal(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior_title: &str,
+    ) -> Result<bool> {
+        Self::verify_selected_title(path, session, revision, |native| {
+            let mut builder = native.event_builder();
+            builder.plan_preview(None);
+            builder.track_saved_opener(prior_title);
+            let (events, _) =
+                native.canonical_events_into(builder, CodexHistory::preview(), |visit| {
+                    rollout_file::visit(&native.path, visit)
+                })?;
+            Ok(events.rollback_title().withdraws(prior_title))
+        })
+    }
+
+    fn verify_selected_title(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        read: impl FnOnce(CodexSession) -> Result<bool>,
+    ) -> Result<bool> {
         validate_provider(session, Provider::Codex)?;
         anyhow::ensure!(
             path_uuid(path).as_deref() == Some(session.id.as_str()),
@@ -210,7 +257,7 @@ impl CodexAdapter {
         let native = CodexSession::parse_with_observation(path, observed)?
             .filter(|native| native.id == session.id)
             .context("selected Codex rollout has a different session header")?;
-        native.read_unchanged(|native, _| native.withdrew_search_title(prior_title))
+        native.read_unchanged(|native, _| read(native))
     }
 
     /// The decoded size of a compressed rollout can differ from its filesystem metadata.
@@ -1086,13 +1133,18 @@ impl CodexSession {
 
     fn canonical_events_with(
         &self,
-        read: impl FnOnce(&mut dyn FnMut(Value, usize) -> Result<()>) -> Result<JsonLineSkips>,
+        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, Option<PathBuf>)> {
-        let (events, history) = self.canonical_events_into(
-            self.event_builder(),
+        let mut builder = self.event_builder();
+        builder.track_rollback_opener(true);
+        let (mut events, history) = self.canonical_events_into(
+            builder,
             CodexHistory::new(self.project_path.clone()),
             read,
         )?;
+        if history.workspace_unknown {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
         Ok((events, history.project_path))
     }
 
@@ -1100,13 +1152,30 @@ impl CodexSession {
         &self,
         mut builder: EventBuilder,
         mut history: CodexHistory,
-        read: impl FnOnce(&mut dyn FnMut(Value, usize) -> Result<()>) -> Result<JsonLineSkips>,
+        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, CodexHistory)> {
         let mut unread_ancestor = false;
         let mut first_gap = None;
+        let mut recovered_after = 0;
         let unreadable = read(&mut |record, skipped_before| {
-            if skipped_before > 0 && first_gap.is_none() {
+            if builder.tracks_rollback_opener()
+                && !ordinary_rollback_record(&record, history.records_seen == 0)
+            {
+                builder.discard_rollback_opener();
+            }
+            if skipped_before.total() > 0 && first_gap.is_none() {
                 first_gap = Some(builder.checkpoint());
+                builder.note_rollback_history_gap();
+            }
+            if skipped_before.workspace_gaps() > 0 {
+                if record["type"] == "turn_context" && record["payload"]["cwd"].is_string() {
+                    recovered_after = skipped_before.workspace_gaps();
+                } else if record["type"] == "event_msg"
+                    && record["payload"]["type"] == "thread_rolled_back"
+                    && record["payload"]["num_turns"].as_u64() != Some(0)
+                {
+                    recovered_after = 0;
+                }
             }
             unread_ancestor |= records_history_base(&record);
             history.push(&mut builder, &record)?;
@@ -1119,8 +1188,19 @@ impl CodexSession {
             }
             Ok(())
         })?;
+        if recovered_after != unreadable.workspace_gaps() {
+            history.workspace_unknown = true;
+            history.project_path = None;
+            history.workspace_record = None;
+        }
         let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
+        if unreadable.total() != 0 {
+            builder.note_rollback_history_gap();
+        }
+        if unread_ancestor || self.is_subagent {
+            builder.discard_rollback_opener();
+        }
         if history.omitted_events > 0 {
             builder.push(
                 EventKind::ProviderEvent,
@@ -1157,54 +1237,66 @@ impl CodexSession {
             self.updated_at,
         );
         if unread_ancestor {
+            history.workspace_history_incomplete |=
+                history.workspace_record.is_none_or(|record| record <= 1);
             report_unread_ancestor(&mut builder, self.updated_at);
         }
         Ok((builder, history))
     }
 
     fn branch_at(&self, project: Option<&Path>) -> Option<String> {
-        (project == self.project_path.as_deref())
+        (project.is_some() && project == self.project_path.as_deref())
             .then(|| self.git_branch.clone())
             .flatten()
     }
 
-    fn read(self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+    fn read(self, session: &SessionRef) -> Result<(omnis_ir::CanonicalSnapshot, RollbackTitle)> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let (events, project_path) = self.canonical_events()?;
         let branch = self.branch_at(project_path.as_deref());
-        Ok(events.snapshot(
-            session.clone(),
-            self.title,
-            project_path,
-            branch,
-            captured_at,
-        ))
-    }
-
-    fn preview(self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
-        if rollout_file::compressed(&self.path) {
-            return Ok(self
-                .compressed_sample(session, MAX_PREVIEW_TAIL_SIZE)?
-                .snapshot);
-        }
-        if contains_rollback_marker(&self.path)? {
-            let (events, project_path) = self.reconstructed_preview(rollout_file::LIMITS)?;
-            let branch = self.branch_at(project_path.as_deref());
-            return Ok(events.snapshot(
+        let title = events.rollback_title();
+        Ok((
+            events.snapshot(
                 session.clone(),
                 self.title,
                 project_path,
                 branch,
                 captured_at,
+            ),
+            title,
+        ))
+    }
+
+    fn preview(
+        self,
+        session: &SessionRef,
+    ) -> Result<(
+        omnis_ir::CanonicalSnapshot,
+        RollbackTitle,
+        CodexWorkspaceProjection,
+    )> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        if rollout_file::compressed(&self.path) {
+            let read = self.compressed_sample(session, MAX_PREVIEW_TAIL_SIZE)?;
+            return Ok((
+                read.snapshot,
+                read.rollback_title,
+                read.workspace_projection,
             ));
         }
-        Ok(self.preview_events()?.snapshot(
-            session.clone(),
-            self.title,
-            self.project_path,
-            self.git_branch,
-            captured_at,
+        let (events, project, reconstructed) = if contains_rollback_marker(&self.path)? {
+            self.reconstructed_preview(rollout_file::LIMITS)?
+        } else {
+            self.preview_events()?
+        };
+        let branch = self.branch_at(project.as_deref());
+        let title = events.rollback_title();
+        let workspace =
+            CodexWorkspaceProjection::from_reconstruction(reconstructed, project.as_deref());
+        Ok((
+            events.snapshot(session.clone(), self.title, project, branch, captured_at),
+            title,
+            workspace,
         ))
     }
 
@@ -1222,14 +1314,17 @@ impl CodexSession {
             return Ok(read);
         }
         let source_complete = fs::metadata(&self.path)?.len() <= full_read_bytes;
-        let snapshot = if source_complete {
-            self.read(session)?
+        let (snapshot, rollback_title, workspace_projection) = if source_complete {
+            let (snapshot, title) = self.read(session)?;
+            (snapshot, title, CodexWorkspaceProjection::Unchecked)
         } else {
             self.preview(session)?
         };
         Ok(IndexRead {
             native_session,
             snapshot,
+            rollback_title,
+            workspace_projection,
             source_complete,
             source_revision,
         })
@@ -1237,48 +1332,58 @@ impl CodexSession {
 
     fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
-        let (events, project, source_complete) = match rollout_file::sample(&self.path, budget)
-            .context("sampling compressed Codex rollout")?
-        {
-            rollout_file::Sample::Complete(bytes) => {
-                let (events, project) = self.canonical_events_with(|visit| {
-                    rollout_file::read_records(bytes.as_slice(), visit)
-                })?;
-                (events, project, true)
-            }
-            rollout_file::Sample::Reconstruct => {
-                let (events, project) = self.reconstructed_preview(rollout_file::LIMITS)?;
-                (events, project, false)
-            }
-            rollout_file::Sample::Edges {
-                records,
-                omitted,
-                unreadable,
-            } => {
-                let mut events = self.events_from_records(records);
-                events.push_json_line_omissions(
-                    unreadable,
-                    MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-                    None,
-                    self.updated_at,
-                );
-                if omitted > 0 {
-                    events.push(
-                        EventKind::ProviderEvent,
-                        json!({"omitted_events": omitted}),
-                        self.updated_at,
-                        ReplayPolicy::HistoricalOnly,
-                        Some("omnisession.preview_limit".to_owned()),
-                        None,
-                    );
+        let (events, project, source_complete, workspace_reconstructed) =
+            match rollout_file::sample(&self.path, budget)
+                .context("sampling compressed Codex rollout")?
+            {
+                rollout_file::Sample::Complete(bytes) => {
+                    let (events, project) = self.canonical_events_with(|visit| {
+                        rollout_file::read_records(bytes.as_slice(), visit)
+                    })?;
+                    (events, project, true, false)
                 }
-                (events, self.project_path.clone(), false)
-            }
-        };
+                rollout_file::Sample::Reconstruct => {
+                    let (events, project, workspace_reconstructed) =
+                        self.reconstructed_preview(rollout_file::LIMITS)?;
+                    (events, project, false, workspace_reconstructed)
+                }
+                rollout_file::Sample::Edges {
+                    records,
+                    omitted,
+                    unreadable,
+                } => {
+                    let project = self.preview_directory(&records, omitted > 0);
+                    let mut events = self.events_from_records(records);
+                    events.push_json_line_omissions(
+                        unreadable,
+                        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+                        None,
+                        self.updated_at,
+                    );
+                    if omitted > 0 {
+                        events.push(
+                            EventKind::ProviderEvent,
+                            json!({"omitted_events": omitted}),
+                            self.updated_at,
+                            ReplayPolicy::HistoricalOnly,
+                            Some("omnisession.preview_limit".to_owned()),
+                            None,
+                        );
+                    }
+                    (events, project, false, false)
+                }
+            };
         let branch = self.branch_at(project.as_deref());
+        let rollback_title = events.rollback_title();
+        let workspace_projection = CodexWorkspaceProjection::from_reconstruction(
+            workspace_reconstructed,
+            project.as_deref(),
+        );
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
             native_session: None,
+            workspace_projection,
+            rollback_title,
             snapshot,
             source_complete,
             source_revision: SourceRevision::default(),
@@ -1288,13 +1393,14 @@ impl CodexSession {
     fn reconstructed_preview(
         &self,
         limits: crate::support::JsonLinesLimits,
-    ) -> Result<(EventBuilder, Option<PathBuf>)> {
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
         let stamp = || fs::metadata(&self.path).map(|metadata| RolloutStamp::new(&metadata));
         let before = stamp()?;
         let per_edge = usize::try_from(MAX_PREVIEW_TAIL_SIZE)?;
         let mut builder = self.event_builder();
         builder.plan_preview(None);
-        let ((selected, omitted), workspace_record) = {
+        builder.track_rollback_opener(false);
+        let ((selected, omitted), workspace_record, first_title) = {
             let (plan, history) =
                 self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
                     rollout_file::visit_with_limits(&self.path, limits, visit)
@@ -1302,11 +1408,13 @@ impl CodexSession {
             (
                 plan.select_preview(rollout_file::SAMPLE_RECORDS, per_edge),
                 history.workspace_record,
+                plan.rollback_title(),
             )
         };
         let expected = selected.len();
         let mut builder = self.event_builder();
         builder.plan_preview(Some(selected.clone()));
+        builder.track_rollback_opener(false);
         let mut project = None;
         let mut position = 0_usize;
         let (mut events, history) =
@@ -1321,6 +1429,7 @@ impl CodexSession {
             })?;
         if stamp()? != before
             || history.workspace_record != workspace_record
+            || events.rollback_title() != first_title
             || events.select_preview(rollout_file::SAMPLE_RECORDS, per_edge) != (selected, omitted)
         {
             return Err(anyhow!(
@@ -1328,6 +1437,9 @@ impl CodexSession {
             ));
         }
         events.finish_preview(expected)?;
+        if history.workspace_unknown {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
         if omitted > 0 {
             events.push(
                 EventKind::ProviderEvent,
@@ -1338,12 +1450,20 @@ impl CodexSession {
                 None,
             );
         }
-        Ok((events, project))
+        Ok((events, project, !history.workspace_history_incomplete))
     }
 
-    fn preview_events(&self) -> Result<EventBuilder> {
+    fn preview_events(&self) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
         const SAMPLE_RECORDS: usize = 1_024;
-        let preview = json_lines_preview_with_omissions(&self.path, SAMPLE_RECORDS)?;
+        let preview = json_lines_preview_with_omissions(
+            &self.path,
+            SAMPLE_RECORDS,
+            rollout_file::workspace_record_candidate,
+        )?;
+        if preview.omissions.workspace_gaps() > 0 {
+            return self.reconstructed_preview(rollout_file::LIMITS);
+        }
+        let project = self.preview_directory(&preview.records, preview.sampled);
         let mut events = self.events_from_records(preview.records);
         events.push_json_line_omissions(
             preview.omissions,
@@ -1361,7 +1481,20 @@ impl CodexSession {
                 None,
             );
         }
-        Ok(events)
+        Ok((events, project, false))
+    }
+
+    fn preview_directory(&self, records: &[Value], sampled: bool) -> Option<PathBuf> {
+        if !sampled
+            && let Some(cwd) = records
+                .iter()
+                .rev()
+                .filter(|record| record["type"] == "turn_context")
+                .find_map(|record| record["payload"]["cwd"].as_str())
+        {
+            return Some(PathBuf::from(cwd));
+        }
+        self.project_path.clone()
     }
 
     fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
@@ -1393,10 +1526,13 @@ struct TurnCheckpoint {
 
 struct CodexHistory {
     project_path: Option<PathBuf>,
+    workspace_unknown: bool,
     workspace_record: Option<usize>,
     records_seen: usize,
     last_visible: Option<(EventKind, String, &'static str)>,
     turns: Vec<TurnCheckpoint>,
+    pruned_turn_checkpoints: bool,
+    workspace_history_incomplete: bool,
     pending_turn: Option<TurnCheckpoint>,
     tool_events: usize,
     omitted_tool_events: usize,
@@ -1407,10 +1543,13 @@ impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
             project_path,
+            workspace_unknown: false,
             workspace_record: None,
             records_seen: 0,
             last_visible: None,
             turns: Vec::new(),
+            pruned_turn_checkpoints: false,
+            workspace_history_incomplete: false,
             pending_turn: None,
             tool_events: 0,
             omitted_tool_events: 0,
@@ -1431,6 +1570,10 @@ impl CodexHistory {
         self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
         self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
+        if excess > 0 || self.omitted_events > 0 || self.omitted_tool_events > 0 {
+            builder.discard_rollback_opener();
+        }
+        self.pruned_turn_checkpoints |= excess > 0;
         self.turns.drain(..excess);
     }
 
@@ -1455,10 +1598,11 @@ impl CodexHistory {
                 .context("Codex rollback marker has no valid num_turns")?;
             let mut truncated = None;
             if count > 0 {
-                let retained = self
-                    .turns
-                    .len()
-                    .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+                let count = usize::try_from(count).unwrap_or(usize::MAX);
+                if self.pruned_turn_checkpoints && count > self.turns.len() {
+                    self.workspace_history_incomplete = true;
+                }
+                let retained = self.turns.len().saturating_sub(count);
                 if retained < self.turns.len() {
                     let checkpoint = self.turns.remove(retained);
                     self.turns.truncate(retained);
@@ -1551,6 +1695,21 @@ fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
     hex.and_then(|hex| std::str::from_utf8(hex).ok())
         .and_then(|hex| u8::from_str_radix(hex, 16).ok())
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+}
+
+fn ordinary_rollback_record(record: &Value, first: bool) -> bool {
+    let payload = &record["payload"];
+    match record["type"].as_str() {
+        Some("session_meta") => {
+            first
+                && payload["history_base"].is_null()
+                && payload["forked_from_id"].is_null()
+                && (payload["history_mode"].is_null() || payload["history_mode"] == "default")
+        }
+        Some("event_msg" | "response_item") => !first && payload["type"].is_string(),
+        Some("turn_context") => !first && payload.is_object(),
+        _ => false,
+    }
 }
 
 fn records_history_base(record: &Value) -> bool {
@@ -2047,12 +2206,14 @@ impl ProviderAdapter for CodexAdapter {
         validate_provider(session, Provider::Codex)?;
         self.find_session(&session.id, None)?
             .read_unchanged(|native, _| native.read(session))
+            .map(|(snapshot, _)| snapshot)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
         self.find_session(&session.id, None)?
             .read_unchanged(|native, _| native.preview(session))
+            .map(|(snapshot, _, _)| snapshot)
     }
 
     fn index_session(
@@ -2064,8 +2225,11 @@ impl ProviderAdapter for CodexAdapter {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session(&session.id, source_path)?;
         let changed = source_path.is_some_and(|path| path != native.path);
-        let read = native
-            .read_unchanged(|native, revision| native.index(session, full_read_bytes, revision));
+        let read = native.read_unchanged(|native, revision| {
+            let mut read = native.index(session, full_read_bytes, revision)?;
+            read.observe_inherited_workspace()?;
+            Ok(read)
+        });
         if changed {
             read.context("selected Codex rollout changed during indexing")
         } else {

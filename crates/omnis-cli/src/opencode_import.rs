@@ -1,16 +1,107 @@
-use std::path::Path;
+use std::{
+    io::{self, Read, Write},
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::recovery::ImportSource;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use omnis_adapters::LaunchPlan;
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
     readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+pub(super) struct StagedInput {
+    file: tempfile::NamedTempFile,
+    size: u64,
+    digest: Sha256,
+}
+
+impl StagedInput {
+    pub(super) fn new(document: &Value) -> Result<Self> {
+        let mut input = Self {
+            file: crate::create_private_import_file()?,
+            size: 0,
+            digest: Sha256::new(),
+        };
+        {
+            let mut writer = io::BufWriter::new(&mut input);
+            serde_json::to_writer(&mut writer, document).context("writing private import")?;
+            writer.flush().context("flushing private import")?;
+        }
+        input
+            .file
+            .as_file()
+            .sync_all()
+            .context("syncing private import")?;
+        Ok(input)
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    /// Checks the path the importer will open, including changes made in place.
+    pub(super) fn check(&self) -> Result<()> {
+        if !self.path().symlink_metadata()?.is_file() {
+            bail!("the staged OpenCode input is no longer a regular file");
+        }
+        let staged = same_file::Handle::from_file(std::fs::File::open(self.path())?)?;
+        let original = same_file::Handle::from_file(self.file.as_file().try_clone()?)?;
+        if staged != original || staged.as_file().metadata()?.len() != self.size {
+            bail!("the staged OpenCode input changed");
+        }
+        let mut input = staged.as_file().take(self.size + 1);
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let n = input.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+        }
+        if digest.finalize() != self.digest.clone().finalize() {
+            bail!("the staged OpenCode input changed");
+        }
+        Ok(())
+    }
+}
+
+impl Write for StagedInput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > crate::MAX_BUNDLE_SIZE - self.size {
+            return Err(io::Error::other(format!(
+                "OpenCode import exceeds {} byte safety limit",
+                crate::MAX_BUNDLE_SIZE
+            )));
+        }
+        let n = self.file.write(bytes)?;
+        self.digest.update(&bytes[..n]);
+        self.size += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for StagedInput {
+    fn drop(&mut self) {
+        // A provider can move the input or leave another file in its place.
+        if self.check().is_err() {
+            self.file.disable_cleanup(true);
+        }
+    }
+}
 
 pub struct OpenCodeImport {
     pub target: SessionRef,
@@ -394,29 +485,44 @@ fn v2_tool(part: &Value, created: i64, completed: i64) -> Value {
     })
 }
 
-pub fn command_with_binary(file: &Path, cwd: &Path, binary: &Path) -> Result<LaunchPlan> {
-    let file_str = file.to_string_lossy();
-    let args = omnis_adapters::opencode_command_args(binary, &["import", &file_str])?;
-    Ok(LaunchPlan {
-        program: binary.to_string_lossy().into_owned(),
-        args,
-        cwd: Some(cwd.to_path_buf()),
-        env: Vec::new(),
-    })
-}
-
-pub fn rollback_command_with_binary(
-    session: &SessionRef,
-    cwd: &Path,
-    binary: &Path,
-) -> Result<LaunchPlan> {
-    let args = omnis_adapters::opencode_command_args(binary, &["session", "delete", &session.id])?;
-    Ok(LaunchPlan {
-        program: binary.to_string_lossy().into_owned(),
-        args,
-        cwd: Some(cwd.to_path_buf()),
-        env: Vec::new(),
-    })
+pub(super) fn wait_for_readback(
+    command: &mut Command,
+    import: &OpenCodeImport,
+    deadline: Instant,
+) -> Result<()> {
+    let mut delay = Duration::from_millis(100);
+    let mut last_error = anyhow!("OpenCode import deadline expired before read-back");
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(last_error);
+        }
+        let checked = omnis_adapters::read_opencode_export(command, &import.target, remaining)
+            .and_then(|snapshot| {
+                let report = readback_report(&snapshot, &import.expected_items);
+                if !report.verified {
+                    bail!(
+                        "matched {} leading messages (expected {}, observed {}, truncated {})",
+                        report.matching_prefix,
+                        report.expected_messages,
+                        report.observed_messages,
+                        report.truncated
+                    );
+                }
+                Ok(())
+            });
+        match checked {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = anyhow!(
+                    "OpenCode import failed read-back verification: {}",
+                    crate::safe_terminal_line(&redact_secrets(&error.to_string()))
+                );
+            }
+        }
+        thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
 }
 
 pub fn readback_report(
@@ -454,6 +560,34 @@ mod tests {
 
     use super::*;
     use omnis_adapters::canonicalize_opencode_export;
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_input_checks_its_file_identity_and_contents() {
+        for change in ["remove", "replace", "overwrite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut staged = StagedInput {
+                file: tempfile::NamedTempFile::new_in(dir.path()).unwrap(),
+                size: 0,
+                digest: Sha256::new(),
+            };
+            staged.write_all(b"expected").unwrap();
+            staged.check().unwrap();
+            let path = staged.path().to_owned();
+            match change {
+                "remove" => fs::remove_file(&path).unwrap(),
+                "replace" => {
+                    let replacement = dir.path().join("replacement");
+                    fs::write(&replacement, b"expected").unwrap();
+                    fs::rename(replacement, &path).unwrap();
+                }
+                _ => fs::write(&path, b"modified").unwrap(),
+            }
+            assert!(staged.check().is_err(), "{change}");
+            drop(staged);
+            assert_eq!(path.exists(), change != "remove", "{change}");
+        }
+    }
 
     fn snapshot() -> CanonicalSnapshot {
         let thread_id = Uuid::new_v4();

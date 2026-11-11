@@ -252,8 +252,9 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
-        source_file_id, missing_ancestor_id, source_contents_id, derived_title_is_verified
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18, ?20)
+        source_file_id, missing_ancestor_id, source_contents_id, derived_title_is_verified, derived_title_is_local_opener
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18, ?20,
+              CASE WHEN ?20 THEN ?22 END)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -272,16 +273,32 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             excluded.protected_by_bundle
         ),
         document_version = excluded.document_version,
-        (derived_title, derived_title_is_verified) = (
+        (derived_title, derived_title_is_verified, derived_title_is_local_opener) = (
             SELECT CASE WHEN replace_title THEN excluded.derived_title
                         ELSE session_trajectories.derived_title END,
                    CASE WHEN replace_title THEN excluded.derived_title_is_verified
                             OR (excluded.derived_title IS NOT NULL AND session_trajectories.derived_title_is_verified
                                 AND excluded.source_file_id IS session_trajectories.source_file_id
                                 AND excluded.derived_title IS session_trajectories.derived_title)
-                        ELSE session_trajectories.derived_title_is_verified END
+                        ELSE session_trajectories.derived_title_is_verified END,
+                   CASE WHEN NOT coalesce(replace_title, 0) THEN session_trajectories.derived_title_is_local_opener
+                        WHEN same_title AND session_trajectories.derived_title_is_verified AND (
+                             NOT excluded.derived_title_is_verified OR
+                             (session_trajectories.derived_title_is_local_opener IS 0 AND ?22))
+                          THEN session_trajectories.derived_title_is_local_opener
+                        ELSE excluded.derived_title_is_local_opener END
             FROM (SELECT
-                (excluded.derived_title IS NOT NULL AND (
+                excluded.source_file_id IS session_trajectories.source_file_id
+                AND excluded.derived_title IS NOT NULL AND excluded.derived_title IS session_trajectories.derived_title AS same_title,
+                CASE WHEN ?23 THEN session_trajectories.origin = 'native'
+                          AND excluded.source_file_id = session_trajectories.source_file_id
+                          AND ?21 = session_trajectories.derived_title AND session_trajectories.derived_title_is_local_opener IS NOT 0
+                     WHEN ?22 AND excluded.source_file_id = session_trajectories.source_file_id
+                         AND session_trajectories.origin = 'native'
+                         AND NOT (excluded.source_complete AND excluded.truncation_strategy IN (
+                             'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'))
+                     THEN session_trajectories.derived_title_is_local_opener IS NOT 0
+                     ELSE (excluded.derived_title IS NOT NULL AND (
                     NOT ?17 OR excluded.derived_title_is_verified
                     OR NOT session_trajectories.derived_title_is_verified
                     OR excluded.source_file_id IS NOT session_trajectories.source_file_id))
@@ -294,13 +311,13 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                     AND NOT session_trajectories.derived_title_is_verified
                     AND session_trajectories.origin = 'native'
                     AND excluded.source_file_id = session_trajectories.source_file_id)
-                AS replace_title)
+                END AS replace_title)
         )
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
        OR (?17 AND excluded.provider = 'codex' AND excluded.origin = 'native'
-           AND session_trajectories.origin = 'native'
+           AND session_trajectories.origin = 'native' AND excluded.source_complete
            AND excluded.source_file_id = session_trajectories.source_file_id
            AND excluded.source_contents_id IS session_trajectories.source_contents_id
            AND (excluded.derived_title_is_verified OR (excluded.source_complete AND excluded.truncation_strategy IN (
@@ -573,6 +590,17 @@ impl SessionTrajectoryOrigin {
     }
 }
 
+/// What replay of the selected ordinary Codex rollout established about its local opener.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalOpenerEvidence {
+    #[default]
+    Unknown,
+    /// The first surviving message and any title it supplies are known.
+    Current,
+    /// The former opener was removed. The surviving replacement could not be read.
+    Withdrawn,
+}
+
 /// One redacted search document with coverage, provenance, and version metadata.
 #[derive(Clone, Copy, Debug)]
 pub struct TrajectoryDocument<'a> {
@@ -590,6 +618,7 @@ pub struct TrajectoryDocument<'a> {
     pub derived_title: Option<&'a str>,
     /// The provider named the session or the read verified its opening message.
     pub title_is_verified: bool,
+    pub local_opener: LocalOpenerEvidence,
     /// A separate read of the complete local history verified that a rollback removed this title,
     /// even if the indexed text came from a preview.
     pub withdrawn_title: Option<&'a str>,
@@ -699,27 +728,71 @@ struct PreparedTrajectoryWrite<'session, 'document> {
     indexed_byte_count: i64,
 }
 
+struct TrajectoryTitleWrite<'a> {
+    current: Option<&'a str>,
+    withdrawn: Option<&'a str>,
+    local: LocalOpenerEvidence,
+    verified: bool,
+}
+
 impl PreparedTrajectoryWrite<'_, '_> {
-    fn withdraw_current_title(&self, transaction: &Transaction<'_>, title: &str) -> Result<()> {
+    fn title_evidence(&self, observed: bool) -> TrajectoryTitleWrite<'_> {
+        let document = &self.document;
+        let native = self.session.provider == Provider::Codex
+            && document.origin == SessionTrajectoryOrigin::Native;
+        let revision = document.source_revision;
+        let stamped = native && observed && revision.file.is_some() && revision.contents.is_some();
+        let withdrawn = document.withdrawn_title.filter(|_| stamped);
+        let local = match document.local_opener {
+            LocalOpenerEvidence::Current if stamped => LocalOpenerEvidence::Current,
+            LocalOpenerEvidence::Withdrawn if withdrawn.is_some() => LocalOpenerEvidence::Withdrawn,
+            _ => LocalOpenerEvidence::Unknown,
+        };
+        let current = document
+            .derived_title
+            .filter(|_| local != LocalOpenerEvidence::Withdrawn);
+        let verified = native
+            && current.is_some()
+            && (document.title_is_verified || local == LocalOpenerEvidence::Current);
+        TrajectoryTitleWrite {
+            current,
+            withdrawn,
+            local,
+            verified,
+        }
+    }
+
+    fn refresh_current_title(
+        &self,
+        transaction: &Transaction<'_>,
+        title: &TrajectoryTitleWrite<'_>,
+    ) -> Result<()> {
         let document = &self.document;
         let revision = document.source_revision;
         transaction
             .execute(
-                "UPDATE session_trajectories SET derived_title = ?1, derived_title_is_verified = ?2
-                 WHERE provider = 'codex' AND session_id = ?3 AND origin = 'native'
-                   AND document_version = ?4 AND source_updated_at = ?5
-                   AND source_file_id = ?6 AND source_contents_id = ?7 AND missing_ancestor_id IS ?8
-                   AND derived_title = ?9 AND NOT derived_title_is_verified",
+                "UPDATE session_trajectories SET derived_title = ?1, derived_title_is_verified = ?2,
+                     derived_title_is_local_opener = CASE WHEN ?2 THEN ?3 END
+                 WHERE provider = 'codex' AND session_id = ?4 AND origin = 'native'
+                   AND document_version = ?5 AND source_updated_at = ?6
+                   AND source_file_id = ?7 AND source_contents_id = ?8 AND missing_ancestor_id IS ?9
+                   AND ((?3 AND derived_title_is_local_opener IS NOT 0) OR (?2 AND NOT ?3)
+                        OR (?10 = derived_title AND (NOT derived_title_is_verified OR
+                            (?11 AND derived_title_is_local_opener IS NOT 0))))
+                   AND (derived_title IS NOT ?1 OR derived_title_is_verified <> ?2
+                        OR derived_title_is_local_opener IS NOT (CASE WHEN ?2 THEN ?3 END))",
                 params![
-                    document.derived_title,
-                    document.title_is_verified && document.derived_title.is_some(),
+                    title.current,
+                    title.verified,
+                    title.local == LocalOpenerEvidence::Current,
                     self.session.id,
                     document.document_version,
                     document.source_updated_at.timestamp_millis(),
                     revision.file.map(Uuid::into_bytes),
                     revision.contents.map(Uuid::into_bytes),
                     revision.missing_ancestor.map(Uuid::into_bytes),
-                    title,
+                    title.withdrawn,
+                    title.local == LocalOpenerEvidence::Withdrawn,
                 ],
             )
             .map_err(database_error)?;
@@ -733,6 +806,7 @@ impl PreparedTrajectoryWrite<'_, '_> {
                 self.session,
                 self.document.source_revision,
                 &self.content_hash,
+                false,
             ),
             Some(CodexWorkspaceUpdate::Withdrawn(evidence)) => {
                 if !self.source_complete
@@ -741,12 +815,17 @@ impl PreparedTrajectoryWrite<'_, '_> {
                 {
                     return Err(StoreError::TrajectorySourceChanged);
                 }
-                codex_workspace::withdraw(
+                CodexWorkspace {
+                    source_revision: *evidence,
+                    project_path: None,
+                    git_branch: None,
+                }
+                .record(
                     transaction,
                     self.session,
                     self.document.source_revision,
-                    *evidence,
                     &self.content_hash,
+                    true,
                 )
             }
             None => Ok(()),
@@ -1743,6 +1822,7 @@ impl Store {
                 document_version: 0,
                 derived_title: None,
                 title_is_verified: false,
+                local_opener: LocalOpenerEvidence::Unknown,
                 withdrawn_title: None,
             },
         )
@@ -2021,13 +2101,9 @@ impl Store {
             write
                 .guard
                 .check(&transaction, write.session, Some(&write.document))?;
-            let native_codex = write.session.provider == Provider::Codex
-                && write.document.origin == SessionTrajectoryOrigin::Native;
             let revision = write.document.source_revision;
             let observed = matches!(write.guard, TrajectorySourceGuard::Observed(_));
-            let withdrawn_title = write.document.withdrawn_title.filter(|_| {
-                native_codex && observed && revision.file.is_some() && revision.contents.is_some()
-            });
+            let title = write.title_evidence(observed);
             let trajectory_id = upsert_parent
                 .query_row(
                     params![
@@ -2044,25 +2120,28 @@ impl Store {
                         write.document.origin.as_str(),
                         i64::from(write.document.origin == SessionTrajectoryOrigin::ImportedBundle),
                         i64::from(write.document.document_version),
-                        write.document.derived_title,
+                        title.current,
                         revision.file.map(Uuid::into_bytes),
                         revision.missing_ancestor.map(Uuid::into_bytes),
                         observed,
                         revision.contents.map(Uuid::into_bytes),
                         selected_metadata.is_some(),
-                        native_codex
-                            && write.document.derived_title.is_some()
-                            && write.document.title_is_verified,
-                        withdrawn_title,
+                        title.verified,
+                        title.withdrawn,
+                        title.local == LocalOpenerEvidence::Current,
+                        title.local == LocalOpenerEvidence::Withdrawn,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()
                 .map_err(database_error)?;
             if trajectory_id.is_none()
-                && let Some(title) = withdrawn_title
+                && observed
+                && (title.local == LocalOpenerEvidence::Current
+                    || title.verified
+                    || title.withdrawn.is_some())
             {
-                write.withdraw_current_title(&transaction, title)?;
+                write.refresh_current_title(&transaction, &title)?;
             }
             if let Some(trajectory_id) = trajectory_id {
                 // A later write of the same session replaces an earlier one in this batch.
@@ -2488,7 +2567,8 @@ impl Store {
             .and_then(|entry| entry.title))
     }
 
-    /// Returns a provisional local title that a verified rollback in this file could withdraw.
+    /// Returns a provisional title that a rollback in this file could withdraw. A verified ordinary
+    /// rollback can also withdraw a known local opener or an unclassified legacy title.
     ///
     /// # Errors
     ///
@@ -2497,6 +2577,7 @@ impl Store {
         &self,
         session: &SessionRef,
         file: Uuid,
+        include_verified_local: bool,
     ) -> Result<Option<String>> {
         validate_session_ref(session)?;
         if session.provider != Provider::Codex {
@@ -2505,8 +2586,9 @@ impl Store {
         self.connection.borrow().query_row(
             "SELECT derived_title FROM session_trajectories
              WHERE provider = 'codex' AND session_id = ?1 AND source_file_id = ?2
-               AND origin = 'native' AND NOT derived_title_is_verified AND length(derived_title) > 0",
-            params![session.id, file.into_bytes()], |row| row.get(0),
+               AND origin = 'native' AND length(derived_title) > 0
+               AND (NOT derived_title_is_verified OR (?3 AND derived_title_is_local_opener IS NOT 0))",
+            params![session.id, file.into_bytes(), include_verified_local], |row| row.get(0),
         ).optional().map_err(database_error)
     }
 
@@ -3391,8 +3473,8 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
     ensure_trajectory_coverage_columns(transaction)?;
     initialize_legacy_codex_v5_projections(transaction)?;
     ensure_trajectory_source_revision_columns(transaction)?;
-    ensure_trajectory_title_provenance(transaction)?;
     codex_workspace::initialize(transaction)?;
+    ensure_trajectory_title_provenance(transaction)?;
     initialize_trajectory_chunk_schema(transaction)
 }
 
@@ -3436,25 +3518,33 @@ fn initialize_legacy_codex_v5_projections(transaction: &Transaction<'_>) -> Resu
 }
 
 fn ensure_trajectory_title_provenance(transaction: &Transaction<'_>) -> Result<()> {
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_trajectories') WHERE name = 'derived_title_is_verified')",
-        [], |row| row.get(0),
-    ).map_err(database_error)?;
-    if !exists {
-        transaction
-            .create_scalar_function(
-                "omnis_migrated_provider_title",
-                1,
-                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                |context| {
-                    Ok(context
-                        .get_raw(0)
-                        .as_str()
-                        .ok()
-                        .and_then(omnis_core::compact_search_title))
-                },
-            )
-            .map_err(database_error)?;
+    let (verified, local): (bool, bool) = transaction
+        .query_row(
+            "SELECT count(*) FILTER (WHERE name = 'derived_title_is_verified'),
+                count(*) FILTER (WHERE name = 'derived_title_is_local_opener')
+         FROM pragma_table_info('session_trajectories')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(database_error)?;
+    if verified && local {
+        return Ok(());
+    }
+    transaction
+        .create_scalar_function(
+            "omnis_migrated_provider_title",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                Ok(context
+                    .get_raw(0)
+                    .as_str()
+                    .ok()
+                    .and_then(omnis_core::compact_search_title))
+            },
+        )
+        .map_err(database_error)?;
+    if !verified {
         // Older documents could retain a withdrawn first prompt after indexing an incomplete leaf.
         // Keep titles confirmed by the catalog or a full read. Recheck the remaining candidates.
         transaction.execute_batch(
@@ -3479,6 +3569,24 @@ fn ensure_trajectory_title_provenance(transaction: &Transaction<'_>) -> Result<(
                                  AND old.content_hash = session_trajectories.content_hash);"
         ).map_err(database_error)?;
     }
+    if !local {
+        transaction.execute_batch(
+            "ALTER TABLE session_trajectories ADD COLUMN derived_title_is_local_opener INTEGER
+                 CHECK (derived_title_is_local_opener IN (0, 1));
+             UPDATE session_trajectories AS doc SET derived_title_is_local_opener = 0
+             WHERE doc.provider = 'codex' AND doc.origin = 'native' AND doc.derived_title_is_verified
+               AND doc.derived_title IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM session_index AS catalog
+                   WHERE catalog.provider = doc.provider AND catalog.session_id = doc.session_id
+                     AND (catalog.source_file_id IS NULL OR catalog.source_file_id IS doc.source_file_id)
+                     AND (catalog.title = doc.derived_title OR omnis_migrated_provider_title(catalog.title) = doc.derived_title)
+               );"
+        ).map_err(database_error)?;
+        codex_workspace::recheck_legacy_projections(transaction)?;
+    }
+    transaction
+        .remove_function("omnis_migrated_provider_title", 1)
+        .map_err(database_error)?;
     Ok(())
 }
 
@@ -4630,7 +4738,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BranchHeadRestore, IndexedSession, SessionTrajectoryOrigin, Store,
+        BranchHeadRestore, IndexedSession, LocalOpenerEvidence, SessionTrajectoryOrigin, Store,
         TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES,
         TRAJECTORY_PHRASE_MAX_TOKENS, TRAJECTORY_QUERY_MAX_TOKEN_BYTES,
         TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument, state_root, trajectory_clauses,
@@ -5225,6 +5333,7 @@ mod tests {
                 document_version,
                 derived_title,
                 title_is_verified: false,
+                local_opener: LocalOpenerEvidence::Unknown,
                 withdrawn_title: None,
             };
         store
@@ -5321,6 +5430,7 @@ mod tests {
                 document_version: 4,
                 derived_title: title,
                 title_is_verified: false,
+                local_opener: LocalOpenerEvidence::Unknown,
                 withdrawn_title: None,
             };
             store
@@ -5385,8 +5495,108 @@ mod tests {
             document_version: version,
             derived_title: None,
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         }
+    }
+
+    fn save_observed_title(
+        store: &Store,
+        session: &SessionRef,
+        document: TrajectoryDocument<'_>,
+    ) -> Option<String> {
+        let observed = store.trajectory_index_state(session).unwrap();
+        store
+            .upsert_observed_trajectory_documents(&[(
+                session,
+                document,
+                super::TrajectorySourceGuard::Observed(observed),
+            )])
+            .unwrap();
+        store.trajectory_title(session).unwrap()
+    }
+
+    #[test]
+    fn a_sampled_rollback_can_replace_only_a_verified_local_opener() {
+        use super::LocalOpenerEvidence::{Current, Unknown, Withdrawn};
+
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let save = |session, document| save_observed_title(&store, session, document);
+        let ordinary = SessionRef::new(Provider::Codex, "ordinary");
+        let named = SessionRef::new(Provider::Codex, "named");
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(42)),
+            contents: Some(Uuid::from_u128(43)),
+            ..SourceRevision::default()
+        };
+        let title = Some("continue");
+        let initial = TrajectoryDocument {
+            derived_title: title,
+            local_opener: Current,
+            truncation_strategy: "none",
+            ..rollout_document("complete searchable body", Utc::now(), revision, true, 6)
+        };
+        for session in [&ordinary, &named] {
+            assert_eq!(save(session, initial).as_deref(), title);
+        }
+        let provider = TrajectoryDocument {
+            local_opener: Unknown,
+            title_is_verified: true,
+            ..initial
+        };
+        assert_eq!(save(&named, provider).as_deref(), title);
+        // An ordinary full read can see the same opening text after the catalog stops supplying a name.
+        assert_eq!(save(&named, initial).as_deref(), title);
+
+        let preview = TrajectoryDocument {
+            local_opener: Current,
+            derived_title: Some("replacement"),
+            ..rollout_document(
+                "preview only",
+                initial.source_updated_at,
+                revision,
+                false,
+                6,
+            )
+        };
+        assert_eq!(save(&ordinary, preview).as_deref(), Some("replacement"));
+        assert_eq!(save(&named, preview).as_deref(), title);
+        assert!(
+            store
+                .search_session_trajectories("complete", 5)
+                .unwrap()
+                .contains(&ordinary)
+        );
+        let negative = TrajectoryDocument {
+            local_opener: Withdrawn,
+            derived_title: None,
+            withdrawn_title: title,
+            ..preview
+        };
+        assert_eq!(save(&ordinary, negative).as_deref(), Some("replacement"));
+        assert_eq!(save(&named, negative).as_deref(), title);
+        assert!(
+            save(
+                &ordinary,
+                TrajectoryDocument {
+                    withdrawn_title: Some("replacement"),
+                    ..negative
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(save(&ordinary, initial).as_deref(), title);
+        assert!(
+            save(
+                &ordinary,
+                TrajectoryDocument {
+                    derived_title: None,
+                    ..preview
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -5401,17 +5611,7 @@ mod tests {
             ..SourceRevision::default()
         };
         let doc = rollout_document("surviving text", Utc::now(), revision, true, 5);
-        let save = |document| {
-            let observed = store.trajectory_index_state(&session).unwrap();
-            store
-                .upsert_observed_trajectory_documents(&[(
-                    &session,
-                    document,
-                    super::TrajectorySourceGuard::Observed(observed),
-                )])
-                .unwrap();
-            store.trajectory_title(&session).unwrap()
-        };
+        let save = |doc| save_observed_title(&store, &session, doc);
         let title = Some("Local request");
         let initial = TrajectoryDocument {
             derived_title: title,
@@ -5420,14 +5620,14 @@ mod tests {
         assert_eq!(save(initial).as_deref(), title);
         assert_eq!(
             store
-                .withdrawable_trajectory_title(&session, file)
+                .withdrawable_trajectory_title(&session, file, false)
                 .unwrap()
                 .as_deref(),
             title
         );
         assert!(
             store
-                .withdrawable_trajectory_title(&session, Uuid::nil())
+                .withdrawable_trajectory_title(&session, Uuid::nil(), false)
                 .unwrap()
                 .is_none()
         );
@@ -5461,7 +5661,7 @@ mod tests {
         assert_eq!(save(named).as_deref(), title);
         assert!(
             store
-                .withdrawable_trajectory_title(&session, file)
+                .withdrawable_trajectory_title(&session, file, false)
                 .unwrap()
                 .is_none()
         );
@@ -5529,7 +5729,7 @@ mod tests {
         );
         assert!(
             store
-                .withdrawable_trajectory_title(&session, file)
+                .withdrawable_trajectory_title(&session, file, false)
                 .unwrap()
                 .is_none()
         );
@@ -5550,11 +5750,84 @@ mod tests {
             .connection
             .borrow()
             .execute_batch(
-                "ALTER TABLE session_trajectories DROP COLUMN derived_title_is_verified;",
+                "ALTER TABLE session_trajectories DROP COLUMN derived_title_is_local_opener;
+                 ALTER TABLE session_trajectories DROP COLUMN derived_title_is_verified;",
             )
             .unwrap();
         drop(store);
         Store::open(path).unwrap()
+    }
+
+    #[test]
+    fn upgrading_an_ambiguous_v6_title_retains_a_matching_provider_name() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let file = Uuid::from_u128(7);
+        let revision = SourceRevision {
+            file: Some(file),
+            contents: Some(Uuid::from_u128(8)),
+            ..SourceRevision::default()
+        };
+        let ordinary = SessionRef::new(Provider::Codex, "old-ordinary");
+        let named = SessionRef::new(Provider::Codex, "old-named");
+        let old = TrajectoryDocument {
+            derived_title: Some("Old name"),
+            title_is_verified: true,
+            ..rollout_document("sampled reply", Utc::now(), revision, false, 6)
+        };
+        for session in [&ordinary, &named] {
+            save_observed_title(&store, session, old);
+        }
+        store
+            .upsert_indexed_session(&IndexedSession {
+                source_revision: Some(revision),
+                ..indexed_session(Provider::Codex, &named.id, "Old   name")
+            })
+            .unwrap();
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "ALTER TABLE session_trajectories DROP COLUMN derived_title_is_local_opener;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let selected = TrajectoryDocument {
+            derived_title: Some("Surviving opener"),
+            local_opener: LocalOpenerEvidence::Current,
+            ..old
+        };
+        assert!(
+            store
+                .trajectory_index_state(&ordinary)
+                .unwrap()
+                .unwrap()
+                .document_version
+                < 6
+        );
+        assert_eq!(
+            store
+                .withdrawable_trajectory_title(&ordinary, file, true)
+                .unwrap()
+                .as_deref(),
+            old.derived_title
+        );
+        assert!(
+            store
+                .withdrawable_trajectory_title(&named, file, true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            save_observed_title(&store, &ordinary, selected).as_deref(),
+            selected.derived_title
+        );
+        assert_eq!(
+            save_observed_title(&store, &named, selected).as_deref(),
+            old.derived_title
+        );
     }
 
     #[test]
@@ -5745,7 +6018,7 @@ mod tests {
         for protected in [&named, &formatted, &complete] {
             assert!(
                 store
-                    .withdrawable_trajectory_title(protected, file)
+                    .withdrawable_trajectory_title(protected, file, false)
                     .unwrap()
                     .is_none()
             );
@@ -5997,7 +6270,7 @@ mod tests {
             .connection
             .borrow()
             .execute_batch(
-                "CREATE TRIGGER reject_workspace_clear BEFORE DELETE ON codex_indexed_workspaces
+                "CREATE TRIGGER reject_workspace_clear BEFORE UPDATE ON codex_indexed_workspaces
              BEGIN SELECT RAISE(ABORT,'failed workspace write'); END;",
             )
             .unwrap();
@@ -6021,7 +6294,7 @@ mod tests {
         let cleared = store.indexed_session(session).unwrap().unwrap();
         assert_eq!(cleared.project_path, None);
         assert_eq!(cleared.git_branch, None);
-        assert_eq!(refresh(), original);
+        assert_eq!(refresh(), cleared);
     }
 
     #[test]
@@ -6046,6 +6319,168 @@ mod tests {
         assert_eq!(saved.event_count, selected.event_count);
         assert_eq!(saved.project_path, None);
         assert_eq!(saved.git_branch, None);
+    }
+
+    #[test]
+    fn an_unknown_workspace_survives_discovery_until_a_repaired_rollout_is_read() {
+        use super::{CodexWorkspace, CodexWorkspaceUpdate};
+
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("store.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(7)),
+            contents: Some(Uuid::from_u128(8)),
+            ..SourceRevision::default()
+        };
+        let mut header = IndexedSession {
+            source_revision: Some(revision),
+            project_path: Some("creation".into()),
+            git_branch: Some("original".to_owned()),
+            ..indexed_session(Provider::Codex, "damaged", "Session title")
+        };
+        let time = DateTime::from_timestamp_millis(1_000).unwrap();
+        let document = rollout_document("answer", time, revision, true, 6);
+        store
+            .upsert_selected_session_document_with_workspace(
+                &header,
+                &store.observe_selected_session(&header.session).unwrap(),
+                document,
+                Some(&CodexWorkspaceUpdate::Withdrawn(revision)),
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&database).unwrap();
+        store.upsert_indexed_session(&header).unwrap();
+        let saved = store.indexed_session(&header.session).unwrap().unwrap();
+        assert_eq!(saved.source_revision, Some(revision));
+        assert_eq!((saved.project_path, saved.git_branch), (None, None));
+
+        let repaired = SourceRevision {
+            contents: Some(Uuid::from_u128(9)),
+            ..revision
+        };
+        header.source_revision = Some(repaired);
+        let workspace = CodexWorkspace {
+            source_revision: repaired,
+            project_path: Some("latest".into()),
+            git_branch: Some("current".to_owned()),
+        };
+        store
+            .upsert_selected_session_document_with_workspace(
+                &header,
+                &store.observe_selected_session(&header.session).unwrap(),
+                TrajectoryDocument {
+                    source_revision: repaired,
+                    ..document
+                },
+                Some(&CodexWorkspaceUpdate::Verified(workspace.clone())),
+            )
+            .unwrap();
+        store.upsert_indexed_session(&header).unwrap();
+        let saved = store.indexed_session(&header.session).unwrap().unwrap();
+        assert_eq!(
+            (saved.project_path, saved.git_branch),
+            (workspace.project_path, workspace.git_branch)
+        );
+    }
+
+    #[test]
+    fn v6_recheck_preserves_full_read_budgets_and_discards_uncertain_workspaces() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("store.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let time = DateTime::from_timestamp_millis(42).unwrap();
+        let named = Some("Provider name");
+        let cases = [
+            ("sparse", false, "source_incomplete", None, None, 5, false),
+            ("damaged", true, "source_incomplete", None, None, 5, false),
+            ("complete", true, "none", None, None, 6, true),
+            ("opener", true, "none", Some("Local opener"), None, 5, true),
+            ("clipped", true, "document_head_tail", named, named, 6, true),
+        ];
+        for (i, (id, full, strategy, title, name, _, _)) in cases.iter().copied().enumerate() {
+            let revision = SourceRevision {
+                file: Some(Uuid::from_u128(i as u128 + 1)),
+                contents: Some(Uuid::from_u128(100)),
+                ..SourceRevision::default()
+            };
+            let selected = IndexedSession {
+                title: name.map(str::to_owned),
+                source_revision: Some(revision),
+                ..indexed_session(Provider::Codex, id, "")
+            };
+            let mut doc = TrajectoryDocument {
+                truncation_strategy: strategy,
+                derived_title: title,
+                title_is_verified: title.is_some(),
+                ..rollout_document("searchable body", time, revision, full, 6)
+            };
+            if strategy == "document_head_tail" {
+                doc.source_byte_count += 1_000;
+            }
+            let workspace = super::CodexWorkspace {
+                source_revision: revision,
+                project_path: Some("turn-directory".into()),
+                git_branch: None,
+            };
+            store
+                .upsert_selected_session_document_with_workspace(
+                    &selected,
+                    &store.observe_selected_session(&selected.session).unwrap(),
+                    doc,
+                    Some(&super::CodexWorkspaceUpdate::Verified(workspace)),
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "ALTER TABLE session_trajectories DROP COLUMN derived_title_is_local_opener;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&database).unwrap();
+        for (id, full, _, _, _, expected_version, keep_workspace) in cases {
+            let state = store
+                .trajectory_index_state(&SessionRef::new(Provider::Codex, id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (state.document_version, state.source_complete),
+                (expected_version, full),
+                "{id}"
+            );
+            assert!(
+                state.source_revision.file.is_some() && state.source_revision.contents.is_some()
+            );
+            let retained: bool = store.connection.borrow().query_row(
+                "SELECT EXISTS (SELECT 1 FROM codex_indexed_workspaces w JOIN session_trajectories t
+                 ON t.id=w.trajectory_id WHERE t.provider='codex' AND t.session_id=?1)",
+                [id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(retained, keep_workspace, "{id}");
+        }
+        store
+            .connection
+            .borrow()
+            .execute(
+                "UPDATE session_trajectories SET document_version=6 WHERE session_id='sparse'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&database)
+            .unwrap()
+            .trajectory_index_states()
+            .unwrap();
+        assert_eq!(
+            reopened[&SessionRef::new(Provider::Codex, "sparse")].document_version,
+            6
+        );
     }
 
     #[test]
@@ -6246,6 +6681,7 @@ mod tests {
         let original = TrajectoryDocument {
             derived_title: Some("Previous title"),
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
             ..rollout_document("original", older, first, true, 2)
         };
@@ -6309,6 +6745,7 @@ mod tests {
         let original = TrajectoryDocument {
             derived_title: Some("Original title"),
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
             ..rollout_document("retiredmarker", time, first, true, 2)
         };
@@ -6558,6 +6995,7 @@ mod tests {
             document_version: 2,
             derived_title: None,
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
         // Earlier writers stored provider omissions as an incomplete read.
@@ -6602,6 +7040,7 @@ mod tests {
             document_version: 1,
             derived_title: None,
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
         // The last document spans more chunks than one insert statement holds.
@@ -6650,6 +7089,7 @@ mod tests {
             document_version: 7,
             derived_title: Some("Synthetic native title"),
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
         let imported_document = TrajectoryDocument {
@@ -6664,6 +7104,7 @@ mod tests {
             document_version: 8,
             derived_title: Some("Synthetic imported title"),
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
 
@@ -6736,6 +7177,7 @@ mod tests {
             document_version: 1,
             derived_title: None,
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
 
@@ -6779,6 +7221,7 @@ mod tests {
             document_version: 1,
             derived_title: None,
             title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
             withdrawn_title: None,
         };
 
