@@ -228,13 +228,14 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
-        source_updated_submillis
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16)
+        source_updated_submillis, provider_limited
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
         source_updated_submillis = excluded.source_updated_submillis,
         source_complete = excluded.source_complete,
+        provider_limited = excluded.provider_limited,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
         source_byte_count = excluded.source_byte_count,
@@ -257,7 +258,9 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         END
     WHERE excluded.document_version >= session_trajectories.document_version
       AND (
-          excluded.source_complete >= session_trajectories.source_complete
+          (excluded.source_complete, excluded.provider_limited) >=
+              (session_trajectories.source_complete, session_trajectories.provider_limited)
+          OR (excluded.provider_limited AND (?15 OR excluded.source_updated_at >= session_trajectories.source_updated_at))
           OR (excluded.document_version = session_trajectories.document_version
               AND (NOT ?15 OR session_trajectories.source_updated_submillis IS NOT NULL))
       ) AND (
@@ -272,9 +275,11 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
            (excluded.source_updated_at, excluded.source_updated_submillis)
            = (session_trajectories.source_updated_at, coalesce(session_trajectories.source_updated_submillis, 0))
            AND (
-               excluded.source_complete > session_trajectories.source_complete
+               (excluded.source_complete, excluded.provider_limited) >
+                   (session_trajectories.source_complete, session_trajectories.provider_limited)
                OR (
-                   excluded.source_complete = session_trajectories.source_complete
+                   (excluded.source_complete, excluded.provider_limited) =
+                       (session_trajectories.source_complete, session_trajectories.provider_limited)
                    AND (
                        excluded.complete > session_trajectories.complete
                        OR (
@@ -491,6 +496,8 @@ pub struct TrajectoryDocument<'a> {
     /// Whether the document came from a full source read rather than a preview, even when the
     /// provider reported omitted events.
     pub source_complete: bool,
+    /// The adapter sampled the source after reaching its full-read limit.
+    pub provider_limited: bool,
     pub origin: SessionTrajectoryOrigin,
     pub document_version: u32,
     pub derived_title: Option<&'a str>,
@@ -564,6 +571,8 @@ pub struct TrajectoryIndexState {
     /// False for historical rows written before the index recorded file time below a millisecond.
     pub source_time_precise: bool,
     pub source_complete: bool,
+    /// The adapter exhausted its full-read budget and returned its best available preview.
+    pub provider_limited: bool,
     pub document_version: u32,
 }
 
@@ -1615,6 +1624,7 @@ impl Store {
                 indexed_byte_count,
                 truncation_strategy,
                 source_complete,
+                provider_limited: false,
                 origin,
                 document_version: 0,
                 derived_title: None,
@@ -1640,6 +1650,7 @@ impl Store {
             1,
             usize::MAX,
         )
+        .map(|_| ())
     }
 
     /// Stores a bounded set of redacted search documents in one atomic transaction.
@@ -1666,6 +1677,7 @@ impl Store {
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
         )
+        .map(|_| ())
     }
 
     /// Stores a batch with each reader's source observation. A single document may exceed the
@@ -1678,6 +1690,19 @@ impl Store {
         &self,
         documents: &[(&SessionRef, TrajectoryDocument<'_>, TrajectorySourceGuard)],
     ) -> Result<()> {
+        self.upsert_observed_trajectory_documents_counted(documents)
+            .map(|_| ())
+    }
+
+    /// Stores an observed batch and returns the number of distinct search documents rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a document is invalid, the batch exceeds its limits, or a write fails.
+    pub fn upsert_observed_trajectory_documents_counted(
+        &self,
+        documents: &[(&SessionRef, TrajectoryDocument<'_>, TrajectorySourceGuard)],
+    ) -> Result<usize> {
         self.upsert_trajectory_documents_with_limits(
             documents.iter().copied(),
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
@@ -1700,9 +1725,9 @@ impl Store {
         >,
         max_documents: usize,
         max_indexed_bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if documents.len() == 0 {
-            return Ok(());
+            return Ok(0);
         }
         if documents.len() > max_documents {
             return Err(StoreError::TrajectoryBatchTooLarge);
@@ -1712,7 +1737,8 @@ impl Store {
         let mut prepared = Vec::with_capacity(documents.len());
         for (session, document, guard) in documents {
             validate_session_ref(session)?;
-            if document.indexed_byte_count != document.redacted_text.len()
+            if (document.source_complete && document.provider_limited)
+                || document.indexed_byte_count != document.redacted_text.len()
                 || !valid_truncation_strategy(document.truncation_strategy)
                 || !valid_trajectory_coverage(
                     document.source_byte_count,
@@ -1782,6 +1808,7 @@ impl Store {
                         write.document.derived_title,
                         write.guard != TrajectorySourceGuard::NewerSource,
                         source_submillis(write.session.provider, write.document.source_updated_at),
+                        write.document.provider_limited,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1803,7 +1830,8 @@ impl Store {
         }
         drop(upsert_parent);
         replace_trajectory_chunks(&transaction, &rewritten)?;
-        transaction.commit().map_err(database_error)
+        transaction.commit().map_err(database_error)?;
+        Ok(rewritten.len())
     }
 
     /// Returns whether complete indexed content already covers source state.
@@ -1889,19 +1917,20 @@ impl Store {
         let connection = self.connection.borrow();
         let row = connection
             .query_row(
-                "SELECT source_updated_at, source_complete, document_version, source_updated_submillis FROM session_trajectories
+                "SELECT source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited FROM session_trajectories
                  WHERE provider = ?1 AND session_id = ?2",
                 params![session.provider.to_string(), session.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(database_error)?;
         row.map(
-            |(updated_at, source_complete, document_version, remainder)| {
+            |(updated_at, source_complete, document_version, remainder, provider_limited)| {
                 Ok(TrajectoryIndexState {
                     source_updated_at: source_time_from_db(updated_at, remainder)?,
                     source_time_precise: remainder.is_some(),
                     source_complete,
+                    provider_limited,
                     document_version,
                 })
             },
@@ -1920,7 +1949,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_updated_submillis
+                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited
                  FROM session_trajectories",
             )
             .map_err(database_error)?;
@@ -1933,6 +1962,7 @@ impl Store {
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<u32>>(5)?,
+                    row.get::<_, bool>(6)?,
                 ))
             })
             .map_err(database_error)?;
@@ -1945,6 +1975,7 @@ impl Store {
                 source_complete,
                 document_version,
                 remainder,
+                provider_limited,
             ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
@@ -1955,6 +1986,7 @@ impl Store {
                     source_updated_at: source_time_from_db(source_updated_at, remainder)?,
                     source_time_precise: remainder.is_some(),
                     source_complete,
+                    provider_limited,
                     document_version: u32::try_from(document_version)
                         .map_err(|_| StoreError::CorruptStore)?,
                 },
@@ -2937,6 +2969,9 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  CHECK (protected_by_bundle IN (0, 1));",
             )
             .map_err(database_error)?;
+    }
+    if !has_column("provider_limited") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN provider_limited INTEGER NOT NULL DEFAULT 0 CHECK (provider_limited IN (0, 1))").map_err(database_error)?;
     }
     ensure_trajectory_version_columns(transaction, &columns)?;
     if missing_coverage {
@@ -4365,6 +4400,7 @@ mod tests {
                 indexed_byte_count: text.len(),
                 truncation_strategy: "none",
                 source_complete: true,
+                provider_limited: false,
                 origin: SessionTrajectoryOrigin::Native,
                 document_version,
                 derived_title,
@@ -4452,6 +4488,50 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_limit_can_replace_an_older_full_session_during_upgrade() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Hermes, "growing-session");
+        let initial = Utc::now();
+        let write = |text: &str, seconds, version, full, limited| {
+            store
+                .upsert_trajectory_document(
+                    &session,
+                    &TrajectoryDocument {
+                        redacted_text: text,
+                        source_updated_at: initial + chrono::Duration::seconds(seconds),
+                        source_byte_count: text.len(),
+                        indexed_byte_count: text.len(),
+                        truncation_strategy: "none",
+                        source_complete: full,
+                        provider_limited: limited,
+                        origin: SessionTrajectoryOrigin::Native,
+                        document_version: version,
+                        derived_title: None,
+                    },
+                )
+                .unwrap();
+        };
+        write("oldmiddle", 0, 4, true, false);
+        write("newpreview", 1, 6, false, false);
+        write("retiredtail", -1, 6, false, true);
+        assert_eq!(
+            store.search_session_trajectories("oldmiddle", 1).unwrap(),
+            std::slice::from_ref(&session)
+        );
+        write("currenttail", 1, 6, false, true);
+        write("sameeventpreview", 1, 6, false, false);
+        assert_eq!(
+            store.search_session_trajectories("currenttail", 1).unwrap(),
+            std::slice::from_ref(&session)
+        );
+        let state = store.trajectory_index_state(&session).unwrap().unwrap();
+        assert_eq!(state.document_version, 6);
+        assert!(state.provider_limited);
+        assert!(!state.source_complete);
+    }
+
+    #[test]
     fn observed_reads_keep_known_titles_until_the_full_source_can_clear_them() {
         let temporary = tempdir().unwrap();
         let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
@@ -4475,6 +4555,7 @@ mod tests {
                 source_byte_count: text.len() + usize::from(strategy == "document_head_tail"),
                 indexed_byte_count: text.len(),
                 source_complete: full_read,
+                provider_limited: false,
                 truncation_strategy: strategy,
                 origin: SessionTrajectoryOrigin::Native,
                 document_version: 4,
@@ -4537,6 +4618,7 @@ mod tests {
             indexed_byte_count: text.len(),
             truncation_strategy: "source_incomplete_event_head_tail",
             source_complete,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::Native,
             document_version: 2,
             derived_title: None,
@@ -4578,6 +4660,7 @@ mod tests {
             indexed_byte_count: str::len(text),
             truncation_strategy: "none",
             source_complete: true,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
@@ -4623,6 +4706,7 @@ mod tests {
             indexed_byte_count: native_text.len(),
             truncation_strategy: "document_head_tail",
             source_complete: true,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::Native,
             document_version: 7,
             derived_title: Some("Synthetic native title"),
@@ -4634,6 +4718,7 @@ mod tests {
             indexed_byte_count: imported_text.len(),
             truncation_strategy: "none",
             source_complete: true,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::ImportedBundle,
             document_version: 8,
             derived_title: Some("Synthetic imported title"),
@@ -4703,6 +4788,7 @@ mod tests {
             indexed_byte_count: text.len(),
             truncation_strategy: "none",
             source_complete: true,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
@@ -4743,6 +4829,7 @@ mod tests {
             indexed_byte_count: text.len(),
             truncation_strategy: "none",
             source_complete: true,
+            provider_limited: false,
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,

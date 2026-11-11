@@ -161,7 +161,7 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
-/// Stores a versioned search document and returns its indexed title.
+/// Stores a versioned search document and returns whether the store rewrote it.
 ///
 /// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
 /// reported by the adapter stay visible through the document's truncation strategy, so a full
@@ -173,7 +173,7 @@ fn store_search_document(
     full_read: bool,
     source_updated_at: chrono::DateTime<Utc>,
     guard: TrajectorySourceGuard,
-) -> omnis_store::Result<Option<String>> {
+) -> omnis_store::Result<bool> {
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
@@ -181,7 +181,7 @@ fn store_search_document(
     };
     let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_observed_trajectory_documents(&[(
+    let rewritten = store.upsert_observed_trajectory_documents_counted(&[(
         session,
         omnis_store::TrajectoryDocument {
             redacted_text: &document.text,
@@ -190,13 +190,14 @@ fn store_search_document(
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
             source_complete: full_read,
+            provider_limited: false,
             origin,
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
         },
         guard,
     )])?;
-    store.trajectory_title(session)
+    Ok(rewritten != 0)
 }
 
 fn build_search_index(
@@ -461,32 +462,23 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             None,
         )
     };
-    if args.cached {
-        if !args.no_index
-            && let Err(error) = refresh_cached_imported_sources(&store, &sessions)
-        {
-            warnings.push(format!("local imported source migration: {error}"));
-        }
+    sessions.sort_by_key(|session| Reverse(session.updated_at));
+    let mut seen = HashSet::new();
+    sessions.retain(|session| seen.insert(session.session.clone()));
+    let (index, stale_known) = if args.cached {
         warnings.push(
             "Cached results only. Provider stores were not checked. Run `omni index` to refresh."
                 .to_owned(),
         );
-    }
-    sessions.sort_by_key(|session| Reverse(session.updated_at));
-    let mut seen = HashSet::new();
-    sessions.retain(|session| seen.insert(session.session.clone()));
-    let index = if args.cached {
-        search_index::IndexSummary {
-            candidates: sessions.len(),
-            ..search_index::IndexSummary::default()
-        }
+        cached_search_index(&store, &sessions, args, &mut warnings)
     } else {
         let candidates = search_index::ordered_candidates(&sessions, Some(&project));
-        if args.no_index {
+        let index = if args.no_index {
             search_index::pending_summary(&store, candidates)?
         } else {
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
-        }
+        };
+        (index, true)
     };
     let titles = store
         .trajectory_titles()
@@ -496,7 +488,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         let mut value = search_json(
             &query,
             &index,
-            args.no_index || args.cached,
+            args.no_index || (args.cached && index.stale == 0),
             &hits,
             has_more,
             args.show_text,
@@ -504,6 +496,8 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         );
         if args.cached {
             value["cached"] = json!(true);
+        }
+        if !stale_known {
             value["index"]["stale"] = Value::Null;
         }
         return write_search_output(&format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -522,7 +516,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         eprintln!(
             "note: indexing interrupted; results cover sessions indexed so far. Search again to finish indexing."
         );
-    } else if args.no_index && index.stale > 0 {
+    } else if args.no_index && !args.cached && index.stale > 0 {
         eprintln!(
             "note: {} sessions are new or changed since indexing; their conversation text was not searched.",
             index.stale
@@ -2458,7 +2452,7 @@ fn imported_session_ref(bundle_id: Uuid) -> SessionRef {
 
 fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     index_bundle_metadata(store, bundle)?;
-    index_bundle_document(store, bundle)
+    index_bundle_document(store, bundle).map(|_| ())
 }
 
 fn index_bundle_metadata(store: &Store, bundle: &PortableBundle) -> Result<()> {
@@ -2482,7 +2476,7 @@ fn index_bundle_metadata(store: &Store, bundle: &PortableBundle) -> Result<()> {
         .context("indexing imported bundle metadata")
 }
 
-fn index_bundle_document(store: &Store, bundle: &PortableBundle) -> Result<()> {
+fn index_bundle_document(store: &Store, bundle: &PortableBundle) -> Result<bool> {
     store_search_document(
         store,
         &imported_session_ref(bundle.manifest.bundle_id),
@@ -2491,8 +2485,7 @@ fn index_bundle_document(store: &Store, bundle: &PortableBundle) -> Result<()> {
         bundle.snapshot.captured_at,
         TrajectorySourceGuard::NewerSource,
     )
-    .context("indexing imported bundle trajectory")?;
-    Ok(())
+    .context("indexing imported bundle trajectory")
 }
 
 fn backfill_missing_imported_sources() -> Result<()> {
@@ -2500,10 +2493,47 @@ fn backfill_missing_imported_sources() -> Result<()> {
     let missing = store
         .bundle_ids_needing_imported_source(None)
         .context("finding missing imported sources")?;
-    index_stored_bundles(&store, missing, index_bundle_metadata)
+    for bundle_id in missing {
+        let Ok(bundle) = load_imported_bundle(&store, bundle_id) else {
+            eprintln!("warning: ignored malformed stored bundle `{bundle_id}`");
+            continue;
+        };
+        index_bundle_metadata(&store, &bundle)
+            .with_context(|| format!("migrating imported bundle `{bundle_id}`"))?;
+    }
+    Ok(())
 }
 
-fn refresh_cached_imported_sources(store: &Store, sessions: &[NativeSession]) -> Result<()> {
+fn cached_search_index(
+    store: &Store,
+    sessions: &[NativeSession],
+    args: &SearchArgs,
+    warnings: &mut Vec<String>,
+) -> (search_index::IndexSummary, bool) {
+    let mut summary = search_index::IndexSummary {
+        candidates: sessions.len(),
+        ..search_index::IndexSummary::default()
+    };
+    let imported_only = args.provider == Some(Provider::Imported);
+    if !imported_only && args.no_index {
+        return (summary, false);
+    }
+    match refresh_cached_imported_sources(store, sessions, args.no_index, &mut summary, warnings) {
+        Ok(()) => (summary, imported_only),
+        Err(error) => {
+            warnings.push(format!("local imported source migration: {error}"));
+            (summary, false)
+        }
+    }
+}
+
+fn refresh_cached_imported_sources(
+    store: &Store,
+    sessions: &[NativeSession],
+    no_index: bool,
+    summary: &mut search_index::IndexSummary,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     let eligible: HashSet<_> = sessions
         .iter()
         .filter(|session| session.session.provider == Provider::Imported)
@@ -2515,25 +2545,23 @@ fn refresh_cached_imported_sources(store: &Store, sessions: &[NativeSession]) ->
     let outdated = store
         .bundle_ids_needing_imported_source(Some(omnis_core::SEARCH_DOCUMENT_VERSION))
         .context("finding outdated imported documents")?;
-    index_stored_bundles(
-        store,
-        outdated.into_iter().filter(|id| eligible.contains(id)),
-        index_bundle_document,
-    )
-}
-
-fn index_stored_bundles(
-    store: &Store,
-    ids: impl IntoIterator<Item = Uuid>,
-    index: fn(&Store, &PortableBundle) -> Result<()>,
-) -> Result<()> {
-    for bundle_id in ids {
+    for bundle_id in outdated.into_iter().filter(|id| eligible.contains(id)) {
+        summary.stale += 1;
+        if no_index {
+            continue;
+        }
         let Ok(bundle) = load_imported_bundle(store, bundle_id) else {
-            eprintln!("warning: ignored malformed stored bundle `{bundle_id}`");
+            summary.failed += 1;
+            warnings.push(format!("ignored malformed stored bundle `{bundle_id}`"));
             continue;
         };
-        index(store, &bundle)
-            .with_context(|| format!("migrating imported bundle `{bundle_id}`"))?;
+        match index_bundle_document(store, &bundle) {
+            Ok(rewritten) => summary.indexed += usize::from(rewritten),
+            Err(error) => {
+                summary.failed += 1;
+                warnings.push(format!("migrating imported bundle `{bundle_id}`: {error}"));
+            }
+        }
     }
     Ok(())
 }

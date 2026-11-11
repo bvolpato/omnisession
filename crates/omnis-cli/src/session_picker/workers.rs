@@ -438,6 +438,7 @@ fn read_picker_preview(
         IndexRead {
             snapshot,
             source_complete: full_read,
+            provider_limited: false,
         },
         source_time,
     ))
@@ -493,6 +494,7 @@ pub(super) fn spawn_preview_updates(
                         let IndexRead {
                             snapshot,
                             source_complete: complete,
+                            ..
                         } = read;
                         if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
                             match crate::store_search_document(
@@ -502,7 +504,9 @@ pub(super) fn spawn_preview_updates(
                                 complete,
                                 source_time,
                                 guard,
-                            ) {
+                            )
+                            .and_then(|_| store.trajectory_title(&key.session))
+                            {
                                 Ok(title) => indexed_title = PreviewIndexTitle::Written(title),
                                 Err(error) => {
                                     let _ = sender.send(PickerUpdate::Warning(format!(

@@ -148,6 +148,7 @@ pub(crate) fn needs_index(
         })
         // Shared database size cannot show whether a per-session preview still needs its budget.
         || (!state.source_complete
+            && !state.provider_limited
             && candidate.session.provider != Provider::Hermes
             && !candidate.oversized())
 }
@@ -226,7 +227,7 @@ pub(crate) fn ordered_candidates(
 fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 {
     // A format or timestamp migration retains the full text a previous indexer read.
     if prior.is_some_and(|state| {
-        state.source_complete
+        (state.source_complete || state.provider_limited)
             && (state.document_version < SEARCH_DOCUMENT_VERSION
                 || (TrajectorySourceGuard::uses_file_time(provider) && !state.source_time_precise))
     }) {
@@ -316,6 +317,7 @@ pub(crate) fn index_candidates(
     });
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
+    let mut processed = 0;
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
@@ -370,6 +372,7 @@ pub(crate) fn index_candidates(
                     }
                 }
             }
+            processed += 1;
             if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                 || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
                 || last_report.elapsed() >= PROGRESS_INTERVAL
@@ -378,14 +381,14 @@ pub(crate) fn index_candidates(
                 batch_bytes = 0;
             }
             if last_report.elapsed() >= PROGRESS_INTERVAL {
-                report(progress(&summary, &mut titles));
+                report(progress(&summary, processed, &mut titles));
                 last_report = Instant::now();
             }
             true
         },
     );
     flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
-    report(progress(&summary, &mut titles));
+    report(progress(&summary, processed, &mut titles));
     Ok(summary)
 }
 
@@ -533,9 +536,8 @@ fn flush_batch(
             )
         })
         .collect::<Vec<_>>();
-    let stored = store.upsert_observed_trajectory_documents(&documents);
-    if stored.is_ok() {
-        summary.indexed += batch.len();
+    if let Ok(indexed) = store.upsert_observed_trajectory_documents_counted(&documents) {
+        summary.indexed += indexed;
         for prepared in batch.drain(..) {
             prepared.report_title(store, titles);
         }
@@ -565,8 +567,8 @@ fn flush_batch(
                     stored = prepared.store(store);
                 }
             }
-            if stored.is_ok() {
-                summary.indexed += 1;
+            if let Ok(indexed) = stored {
+                summary.indexed += indexed;
                 prepared.report_title(store, titles);
             } else {
                 summary.failed += 1;
@@ -577,10 +579,11 @@ fn flush_batch(
 
 fn progress(
     summary: &IndexSummary,
+    processed: usize,
     titles: &mut Vec<(SessionRef, Option<String>)>,
 ) -> IndexProgress {
     IndexProgress {
-        indexed: summary.indexed + summary.failed,
+        indexed: processed,
         total: summary.stale,
         failed: summary.failed,
         titles: std::mem::take(titles),
@@ -593,6 +596,7 @@ struct PreparedIndex {
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
     source_complete: bool,
+    provider_limited: bool,
     origin: SessionTrajectoryOrigin,
     title: Option<String>,
 }
@@ -605,8 +609,8 @@ impl PreparedIndex {
         }
     }
 
-    fn store(&self, store: &Store) -> omnis_store::Result<()> {
-        store.upsert_observed_trajectory_documents(&[(
+    fn store(&self, store: &Store) -> omnis_store::Result<usize> {
+        store.upsert_observed_trajectory_documents_counted(&[(
             &self.candidate.session,
             self.store_document(),
             self.guard,
@@ -621,6 +625,7 @@ impl PreparedIndex {
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,
+            provider_limited: self.provider_limited,
             origin: self.origin,
             document_version: SEARCH_DOCUMENT_VERSION,
             derived_title: self.title.as_deref(),
@@ -642,6 +647,7 @@ fn prepare_session(
             IndexRead {
                 snapshot,
                 source_complete: true,
+                provider_limited: false,
             },
             Some(updated_at),
         )
@@ -665,6 +671,7 @@ fn prepare_session(
     let IndexRead {
         snapshot,
         source_complete,
+        provider_limited,
     } = read;
     let document = trajectory_search_document(&snapshot);
     let source_updated_at = source_updated_at
@@ -680,6 +687,7 @@ fn prepare_session(
         document,
         source_updated_at,
         source_complete,
+        provider_limited,
         origin,
         title: session_search_title(&snapshot),
     })
@@ -824,6 +832,7 @@ mod tests {
             source_updated_at: now,
             source_time_precise: true,
             source_complete: true,
+            provider_limited: false,
             document_version: SEARCH_DOCUMENT_VERSION,
         };
         let small = candidate(Some(now), None);
@@ -881,6 +890,7 @@ mod tests {
             source_updated_at: now,
             source_time_precise: true,
             source_complete: false,
+            provider_limited: false,
             document_version: SEARCH_DOCUMENT_VERSION,
         };
 
@@ -1069,6 +1079,7 @@ mod tests {
                     indexed_byte_count: 21,
                     truncation_strategy: "none",
                     source_complete: false,
+                    provider_limited: false,
                     origin: SessionTrajectoryOrigin::Native,
                     document_version: 2,
                     derived_title: None,
@@ -1259,7 +1270,7 @@ mod tests {
             &mut recovered,
             &mut titles,
         );
-        assert_eq!(recovered.indexed, 1);
+        assert_eq!(recovered.indexed, 0);
         assert_eq!(
             titles,
             [(restored[0].session.clone(), Some("backupneedle".to_owned()))]
@@ -1326,6 +1337,7 @@ mod tests {
                 },
                 source_updated_at: now,
                 source_complete: true,
+                provider_limited: false,
                 origin: SessionTrajectoryOrigin::Native,
                 title: Some(id.to_owned()),
             }

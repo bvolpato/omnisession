@@ -126,11 +126,27 @@ fn upgraded_search_documents_refresh_on_direct_reads_and_for_imported_bundles() 
     fixture.run_json(&["show", &format!("codex:{CODEX_ID}")]);
     let scoped = fixture.search_json(&["oldprojectiononly", "--no-index", "--provider", "codex"]);
     assert_eq!(scoped["index"]["indexed"], 0);
-    let existing =
-        fixture.search_json(&["oldprojectiononly", "--no-index", "--provider", "imported"]);
+    let existing = fixture.search_json(&[
+        "oldprojectiononly",
+        "--cached",
+        "--no-index",
+        "--provider",
+        "imported",
+    ]);
     assert_eq!(result_sessions(&existing), [imported.as_str()]);
+    assert_eq!(existing["index"]["stale"], 1);
+    assert_eq!(existing["index"]["indexed"], 0);
+    assert_eq!(existing["index"]["skipped"], true);
+    let refreshed = fixture.search_json(&["zebracorn", "--cached", "--provider", "imported"]);
+    assert_eq!(result_sessions(&refreshed), [imported.as_str()]);
+    assert_eq!(refreshed["index"]["stale"], 1);
+    assert_eq!(refreshed["index"]["indexed"], 1);
+    assert_eq!(refreshed["index"]["skipped"], false);
+    let current = fixture.search_json(&["zebracorn", "--cached", "--provider", "imported"]);
+    assert_eq!(current["index"]["stale"], 0);
+    assert_eq!(current["index"]["indexed"], 0);
+    assert_eq!(current["index"]["skipped"], true);
     let cached = |query| result_sessions(&fixture.search_json(&[query, "--cached"]));
-    assert_eq!(cached("zebracorn"), [imported.as_str()]);
     assert_eq!(cached("oldprojectiononly"), [source.as_str()]);
     let other = fixture.search_json(&[
         "oldprojectiononly",
@@ -170,6 +186,7 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
                 source_updated_at: file_time.into(),
                 truncation_strategy: "none",
                 source_complete: false,
+                provider_limited: false,
                 origin: omnis_store::SessionTrajectoryOrigin::Native,
                 document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
                 derived_title: None,
