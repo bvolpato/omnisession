@@ -2070,7 +2070,7 @@ fn inspect_import_stats(
         Provider::Codex => resolved_provider_binary(target)
             .and_then(|binary| codex_import::ensure_supported(&binary))
             .and_then(|_| codex_import::build(snapshot))
-            .and_then(|import| import.for_launch_profile(agent.profile))
+            .and_then(|import| import.for_launch_profile(agent))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, project))

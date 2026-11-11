@@ -9,8 +9,25 @@ pub(super) mod assistant;
 mod positional;
 
 pub(super) fn prepare_record(record: &mut Value) -> bool {
-    if record["type"] != "event_msg" {
-        return true;
+    match record["type"].as_str() {
+        Some("response_item") => {
+            return checkpoint_wire::prepare_response_output(&mut record["payload"]);
+        }
+        Some("compacted") => {
+            for field in ["replacement_history", "guardian_history"] {
+                if let Some(items) = record["payload"]
+                    .get_mut(field)
+                    .and_then(Value::as_array_mut)
+                {
+                    for item in items {
+                        checkpoint_wire::prepare_response_output(item);
+                    }
+                }
+            }
+            return true;
+        }
+        Some("event_msg") => {}
+        _ => return true,
     }
     if !positional::prepare_container(record) {
         return false;
@@ -21,7 +38,7 @@ pub(super) fn prepare_record(record: &mut Value) -> bool {
     let payload = &mut record["payload"];
     let item = &payload["item"];
     match item["type"].as_str() {
-        Some("UserMessage" | "AgentMessage" | "Plan")
+        Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput")
             if !valid_envelope(payload) || !item["id"].is_string() =>
         {
             false
@@ -29,6 +46,14 @@ pub(super) fn prepare_record(record: &mut Value) -> bool {
         Some("UserMessage") => prepare_user_message(&mut payload["item"]),
         Some("AgentMessage") => assistant::valid(item),
         Some("Plan") => item["text"].is_string(),
+        Some("FunctionCallOutput") => {
+            item["name"].is_string()
+                && checkpoint_wire::optional(&item["namespace"], Value::is_string)
+                && payload["item"].get_mut("output").is_some_and(|output| {
+                    checkpoint_wire::normalize_output(output);
+                    checkpoint_wire::output(output)
+                })
+        }
         _ => true,
     }
 }

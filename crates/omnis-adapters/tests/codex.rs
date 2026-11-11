@@ -41,6 +41,44 @@ mod turn_ownership;
 
 const SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
+#[test]
+fn a_duplicate_with_the_wrong_header_cannot_supply_the_recorded_provider() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let active = temporary.path().join("sessions");
+    let archive = temporary.path().join("archived_sessions");
+    fs::create_dir(&active)?;
+    fs::create_dir(&archive)?;
+    let name = format!("rollout-{SESSION_ID}.jsonl");
+    let write_header = |directory: &Path, id: &str, provider: &str| {
+        let record = json!({"type":"session_meta","payload":{"id":id,"model_provider":provider}});
+        fs::write(directory.join(&name), record.to_string())
+    };
+    write_header(&active, "55555555-5555-4555-8555-555555555555", "other")?;
+    write_header(&archive, SESSION_ID, "saved")?;
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let source = adapter.find_native_session(SESSION_ID)?.unwrap();
+    assert_eq!(
+        source.source_path,
+        Some(omnis_core::canonicalize_path(archive.join(&name))?)
+    );
+    assert_eq!(
+        adapter.recorded_model_provider(SESSION_ID)?.as_deref(),
+        Some("saved")
+    );
+    assert!(
+        adapter
+            .index_session(&source.session, Some(&active.join(&name)), u64::MAX)
+            .is_err()
+    );
+    assert!(
+        !adapter
+            .index_session(&source.session, None, 1)?
+            .source_complete
+    );
+    assert_eq!(adapter.list_sessions(None)?, [source]);
+    Ok(())
+}
+
 fn read_records(records: Vec<Value>) -> anyhow::Result<CanonicalSnapshot> {
     read_records_with_preview(records, false)
 }

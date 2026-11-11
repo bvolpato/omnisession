@@ -92,11 +92,10 @@ pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
 }
 
 impl CodexImport {
-    pub(crate) fn for_launch_profile(
-        mut self,
-        profile: Option<&crate::launch_profile::LaunchProfile>,
-    ) -> Result<Self> {
-        if let Some(profile) = profile.filter(|p| !p.overrides_program()) {
+    pub(crate) fn for_launch_profile(mut self, target: AgentTarget) -> Result<Self> {
+        if let Some(profile) = target.profile
+            && target.uses_provider_program()?
+        {
             let args = profile.expanded_args(&crate::launch_profile::environment)?;
             self.profile = ImportProfile::resolve(&args, &codex_home()?)?;
         }
@@ -108,8 +107,7 @@ impl CodexImport {
 ///
 /// Codex resumes a session only with the model provider that created it. The result is empty for
 /// other agents, for sessions that plain `codex` can open, and when nothing can be determined.
-/// A profile with its own program never matches, because that program decides what its arguments
-/// mean.
+/// Only the installed Codex executable gives the profile arguments their native meaning.
 pub(crate) fn profiles_for_recorded_provider(
     source: &SessionRef,
     targets: &[AgentTarget],
@@ -127,17 +125,17 @@ pub(crate) fn profiles_for_recorded_provider(
         return Vec::new();
     }
     let supplies = |profile: &LaunchProfile| {
-        !profile.overrides_program()
-            && profile
-                .expanded_args(&crate::launch_profile::environment)
-                .and_then(|args| ImportProfile::resolve(&args, &home))
-                .is_ok_and(|import| import.provider() == Some(provider.as_str()))
+        profile
+            .expanded_args(&crate::launch_profile::environment)
+            .and_then(|args| ImportProfile::resolve(&args, &home))
+            .is_ok_and(|import| import.provider() == Some(provider.as_str()))
     };
     targets
         .iter()
         .copied()
         .filter(|target| {
             target.provider == Provider::Codex
+                && target.uses_provider_program().unwrap_or(false)
                 && target.profile.is_some_and(supplies)
                 && target.check().is_ok()
         })

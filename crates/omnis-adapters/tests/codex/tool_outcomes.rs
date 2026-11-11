@@ -771,3 +771,72 @@ fn checkpoint_retains_only_a_published_client_authored_standalone_receipt() {
         }
     }
 }
+
+#[test]
+fn a_malformed_function_result_cannot_replace_the_previous_output_or_block_its_repair() {
+    let displayed = |ordinal: u64, output: Value| {
+        let mut record = turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"result","name":"lookup","output":output}),
+        );
+        record["timestamp"] = "2026-01-05T09:00:00.000Z".into();
+        record["ordinal"] = ordinal.into();
+        record
+    };
+    for bad in [
+        json!({"type":"input_text"}),
+        json!({"type":"input_image","file_id":"file","detail":"medium"}),
+        json!({"type":"input_audio","file_id":"file"}),
+        json!({"type":"encrypted_content","encrypted_content":[1]}),
+    ] {
+        let mut rows = vec![
+            displayed(1, "first result".into()),
+            displayed(
+                2,
+                json!([{"type":"input_text","text":"unpublished fragment"},bad]),
+            ),
+        ];
+        for expected in [json!("first result"), json!(["repaired result"])] {
+            let snap = read_with_history_mode(rows.clone(), false, Some("paginated")).unwrap();
+            let outputs = snap
+                .events
+                .iter()
+                .filter(|e| e.payload["id"] == "result")
+                .map(|e| &e.payload["output"])
+                .collect::<Vec<_>>();
+            assert_eq!(outputs, [&expected]);
+            assert!(
+                snap.events
+                    .iter()
+                    .any(|e| e.payload["native_history_unverified"] == true)
+            );
+            assert!(
+                !serde_json::to_string(&snap)
+                    .unwrap()
+                    .contains("unpublished fragment")
+            );
+            rows.push(displayed(2, json!([["input_text", "repaired result"]])));
+        }
+    }
+}
+
+#[test]
+fn raw_function_results_retain_visible_text_and_omit_private_media() {
+    let mut raw = model_result("unused");
+    raw["payload"]["output"] = json!([
+        [0,"visible text"],
+        {"type":"input_image","file_id":"hidden-image"},
+        [2,"hidden-audio"],
+        [3,"hidden-ciphertext"]
+    ]);
+    for mode in [None, Some("paginated")] {
+        let snap = read_with_history_mode(vec![raw.clone()], false, mode).unwrap();
+        let public = serde_json::to_string(&snap).unwrap();
+        assert!(public.contains("visible text"));
+        assert!(
+            !["hidden-image", "hidden-audio", "hidden-ciphertext"]
+                .iter()
+                .any(|text| public.contains(text))
+        );
+    }
+}

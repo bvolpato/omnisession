@@ -1266,7 +1266,7 @@ fn prepare_codex_import(context: &ResumeContext<'_>) -> Result<()> {
     };
     match codex_import::ensure_supported(&binary)
         .and_then(|_| codex_import::build(context))
-        .and_then(|import| import.for_launch_profile(context.profile))
+        .and_then(|import| import.for_launch_profile(context.agent_target()))
     {
         Ok(import) => resume_via_codex_import(context, &import, &binary),
         Err(error) => native_import_fallback(context, "Codex", &error),
