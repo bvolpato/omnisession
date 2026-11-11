@@ -951,51 +951,411 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
     }
 }
 
-// `opencode session delete` exits 1 for a session that does not exist, so rolling back an import
-// that created nothing used to abort with "rollback also failed" instead of falling back.
 #[cfg(unix)]
-#[test]
-fn opencode_import_that_creates_nothing_falls_back_without_a_rollback_failure() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = Fixture::new();
-    let opencode = fixture.root.join("opencode");
-    fs::write(
-        &opencode,
-        r#"#!/bin/sh
-echo "$*" >> "$FAKE_OPENCODE_LOG"
-case "$*" in
-    "--pure models") echo "synthetic/model" ;;
-    "--pure import "*) exit 1 ;;
-    "--pure export "*) echo "Session not found" >&2; exit 1 ;;
-    "--pure session delete "*) echo "Session not found" >&2; exit 1 ;;
+const SYNTHETIC_OPENCODE: &str = r#"#!/bin/sh
+for arg do [ "$arg" = --standalone ] || last=$arg; done
+echo " $*" >> "$FAKE_CODEX_CAPTURE/opencode.log"
+case "$FAKE_OPENCODE_OUTCOME:$*" in
+    pipe-switch:*" export "*|pipe-cancel:*" delete "*)
+        touch "$FAKE_CODEX_CAPTURE/close-pipe"
+        for i in $(seq 1 120); do
+            [ ! -f "$FAKE_CODEX_CAPTURE/pipe-closed" ] || break
+            sleep 0.1
+        done ;;
 esac
-"#,
-    )
-    .expect("write synthetic OpenCode");
-    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
-    let log = fixture.capture.join("opencode.log");
+case "$*" in
+    --version)
+        [ ! -f "$FAKE_CODEX_CAPTURE/models-picked" ] || exit 1
+        echo "$FAKE_OPENCODE_VERSION" ;;
+    "--pure models"|"models --standalone")
+        case "$FAKE_OPENCODE_OUTCOME" in pipe-*) touch "$FAKE_CODEX_CAPTURE/models-picked" ;; esac
+        echo "synthetic/model" ;;
+    *" import "*)
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delayed-first)
+                sed 's/"id"[[:space:]]*:[[:space:]]*"ses_[^"]*"/"id":"ses_unrelated"/g' "$last" > "$FAKE_CODEX_CAPTURE/stale.json"
+                (for i in $(seq 1 80); do
+                    if [ -f "$FAKE_CODEX_CAPTURE/returned-stale" ]; then
+                        /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json"
+                        exit
+                    fi
+                    sleep 0.25
+                 done) </dev/null >/dev/null 2>&1 &
+                exit 0 ;;
+            queued-move|queued-copy|claimed-missing)
+                case "$FAKE_OPENCODE_OUTCOME" in
+                    queued-move) /bin/mv "$last" "$FAKE_CODEX_CAPTURE/pending.json" ;;
+                    queued-copy) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json" && /bin/rm "$last" ;;
+                    *) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+                esac
+                if [ "$1" = --pure ]; then printf '\033[91m\033[1mError: \033[0mFile not found: %s\n' "$last" >&2
+                elif [ "$FAKE_OPENCODE_VERSION" = 2.0.0 ]; then
+                    printf "[12:34:56.789] ERROR (#1): Error: Failed to read session data: ENOENT: no such file or directory, open '%s'\n" "$last"
+                else printf "Error: Failed to read session data: ENOENT: no such file or directory, open '%s'\n" "$last" >&2; fi
+                exit 1 ;;
+        esac
+        /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json"
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delete-retry-*|pipe-cancel) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json"; exit 0 ;;
+            delete-*|pipe-switch) exit 0 ;;
+            success-aux)
+                (for i in $(seq 1 80); do
+                    [ ! -f "$FAKE_CODEX_CAPTURE/exported" ] || exit 0
+                    sleep 0.25
+                 done
+                 touch "$FAKE_CODEX_CAPTURE/blocked") &
+                exit 0 ;;
+            retry)
+                /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json"
+                (for i in $(seq 1 80); do
+                    [ ! -f "$FAKE_CODEX_CAPTURE/release" ] || break
+                    sleep 0.25
+                 done
+                 /bin/mv "$FAKE_CODEX_CAPTURE/pending.json" "$FAKE_CODEX_CAPTURE/stranded.json"
+                 touch "$FAKE_CODEX_CAPTURE/retried") </dev/null >/dev/null 2>&1 &
+                exit 124 ;;
+            signal) kill -TERM "$$" ;;
+            *) exit 1 ;;
+        esac ;;
+    "session delete "*|*" session delete "*)
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delete-retry-*|pipe-cancel) /bin/rm "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+            delete-lied) exit 0 ;;
+            *) exit 1 ;;
+        esac ;;
+    *" db "*|*" GET /api/session/"*)
+        id=${last##*/}
+        case "$FAKE_OPENCODE_OUTCOME" in
+            queued-*|delete-retry-*|pipe-cancel)
+                if [ "$1" = --pure ]; then echo '[]'; exit 0; fi
+                echo 'HTTP 404 Not Found' >&2
+                printf '{"_tag":"SessionNotFoundError","sessionID":"%s"}\n' "$id" ;;
+            delete-wrong-id)
+                echo 'HTTP 404 Not Found' >&2
+                echo '{"_tag":"SessionNotFoundError","sessionID":"ses_unrelated"}' ;;
+            delete-lied)
+                printf '{"data":{"id":"%s"}}\n' "$id"; exit 0 ;;
+            *) echo 'database is locked' >&2 ;;
+        esac
+        exit 1 ;;
+    *" export "*)
+        if [ "$FAKE_OPENCODE_OUTCOME" = delayed-first ] && [ ! -f "$FAKE_CODEX_CAPTURE/stranded.json" ]; then
+            if [ -f "$FAKE_CODEX_CAPTURE/exported" ]; then
+                /bin/cat "$FAKE_CODEX_CAPTURE/stale.json"
+                touch "$FAKE_CODEX_CAPTURE/returned-stale"
+                exit 0
+            fi
+            touch "$FAKE_CODEX_CAPTURE/exported"
+            exit 1
+        fi
+        touch "$FAKE_CODEX_CAPTURE/exported"
+        exec /bin/cat "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+esac
+"#;
 
-    let run = fixture.run(
-        &strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]),
+#[cfg(unix)]
+fn write_opencode_fixture(fixture: &Fixture) -> PathBuf {
+    let opencode = fixture.root.join("opencode");
+    fs::write(&opencode, SYNTHETIC_OPENCODE).expect("write synthetic OpenCode");
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
+    opencode
+}
+
+#[cfg(unix)]
+fn run_opencode_import(fixture: &Fixture, version: &str, outcome: &str) -> Run {
+    let opencode = write_opencode_fixture(fixture);
+    let mut args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]);
+    if matches!(
+        outcome,
+        "success-aux" | "delayed-first" | "published-materialize-only"
+    ) {
+        args.push("--materialize-only".to_owned());
+    }
+    fixture.run(
+        &args,
         &[
             ("OMNI_OPENCODE_BIN", opencode.to_str().expect("UTF-8 path")),
-            ("FAKE_OPENCODE_LOG", log.to_str().expect("UTF-8 path")),
+            ("FAKE_OPENCODE_VERSION", version),
+            ("FAKE_OPENCODE_OUTCOME", outcome),
+            (
+                INTERRUPT,
+                if outcome == "delete-retry-recorded" {
+                    "recorded"
+                } else if outcome.starts_with("delete-") {
+                    "materialized"
+                } else {
+                    ""
+                },
+            ),
         ],
-    );
+    )
+}
 
-    assert!(run.status.success(), "did not fall back: {}", run.stderr);
-    for expected in ["OpenCode import exited with", "using semantic handoff"] {
-        assert!(run.stderr.contains(expected), "{expected}: {}", run.stderr);
+#[cfg(unix)]
+#[test]
+fn opencode_preparation_failure_falls_back_before_starting_the_importer() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("state/imports"), "not a directory").unwrap();
+    let run = run_opencode_import(&fixture, "2.2.0", "preflight");
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("using semantic handoff"),
+        "{}",
+        run.stderr
+    );
+    let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+    assert!(!calls.contains(" import "), "{calls}");
+    assert!(
+        calls.lines().last().unwrap().contains("--prompt"),
+        "{calls}"
+    );
+}
+
+// Linux filesystems support byte paths that the provider's string arguments cannot represent.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_opencode_staging_path_offers_a_readable_handoff_before_submission() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let fixture = Fixture::new();
+    let state = fixture.root.join(OsStr::from_bytes(b"state-\xff"));
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = fixture
+        .command()
+        .env("OMNISESSION_HOME", &state)
+        .env("OMNI_OPENCODE_BIN", write_opencode_fixture(&fixture))
+        .env("FAKE_OPENCODE_VERSION", "2.2.0")
+        .args(["fork", &format!("claude:{SOURCE_ID}"), "--in", "opencode"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("UTF-8 import file path") && stderr.contains("using semantic handoff"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+    assert!(!calls.contains(" import "), "{calls}");
+    let handoff = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+        .unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.contains("--prompt") && line.contains(handoff)),
+        "{calls}"
+    );
+    let private_file = Path::new(handoff);
+    assert_eq!(
+        fs::metadata(private_file).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert!(
+        fs::read_to_string(private_file)
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_dir(state.join("imports")).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_switch_commits_or_restores_its_binding_after_stdout_closes() {
+    for outcome in ["pipe-switch", "pipe-cancel"] {
+        let fixture = Fixture::new();
+        let mut source = fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .root
+                    .join(format!("claude/projects/synthetic/{SOURCE_ID}.jsonl")),
+            )
+            .unwrap();
+        let record = json!({"type":"assistant", "sessionId":SOURCE_ID, "cwd":fixture.workspace,
+            "message":{"role":"assistant", "content":format!("{}saved final detail", "word ".repeat(26_000))}});
+        writeln!(source, "{record}").unwrap();
+        drop(source);
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut command = fixture.command();
+        command
+            .args(["switch", "opencode"])
+            .env("OMNI_OPENCODE_BIN", write_opencode_fixture(&fixture))
+            .env("FAKE_OPENCODE_VERSION", "2.2.0")
+            .env("FAKE_OPENCODE_OUTCOME", outcome)
+            .env(
+                INTERRUPT,
+                if outcome == "pipe-cancel" {
+                    "recorded"
+                } else {
+                    ""
+                },
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        wait_for_file(&fixture.capture.join("close-pipe"), Duration::from_secs(20)).unwrap();
+        drop(reader);
+        fs::write(fixture.capture.join("pipe-closed"), "").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let run = Run {
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            elapsed: Duration::ZERO,
+        };
+
+        let published = fixture.capture.join("stranded.json");
+        if outcome == "pipe-cancel" {
+            assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+            assert!(!published.exists());
+            fs::rename(fixture.capture.join("pending.json"), &published).unwrap();
+        } else {
+            assert!(run.status.success(), "{}", run.stderr);
+        }
+        let contents = fs::read_to_string(published).unwrap();
+        let doc: Value = serde_json::from_str(&contents).unwrap();
+        let target = format!("opencode:{}", doc["info"]["id"].as_str().unwrap());
+        let expected = if outcome == "pipe-cancel" {
+            format!("claude:{SOURCE_ID}")
+        } else {
+            target
+        };
+        assert_eq!(fixture.bound_session(), expected);
+        let path = run
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+            .unwrap();
+        assert!(contents.contains(path));
+        fixture.assert_recovery_saved(outcome, &run, "saved final detail");
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        let (_, after_model) = calls.split_once(" models --standalone").unwrap();
+        assert!(!after_model.contains("--version"), "{calls}");
+        assert!(
+            after_model.contains(" session import ") && after_model.contains(" session export "),
+            "{calls}"
+        );
+        assert!(!after_model.contains("--prompt"), "{calls}");
     }
-    assert!(!run.stderr.contains("rollback"), "{}", run.stderr);
-    let calls = fs::read_to_string(&log).expect("OpenCode call log");
-    // The rollback is still attempted, then the unreadable target proves nothing was created.
-    for expected in ["--pure import ", "--pure session delete ", "--pure export "] {
-        assert!(calls.contains(expected), "{expected}: {calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_accepts_verified_history_from_a_delayed_worker_or_with_a_live_auxiliary() {
+    for outcome in ["delayed-first", "success-aux"] {
+        let fixture = Fixture::new();
+        let run = run_opencode_import(&fixture, "1.18.18", outcome);
+        assert!(run.status.success(), "{}", run.stderr);
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        assert!(calls.contains(" export "), "{calls}");
+        assert!(!calls.contains(" session delete "), "{calls}");
+        if outcome == "delayed-first" {
+            assert!(fixture.capture.join("returned-stale").exists());
+            assert!(fixture.capture.join("stranded.json").is_file());
+        } else {
+            assert!(!fixture.capture.join("blocked").exists(), "{calls}");
+        }
+        fixture.assert_nothing_left_behind(outcome);
     }
-    let launch = calls.lines().last().expect("handoff launch");
-    assert!(launch.contains("--prompt"), "{launch}");
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_opencode_import_saves_a_private_handoff_for_a_complete_source() {
+    for outcome in ["published", "published-materialize-only"] {
+        let fixture = Fixture::new();
+        let run = run_opencode_import(&fixture, "1.18.18", outcome);
+        assert!(!run.status.success());
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.capture.join("stranded.json")).unwrap())
+                .unwrap();
+        assert!(
+            run.stderr
+                .contains(document["info"]["id"].as_str().unwrap())
+        );
+        fixture.assert_recovery_saved(outcome, &run, SOURCE_QUESTION);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn uncertain_opencode_rollback_preserves_the_target_and_recovery_reference() {
+    for (version, outcome) in [
+        ("1.18.18", "published"),
+        ("1.18.18", "retry"),
+        ("1.18.18", "signal"),
+        ("1.18.18", "queued-move"),
+        ("2.0.0", "queued-copy"),
+        ("2.2.0", "claimed-missing"),
+        ("1.18.18", "delete-retry-materialized"),
+        ("2.2.0", "delete-retry-recorded"),
+        ("1.18.18", "delete-busy"),
+        ("2.2.0", "delete-wrong-id"),
+        ("2.2.0", "delete-lied"),
+    ] {
+        let fixture = Fixture::new();
+        let source = fixture
+            .root
+            .join(format!("claude/projects/synthetic/{SOURCE_ID}.jsonl"));
+        let mut source = fs::OpenOptions::new().append(true).open(source).unwrap();
+        let record = json!({"type":"assistant", "sessionId":SOURCE_ID, "cwd":fixture.workspace,
+            "message":{"role":"assistant", "content":format!("{}saved final detail", "word ".repeat(26_000))}});
+        writeln!(source, "{record}").unwrap();
+        drop(source);
+        let run = run_opencode_import(&fixture, version, outcome);
+        if outcome == "retry" {
+            fs::write(fixture.capture.join("release"), "").unwrap();
+            wait_for_file(&fixture.capture.join("retried"), Duration::from_secs(15)).unwrap();
+        }
+        if outcome.starts_with("queued-") || outcome.starts_with("delete-retry-") {
+            // The worker completes its pending write only after OmniSession exits.
+            let published = fixture.capture.join("stranded.json");
+            assert!(!published.exists());
+            fs::rename(fixture.capture.join("pending.json"), published).unwrap();
+        }
+        assert!(!run.status.success(), "{outcome}: {}", run.stderr);
+        let imported = fs::read_to_string(fixture.capture.join("stranded.json")).unwrap();
+        let document: Value = serde_json::from_str(&imported).unwrap();
+        assert!(
+            run.stderr
+                .contains(document["info"]["id"].as_str().unwrap()),
+            "{}",
+            run.stderr
+        );
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        assert!(!calls.contains("--prompt"), "{calls}");
+        if outcome.starts_with("delete-") {
+            if outcome.starts_with("delete-retry-") {
+                assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+            } else {
+                assert!(
+                    run.stderr.contains("rollback also failed"),
+                    "{}",
+                    run.stderr
+                );
+            }
+            let (_, after_delete) = calls.split_once(" session delete ").unwrap();
+            assert!(!after_delete.contains(" export "), "{calls}");
+        } else {
+            assert!(
+                run.stderr.contains("may still be writing"),
+                "{}",
+                run.stderr
+            );
+            assert!(!calls.contains(" session delete "), "{calls}");
+        }
+        let file = run
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+            .unwrap();
+        assert!(Path::new(file).is_file());
+        assert!(imported.contains(&file.replace('\\', "\\\\")));
+        fixture.assert_recovery_saved(outcome, &run, "saved final detail");
+    }
 }
 
 #[test]
@@ -1045,7 +1405,7 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
                 format!("claude:{SOURCE_ID}"),
                 "{label}"
             );
-            fixture.assert_nothing_left_behind(&label);
+            fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
         }
     }
 }
@@ -1167,7 +1527,7 @@ fn codex_ambiguous_receipts_never_delete_or_launch() {
         );
         assert_eq!(fixture.launch_arguments(), None, "{mode}");
         assert_eq!(fixture.bound_session(), format!("claude:{SOURCE_ID}"));
-        fixture.assert_nothing_left_behind(mode);
+        fixture.assert_recovery_saved(mode, &run, SOURCE_QUESTION);
     }
 }
 
@@ -1309,7 +1669,7 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
             format!("claude:{SOURCE_ID}"),
             "{label}"
         );
-        fixture.assert_nothing_left_behind(&label);
+        fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
     }
 }
 
@@ -1397,7 +1757,7 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
             "{label}: failed rollback must strand the generated thread"
         );
         assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
-        fixture.assert_nothing_left_behind(&label);
+        fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
     }
 }
 
@@ -1968,6 +2328,33 @@ impl Fixture {
             format!("claude:{SOURCE_ID}"),
             "{label}"
         );
+        if run.status.success() {
+            self.assert_nothing_left_behind(label);
+        } else {
+            self.assert_recovery_saved(label, run, SOURCE_QUESTION);
+        }
+    }
+
+    fn assert_recovery_saved(&self, label: &str, run: &Run, expected: &str) {
+        let mut paths = run
+            .stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("Recovery handoff saved to "));
+        let path = Path::new(
+            paths
+                .next()
+                .unwrap_or_else(|| panic!("{label}: {}", run.stderr)),
+        );
+        assert_eq!(
+            paths.next(),
+            None,
+            "{label} reported multiple recovery files"
+        );
+        assert_eq!(path.parent(), Some(self.root.join("tmp").as_path()));
+        assert!(fs::read_to_string(path).unwrap().contains(expected));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        fs::remove_file(path).expect("remove the verified private recovery file");
         self.assert_nothing_left_behind(label);
     }
 
