@@ -635,7 +635,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             fs::create_dir_all(&session).expect("Grok source directory");
             fs::write(
                 session.join("summary.json"),
-                json!({"id": GROK_SOURCE_ID, "cwd": self.workspace, "num_messages": 2}).to_string(),
+                json!({"info": {"id": GROK_SOURCE_ID, "cwd": self.workspace}, "session_summary":"Synthetic Grok session", "num_messages": 2}).to_string(),
             )
             .expect("write synthetic Grok summary");
             let update = |kind: &str, text: &str| {
