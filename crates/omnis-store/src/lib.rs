@@ -1991,6 +1991,24 @@ impl Store {
         Ok(())
     }
 
+    /// Returns the derived title that survived a search document update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or a failed read.
+    pub fn trajectory_title(&self, session: &SessionRef) -> Result<Option<String>> {
+        validate_session_ref(session)?;
+        self.connection.borrow()
+            .query_row(
+                "SELECT derived_title FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+                params![session.provider.to_string(), session.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(database_error)
+    }
+
     /// Returns redacted titles derived from indexed conversations.
     ///
     /// # Errors

@@ -74,7 +74,7 @@ pub(crate) struct IndexProgress {
     pub(crate) indexed: usize,
     pub(crate) total: usize,
     pub(crate) failed: usize,
-    pub(crate) titles: Vec<(SessionRef, String)>,
+    pub(crate) titles: Vec<(SessionRef, Option<String>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -486,7 +486,7 @@ fn flush_batch(
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
-    titles: &mut Vec<(SessionRef, String)>,
+    titles: &mut Vec<(SessionRef, Option<String>)>,
 ) {
     if batch.is_empty() {
         return;
@@ -505,9 +505,7 @@ fn flush_batch(
     if stored.is_ok() {
         summary.indexed += batch.len();
         for prepared in batch.drain(..) {
-            if let Some(title) = prepared.title {
-                titles.push((prepared.candidate.session, title));
-            }
+            prepared.report_title(store, titles);
         }
     } else {
         for mut prepared in batch.drain(..) {
@@ -528,9 +526,7 @@ fn flush_batch(
             }
             if stored.is_ok() {
                 summary.indexed += 1;
-                if let Some(title) = prepared.title {
-                    titles.push((prepared.candidate.session, title));
-                }
+                prepared.report_title(store, titles);
             } else {
                 summary.failed += 1;
             }
@@ -538,7 +534,10 @@ fn flush_batch(
     }
 }
 
-fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> IndexProgress {
+fn progress(
+    summary: &IndexSummary,
+    titles: &mut Vec<(SessionRef, Option<String>)>,
+) -> IndexProgress {
     IndexProgress {
         indexed: summary.indexed + summary.failed,
         total: summary.stale,
@@ -557,7 +556,26 @@ struct PreparedIndex {
     title: Option<String>,
 }
 
+pub(crate) fn saved_title(
+    store: &Store,
+    session: &SessionRef,
+    proposed: Option<String>,
+) -> omnis_store::Result<Option<String>> {
+    // An incomplete read can retain an earlier title. Report the one in the index.
+    match proposed {
+        Some(title) => Ok(Some(title)),
+        None => store.trajectory_title(session),
+    }
+}
+
 impl PreparedIndex {
+    fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
+        let session = self.candidate.session;
+        if let Ok(title) = saved_title(store, &session, self.title) {
+            titles.push((session, title));
+        }
+    }
+
     fn store(&self, store: &Store) -> omnis_store::Result<()> {
         store.upsert_observed_trajectory_documents(&[(
             &self.candidate.session,
@@ -1076,7 +1094,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 SessionRef::new(Provider::Codex, id),
-                "Synthetic rate limiter request".to_owned()
+                Some("Synthetic rate limiter request".to_owned())
             )]
         );
         let again = index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
@@ -1084,33 +1102,38 @@ mod tests {
         assert_eq!(again.stale, 0);
     }
 
-    #[test]
-    fn restored_codex_rollout_replaces_search_text_even_with_a_delayed_writer() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex");
+    fn write_codex_rollout(
+        home: &Path,
+        marker: Option<&str>,
+        modified: u64,
+    ) -> (AdapterRegistry, Vec<IndexCandidate>) {
         let sessions = home.join("sessions/2026/01/01");
         fs::create_dir_all(&sessions).unwrap();
         let id = "019f0000-0000-7000-8000-000000000001";
         let path = sessions.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
-        let store = Store::open(temp.path().join("store.sqlite3")).unwrap();
-        let write_rollout = |marker: &str, modified: u64| {
-            fs::write(&path, format!("{}\n{}\n",
-                json!({"type":"session_meta","payload":{"id":id}}),
-                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":marker}]}}),
-            )).unwrap();
-            File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified))
-                .unwrap();
-            let mut registry = AdapterRegistry::new();
-            registry.register(CodexAdapter::with_root(&home));
-            let listed = registry.list_sessions(Provider::Codex, None).unwrap();
-            (registry, ordered_candidates(&listed, None))
-        };
+        let mut records = vec![json!({"type":"session_meta","payload":{"id":id}}).to_string()];
+        if let Some(marker) = marker {
+            records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":marker}]}}).to_string());
+        }
+        fs::write(&path, records.join("\n") + "\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified))
+            .unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(CodexAdapter::with_root(home));
+        let listed = registry.list_sessions(Provider::Codex, None).unwrap();
+        (registry, ordered_candidates(&listed, None))
+    }
 
-        let (registry, original) = write_rollout("oldneedle", 1_800_100_000);
+    #[test]
+    fn restored_codex_rollout_replaces_search_text_even_with_a_delayed_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let store = Store::open(temp.path().join("store.sqlite3")).unwrap();
+        let (registry, original) = write_codex_rollout(&home, Some("oldneedle"), 1_800_100_000);
         index_candidates(
             &registry,
             &store,
@@ -1123,7 +1146,7 @@ mod tests {
         let guard = observe_source(&store, &original[0].session).unwrap();
         let delayed = prepare_session(&registry, &original[0], guard).unwrap();
 
-        let (registry, restored) = write_rollout("backupneedle", 1_800_000_000);
+        let (registry, restored) = write_codex_rollout(&home, Some("backupneedle"), 1_800_000_000);
         let restored_time = restored[0].updated_at.unwrap();
         assert!(
             !store
@@ -1163,7 +1186,7 @@ mod tests {
         assert_eq!(recovered.indexed, 1);
         assert_eq!(
             titles,
-            [(restored[0].session.clone(), "backupneedle".to_owned())]
+            [(restored[0].session.clone(), Some("backupneedle".to_owned()))]
         );
         assert!(
             store
@@ -1178,6 +1201,19 @@ mod tests {
             [restored[0].session.clone()]
         );
         assert_eq!(index().stale, 0);
+
+        let (registry, header_only) = write_codex_rollout(&home, None, 1_799_900_000);
+        let mut updates = Vec::new();
+        index_candidates(
+            &registry,
+            &store,
+            header_only,
+            false,
+            &|| false,
+            &mut |progress| updates.extend(progress.titles),
+        )
+        .unwrap();
+        assert_eq!(updates, [(restored[0].session.clone(), None)]);
     }
 
     #[test]
@@ -1236,9 +1272,12 @@ mod tests {
             vec![
                 (
                     SessionRef::new(Provider::Codex, "first"),
-                    "first".to_owned()
+                    Some("first".to_owned())
                 ),
-                (SessionRef::new(Provider::Codex, "last"), "last".to_owned()),
+                (
+                    SessionRef::new(Provider::Codex, "last"),
+                    Some("last".to_owned())
+                ),
             ]
         );
         assert_eq!(

@@ -163,7 +163,7 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
-/// Stores a versioned search document and returns the title derived from the snapshot.
+/// Stores a versioned search document and returns its indexed title.
 ///
 /// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
 /// reported by the adapter stay visible through the document's truncation strategy, so a full
@@ -193,7 +193,7 @@ fn store_search_document(
         },
         guard,
     )])?;
-    Ok(derived_title)
+    search_index::saved_title(store, session, derived_title)
 }
 
 fn build_search_index(

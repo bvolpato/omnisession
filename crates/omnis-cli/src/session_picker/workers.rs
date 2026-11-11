@@ -47,6 +47,7 @@ pub(super) enum PickerUpdate {
     Preview {
         key: PreviewKey,
         value: PreviewValue,
+        removed_title: bool,
     },
     TrajectorySearch {
         generation: u64,
@@ -423,29 +424,22 @@ pub(super) fn spawn_preview_updates(
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
         let mut store_warning_sent = false;
-        let mut store = match Store::open_default() {
+        let mut open_store = || match Store::open_default() {
             Ok(store) => Some(store),
             Err(error) => {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index unavailable: {error}"
-                )));
-                store_warning_sent = true;
+                if !store_warning_sent {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "trajectory index unavailable: {error}"
+                    )));
+                    store_warning_sent = true;
+                }
                 None
             }
         };
+        let mut store = open_store();
         while let Ok(keys) = receiver.recv() {
             if store.is_none() {
-                match Store::open_default() {
-                    Ok(opened) => store = Some(opened),
-                    Err(error) => {
-                        if !store_warning_sent {
-                            let _ = sender.send(PickerUpdate::Warning(format!(
-                                "trajectory index unavailable: {error}"
-                            )));
-                            store_warning_sent = true;
-                        }
-                    }
-                }
+                store = open_store();
             }
             let mut queue = VecDeque::from(keys);
             while let Some(key) = queue.pop_front() {
@@ -464,6 +458,7 @@ pub(super) fn spawn_preview_updates(
                         }
                     }
                 });
+                let mut removed_title = false;
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
@@ -478,7 +473,7 @@ pub(super) fn spawn_preview_updates(
                     snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
                         if let Some((store, guard)) = writer {
                             let document = trajectory_search_document(&snapshot);
-                            if let Err(error) = crate::store_search_document(
+                            match crate::store_search_document(
                                 store,
                                 &key.session,
                                 &snapshot,
@@ -491,9 +486,12 @@ pub(super) fn spawn_preview_updates(
                                 },
                                 guard,
                             ) {
-                                let _ = sender.send(PickerUpdate::Warning(format!(
-                                    "trajectory index write: {error}"
-                                )));
+                                Ok(title) => removed_title = title.is_none(),
+                                Err(error) => {
+                                    let _ = sender.send(PickerUpdate::Warning(format!(
+                                        "trajectory index write: {error}"
+                                    )));
+                                }
                             }
                         }
                         PreviewValue::Ready {
@@ -505,7 +503,14 @@ pub(super) fn spawn_preview_updates(
                         }
                     })
                 };
-                if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                if sender
+                    .send(PickerUpdate::Preview {
+                        key,
+                        value,
+                        removed_title,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -575,8 +580,12 @@ pub(super) fn receive_updates(
             PickerUpdate::Lineage(Err(error)) => {
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
-            PickerUpdate::Preview { key, value } => {
-                state.remember_preview_title(&key, &value);
+            PickerUpdate::Preview {
+                key,
+                value,
+                removed_title,
+            } => {
+                state.remember_preview_title(&key, &value, removed_title);
                 state.previews.insert(key, value, &state.preview_window);
                 state.trajectory_index_changed();
             }
@@ -606,7 +615,11 @@ pub(super) fn receive_updates(
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
             }
-            PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
+            PickerUpdate::Titles(titles) => state.remember_derived_titles(
+                titles
+                    .into_iter()
+                    .map(|(session, title)| (session, Some(title))),
+            ),
             PickerUpdate::Indexing(progress) => {
                 state.index_progress = Some((progress.indexed, progress.total));
                 if !progress.titles.is_empty() {
