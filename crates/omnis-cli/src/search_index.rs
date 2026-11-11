@@ -2373,7 +2373,12 @@ mod tests {
         let path = candidates[0].source_path.as_ref().unwrap();
         let updated =
             path.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
-        fs::File::open(path).unwrap().set_modified(updated).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(updated)
+            .unwrap();
         let fresh_adapter = CodexAdapter::with_root(temporary.path().join("codex"));
         let changed = ordered_candidates(&fresh_adapter.list_sessions(None).unwrap(), None);
         assert_eq!(pass(&changed, false), (1, 0, 1, 0, 2));

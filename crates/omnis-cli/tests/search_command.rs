@@ -61,7 +61,9 @@ fn codex_search_follows_a_restored_active_rollout_at_an_older_or_equal_time() {
             "Restored request",
             "metronome",
         );
-        fs::File::open(&active)
+        fs::File::options()
+            .write(true)
+            .open(&active)
             .unwrap()
             .set_modified(if same_project {
                 archived_time
