@@ -4093,26 +4093,50 @@ fn check_discovered_catalog<'a>(
     Ok(unowned)
 }
 
+const SELECTED_CATALOG_SQL: &str = "SELECT c.provider,c.session_id,c.title,c.project_path,c.git_branch,c.created_at,c.updated_at,
+         c.updated_at_approximate,c.event_count,c.source_file_id,c.source_contents_id,c.codex_home,
+         scoped.name_observable IS 1,scoped.unscoped_name IS 1,scoped.matches_unscoped_document,scoped.home_matches IS 1
+         FROM session_index c LEFT JOIN (
+             SELECT codex_home,name_observable,unscoped_name,matches_unscoped_document,home_matches
+             FROM raw_session_catalog WHERE provider=?1 AND session_id=?2
+         ) scoped ON scoped.codex_home IS c.codex_home
+         WHERE c.provider=?1 AND c.session_id=?2
+         ORDER BY scoped.home_matches DESC LIMIT 1";
+
 fn selected_catalog_rows(
     connection: &Connection,
     session: &SessionRef,
 ) -> Result<(Option<ScopedCatalogRow>, Option<UntrustedCatalogRow>)> {
-    let row = connection.query_row(
-        "SELECT c.provider,c.session_id,c.title,c.project_path,c.git_branch,c.created_at,c.updated_at,
-         c.updated_at_approximate,c.event_count,c.source_file_id,c.source_contents_id,c.codex_home,
-         scoped.name_observable IS 1,scoped.unscoped_name IS 1,scoped.matches_unscoped_document,scoped.home_matches IS 1
-         FROM session_index c LEFT JOIN raw_session_catalog scoped
-           ON scoped.provider=c.provider AND scoped.session_id=c.session_id
-         WHERE c.provider=?1 AND c.session_id=?2",
-        params![session.provider.to_string(),session.id], |r| {
-            let entry=indexed_session_from_row(r)?;
-            if r.get::<_,bool>(12)? {
-                Ok((Some(ScopedCatalogRow { metadata:entry,name_observable:true,matches_unscoped_document:r.get(14)?,home_matches:r.get(15)? }),None))
-            } else {
-                Ok((None,Some(UntrustedCatalogRow { row:entry, home:r.get(11)?, recoverable:r.get(13)? })))
-            }
-        },
-    ).optional().map_err(database_error)?;
+    let row = connection
+        .query_row(
+            SELECTED_CATALOG_SQL,
+            params![session.provider.to_string(), session.id],
+            |r| {
+                let entry = indexed_session_from_row(r)?;
+                if r.get::<_, bool>(12)? {
+                    Ok((
+                        Some(ScopedCatalogRow {
+                            metadata: entry,
+                            name_observable: true,
+                            matches_unscoped_document: r.get(14)?,
+                            home_matches: r.get(15)?,
+                        }),
+                        None,
+                    ))
+                } else {
+                    Ok((
+                        None,
+                        Some(UntrustedCatalogRow {
+                            row: entry,
+                            home: r.get(11)?,
+                            recoverable: r.get(13)?,
+                        }),
+                    ))
+                }
+            },
+        )
+        .optional()
+        .map_err(database_error)?;
     Ok(row.unwrap_or_default())
 }
 
@@ -7432,6 +7456,34 @@ mod tests {
         publish(false, observed_source()).unwrap();
         assert_eq!(store.trajectory_index_state(session).unwrap(), full);
         assert!(store.indexed_session(session).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_catalog_point_lookup_skips_unrelated_sessions() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let chosen = indexed_session(Provider::Codex, "chosen", "Chosen title");
+        store.upsert_indexed_session(&chosen).unwrap();
+        let connection = store.connection.borrow();
+        let mut statement = connection.prepare(super::SELECTED_CATALOG_SQL).unwrap();
+        let mut lookup = || {
+            let title: String = statement
+                .query_row(["codex", "chosen"], |row| row.get(2))
+                .unwrap();
+            assert_eq!(title, "Chosen title");
+            statement.reset_status(rusqlite::StatementStatus::VmStep)
+        };
+        let before = lookup();
+        connection.execute_batch(
+            "WITH RECURSIVE sessions(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM sessions WHERE id<256)
+             INSERT INTO session_index(provider,session_id,codex_home,event_count,indexed_at)
+             SELECT 'codex','unrelated-' || id,(SELECT home FROM current_codex_home),0,0 FROM sessions;",
+        ).unwrap();
+        let after = lookup();
+        assert!(
+            after < before * 2,
+            "point lookup took {before} steps before adding unrelated sessions and {after} afterward"
+        );
     }
 
     #[test]

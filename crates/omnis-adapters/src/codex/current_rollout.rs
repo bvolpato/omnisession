@@ -58,8 +58,10 @@ impl CurrentRollouts {
         home: &Path,
         cwd: &Path,
         overrides: &crate::CodexLaunchOverrides,
+        expand_env_tilde: &dyn Fn() -> Result<bool>,
     ) -> Result<PathBuf> {
-        self.sqlite_home.resolve_in(home, cwd, overrides)
+        self.sqlite_home
+            .resolve_for_launch(home, cwd, overrides, expand_env_tilde)
     }
 
     pub(super) fn stamp(&self, home: &Path) -> Option<CurrentRolloutStamp> {
@@ -224,6 +226,14 @@ impl CurrentRollout {
             || ids(&self.path).is_some_and(|(thread, rollout)| thread != rollout)
     }
 
+    pub(super) fn requires_selection(&self, home: &Path) -> bool {
+        self.required() || self.outside_home(home)
+    }
+
+    pub(super) fn outside_home(&self, home: &Path) -> bool {
+        !self.path.starts_with(home)
+    }
+
     pub(super) fn has_legacy_name(&self) -> bool {
         !canonical_name(&self.path)
     }
@@ -237,7 +247,7 @@ impl CurrentRollout {
     ) -> Result<Option<CurrentFile>> {
         ensure!(self.paginated.is_some(), CurrentRolloutUnavailable);
         let selected = self.resolve_path(home, id, paths, complete)?;
-        if selected.is_none() && self.required() {
+        if selected.is_none() && self.requires_selection(home) {
             return Err(CurrentRolloutUnavailable.into());
         }
         Ok(selected)
@@ -257,7 +267,9 @@ impl CurrentRollout {
         let name = rollout_file::jsonl_file_name(&self.path).expect("validated rollout name");
         let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
         let mut copies = Vec::new();
-        if let Some(recorded) = local_recording(home, &root, &self.path)? {
+        let recorded = local_recording(home, &root, &self.path)?;
+        let relocated = recorded.is_none();
+        if let Some(recorded) = recorded {
             let plain = recorded.with_file_name(name);
             let native_recording = self.path.extension().is_some_and(|ext| ext != "gz");
             let mut native = native_recording && recorded.starts_with(home.join("sessions"));
@@ -287,12 +299,9 @@ impl CurrentRollout {
             } else if let Some(restored) = restored_rollout(home, &recorded) {
                 copies.extend(representations(&restored));
             }
-        } else if !canonical_name(&self.path) {
-            // A path from another computer can identify a local restore by its exact Codex filename.
-            return Ok(None);
         }
         if !complete {
-            ensure!(!self.required(), CurrentRolloutUnconfirmed);
+            ensure!(!self.requires_selection(home), CurrentRolloutUnconfirmed);
             return Ok(None);
         }
         for path in paths {
@@ -300,6 +309,72 @@ impl CurrentRollout {
                 copies.push(path.to_owned());
             }
         }
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        let original = if relocated {
+            self.original_recording(id, name)?
+        } else {
+            None
+        };
+        let copies = self.agreeing_copies(home, &root, id, copies, original.as_ref());
+        if !relocated {
+            return copies;
+        }
+        let selected = copies.context(
+            "could not match the local restore to the rollout selected by the Codex state database",
+        )?;
+        let verified = self.original_recording(id, name)?;
+        ensure!(
+            original.as_ref().map(|file| (&file.path, file.revision))
+                == verified.as_ref().map(|file| (&file.path, file.revision)),
+            CurrentRolloutUnconfirmed
+        );
+        Ok(selected)
+    }
+
+    fn original_recording(&self, id: &str, name: &Path) -> Result<Option<CurrentFile>> {
+        ensure!(
+            self.path.is_absolute() && !omnis_core::may_reach_network(&self.path),
+            CurrentRolloutUnconfirmed
+        );
+        let plain = self.path.with_file_name(name);
+        let gzip = self.path.extension().is_some_and(|ext| ext == "gz");
+        for path in representations(&plain)
+            .filter(|path| path.extension().is_some_and(|ext| ext == "gz") == gzip)
+        {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Ok(meta) => ensure!(meta.is_file(), CurrentRolloutUnconfirmed),
+                Err(error) => return Err(error).context(CurrentRolloutUnconfirmed),
+            }
+            // Read only a regular Codex rollout under the recorded home's session directories.
+            let home = path
+                .ancestors()
+                .find(|part| part.ends_with("sessions") || part.ends_with("archived_sessions"))
+                .and_then(Path::parent)
+                .context(CurrentRolloutUnconfirmed)?;
+            let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+            ensure!(
+                live_rollout_path(home, &root, &path),
+                CurrentRolloutUnconfirmed
+            );
+            return self
+                .check(&path, id)?
+                .map(Some)
+                .ok_or_else(|| CurrentRolloutUnavailable.into());
+        }
+        Ok(None)
+    }
+
+    fn agreeing_copies(
+        &self,
+        home: &Path,
+        root: &Path,
+        id: &str,
+        mut copies: Vec<PathBuf>,
+        original: Option<&CurrentFile>,
+    ) -> Result<Option<CurrentFile>> {
         let active = home.join("sessions");
         copies.sort_unstable_by(|a, b| {
             super::rollout_priority(b, &active).cmp(&super::rollout_priority(a, &active))
@@ -309,18 +384,27 @@ impl CurrentRollout {
         let mut digest = None;
         let mut bytes = 64 * 1024 * 1024;
         for path in copies {
-            if !accessible(home, &root, &path)? {
+            if !accessible(home, root, &path)? {
                 continue;
             }
             let Some(copy) = self.check(&path, id)? else {
                 continue;
             };
-            if let Some(prior) = &selected {
-                if prior.path.extension() == path.extension()
+            if let Some(prior) = original.or(selected.as_ref())
+                && !(prior.path.extension() == path.extension()
                     && same_file::is_same_file(&prior.path, &path)
-                        .context(CurrentRolloutUnconfirmed)?
-                {
-                    continue;
+                        .context(CurrentRolloutUnconfirmed)?)
+            {
+                if !rollout_file::compressed(&prior.path) && !rollout_file::compressed(&path) {
+                    ensure!(
+                        fs::metadata(&prior.path)
+                            .context(CurrentRolloutUnconfirmed)?
+                            .len()
+                            == fs::metadata(&path)
+                                .context(CurrentRolloutUnconfirmed)?
+                                .len(),
+                        CurrentRolloutUnavailable
+                    );
                 }
                 let expected = match digest {
                     Some(hash) => hash,
@@ -330,9 +414,8 @@ impl CurrentRollout {
                     return Err(CurrentRolloutUnavailable.into());
                 }
                 digest = Some(expected);
-            } else {
-                selected = Some(copy);
             }
+            selected.get_or_insert(copy);
         }
         Ok(selected)
     }
@@ -637,6 +720,48 @@ mod tests {
         let error = read().expect_err("a missing selected generation must hide the original");
         assert!(error.is::<CurrentRolloutUnavailable>(), "{error:#}");
         assert_eq!((fs::read(db)?, fs::read(wal)?), source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_restored_compressed_rollout_must_match_the_readable_sqlite_selection() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let original = fixture.path().join("origin/sessions/2026/01/01");
+        let home = fixture.path().join("restored");
+        let archive = home.join("archived_sessions");
+        fs::create_dir_all(&archive)?;
+        let selected = rollout(&original, None, "opening request")?;
+        let prefix = fs::read(&selected)?;
+        let copy = archive
+            .join(selected.file_name().unwrap())
+            .with_extension("jsonl.gz");
+        let mut gzip =
+            flate2::write::GzEncoder::new(fs::File::create(&copy)?, flate2::Compression::fast());
+        gzip.write_all(&prefix)?;
+        gzip.finish()?;
+        let row = CurrentRollout {
+            path: selected.clone(),
+            paginated: Some(false),
+            archived: false,
+        };
+        let read = || row.resolve(&home, THREAD, [copy.as_path()], true);
+        assert_eq!(read()?.unwrap().path, copy);
+
+        let tail = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"second request"}});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&selected)?
+            .write_all(format!("{tail}\n").as_bytes())?;
+        assert!(read().unwrap_err().is::<CurrentRolloutUnavailable>());
+        let packed = selected.with_extension("jsonl.zst");
+        fs::write(
+            &packed,
+            zstd::stream::encode_all(fs::File::open(&selected)?, 1)?,
+        )?;
+        fs::remove_file(&selected)?;
+        assert!(read().unwrap_err().is::<CurrentRolloutUnavailable>());
+        fs::remove_file(packed)?;
+        assert_eq!(read()?.unwrap().path, copy);
         Ok(())
     }
 

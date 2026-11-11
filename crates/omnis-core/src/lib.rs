@@ -5,7 +5,7 @@ mod recovery;
 
 pub use cursor_workspace::{
     SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
-    local_cursor_workspace_path, session_workspace_matches,
+    local_cursor_workspace_path, resolve_local_path, session_workspace_matches,
 };
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
@@ -374,6 +374,24 @@ pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<P
     // A repository root always contains its members, so skip spawning Git for outside paths.
     recorded.starts_with(&requested_root)
         && workspace_root(&recorded).is_ok_and(|recorded_root| recorded_root == requested_root)
+}
+
+/// Returns the directory to compare with a recorded workspace when a profile changes the cwd.
+/// A folder inside that workspace shares its identity until a nested Git worktree begins.
+/// Only existing local directories can establish a match.
+#[must_use]
+pub fn workspace_path_for_profile_match(recorded: &Path, requested: &Path) -> Option<PathBuf> {
+    let requested = cursor_workspace::local_working_directory(requested)?;
+    if let Some(recorded) = cursor_workspace::local_working_directory(recorded)
+        && requested.starts_with(&recorded)
+        && requested
+            .ancestors()
+            .take_while(|parent| *parent != recorded)
+            .all(|parent| git_marker_status(parent) == Some(false))
+    {
+        return Some(recorded);
+    }
+    Some(requested)
 }
 
 /// Captures repository state without storing raw remote URLs or environment values.
@@ -4201,6 +4219,33 @@ mod tests {
 
         assert!(workspace_paths_match(&nested, &repo));
         assert!(!workspace_paths_match(&nested, &sibling_repo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_subdirectories_respect_nested_worktrees_and_physical_symlinks() -> std::io::Result<()>
+    {
+        let temporary = TempDir::new()?;
+        let workspace = temporary.path().join("workspace");
+        let nested = workspace.join("module");
+        let outside = temporary.path().join("other");
+        fs::create_dir_all(nested.join("deeper"))?;
+        fs::create_dir(nested.join("redirect"))?;
+        fs::create_dir_all(outside.join("module"))?;
+        std::os::unix::fs::symlink(nested.join("deeper"), workspace.join("inside"))?;
+        std::os::unix::fs::symlink(outside.join("module"), workspace.join("redirect"))?;
+        let matches = |path: &std::path::Path| {
+            super::workspace_path_for_profile_match(&workspace, path)
+                .is_some_and(|target| workspace_paths_match(&workspace, target))
+        };
+        assert!(matches(&workspace.join("inside")));
+        assert!(!matches(&workspace.join("redirect/../module")));
+        assert!(!matches(&workspace.join("inside/../redirect")));
+        assert!(!matches(std::path::Path::new("//host.invalid/project")));
+        git(&nested, &["init", "--initial-branch=main"]);
+        assert!(!matches(&nested));
+        assert!(!matches(&workspace.join("inside")));
+        Ok(())
     }
 
     #[test]

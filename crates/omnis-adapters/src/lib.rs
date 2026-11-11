@@ -243,8 +243,7 @@ pub struct LaunchPlan {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
-    /// Changes to the inherited environment, applied in order. Built-in adapters leave it empty.
-    /// A launch profile sets it.
+    /// Changes to the inherited environment, applied in order before the child starts.
     pub env: Vec<EnvChange>,
 }
 
@@ -314,6 +313,7 @@ pub trait ProviderAdapter: Send + Sync {
         _session: Option<&SessionRef>,
         _cwd: &Path,
         _overrides: &CodexLaunchOverrides,
+        _expand_env_tilde: &dyn Fn() -> Result<bool>,
     ) -> Result<Option<PathBuf>> {
         Ok(None)
     }

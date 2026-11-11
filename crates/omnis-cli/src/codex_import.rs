@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use omnis_adapters::CodexAdapter;
+use omnis_adapters::{AdapterRegistry, CodexAdapter, LaunchTarget};
 use omnis_core::{
     CODEX_IMPORT_MARKER, HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope,
     redact_secrets, reports_omitted_events,
@@ -27,7 +27,7 @@ use crate::{
 };
 mod profile;
 use profile::{ImportProfile, plain_codex_supplies};
-pub(crate) use profile::{launch_directory, pin_local_server};
+pub(crate) use profile::{launch_directory, pin_local_server, profile_working_directory};
 
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -40,7 +40,8 @@ pub(crate) fn check_continuation_target(target: AgentTarget, source: &SessionRef
         .filter(|_| target.provider == Provider::Codex)
     {
         let args = profile.expanded_args(&crate::launch_profile::environment)?;
-        if let Err(error) = profile::require_continuation_args(&args, !profile.overrides_program())
+        if let Err(error) =
+            profile::require_continuation_args(&args, target.uses_provider_program()?)
         {
             let source = crate::safe_terminal_line(&source.to_string());
             bail!(
@@ -56,6 +57,8 @@ pub struct CodexImport {
     pub title: Option<String>,
     pub tool_events: usize,
     pub truncated: bool,
+    home: PathBuf,
+    sqlite_home_arg: Option<String>,
     profile: ImportProfile,
 }
 
@@ -104,6 +107,8 @@ pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
         title: snapshot.title.as_deref().map(redact_secrets),
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
+        home: codex_home()?,
+        sqlite_home_arg: None,
         profile: ImportProfile::default(),
     })
 }
@@ -111,12 +116,32 @@ pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
 impl CodexImport {
     pub(crate) fn for_launch_profile(
         mut self,
-        profile: Option<&crate::launch_profile::LaunchProfile>,
+        registry: &AdapterRegistry,
+        target: AgentTarget,
+        process_directory: &Path,
     ) -> Result<Self> {
-        if let Some(profile) = profile.filter(|p| !p.overrides_program()) {
-            let args = profile.expanded_args(&crate::launch_profile::environment)?;
-            self.profile = ImportProfile::resolve(&args, &codex_home()?)?;
+        let adapter = registry.adapter(Provider::Codex)?;
+        let mut plan = target.launch(adapter.new_session_plan(&LaunchTarget {
+            cwd: Some(process_directory.to_owned()),
+            ..LaunchTarget::default()
+        })?)?;
+        if !target.uses_provider_program()? {
+            // Native import uses the installed Codex. The replacement program runs only after the copy is verified.
+            plan.args.clear();
+            plan.program = "codex".into();
+        } else if target.profile.is_some() {
+            self.profile = ImportProfile::resolve(&plan.args, &self.home)?;
         }
+        let sqlite_home = if let Some(home) = profile::selected_sqlite_home(adapter, None, &plan)? {
+            home
+        } else {
+            // The importer can create a local copy even when a profile's project settings prevent a verified relaunch.
+            plan.cwd = Some(profile::launch_directory(&plan)?);
+            plan.args.clear();
+            profile::selected_sqlite_home(adapter, None, &plan)?
+                .context("cannot verify the local Codex SQLite home for native import")?
+        };
+        self.sqlite_home_arg = Some(profile::sqlite_home_argument(&sqlite_home)?);
         Ok(self)
     }
 }
@@ -125,8 +150,7 @@ impl CodexImport {
 ///
 /// Codex resumes a session only with the model provider that created it. The result is empty for
 /// other agents, for sessions that plain `codex` can open, and when nothing can be determined.
-/// A profile with its own program never matches, because that program decides what its arguments
-/// mean.
+/// Only the installed Codex executable gives the profile arguments their native meaning.
 pub(crate) fn profiles_for_recorded_provider(
     source: &SessionRef,
     targets: &[AgentTarget],
@@ -144,17 +168,17 @@ pub(crate) fn profiles_for_recorded_provider(
         return Vec::new();
     }
     let supplies = |profile: &LaunchProfile| {
-        !profile.overrides_program()
-            && profile
-                .expanded_args(&crate::launch_profile::environment)
-                .and_then(|args| ImportProfile::resolve(&args, &home))
-                .is_ok_and(|import| import.provider() == Some(provider.as_str()))
+        profile
+            .expanded_args(&crate::launch_profile::environment)
+            .and_then(|args| ImportProfile::resolve(&args, &home))
+            .is_ok_and(|import| import.provider() == Some(provider.as_str()))
     };
     targets
         .iter()
         .copied()
         .filter(|target| {
             target.provider == Provider::Codex
+                && target.uses_provider_program().unwrap_or(false)
                 && target.profile.is_some_and(supplies)
                 && target.check().is_ok()
         })
@@ -191,26 +215,21 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
     ensure_supported(binary)?;
     let source_home = temporary_home().context("creating isolated Codex import source")?;
     let source_path = write_external_session(source_home.path(), cwd, import)?;
-    let codex_home = codex_home()?;
+    let codex_home = &import.home;
     if env::var_os("CODEX_HOME").is_none_or(|path| path.is_empty()) && !codex_home.is_dir() {
         // The import process needs an explicit target because its HOME holds the temporary source.
         #[cfg(unix)]
         let created = std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
-            .create(&codex_home);
+            .create(codex_home);
         #[cfg(not(unix))]
-        let created = fs::create_dir(&codex_home);
+        let created = fs::create_dir(codex_home);
         if let Err(error) = created
             && !(error.kind() == std::io::ErrorKind::AlreadyExists && codex_home.is_dir())
         {
             return Err(error).context("creating the default Codex home for native import");
         }
     }
-    let mut server = AppServer::start(
-        binary,
-        cwd,
-        &import.profile,
-        Some((source_home.path(), &codex_home)),
-    )?;
+    let mut server = AppServer::start(binary, cwd, import, Some(source_home.path()))?;
     server.initialize().map_err(|error| {
         if codex_home.is_dir() {
             error
@@ -368,10 +387,9 @@ fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Resu
 
 fn codex_home() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
-        let path = PathBuf::from(path);
-        if !path.is_absolute() {
-            bail!("CODEX_HOME must be absolute for native Codex import");
-        }
+        let path = CodexAdapter::absolute_home(Path::new(&path))?;
+        path.to_str()
+            .context("Codex requires a Unicode path in CODEX_HOME")?;
         return Ok(path);
     }
     CodexAdapter::default_home().context("resolving home directory for Codex import")
@@ -566,7 +584,7 @@ pub fn rollback(
     target: &SessionRef,
     import: &CodexImport,
 ) -> Result<()> {
-    let mut server = AppServer::start(binary, cwd, &import.profile, None)?;
+    let mut server = AppServer::start(binary, cwd, import, None)?;
     server.initialize()?;
     server.request("thread/delete", &json!({ "threadId": target.id }))?;
     server.shutdown().context("flushing Codex rollback")
@@ -661,17 +679,22 @@ impl AppServer {
     fn start(
         binary: &Path,
         cwd: &Path,
-        profile: &ImportProfile,
-        import_environment: Option<(&Path, &Path)>,
+        import: &CodexImport,
+        source_home: Option<&Path>,
     ) -> Result<Self> {
         let mut command = crate::provider_launch::provider_process(binary)?;
         command.args(["app-server", "--stdio"]).current_dir(cwd);
-        profile.apply(&mut command);
-        if let Some((source_home, codex_home)) = import_environment {
+        import.profile.apply(&mut command);
+        let sqlite_home = import
+            .sqlite_home_arg
+            .as_deref()
+            .context("missing verified Codex import SQLite home")?;
+        command.args(["-c", sqlite_home]);
+        command.env("CODEX_HOME", &import.home);
+        if let Some(source_home) = source_home {
             command
                 .env("HOME", source_home)
-                .env("USERPROFILE", source_home)
-                .env("CODEX_HOME", codex_home);
+                .env("USERPROFILE", source_home);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -870,6 +893,8 @@ mod tests {
             title: None,
             tool_events: 0,
             truncated: false,
+            home: PathBuf::new(),
+            sqlite_home_arg: None,
             profile: ImportProfile::default(),
         };
         let user =
