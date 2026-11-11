@@ -34,6 +34,7 @@ use omnis_ir::{
 };
 use omnis_store::{
     IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
+    TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -121,18 +122,22 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        let cache = Store::open_default().and_then(|store| {
+            let prior = store.trajectory_index_state(session)?;
+            Ok((store, prior))
+        });
         let snapshot = read_session(self, session)?;
-        match Store::open_default() {
-            Ok(store) => {
-                let current = match store
-                    .session_trajectory_source_is_current(session, snapshot.captured_at)
-                {
-                    Ok(current) => current,
-                    Err(error) => {
-                        eprintln!("warning: local trajectory index status: {error}");
-                        false
-                    }
-                };
+        match cache {
+            Ok((store, prior)) => {
+                let current = prior.is_some_and(|state| {
+                    state.source_complete
+                        && state.document_version >= omnis_core::SEARCH_DOCUMENT_VERSION
+                        && !search_index::source_time_changed(
+                            session.provider,
+                            snapshot.captured_at,
+                            state.source_updated_at,
+                        )
+                });
                 if !current {
                     let document = trajectory_search_document(&snapshot);
                     if let Err(error) = store_search_document(
@@ -146,7 +151,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         } else {
                             SessionTrajectoryOrigin::Native
                         },
-                        snapshot.captured_at,
+                        search_index::source_guard(session.provider, prior.as_ref()),
                     ) {
                         eprintln!("warning: local trajectory index write: {error}");
                     }
@@ -170,14 +175,14 @@ fn store_search_document(
     document: &omnis_core::SearchDocument,
     full_read: bool,
     origin: SessionTrajectoryOrigin,
-    source_updated_at: chrono::DateTime<Utc>,
+    guard: TrajectorySourceGuard,
 ) -> omnis_store::Result<Option<String>> {
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_trajectory_document(
+    store.upsert_observed_trajectory_documents(&[(
         session,
-        &omnis_store::TrajectoryDocument {
+        omnis_store::TrajectoryDocument {
             redacted_text: &document.text,
-            source_updated_at,
+            source_updated_at: snapshot.captured_at,
             source_byte_count: document.source_byte_count,
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
@@ -186,7 +191,8 @@ fn store_search_document(
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
         },
-    )?;
+        guard,
+    )])?;
     Ok(derived_title)
 }
 
@@ -2434,7 +2440,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         &document,
         true,
         SessionTrajectoryOrigin::ImportedBundle,
-        bundle.snapshot.captured_at,
+        TrajectorySourceGuard::NewerSource,
     )
     .context("indexing imported bundle trajectory")?;
     Ok(())

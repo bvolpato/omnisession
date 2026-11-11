@@ -453,6 +453,17 @@ pub(super) fn spawn_preview_updates(
                     queue = VecDeque::from(newer);
                 }
                 let full_read = key.continuation_after.is_some();
+                let writer = store.as_ref().and_then(|store| {
+                    match crate::search_index::observe_source(store, &key.session) {
+                        Ok(guard) => Some((store, guard)),
+                        Err(error) => {
+                            let _ = sender.send(PickerUpdate::Warning(format!(
+                                "trajectory index status: {error}"
+                            )));
+                            None
+                        }
+                    }
+                });
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
@@ -465,7 +476,7 @@ pub(super) fn spawn_preview_updates(
                         registry.preview_session(&key.session)
                     };
                     snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
-                        if let Some(store) = &store {
+                        if let Some((store, guard)) = writer {
                             let document = trajectory_search_document(&snapshot);
                             if let Err(error) = crate::store_search_document(
                                 store,
@@ -478,7 +489,7 @@ pub(super) fn spawn_preview_updates(
                                 } else {
                                     SessionTrajectoryOrigin::Native
                                 },
-                                snapshot.captured_at,
+                                guard,
                             ) {
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"
