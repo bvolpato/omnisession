@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use super::rollout_lines::{valid_envelope, valid_event};
+use super::rollout_lines::{Wire, classify_event, valid_envelope};
 use super::workspace_damage::{
     DamagedWorkspace, damaged_workspace_record, oversized_workspace_record,
 };
-use super::{RolloutWorkspace, WorkspaceSettings, oversized_settings_marker, string_at};
+use super::{RolloutWorkspace, WorkspaceSettings, oversized_settings_marker};
 use crate::support::{JsonLine, JsonLineLocation};
 
 #[derive(Default)]
@@ -59,7 +59,8 @@ impl WorkspaceRecords {
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("turn_context"), _) => !self.paginated || valid_envelope(record),
             (Some("event_msg"), Some("thread_rolled_back" | "thread_settings_applied")) => {
-                !self.paginated || (valid_envelope(record) && valid_event(payload))
+                !self.paginated
+                    || (valid_envelope(record) && classify_event(payload) != Wire::Invalid)
             }
             _ => false,
         }
@@ -111,7 +112,7 @@ impl WorkspaceRecords {
         self.workspace.settings.observe(session, record);
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("turn_context"), _) => {
-                if let Some(cwd) = string_at(payload, &[&["cwd"]]) {
+                if let Some(cwd) = payload["cwd"].as_str() {
                     self.workspace.directory = Some(PathBuf::from(cwd));
                     self.restore_context();
                 }
@@ -143,7 +144,11 @@ impl WorkspaceRecords {
         if self.had_gap() && self.invalid_rollback {
             self.workspace.rolled_back = false;
         }
-        let directory = self.workspace.settings.directory(self.workspace.directory);
+        let directory = self
+            .workspace
+            .settings
+            .directory(self.workspace.directory)
+            .filter(|path| path.is_absolute());
         let unverified = match self.settings_gap {
             Some(SettingsGap::PossibleSettings) => true,
             Some(SettingsGap::Unclassified(locations))

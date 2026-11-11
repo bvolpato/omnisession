@@ -3050,9 +3050,48 @@ mod tests {
         }
     }
 
+    fn fixture_workspace() -> &'static Path {
+        Path::new(if cfg!(windows) {
+            r"C:\workspace"
+        } else {
+            "/workspace"
+        })
+    }
+
+    #[test]
+    fn codex_picker_scope_requires_an_absolute_recorded_directory() {
+        let current = std::env::current_dir().expect("current directory");
+        let projects = [
+            ("absolute", current.as_path()),
+            ("relative", Path::new(".")),
+            #[cfg(windows)]
+            ("rooted-without-drive", Path::new(r"\workspace")),
+            #[cfg(windows)]
+            ("drive-relative", Path::new("C:workspace")),
+        ];
+        let sessions = projects
+            .iter()
+            .map(|(id, project)| session(Provider::Codex, id, project, None))
+            .collect();
+        let mut state = PickerState::new(sessions, &current, Some(Provider::Codex), false);
+
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state
+                .selected_entry()
+                .expect("absolute project")
+                .session
+                .session
+                .id,
+            "absolute"
+        );
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), projects.len());
+    }
+
     #[test]
     fn filtering_combines_scope_provider_and_search() {
-        let current = Path::new("/workspace/current");
+        let current = &fixture_workspace().join("current");
         let mut state = PickerState::new(
             vec![
                 session(
@@ -3070,7 +3109,7 @@ mod tests {
                 session(
                     Provider::Claude,
                     "claude-other",
-                    Path::new("/workspace/other"),
+                    &fixture_workspace().join("other"),
                     Some("Billing"),
                 ),
             ],
@@ -3095,13 +3134,13 @@ mod tests {
         );
         state.query = "aude-oth".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
-        state.query = "workspace/other".to_owned();
+        state.query = format!("workspace{MAIN_SEPARATOR}other");
         assert_eq!(state.visible_indices().len(), 1);
     }
 
     #[test]
     fn provider_cycle_includes_all_sources() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
         assert_eq!(state.provider(), None);
         state.cycle_provider(false);
         assert_eq!(state.provider(), Some(Provider::Claude));
@@ -3117,10 +3156,10 @@ mod tests {
             vec![session(
                 Provider::Codex,
                 "session",
-                Path::new("/workspace"),
+                fixture_workspace(),
                 None,
             )],
-            Path::new("/workspace"),
+            fixture_workspace(),
             None,
             false,
         );
@@ -3140,7 +3179,7 @@ mod tests {
 
     #[test]
     fn update_offer_opens_from_help_and_renders_in_footer() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
         state.available_update = Some("99.1.2".to_owned());
         assert_eq!(
             handle_key(
@@ -3220,7 +3259,7 @@ mod tests {
 
     #[test]
     fn footer_keeps_key_hints_and_help_lists_provider_warnings() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(Vec::new(), current, None, true);
         let mut render_state = PickerRenderState::default();
         let warnings = [
@@ -3253,7 +3292,7 @@ mod tests {
 
     #[test]
     fn ctrl_u_clears_query_even_with_available_update() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
         state.available_update = Some("99.1.2".to_owned());
         state.query = "needle".to_owned();
         assert_eq!(
@@ -3269,7 +3308,7 @@ mod tests {
 
     #[test]
     fn esc_clears_search_before_quitting() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -3303,7 +3342,7 @@ mod tests {
 
     #[test]
     fn home_end_emacs_and_word_keys_edit_selection_and_query() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             (0..5)
                 .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
@@ -3339,7 +3378,7 @@ mod tests {
 
     #[test]
     fn double_click_opens_the_first_clicked_row_after_recentering() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             (0..20)
                 .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
@@ -3374,7 +3413,7 @@ mod tests {
 
     #[test]
     fn mouse_click_selects_double_click_opens_and_wheel_scrolls() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             (0..20)
                 .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
@@ -3493,7 +3532,7 @@ mod tests {
 
     #[test]
     fn detail_pane_puts_conversation_first_and_scrolls() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -3545,7 +3584,7 @@ mod tests {
 
     #[test]
     fn preview_titles_become_searchable() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(Provider::Codex, "session", current, None)],
             current,
@@ -3568,7 +3607,7 @@ mod tests {
 
     #[test]
     fn derived_titles_fill_missing_titles_and_become_searchable() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(Provider::Codex, "untitled", current, None),
@@ -3603,7 +3642,7 @@ mod tests {
 
     #[test]
     fn index_requests_start_with_current_workspace_and_known_sources() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let with_source = |provider, id: &str, project: &Path| {
             let mut native = session(provider, id, project, None);
             native.source_path = Some(PathBuf::from(format!("/synthetic/{id}.jsonl")));
@@ -3611,7 +3650,7 @@ mod tests {
         };
         let mut state = PickerState::new(
             vec![
-                with_source(Provider::Codex, "other", Path::new("/workspace/other")),
+                with_source(Provider::Codex, "other", &fixture_workspace().join("other")),
                 with_source(Provider::Codex, "current", current),
                 session(Provider::Codex, "no-source", current, None),
                 with_source(Provider::OpenCode, "opencode", current),
@@ -3635,7 +3674,7 @@ mod tests {
 
     #[test]
     fn header_shows_conversation_indexing_progress() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
         state.index_progress = Some((45, 100));
         let mut render_state = PickerRenderState::default();
 
@@ -3651,7 +3690,7 @@ mod tests {
 
     #[test]
     fn long_notice_replaces_hints_instead_of_truncating_them() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
         state.notice = Some(NO_TARGET_NOTICE.to_owned());
         let mut render_state = PickerRenderState::default();
 
@@ -3710,7 +3749,7 @@ mod tests {
 
     #[test]
     fn delete_key_requires_confirmation_and_renders_selected_session() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -3768,7 +3807,7 @@ mod tests {
 
     #[test]
     fn deleting_row_preserves_position_and_blocks_stale_refresh() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let deleted = SessionRef::new(Provider::Codex, "deleted");
         let mut state = PickerState::new(
             vec![
@@ -3814,7 +3853,7 @@ mod tests {
 
     #[test]
     fn unsupported_provider_delete_stays_read_only() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(Provider::Imported, "session", current, None)],
             current,
@@ -3835,7 +3874,7 @@ mod tests {
 
     #[test]
     fn newest_session_is_selected_before_new_session_row() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -3905,7 +3944,7 @@ mod tests {
 
     #[test]
     fn repeated_picker_frames_clear_only_after_terminal_resize() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -3944,7 +3983,7 @@ mod tests {
 
     #[test]
     fn session_list_erases_rows_left_by_shorter_results() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -4084,7 +4123,8 @@ mod tests {
 
     #[test]
     fn selected_detail_shows_first_and_latest_messages() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
+        let recorded_dir = current.join("crates").join("omnis-cli");
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -4118,8 +4158,8 @@ mod tests {
                     reasoning_mode: Some("high".to_owned()),
                     total_tokens: Some(12_345),
                     token_usage_is_cumulative: true,
-                    workspace_root: Some(PathBuf::from("/workspace")),
-                    current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
+                    workspace_root: Some(current.to_path_buf()),
+                    current_dir: Some(recorded_dir.clone()),
                     git_branch: Some("feature/session-details".to_owned()),
                     git_head: Some("0123456789abcdef".to_owned()),
                 }),
@@ -4138,7 +4178,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("/workspace/crates/omnis-cli"))
+                .any(|line| line.contains(recorded_dir.to_string_lossy().as_ref()))
         );
         assert!(
             lines
@@ -4167,7 +4207,7 @@ mod tests {
 
     #[test]
     fn searched_detail_promotes_complete_tree_with_missing_parent() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let selected = SessionRef::new(Provider::Codex, "selected");
         let child = SessionRef::new(Provider::OpenCode, "child");
         let missing = SessionRef::new(Provider::Claude, "missing-parent-session");
@@ -4240,7 +4280,7 @@ mod tests {
 
     #[test]
     fn preview_requests_cover_rendered_viewport_with_selected_first() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             (0..60)
                 .map(|index| session(Provider::Claude, &format!("session-{index}"), current, None))
@@ -4273,7 +4313,7 @@ mod tests {
 
     #[test]
     fn preview_requests_include_filtered_lineage_sessions() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let parent = SessionRef::new(Provider::Claude, "parent");
         let child = SessionRef::new(Provider::Codex, "child");
         let mut state = PickerState::new(
@@ -4340,7 +4380,7 @@ mod tests {
         let session = session(
             Provider::Codex,
             "019f4e2b-2c98-7f03-8e2d-5f229240bba1",
-            Path::new("/workspace"),
+            fixture_workspace(),
             None,
         );
         let columns = ListColumns::for_width(100, false);
@@ -4360,7 +4400,7 @@ mod tests {
         let session = session(
             Provider::Hermes,
             "session-id",
-            Path::new("/workspace"),
+            fixture_workspace(),
             Some("deploy with sk-proj-abcdefghijklmnopqrstuvwxyz123456"),
         );
 
@@ -4379,7 +4419,7 @@ mod tests {
 
     #[test]
     fn list_title_uses_first_message_preview() {
-        let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
+        let session = session(Provider::Codex, "session-id", fixture_workspace(), None);
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
                 first: Some(HandoffMessage {
@@ -4422,7 +4462,7 @@ mod tests {
         let session = session(
             Provider::OpenCode,
             "target",
-            Path::new("/workspace"),
+            fixture_workspace(),
             Some("Imported from codex:source"),
         );
         let preview = PreviewValue::Ready {
@@ -4470,13 +4510,13 @@ mod tests {
 
     #[test]
     fn fuzzy_search_ranks_title_matches_and_tolerates_word_gaps() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(
                     Provider::Codex,
                     "path-only",
-                    Path::new("/workspace/rate-limiter"),
+                    &fixture_workspace().join("rate-limiter"),
                     Some("Unrelated cleanup"),
                 ),
                 session(
@@ -4507,7 +4547,7 @@ mod tests {
 
     #[test]
     fn quoted_query_filters_rows_by_exact_phrase() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(
@@ -4541,7 +4581,7 @@ mod tests {
 
     #[test]
     fn trajectory_matches_extend_metadata_search_results() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(Provider::Codex, "auth", current, Some("Auth refactor")),
@@ -4566,7 +4606,7 @@ mod tests {
 
     #[test]
     fn trajectory_results_select_first_match_after_automatic_new_session_selection() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(Provider::Claude, "first", current, Some("First summary")),
@@ -4631,7 +4671,7 @@ mod tests {
 
     #[test]
     fn moving_down_before_trajectory_results_does_not_pin_new_session() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -4663,7 +4703,7 @@ mod tests {
 
     #[test]
     fn trajectory_results_keep_explicit_new_session_selection() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
@@ -4702,7 +4742,7 @@ mod tests {
 
     #[test]
     fn trajectory_results_append_without_moving_metadata_selection() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(
@@ -4767,7 +4807,7 @@ mod tests {
 
     #[test]
     fn trajectory_only_rows_preserve_ranked_page_order() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(Provider::Claude, "first", current, Some("Unrelated one")),
@@ -4803,7 +4843,7 @@ mod tests {
         let session = session(
             Provider::Claude,
             "trajectory",
-            Path::new("/workspace"),
+            fixture_workspace(),
             Some("Unrelated visible title"),
         );
 
@@ -4848,7 +4888,7 @@ mod tests {
 
     #[test]
     fn trajectory_match_refresh_preserves_selected_session() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             (0..20)
                 .map(|index| {
@@ -4899,7 +4939,7 @@ mod tests {
 
     #[test]
     fn trajectory_search_is_debounced_and_generation_scoped() {
-        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, true);
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, true);
         state.query = "database lock".to_owned();
         state.query_changed();
 
@@ -4917,7 +4957,7 @@ mod tests {
 
     #[test]
     fn trajectory_search_request_snapshots_workspace_and_provider_eligibility() {
-        let current = Path::new("/workspace/current");
+        let current = &fixture_workspace().join("current");
         let mut state = PickerState::new(
             vec![
                 session(Provider::Codex, "current-codex", current, None),
@@ -4925,7 +4965,7 @@ mod tests {
                 session(
                     Provider::Codex,
                     "other-codex",
-                    Path::new("/workspace/other"),
+                    &fixture_workspace().join("other"),
                     None,
                 ),
             ],
@@ -5003,7 +5043,7 @@ mod tests {
 
     #[test]
     fn provider_refresh_replaces_cached_rows_without_resetting_other_providers() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![
                 session(Provider::Claude, "stale", current, None),
@@ -5099,7 +5139,7 @@ mod tests {
 
     #[test]
     fn lineage_update_groups_sessions_without_changing_selection() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let root = SessionRef::new(Provider::Claude, "root");
         let first_child = SessionRef::new(Provider::Codex, "first-child");
         let selected_child = SessionRef::new(Provider::OpenCode, "selected-child");
@@ -5173,7 +5213,7 @@ mod tests {
         let session = session(
             Provider::OpenCode,
             "child",
-            Path::new("/workspace"),
+            fixture_workspace(),
             Some("Linked continuation"),
         );
         let columns = ListColumns::for_width(120, false);
@@ -5212,7 +5252,7 @@ mod tests {
 
     #[test]
     fn provider_failure_keeps_cached_snapshot() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let (sender, receiver) = mpsc::channel();
         sender
             .send(PickerUpdate::Cached(Ok(picker_entries(
@@ -5251,7 +5291,7 @@ mod tests {
 
     #[test]
     fn provider_refresh_keeps_unobserved_entries_until_discovery_is_complete() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let omitted = session(
             Provider::Claude,
             "unobserved",

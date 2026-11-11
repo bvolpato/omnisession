@@ -1932,12 +1932,13 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
             None,
         )?
     } else {
-        let matches = transfer_repository_matches(&source, &snapshot, &current)?;
         let project = if source.provider == Provider::Codex && target.provider == source.provider {
             transfer::codex_launch_directory(current, Some(&snapshot.workspace.current_dir))?
         } else {
             current
         };
+        let effective = codex_import::profile_working_directory(target, &project)?;
+        let matches = transfer_repository_matches(&source, &snapshot, &effective)?;
         (project, matches)
     };
     transfer::launch_mode_args(

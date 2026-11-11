@@ -224,3 +224,62 @@ fn uploaded_images_match_their_legacy_file_ids_in_either_order() {
         }
     }
 }
+
+#[test]
+fn overlapping_local_and_inline_images_match_and_roll_back_one_request() {
+    let caption = "compare the two photos";
+    let local = [
+        json!({"type":"input_text","text":"<image name=[Image #1] path=\"photo.png\">"}),
+        json!({"type":"input_image","image_url":"synthetic-image"}),
+        json!({"type":"input_text","text":"</image>"}),
+    ];
+    let bare = json!({"type":"input_image","image_url":"synthetic-image"});
+    let legacy = event(
+        "user_message",
+        json!({
+            "message":caption,"local_images":["photo.png"],"images":["synthetic-image"]
+        }),
+    );
+    for attachments in [
+        [local.to_vec(), vec![bare.clone()]].concat(),
+        [vec![bare], local.to_vec()].concat(),
+    ] {
+        let mut content = vec![json!({"type":"input_text","text":caption})];
+        content.extend(attachments);
+        let raw = json!({"type":"response_item","payload":{"type":"message","role":"user","content":content}});
+        let mut rows = vec![message("user", "keep this"), raw, legacy.clone()];
+        for expected in [vec!["keep this", caption], vec!["keep this"]] {
+            for preview in [false, true] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(rows.clone(), preview).unwrap()),
+                    expected
+                );
+            }
+            rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+    }
+}
+
+#[test]
+fn bounded_attachment_matching_keeps_inconclusive_occurrences_separate() {
+    let caption = "repeated photos";
+    for (copies, expected) in [(4, 1), (64, 2)] {
+        let mut content = vec![json!({"type":"input_text","text":caption})];
+        for _ in 0..2 * copies {
+            content.extend([
+                json!({"type":"input_text","text":"<image name=[Image #1] path=\"photo.png\">"}),
+                json!({"type":"input_image","file_id":"file-1"}),
+                json!({"type":"input_text","text":"</image>"}),
+            ]);
+        }
+        let raw = json!({"type":"response_item","payload":{"type":"message","role":"user","content":content}});
+        let legacy = event(
+            "user_message",
+            json!({
+                "message":caption,"local_images":vec!["photo.png"; copies],"file_ids":vec!["file-1"; copies]
+            }),
+        );
+        let snapshot = read_records_with_preview(vec![raw, legacy], false).unwrap();
+        assert_eq!(visible_text(&snapshot), vec![caption; expected]);
+    }
+}

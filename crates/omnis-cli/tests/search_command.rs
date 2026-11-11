@@ -8,6 +8,9 @@ use std::{
 
 use serde_json::{Value, json};
 
+#[path = "search_command/codex_home.rs"]
+mod codex_home;
+
 const CLAUDE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CODEX_ID: &str = "019f0000-0000-7000-8000-000000000001";
 const OTHER_CODEX_ID: &str = "019f0000-0000-7000-8000-000000000002";

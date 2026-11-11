@@ -201,15 +201,20 @@ pub(super) fn exchange(
 
 #[test]
 fn paginated_rollback_uses_the_surviving_workspace_and_keeps_its_display() {
-    let with_directory = |turn, path, copied| {
+    let work = tempfile::tempdir().unwrap();
+    let one = work.path().join("one");
+    let two = work.path().join("two");
+    let three = work.path().join("three");
+    let original = std::env::temp_dir();
+    let with_directory = |turn, path: &std::path::Path, copied| {
         // Migration can write the original turn context before the generated start marker.
         let mut rows = vec![json!({"type":"turn_context","payload":{"turn_id":turn,"cwd":path}})];
         rows.extend(exchange(turn, turn, "answer", copied));
         rows
     };
-    let first = with_directory("first", "/workspace/one", true);
-    let second = with_directory("second", "/workspace/two", true);
-    let typed = with_directory("typed", "/workspace/three", false);
+    let first = with_directory("first", one.as_path(), true);
+    let second = with_directory("second", two.as_path(), true);
+    let typed = with_directory("typed", three.as_path(), false);
     let rollback = || event("thread_rolled_back", json!({"num_turns":1}));
     let mut ambiguous = second.clone();
     let user = ambiguous
@@ -229,37 +234,34 @@ fn paginated_rollback_uses_the_surviving_workspace_and_keeps_its_display() {
     for (rows, directory, kept) in [
         (
             [first.clone(), second.clone(), vec![rollback()]].concat(),
-            "/workspace/one",
+            one.as_path(),
             vec!["first"],
         ),
         (
             [first.clone(), second.clone(), typed, vec![rollback()]].concat(),
-            "/workspace/three",
+            three.as_path(),
             vec!["first", "typed"],
         ),
         (
             [first.clone(), second, vec![rollback(), rollback()]].concat(),
-            "/workspace/original",
+            original.as_path(),
             vec![],
         ),
         (
             [first.clone(), ambiguous, vec![rollback()]].concat(),
-            "",
+            std::path::Path::new(""),
             vec!["first"],
         ),
         (
             [first, steer, vec![rollback()]].concat(),
-            "/workspace/two",
+            two.as_path(),
             vec!["first", "second"],
         ),
     ] {
         for preview in [false, true] {
             let snapshot =
                 read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
-            assert_eq!(
-                snapshot.workspace.current_dir,
-                std::path::Path::new(directory)
-            );
+            assert_eq!(snapshot.workspace.current_dir, directory);
             assert!(visible_text(&snapshot).contains(&"second"));
             let active: Vec<_> = omnis_core::import_conversation(&snapshot)
                 .messages
@@ -1384,10 +1386,7 @@ fn a_damaged_checkpoint_preserves_the_last_verified_window() {
                 search.text.contains("first request") && search.text.contains("second request")
             );
             assert!(!search.text.contains("private checkpoint field"));
-            assert_eq!(
-                snapshot.workspace.current_dir,
-                std::path::Path::new("/workspace/original")
-            );
+            assert_eq!(snapshot.workspace.current_dir, std::env::temp_dir());
         }
     }
 }

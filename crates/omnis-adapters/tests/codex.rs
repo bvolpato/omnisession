@@ -64,7 +64,7 @@ fn read_with_history_mode(
         .join(format!("sessions/rollout-{SESSION_ID}.jsonl"));
     let mut header = json!({
         "type": "session_meta",
-        "payload": {"id": SESSION_ID, "cwd": "/workspace/original", "git":{"branch":"original"}},
+        "payload": {"id": SESSION_ID, "cwd": std::env::temp_dir(), "git":{"branch":"original"}},
     });
     if let Some(mode) = mode {
         header["payload"]["history_mode"] = mode.into();
@@ -153,12 +153,12 @@ fn migrated_codex_messages_survive_full_reads_and_previews() {
         let snapshot = read_records_with_preview(
             vec![
                 request.clone(),
-                completed(&json!({"type":"Reasoning","id":"private","raw_content":["private reasoning"]})),
-                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"private hook context"}]})),
+                completed(&json!({"type":"Reasoning","id":"fixture-private-id","raw_content":["fixture-private-reasoning"]})),
+                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"fixture-private-hook"}]})),
                 answer.clone(),
                 message("assistant", "The entry expired."),
                 completed(&json!({"type":"AgentMessage","id":"item-3","content":[{"type":"Text","text":"The entry expired."}]})),
-                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"private-image.png"}]})),
+                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"fixture-private-image.png"}]})),
             ],
             preview,
         ).unwrap();
@@ -172,7 +172,7 @@ fn migrated_codex_messages_survive_full_reads_and_previews() {
             ]
         );
         let encoded = serde_json::to_string(&snapshot).unwrap();
-        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("fixture-private-"));
     }
 }
 
@@ -463,7 +463,9 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
     let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
     let adapter = CodexAdapter::with_root(home.path());
     let session = SessionRef::new(Provider::Codex, SESSION_ID);
-    let check = |directory: Option<&str>| {
+    let initial = home.path();
+    let later = initial.join("later");
+    let check = |directory: Option<&Path>| {
         assert_eq!(
             adapter
                 .native_workspace(&session)
@@ -471,14 +473,14 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
                 .unwrap()
                 .directory
                 .as_deref(),
-            directory.map(Path::new)
+            directory
         );
         let full = adapter.read_session(&session).unwrap();
         let preview = adapter.preview_session(&session).unwrap();
         for snapshot in [&full, &preview] {
             assert_eq!(
                 snapshot.workspace.current_dir,
-                Path::new(directory.unwrap_or_default())
+                directory.unwrap_or(Path::new(""))
             );
             assert_eq!(visible_text(snapshot), ["surviving answer"]);
         }
@@ -492,7 +494,7 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
     writeln!(
         file,
         "{}",
-        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace/initial"}})
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":initial}})
     )
     .unwrap();
     writeln!(file, "{}", message("assistant", "surviving answer")).unwrap();
@@ -501,16 +503,16 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
         r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"turn_context"#
     )
     .unwrap();
-    check(Some("/workspace/initial"));
+    check(Some(initial));
     writeln!(file, r#"{{"type":"turn_context","payload":"#).unwrap();
     check(None);
     writeln!(
         file,
         "{}",
-        json!({"type":"turn_context","payload":{"cwd":"/workspace/later"}})
+        json!({"type":"turn_context","payload":{"cwd":&later}})
     )
     .unwrap();
-    check(Some("/workspace/later"));
+    check(Some(&later));
     writeln!(
         file,
         r#"{{"type":"event_msg","payload":{{"type":"thread_settings_applied","thread_settings":"#
@@ -519,7 +521,7 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
     writeln!(
         file,
         "{}",
-        json!({"type":"turn_context","payload":{"cwd":"/workspace/unverified"}})
+        json!({"type":"turn_context","payload":{"cwd":initial.join("unverified")}})
     )
     .unwrap();
     check(None);
@@ -527,7 +529,9 @@ fn damaged_workspace_records_clear_routes_until_later_evidence() {
 
 #[test]
 fn legacy_rollback_only_restores_directory_evidence_after_a_gap() {
-    let turn = |id: &str, cwd: &str| {
+    let work = tempfile::tempdir().unwrap();
+    let survivor = work.path().join("survivor");
+    let turn = |id: &str, cwd: &Path| {
         [
             event("task_started", json!({"turn_id": id})),
             json!({"type":"turn_context","payload":{"turn_id":id,"cwd":cwd}}),
@@ -537,10 +541,10 @@ fn legacy_rollback_only_restores_directory_evidence_after_a_gap() {
         .map(|r| r.to_string())
     };
     let rollback = |count| event("thread_rolled_back", json!({"num_turns":count})).to_string();
-    let mut records = Vec::from(turn("old", "/workspace/original"));
+    let mut records = Vec::from(turn("old", work.path()));
     records.push(r#"{"type":"turn_context","payload":"#.to_owned());
-    records.extend(turn("first", "/workspace/survivor"));
-    records.extend(turn("second", "/workspace/withdrawn"));
+    records.extend(turn("first", &survivor));
+    records.extend(turn("second", &work.path().join("withdrawn")));
     records.push(rollback(1));
     for preview in [false, true] {
         assert_eq!(
@@ -548,7 +552,7 @@ fn legacy_rollback_only_restores_directory_evidence_after_a_gap() {
                 .unwrap()
                 .workspace
                 .current_dir,
-            Path::new("/workspace/survivor")
+            survivor
         );
     }
     records.extend([
@@ -573,14 +577,17 @@ fn legacy_rollback_only_restores_directory_evidence_after_a_gap() {
 #[test]
 fn changed_turn_directory_does_not_inherit_creation_git() {
     let padding = json!({"type":"event_msg","payload":{"note":"x".repeat(2_048)}}).to_string();
-    let context = r#"{"type":"turn_\u0063ontext","payload":{"cwd":"/workspace/elsewhere"}}"#;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let context = json!({"type":"turn_context","payload":{"cwd":elsewhere.path()}})
+        .to_string()
+        .replace("turn_context", r"turn_\u0063ontext");
     let records: Vec<_> = std::iter::repeat_n(padding.as_str(), 1_025)
-        .chain([context])
+        .chain([context.as_str()])
         .chain(std::iter::repeat_n(padding.as_str(), 1_025))
         .collect();
     for preview in [false, true] {
         let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
-        assert_eq!(snapshot.workspace.root, Path::new("/workspace/elsewhere"));
+        assert_eq!(snapshot.workspace.root, elsewhere.path());
         assert_eq!(snapshot.workspace.git, omnis_ir::GitState::default());
     }
 }
@@ -590,16 +597,17 @@ fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
     use std::io::Write as _;
 
     let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join("recovered");
     let sessions = home.path().join("sessions");
     fs::create_dir(&sessions).unwrap();
     let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
     writeln!(
         file,
         "{}",
-        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace/initial"}})
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":home.path()}})
     )
     .unwrap();
-    writeln!(file, "{}", json!({"type":"turn_context","payload":{"cwd":"/workspace/unreadable","padding":"x".repeat(16*1024*1024)}})).unwrap();
+    writeln!(file, "{}", json!({"type":"turn_context","payload":{"cwd":home.path().join("unreadable"),"padding":"x".repeat(16*1024*1024)}})).unwrap();
     writeln!(file, "{}", message("assistant", "A recent reply")).unwrap();
 
     let adapter = CodexAdapter::with_root(home.path());
@@ -628,7 +636,7 @@ fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
     writeln!(
         file,
         "{}",
-        json!({"type":"turn_context","payload":{"cwd":"/workspace/recovered"}})
+        json!({"type":"turn_context","payload":{"cwd":directory}})
     )
     .unwrap();
     writeln!(
@@ -637,7 +645,6 @@ fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
         event("thread_rolled_back", json!({"num_turns": 0}))
     )
     .unwrap();
-    let directory = Path::new("/workspace/recovered");
     assert_eq!(
         adapter
             .native_workspace(&session)
@@ -645,7 +652,7 @@ fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
             .unwrap()
             .directory
             .as_deref(),
-        Some(directory)
+        Some(directory.as_path())
     );
     assert_eq!(
         adapter.preview_session(&session).unwrap().workspace.root,
@@ -782,7 +789,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
             json!({
                 "timestamp": "2026-11-01T02:24:47Z",
                 "type": "session_meta",
-                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli", "forked_from_id": SOURCE}
+                "payload": {"id": CHILD, "cwd": temporary.path(), "source": "cli", "forked_from_id": SOURCE}
             })
             .to_string(),
         )
@@ -791,7 +798,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
         let candidates = CodexAdapter::with_root(temporary.path())
             .fork_candidates_created_since(
                 &SessionRef::new(Provider::Codex, SOURCE),
-                Path::new("/workspace/original"),
+                temporary.path(),
                 "2026-11-01T02:24:00Z".parse().expect("start time"),
             )
             .expect("fork candidates");
@@ -848,12 +855,12 @@ fn codex_listing_skips_guardian_subagent_threads() {
 fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
     let snapshot = read_records(vec![
         event("user_message", json!({"message": "keep this request"})),
-        json!({"type": "turn_context", "payload": {"cwd": "/workspace/original"}}),
+        json!({"type": "turn_context", "payload": {"cwd": std::env::temp_dir()}}),
         message("user", "keep this request"),
         message("assistant", "keep this answer"),
         event("task_complete", json!({"turn_id": "kept"})),
         event("task_started", json!({"turn_id": "discarded"})),
-        json!({"type": "turn_context", "payload": {"cwd": "/workspace/discarded", "model": "discarded-model"}}),
+        json!({"type": "turn_context", "payload": {"cwd": std::env::temp_dir().join("discarded"), "model": "discarded-model"}}),
         event("user_message", json!({"message": "discard this request"})),
         message("user", "discard this request"),
         json!({"type": "response_item", "payload": {"type": "function_call", "name": "discarded-tool", "arguments": "{}"}}),
@@ -872,10 +879,7 @@ fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
             "replacement answer"
         ]
     );
-    assert_eq!(
-        snapshot.workspace.current_dir.to_str(),
-        Some("/workspace/original")
-    );
+    assert_eq!(snapshot.workspace.current_dir, std::env::temp_dir());
     assert!(
         !serde_json::to_string(&snapshot)
             .unwrap()

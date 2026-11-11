@@ -19,18 +19,18 @@ pub(super) fn prepare_record(record: &mut Value) -> bool {
         return true;
     }
     let payload = &mut record["payload"];
-    let user = match payload["item"]["type"].as_str() {
-        Some("UserMessage") => true,
-        Some("AgentMessage") => false,
-        _ => return true,
-    };
-    valid_envelope(payload)
-        && payload["item"]["id"].is_string()
-        && if user {
-            prepare_user_message(&mut payload["item"])
-        } else {
-            assistant::valid(&payload["item"])
+    let item = &payload["item"];
+    match item["type"].as_str() {
+        Some("UserMessage" | "AgentMessage" | "Plan")
+            if !valid_envelope(payload) || !item["id"].is_string() =>
+        {
+            false
         }
+        Some("UserMessage") => prepare_user_message(&mut payload["item"]),
+        Some("AgentMessage") => assistant::valid(item),
+        Some("Plan") => item["text"].is_string(),
+        _ => true,
+    }
 }
 
 pub(super) fn valid_envelope(payload: &Value) -> bool {
@@ -88,7 +88,7 @@ fn user_input(part: &mut Value) -> bool {
     }
 }
 
-fn text_element(value: &Value) -> bool {
+pub(super) fn text_element(value: &Value) -> bool {
     checkpoint_wire::fields(
         value,
         &[

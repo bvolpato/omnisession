@@ -17,13 +17,13 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, NativeWorkspace, ProviderAdapter,
+    EnvChange, LaunchPlan, LaunchTarget, NativeSession, NativeWorkspace, ProviderAdapter,
     ProviderInstallation,
     support::{
         EventBuilder, JsonLine, JsonlRecord, MAX_PREVIEW_TAIL_SIZE,
-        MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at,
+        MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
+        json_lines_preview, omitted_images_text, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, sort_sessions, string_at, validate_provider, value_at,
         visit_filtered_streamed_json_lines, visit_index_json_lines, visit_json_lines_tail,
     },
 };
@@ -31,7 +31,7 @@ use crate::{
 mod attachments;
 mod checkpoint_wire;
 mod rollout_lines;
-use rollout_lines::{Admission, RolloutLines};
+use rollout_lines::{Admission, RolloutLines, Wire};
 mod completed_item;
 mod display_text;
 mod message_mirrors;
@@ -103,6 +103,7 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    pin_relative_home: bool,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
     workspace_catalog: Option<Arc<WorkspaceCatalog>>,
@@ -114,14 +115,41 @@ pub struct CodexAdapter {
 impl CodexAdapter {
     #[must_use]
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
+        let home = codex_home.into();
         Self {
-            codex_home: Some(codex_home.into()),
+            pin_relative_home: home.is_relative(),
+            codex_home: Some(canonical_home(home)),
             rollout_cache: None,
             workspace_catalog: None,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
         }
+    }
+
+    fn native_launch(&self, target: &LaunchTarget, args: Vec<String>) -> Result<LaunchPlan> {
+        let mut env = Vec::new();
+        if let Some(home) = self
+            .codex_home
+            .as_deref()
+            .filter(|_| self.pin_relative_home)
+        {
+            let absolute =
+                std::path::absolute(home).context("resolving the selected Codex home")?;
+            let value = absolute
+                .to_str()
+                .context("Codex requires a Unicode path in CODEX_HOME")?;
+            env.push(EnvChange::Set {
+                name: "CODEX_HOME".to_owned(),
+                value: value.to_owned(),
+            });
+        }
+        Ok(LaunchPlan {
+            program: "codex".to_owned(),
+            args,
+            cwd: target.cwd.clone(),
+            env,
+        })
     }
 
     fn discover_session_scan(&self) -> CodexFileScan {
@@ -201,6 +229,7 @@ impl CodexAdapter {
         let mut cache = self
             .rollout_cache
             .as_deref()
+            .filter(|_| cfg!(unix))
             .zip(self.codex_home.as_deref())
             .and_then(|(path, home)| RolloutCache::load(path, home));
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
@@ -388,10 +417,17 @@ impl CodexAdapter {
     }
 }
 
+fn canonical_home(home: PathBuf) -> PathBuf {
+    omnis_core::canonicalize_path(&home).unwrap_or(home)
+}
+
 impl Default for CodexAdapter {
     fn default() -> Self {
-        let codex_home = provider_root("CODEX_HOME", &[".codex"]);
+        let selected = provider_root("CODEX_HOME", &[".codex"]);
+        let pin_relative_home = selected.as_deref().is_some_and(Path::is_relative);
+        let codex_home = selected.map(canonical_home);
         Self {
+            pin_relative_home,
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             workspace_catalog: codex_home
                 .as_deref()
@@ -699,10 +735,20 @@ impl CodexSession {
     }
 
     fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
-        let metadata = fs::metadata(path)?;
-        let records = json_lines_prefix(path, 1)?;
-        Ok(records
-            .first()
+        let file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(anyhow!("provider path is not a file"));
+        }
+        let mut line = Vec::new();
+        std::io::BufReader::new(file.take(MAX_TRANSCRIPT_LINE_SIZE + 1))
+            .read_until(b'\n', &mut line)?;
+        if line.len() as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice(&line)
+            .ok()
+            .as_ref()
             .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, &metadata)))
     }
 
@@ -726,7 +772,9 @@ impl CodexSession {
             id: id.to_owned(),
             title: None,
             path,
-            project_path: string_at(payload, &[&["cwd"]]).map(PathBuf::from),
+            project_path: string_at(payload, &[&["cwd"]])
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute()),
             git: GitState {
                 branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
                     .map(str::to_owned),
@@ -800,7 +848,11 @@ impl CodexSession {
             session: SessionRef::new(Provider::Codex, self.id.clone()),
             title: self.title.clone(),
             project_path: self.project_path.clone(),
-            git_branch: self.git.branch.clone(),
+            git_branch: self
+                .project_path
+                .as_ref()
+                .and(self.git.branch.as_ref())
+                .cloned(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             updated_at_approximate: false,
@@ -991,6 +1043,7 @@ impl CodexSession {
                 if history
                     .rollout_lines
                     .prepare_wire(&mut record, true, Some(true))
+                    != Wire::Invalid
                 {
                     history.push_admitted(&mut events, &record, Admission::ModelOnly)?;
                 }
@@ -1024,6 +1077,20 @@ impl CodexSession {
         } else {
             GitState::default()
         }
+    }
+
+    fn live_workspace(&self) -> Result<NativeWorkspace> {
+        let workspace = self.workspace_metadata(false)?;
+        let directory = if workspace.rolled_back && !workspace.settings.has_owned() {
+            self.canonical_events()?.1
+        } else {
+            workspace.directory
+        };
+        Ok(NativeWorkspace {
+            git: self.git_at(directory.as_deref()),
+            directory,
+            startup_directory: workspace.settings.startup,
+        })
     }
 
     fn snapshot(
@@ -1733,7 +1800,7 @@ impl CodexHistory {
     }
 
     fn observe_turn_directory(&mut self, record: &Value, turn_id: Option<&str>) {
-        if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
+        if let Some(cwd) = record["payload"]["cwd"].as_str() {
             if self.paginated {
                 self.paginated_workspace
                     .observe(turn_id.or(self.active_turn_id.as_deref()), Path::new(&cwd));
@@ -1984,13 +2051,19 @@ impl CodexHistory {
             }
         }
         if self.rollout_lines.skipped > 0 || self.rollout_lines.gap {
+            let reason = if self.rollout_lines.contested {
+                "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
+            } else {
+                "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+            };
             builder.push(
                 EventKind::ProviderEvent,
                 json!({
                     "omitted_events": self.rollout_lines.skipped,
                     "ordinal_gap": self.rollout_lines.gap,
+                    "contested_ordinal": self.rollout_lines.contested,
                     "native_history_unverified": true,
-                    "reason": "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+                    "reason": reason
                 }),
                 None,
                 ReplayPolicy::HistoricalOnly,
@@ -3665,10 +3738,10 @@ fn is_implicit_turn(id: &str) -> bool {
 impl CodexItems {
     fn can_publish_empty(&self, kind: &EventKind) -> bool {
         match kind {
-            EventKind::MessageAssistant => self.identity.scoped(true).is_some(),
-            EventKind::MessageUser => {
-                self.update.is_some() && self.identity.scoped(false).is_some()
+            EventKind::MessageAssistant => {
+                self.update.is_some() || self.identity.scoped(true).is_some()
             }
+            EventKind::MessageUser => self.update.is_some(),
             _ => false,
         }
     }
@@ -3708,9 +3781,7 @@ impl CodexItems {
         if payload["type"] != "item_completed" {
             return push_response_item(builder, payload, timestamp, self);
         }
-        if !turn.is_empty()
-            && !id.is_empty()
-            && payload["item"]["type"] == "Plan"
+        if payload["item"]["type"] == "Plan"
             && let Some(text) = payload["item"]["text"].as_str()
         {
             self.push_plan(builder, turn, id, text, timestamp);
@@ -4474,7 +4545,7 @@ impl ProviderAdapter for CodexAdapter {
         for raw in raw_sessions {
             let mut session = raw.native_session();
             if let Some((catalog, observation)) = catalog.zip(observations.get(&raw.id)) {
-                catalog.apply(raw, &mut session, observation);
+                catalog.apply(raw, &mut session, observation, project);
             }
             if project.is_some_and(|project| {
                 session
@@ -4506,7 +4577,7 @@ impl ProviderAdapter for CodexAdapter {
         if let Some(catalog) = self.workspace_catalog.as_deref()
             && let Some(observation) = catalog.find(id)
         {
-            catalog.apply(&session, &mut native, &observation);
+            catalog.apply(&session, &mut native, &observation, None);
         }
         Ok(Some(native))
     }
@@ -4581,30 +4652,19 @@ impl ProviderAdapter for CodexAdapter {
                 startup_directory: None,
             }));
         }
-        let workspace = native.workspace_metadata(false)?;
-        let directory = if workspace.rolled_back && !workspace.settings.has_owned() {
-            native.canonical_events()?.1
-        } else {
-            workspace.directory
-        };
-        let git = native.git_at(directory.as_deref());
+        let workspace = native.live_workspace()?;
         if let Some(catalog) = self.workspace_catalog.as_deref() {
-            catalog.record(&native, directory.as_deref(), git.branch.as_deref());
+            catalog.record(
+                &native,
+                workspace.directory.as_deref(),
+                workspace.git.branch.as_deref(),
+            );
         }
-        Ok(Some(NativeWorkspace {
-            directory,
-            startup_directory: workspace.settings.startup,
-            git,
-        }))
+        Ok(Some(workspace))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
-        Ok(LaunchPlan {
-            program: "codex".to_owned(),
-            args: target.prompt.iter().cloned().collect(),
-            cwd: target.cwd.clone(),
-            env: Vec::new(),
-        })
+        self.native_launch(target, target.prompt.iter().cloned().collect())
     }
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -4617,12 +4677,7 @@ impl ProviderAdapter for CodexAdapter {
         if let Some(prompt) = &target.prompt {
             args.push(prompt.clone());
         }
-        Ok(LaunchPlan {
-            program: "codex".to_owned(),
-            args,
-            cwd: target.cwd.clone(),
-            env: Vec::new(),
-        })
+        self.native_launch(target, args)
     }
 }
 
@@ -4732,14 +4787,13 @@ mod tests {
         fs::create_dir_all(&day).expect("session day");
         let id = "019a3b1c-0000-7000-8000-000000000001";
         let rollout = day.join(format!("rollout-2026-09-15T10-00-00-{id}.jsonl"));
-        let write_rollout = |cwd: &str| {
-            fs::write(
-                &rollout,
-                format!(
-                    "{{\"timestamp\":\"2026-09-15T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n"
-                ),
-            )
-            .expect("rollout");
+        let write_rollout = |cwd: &Path| {
+            let header = json!({
+                "timestamp": "2026-09-15T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": id, "cwd": cwd}
+            });
+            fs::write(&rollout, format!("{header}\n")).expect("rollout");
         };
         let cache = temporary.path().join("state/cache/codex-rollouts.json");
         let listed_projects = || {
@@ -4752,11 +4806,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        write_rollout("/workspace/original");
-        assert_eq!(
-            listed_projects(),
-            [Some(PathBuf::from("/workspace/original"))]
-        );
+        let original = temporary.path().join("original");
+        let renamed = temporary.path().join("renamed-longer");
+        fs::create_dir(&original).expect("original project");
+        fs::create_dir(&renamed).expect("renamed project");
+        write_rollout(&original);
+        assert_eq!(listed_projects(), [Some(original.clone())]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4770,39 +4825,23 @@ mod tests {
             };
             assert_eq!(mode(&cache), 0o600);
             assert_eq!(mode(cache.parent().expect("cache directory")), 0o700);
+
+            let cached_project = temporary.path().join("cached");
+            let mut cached: Value =
+                serde_json::from_slice(&fs::read(&cache).expect("cache file")).expect("cache JSON");
+            let physical_rollout = fs::canonicalize(&rollout).expect("physical rollout path");
+            cached["rollouts"][physical_rollout.to_str().expect("rollout path")]["header"]["project_path"] =
+                json!(cached_project);
+            fs::write(&cache, cached.to_string()).expect("edited cache");
+            assert_eq!(listed_projects(), [Some(cached_project)]);
+
+            cached["format"] = json!("0-stale");
+            fs::write(&cache, cached.to_string()).expect("stale cache");
+            assert_eq!(listed_projects(), [Some(original)]);
         }
 
-        // Unchanged rollouts are not read again, so an edited cache entry shows through.
-        let cached = fs::read_to_string(&cache).expect("cache file");
-        fs::write(
-            &cache,
-            cached.replace("/workspace/original", "/workspace/cached"),
-        )
-        .expect("edited cache");
-        assert_eq!(
-            listed_projects(),
-            [Some(PathBuf::from("/workspace/cached"))]
-        );
-
-        // A cache written by another parser build is ignored.
-        let mut stale: Value =
-            serde_json::from_slice(&fs::read(&cache).expect("cache file")).expect("cache JSON");
-        stale["format"] = json!("0-stale");
-        fs::write(
-            &cache,
-            serde_json::to_vec(&stale).expect("stale cache JSON"),
-        )
-        .expect("stale cache");
-        assert_eq!(
-            listed_projects(),
-            [Some(PathBuf::from("/workspace/original"))]
-        );
-
-        write_rollout("/workspace/renamed-longer");
-        assert_eq!(
-            listed_projects(),
-            [Some(PathBuf::from("/workspace/renamed-longer"))]
-        );
+        write_rollout(&renamed);
+        assert_eq!(listed_projects(), [Some(renamed)]);
     }
 
     #[test]

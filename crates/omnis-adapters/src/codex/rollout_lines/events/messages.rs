@@ -1,0 +1,78 @@
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::checkpoint_wire::{array, audio, image_detail, optional, optional_phase};
+use super::completed_item::{assistant, text_element};
+
+type Field = (&'static str, fn(&Value) -> bool);
+
+fn fields(payload: &Value, required_positions: usize, schema: &[Field]) -> bool {
+    if let Some(parts) = payload.as_array() {
+        return (required_positions + 1..=schema.len() + 1).contains(&parts.len())
+            && parts
+                .iter()
+                .skip(1)
+                .zip(schema)
+                .all(|(v, (_, valid))| valid(v));
+    }
+    schema
+        .iter()
+        .all(|(key, valid)| payload.get(*key).map_or(*key != "message", valid))
+}
+
+pub(super) fn agent(payload: &Value) -> bool {
+    fields(
+        payload,
+        1,
+        &[
+            ("message", Value::is_string),
+            ("phase", optional_phase),
+            ("memory_citation", |v| optional(v, assistant::citation)),
+            ("delivery", |v| optional(v, assistant::is_async)),
+            ("questions", |v| {
+                optional(v, |v| array(v, assistant::question))
+            }),
+        ],
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MediaKind {
+    Inline,
+    File,
+}
+
+fn strings(v: &Value) -> bool {
+    array(v, Value::is_string)
+}
+fn details(v: &Value) -> bool {
+    array(v, image_detail)
+}
+fn order(v: &Value) -> bool {
+    array(v, |kind| MediaKind::deserialize(kind).is_ok())
+}
+
+pub(super) fn user(payload: &Value) -> bool {
+    // A positional event needs all ten slots through nullable audio. Named fields default independently.
+    fields(
+        payload,
+        10,
+        &[
+            ("client_id", |v| optional(v, Value::is_string)),
+            ("message", Value::is_string),
+            ("images", |v| optional(v, strings)),
+            ("image_details", details),
+            ("file_ids", |v| optional(v, strings)),
+            ("file_id_details", details),
+            ("image_order", order),
+            ("local_images", strings),
+            ("local_image_details", details),
+            ("audio", |v| optional(v, strings)),
+            ("audio_references", |v| optional(v, |v| array(v, audio))),
+            ("audio_order", order),
+            ("local_audio", strings),
+            ("text_elements", |v| array(v, text_element)),
+        ],
+    )
+}

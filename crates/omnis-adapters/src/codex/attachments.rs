@@ -9,6 +9,7 @@ const AUDIO_URL: u8 = 3;
 const IMAGE_FILE: u8 = 4;
 const AUDIO_FILE: u8 = 5;
 const GROUPS: usize = 6;
+const MAX_GROUP_CURSORS: usize = 32;
 
 fn local_kind(kind: u8) -> u8 {
     match kind {
@@ -162,19 +163,47 @@ impl AttachmentReceipt {
         for slot in &self.slots {
             groups[group(slot.kind)].push(slot.reference);
         }
-        let mut consumed = [0; GROUPS];
+        // Reserve each bare reference's group before assigning a framed slot to its path or reference.
+        let mut required = [0; GROUPS];
+        for slot in other.slots.iter().filter(|slot| slot.path.is_none()) {
+            required[group(slot.kind)] += 1;
+        }
+        let mut cursors = vec![[0; GROUPS]];
+        let mut next = Vec::new();
         for slot in &other.slots {
             let wire = group(slot.kind);
-            let local = group(local_kind(slot.kind));
-            let by_wire = groups[wire].get(consumed[wire]) == Some(&slot.reference);
-            let by_path = slot
-                .path
-                .is_some_and(|path| groups[local].get(consumed[local]) == Some(&path));
-            match (by_wire, by_path) {
-                (true, false) => consumed[wire] += 1,
-                (false, true) => consumed[local] += 1,
-                _ => return false,
+            if slot.path.is_none() {
+                required[wire] -= 1;
             }
+            let choices = [
+                (wire, Some(slot.reference)),
+                (group(local_kind(slot.kind)), slot.path),
+            ];
+            for cursor in &cursors {
+                for (index, key) in choices {
+                    if let Some(key) = key
+                        && groups[index].get(cursor[index]) == Some(&key)
+                        && groups[index].len() - cursor[index] > required[index]
+                    {
+                        let mut advanced = *cursor;
+                        advanced[index] += 1;
+                        next.push(advanced);
+                    }
+                }
+            }
+            if next.is_empty() {
+                return false;
+            }
+            if next.len() > 1 {
+                next.sort_unstable();
+                next.dedup();
+                // A partial assignment cannot prove that these records describe one submission.
+                if next.len() > MAX_GROUP_CURSORS {
+                    return false;
+                }
+            }
+            std::mem::swap(&mut cursors, &mut next);
+            next.clear();
         }
         true
     }

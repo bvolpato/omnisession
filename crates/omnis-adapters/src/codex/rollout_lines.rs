@@ -7,7 +7,7 @@ use super::{checkpoint_wire, completed_item};
 
 mod events;
 
-pub(super) use events::valid as valid_event;
+pub(super) use events::classify as classify_event;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Admission {
@@ -16,18 +16,37 @@ pub(super) enum Admission {
     Skip,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wire {
+    Decoded,
+    Invalid,
+    Undetermined,
+}
+
+impl Wire {
+    fn checked(valid: bool) -> Self {
+        if valid { Self::Decoded } else { Self::Invalid }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RolloutLines {
     next: Option<u64>,
+    // A documentary record may decode in Codex without a locally known schema.
+    possible_next: Option<u64>,
+    possible_gap: bool,
     pub(super) invalid_checkpoints: usize,
     pub(super) invalid_messages: usize,
     pub(super) skipped: usize,
     pub(super) gap: bool,
+    pub(super) contested: bool,
 }
 
 impl RolloutLines {
     /// Each physical file has its own cursor, including a child that starts after an inherited prefix.
     pub(super) fn start_segment(&mut self, header: &Value) {
+        self.possible_next = None;
+        self.possible_gap = false;
         self.next = (header["type"] == "session_meta"
             && header["payload"]["history_mode"] == "paginated")
             .then(|| {
@@ -53,26 +72,45 @@ impl RolloutLines {
         terminated: bool,
         checkpoint_mode: Option<bool>,
     ) -> Admission {
-        if !self.prepare_wire(record, self.paginated(), checkpoint_mode) {
+        let wire = self.prepare_wire(record, self.paginated(), checkpoint_mode);
+        if wire == Wire::Invalid {
             return Admission::Skip;
         }
         let Some(next) = self.next else {
             return Admission::Complete;
         };
+        // SQLite stores both the ordinal and the next exclusive ordinal.
         let Some(ordinal) = record["ordinal"]
             .as_u64()
-            .filter(|n| terminated && *n >= next)
+            .filter(|n| terminated && *n >= next && *n < i64::MAX as u64)
         else {
             self.skipped += 1;
             return Admission::ModelOnly;
         };
-        // The SQLite projection also stores the next exclusive ordinal.
-        if ordinal >= i64::MAX as u64 {
+        let following = ordinal + 1;
+        let possible_next = self.possible_next.unwrap_or(next);
+        if ordinal < possible_next {
+            // A prior documentary record could already have consumed this position.
             self.skipped += 1;
+            self.contested = true;
+            if wire == Wire::Decoded {
+                self.next = Some(following);
+                if following == possible_next {
+                    self.possible_next = None;
+                    self.possible_gap = false;
+                }
+            }
             return Admission::ModelOnly;
         }
-        self.gap |= ordinal > next;
-        self.next = Some(ordinal + 1);
+        if wire == Wire::Decoded {
+            self.gap |= self.possible_gap || ordinal > possible_next;
+            self.possible_gap = false;
+            self.next = Some(following);
+            self.possible_next = None;
+        } else {
+            self.possible_gap |= ordinal > possible_next;
+            self.possible_next = Some(following);
+        }
         let payload = &record["payload"];
         let event = payload
             .get("type")
@@ -100,35 +138,36 @@ impl RolloutLines {
         record: &mut Value,
         paginated: bool,
         checkpoint_mode: Option<bool>,
-    ) -> bool {
+    ) -> Wire {
         if paginated && !valid_envelope(record) {
             self.skipped += 1;
-            return false;
+            return Wire::Invalid;
         }
         // Neither reader consumes the ordinal of an item it could not decode.
         if !completed_item::prepare_record(record) {
             self.invalid_messages += 1;
-            return false;
-        }
-        if paginated {
-            let decoded = match record["type"].as_str() {
-                Some("response_item") => checkpoint_wire::response_record(record),
-                Some("event_msg") => valid_event(&record["payload"]),
-                _ => true,
-            };
-            if !decoded {
-                self.skipped += 1;
-                return false;
-            }
+            return Wire::Invalid;
         }
         if let Some(paginated) = checkpoint_mode
             && record["type"] == "compacted"
             && !checkpoint_wire::valid(&record["payload"], paginated)
         {
             self.invalid_checkpoints += 1;
-            return false;
+            return Wire::Invalid;
         }
-        true
+        if !paginated {
+            return Wire::Decoded;
+        }
+        let wire = match record["type"].as_str() {
+            Some("response_item") => Wire::checked(checkpoint_wire::response_record(record)),
+            Some("event_msg") => classify_event(&record["payload"]),
+            Some("compacted") if checkpoint_mode.is_some() => Wire::Decoded,
+            _ => Wire::Undetermined,
+        };
+        if wire == Wire::Invalid {
+            self.skipped += 1;
+        }
+        wire
     }
 }
 
