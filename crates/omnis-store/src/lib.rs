@@ -336,6 +336,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                            (excluded.complete = session_trajectories.complete OR ?19)
                            AND (
                                excluded.content_hash <> session_trajectories.content_hash
+                               OR (session_trajectories.tail_reader_version = 0 AND ?24)
                                OR excluded.source_byte_count <>
                                    session_trajectories.source_byte_count
                                OR excluded.indexed_byte_count <>
@@ -694,9 +695,25 @@ impl TrajectorySourceGuard {
     }
 }
 
+fn samples_jsonl_tail(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Codex
+            | Provider::Claude
+            | Provider::Grok
+            | Provider::Antigravity
+            | Provider::AntigravityIde
+            | Provider::AntigravityDesktop
+            | Provider::Pi
+            | Provider::OhMyPi
+    )
+}
+
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
+    /// Version of the tail reader that produced this native JSONL preview.
+    pub jsonl_tail_reader_version: Option<u32>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     /// False for historical rows written before the index recorded file time below a millisecond.
@@ -2446,6 +2463,9 @@ impl Store {
             }
             let verified_metadata = write.verified_metadata;
             let revision = write.document.source_revision;
+            let jsonl_preview = !write.source_complete
+                && write.document.origin == SessionTrajectoryOrigin::Native
+                && samples_jsonl_tail(write.session.provider);
             let trajectory_id = upsert_parent
                 .query_row(
                     params![
@@ -2474,6 +2494,7 @@ impl Store {
                         revision.missing_ancestor.map(Uuid::into_bytes),
                         revision.contents.map(Uuid::into_bytes),
                         verified_metadata.is_some(),
+                        jsonl_preview,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2500,6 +2521,14 @@ impl Store {
                 }
             }
             if let Some(trajectory_id) = trajectory_id {
+                if jsonl_preview {
+                    transaction
+                        .execute(
+                            "UPDATE session_trajectories SET tail_reader_version = 1 WHERE id = ?1",
+                            [trajectory_id],
+                        )
+                        .map_err(database_error)?;
+                }
                 // A later write of the same session replaces an earlier one in this batch.
                 rewritten.retain(|(other, _)| *other != trajectory_id);
                 rewritten.push((trajectory_id, write.document.redacted_text));
@@ -2626,9 +2655,10 @@ impl Store {
         let connection = self.connection.borrow();
         connection.query_row(
             "SELECT source_updated_at, source_complete, document_version, source_updated_submillis,
-                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id
+                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id,
+                    CASE WHEN origin = 'native' AND source_complete = 0 THEN tail_reader_version END
              FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
-            params![session.provider.to_string(), session.id], |row| state_from_row(row, 0),
+            params![session.provider.to_string(), session.id], |row| state_from_row(row, 0, session.provider),
         ).optional().map_err(database_error)
     }
 
@@ -2645,7 +2675,8 @@ impl Store {
             .prepare(
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version,
                     source_updated_submillis, provider_limited, title_authoritative, source_file_id,
-                    missing_ancestor_id, source_contents_id FROM session_trajectories",
+                    missing_ancestor_id, source_contents_id,
+                    CASE WHEN origin = 'native' AND source_complete = 0 THEN tail_reader_version END FROM session_trajectories",
             )
             .map_err(database_error)?;
         let mut rows = statement.query([]).map_err(database_error)?;
@@ -2658,7 +2689,10 @@ impl Store {
                 .map_err(|_| StoreError::CorruptStore)?;
             let session =
                 SessionRef::new(provider, row.get::<_, String>(1).map_err(database_error)?);
-            states.insert(session, state_from_row(row, 2).map_err(database_error)?);
+            states.insert(
+                session,
+                state_from_row(row, 2, provider).map_err(database_error)?,
+            );
         }
         Ok(states)
     }
@@ -3882,37 +3916,6 @@ fn initialize_catalog_generations(transaction: &Transaction<'_>) -> Result<()> {
     ).map_err(database_error)
 }
 
-fn invalidate_legacy_jsonl_previews(transaction: &Transaction<'_>) -> Result<()> {
-    // Older JSONL previews could omit a record at the start of the tail window.
-    transaction
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS search_data_migrations (
-                name TEXT PRIMARY KEY
-            ) WITHOUT ROWID;",
-        )
-        .map_err(database_error)?;
-    let pending = transaction
-        .execute(
-            "INSERT OR IGNORE INTO search_data_migrations (name) VALUES ('jsonl_tail_boundary')",
-            [],
-        )
-        .map_err(database_error)?;
-    if pending != 0 {
-        transaction
-            .execute(
-                "UPDATE session_trajectories SET document_version = 0
-                 WHERE origin = 'native' AND source_complete = 0 AND provider_limited = 0
-                   AND ((provider IN ('codex', 'claude', 'grok', 'antigravity',
-                                      'antigravity-ide', 'antigravity-desktop') AND document_version <= 5)
-                        OR (provider = 'pi' AND document_version <= 6)
-                        OR (provider = 'omp' AND document_version <= 8))",
-                [],
-            )
-            .map_err(database_error)?;
-    }
-    Ok(())
-}
-
 fn initialize_source_revision_schema(transaction: &Transaction<'_>) -> Result<()> {
     for (table, column) in [
         ("session_index", "source_file_id"),
@@ -3936,8 +3939,7 @@ fn initialize_source_revision_schema(transaction: &Transaction<'_>) -> Result<()
                 .map_err(database_error)?;
         }
     }
-    initialize_catalog_generations(transaction)?;
-    invalidate_legacy_jsonl_previews(transaction)
+    initialize_catalog_generations(transaction)
 }
 
 fn source_revision_from_row(
@@ -4010,6 +4012,17 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
         )
         .map_err(database_error)?;
     ensure_trajectory_coverage_columns(transaction)?;
+    // Older writers replace the content without recording which reader produced it.
+    // A current writer restores the marker after the upsert in the same transaction.
+    transaction
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS reset_tail_reader_after_write
+             AFTER UPDATE OF content_hash ON session_trajectories WHEN OLD.tail_reader_version <> 0
+             BEGIN
+                 UPDATE session_trajectories SET tail_reader_version = 0 WHERE id = NEW.id;
+             END;",
+        )
+        .map_err(database_error)?;
     initialize_trajectory_chunk_schema(transaction)
 }
 
@@ -4028,6 +4041,14 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
         || !has_column("indexed_byte_count")
         || !has_column("truncation_strategy")
         || !has_column("source_complete");
+    if !has_column("tail_reader_version") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE session_trajectories
+                 ADD COLUMN tail_reader_version INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(database_error)?;
+    }
     if !has_column("content_hash") {
         transaction
             .execute_batch(
@@ -4703,6 +4724,7 @@ fn write_indexed_session_row(
 fn state_from_row(
     row: &rusqlite::Row<'_>,
     column: usize,
+    provider: Provider,
 ) -> rusqlite::Result<TrajectoryIndexState> {
     let remainder: Option<u32> = row.get(column + 3)?;
     let time: i64 = row.get(column)?;
@@ -4710,6 +4732,11 @@ fn state_from_row(
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })?;
     Ok(TrajectoryIndexState {
+        jsonl_tail_reader_version: if samples_jsonl_tail(provider) {
+            row.get(column + 9)?
+        } else {
+            None
+        },
         source_revision: source_revision_from_row(row, column + 6)?,
         source_updated_at,
         source_complete: row.get(column + 1)?,

@@ -178,7 +178,8 @@ pub(crate) fn needs_index(
     if state.document_version > version {
         return false;
     }
-    state.document_version < version
+    state.jsonl_tail_reader_version == Some(0)
+        || state.document_version < version
         || (candidate.source_revision.file.is_some()
             && !candidate.source_revision.matches_file_contents(state.source_revision))
         || (candidate.session.provider == Provider::OhMyPi
@@ -280,7 +281,8 @@ fn read_budget(
     // Read the full source when upgrading a document from a full or provider-limited read.
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
-            && (state.document_version < candidate.document_version
+            && (state.jsonl_tail_reader_version == Some(0)
+                || state.document_version < candidate.document_version
                 || (candidate.source_revision.file.is_some()
                     && (state.source_revision.file.is_none()
                         || state.source_revision.contents.is_none()))
@@ -1111,6 +1113,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            jsonl_tail_reader_version: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(true),
             source_updated_at: now,
@@ -1158,6 +1161,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            jsonl_tail_reader_version: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(false),
             source_updated_at: now,
