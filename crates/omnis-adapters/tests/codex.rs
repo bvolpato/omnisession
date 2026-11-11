@@ -583,6 +583,67 @@ fn codex_discovers_and_reads_compressed_active_and_archived_rollouts() {
 }
 
 #[test]
+fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
+    for inherited in [true, false] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let source = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+        let mut header =
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}});
+        let mut rows = Vec::new();
+        if inherited {
+            header["payload"]["history_mode"] = json!("paginated");
+            header["payload"]["history_base"] = json!({
+                "thread_id":"55555555-5555-4555-8555-555555555555",
+                "end_byte_offset":512, "end_ordinal_exclusive":4
+            });
+        } else {
+            rows.push(json!({"type":"compacted","payload":{
+                "message":"Checkpoint for the remaining work",
+                "replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"retained request"}]}]
+            }}));
+        }
+        rows.insert(0, header);
+        rows.push(message("user", "request in the retained rollout"));
+        let text = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let encoded = encode_rollout(text.as_bytes(), "zst");
+        fs::write(&source, &encoded).unwrap();
+        let adapter = CodexAdapter::with_root(home.path());
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let indexed = adapter
+            .index_session(&session, Some(&source), 4 * 1024 * 1024)
+            .unwrap();
+        if inherited {
+            assert!(!indexed.source_complete, "referenced prefix was not read");
+        }
+        for snapshot in [
+            indexed.snapshot,
+            adapter.read_session(&session).unwrap(),
+            adapter.preview_session(&session).unwrap(),
+        ] {
+            assert!(visible_text(&snapshot).contains(&"request in the retained rollout"));
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            let restored_checkpoint = !inherited
+                && trajectory
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("retained request"));
+            if !restored_checkpoint {
+                assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+                assert!(omnis_core::import_conversation(&snapshot).truncated);
+                assert!(trajectory.truncated);
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), encoded);
+    }
+}
+
+#[test]
 fn codex_uses_plain_sibling_and_reports_truncated_compressed_history() {
     let home = tempfile::tempdir().unwrap();
     let folder = home.path().join("sessions");
@@ -609,6 +670,77 @@ fn codex_uses_plain_sibling_and_reports_truncated_compressed_history() {
         assert!(adapter.read_session(&source).is_err());
         fs::remove_file(&compressed).unwrap();
     }
+}
+
+#[test]
+fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges() {
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("archived_sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+    let mut writer =
+        zstd::stream::write::Encoder::new(fs::File::create(&path).unwrap(), 1).unwrap();
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic","cli_version":"v".repeat(32 * 1024)}});
+    writeln!(writer, "{header}").unwrap();
+    writeln!(
+        writer,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":"/synthetic/surviving"}})
+    )
+    .unwrap();
+    writeln!(writer, "{}", message("user", "surviving head")).unwrap();
+    let surviving = message("assistant", &"s".repeat(128 * 1024)).to_string();
+    for _ in 0..96 {
+        writeln!(writer, "{surviving}").unwrap();
+    }
+    writeln!(writer, "{}", message("assistant", "reply before rollback")).unwrap();
+    let discarded = message("user", &format!("discarded {}", "d".repeat(128 * 1024))).to_string();
+    let path_component = "a/".repeat(16 * 1024);
+    for index in 0..160 {
+        let cwd = format!("/synthetic/{index}/{path_component}");
+        writeln!(
+            writer,
+            "{}",
+            json!({"type":"turn_context","payload":{"cwd":cwd}})
+        )
+        .unwrap();
+        writeln!(writer, "{discarded}").unwrap();
+    }
+    writeln!(
+        writer,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns":160}))
+    )
+    .unwrap();
+    writeln!(writer, "{}", message("user", "follow-up")).unwrap();
+    writer.finish().unwrap();
+
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let read = adapter
+        .index_session(&session, Some(&path), 64 * 1024)
+        .unwrap();
+    let text = visible_text(&read.snapshot);
+    assert_eq!(text.first(), Some(&"surviving head"));
+    assert!(text.ends_with(&["reply before rollback", "follow-up"]));
+    assert!(text.iter().all(|message| !message.starts_with("discarded")));
+    let text_bytes = text.iter().map(|text| text.len()).sum::<usize>();
+    let metadata_bytes: usize = read
+        .snapshot
+        .events
+        .iter()
+        .filter_map(|e| e.source.provider_version.as_ref())
+        .map(String::len)
+        .sum();
+    assert!(text_bytes + metadata_bytes <= 8 * 1024 * 1024);
+    assert_eq!(
+        read.snapshot.workspace.root,
+        Path::new("/synthetic/surviving")
+    );
+    assert!(!read.source_complete);
+    assert!(omnis_core::import_conversation(&read.snapshot).truncated);
 }
 
 #[test]
@@ -644,4 +776,71 @@ fn codex_index_budgets_the_decoded_size_of_compressed_rollouts() {
         visible_text(&adapter.read_session(&session).unwrap()),
         ["head", "middle", "tail"]
     );
+}
+
+#[test]
+fn codex_list_read_index_and_resume_choose_the_same_rollout() -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let archive_dir = home.path().join("archived_sessions");
+    let active_dir = home.path().join("sessions/2026/03/10");
+    fs::create_dir_all(&active_dir)?;
+    fs::create_dir(&archive_dir)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let archive = archive_dir.join(format!("{name}.gz"));
+    let active = active_dir.join(name);
+    let source = |text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID}}),
+            message("user", text)
+        )
+    };
+    fs::write(
+        &archive,
+        encode_rollout(source("archived request").as_bytes(), "gz"),
+    )?;
+    let picker = CodexAdapter::with_root(home.path());
+    let cached = picker.list_sessions(None)?.pop().unwrap();
+    assert_eq!(cached.source_path.as_ref(), Some(&archive));
+    fs::write(&active, source("active request"))?;
+    fs::File::open(&active)?.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert_eq!(listed.len(), 1);
+    let session = &listed[0].session;
+    assert_eq!(listed[0].source_path.as_ref(), Some(&active));
+    assert_eq!(
+        adapter.native_resume_support(session)?,
+        NativeResumeSupport::Direct
+    );
+    assert_eq!(
+        visible_text(&adapter.read_session(session)?),
+        ["active request"]
+    );
+    assert_eq!(
+        visible_text(
+            &picker
+                .index_session(session, cached.source_path.as_deref(), u64::MAX)?
+                .snapshot
+        ),
+        ["active request"]
+    );
+    fs::remove_file(&active)?;
+    assert_eq!(
+        visible_text(
+            &adapter
+                .index_session(session, Some(&active), u64::MAX)?
+                .snapshot
+        ),
+        ["archived request"]
+    );
+    assert_eq!(
+        adapter.native_resume_support(session)?,
+        NativeResumeSupport::ImportOnly
+    );
+    Ok(())
 }

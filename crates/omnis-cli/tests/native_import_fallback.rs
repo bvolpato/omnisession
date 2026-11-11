@@ -576,6 +576,21 @@ fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
     fs::write(&source, &history).unwrap();
     let reference = format!("codex:{SOURCE_ID}");
 
+    for option in ["--dry-run", "--materialize-only"] {
+        let run = fixture.run(&strings(&["resume", &reference, "--no-fork", option]), &[]);
+        assert!(!run.status.success());
+        assert!(run.stderr.contains("in place"), "{}", run.stderr);
+        assert!(
+            run.stderr
+                .contains(&format!("omni fork {reference} --in codex")),
+            "{}",
+            run.stderr
+        );
+    }
+    assert!(fixture.rpc_log().is_empty());
+    assert_eq!(fixture.launch_arguments(), None);
+    assert!(!fixture.generated_rollout().exists());
+
     for args in [
         vec!["inspect", &reference, "--target", "codex"],
         vec!["resume", &reference, "--dry-run"],

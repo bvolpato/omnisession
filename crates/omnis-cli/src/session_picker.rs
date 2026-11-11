@@ -1310,7 +1310,7 @@ pub fn pick_session(
     new_session_targets: &[AgentTarget],
     initial_provider: Option<Provider>,
     all_projects: bool,
-    force_cross_provider: bool,
+    materialize: Option<CanMaterialize<'_>>,
     requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
@@ -1399,7 +1399,7 @@ pub fn pick_session(
                 target,
                 available_targets,
                 new_session_targets,
-                force_cross_provider,
+                materialize,
                 requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
@@ -1430,14 +1430,20 @@ fn select_picker_row(
     target: Option<AgentTarget>,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    force_cross_provider: bool,
+    materialize: Option<CanMaterialize<'_>>,
     requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
         if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(target, None, None, new_session_targets, requested_mode)? {
+        return match requested_target(
+            target,
+            TargetIntent::New,
+            None,
+            new_session_targets,
+            requested_mode,
+        )? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.target(),
                 mode: choice.mode,
@@ -1454,17 +1460,15 @@ fn select_picker_row(
     };
     let session = entry.session.session.clone();
     let project_path = entry.session.project_path.clone();
-    let targets = available_targets
-        .iter()
-        .copied()
-        .filter(|target| !force_cross_provider || target.provider != session.provider)
-        .collect::<Vec<_>>();
+    let intent = materialize.map_or(TargetIntent::Resume(&session), |can_copy| {
+        TargetIntent::Materialize(&session, can_copy)
+    });
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(
         target,
-        Some(&session),
+        intent,
         Some(preferred_target),
-        &targets,
+        available_targets,
         requested_mode,
     )? {
         TargetOutcome::Selected(choice) => {
@@ -1505,24 +1509,20 @@ fn select_picker_row(
 
 fn requested_target(
     target: Option<AgentTarget>,
-    source: Option<&SessionRef>,
+    intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     target.map_or_else(
-        || {
-            source.map_or_else(
-                || pick_new_target(targets, requested_mode),
-                |source| pick_target(source, preferred_target, targets, requested_mode),
-            )
-        },
+        || pick_target_for(intent, preferred_target, targets, requested_mode),
         |target| {
             // `--in` skipped the page, so `--mode` or the agent's default decides.
             Ok(TargetOutcome::Selected(TargetChoice {
                 provider: target.provider,
                 profile: target.profile,
-                fork: false,
+                fork: matches!(intent, TargetIntent::Materialize(source, can_copy)
+                    if source.provider == target.provider && can_copy(source, target)),
                 mode: None,
             }))
         },
@@ -1607,23 +1607,32 @@ struct TargetChoice {
     mode: Option<ModeKind>,
 }
 
+pub(super) type CanMaterialize<'a> = &'a dyn Fn(&SessionRef, AgentTarget) -> bool;
+
 #[derive(Clone, Copy)]
 enum TargetIntent<'a> {
     Resume(&'a SessionRef),
     Fork(&'a SessionRef),
+    Materialize(&'a SessionRef, CanMaterialize<'a>),
     New,
 }
 
 impl<'a> TargetIntent<'a> {
     fn source(self) -> Option<&'a SessionRef> {
         match self {
-            Self::Resume(source) | Self::Fork(source) => Some(source),
+            Self::Resume(source) | Self::Fork(source) | Self::Materialize(source, _) => {
+                Some(source)
+            }
             Self::New => None,
         }
     }
 
     fn source_provider(self) -> Option<Provider> {
         self.source().map(|source| source.provider)
+    }
+
+    fn creates_copy(self) -> bool {
+        matches!(self, Self::Fork(_) | Self::Materialize(..))
     }
 }
 
@@ -1796,38 +1805,20 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn pick_target(
-    source: &SessionRef,
-    preferred_target: Option<Provider>,
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(
-        TargetIntent::Resume(source),
-        preferred_target,
-        targets,
-        requested_mode,
-    )
-}
-
-fn pick_new_target(
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, None, targets, requested_mode)
-}
-
 pub fn pick_fork_target(
     source: &SessionRef,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
+    materialize: Option<CanMaterialize<'_>>,
 ) -> Result<Option<PickedTarget>> {
     require_terminal("`--in` is required without an interactive terminal")?;
     let _terminal = TerminalGuard::enter()?;
     theme::init();
     let preferred_target = crate::continuation_target_provider(source)?;
     match pick_target_for(
-        TargetIntent::Fork(source),
+        materialize.map_or(TargetIntent::Fork(source), |can_copy| {
+            TargetIntent::Materialize(source, can_copy)
+        }),
         Some(preferred_target),
         targets,
         requested_mode,
@@ -1982,7 +1973,7 @@ fn target_rows(intent: TargetIntent<'_>, choices: Vec<TargetChoice>) -> Vec<Targ
         .into_iter()
         .map(TargetRow::Agent)
         .collect::<Vec<_>>();
-    if intent.source().is_some() {
+    if matches!(intent, TargetIntent::Resume(_) | TargetIntent::Fork(_)) {
         rows.push(TargetRow::ClipboardHandoff);
     }
     rows
@@ -2090,10 +2081,15 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
     let source = intent.source_provider();
     let mut choices = Vec::with_capacity(targets.len() + 1);
     for &entry in targets {
-        let AgentTarget { provider, profile } = entry.into();
+        let target = entry.into();
+        let AgentTarget { provider, profile } = target;
         let same_provider = Some(provider) == source;
         let available = match intent {
             TargetIntent::New => supports_capability_on(provider, Capability::CleanStart, platform),
+            TargetIntent::Materialize(source, can_copy) => {
+                supports_capability_on(provider, Capability::CrossProviderImport, platform)
+                    && can_copy(source, target)
+            }
             TargetIntent::Resume(_) | TargetIntent::Fork(_) if same_provider => {
                 supports_capability_on(provider, Capability::SameProviderResume, platform)
             }
@@ -2105,10 +2101,7 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
         if !available {
             continue;
         }
-        let materialized_fork = matches!(
-            provider,
-            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
-        );
+        let materialized_fork = crate::transfer::materializes_native_forks(provider);
         if matches!(intent, TargetIntent::Fork(_))
             && same_provider
             && materialized_fork
@@ -2116,11 +2109,15 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
         {
             continue;
         }
-        let mode = launch_mode::default_mode(provider).map(|mode| mode.kind);
+        let mode = if matches!(intent, TargetIntent::Materialize(..)) {
+            None
+        } else {
+            launch_mode::default_mode(provider).map(|mode| mode.kind)
+        };
         choices.push(TargetChoice {
             provider,
             profile,
-            fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
+            fork: intent.creates_copy() && same_provider,
             mode,
         });
         if matches!(intent, TargetIntent::Resume(_))
@@ -2145,7 +2142,7 @@ fn profile_target_index(
     target: AgentTarget,
     choices: &[TargetChoice],
 ) -> Option<usize> {
-    let fork = matches!(intent, TargetIntent::Fork(_));
+    let fork = intent.creates_copy() && Some(target.provider) == intent.source_provider();
     choices
         .iter()
         .position(|choice| choice.target() == target && choice.fork == fork)
@@ -2158,7 +2155,7 @@ fn default_target_index(
 ) -> Option<usize> {
     let source = intent.source_provider();
     let preferred = preferred_target.or(source);
-    let fork = matches!(intent, TargetIntent::Fork(_)) && preferred == source;
+    let fork = intent.creates_copy() && preferred == source;
     preferred
         .and_then(|provider| {
             choices
@@ -2202,6 +2199,7 @@ fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String
             == crate::transfer::CrossProviderRoute::SemanticHandoff;
     let action = match intent {
         TargetIntent::New => format!("Start new session in {target_name}"),
+        TargetIntent::Materialize(..) => format!("Create a verified copy in {target_name}"),
         TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
         TargetIntent::Fork(_) if handoff => {
             format!("Fork continuation into {target_name} through semantic handoff")
@@ -2372,6 +2370,7 @@ fn render_target(
         TargetIntent::Resume(_) => "Where should this session open?",
         TargetIntent::Fork(_) => "Where should this session fork?",
         TargetIntent::New => "Where should this new session start?",
+        TargetIntent::Materialize(..) => "Where should the session copy be created?",
     };
     queue_styled(
         &mut frame,
@@ -2414,11 +2413,12 @@ fn render_target(
         queue!(frame, Print("\r\n"))?;
     }
     if visible.is_empty() {
-        queue_styled(
-            &mut frame,
-            DetailStyle::Muted,
-            &truncate("No available target matches this filter.", width),
-        )?;
+        let message = if filter.is_empty() && matches!(intent, TargetIntent::Materialize(..)) {
+            "No available target can create a copy of this session."
+        } else {
+            "No available target matches this filter."
+        };
+        queue_styled(&mut frame, DetailStyle::Muted, &truncate(message, width))?;
         queue!(frame, Print("\r\n\r\n"))?;
     }
     queue!(frame, Print("\r\n"))?;
@@ -2427,11 +2427,16 @@ fn render_target(
     } else {
         "Esc clear filter"
     };
+    let action = if matches!(intent, TargetIntent::Materialize(..)) {
+        "Enter create copy"
+    } else {
+        "←→ mode  Enter open"
+    };
     queue_styled(
         &mut frame,
         DetailStyle::Muted,
         &truncate(
-            &format!("Type to filter  ↑↓ target  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
+            &format!("Type to filter  ↑↓ target  {action}  {escape}  Ctrl-C cancel"),
             width,
         ),
     )?;
@@ -3292,7 +3297,7 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
+        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], None, None)
             .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
@@ -5193,6 +5198,46 @@ mod tests {
     }
 
     #[test]
+    fn materialize_only_offers_a_codex_copy_when_the_source_requires_import() {
+        let home = tempfile::tempdir().unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+        let can_copy = |session: &SessionRef, target| {
+            crate::transfer::can_materialize_target(&registry, session, target)
+        };
+        let targets = [Provider::Codex, Provider::Claude];
+        for (folder, expect_copy) in [("archived_sessions", true), ("sessions/2026/01/01", false)] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let directory = home.path().join(folder);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl")),
+                format!(r#"{{"type":"session_meta","payload":{{"id":"{id}"}}}}"#),
+            )
+            .unwrap();
+            let source = SessionRef::new(Provider::Codex, id);
+            let intent = TargetIntent::Materialize(&source, &can_copy);
+            let choices = target_choices_on(intent, &targets, Platform::Linux);
+            assert_eq!(
+                choices
+                    .iter()
+                    .any(|choice| choice.provider == Provider::Codex && choice.fork),
+                expect_copy
+            );
+            assert!(
+                choices
+                    .iter()
+                    .any(|choice| choice.provider == Provider::Claude && !choice.fork)
+            );
+            assert!(
+                target_rows(intent, choices)
+                    .iter()
+                    .all(|row| matches!(row, TargetRow::Agent(_)))
+            );
+        }
+    }
+
+    #[test]
     fn clipboard_handoff_is_last_after_all_agent_and_profile_rows_for_existing_sessions() {
         let source = SessionRef::new(Provider::Claude, "source");
         let targets = with_profiles(local_gateway_profiles());
@@ -5614,8 +5659,8 @@ agent = "codex"
         );
         assert_eq!(target.to_string(), "claude-local");
         // An `--in` choice skips the page and carries the same pair.
-        let requested =
-            requested_target(Some(target), None, None, &[], None).expect("requested target");
+        let requested = requested_target(Some(target), TargetIntent::New, None, &[], None)
+            .expect("requested target");
         let TargetOutcome::Selected(choice) = requested else {
             panic!("`--in` selects without a page");
         };

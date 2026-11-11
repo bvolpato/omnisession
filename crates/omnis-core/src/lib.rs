@@ -44,8 +44,8 @@ const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
 const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
-/// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+/// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
+pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -3247,7 +3247,10 @@ pub fn build_semantic_handoff_report_for_snapshot(
         )
     });
     let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
-    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+    with_codex_history_warnings(
+        semantic_handoff_report(source, target, repository_matches, source_is_opaque),
+        snapshot,
+    )
 }
 
 fn semantic_handoff_report(
@@ -3461,7 +3464,38 @@ fn with_source_compaction(
             detail.push_str(". Source history includes a provider compaction summary");
         }
     }
+    with_codex_history_warnings(report, snapshot)
+}
+
+fn with_codex_history_warnings(
+    mut report: FidelityReport,
+    snapshot: &CanonicalSnapshot,
+) -> FidelityReport {
     report
+        .warnings
+        .extend(codex_history_warnings(snapshot).map(str::to_owned));
+    report
+}
+
+fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    [
+        (
+            "omnisession.codex_history_base",
+            "The Codex fork references earlier history that was unavailable for this transfer.",
+        ),
+        (
+            "omnisession.codex_compacted",
+            "This transfer could not reconstruct a Codex compaction checkpoint.",
+        ),
+    ]
+    .into_iter()
+    .filter_map(move |(record, warning)| {
+        (snapshot.session.provider == Provider::Codex
+            && snapshot.events.iter().any(|event| {
+                !is_secret(event) && event.source.raw_record_type.as_deref() == Some(record)
+            }))
+        .then_some(warning)
+    })
 }
 
 /// Builds a fidelity report for a captured snapshot and transfer target.

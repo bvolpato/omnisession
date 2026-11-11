@@ -70,13 +70,25 @@ fn resume_request(
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
+    let restore_source =
+        requires_import_for_native_resume(registry, &request.source, request.agent_target())?;
+    // `switch` sets no_fork to prefer the bound session. The picker lets the user explicitly
+    // choose "Continue original session".
+    let require_original = (args.no_fork && task_binding.is_none())
+        || (request.picked_target && request.resume_in_place);
+    if restore_source && require_original {
+        let source = safe_terminal_line(&request.source.to_string());
+        bail!(
+            "{} cannot resume `{source}` in place from its current storage. To continue in a copy, run `omni fork {source} --in {}`.",
+            provider_name(request.target),
+            request.agent_target(),
+        );
+    }
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
         launch_mode_args(request.agent_target(), request.mode, json_output)?
     };
-    let restore_source =
-        requires_import_for_native_resume(registry, &request.source, request.agent_target())?;
     if can_resume_without_snapshot(request) && !restore_source {
         return resume_native_without_snapshot(
             registry,
@@ -285,7 +297,15 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         (target, args.mode)
     } else {
         let targets = launch_profile::runnable_agent_targets();
-        let Some(picked) = session_picker::pick_fork_target(&source, &targets, args.mode)? else {
+        let can_copy =
+            |source: &SessionRef, target| can_materialize_target(registry, source, target);
+        let Some(picked) = session_picker::pick_fork_target(
+            &source,
+            &targets,
+            args.mode,
+            args.materialize_only.then_some(&can_copy),
+        )?
+        else {
             return Ok(());
         };
         match picked {
@@ -426,10 +446,24 @@ pub(super) fn requires_import_for_native_resume(
 pub(super) fn requires_materialized_fork(request: &ResolvedResumeRequest) -> bool {
     !request.resume_in_place
         && request.source.provider == request.target
-        && matches!(
-            request.target,
-            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
-        )
+        && materializes_native_forks(request.target)
+}
+
+pub(super) const fn materializes_native_forks(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
+    )
+}
+
+pub(super) fn can_materialize_target(
+    registry: &AdapterRegistry,
+    source: &SessionRef,
+    target: AgentTarget,
+) -> bool {
+    source.provider != target.provider
+        || materializes_native_forks(target.provider)
+        || requires_import_for_native_resume(registry, source, target).unwrap_or(false)
 }
 
 pub(super) fn resume_project(
@@ -2821,11 +2855,6 @@ fn resolve_resume_request(
         let project = current_project()?;
         let runnable_targets = launch_profile::runnable_agent_targets();
         let delete_providers = DELETE_PROVIDERS.to_vec();
-        let targets = if args.target.is_none() {
-            runnable_targets.clone()
-        } else {
-            Vec::new()
-        };
         let launch_target = LaunchTarget {
             cwd: Some(project.clone()),
             fork: false,
@@ -2835,7 +2864,8 @@ fn resolve_resume_request(
             Vec::new()
         } else {
             runnable_targets
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|target| args.target.is_none_or(|requested| requested == *target))
                 .filter(|target| {
                     registry
@@ -2844,14 +2874,18 @@ fn resolve_resume_request(
                 })
                 .collect::<Vec<_>>()
         };
+        let can_copy = |source: &SessionRef, target: AgentTarget| {
+            (!args.no_fork || source.provider != target.provider)
+                && can_materialize_target(registry, source, target)
+        };
         session_picker::pick_session(
             &project,
             args.target,
-            &targets,
+            &runnable_targets,
             &new_session_targets,
             args.source_provider,
             args.all_projects,
-            args.materialize_only,
+            args.materialize_only.then_some(&can_copy),
             args.mode,
             &delete_providers,
             &|session, workspace| delete_native_session(registry, session, workspace),

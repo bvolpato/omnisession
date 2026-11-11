@@ -753,6 +753,17 @@ mod tests {
             &candidate(Some(now), Some(path)),
             Some(&sampled)
         ));
+        let compressed = candidate(Some(now), Some(temporary.path().join("rollout.jsonl.zst")));
+        // Codex preserves the rollout mtime during compression. A v4 picker document can
+        // have only the edges of a session that fits the decoded full-read budget.
+        assert!(needs_index(
+            &compressed,
+            Some(&TrajectoryIndexState {
+                document_version: 4,
+                ..sampled
+            })
+        ));
+        assert!(!needs_index(&compressed, Some(&sampled)));
         let mut shared_database = candidate(Some(now), None);
         shared_database.session.provider = Provider::Hermes;
         assert!(!needs_index(&shared_database, Some(&sampled)));

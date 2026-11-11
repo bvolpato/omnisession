@@ -1221,6 +1221,81 @@ pub(crate) struct EventBuilder {
     branch_id: Uuid,
     next_sequence: u64,
     events: Vec<OmniEvent>,
+    preview: Option<EventPreview>,
+}
+
+#[derive(Default)]
+struct EventPreview {
+    outline: Vec<PreviewEvent>,
+    selection: Option<VecDeque<PreviewEvent>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PreviewEvent {
+    sequence: u64,
+    bytes: usize,
+    tool: bool,
+}
+
+impl EventPreview {
+    fn record(
+        &mut self,
+        sequence: u64,
+        kind: &EventKind,
+        payload: &Value,
+        source_bytes: usize,
+    ) -> bool {
+        let item = PreviewEvent {
+            sequence,
+            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
+            tool: is_tool_event(kind),
+        };
+        self.outline.push(item);
+        let Some(selected) = self.selection.as_mut() else {
+            return false;
+        };
+        if selected
+            .front()
+            .is_some_and(|next| next.sequence == sequence)
+        {
+            return selected
+                .pop_front()
+                .is_some_and(|next| item.bytes <= next.bytes);
+        }
+        false
+    }
+}
+
+fn is_tool_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::ToolCalled
+            | EventKind::ToolCompleted
+            | EventKind::ToolFailed
+            | EventKind::CommandExecuted
+    )
+}
+
+fn retain_latest_matching<T>(
+    values: &mut Vec<T>,
+    limit: usize,
+    matches: impl Fn(&T) -> bool,
+) -> usize {
+    let removed = values
+        .iter()
+        .filter(|value| matches(value))
+        .count()
+        .saturating_sub(limit);
+    let mut remaining = removed;
+    values.retain(|value| {
+        if remaining > 0 && matches(value) {
+            remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 /// Conservative retained-memory estimate for a canonical event and its cloned JSON payload.
@@ -1272,7 +1347,64 @@ impl EventBuilder {
             branch_id: thread_id,
             next_sequence: 0,
             events: Vec::new(),
+            preview: None,
         }
+    }
+
+    /// The first pass retains only event sizes and sequence numbers. The second pass materializes the selection.
+    pub(crate) fn plan_preview(&mut self, selection: Option<VecDeque<PreviewEvent>>) {
+        self.preview = Some(EventPreview {
+            selection,
+            ..EventPreview::default()
+        });
+    }
+
+    pub(crate) fn select_preview(
+        &self,
+        limit: usize,
+        bytes_per_edge: usize,
+    ) -> (VecDeque<PreviewEvent>, usize) {
+        let outline = &self
+            .preview
+            .as_ref()
+            .expect("preview planning enabled")
+            .outline;
+        let mut selected = VecDeque::new();
+        let add_edge = |events: &mut dyn Iterator<Item = &PreviewEvent>| {
+            let mut added = Vec::new();
+            let mut remaining = bytes_per_edge;
+            for event in events {
+                if event.bytes > bytes_per_edge {
+                    continue;
+                }
+                if added.len() == limit / 2 || event.bytes > remaining {
+                    break;
+                }
+                remaining -= event.bytes;
+                added.push(*event);
+            }
+            added
+        };
+        selected.extend(add_edge(&mut outline.iter()));
+        let end = selected.back().map(|event| event.sequence);
+        selected.extend(
+            add_edge(&mut outline.iter().rev())
+                .into_iter()
+                .rev()
+                .filter(|event| end.is_none_or(|last| event.sequence > last)),
+        );
+        let omitted = outline.len() - selected.len();
+        (selected, omitted)
+    }
+
+    pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
+        self.preview = None;
+        if self.events.len() != expected {
+            return Err(anyhow!(
+                "provider history changed while reading the preview"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn set_provider_version(&mut self, provider_version: Option<String>) {
@@ -1284,6 +1416,13 @@ impl EventBuilder {
     }
 
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        if let Some(preview) = &mut self.preview {
+            preview.outline.truncate(
+                preview
+                    .outline
+                    .partition_point(|event| event.sequence < checkpoint),
+            );
+        }
         self.events.retain(|event| event.sequence < checkpoint);
     }
 
@@ -1336,6 +1475,14 @@ impl EventBuilder {
     ) {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        if self.preview.as_mut().is_some_and(|preview| {
+            let source_bytes = self.session_id.len()
+                + self.provider_version.as_ref().map_or(0, String::len)
+                + raw_record_type.as_ref().map_or(0, String::len);
+            !preview.record(sequence, &kind, &payload, source_bytes)
+        }) {
+            return;
+        }
         let event_seed = event_id.map_or_else(
             || sequence.to_string(),
             |native_id| format!("{sequence}:{native_id}"),
@@ -1362,42 +1509,19 @@ impl EventBuilder {
     }
 
     pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
-        let tool_events = self
-            .events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.kind,
-                    EventKind::ToolCalled
-                        | EventKind::ToolCompleted
-                        | EventKind::ToolFailed
-                        | EventKind::CommandExecuted
-                )
-            })
-            .count();
-        let mut remaining = tool_events.saturating_sub(limit);
-        let removed = remaining;
-        self.events.retain(|event| {
-            if remaining > 0
-                && matches!(
-                    event.kind,
-                    EventKind::ToolCalled
-                        | EventKind::ToolCompleted
-                        | EventKind::ToolFailed
-                        | EventKind::CommandExecuted
-                )
-            {
-                remaining -= 1;
-                false
-            } else {
-                true
-            }
-        });
-        removed
+        if let Some(preview) = &mut self.preview {
+            return retain_latest_matching(&mut preview.outline, limit, |event| event.tool);
+        }
+        retain_latest_matching(&mut self.events, limit, |event| is_tool_event(&event.kind))
     }
 
     /// Drops the oldest events above `limit` and returns how many were dropped.
     pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        if let Some(preview) = &mut self.preview {
+            let omitted = preview.outline.len().saturating_sub(limit);
+            preview.outline.drain(..omitted);
+            return omitted;
+        }
         let omitted = self.events.len().saturating_sub(limit);
         self.events.drain(..omitted);
         omitted

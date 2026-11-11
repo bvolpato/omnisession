@@ -2,9 +2,9 @@ use std::io::{self, Write};
 
 use super::{
     CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
-    OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
-    is_secret, markdown_tool_label, next_action, quote_untrusted, redact_secrets,
-    redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
+    OmniEvent, ReplayPolicy, bounded_text, codex_history_warnings, is_documentary_tool_message,
+    is_harness_envelope, is_secret, markdown_tool_label, next_action, quote_untrusted,
+    redact_secrets, redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
     source_compaction_text, text_from_payload_ref, visible_events,
 };
 
@@ -98,6 +98,9 @@ pub fn write_recovery_handoff(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
+        for reason in codex_history_warnings(snapshot) {
+            writeln!(output, "{reason}\n")?;
+        }
     }
     writeln!(output, "## Available conversation\n")?;
     let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;

@@ -181,7 +181,8 @@ fn store_search_document(
             source_byte_count: document.source_byte_count,
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read,
+            source_complete: full_read
+                && !omnis_adapters::CodexAdapter::has_unavailable_ancestry(snapshot),
             origin,
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
