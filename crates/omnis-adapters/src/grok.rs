@@ -113,15 +113,7 @@ struct OwnerHeader {
 }
 
 #[derive(Deserialize)]
-struct UpdateHeader {
-    params: Option<UpdateParams>,
-    #[serde(rename = "sessionUpdate", alias = "type", alias = "event")]
-    legacy_kind: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct UpdateParams {
-    update: Option<serde::de::IgnoredAny>,
     #[serde(default, rename = "sessionId", deserialize_with = "present_owner")]
     session_id: Option<String>,
 }
@@ -469,7 +461,7 @@ impl GrokAdapter {
         let mut omissions = JsonLineSkips::default();
         let log = provider_file(root, &directory.join("updates.jsonl"));
         if let Some(file) = &log {
-            let mut push = |record: Value| -> Result<()> {
+            let mut push = |record: Value, gap: bool| -> Result<()> {
                 // Grok rekeys inherited ACP updates when it creates a native fork.
                 anyhow::ensure!(
                     record
@@ -481,7 +473,7 @@ impl GrokAdapter {
                 if is_update_record(&record) {
                     observed += 1;
                 }
-                updates.push_record(&mut builder, record);
+                updates.push_record(&mut builder, record, gap);
                 Ok(())
             };
             if full {
@@ -500,8 +492,8 @@ impl GrokAdapter {
                 )?;
                 sampled = preview.sampled;
                 omissions = preview.omissions;
-                for record in preview.records {
-                    push(record)?;
+                for (index, record) in preview.records.into_iter().enumerate() {
+                    push(record, preview.gap_before.contains(&index))?;
                 }
             }
         }
@@ -624,22 +616,36 @@ fn native_update_headers(
         let Some(line) = line else {
             return Ok(false);
         };
-        let Ok(header) = serde_json::from_slice::<UpdateHeader>(line) else {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
             return Ok(false);
         };
-        if let Some(owner) = header
-            .params
-            .as_ref()
-            .and_then(|params| params.session_id.as_deref())
-        {
-            anyhow::ensure!(owner == id, GrokHistoryError::ForeignOwner);
+        if let Some(owner) = record.pointer("/params/sessionId") {
+            anyhow::ensure!(owner.as_str() == Some(id), GrokHistoryError::ForeignOwner);
         }
-        if header.legacy_kind.is_none()
-            && header.params.is_none_or(|params| params.update.is_none())
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        let update = record.pointer("/params/update").unwrap_or(&record);
+        let kind = string_at(update, &[&["sessionUpdate"], &["type"], &["event"]]);
+        Ok(match kind {
+            Some(
+                "user_message_chunk"
+                | "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "user"
+                | "user_message"
+                | "assistant"
+                | "assistant_message",
+            ) => {
+                let content = &update["content"];
+                match content["type"].as_str() {
+                    Some("text") => content["text"].is_string(),
+                    Some("image" | "audio") => {
+                        content["data"].is_string() && content["mimeType"].is_string()
+                    }
+                    _ => false,
+                }
+            }
+            Some(_) => true,
+            None => false,
+        })
     })?
     else {
         return Ok(NativeResumeSupport::ImportOnly);
@@ -776,8 +782,8 @@ impl GrokMetadata {
     fn source_revision(&self, path: &Path) -> SourceRevision {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
-        // Older projections did not check ownership and the native update count.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v1");
+        // The revision includes the projection that preserves gaps between message chunks.
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v2");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -949,7 +955,7 @@ fn is_update_record(record: &Value) -> bool {
 }
 
 impl GrokUpdateProcessor {
-    fn push_record(&mut self, builder: &mut EventBuilder, mut record: Value) {
+    fn push_record(&mut self, builder: &mut EventBuilder, mut record: Value, gap: bool) {
         let timestamp = parse_timestamp(value_at(
             &record,
             &[&["timestamp"], &["created_at"], &["createdAt"]],
@@ -994,6 +1000,9 @@ impl GrokUpdateProcessor {
             }
             match &mut self.pending {
                 Some(pending) if pending.kind == kind && pending.message_id == message_id => {
+                    if gap {
+                        pending.text.push_str("\n[Source records omitted]\n");
+                    }
                     pending.text.push_str(&text);
                     pending.content.extend(content);
                     pending.content_unreadable |= content_unreadable;
@@ -1926,6 +1935,28 @@ mod tests {
     }
 
     #[test]
+    fn torn_records_separate_same_id_chunks_in_full_and_bounded_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = write_session(root.path(), SESSION_ID, &json!({"id": SESSION_ID}), &[]);
+        let chunk = |text| json!({"sessionUpdate":"agent_message_chunk","messageId":"r","content":{"type":"text","text":text}});
+        fs::write(
+            directory.join("updates.jsonl"),
+            format!("{}\n{{\n{}\n", chunk("copper"), chunk("finch")),
+        )
+        .unwrap();
+        let adapter = GrokAdapter::with_root(root.path());
+        for budget in [0, u64::MAX] {
+            let read = adapter
+                .index_session(&SessionRef::new(Provider::Grok, SESSION_ID), None, budget)
+                .unwrap();
+            assert_eq!(
+                read.snapshot.events[0].payload["text"],
+                "copper\n[Source records omitted]\nfinch"
+            );
+        }
+    }
+
+    #[test]
     fn grok_preview_covers_a_metadata_only_log_read_to_eof() {
         let root = tempfile::tempdir().unwrap();
         write_session(
@@ -2116,6 +2147,12 @@ mod tests {
         with_history["num_messages"] = json!(1);
         fs::write(&summaries, with_history.to_string()).unwrap();
         assert!(adapter.native_resume_support(&session).is_err());
+        let incomplete = json!({"params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk","messageId":"reply"}}});
+        fs::write(&updates, incomplete.to_string()).unwrap();
+        assert_eq!(
+            adapter.native_resume_support(&session).unwrap(),
+            NativeResumeSupport::ImportOnly
+        );
         let owned = json!({"params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"session_info_update"}}});
         fs::write(&updates, format!("{owned}\n")).unwrap();
         assert_eq!(
@@ -2414,7 +2451,7 @@ mod tests {
             json!({"sessionUpdate": "tool_call", "toolCallId": "synthetic", "rawInput": "x".repeat(8_192)}),
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Unchanged visible answer"}}),
         ] {
-            processor.push_record(&mut builder, record);
+            processor.push_record(&mut builder, record, false);
         }
         processor.finish(&mut builder);
         let snapshot = builder.snapshot(
@@ -2472,6 +2509,7 @@ mod tests {
             processor.push_record(
                 &mut builder,
                 json!({"sessionUpdate": "future_record", "index": index}),
+                false,
             );
         }
         processor.finish(&mut builder);

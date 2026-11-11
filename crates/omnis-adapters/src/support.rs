@@ -979,9 +979,10 @@ impl JsonLinesLimits {
 pub(crate) fn visit_json_lines(
     path: &Path,
     file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
+    mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_omissions(path, file_limit, visit).map(|skips| skips.oversized)
+    visit_json_lines_with_omissions(path, file_limit, |record, _| visit(record))
+        .map(|skips| skips.oversized)
 }
 
 /// Byte location of one complete JSON value in a bounded JSONL transcript.
@@ -999,10 +1000,14 @@ pub(crate) struct JsonLineLocation {
 pub(crate) fn visit_json_lines_with_offsets(
     reader: &mut BufReader<File>,
     file_limit: u64,
-    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
-        .map(|skips| skips.oversized)
+    visit_json_lines_with_offsets_and_limits(
+        reader,
+        JsonLinesLimits::streamed(file_limit),
+        |loc, record, _| visit(loc, record),
+    )
+    .map(|skips| skips.oversized)
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -1042,13 +1047,18 @@ pub(crate) fn omitted_images_text(count: usize) -> String {
 pub(crate) fn visit_json_lines_with_omissions(
     path: &Path,
     file_limit: u64,
-    mut visit: impl FnMut(Value) -> Result<()>,
+    mut visit: impl FnMut(Value, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
+    let mut previous = 0;
     let file = File::open(path)?;
     visit_json_lines_with_offsets_and_limits(
         &mut BufReader::new(file),
         JsonLinesLimits::streamed(file_limit),
-        |_, record| visit(record),
+        |_, record, skips| {
+            let gap = skips.total() > previous;
+            previous = skips.total();
+            visit(record, gap)
+        },
     )
 }
 
@@ -1059,7 +1069,7 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
+    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record, _| {
         visit(record)
     })
     .map(|skips| skips.oversized)
@@ -1068,20 +1078,15 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
     }
     reader.seek(SeekFrom::Start(0))?;
-    visit_json_reader(
-        reader,
-        limits,
-        |_, _| WorkspaceGap::Other,
-        |location, record, _| visit(location, record),
-    )
-    .map(|(omissions, _)| omissions)
+    visit_json_reader(reader, limits, |_, _| WorkspaceGap::Other, visit)
+        .map(|(omissions, _)| omissions)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1344,6 +1349,7 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
 
 #[derive(Default)]
 pub(crate) struct JsonLinesPreview {
+    pub(crate) gap_before: std::collections::BTreeSet<usize>,
     pub(crate) records: Vec<Value>,
     pub(crate) omissions: JsonLineSkips,
     pub(crate) sampled: bool,
@@ -1438,6 +1444,7 @@ fn read_json_lines_tail(
         offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
+    let mut previous = preview.omissions.total();
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1462,10 +1469,21 @@ fn read_json_lines_tail(
                 records.pop_front();
                 preview.sampled = true;
             }
-            records.push_back((line_offset, record));
+            records.push_back((line_offset, record, preview.omissions.total() > previous));
+            previous = preview.omissions.total();
         }
     }
-    Ok(records.into_iter().collect())
+    let records = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, record, gap))| {
+            if gap || (index == 0 && preview.sampled) {
+                preview.gap_before.insert(preview.records.len() + index);
+            }
+            (offset, record)
+        })
+        .collect();
+    Ok(records)
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
@@ -1508,6 +1526,7 @@ fn read_json_lines_prefix(
             break;
         }
         consumed = end;
+        let previous = preview.omissions.total();
         match line_kind {
             BoundedLine::Oversized => preview
                 .omissions
@@ -1517,6 +1536,9 @@ fn read_json_lines_prefix(
                     preview.records.push(record);
                 }
             }
+        }
+        if preview.omissions.total() > previous {
+            preview.gap_before.insert(preview.records.len());
         }
     }
     Ok(consumed)
