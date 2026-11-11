@@ -504,6 +504,7 @@ pub(super) fn spawn_preview_updates(
                                 complete,
                                 source_time,
                                 guard,
+                                None,
                             )
                             .and_then(|_| store.trajectory_title(&key.session))
                             {

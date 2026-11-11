@@ -1161,6 +1161,36 @@ impl Store {
             .collect())
     }
 
+    /// Returns eligible imported session IDs whose search document is missing or outdated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored index cannot be read.
+    pub fn outdated_imported_documents(
+        &self,
+        eligible_ids: &[&str],
+        document_version: u32,
+    ) -> Result<Vec<String>> {
+        let eligible = serde_json::to_string(eligible_ids)
+            .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "SELECT eligible.value FROM json_each(?1) AS eligible
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM session_trajectories
+                     WHERE provider = 'imported' AND session_id = eligible.value
+                       AND document_version >= ?2
+                 )",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map(params![eligible, document_version], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
     /// Returns cached native-session metadata ordered by most recent update.
     ///
     /// # Errors
@@ -1219,6 +1249,24 @@ impl Store {
     ///
     /// Returns an error for invalid metadata or failed persistence.
     pub fn upsert_indexed_session(&self, session: &IndexedSession) -> Result<()> {
+        Self::write_indexed_session(&self.connection.borrow(), session)
+    }
+
+    /// Returns whether one cached session has a metadata row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or failed lookup.
+    pub fn has_indexed_session(&self, session: &SessionRef) -> Result<bool> {
+        validate_session_ref(session)?;
+        self.connection.borrow().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_index WHERE provider = ?1 AND session_id = ?2)",
+            params![session.provider.to_string(), session.id],
+            |row| row.get(0),
+        ).map_err(database_error)
+    }
+
+    fn write_indexed_session(connection: &Connection, session: &IndexedSession) -> Result<()> {
         validate_session_ref(&session.session)?;
         let project_path = session
             .project_path
@@ -1227,7 +1275,6 @@ impl Store {
             .transpose()?;
         let event_count =
             i64::try_from(session.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
-        let connection = self.connection.borrow();
         connection
             .execute(
                 "
@@ -1647,6 +1694,7 @@ impl Store {
     ) -> Result<()> {
         self.upsert_trajectory_documents_with_limits(
             std::iter::once((session, *document, TrajectorySourceGuard::NewerSource)),
+            None,
             1,
             usize::MAX,
         )
@@ -1674,6 +1722,7 @@ impl Store {
             documents.iter().map(|&(session, document)| {
                 (session, document, TrajectorySourceGuard::NewerSource)
             }),
+            None,
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
         )
@@ -1705,6 +1754,7 @@ impl Store {
     ) -> Result<usize> {
         self.upsert_trajectory_documents_with_limits(
             documents.iter().copied(),
+            None,
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             if documents.len() == 1 {
                 usize::MAX
@@ -1712,6 +1762,35 @@ impl Store {
                 MAX_TRAJECTORY_WRITE_BATCH_BYTES
             },
         )
+    }
+
+    /// Stores an imported session's locator and search document in the same transaction.
+    /// Returns whether the search document was rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid imported metadata, an invalid document, or a failed write.
+    pub fn upsert_imported_session_document(
+        &self,
+        locator: &IndexedSession,
+        document: &TrajectoryDocument<'_>,
+    ) -> Result<bool> {
+        if locator.session.provider != Provider::Imported
+            || document.origin != SessionTrajectoryOrigin::ImportedBundle
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        self.upsert_trajectory_documents_with_limits(
+            std::iter::once((
+                &locator.session,
+                *document,
+                TrajectorySourceGuard::NewerSource,
+            )),
+            Some(locator),
+            1,
+            usize::MAX,
+        )
+        .map(|rewritten| rewritten != 0)
     }
 
     fn upsert_trajectory_documents_with_limits<'s, 'd>(
@@ -1723,6 +1802,7 @@ impl Store {
                 TrajectorySourceGuard,
             ),
         >,
+        locator: Option<&IndexedSession>,
         max_documents: usize,
         max_indexed_bytes: usize,
     ) -> Result<usize> {
@@ -1779,6 +1859,9 @@ impl Store {
 
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        if let Some(locator) = locator {
+            Self::write_indexed_session(&transaction, locator)?;
+        }
         let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
         let mut upsert_parent = transaction
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
@@ -1819,13 +1902,7 @@ impl Store {
                 rewritten.retain(|(other, _)| *other != trajectory_id);
                 rewritten.push((trajectory_id, write.document.redacted_text));
             } else if write.document.origin == SessionTrajectoryOrigin::ImportedBundle {
-                transaction
-                    .execute(
-                        "UPDATE session_trajectories SET protected_by_bundle = 1
-                         WHERE provider = ?1 AND session_id = ?2",
-                        params![write.session.provider.to_string(), write.session.id],
-                    )
-                    .map_err(database_error)?;
+                protect_bundle_trajectory(&transaction, write.session)?;
             }
         }
         drop(upsert_parent);

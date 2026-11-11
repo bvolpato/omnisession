@@ -122,6 +122,14 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        if session.provider == Provider::Imported {
+            let store = Store::open_default().context("opening OmniSession state")?;
+            let bundle = load_imported_bundle(&store, imported_bundle_id(session)?)?;
+            if let Err(error) = refresh_opened_bundle(&store, session, &bundle) {
+                eprintln!("warning: local imported source index: {error}");
+            }
+            return Ok(bundle.snapshot);
+        }
         let cache = Store::open_default().and_then(|store| {
             let prior = store.trajectory_index_state(session)?;
             Ok((store, prior))
@@ -132,17 +140,7 @@ impl IndexedSessionReader for AdapterRegistry {
         };
         match cache {
             Ok((store, prior)) => {
-                let current = prior.is_some_and(|state| {
-                    state.document_version > omnis_core::SEARCH_DOCUMENT_VERSION
-                        || (state.source_complete
-                            && state.document_version == omnis_core::SEARCH_DOCUMENT_VERSION
-                            && !search_index::source_time_changed(
-                                session.provider,
-                                source_updated_at,
-                                &state,
-                            ))
-                });
-                if !current
+                if !full_document_current(session, source_updated_at, prior.as_ref())
                     && let Err(error) = store_search_document(
                         &store,
                         session,
@@ -150,6 +148,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         true,
                         source_updated_at,
                         search_index::source_guard(session.provider, prior.as_ref()),
+                        None,
                     )
                 {
                     eprintln!("warning: local trajectory index write: {error}");
@@ -159,6 +158,19 @@ impl IndexedSessionReader for AdapterRegistry {
         }
         Ok(snapshot)
     }
+}
+
+fn full_document_current(
+    session: &SessionRef,
+    source_updated_at: chrono::DateTime<Utc>,
+    prior: Option<&omnis_store::TrajectoryIndexState>,
+) -> bool {
+    prior.is_some_and(|state| {
+        state.document_version > omnis_core::SEARCH_DOCUMENT_VERSION
+            || (state.source_complete
+                && state.document_version == omnis_core::SEARCH_DOCUMENT_VERSION
+                && !search_index::source_time_changed(session.provider, source_updated_at, state))
+    })
 }
 
 /// Stores a versioned search document and returns whether the store rewrote it.
@@ -173,6 +185,7 @@ fn store_search_document(
     full_read: bool,
     source_updated_at: chrono::DateTime<Utc>,
     guard: TrajectorySourceGuard,
+    locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
@@ -181,23 +194,24 @@ fn store_search_document(
     };
     let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    let rewritten = store.upsert_observed_trajectory_documents_counted(&[(
-        session,
-        omnis_store::TrajectoryDocument {
-            redacted_text: &document.text,
-            source_updated_at,
-            source_byte_count: document.source_byte_count,
-            indexed_byte_count: document.indexed_byte_count,
-            truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read,
-            provider_limited: false,
-            origin,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
-            derived_title: derived_title.as_deref(),
-        },
-        guard,
-    )])?;
-    Ok(rewritten != 0)
+    let document = omnis_store::TrajectoryDocument {
+        redacted_text: &document.text,
+        source_updated_at,
+        source_byte_count: document.source_byte_count,
+        indexed_byte_count: document.indexed_byte_count,
+        truncation_strategy: document.truncation_strategy.as_str(),
+        source_complete: full_read,
+        provider_limited: false,
+        origin,
+        document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+        derived_title: derived_title.as_deref(),
+    };
+    if let Some(locator) = locator {
+        return store.upsert_imported_session_document(locator, &document);
+    }
+    store
+        .upsert_observed_trajectory_documents_counted(&[(session, document, guard)])
+        .map(|rewritten| rewritten != 0)
 }
 
 fn build_search_index(
@@ -2450,40 +2464,55 @@ fn imported_session_ref(bundle_id: Uuid) -> SessionRef {
     SessionRef::new(Provider::Imported, bundle_id.to_string())
 }
 
-fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
-    index_bundle_metadata(store, bundle)?;
-    index_bundle_document(store, bundle).map(|_| ())
+fn refresh_opened_bundle(
+    store: &Store,
+    session: &SessionRef,
+    bundle: &PortableBundle,
+) -> Result<()> {
+    let prior = store.trajectory_index_state(session)?;
+    if !full_document_current(session, bundle.snapshot.captured_at, prior.as_ref()) {
+        index_bundle_source(store, bundle)?;
+    } else if !store.has_indexed_session(session)? {
+        index_bundle_metadata(store, bundle)?;
+    }
+    Ok(())
+}
+
+fn bundle_locator(bundle: &PortableBundle) -> IndexedSession {
+    IndexedSession {
+        session: imported_session_ref(bundle.manifest.bundle_id),
+        title: bundle.snapshot.title.as_deref().map(redact_secrets),
+        project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
+        git_branch: bundle
+            .snapshot
+            .workspace
+            .git
+            .branch
+            .as_deref()
+            .map(redact_secrets),
+        created_at: Some(bundle.manifest.created_at),
+        updated_at: Some(bundle.snapshot.captured_at),
+        updated_at_approximate: false,
+        event_count: bundle.manifest.event_count,
+    }
 }
 
 fn index_bundle_metadata(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store
-        .upsert_indexed_session(&IndexedSession {
-            session: imported_session_ref(bundle.manifest.bundle_id),
-            title: bundle.snapshot.title.as_deref().map(redact_secrets),
-            project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
-            git_branch: bundle
-                .snapshot
-                .workspace
-                .git
-                .branch
-                .as_deref()
-                .map(redact_secrets),
-            created_at: Some(bundle.manifest.created_at),
-            updated_at: Some(bundle.snapshot.captured_at),
-            updated_at_approximate: false,
-            event_count: bundle.manifest.event_count,
-        })
+        .upsert_indexed_session(&bundle_locator(bundle))
         .context("indexing imported bundle metadata")
 }
 
-fn index_bundle_document(store: &Store, bundle: &PortableBundle) -> Result<bool> {
+fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<bool> {
+    let locator = bundle_locator(bundle);
     store_search_document(
         store,
-        &imported_session_ref(bundle.manifest.bundle_id),
+        &locator.session,
         &bundle.snapshot,
         true,
         bundle.snapshot.captured_at,
         TrajectorySourceGuard::NewerSource,
+        Some(&locator),
     )
     .context("indexing imported bundle trajectory")
 }
@@ -2534,32 +2563,36 @@ fn refresh_cached_imported_sources(
     summary: &mut search_index::IndexSummary,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    let eligible: HashSet<_> = sessions
+    let eligible: Vec<_> = sessions
         .iter()
         .filter(|session| session.session.provider == Provider::Imported)
-        .filter_map(|session| imported_bundle_id(&session.session).ok())
+        .map(|session| session.session.id.as_str())
         .collect();
     if eligible.is_empty() {
         return Ok(());
     }
     let outdated = store
-        .bundle_ids_needing_imported_source(Some(omnis_core::SEARCH_DOCUMENT_VERSION))
+        .outdated_imported_documents(&eligible, omnis_core::SEARCH_DOCUMENT_VERSION)
         .context("finding outdated imported documents")?;
-    for bundle_id in outdated.into_iter().filter(|id| eligible.contains(id)) {
-        summary.stale += 1;
-        if no_index {
-            continue;
-        }
-        let Ok(bundle) = load_imported_bundle(store, bundle_id) else {
+    summary.stale = outdated.len();
+    if no_index {
+        return Ok(());
+    }
+    for id in outdated {
+        let session = SessionRef::new(Provider::Imported, id);
+        let Ok(bundle_id) = imported_bundle_id(&session) else {
             summary.failed += 1;
-            warnings.push(format!("ignored malformed stored bundle `{bundle_id}`"));
+            warnings.push("invalid imported session locator in the cache".to_owned());
             continue;
         };
-        match index_bundle_document(store, &bundle) {
+        match load_imported_bundle(store, bundle_id)
+            .context("missing or malformed stored bundle")
+            .and_then(|bundle| index_bundle_source(store, &bundle))
+        {
             Ok(rewritten) => summary.indexed += usize::from(rewritten),
             Err(error) => {
                 summary.failed += 1;
-                warnings.push(format!("migrating imported bundle `{bundle_id}`: {error}"));
+                warnings.push(format!("refreshing `{session}`: {error:#}"));
             }
         }
     }

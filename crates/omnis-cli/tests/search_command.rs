@@ -164,6 +164,88 @@ fn upgraded_search_documents_refresh_on_direct_reads_and_for_imported_bundles() 
 }
 
 #[test]
+fn opening_an_imported_session_restores_the_locator_and_document_together() {
+    let fixture = Fixture::new();
+    let bundle = fixture.root.join("stored.json");
+    let receipt = fixture.run_json(&[
+        "export",
+        &format!("claude:{CLAUDE_ID}"),
+        "--output",
+        bundle.to_str().unwrap(),
+    ]);
+    let imported = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    database
+        .execute_batch(
+            "DELETE FROM session_index WHERE provider = 'imported';
+         UPDATE session_trajectories SET document_version = 0 WHERE provider = 'imported';
+         CREATE TRIGGER reject_document BEFORE INSERT ON session_trajectories
+         WHEN NEW.provider = 'imported' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+        )
+        .unwrap();
+    fixture.run_json(&["show", &imported]);
+    let count_locator = || {
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM session_index WHERE provider = 'imported'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count_locator(), 0);
+
+    database
+        .execute_batch("DROP TRIGGER reject_document;")
+        .unwrap();
+    fixture.run_json(&["show", &imported]);
+    let matches = fixture.search_json(&[
+        "zebracorn",
+        "--cached",
+        "--no-index",
+        "--provider",
+        "imported",
+        "--all-projects",
+    ]);
+    assert_eq!(result_sessions(&matches), [imported.as_str()]);
+    assert_eq!(matches["index"]["indexed"], 0);
+    assert_eq!(count_locator(), 1);
+}
+
+#[test]
+fn cached_search_counts_a_missing_imported_bundle_as_a_failed_refresh() {
+    let fixture = Fixture::new();
+    fixture.run_json(&["list", "--provider", "imported"]);
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    database
+        .execute(
+            "INSERT INTO session_index (provider, session_id, project_path, event_count, indexed_at)
+             VALUES ('imported', ?1, ?2, 0, 0)",
+            [CLAUDE_ID, fixture.workspace.to_str().unwrap()],
+        )
+        .unwrap();
+    let pending =
+        fixture.search_json(&["marker", "--cached", "--provider", "imported", "--no-index"]);
+    assert_eq!(pending["index"]["stale"], 1);
+    assert_eq!(pending["index"]["failed"], 0);
+    assert_eq!(pending["index"]["skipped"], true);
+    let searched = fixture.search_json(&["marker", "--cached", "--provider", "imported"]);
+    assert_eq!(
+        searched["index"],
+        json!({"candidates": 1, "stale": 1, "indexed": 0, "failed": 1, "failed_skipped": 0, "skipped": false, "interrupted": false})
+    );
+    assert!(
+        searched["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains(CLAUDE_ID) && text.contains("not found")))
+    );
+}
+
+#[test]
 fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
     let fixture = Fixture::new();
     let source = format!("claude:{CLAUDE_ID}");
