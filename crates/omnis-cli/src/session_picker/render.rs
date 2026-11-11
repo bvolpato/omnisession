@@ -1628,6 +1628,7 @@ pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
         return None;
     };
     match &preview.title {
+        omnis_core::SessionPreviewTitle::VerifiedRename(name) => return Some(name.clone()),
         omnis_core::SessionPreviewTitle::AfterClear(title) => return title.clone(),
         omnis_core::SessionPreviewTitle::Unverified => return None,
         omnis_core::SessionPreviewTitle::FirstMessage => {}
@@ -2012,6 +2013,7 @@ pub(super) fn display_title(session: &NativeSession, preview: Option<&PreviewVal
                 return None;
             };
             match &preview.title {
+                omnis_core::SessionPreviewTitle::VerifiedRename(name) => Some(name.clone()),
                 omnis_core::SessionPreviewTitle::AfterClear(title) => Some(
                     title
                         .clone()

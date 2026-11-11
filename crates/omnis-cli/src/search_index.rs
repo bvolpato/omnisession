@@ -24,7 +24,7 @@ use omnis_core::{
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
-    MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
+    IndexedSession, MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
     SessionTrajectoryOrigin, Store, TrajectoryDocument, TrajectoryIndexFailure,
     TrajectoryIndexState, TrajectorySourceGuard,
 };
@@ -103,31 +103,12 @@ pub(crate) fn source_time_changed(
     }
 }
 
-pub(crate) fn source_guard(
-    provider: Provider,
-    prior: Option<&TrajectoryIndexState>,
-) -> TrajectorySourceGuard {
-    if TrajectorySourceGuard::uses_file_time(provider) {
-        match prior {
-            Some(state) if !state.source_time_precise => {
-                TrajectorySourceGuard::ObservedLegacy(state.source_updated_at)
-            }
-            _ => TrajectorySourceGuard::Observed(prior.map(|state| state.source_updated_at)),
-        }
-    } else {
-        TrajectorySourceGuard::NewerSource
-    }
-}
-
 pub(crate) fn observe_source(
     store: &Store,
     session: &SessionRef,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
     if TrajectorySourceGuard::uses_file_time(session.provider) {
-        Ok(source_guard(
-            session.provider,
-            store.trajectory_index_state(session)?.as_ref(),
-        ))
+        store.observe_trajectory_document(session)
     } else {
         Ok(TrajectorySourceGuard::NewerSource)
     }
@@ -246,7 +227,7 @@ fn read_budget(candidate: &IndexCandidate, prior: Option<&TrajectoryIndexState>)
 
 /// Stale candidates in order, the failures they were checked against, and their counts.
 struct Pending {
-    stale: Vec<(IndexCandidate, TrajectorySourceGuard, u64)>,
+    stale: Vec<(IndexCandidate, Option<TrajectoryIndexState>)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
     summary: IndexSummary,
 }
@@ -296,9 +277,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            let guard = source_guard(candidate.session.provider, prior);
-            let budget = read_budget(&candidate, prior);
-            stale.push((candidate, guard, budget));
+            stale.push((candidate, prior.copied()));
         }
     }
     summary.stale = stale.len();
@@ -347,6 +326,21 @@ pub(crate) fn index_candidates(
         total: stale.len(),
         ..IndexProgress::default()
     });
+    let stale = stale
+        .into_iter()
+        .map(|(candidate, prior)| {
+            let guard = if prior.is_none()
+                && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
+            {
+                // The bulk state query already observed the missing row.
+                TrajectorySourceGuard::ObservedDocument(None)
+            } else {
+                observe_source(store, &candidate.session)?
+            };
+            let budget = read_budget(&candidate, prior.as_ref());
+            Ok((candidate, guard, budget))
+        })
+        .collect::<omnis_store::Result<Vec<_>>>()?;
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
     let mut processed = 0;
@@ -582,19 +576,7 @@ fn flush_batch(
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                let session = &prepared.candidate.session;
-                if let Ok(fresh) = store
-                    .trajectory_index_state(session)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|prior| {
-                        prepare_session(
-                            registry,
-                            &prepared.candidate,
-                            source_guard(session.provider, prior.as_ref()),
-                            read_budget(&prepared.candidate, prior.as_ref()),
-                        )
-                    })
-                {
+                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
                     prepared = fresh;
                     stored = prepared.store(store);
                 }
@@ -607,6 +589,26 @@ fn flush_batch(
             }
         }
     }
+}
+
+fn reread_after_conflict(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidate: &IndexCandidate,
+) -> anyhow::Result<PreparedIndex> {
+    let session = &candidate.session;
+    let guard = if TrajectorySourceGuard::uses_file_time(session.provider) {
+        store.observe_verified_session(session)?
+    } else {
+        observe_source(store, session)?
+    };
+    let prior = store.trajectory_index_state(session)?;
+    prepare_session(
+        registry,
+        candidate,
+        guard,
+        read_budget(candidate, prior.as_ref()),
+    )
 }
 
 fn progress(
@@ -624,6 +626,7 @@ fn progress(
 
 struct PreparedIndex {
     guard: TrajectorySourceGuard,
+    verified_metadata: Option<IndexedSession>,
     candidate: IndexCandidate,
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
@@ -649,6 +652,13 @@ impl PreparedIndex {
     }
 
     fn store(&self, store: &Store) -> omnis_store::Result<usize> {
+        if let Some(metadata) = &self.verified_metadata {
+            return store.upsert_verified_session_document(
+                metadata,
+                self.store_document(),
+                self.guard,
+            );
+        }
         store.upsert_observed_trajectory_documents_counted(&[(
             &self.candidate.session,
             self.store_document(),
@@ -708,7 +718,7 @@ fn prepare_session(
         snapshot,
         source_complete,
         provider_limited,
-        ..
+        native_session,
     } = read;
     let document = trajectory_search_document(&snapshot);
     let source_updated_at = source_updated_at
@@ -720,6 +730,10 @@ fn prepare_session(
     };
     Ok(PreparedIndex {
         guard,
+        verified_metadata: native_session
+            .as_ref()
+            .filter(|_| matches!(guard, TrajectorySourceGuard::Verified(_)))
+            .map(crate::indexed_session_metadata),
         candidate: candidate.clone(),
         document,
         source_updated_at,
@@ -1200,6 +1214,90 @@ mod tests {
     }
 
     #[test]
+    fn stale_pi_index_worker_rereads_the_latest_same_time_replacement() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        fs::create_dir(&root)?;
+        let path = root.join("session.jsonl");
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let replace = |revision: &str| -> Result<()> {
+            let workspace = temporary.path().join(revision);
+            fs::create_dir(&workspace)?;
+            let header = json!({"type":"session","version":3,"id":"same-time","cwd":workspace,"title":revision});
+            let message = json!({"type":"message","id":"ask","parentId":null,
+                "message":{"role":"user","content":format!("{revision}body")}});
+            let next = path.with_extension("next");
+            fs::write(&next, format!("{header}\n{message}\n"))?;
+            File::options()
+                .write(true)
+                .open(&next)?
+                .set_modified(modified)?;
+            fs::rename(next, &path)?;
+            Ok(())
+        };
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::PiAdapter::with_root(root));
+        let store = Store::open(temporary.path().join("store.sqlite3"))?;
+        let session = SessionRef::new(Provider::Pi, "same-time");
+
+        replace("alpha")?;
+        store.upsert_session_trajectory(&session, "Initial preview", modified.into(), false)?;
+        let listed = registry
+            .find_native_session(Provider::Pi, &session.id)?
+            .unwrap();
+        let candidate = IndexCandidate::from_session(&listed).unwrap();
+        let prepared = prepare_session(
+            &registry,
+            &candidate,
+            observe_source(&store, &session)?,
+            FULL_READ_SOURCE_BYTES,
+        )?;
+        replace("bravo")?;
+        let guard = store.observe_verified_session(&session)?;
+        let (read, source_time) = crate::read_search_snapshot(&registry, &session, true)?;
+        let metadata = crate::indexed_session_metadata(&read.native_session.unwrap());
+        crate::store_search_document(
+            &store,
+            &session,
+            &read.snapshot,
+            true,
+            source_time.unwrap(),
+            guard,
+            Some(&metadata),
+        )?;
+        assert_eq!(store.trajectory_title(&session)?.as_deref(), Some("bravo"));
+
+        replace("delta")?;
+        let mut summary = IndexSummary::default();
+        flush_batch(
+            &registry,
+            &store,
+            &mut vec![prepared],
+            &mut summary,
+            &mut Vec::new(),
+        );
+        assert_eq!((summary.indexed, summary.failed), (1, 0));
+        let catalog = store.indexed_sessions_for_provider(Provider::Pi)?;
+        assert_eq!(
+            catalog[0].project_path,
+            Some(temporary.path().join("delta"))
+        );
+        assert_eq!(catalog[0].title.as_deref(), Some("delta"));
+        assert_eq!(store.trajectory_title(&session)?.as_deref(), Some("delta"));
+        assert_eq!(
+            store.search_session_trajectories("deltabody", 1)?,
+            [session]
+        );
+        for stale in ["alphabody", "bravobody"] {
+            assert!(
+                store.search_session_trajectories(stale, 1)?.is_empty(),
+                "{stale}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn failed_batch_retries_each_session_without_losing_its_neighbors() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let database = temporary.path().join("store.sqlite3");
@@ -1223,6 +1321,7 @@ mod tests {
                     document_version: search_document_version(Provider::Codex),
                 },
                 guard: TrajectorySourceGuard::NewerSource,
+                verified_metadata: None,
                 document: SearchDocument {
                     source_byte_count: text.len(),
                     indexed_byte_count: text.len(),

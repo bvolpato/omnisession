@@ -122,56 +122,73 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        let cache = Store::open_default().and_then(|store| {
-            let (prior, guard) = if matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
-                (None, store.observe_verified_session(session)?)
-            } else {
-                let prior = store.trajectory_index_state(session)?;
-                (
-                    prior,
-                    search_index::source_guard(session.provider, prior.as_ref()),
-                )
-            };
-            Ok((store, prior, guard))
-        });
-        let (read, source_updated_at) = read_search_snapshot(self, session, true)?;
-        let snapshot = read.snapshot;
-        let Some(source_updated_at) = source_updated_at else {
-            return Ok(snapshot);
-        };
-        match cache {
-            Ok((store, prior, guard)) => {
-                let version = omnis_core::search_document_version(snapshot.session.provider);
-                let current = prior.is_some_and(|state| {
-                    state.document_version > version
-                        || (state.source_complete
-                            && state.document_version == version
-                            && !search_index::source_time_changed(
-                                session.provider,
-                                source_updated_at,
-                                &state,
-                            ))
-                });
-                if !current
-                    && let Err(error) = store_search_document(
-                        &store,
-                        session,
-                        &snapshot,
-                        true,
-                        source_updated_at,
-                        guard,
-                        read.native_session
-                            .as_ref()
-                            .map(indexed_session_metadata)
-                            .as_ref(),
-                    )
-                {
-                    eprintln!("warning: local trajectory index write: {error}");
-                }
+        let store = match Store::open_default() {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("warning: local trajectory index unavailable: {error}");
+                return read_session(self, session);
             }
-            Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
+        };
+        let mut retry = true;
+        loop {
+            let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+                store
+                    .observe_verified_session(session)
+                    .map(|guard| (None, guard))
+            } else {
+                store
+                    .trajectory_index_state(session)
+                    .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
+            };
+            let (read, source_time) = read_search_snapshot(self, session, true)?;
+            let snapshot = read.snapshot;
+            let Some(source_time) = source_time else {
+                if retry && TrajectorySourceGuard::uses_file_time(session.provider) {
+                    retry = false;
+                    continue;
+                }
+                return Ok(snapshot);
+            };
+            let (prior, guard) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    eprintln!("warning: local trajectory index unavailable: {error}");
+                    return Ok(snapshot);
+                }
+            };
+            let version = omnis_core::search_document_version(snapshot.session.provider);
+            let current = prior.is_some_and(|state| {
+                state.document_version > version
+                    || (state.source_complete
+                        && state.document_version == version
+                        && !search_index::source_time_changed(
+                            session.provider,
+                            source_time,
+                            &state,
+                        ))
+            });
+            if !current
+                && let Err(error) = store_search_document(
+                    &store,
+                    session,
+                    &snapshot,
+                    true,
+                    source_time,
+                    guard,
+                    read.native_session
+                        .as_ref()
+                        .map(indexed_session_metadata)
+                        .as_ref(),
+                )
+            {
+                if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
+                    retry = false;
+                    continue;
+                }
+                eprintln!("warning: local trajectory index write: {error}");
+            }
+            return Ok(snapshot);
         }
-        Ok(snapshot)
     }
 }
 

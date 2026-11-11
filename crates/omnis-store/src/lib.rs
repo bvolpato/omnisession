@@ -249,6 +249,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
+            -- A new OMP reader must verify names guessed by an older sample.
+            WHEN excluded.provider = 'omp'
+                AND excluded.document_version > session_trajectories.document_version
+                AND NOT session_trajectories.source_complete
+                AND NOT coalesce(session_trajectories.title_authoritative, 0)
+                THEN excluded.derived_title
             WHEN ?18 AND (
                 ?15 OR excluded.document_version > session_trajectories.document_version
                 OR session_trajectories.source_complete = 0
@@ -534,6 +540,8 @@ pub enum TrajectorySourceGuard {
     Observed(Option<DateTime<Utc>>),
     /// A previous indexer recorded only the millisecond that contained the modification time.
     ObservedLegacy(DateTime<Utc>),
+    /// The indexed document observed before reading a source whose update time can repeat.
+    ObservedDocument(Option<[u8; 32]>),
     /// The document and catalog observed before opening one native session.
     Verified([u8; 32]),
 }
@@ -553,6 +561,13 @@ impl TrajectorySourceGuard {
     ) -> Result<()> {
         let prior = match self {
             Self::NewerSource => return Ok(()),
+            Self::ObservedDocument(expected) => {
+                return if expected == document_receipt(transaction, session)? {
+                    Ok(())
+                } else {
+                    Err(StoreError::TrajectorySourceChanged)
+                };
+            }
             Self::Verified(expected) => {
                 return if expected == verified_session_state(transaction, session)? {
                     Ok(())
@@ -680,6 +695,12 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         })
     }
 
+    fn observed_full_source(&self) -> bool {
+        self.source_complete
+            && self.document.origin == SessionTrajectoryOrigin::Native
+            && matches!(self.guard, TrajectorySourceGuard::ObservedDocument(_))
+    }
+
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
         let doc = self.document;
         connection
@@ -718,22 +739,39 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
     }
 }
 
+const DOCUMENT_RECEIPT_SQL: &str =
+    "SELECT json_array(id, indexed_at, hex(content_hash), source_updated_at,
+         source_updated_submillis, source_complete, provider_limited, complete,
+         document_version, source_byte_count, indexed_byte_count, truncation_strategy,
+         origin, derived_title, title_authoritative)
+     FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
+
+fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
+    connection
+        .prepare_cached(DOCUMENT_RECEIPT_SQL)
+        .map_err(database_error)?
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            Ok(Sha256::digest(row.get::<_, String>(0)?).into())
+        })
+        .optional()
+        .map_err(database_error)
+}
+
 fn verified_session_state(connection: &Connection, session: &SessionRef) -> Result<[u8; 32]> {
     // A restored file can reuse its modification time. Observe content, coverage and catalog
     // together so another full reader cannot restore an obsolete title or workspace.
+    let sql = format!(
+        "SELECT json_array(?1, ?2, ({DOCUMENT_RECEIPT_SQL}),
+            (SELECT json_array(title, project_path, git_branch, created_at, updated_at,
+                 updated_at_approximate, event_count, source_updated_submillis)
+             FROM session_index WHERE provider = ?1 AND session_id = ?2))"
+    );
     let state: String = connection
-        .query_row(
-            "SELECT json_array(?1, ?2,
-                (SELECT json_array(hex(content_hash), source_updated_at, source_updated_submillis,
-                     source_complete, provider_limited, complete, source_byte_count, indexed_byte_count,
-                     truncation_strategy, origin, document_version, derived_title, title_authoritative)
-                 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2),
-                (SELECT json_array(title, project_path, git_branch, created_at, updated_at,
-                     updated_at_approximate, event_count, source_updated_submillis)
-                 FROM session_index WHERE provider = ?1 AND session_id = ?2))",
-            params![session.provider.to_string(), session.id],
-            |row| row.get(0),
-        )
+        .prepare_cached(&sql)
+        .map_err(database_error)?
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            row.get(0)
+        })
         .map_err(database_error)?;
     Ok(Sha256::digest(state.as_bytes()).into())
 }
@@ -1903,6 +1941,20 @@ impl Store {
         )
     }
 
+    /// Captures the current search document before reading a source whose update time can repeat.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference is invalid or the document cannot be read.
+    pub fn observe_trajectory_document(
+        &self,
+        session: &SessionRef,
+    ) -> Result<TrajectorySourceGuard> {
+        validate_session_ref(session)?;
+        document_receipt(&self.connection.borrow(), session)
+            .map(TrajectorySourceGuard::ObservedDocument)
+    }
+
     /// Captures the current search document and catalog before reading the selected session.
     ///
     /// # Errors
@@ -2016,7 +2068,7 @@ impl Store {
                         source_submillis(write.session.provider, write.document.source_updated_at),
                         write.document.provider_limited,
                         write.document.can_clear_derived_title(),
-                        verified_metadata.is_some(),
+                        verified_metadata.is_some() || write.observed_full_source(),
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4971,6 +5023,76 @@ mod tests {
     }
 
     #[test]
+    fn document_observation_rejects_stale_equal_time_writes_after_insert_or_replacement() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("store.sqlite3");
+        let background = Store::open(&path).unwrap();
+        let show = Store::open(&path).unwrap();
+        let time = DateTime::from_timestamp(1_000, 843).unwrap();
+        let document = |text: &'static str| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at: time,
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 5,
+            derived_title: Some(text),
+            title_authoritative: false,
+        };
+        let old = document("withdrawn");
+        let restored = document("replacement");
+        for (provider, existing) in [(Provider::Pi, false), (Provider::OhMyPi, true)] {
+            let mut catalog = indexed_session(provider, "concurrent-index", "Native title");
+            catalog.updated_at = Some(time);
+            let session = &catalog.session;
+            if existing {
+                show.upsert_trajectory_document(session, &old).unwrap();
+            }
+            let delayed = background.observe_trajectory_document(session).unwrap();
+            let before_show = show.observe_verified_session(session).unwrap();
+            show.upsert_verified_session_document(&catalog, restored, before_show)
+                .unwrap();
+            assert!(matches!(
+                background.upsert_observed_trajectory_documents_counted(&[(session, old, delayed)]),
+                Err(StoreError::TrajectorySourceChanged)
+            ));
+            assert!(
+                background
+                    .search_session_trajectories("withdrawn", 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                background
+                    .search_session_trajectories("replacement", 2)
+                    .unwrap()
+                    .contains(session)
+            );
+
+            let current = background.observe_trajectory_document(session).unwrap();
+            let bounded = TrajectoryDocument {
+                source_byte_count: 12_000,
+                truncation_strategy: "event_head_tail",
+                ..document("currenttail")
+            };
+            assert_eq!(
+                background
+                    .upsert_observed_trajectory_documents_counted(&[(session, bounded, current)])
+                    .unwrap(),
+                1
+            );
+            assert!(
+                show.search_session_trajectories("currenttail", 2)
+                    .unwrap()
+                    .contains(session)
+            );
+        }
+    }
+
+    #[test]
     fn restored_file_wins_over_a_reader_that_started_before_the_restore() {
         use super::TrajectorySourceGuard::Observed;
 
@@ -5019,6 +5141,58 @@ mod tests {
             store.search_session_trajectories("replacement", 1).unwrap(),
             [session]
         );
+    }
+
+    #[test]
+    fn omp_title_upgrade_discards_only_an_older_unverified_sample() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("index.sqlite3")).unwrap();
+        let time = Utc::now();
+        for (id, provider, full, verified, upgrade, retain) in [
+            ("guess", Provider::OhMyPi, false, false, true, false),
+            ("same-format", Provider::OhMyPi, false, false, false, true),
+            ("known-name", Provider::OhMyPi, false, true, true, true),
+            ("full", Provider::OhMyPi, true, true, true, true),
+            ("other-provider", Provider::Pi, false, false, true, true),
+        ] {
+            let session = SessionRef::new(provider, id);
+            let original = TrajectoryDocument {
+                redacted_text: "row",
+                source_updated_at: time,
+                source_byte_count: 3,
+                indexed_byte_count: 3,
+                source_complete: full,
+                provider_limited: false,
+                truncation_strategy: "none",
+                origin: SessionTrajectoryOrigin::Native,
+                document_version: 4,
+                derived_title: Some("Prior name"),
+                title_authoritative: verified,
+            };
+            let refreshed = TrajectoryDocument {
+                source_updated_at: time + chrono::Duration::seconds(1),
+                source_complete: false,
+                provider_limited: true,
+                document_version: original.document_version + u32::from(upgrade),
+                title_authoritative: false,
+                derived_title: None,
+                ..original
+            };
+            for (doc, prior) in [(original, None), (refreshed, Some(time))] {
+                store
+                    .upsert_observed_trajectory_documents(&[(
+                        &session,
+                        doc,
+                        super::TrajectorySourceGuard::Observed(prior),
+                    )])
+                    .unwrap();
+            }
+            assert_eq!(
+                store.trajectory_title(&session).unwrap().as_deref(),
+                retain.then_some("Prior name"),
+                "{id}"
+            );
+        }
     }
 
     #[test]

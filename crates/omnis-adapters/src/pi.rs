@@ -454,26 +454,43 @@ fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc>
         .unwrap_or(fallback)
 }
 
+#[cfg(test)]
 fn session_path(
     records: &[Value],
     provider: Provider,
     allow_missing_ancestors: bool,
 ) -> Result<Vec<(&Value, CompactionRole)>> {
-    let entries = records
-        .iter()
-        .skip(1)
-        .filter(|record| record.get("type").and_then(Value::as_str) != Some("session"))
-        .collect::<Vec<_>>();
+    let path = selected_branch(records, allow_missing_ancestors)?;
+    Ok(ordered_entries(path, provider).collect())
+}
+
+fn ordered_entries(
+    path: Vec<&Value>,
+    provider: Provider,
+) -> impl Iterator<Item = (&Value, CompactionRole)> {
+    order_compaction(
+        path,
+        move |entry| branch_entry_kind(provider, entry),
+        |entry| entry["firstKeptEntryId"].as_str(),
+        |entry| entry["id"].as_str(),
+    )
+}
+
+fn selected_branch(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<&Value>> {
     let mut by_id = HashMap::new();
     let mut leaf = None;
-    for entry in &entries {
+    for entry in records
+        .iter()
+        .skip(1)
+        .filter(|record| record["type"] != "session")
+    {
         let Some(id) = entry.get("id").and_then(Value::as_str) else {
             continue;
         };
         if id.is_empty() {
             continue;
         }
-        by_id.insert(id, *entry);
+        by_id.insert(id, entry);
         leaf = Some(id);
     }
 
@@ -494,13 +511,7 @@ fn session_path(
         current = entry.get("parentId").and_then(Value::as_str);
     }
     path.reverse();
-    Ok(order_compaction(
-        path,
-        |entry| branch_entry_kind(provider, entry),
-        |entry| entry["firstKeptEntryId"].as_str(),
-        |entry| entry["id"].as_str(),
-    )
-    .collect())
+    Ok(path)
 }
 
 /// Position the latest compaction ahead of its retained entries and identify older summaries in that range.
@@ -1110,6 +1121,49 @@ fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRea
     })
 }
 
+/// Walk the selected parent chain back from EOF. A gap or unknown entry ends the title evidence.
+fn sampled_omp_title<'a>(branch: &[&'a Value], suffix: &[Value]) -> (Option<&'a str>, bool) {
+    if !branch
+        .last()
+        .zip(suffix.last())
+        .is_some_and(|(leaf, last)| std::ptr::eq(*leaf, last))
+    {
+        return (None, false);
+    }
+    let range = suffix.as_ptr_range();
+    let mut name = None;
+    for &entry in branch
+        .iter()
+        .rev()
+        .take_while(|entry| range.contains(&std::ptr::from_ref(**entry)))
+    {
+        match entry["type"].as_str() {
+            Some("title_change") => {
+                name = name.or_else(|| omp_branch_title(entry));
+            }
+            Some("reset_boundary") => return (name, true),
+            Some(
+                "message"
+                | "model_usage"
+                | "thinking_level_change"
+                | "model_change"
+                | "service_tier_change"
+                | "compaction"
+                | "branch_summary"
+                | "custom"
+                | "custom_message"
+                | "label"
+                | "ttsr_injection"
+                | "session_init"
+                | "mode_change"
+                | "credential_pin",
+            ) => {}
+            _ => break,
+        }
+    }
+    (name, false)
+}
+
 fn snapshot_from_records_preview(
     session: &SessionRef,
     records: &[Value],
@@ -1126,28 +1180,31 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    let path = session_path(records, session.provider, true)?;
-    // Only the selected branch can rename the session after the header was written.
+    let path = selected_branch(records, true)?;
+    let (rename, verified_reset) = if session.provider == Provider::OhMyPi {
+        let suffix = &records[records.len().saturating_sub(suffix_len)..];
+        sampled_omp_title(&path, suffix)
+    } else {
+        (None, false)
+    };
     let title = if session.provider == Provider::OhMyPi {
-        path.iter()
-            .rev()
-            .find_map(|(entry, _)| omp_branch_title(entry))
-            .map(str::to_owned)
-            .or(header.title)
+        rename.map(str::to_owned).or(header.title)
     } else {
         session_title(records)
     };
-    let suffix = &records[records.len().saturating_sub(suffix_len)..];
-    let verified_reset = session.provider == Provider::OhMyPi
-        && path
-            .iter()
-            .rfind(|(entry, _)| entry["type"] == "reset_boundary")
-            .is_some_and(|(reset, _)| suffix.iter().any(|record| std::ptr::eq(record, *reset)));
-    for (entry, role) in path {
+    for (entry, role) in ordered_entries(path, session.provider) {
         emit_entry(&mut builder, session.provider, entry, role);
     }
     let mut snapshot =
         builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at);
+    if let Some(name) = rename
+        && let Some(event) = snapshot.events.iter_mut().rfind(|event| {
+            event.source.raw_record_type.as_deref() == Some("title_change")
+                && event.payload["title"] == name
+        })
+    {
+        event.payload["verified_through_leaf"] = true.into();
+    }
     if session.provider == Provider::OhMyPi
         && let Some(reset) = snapshot
             .events
@@ -1730,6 +1787,56 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.events[0].kind, EventKind::CompactionCreated);
+    }
+
+    #[test]
+    fn sampled_omp_rename_requires_a_known_path_to_the_leaf() {
+        let session = SessionRef::new(Provider::OhMyPi, "session");
+        let slot = json!({"type":"title","v":1,"title":"Original"});
+        let header = json!({"type":"session","version":3,"id":"session","cwd":"/test"});
+        let reset = json!({"type":"reset_boundary","id":"reset","parentId":null});
+        let rename = json!({"type":"title_change","id":"name","parentId":"missing older entry","title":"Active"});
+        let middle = json!({"type":"model_change","id":"middle","parentId":"name"});
+        let leaf = json!({"type":"message","id":"leaf","parentId":"middle","message":{"role":"assistant","content":"Reply"}});
+        let original = vec![slot, header, reset, rename, middle, leaf];
+        for (name, kind, parent, tail, expected) in [
+            ("Active", "model_change", "name", 3, true),
+            ("Active", "model_change", "name", 2, false),
+            ("Active", "model_change", "sibling", 3, false),
+            ("Active", "future_entry", "name", 3, false),
+            ("Active", "model_change", "name", 0, false),
+            (" ", "model_change", "name", 3, false),
+        ] {
+            let mut records = original.clone();
+            records[3]["title"] = name.into();
+            records[4]["type"] = kind.into();
+            records[4]["parentId"] = parent.into();
+            let snapshot = snapshot_from_records_preview(&session, &records, tail).unwrap();
+            let title = omnis_core::session_search_title(&snapshot);
+            assert_eq!(
+                title.as_deref(),
+                Some(if expected { "Active" } else { "Original" })
+            );
+            assert_eq!(
+                omnis_core::session_search_title_is_authoritative(&snapshot, false),
+                expected
+            );
+            assert_eq!(
+                omnis_core::session_preview(&snapshot).title
+                    == omnis_core::SessionPreviewTitle::VerifiedRename("Active".into()),
+                expected
+            );
+        }
+        let mut unknown_leaf = original;
+        unknown_leaf.push(json!({"type":"future_entry_without_id"}));
+        let snapshot = snapshot_from_records_preview(&session, &unknown_leaf, 4).unwrap();
+        assert!(!omnis_core::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        assert_eq!(
+            omnis_core::session_search_title(&snapshot).as_deref(),
+            Some("Original")
+        );
     }
 
     #[test]

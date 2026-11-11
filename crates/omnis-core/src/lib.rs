@@ -51,7 +51,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Pi | Provider::OhMyPi => 6,
+        Provider::OhMyPi => 7,
+        Provider::Pi => 6,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -748,8 +749,36 @@ pub struct SessionPreview {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionPreviewTitle {
     FirstMessage,
+    VerifiedRename(String),
     AfterClear(Option<String>),
     Unverified,
+}
+
+fn verified_omp_rename(snapshot: &CanonicalSnapshot) -> Option<&str> {
+    if snapshot.session.provider != Provider::OhMyPi {
+        return None;
+    }
+    let event = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.source.provider == Provider::OhMyPi
+                && event.kind == EventKind::ProviderEvent
+                && match event.source.raw_record_type.as_deref() {
+                    Some("reset_boundary" | "session_info") => true,
+                    Some("title_change") => event.payload["title"]
+                        .as_str()
+                        .is_some_and(|name| !name.trim().is_empty()),
+                    _ => false,
+                }
+        })
+        .max_by_key(|event| (event.sequence, event.event_id))?;
+    (event.source.raw_record_type.as_deref() == Some("title_change")
+        && event.payload["type"] == "title_change"
+        && event.payload["verified_through_leaf"] == true
+        && !is_secret(event))
+    .then(|| event.payload["title"].as_str())
+    .flatten()
 }
 
 /// Reports whether the read verified the current task title or its absence.
@@ -759,6 +788,7 @@ pub fn session_search_title_is_authoritative(
     full_read: bool,
 ) -> bool {
     (full_read && !snapshot.events.iter().any(reports_omitted_events))
+        || verified_omp_rename(snapshot).is_some()
         || latest_omp_reset(snapshot).is_some_and(|reset| {
             reset.payload["verified_through_leaf"] == true
                 && reset.payload["type"] == "reset_boundary"
@@ -770,6 +800,9 @@ pub fn session_search_title_is_authoritative(
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    if let Some(name) = verified_omp_rename(snapshot) {
+        return compact_search_title(name);
+    }
     if let Some((context, verified)) = reset_preview_context(snapshot) {
         return if verified {
             post_clear_search_title(snapshot, &context.events[context.start..])
@@ -851,6 +884,9 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
             SessionPreviewTitle::FirstMessage,
         )
     };
+    let title = verified_omp_rename(snapshot)
+        .and_then(compact_search_title)
+        .map_or(title, SessionPreviewTitle::VerifiedRename);
     for event in events.into_iter().skip(start) {
         if is_preview_message(event) {
             first.get_or_insert(event);
