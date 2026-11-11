@@ -64,12 +64,8 @@ fn configured_home(home: &Path) -> Result<Option<PathBuf>> {
     };
     let path = if metadata.is_symlink() {
         let target = path.canonicalize()?;
-        let root = home.canonicalize()?;
-        let relative = target
-            .strip_prefix(&root)
-            .context("Codex config link leaves its home")?;
         anyhow::ensure!(
-            !relative.components().any(|part| {
+            !target.components().any(|part| {
                 let name = part.as_os_str().to_string_lossy();
                 [
                     "auth.json",
@@ -90,7 +86,8 @@ fn configured_home(home: &Path) -> Result<Option<PathBuf>> {
     } else {
         path
     };
-    let path = provider_file(home, &path).context("invalid Codex config file")?;
+    let directory = path.parent().context("invalid Codex config file")?;
+    let path = provider_file(directory, &path).context("invalid Codex config file")?;
     let file = std::fs::File::open(path)?;
     let mut text = String::new();
     anyhow::ensure!(file.metadata()?.len() <= LIMIT);
@@ -117,9 +114,9 @@ pub(super) struct StateName {
 }
 
 impl StateName {
-    pub(super) fn title(&self, indexed: Option<&String>) -> Option<String> {
+    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
         if self.use_index {
-            indexed.cloned().or_else(|| self.name.clone())
+            indexed().or_else(|| self.name.clone())
         } else {
             self.name.clone()
         }

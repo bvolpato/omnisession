@@ -665,7 +665,13 @@ fn check_linked_gui_config(home: &Path, path: &Path) -> anyhow::Result<()> {
     std::os::unix::fs::symlink("profile.toml", &config)?;
     check_gui_title(home, path, Some("Configured name"))?;
     fs::remove_file(&config)?;
-    fs::rename(home.join("profile.toml"), home.join("auth.json"))?;
+    let dotfiles = tempfile::tempdir()?;
+    let profile = dotfiles.path().join("profile.toml");
+    fs::rename(home.join("profile.toml"), &profile)?;
+    std::os::unix::fs::symlink(&profile, &config)?;
+    check_gui_title(home, path, Some("Configured name"))?;
+    fs::remove_file(&config)?;
+    fs::rename(&profile, home.join("auth.json"))?;
     std::os::unix::fs::symlink("auth.json", &config)?;
     assert_eq!(
         CodexAdapter::with_root(home).list_sessions(None)?[0].title,
@@ -691,5 +697,50 @@ fn check_archived_gui_name(
     CodexAdapter::with_root(home).refresh_session_titles(&mut rows);
     assert_eq!(rows[0].title.as_deref(), Some("Configured name"));
     assert_eq!(rows[0].source_path.as_deref(), Some(archived.as_path()));
+    Ok(())
+}
+
+#[test]
+fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let rollout = |name: &str, project: &str| -> anyhow::Result<_> {
+        let path = sessions.join(format!("{name}-{SESSION_ID}.jsonl"));
+        let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":project}});
+        fs::write(&path, format!("{header}\n"))?;
+        Ok(path.canonicalize()?)
+    };
+    let original = rollout("original", "/one")?;
+    fs::write(
+        home.path().join("session_index.jsonl"),
+        json!({"id":SESSION_ID,"thread_name":"Original name"}).to_string(),
+    )?;
+    let mut warm = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    assert_eq!(warm[0].title.as_deref(), Some("Original name"));
+    warm[0].source_path = None;
+    let duplicate = rollout("duplicate", "/two")?;
+    let check = || -> anyhow::Result<()> {
+        let adapter = CodexAdapter::with_root(home.path());
+        assert_eq!(adapter.list_sessions(None)?[0].title, None);
+        let mut cached = warm.clone();
+        adapter.refresh_session_titles(&mut cached);
+        assert_eq!(cached[0].title, None);
+        Ok(())
+    };
+    check()?;
+    let state = home.path().join("alternate");
+    fs::create_dir(&state)?;
+    fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
+    let db = rusqlite::Connection::open(state.join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
+    check()?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,'Private opener','Private opener')",
+        rusqlite::params![SESSION_ID, original.to_str()],
+    )?;
+    check()?;
+    fs::remove_file(duplicate)?;
+    check_gui_title(home.path(), &original, Some("Original name"))?;
     Ok(())
 }

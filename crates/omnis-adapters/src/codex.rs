@@ -40,7 +40,29 @@ const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
     files: Vec<PathBuf>,
+    unique_paths: OnceLock<HashMap<String, Option<usize>>>,
     notes: Vec<String>,
+}
+
+impl CodexFileScan {
+    fn unique_path(&self, id: &str) -> Option<&Path> {
+        if !self.notes.is_empty() {
+            return None;
+        }
+        let paths = self.unique_paths.get_or_init(|| {
+            let mut paths = HashMap::new();
+            for (index, path) in self.files.iter().enumerate() {
+                if let Some(id) = path_uuid(path) {
+                    paths
+                        .entry(id)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(index));
+                }
+            }
+            paths
+        });
+        paths.get(id)?.map(|index| self.files[index].as_path())
+    }
 }
 
 #[derive(Debug)]
@@ -150,11 +172,19 @@ impl CodexAdapter {
             .gui_names
             .read(home, sessions.iter().map(|s| s.id.as_str()));
         for session in sessions {
-            let indexed = index.titles.get(&session.id);
+            let indexed = || {
+                index
+                    .titles
+                    .get(&session.id)
+                    .filter(|_| {
+                        self.session_scan().unique_path(&session.id) == Some(session.path.as_path())
+                    })
+                    .cloned()
+            };
             session.title = match names.get(&session.id) {
                 Some(row) if row.matches_path(&session.path) => row.title(indexed),
                 Some(_) => None,
-                None => indexed.cloned(),
+                None => indexed(),
             };
         }
     }
@@ -203,32 +233,12 @@ impl CodexAdapter {
         let names = self
             .gui_names
             .read(home, sessions.iter().map(|s| s.session.id.as_str()));
-        let files = std::cell::LazyCell::new(|| {
-            self.session_files()
-                .iter()
-                .filter_map(|p| path_uuid(p).map(|id| (id, p)))
-                .collect::<HashMap<_, _>>()
-        });
         for session in sessions {
             let id = &session.session.id;
-            if let Some(row) = names.get(id) {
-                if session.source_path.as_deref().map_or_else(
-                    || row.matches_cached(home, id, session.source_revision),
-                    |path| row.matches_path(path),
-                ) {
-                    session.title = row.title(index.titles.get(id));
-                } else if let Some(local) = observed.get(id.as_str())
-                    && session.project_path == local.project_path
-                    && row.matches_path(&local.path)
-                {
-                    // An archive move changes the path-based file identity.
-                    *session = local.native_session();
-                } else {
-                    session.title = None;
-                }
-            } else if let Some(name) = index.titles.get(id)
-                && let Some(path) = files.get(id)
-                && session.source_path.as_deref().map_or_else(
+            let indexed = || {
+                let name = index.titles.get(id)?;
+                let path = self.session_scan().unique_path(id)?;
+                let bound = session.source_path.as_deref().map_or_else(
                     || {
                         session
                             .source_revision
@@ -238,10 +248,29 @@ impl CodexAdapter {
                                     .is_some_and(|revision| revision.file == Some(file))
                             })
                     },
-                    |source| source == *path,
-                )
+                    |source| source == path,
+                );
+                bound.then(|| name.clone())
+            };
+            if let Some(row) = names.get(id) {
+                if session.source_path.as_deref().map_or_else(
+                    || row.matches_cached(home, id, session.source_revision),
+                    |path| row.matches_path(path),
+                ) {
+                    session.title = row.title(indexed);
+                } else if let Some(local) = observed.get(id.as_str())
+                    && session.project_path == local.project_path
+                    && row.matches_path(&local.path)
+                {
+                    // An archive move changes the path-based file identity.
+                    *session = local.native_session();
+                } else {
+                    session.title = None;
+                }
+            } else if index.titles.contains_key(id)
+                || (session.title.is_some() && self.session_scan().unique_path(id).is_none())
             {
-                session.title = Some(name.clone());
+                session.title = indexed();
             }
         }
     }
@@ -520,7 +549,11 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             "Codex scan stopped after {limit} newest jsonl files; older sessions are omitted."
         ));
     }
-    CodexFileScan { files, notes }
+    CodexFileScan {
+        files,
+        notes,
+        unique_paths: OnceLock::default(),
+    }
 }
 
 fn listing_notes(
@@ -1700,6 +1733,7 @@ mod tests {
     fn listing_notes_describe_empty_and_partial_scans() {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
+            unique_paths: std::sync::OnceLock::new(),
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),
