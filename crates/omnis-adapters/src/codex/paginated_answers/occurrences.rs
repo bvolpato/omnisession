@@ -364,6 +364,7 @@ impl ConfirmedAnswers {
 #[derive(Default)]
 struct Ruling {
     current: Option<Evidence>,
+    position: Option<(u64, u64)>,
     prior: Option<(Hash, u64)>,
     // A revised public item can have several accepted spellings in the same model window.
     copies: Vec<(Hash, u64, u64)>,
@@ -593,12 +594,14 @@ impl AnswerOccurrences {
                 continue;
             };
             let ruling = rulings.entry(seq).or_default();
-            if shown.revised
-                && let Evidence::Witness(raw) = evidence
+            if let Evidence::Witness(raw) = evidence
                 && !raw.removed
                 && matches.unique(raw, shown)
             {
-                ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+                ruling.position = Some((raw.ordinal, raw.sequence));
+                if shown.revised {
+                    ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+                }
             }
             ruling
                 .copies
@@ -611,6 +614,13 @@ impl AnswerOccurrences {
         }
         self.rulings = rulings;
         result
+    }
+
+    pub(super) fn surviving_position(&self, sequence: u64, after: u64) -> Option<(u64, u64)> {
+        self.rulings
+            .get(&sequence)?
+            .position
+            .filter(|(ordinal, _)| *ordinal > after)
     }
 
     fn text(&self, sequence: u64, digest: Hash) -> Option<&str> {

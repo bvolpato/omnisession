@@ -7,6 +7,7 @@ pub(super) fn valid(payload: &Value) -> bool {
     if !payload["message"].is_string()
         || !optional(&payload["window_number"], Value::is_u64)
         || !optional(&payload["window_id"], |id| id.is_string() || id.is_u64())
+        || !optional(&payload["resume_metadata"], resume_metadata)
     {
         return false;
     }
@@ -32,6 +33,114 @@ pub(super) fn valid(payload: &Value) -> bool {
                 })
         })
     }) && items.iter().all(response_item)
+}
+
+// Serde accepts named fields and positional arrays for the structs in compaction_resume_metadata.rs.
+type WireField = (&'static str, fn(&Value) -> bool);
+
+fn fields(value: &Value, schema: &[WireField]) -> bool {
+    match value {
+        Value::Object(_) => schema.iter().all(|(name, valid)| valid(&value[*name])),
+        Value::Array(parts) => {
+            parts.len() == schema.len()
+                && parts
+                    .iter()
+                    .zip(schema)
+                    .all(|(part, (_, valid))| valid(part))
+        }
+        _ => false,
+    }
+}
+
+fn optional_text(value: &Value) -> bool {
+    optional(value, Value::is_string)
+}
+
+fn resume_metadata(metadata: &Value) -> bool {
+    fields(
+        metadata,
+        &[
+            ("dynamic_tools", |v| optional(v, dynamic_catalog)),
+            ("multi_agent_version", |v| {
+                optional(v, |v| matches!(v.as_str(), Some("disabled" | "v1" | "v2")))
+            }),
+            ("last_started_turn_id", optional_text),
+            ("turn_attribution", |v| optional(v, turn_attribution)),
+            ("previous_turn_settings", |v| optional(v, previous_settings)),
+        ],
+    )
+}
+
+fn previous_settings(settings: &Value) -> bool {
+    fields(
+        settings,
+        &[
+            ("model", Value::is_string),
+            ("cyber_access_program", |v| {
+                optional(v, |v| {
+                    matches!(
+                        v.as_str(),
+                        Some("standard" | "daybreak_blue" | "daybreak_red")
+                    )
+                })
+            }),
+            ("comp_hash", optional_text),
+            ("realtime_active", |v| optional(v, Value::is_boolean)),
+        ],
+    )
+}
+
+fn turn_attribution(attribution: &Value) -> bool {
+    fields(
+        attribution,
+        &[
+            ("turn_id", Value::is_string),
+            ("turn_trigger", optional_text),
+            ("parent_turn_id", optional_text),
+            ("initiating_agent_path", |v| {
+                optional(v, |v| {
+                    v.as_str()
+                        .is_some_and(super::paginated_rollback::agent_path)
+                })
+            }),
+            ("root_turn_id", optional_text),
+        ],
+    )
+}
+
+fn dynamic_catalog(catalog: &Value) -> bool {
+    fields(
+        catalog,
+        &[
+            ("thread_id", |v| {
+                v.as_str()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            }),
+            ("tools", |v| array(v, |tool| dynamic_tool(tool, true))),
+        ],
+    )
+}
+
+fn dynamic_tool(tool: &Value, allow_namespace: bool) -> bool {
+    let field = |name: &str, index: usize| tool.get(name).or_else(|| tool.get(index));
+    if !field("name", 1).is_some_and(Value::is_string)
+        || !field("description", 2).is_some_and(Value::is_string)
+    {
+        return false;
+    }
+    match field("type", 0).and_then(Value::as_str) {
+        Some("function") => {
+            field("inputSchema", 3).is_some()
+                && field("deferLoading", 4).is_none_or(Value::is_boolean)
+                && tool.as_array().is_none_or(|fields| fields.len() <= 5)
+        }
+        Some("namespace") if allow_namespace => {
+            tool.as_array().is_none_or(|fields| fields.len() == 4)
+                && field("tools", 3)
+                    .is_some_and(|tools| array(tools, |child| dynamic_tool(child, false)))
+        }
+        _ => false,
+    }
 }
 
 fn optional(value: &Value, valid: impl FnOnce(&Value) -> bool) -> bool {

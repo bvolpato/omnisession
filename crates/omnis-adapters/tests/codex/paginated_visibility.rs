@@ -840,6 +840,92 @@ fn a_damaged_checkpoint_preserves_the_last_verified_window() {
 }
 
 #[test]
+fn checkpoint_selection_validates_typed_resume_metadata() {
+    let rows = exchange("first", "request", "answer", true);
+    let checkpoint = |role: &str, number: u64| {
+        let item = rows
+            .iter()
+            .find(|row| row["payload"]["role"] == role)
+            .unwrap();
+        json!({"type":"compacted","payload":{"message":"","window_number":number,"replacement_history":[item["payload"]]}})
+    };
+    let thread = "00000000-0000-4000-8000-000000000001";
+    let catalog = |tool: Value| json!({"dynamic_tools":{"thread_id":thread,"tools":[tool]}});
+    let function = json!({"type":"function","name":"inspect","description":"private catalog field","inputSchema":null});
+    let mut complete =
+        catalog(json!({"type":"namespace","name":"test","description":"","tools":[function]}));
+    complete["multi_agent_version"] = json!("v1");
+    complete["last_started_turn_id"] = json!("first");
+    complete["previous_turn_settings"] = json!({"model":"","comp_hash":null,"realtime_active":false,"cyber_access_program":"standard","future":true});
+    complete["turn_attribution"] =
+        json!({"turn_id":"first","initiating_agent_path":"/root/worker","future":123});
+    for (metadata, accepted) in [
+        (Value::Null, true),
+        (json!({"previous_turn_settings":null}), true),
+        (complete, true),
+        (
+            json!([
+                [
+                    thread,
+                    [["namespace", "test", "", [["function", "inspect", "", null]]]]
+                ],
+                null,
+                null,
+                null,
+                ["", null, null, false]
+            ]),
+            true,
+        ),
+        (json!([null, null, null, null]), false),
+        (json!({"previous_turn_settings":{}}), false),
+        (json!({"previous_turn_settings":{"model":null}}), false),
+        (json!({"previous_turn_settings":{"model":42}}), false),
+        (
+            json!({"previous_turn_settings":{"model":"","realtime_active":1}}),
+            false,
+        ),
+        (json!({"multi_agent_version":"future"}), false),
+        (
+            json!({"turn_attribution":{"turn_id":"","initiating_agent_path":"relative"}}),
+            false,
+        ),
+        (
+            json!({"dynamic_tools":{"thread_id":"invalid","tools":[]}}),
+            false,
+        ),
+        (
+            catalog(json!({"type":"function","name":"missing_schema","description":""})),
+            false,
+        ),
+        (
+            catalog(
+                json!({"type":"function","name":"bad_flag","description":"","inputSchema":{},"deferLoading":null}),
+            ),
+            false,
+        ),
+    ] {
+        let mut latest = checkpoint("assistant", 2);
+        latest["payload"]["resume_metadata"] = metadata;
+        let mut records = rows.clone();
+        records.extend([checkpoint("user", 1), latest]);
+        let snapshot = read_with_history_mode(records, false, Some("paginated")).unwrap();
+        let conversation = omnis_core::import_conversation(&snapshot);
+        let active: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(active, [if accepted { "answer" } else { "request" }]);
+        assert_eq!(conversation.truncated, !accepted);
+        assert!(
+            !omnis_core::trajectory_search_document(&snapshot)
+                .text
+                .contains("private catalog field")
+        );
+    }
+}
+
+#[test]
 fn opaque_checkpoint_items_cannot_confirm_legacy_tool_records() {
     let call = json!({"type":"computer_call", "call_id":"legacy", "name":"view", "arguments":"{}"});
     let result =

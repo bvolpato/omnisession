@@ -14,14 +14,20 @@ impl PaginatedRollback {
         let aliases = self.resolved_turns();
         let mut marked = HashMap::new();
         let mut witnesses = HashMap::new();
-        self.match_model_inputs(0, &aliases, &mut marked, |seq, raw, shown| {
-            if raw.text.is_some()
-                && raw.text == shown.text
-                && (shown.plain_text() || shown.retains_caption(raw.media))
-            {
-                witnesses.insert(raw.ordinal, seq);
-            }
-        });
+        self.match_model_inputs(
+            0,
+            super::PairPurpose::Membership,
+            &aliases,
+            &mut marked,
+            |seq, raw, shown| {
+                if raw.text.is_some()
+                    && raw.text == shown.text
+                    && (shown.plain_text() || shown.retains_caption(raw.media))
+                {
+                    witnesses.insert(raw.ordinal, seq);
+                }
+            },
+        );
         self.model
             .range(start..end)
             .filter(|raw| raw.kind != IdKind::InterAgent)

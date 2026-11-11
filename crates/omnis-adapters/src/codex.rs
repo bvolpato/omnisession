@@ -1267,7 +1267,7 @@ impl CodexHistory {
         {
             if !self
                 .paginated_inputs
-                .model_user(record, self.source_ordinal)
+                .model_user(record, self.source_ordinal, builder.checkpoint())
                 && payload["type"] == "message"
                 && payload["role"] == "assistant"
             {
@@ -1436,7 +1436,8 @@ impl CodexHistory {
     }
 
     fn annotate_model_window(&mut self, builder: &mut EventBuilder) {
-        let answers = self.paginated_answers.finish_answers();
+        let aliases = self.paginated_inputs.resolved_turns();
+        let answers = self.paginated_answers.finish_answers(&aliases);
         let checkpoint = self.paginated_checkpoint.as_ref();
         if self.paginated_checkpoint.saw_legacy() {
             builder.retain_events(|event| {
@@ -1447,7 +1448,7 @@ impl CodexHistory {
                     })
             });
         }
-        let mut has_checkpoint_replies = false;
+        let mut has_positioned_replies = false;
         builder.visit_events_mut(|event| {
             if !matches!(
                 event.kind,
@@ -1481,6 +1482,7 @@ impl CodexHistory {
                     self.paginated_answers
                         .project_answer(seq, &self.paginated_checkpoint, status);
                 if !projection.versions.is_empty() {
+                    has_positioned_replies = true;
                     let mut versions = Vec::with_capacity(projection.versions.len());
                     for version in projection.versions {
                         let position = match version.anchor {
@@ -1488,7 +1490,6 @@ impl CodexHistory {
                                 let Some(checkpoint) = checkpoint else {
                                     continue;
                                 };
-                                has_checkpoint_replies = true;
                                 json!([checkpoint.display_end(), ordinal, index])
                             }
                             paginated_answers::ReplyAnchor::Source { ordinal, sequence } => {
@@ -1515,14 +1516,44 @@ impl CodexHistory {
                 }
             }
         });
-        if has_checkpoint_replies && let Some(checkpoint) = checkpoint {
-            builder.visit_events_mut(|event| {
-                if let Some(index) = checkpoint.first_retained_index(event.sequence) {
-                    event.payload["omnisession_codex_checkpoint_position"] =
-                        json!([checkpoint.display_end(), checkpoint.source_ordinal(), index]);
-                }
-            });
+        if has_positioned_replies {
+            self.position_model_window(builder, &aliases);
         }
+    }
+
+    fn position_model_window(
+        &self,
+        builder: &mut EventBuilder,
+        aliases: &HashMap<[u8; 32], [u8; 32]>,
+    ) {
+        let legacy = self.paginated_checkpoint.legacy_ordinal();
+        let checkpoint = self
+            .paginated_checkpoint
+            .as_ref()
+            .filter(|_| legacy.is_none());
+        let Some(after) = legacy
+            .or_else(|| checkpoint.map(paginated_checkpoint::PaginatedCheckpoint::source_ordinal))
+        else {
+            return;
+        };
+        let users = self
+            .paginated_inputs
+            .confirmed_suffix_positions(after, aliases);
+        builder.visit_events_mut(|event| {
+            let seq = event.sequence;
+            if let Some((ordinal, slot)) = users
+                .get(&seq)
+                .copied()
+                .or_else(|| self.paginated_answers.surviving_position(seq, after))
+            {
+                event.payload["omnisession_codex_checkpoint_position"] = json!([slot, ordinal, 0]);
+            } else if let Some(window) = checkpoint
+                && let Some(index) = window.first_retained_index(seq)
+            {
+                event.payload["omnisession_codex_checkpoint_position"] =
+                    json!([window.display_end(), window.source_ordinal(), index]);
+            }
+        });
     }
 
     fn push_message_or_metadata(

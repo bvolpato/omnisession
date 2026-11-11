@@ -91,7 +91,7 @@ pub(super) fn communication(message: &Value) -> bool {
         }
 }
 
-fn agent_path(path: &str) -> bool {
+pub(super) fn agent_path(path: &str) -> bool {
     path == "/morpheus"
         || path == "/root"
         || path.strip_prefix("/root/").is_some_and(|rest| {
@@ -189,6 +189,12 @@ fn hook_fragment(text: &str) -> bool {
             .is_ok_and(|hook| !hook.run_id.trim().is_empty())
 }
 
+fn display_selection(part: &Value) -> bool {
+    matches!(part["type"].as_str(), Some("skill" | "mention"))
+        && part["name"].is_string()
+        && part["path"].is_string()
+}
+
 fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) {
     let Some(parts) = payload["content"].as_array() else {
         return (None, None);
@@ -220,6 +226,9 @@ fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) 
     hash.update([0_u8]);
     let mut nonempty = false;
     for part in parts {
+        if display && display_selection(part) {
+            continue;
+        }
         let Some(text) = part["text"].as_str().filter(|_| part["type"] == tag) else {
             return (None, attachment);
         };
@@ -247,7 +256,7 @@ fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
             Some("local_image" | "image" | "input_image") => images += 1,
             Some("local_audio" | "audio" | "input_audio") => audio += 1,
             kind => {
-                known_parts &= kind == Some(text_tag);
+                known_parts &= kind == Some(text_tag) || (display && display_selection(part));
                 continue;
             }
         }
@@ -354,6 +363,12 @@ enum Spelling {
     Ambiguous,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PairPurpose {
+    Membership,
+    ActiveOrder,
+}
+
 #[derive(Clone, Copy)]
 struct Input {
     segment: u64,
@@ -369,6 +384,7 @@ struct Input {
     model_content: Option<Key>,
     media: Option<MediaShape>,
     ordinal: u64,
+    sequence: u64,
     legacy_tokens: usize,
     // A migrated request can have a generated turn opening immediately before its display.
     display_start: u64,
@@ -425,6 +441,7 @@ impl Input {
             model_content: (!display && turn.is_some() && id.is_some())
                 .then(|| content_digest(payload)),
             ordinal,
+            sequence: 0,
             legacy_tokens: 0,
             display_start: ordinal,
             order: None,
@@ -569,7 +586,7 @@ impl PaginatedRollback {
             .map(|turn| (key(turn), ordinal));
     }
 
-    pub(super) fn model_user(&mut self, record: &Value, ordinal: u64) -> bool {
+    pub(super) fn model_user(&mut self, record: &Value, ordinal: u64, sequence: u64) -> bool {
         let payload = &record["payload"];
         let standalone = record["type"] == "inter_agent_communication";
         let admitted = if standalone {
@@ -592,6 +609,7 @@ impl PaginatedRollback {
                 super::model_cut::acceptance_order(payload, &record["metadata"]);
         }
         input.window = self.window;
+        input.sequence = sequence;
         input.inherited = !standalone && record["metadata"]["inherited_user_message"] == true;
         if !standalone {
             input.order = super::model_cut::input_order(&record["metadata"]);
@@ -703,7 +721,13 @@ impl PaginatedRollback {
             }
             self.evicted = self.evicted.saturating_sub(extra);
         }
-        self.match_model_inputs(cut, aliases, &mut marked, |_, _, _| {});
+        self.match_model_inputs(
+            cut,
+            PairPurpose::Membership,
+            aliases,
+            &mut marked,
+            |_, _, _| {},
+        );
         let cutoff = boundary
             .filter(|(ordinal, _)| {
                 self.model
@@ -726,6 +750,38 @@ impl PaginatedRollback {
         marked
     }
 
+    /// Position an accepted request only when its surviving model row matches the public input.
+    pub(super) fn confirmed_suffix_positions(
+        &self,
+        after: u64,
+        aliases: &HashMap<Key, Key>,
+    ) -> HashMap<u64, (u64, u64)> {
+        let mut positions = HashMap::new();
+        if self.model.back().is_none_or(|raw| raw.ordinal <= after) {
+            return positions;
+        }
+        let mut marked = HashMap::new();
+        let cut = self.model.partition_point(|raw| raw.ordinal <= after);
+        self.match_model_inputs(
+            cut,
+            PairPurpose::ActiveOrder,
+            aliases,
+            &mut marked,
+            |sequence, raw, shown| {
+                if raw.ordinal > after
+                    && shown.segment == raw.segment
+                    && raw.text.is_some()
+                    && raw.text == shown.text
+                    && (shown.plain_text() || shown.retains_caption(raw.media))
+                {
+                    positions.insert(sequence, (raw.ordinal, raw.sequence));
+                }
+            },
+        );
+        positions.retain(|seq, _| marked.get(seq) == Some(&Withdrawal::Confirmed));
+        positions
+    }
+
     pub(super) fn confirmed_input_copies(
         &self,
         aliases: &HashMap<Key, Key>,
@@ -742,16 +798,22 @@ impl PaginatedRollback {
         }
         let mut copies = HashMap::new();
         let mut marked = HashMap::new();
-        self.match_model_inputs(0, aliases, &mut marked, |seq, raw, shown| {
-            if let Some(id) = raw.turn.zip(raw.id)
-                && !repeated.contains(&id)
-                && let Some(witness) = raw.model_content
-                && shown.text.is_some()
-                && (shown.text == raw.text || shown.text == raw.literal)
-            {
-                copies.insert(id, (seq, witness));
-            }
-        });
+        self.match_model_inputs(
+            0,
+            PairPurpose::Membership,
+            aliases,
+            &mut marked,
+            |seq, raw, shown| {
+                if let Some(id) = raw.turn.zip(raw.id)
+                    && !repeated.contains(&id)
+                    && let Some(witness) = raw.model_content
+                    && shown.text.is_some()
+                    && (shown.text == raw.text || shown.text == raw.literal)
+                {
+                    copies.insert(id, (seq, witness));
+                }
+            },
+        );
         copies.retain(|_, (seq, _)| marked.get(seq) == Some(&Withdrawal::Confirmed));
         let unstamped = self.unstamped_copies(checkpoint, &copies);
         self.match_checkpoint_inputs(aliases, checkpoint, &mut copies);
@@ -830,6 +892,7 @@ impl PaginatedRollback {
     fn match_model_inputs(
         &self,
         cut: usize,
+        purpose: PairPurpose,
         aliases: &HashMap<Key, Key>,
         marked: &mut HashMap<u64, Withdrawal>,
         mut confirm: impl FnMut(u64, Input, Input),
@@ -907,7 +970,14 @@ impl PaginatedRollback {
         }
         for (key, raw) in pending {
             if let Some(shown) = by_text.get(&key) {
-                self.match_text(&raw, shown, &reserved, marked, &mut confirm);
+                self.match_text(
+                    &raw,
+                    shown,
+                    &reserved,
+                    (purpose == PairPurpose::ActiveOrder).then_some(&raw_ids),
+                    marked,
+                    &mut confirm,
+                );
             }
         }
     }
@@ -972,6 +1042,7 @@ impl PaginatedRollback {
         raw: &[(bool, Input)],
         shown: &[(u64, Input)],
         reserved: &HashSet<u64>,
+        ordering_ids: Option<&IdIndex<usize>>,
         marked: &mut HashMap<u64, Withdrawal>,
         confirm: &mut impl FnMut(u64, Input, Input),
     ) {
@@ -997,6 +1068,21 @@ impl PaginatedRollback {
                 continue;
             }
             displayed.sort_unstable_by_key(|(_, item)| item.ordinal);
+            // The provider generates a separate display ID. A unique admitted request can
+            // span a tool or reply when positioning an already visible item in active history.
+            let generated_pair = match (raw.as_slice(), displayed.as_slice(), ordering_ids) {
+                ([(true, raw)], [(_, shown)], Some(ids)) => {
+                    self.history_floor == 0
+                        && shown.segment == self.segment
+                        && raw.kind == IdKind::ModelInput
+                        && matches!(shown.kind, IdKind::GeneratedDisplay | IdKind::LiveDisplay)
+                        && raw
+                            .id
+                            .and_then(|id| ids.get(&(raw.window, turn, id)))
+                            .is_some_and(|copies| copies.len() == 1)
+                }
+                _ => false,
+            };
             let paired = turn.is_some()
                 && raw.len() == displayed.len()
                 && raw.iter().zip(&displayed).all(|((_, r), (_, d))| {
@@ -1005,7 +1091,7 @@ impl PaginatedRollback {
                         && !r.inherited
                         && r.segment == self.segment
                         && r.ordinal.min(d.ordinal) >= self.history_floor
-                        && r.adjacent(*d)
+                        && (r.adjacent(*d) || generated_pair)
                         && r.permits_text(*d)
                 })
                 && raw

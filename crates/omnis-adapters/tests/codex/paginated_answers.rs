@@ -454,6 +454,57 @@ fn a_verified_post_compaction_reply_follows_its_request_only_in_active_history()
 }
 
 #[test]
+fn a_migrated_reply_uses_the_final_confirmed_turn() {
+    let generated = "rollout-2";
+    let request = |turn, number, text| {
+        model(
+            turn,
+            &format!("msg_input_01948226-0000-7000-8000-{number:012x}"),
+            "user",
+            text,
+        )
+    };
+    let first = request("original", 1, "first request");
+    let mut rows = vec![
+        first.clone(),
+        start(generated),
+        page_user(generated, "item-1", "first request"),
+        model("original", "reply", "assistant", "original reply"),
+        shown(generated, "reply", "original reply"),
+        json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[first["payload"]]}}),
+        request("original", 2, "second request"),
+        page_user(generated, "item-3", "second request"),
+        model("original", "reply", "assistant", "revised reply"),
+        shown(generated, "reply", "revised reply"),
+    ];
+    check(
+        &rows,
+        &["first request", "revised reply", "second request"],
+        &["first request", "second request", "revised reply"],
+    );
+    rows.extend([
+        start("other"),
+        model("other", "temporary", "user", "temporary request"),
+        page_user("other", "temporary", "temporary request"),
+        rollback(),
+        start(generated),
+        request("other", 3, "other request"),
+        page_user(generated, "item-8", "other request"),
+    ]);
+    check(
+        &rows,
+        &[
+            "first request",
+            "revised reply",
+            "second request",
+            "temporary request",
+            "other request",
+        ],
+        &["first request", "second request", "other request"],
+    );
+}
+
+#[test]
 fn a_surviving_model_only_revision_never_becomes_public_text() {
     let rows = [
         start("turn"),

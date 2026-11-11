@@ -184,8 +184,15 @@ impl PaginatedAnswers {
         self.answers.confirmed(aliases, items, plan_mode)
     }
 
-    pub(super) fn finish_answers(&mut self) -> HashMap<u64, Option<Withdrawal>> {
-        self.answers.rulings(&self.aliases)
+    pub(super) fn finish_answers(
+        &mut self,
+        aliases: &TurnAliases,
+    ) -> HashMap<u64, Option<Withdrawal>> {
+        self.answers.rulings(aliases)
+    }
+
+    pub(super) fn surviving_position(&self, sequence: u64, after: u64) -> Option<(u64, u64)> {
+        self.answers.surviving_position(sequence, after)
     }
 
     pub(super) fn project_answer(
