@@ -1062,9 +1062,21 @@ impl Branch {
         compactions: &Compactions,
     ) -> Option<OpaqueReturn> {
         let id = super::record_uuid(record, "parentUuid")?;
+        if duplicates.contains(&id) {
+            return None;
+        }
+        let latest = self.latest_attachment_checkpoint(compactions);
+        let prior = self.opaque_record(parent).and_then(|r| r.detached);
+        // A descendant inherits the detached occurrence, including its original timestamp decision.
+        // Its older conversation parent can be retained without restoring the missing link.
+        if let Some(prior) = prior
+            && Some(prior.cutoff) == latest
+        {
+            return Some(prior);
+        }
         // Returning directly to an omitted child can use the retained tail. A new
         // attachment written under that child must establish its own timestamp link.
-        if let Some(summary) = self.latest_attachment_checkpoint(compactions)
+        if let Some(summary) = latest
             && parent.node == Some(summary)
             && parent.suffix.is_some()
             && let Some(opaque) = self.opaque_record(parent)
@@ -1077,15 +1089,12 @@ impl Branch {
                 anchor: self.timed_attachment_anchor(summary, record, parent, duplicates),
             });
         }
-        let prior = self.opaque_record(parent).and_then(|r| r.detached);
         // A verified timestamp at the current checkpoint supersedes a cutoff inherited
         // through any number of earlier conversation or attachment records.
-        let timed = self
-            .latest_attachment_checkpoint(compactions)
-            .filter(|&summary| {
-                self.timed_attachment_anchor(summary, record, parent, duplicates)
-                    .is_some()
-            });
+        let timed = latest.filter(|&summary| {
+            self.timed_attachment_anchor(summary, record, parent, duplicates)
+                .is_some()
+        });
         let summary = timed.or_else(|| {
             if let Some(origin) = parent.source.or(prior.map(|r| r.cutoff)) {
                 return self.cutoff_for_origin(origin);
@@ -1101,7 +1110,6 @@ impl Branch {
         // takes precedence over an earlier cutoff on its original branch.
         if Self::retained_attachment_since(parent, summary, records, compactions)
             || parent.missing_ancestor
-            || duplicates.contains(&id)
             || compactions.contains(summary, id, records)
             || parent
                 .source

@@ -737,6 +737,51 @@ fn a_retained_root_directory_only_supplies_its_position_to_children_written_afte
 }
 
 #[test]
+fn descendants_of_an_omitted_directory_keep_its_cutoff_when_the_request_was_retained() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        directory_attachment(30, 1),
+        directory_attachment(31, 30),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    base.extend(compaction(3, 2, &[1, 30, 2]));
+    let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    for (delay, links) in [(13, 1), (13, 2), (1, 1), (1, 2)] {
+        let mut rows = base.clone();
+        let mut parent = 31;
+        for id in 32..32 + links {
+            rows.push(directory_attachment(id, parent));
+            parent = id;
+        }
+        rows.push(message(11, parent, "user", json!("New request")));
+        for (i, row) in rows.iter_mut().enumerate() {
+            let seconds = i64::try_from(i).unwrap() + if i >= base.len() { delay - 1 } else { 0 };
+            row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
+            row["isSidechain"] = json!(false);
+        }
+        let expected: &[&str] = if delay == 1 {
+            &["Summary 3", "New request"]
+        } else {
+            &["New request"]
+        };
+        for preview in [false, true] {
+            let case = (delay, links, preview);
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(handoff_messages(&active), expected, "{case:?}");
+            assert!(active.truncated, "{case:?}");
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete, "{case:?}");
+            let recovery = recovery_text(&snapshot);
+            assert!(
+                search.text.contains("Retained reply") && recovery.contains("Retained reply"),
+                "{case:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_retained_directory_with_a_missing_parent_still_identifies_its_verified_checkpoint() {
     let mut rows = vec![
         message(1, 0, "user", json!("Original task")),
