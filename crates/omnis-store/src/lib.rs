@@ -250,7 +250,10 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         derived_title = CASE WHEN NOT session_trajectories.codex_workspace_current
             OR (excluded.provider = 'claude' AND (excluded.source_complete OR excluded.document_version > session_trajectories.document_version))
             THEN excluded.derived_title ELSE coalesce(excluded.derived_title, session_trajectories.derived_title) END
-    WHERE excluded.document_version >= session_trajectories.document_version AND (
+    WHERE excluded.document_version >= session_trajectories.document_version
+      AND NOT (excluded.provider = 'claude' AND session_trajectories.source_complete
+               AND NOT excluded.source_complete AND excluded.document_version > session_trajectories.document_version)
+      AND (
        NOT session_trajectories.codex_workspace_current
        OR excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
@@ -2024,6 +2027,26 @@ impl Store {
                     document_version,
                 ],
                 |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error)
+    }
+
+    /// Checks whether a complete Claude document needs a full projection upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be read.
+    pub fn needs_full_claude_upgrade(&self, session: &SessionRef, version: u32) -> Result<bool> {
+        if session.provider != Provider::Claude {
+            return Ok(false);
+        }
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = 'claude'
+                AND session_id = ?1 AND source_complete AND document_version < ?2)",
+                params![session.id, version],
+                |row| row.get(0),
             )
             .map_err(database_error)
     }

@@ -769,12 +769,12 @@ impl PickerState {
                 continue;
             }
             changed = true;
-            if let Some(entry) = self
-                .entry_positions
-                .get(&key)
-                .and_then(|index| self.entries.get_mut(*index))
-            {
-                apply_derived_title(entry, title.as_deref());
+            if let Some(&index) = self.entry_positions.get(&key) {
+                let displayed = title.or_else(|| {
+                    let key = self.preview_key(&self.entries[index].session);
+                    self.previews.get(&key).and_then(preview_title)
+                });
+                apply_derived_title(&mut self.entries[index], displayed.as_deref());
             }
         }
         if changed {

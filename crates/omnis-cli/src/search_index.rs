@@ -45,6 +45,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) session: SessionRef,
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
+    upgrade_full_document: bool,
 }
 
 impl IndexCandidate {
@@ -58,6 +59,7 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
+            upgrade_full_document: false,
         })
     }
 
@@ -185,7 +187,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         ..IndexSummary::default()
     };
     let mut stale = Vec::new();
-    for candidate in candidates {
+    for mut candidate in candidates {
         if !needs_index(&candidate, states.get(&candidate.session)) {
             continue;
         }
@@ -196,6 +198,10 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
+            candidate.upgrade_full_document = candidate.session.provider == Provider::Claude
+                && states.get(&candidate.session).is_some_and(|state| {
+                    state.source_complete && state.document_version < SEARCH_DOCUMENT_VERSION
+                });
             stale.push(candidate);
         }
     }
@@ -542,7 +548,11 @@ fn prepare_session(
         registry.index_session(
             &candidate.session,
             candidate.source_path.as_deref(),
-            FULL_READ_SOURCE_BYTES,
+            if candidate.upgrade_full_document {
+                u64::MAX
+            } else {
+                FULL_READ_SOURCE_BYTES
+            },
         )
     }?;
     let document = trajectory_search_document(&snapshot);
@@ -642,6 +652,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
             source_path,
+            upgrade_full_document: false,
         }
     }
 
@@ -1284,6 +1295,7 @@ mod tests {
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
                         source_path: None,
+                        upgrade_full_document: false,
                     })
                     .collect(),
                 _temporary: temporary,

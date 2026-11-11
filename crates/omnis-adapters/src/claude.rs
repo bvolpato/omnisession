@@ -773,28 +773,27 @@ fn claude_session_metadata(record: &Value) -> Option<Value> {
 struct AmbiguousResponse {
     key: (String, String),
     position: usize,
-    event: ClaudeEvent,
 }
 
 impl AmbiguousResponse {
-    fn changes_history(&self, transcript: &ClaudeTranscript) -> bool {
+    fn changes_history(&self, transcript: &ClaudeTranscript, visible_positions: &[usize]) -> bool {
         let Some(&index) = transcript.responses.get(&self.key) else {
             return true;
         };
         let confirmed = &transcript.events[index];
-        let payload = if self.position <= index {
-            if self.position != index || self.event.timestamp != confirmed.timestamp {
+        let candidate = &transcript.events[self.position];
+        if self.position < index {
+            let confirmed_position = visible_positions[index];
+            if !(confirmed_position..=confirmed_position + 1)
+                .contains(&visible_positions[self.position])
+                || candidate.timestamp != confirmed.timestamp
+            {
                 return true;
             }
-            let mut merged = self.event.payload.clone();
-            merge_response_metadata(&mut merged, &confirmed.payload);
-            merged
-        } else {
-            let mut merged = confirmed.payload.clone();
-            merge_response_metadata(&mut merged, &self.event.payload);
-            merged
-        };
-        payload != confirmed.payload
+        }
+        let mut merged = candidate.payload.clone();
+        merge_response_metadata(&mut merged, &confirmed.payload);
+        merged != confirmed.payload
     }
 }
 
@@ -838,10 +837,16 @@ impl ClaudeTranscript {
             let mut response = ResponseMetadata::default();
             push_events(&mut possible, &mut response, record);
             if let Some((key, index)) = response.into_iter().next() {
+                let mut candidate = possible.swap_remove(index);
+                if let Some(&existing) = self.responses.get(&key) {
+                    let mut payload = self.events[existing].payload.clone();
+                    merge_response_metadata(&mut payload, &candidate.payload);
+                    candidate.payload = payload;
+                }
+                self.events.push(candidate);
                 self.ambiguous_responses.push(AmbiguousResponse {
                     key,
                     position: start,
-                    event: possible.swap_remove(index),
                 });
             }
             self.omitted_events += possible.len();
@@ -852,7 +857,7 @@ impl ClaudeTranscript {
                         .is_some();
             }
         }
-        // An explicitly retained record with unknown ownership has an ID but no visible events.
+        // Keep each record’s physical range so compaction can order unresolved metadata.
         if let Some(id) = record
             .get("uuid")
             .and_then(Value::as_str)
@@ -871,7 +876,7 @@ impl ClaudeTranscript {
         }
     }
 
-    fn restore_preserved_context(&mut self) -> Result<()> {
+    fn restore_preserved_context(&mut self, order: &mut Vec<usize>) -> Result<()> {
         let Some(preserved) = self.preserved_context.take() else {
             return Ok(());
         };
@@ -932,17 +937,48 @@ impl ClaudeTranscript {
         if selected.is_empty() {
             return Ok(());
         }
-        let mut slots = std::mem::take(&mut self.events)
+        let retained: HashSet<_> = selected.iter().copied().collect();
+        order.retain(|index| !retained.contains(index));
+        order.splice(insertion..insertion, selected);
+        Ok(())
+    }
+
+    fn ordered_events(&mut self) -> (Vec<ClaudeEvent>, Option<anyhow::Error>) {
+        self.omitted_events += usize::from(self.ambiguous_retention);
+        if self.preserved_context.is_none() && self.ambiguous_responses.is_empty() {
+            return (std::mem::take(&mut self.events), None);
+        }
+        let mut order: Vec<_> = (0..self.events.len()).collect();
+        let preservation_error = self.restore_preserved_context(&mut order).err();
+        if !self.ambiguous_responses.is_empty() {
+            let hidden: HashSet<_> = self
+                .ambiguous_responses
+                .iter()
+                .map(|response| response.position)
+                .collect();
+            let mut visible_positions = vec![0; order.len()];
+            let mut position = 0;
+            order.retain(|index| {
+                visible_positions[*index] = position;
+                let visible = !hidden.contains(index);
+                position += usize::from(visible);
+                visible
+            });
+            self.omitted_events += self
+                .ambiguous_responses
+                .iter()
+                .filter(|response| response.changes_history(self, &visible_positions))
+                .count();
+        }
+        let mut events = std::mem::take(&mut self.events)
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>();
-        let retained = selected
+        let history = order
             .into_iter()
-            .map(|index| slots[index].take().expect("validated retained event index"))
-            .collect::<Vec<_>>();
-        self.events = slots.into_iter().flatten().collect();
-        self.events.splice(insertion..insertion, retained);
-        Ok(())
+            .map(|index| events[index].take().expect("unique event index"))
+            .collect();
+        (history, preservation_error)
     }
 
     fn snapshot(
@@ -957,19 +993,11 @@ impl ClaudeTranscript {
             ));
         }
         self.coverage.validate(session)?;
-        self.omitted_events += self
-            .ambiguous_responses
-            .iter()
-            .filter(|response| response.changes_history(&self))
-            .count()
-            + usize::from(self.ambiguous_retention);
-        let preservation_error = self.restore_preserved_context().err();
-        // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
-        drop(self.responses);
+        let (history, preservation_error) = self.ordered_events();
         let metadata = self.metadata;
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Claude, &session.id);
-        for event in self.events {
+        for event in history {
             builder.push(
                 event.kind,
                 event.payload,
@@ -1428,6 +1456,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(visible, ["Summary", "Confirmed reply"]);
         assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
+    }
+
+    #[test]
+    fn ambiguous_response_metadata_can_move_across_a_compaction_summary() {
+        let reply = uuid::Uuid::new_v4();
+        let boundary = uuid::Uuid::new_v4();
+        let anchor = uuid::Uuid::new_v4();
+        let snapshot = snapshot_from_records(&[
+            json!({"type":"assistant","isSidechain":"unknown","message":{"id":"response","model":"test","content":[]}}),
+            json!({"type":"assistant","uuid":reply,"message":{"id":"response","model":"test","content":"Retained answer"}}),
+            json!({"type":"system","uuid":boundary,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":{"anchorUuid":anchor,"uuids":[reply]}}}),
+            json!({"type":"user","uuid":anchor,"parentUuid":boundary,"isCompactSummary":true,"message":{"content":"Summary"}}),
+        ]);
+        assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["text"] == "Retained answer")
+        );
     }
 
     #[test]

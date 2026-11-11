@@ -484,7 +484,15 @@ pub(super) fn spawn_preview_updates(
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let full_read = key.continuation_after.is_some();
+                let full_read = key.continuation_after.is_some()
+                    || store.as_ref().is_some_and(|store| {
+                        store
+                            .needs_full_claude_upgrade(
+                                &key.session,
+                                omnis_core::SEARCH_DOCUMENT_VERSION,
+                            )
+                            .unwrap_or(false)
+                    });
                 let mut indexed_title = PreviewTitle::FromPreview;
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
@@ -616,7 +624,9 @@ pub(super) fn receive_updates(
                 if key.revision == state.previews.revision(&key.session) {
                     state.remember_preview_workspace(&key, &value);
                     if let PreviewTitle::Indexed(title) = indexed_title {
-                        let title = preview_continuation_title(&value).or(title);
+                        let title = preview_continuation_title(&value)
+                            .or(title)
+                            .or_else(|| super::preview_title(&value));
                         state.remember_derived_titles(vec![(key.session.clone(), title)]);
                     } else {
                         state.remember_preview_title(&key, &value);
