@@ -968,6 +968,8 @@ pub struct SearchDocument {
 /// Coverage strategy used to bound one local full-text search document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchTruncationStrategy {
+    /// A bounded source read exceeded the provider file limit.
+    ProviderReadLimit,
     None,
     SourceIncomplete,
     EventHeadTail,
@@ -982,6 +984,7 @@ impl SearchTruncationStrategy {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProviderReadLimit => "provider_read_limit",
             Self::None => "none",
             Self::SourceIncomplete => "source_incomplete",
             Self::EventHeadTail => "event_head_tail",
@@ -1082,6 +1085,12 @@ impl SearchDocumentBuilder {
             .saturating_add(text.source_byte_count);
         self.event_truncated |= text.truncated;
         self.retained.push(&text.text);
+    }
+
+    /// Counts the searchable bytes observed before the document text limit.
+    #[must_use]
+    pub const fn source_byte_count(&self) -> usize {
+        self.source_byte_count
     }
 
     /// Returns the redacted text and its coverage under the search limits.

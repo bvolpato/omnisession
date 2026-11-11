@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use omnis_core::{SearchDocumentBuilder, session_preview};
+use omnis_core::{SearchDocumentBuilder, SearchTruncationStrategy, session_preview};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use prost::Message;
 use rusqlite::OptionalExtension;
@@ -16,9 +16,10 @@ use crate::{
     IncompleteTranscript, IndexedSearchDocument, LaunchPlan, LaunchTarget, NativeSession,
     ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes,
+        json_lines_preview_with_tail, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, sort_sessions, sqlite_snapshot, store_is_missing,
+        validate_provider, visit_json_lines_with_tail, visit_limited_search_edges,
         visit_streamed_json_file,
     },
 };
@@ -80,15 +81,24 @@ impl AntigravityAdapter {
         match self.source(&summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
                 let oversized = if preview {
-                    for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
+                    for record in json_lines_preview_with_tail(
+                        &path,
+                        PREVIEW_RECORDS,
+                        JsonLineTail::RequireComplete,
+                    )? {
                         push_transcript_record(&mut builder, &record);
                     }
                     0
                 } else {
-                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
-                        push_transcript_record(&mut builder, &record);
-                        Ok(())
-                    })?
+                    visit_json_lines_with_tail(
+                        &path,
+                        MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+                        JsonLineTail::RequireComplete,
+                        |record| {
+                            push_transcript_record(&mut builder, &record);
+                            Ok(())
+                        },
+                    )?
                 };
                 verify_jsonl_history(&summary, &builder)?;
                 builder.push_oversized_record_notice(oversized, summary.updated_at);
@@ -215,13 +225,11 @@ impl ProviderAdapter for AntigravityAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
+        prior_search_bytes: Option<usize>,
     ) -> Result<IndexedSearchDocument> {
-        let Some(path) = source_path.filter(|path| {
-            path.extension().is_some_and(|ext| ext == "jsonl")
-                && path
-                    .metadata()
-                    .is_ok_and(|meta| meta.len() <= full_read_bytes)
-        }) else {
+        let Some(path) =
+            source_path.filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        else {
             return self
                 .index_session(session, source_path, full_read_bytes)
                 .map(Into::into);
@@ -232,9 +240,31 @@ impl ProviderAdapter for AntigravityAdapter {
             self.source(&summary).as_deref() == Some(path),
             "Antigravity history changed during the search read"
         );
-        let file = std::fs::File::open(path)?;
+        let file = std::fs::File::open(path)
+            .context("Antigravity history changed during the search read")?;
         let before = file.metadata()?;
         let source_file = same_file::Handle::from_file(file.try_clone()?)?;
+        let require_same_source = || -> Result<()> {
+            let after = path
+                .metadata()
+                .context("Antigravity history changed during the search read")?;
+            anyhow::ensure!(
+                before.len() == after.len()
+                    && before.modified()? == after.modified()?
+                    && source_file
+                        == same_file::Handle::from_path(path)
+                            .context("Antigravity history changed during the search read")?
+                    && self.source(&summary).as_deref() == Some(path),
+                "Antigravity history changed during the search read"
+            );
+            Ok(())
+        };
+        let limited = before.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
+        if !limited && before.len() > full_read_bytes {
+            let preview = self.index_session(session, Some(path), full_read_bytes);
+            require_same_source()?;
+            return preview.map(Into::into);
+        }
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut title_source = EventBuilder::new(Provider::Antigravity, &session.id).snapshot(
             session.clone(),
@@ -245,42 +275,55 @@ impl ProviderAdapter for AntigravityAdapter {
         );
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
         let mut document = SearchDocumentBuilder::default();
-        let oversized =
-            visit_streamed_json_file(file, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
-                push_transcript_record(&mut events, &record);
-                for event in events.drain_events() {
-                    document.push(&event);
-                    if title_source.events.is_empty()
-                        && matches!(
-                            event.kind,
-                            EventKind::MessageUser | EventKind::MessageAssistant
-                        )
-                    {
-                        title_source.events.push(event);
-                        if session_preview(&title_source).first.is_none() {
-                            title_source.events.clear();
-                        }
+        let mut push = |record| {
+            push_transcript_record(&mut events, &record);
+            for event in events.drain_events() {
+                document.push(&event);
+                if title_source.events.is_empty()
+                    && matches!(
+                        event.kind,
+                        EventKind::MessageUser | EventKind::MessageAssistant
+                    )
+                {
+                    title_source.events.push(event);
+                    if session_preview(&title_source).first.is_none() {
+                        title_source.events.clear();
                     }
                 }
-                Ok(())
-            })?;
-        let after = path.metadata()?;
-        anyhow::ensure!(
-            before.len() == after.len()
-                && before.modified()? == after.modified()?
-                && source_file == same_file::Handle::from_path(path)?
-                && self.source(&summary).as_deref() == Some(path),
-            "Antigravity history changed during the search read"
-        );
+            }
+            document.source_byte_count()
+        };
+        let oversized = if limited {
+            visit_limited_search_edges(file, prior_search_bytes, PREVIEW_RECORDS, &mut push)
+                .map(|()| 0)
+        } else {
+            visit_streamed_json_file(
+                file,
+                MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+                JsonLineTail::RequireComplete,
+                |record| {
+                    push(record);
+                    Ok(())
+                },
+            )
+        };
+        require_same_source()?;
+        let oversized = oversized?;
         verify_jsonl_history(&summary, &events)?;
         events.push_oversized_record_notice(oversized, summary.updated_at);
         for event in events.drain_events() {
             document.push(&event);
         }
+        let mut document = document.finish();
+        if limited && prior_search_bytes.is_some() {
+            document.source_complete = false;
+            document.truncated = true;
+            document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
+        }
         Ok(IndexedSearchDocument {
-            document: document.finish(),
+            document,
             title_source,
-            source_complete: true,
+            source_complete: !limited,
         })
     }
 

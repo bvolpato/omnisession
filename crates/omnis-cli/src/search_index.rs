@@ -96,6 +96,7 @@ pub(crate) fn needs_index(
     };
     // The index stores millisecond timestamps, so compare at that precision.
     state.document_version < search_document_version(candidate.session.provider)
+        || (state.provider_limited && candidate.source_path.as_ref().and_then(|path| path.metadata().ok()).is_some_and(|metadata| metadata.len() <= omnis_adapters::MAX_STREAMED_TRANSCRIPT_FILE_SIZE))
         || candidate.updated_at.is_some_and(|updated_at| {
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
         })
@@ -171,7 +172,7 @@ pub(crate) fn ordered_candidates(
 
 /// Stale candidates in order, the failures they were checked against, and their counts.
 struct Pending {
-    stale: Vec<(IndexCandidate, u64)>,
+    stale: Vec<(IndexCandidate, Option<usize>)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
     summary: IndexSummary,
 }
@@ -196,19 +197,18 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            let full_read_bytes = if matches!(
-                candidate.session.provider,
-                Provider::Antigravity | Provider::AntigravityDesktop
-            ) && prior.is_some_and(|state| {
-                state.source_complete
-                    && state.document_version < search_document_version(candidate.session.provider)
-            }) {
-                // Upgrade a full search document with another full read.
-                u64::MAX
-            } else {
-                FULL_READ_SOURCE_BYTES
-            };
-            stale.push((candidate, full_read_bytes));
+            let prior_search_bytes = prior
+                .filter(|state| {
+                    matches!(
+                        candidate.session.provider,
+                        Provider::Antigravity | Provider::AntigravityDesktop
+                    ) && ((state.source_complete
+                        && state.document_version
+                            < search_document_version(candidate.session.provider))
+                        || state.provider_limited)
+                })
+                .map(|state| state.source_byte_count);
+            stale.push((candidate, prior_search_bytes));
         }
     }
     summary.stale = stale.len();
@@ -262,22 +262,22 @@ pub(crate) fn index_candidates(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |(candidate, full_read_bytes): &(IndexCandidate, u64)| {
+    let prepare = |(candidate, prior_search_bytes): &(IndexCandidate, Option<usize>)| {
         reads_transcript_file(candidate.session.provider)
-            .then(|| prepare_session(registry, candidate, *full_read_bytes))
+            .then(|| prepare_session(registry, candidate, *prior_search_bytes))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |(candidate, full_read_bytes), prepared| {
+        |(candidate, prior_search_bytes), prepared| {
             if stop() {
                 flush_batch(store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
-            let result =
-                prepared.unwrap_or_else(|| prepare_session(registry, candidate, *full_read_bytes));
+            let result = prepared
+                .unwrap_or_else(|| prepare_session(registry, candidate, *prior_search_bytes));
             // A successful read makes a recorded failure obsolete even when storing the document
             // fails. Best effort: a leftover record no longer applies once the source changes.
             if result.is_ok() && failures.contains_key(&candidate.session) {
@@ -534,7 +534,7 @@ impl PreparedIndex {
 fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
-    full_read_bytes: u64,
+    prior_search_bytes: Option<usize>,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
     let IndexedSearchDocument {
@@ -553,7 +553,8 @@ fn prepare_session(
             .index_search_document(
                 &candidate.session,
                 candidate.source_path.as_deref(),
-                full_read_bytes,
+                prior_search_bytes.map_or(FULL_READ_SOURCE_BYTES, |_| u64::MAX),
+                prior_search_bytes,
             )?
     };
     let captured_at = title_source.captured_at;
@@ -711,6 +712,8 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            source_byte_count: 0,
+            provider_limited: false,
             source_updated_at: now,
             source_complete: true,
             document_version: search_document_version(Provider::Codex),
@@ -754,6 +757,8 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            source_byte_count: 0,
+            provider_limited: false,
             source_updated_at: now,
             source_complete: false,
             document_version: search_document_version(Provider::Codex),

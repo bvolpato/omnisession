@@ -43,7 +43,7 @@ pub use opencode::{
 };
 pub use pi::PiAdapter;
 pub use provider_process::{bounded_provider_output, provider_process};
-pub use support::IncompleteTranscript;
+pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +256,7 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
+        _prior_search_bytes: Option<usize>,
     ) -> Result<IndexedSearchDocument> {
         self.index_session(session, source_path, full_read_bytes)
             .map(Into::into)

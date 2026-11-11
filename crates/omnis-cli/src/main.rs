@@ -730,7 +730,9 @@ fn search_text(
 }
 
 fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
-    if conversation.complete {
+    if conversation.truncation_strategy == "provider_read_limit" {
+        "source-limit"
+    } else if conversation.complete {
         "complete"
     } else if head_tail_coverage(conversation) {
         "head-tail"

@@ -120,6 +120,7 @@ fn lists_and_reads_synthetic_antigravity_session_without_mutation() {
             &sessions[0].session,
             sessions[0].source_path.as_deref(),
             u64::MAX,
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -230,8 +231,14 @@ fn full_search_retries_empty_jsonl_and_streams_past_the_snapshot_record_limit() 
     fs::write(&path, "").unwrap();
     let adapter = AntigravityAdapter::with_root(root);
     let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
-    let search =
-        || adapter.index_search_document(&listed.session, listed.source_path.as_deref(), u64::MAX);
+    let search = || {
+        adapter.index_search_document(
+            &listed.session,
+            listed.source_path.as_deref(),
+            u64::MAX,
+            None,
+        )
+    };
     assert!(
         adapter
             .preview_session(&listed.session)
