@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     ffi::OsString,
     fs,
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -20,9 +20,9 @@ use crate::{
     NativeSession, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
         EventBuilder, JsonLineSkips, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-        MAX_TRANSCRIPT_LINE_SIZE, json_lines_preview_with_omissions, omitted_images_text,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        json_lines_preview_with_omissions, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, provider_file, provider_root, sort_sessions, string_at,
+        validate_provider, value_at, visit_index_json_lines,
     },
 };
 
@@ -613,27 +613,51 @@ impl NativeSession {
         }
         false
     }
-}
 
-fn apply_verified_workspace(
-    session: &mut NativeSession,
-    workspaces: &HashMap<Uuid, omnis_store::CodexWorkspace>,
-    cached_header: bool,
-) -> bool {
-    if let Some(revision) = session.source_revision
-        && let Some(workspace) = revision.file.and_then(|file| workspaces.get(&file))
-        && revision.matches_file_contents(workspace.source_revision)
-        && (!cached_header
-            || session
+    /// Applies the workspace recorded for this exact Codex source. A pending recheck hides the old directory.
+    /// Returns true only for a verified observation, including one that established an unknown workspace.
+    pub fn apply_codex_workspace_index(
+        &mut self,
+        index: &omnis_store::CodexWorkspaceIndex,
+        cached_header: bool,
+    ) -> bool {
+        let Some(revision) = self
+            .source_revision
+            .filter(|_| self.session.provider == Provider::Codex)
+        else {
+            return false;
+        };
+        let Some(file) = revision.file else {
+            return false;
+        };
+        let verified = index
+            .verified
+            .get(&file)
+            .filter(|entry| revision.matches_file_contents(entry.source_revision));
+        let pending = index
+            .pending
+            .get(&file)
+            .is_some_and(|pending| revision.matches_file_contents(*pending));
+        if verified.is_none() && !pending {
+            return false;
+        }
+        if cached_header
+            && !self
                 .source_path
                 .as_deref()
                 .and_then(CodexAdapter::index_file_revision)
-                .is_some_and(|current| current.matches_file_contents(revision)))
-    {
-        session.apply_codex_workspace(workspace);
-        return true;
+                .is_some_and(|current| current.matches_file_contents(revision))
+        {
+            return false;
+        }
+        if let Some(workspace) = verified {
+            self.apply_codex_workspace(workspace);
+            return true;
+        }
+        self.project_path = None;
+        self.git_branch = None;
+        false
     }
-    false
 }
 
 impl Default for CodexAdapter {
@@ -1142,7 +1166,7 @@ impl CodexSession {
             CodexHistory::new(self.project_path.clone()),
             read,
         )?;
-        if history.workspace_unknown {
+        if history.workspace_unknown() {
             events.mark_codex_workspace_unknown(self.updated_at);
         }
         Ok((events, history.project_path))
@@ -1156,7 +1180,6 @@ impl CodexSession {
     ) -> Result<(EventBuilder, CodexHistory)> {
         let mut unread_ancestor = false;
         let mut first_gap = None;
-        let mut recovered_after = 0;
         let unreadable = read(&mut |record, skipped_before| {
             if builder.tracks_rollback_opener()
                 && !ordinary_rollback_record(&record, history.records_seen == 0)
@@ -1167,16 +1190,7 @@ impl CodexSession {
                 first_gap = Some(builder.checkpoint());
                 builder.note_rollback_history_gap();
             }
-            if skipped_before.workspace_gaps() > 0 {
-                if record["type"] == "turn_context" && record["payload"]["cwd"].is_string() {
-                    recovered_after = skipped_before.workspace_gaps();
-                } else if record["type"] == "event_msg"
-                    && record["payload"]["type"] == "thread_rolled_back"
-                    && record["payload"]["num_turns"].as_u64() != Some(0)
-                {
-                    recovered_after = 0;
-                }
-            }
+            history.observe_workspace_gaps(skipped_before.workspace_gaps());
             unread_ancestor |= records_history_base(&record);
             history.push(&mut builder, &record)?;
             if history
@@ -1188,11 +1202,7 @@ impl CodexSession {
             }
             Ok(())
         })?;
-        if recovered_after != unreadable.workspace_gaps() {
-            history.workspace_unknown = true;
-            history.project_path = None;
-            history.workspace_record = None;
-        }
+        history.observe_workspace_gaps(unreadable.workspace_gaps());
         let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
         if unreadable.total() != 0 {
@@ -1284,10 +1294,11 @@ impl CodexSession {
                 read.workspace_projection,
             ));
         }
-        let (events, project, reconstructed) = if contains_rollback_marker(&self.path)? {
+        let scan = self.scan_workspace()?;
+        let (events, project, reconstructed) = if scan.reconstruct_history {
             self.reconstructed_preview(rollout_file::LIMITS)?
         } else {
-            self.preview_events()?
+            self.preview_events(scan.directory)?
         };
         let branch = self.branch_at(project.as_deref());
         let title = events.rollback_title();
@@ -1333,7 +1344,7 @@ impl CodexSession {
     fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let (events, project, source_complete, workspace_reconstructed) =
-            match rollout_file::sample(&self.path, budget)
+            match rollout_file::sample(&self.path, budget, self.project_path.as_deref())
                 .context("sampling compressed Codex rollout")?
             {
                 rollout_file::Sample::Complete(bytes) => {
@@ -1351,8 +1362,8 @@ impl CodexSession {
                     records,
                     omitted,
                     unreadable,
+                    directory,
                 } => {
-                    let project = self.preview_directory(&records, omitted > 0);
                     let mut events = self.events_from_records(records);
                     events.push_json_line_omissions(
                         unreadable,
@@ -1370,7 +1381,7 @@ impl CodexSession {
                             None,
                         );
                     }
-                    (events, project, false, false)
+                    (events, directory, false, true)
                 }
             };
         let branch = self.branch_at(project.as_deref());
@@ -1437,7 +1448,7 @@ impl CodexSession {
             ));
         }
         events.finish_preview(expected)?;
-        if history.workspace_unknown {
+        if history.workspace_unknown() {
             events.mark_codex_workspace_unknown(self.updated_at);
         }
         if omitted > 0 {
@@ -1453,21 +1464,25 @@ impl CodexSession {
         Ok((events, project, !history.workspace_history_incomplete))
     }
 
-    fn preview_events(&self) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+    fn preview_events(
+        &self,
+        directory: Option<PathBuf>,
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
         const SAMPLE_RECORDS: usize = 1_024;
         let preview = json_lines_preview_with_omissions(
             &self.path,
             SAMPLE_RECORDS,
+            MAX_PREVIEW_TAIL_SIZE,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             rollout_file::workspace_record_candidate,
         )?;
         if preview.omissions.workspace_gaps() > 0 {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
-        let project = self.preview_directory(&preview.records, preview.sampled);
         let mut events = self.events_from_records(preview.records);
         events.push_json_line_omissions(
             preview.omissions,
-            MAX_TRANSCRIPT_LINE_SIZE,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             None,
             self.updated_at,
         );
@@ -1481,20 +1496,7 @@ impl CodexSession {
                 None,
             );
         }
-        Ok((events, project, false))
-    }
-
-    fn preview_directory(&self, records: &[Value], sampled: bool) -> Option<PathBuf> {
-        if !sampled
-            && let Some(cwd) = records
-                .iter()
-                .rev()
-                .filter(|record| record["type"] == "turn_context")
-                .find_map(|record| record["payload"]["cwd"].as_str())
-        {
-            return Some(PathBuf::from(cwd));
-        }
-        self.project_path.clone()
+        Ok((events, directory, true))
     }
 
     fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
@@ -1526,8 +1528,10 @@ struct TurnCheckpoint {
 
 struct CodexHistory {
     project_path: Option<PathBuf>,
-    workspace_unknown: bool,
     workspace_record: Option<usize>,
+    retain_workspace_path: bool,
+    workspace_gaps: usize,
+    records_before_workspace_gap: usize,
     records_seen: usize,
     last_visible: Option<(EventKind, String, &'static str)>,
     turns: Vec<TurnCheckpoint>,
@@ -1543,8 +1547,10 @@ impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
             project_path,
-            workspace_unknown: false,
-            workspace_record: None,
+            workspace_record: Some(1),
+            retain_workspace_path: true,
+            workspace_gaps: 0,
+            records_before_workspace_gap: 0,
             records_seen: 0,
             last_visible: None,
             turns: Vec::new(),
@@ -1560,8 +1566,22 @@ impl CodexHistory {
     /// During preview, a checkpoint holds the position of the cwd record. The second pass reads the surviving path.
     fn preview() -> Self {
         Self {
-            workspace_record: Some(1),
+            retain_workspace_path: false,
             ..Self::new(None)
+        }
+    }
+
+    fn workspace_unknown(&self) -> bool {
+        self.workspace_gaps > 0 && self.workspace_record.is_none()
+    }
+
+    fn observe_workspace_gaps(&mut self, skipped: usize) {
+        if skipped != self.workspace_gaps {
+            self.workspace_gaps = skipped;
+            // Only a cwd recorded after this gap can establish the workspace again.
+            self.records_before_workspace_gap = self.records_seen;
+            self.workspace_record = None;
+            self.project_path = None;
         }
     }
 
@@ -1608,10 +1628,15 @@ impl CodexHistory {
                     self.turns.truncate(retained);
                     builder.truncate_from(checkpoint.sequence);
                     truncated = Some(checkpoint.sequence);
-                    self.project_path = checkpoint.project_path;
-                    self.workspace_record = checkpoint.workspace_record;
+                    self.workspace_record = checkpoint
+                        .workspace_record
+                        .filter(|position| *position > self.records_before_workspace_gap);
+                    self.project_path = self.workspace_record.and(checkpoint.project_path);
                     self.tool_events = checkpoint.tool_events;
                     self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
+                } else if self.workspace_gaps > 0 {
+                    self.project_path = None;
+                    self.workspace_record = None;
                 }
                 self.last_visible = None;
                 self.pending_turn = None;
@@ -1630,17 +1655,17 @@ impl CodexHistory {
         }
         if record_type == Some("turn_context") {
             if self.pending_turn.is_none()
-                && self
-                    .last_visible
-                    .as_ref()
-                    .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser)
+                && (self.workspace_unknown()
+                    || self
+                        .last_visible
+                        .as_ref()
+                        .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser))
             {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
             if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
-                if self.workspace_record.is_some() {
-                    self.workspace_record = Some(self.records_seen);
-                } else {
+                self.workspace_record = Some(self.records_seen);
+                if self.retain_workspace_path {
                     self.project_path = Some(PathBuf::from(cwd));
                 }
             }
@@ -1657,44 +1682,6 @@ impl CodexHistory {
         }
         Ok(None)
     }
-}
-
-fn contains_rollback_marker(path: &Path) -> Result<bool> {
-    contains_rollback_marker_with_chunk(path, 1024 * 1024)
-}
-
-fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
-    const MARKER: &[u8] = b"thread_rolled_back";
-    let marker = memchr::memmem::Finder::new(MARKER);
-    let escape = memchr::memmem::Finder::new(b"\\u00");
-    let mut file = fs::File::open(path)?;
-    // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
-    let mut buffer = vec![0_u8; chunk.max(MARKER.len())];
-    let mut overlap = 0;
-    loop {
-        let read = file.read(&mut buffer[overlap..])?;
-        if read == 0 {
-            return Ok(false);
-        }
-        let length = overlap + read;
-        let window = &buffer[..length];
-        // Writers never need to escape letters, so an escaped letter may be hiding the marker.
-        if marker.find(window).is_some()
-            || escape
-                .find_iter(window)
-                .any(|position| escapes_ascii_letter(window.get(position + 4..position + 6)))
-        {
-            return Ok(true);
-        }
-        overlap = (MARKER.len() - 1).min(length);
-        buffer.copy_within(length - overlap..length, 0);
-    }
-}
-
-fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
-    hex.and_then(|hex| std::str::from_utf8(hex).ok())
-        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
 }
 
 fn ordinary_rollback_record(record: &Value, first: bool) -> bool {
@@ -2171,9 +2158,9 @@ impl ProviderAdapter for CodexAdapter {
         let mut native = session.native_session();
         if self.use_workspace_index
             && let Some(file) = native.source_revision.and_then(|revision| revision.file)
-            && let Ok(workspaces) = omnis_store::CodexWorkspace::read_index(Some(file))
+            && let Ok(workspaces) = omnis_store::CodexWorkspace::discovery_index(Some(file))
         {
-            apply_verified_workspace(&mut native, &workspaces, false);
+            native.apply_codex_workspace_index(&workspaces, false);
         }
         Ok(Some(native))
     }
@@ -2226,8 +2213,9 @@ impl ProviderAdapter for CodexAdapter {
         let native = self.find_session(&session.id, source_path)?;
         let changed = source_path.is_some_and(|path| path != native.path);
         let read = native.read_unchanged(|native, revision| {
+            let selected_path = native.path.clone();
             let mut read = native.index(session, full_read_bytes, revision)?;
-            read.observe_inherited_workspace()?;
+            read.observe_inherited_workspace(&selected_path)?;
             Ok(read)
         });
         if changed {
@@ -2433,34 +2421,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_scan_ignores_unicode_escapes() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let escaped = temporary.path().join("escaped.jsonl");
-        fs::write(
-            &escaped,
-            "{\"type\":\"event_msg\",\"payload\":{\"text\":\"\\u001b[31mred\\u001b[0m\"}}\n",
-        )
-        .expect("escaped rollout");
-        assert!(!contains_rollback_marker(&escaped).expect("scan escaped rollout"));
-
-        let rolled_back = temporary.path().join("rolled-back.jsonl");
-        fs::write(
-            &rolled_back,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n",
-        )
-        .expect("rolled back rollout");
-        assert!(contains_rollback_marker(&rolled_back).expect("scan rolled back rollout"));
-
-        let escaped_marker = temporary.path().join("escaped-marker.jsonl");
-        fs::write(
-            &escaped_marker,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_\\u0062ack\"}}\n",
-        )
-        .expect("escaped marker rollout");
-        assert!(contains_rollback_marker(&escaped_marker).expect("scan escaped marker rollout"));
-    }
-
-    #[test]
     fn path_uuid_ignores_stems_that_end_mid_character() {
         let mid_character = format!("{}a.jsonl", "\u{e9}".repeat(18));
         assert_eq!(path_uuid(Path::new(&mid_character)), None);
@@ -2508,35 +2468,6 @@ mod tests {
         );
     }
 
-    fn naive_rollback_marker(bytes: &[u8]) -> bool {
-        const MARKER: &[u8] = b"thread_rolled_back";
-        bytes.windows(MARKER.len()).any(|window| window == MARKER)
-            || bytes.windows(6).any(|window| {
-                window.starts_with(b"\\u00")
-                    && std::str::from_utf8(&window[4..])
-                        .ok()
-                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-            })
-    }
-
-    /// JSON unicode escape of one byte, e.g. the escaped `b` a writer may emit.
-    fn json_escape(byte: u8) -> String {
-        format!("\\u{byte:04x}")
-    }
-
-    fn rollback_filler() -> impl Strategy<Value = u8> {
-        prop_oneof![
-            8 => b'a'..=b'z',
-            1 => Just(b'\\'),
-            1 => Just(b'u'),
-            1 => Just(b'0'),
-            1 => Just(b'_'),
-            1 => Just(b'"'),
-            1 => Just(b'\n'),
-        ]
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -2558,38 +2489,5 @@ mod tests {
             );
         }
 
-        #[test]
-        fn rollback_scan_matches_naive_search_across_chunk_boundaries(
-            filler in proptest::collection::vec(rollback_filler(), 0..160),
-            marker in prop_oneof![
-                Just(String::new()),
-                Just("thread_rolled_back".to_owned()),
-                Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
-                Just(format!("{}hread_rolled_back", json_escape(b't'))),
-                Just(format!("{}[31m", json_escape(0x1b))),
-            ],
-            chunk in 18_usize..48,
-            window in 0_usize..4,
-            shift in 0_usize..24,
-            random_offset in any::<proptest::sample::Index>(),
-            near_boundary in any::<bool>(),
-        ) {
-            // After the first window, each read advances by `chunk` minus the 17-byte overlap.
-            let boundary = chunk + window * (chunk - 17);
-            let offset = if near_boundary {
-                boundary.saturating_sub(shift).min(filler.len())
-            } else {
-                random_offset.index(filler.len() + 1)
-            };
-            let bytes = [&filler[..offset], marker.as_bytes(), &filler[offset..]].concat();
-            let temporary = tempfile::tempdir().expect("temporary directory");
-            let path = temporary.path().join("rollout.jsonl");
-            fs::write(&path, &bytes).expect("synthetic rollout");
-
-            prop_assert_eq!(
-                contains_rollback_marker_with_chunk(&path, chunk).expect("chunked scan"),
-                naive_rollback_marker(&bytes)
-            );
-        }
     }
 }

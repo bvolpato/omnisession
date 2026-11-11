@@ -145,7 +145,7 @@ fn resume_from_snapshot(
         ))?;
         progress_line("Reading source trajectory...")?;
     }
-    let snapshot = registry
+    let read = registry
         .read_selected_session_indexed(
             source,
             request
@@ -157,21 +157,21 @@ fn resume_from_snapshot(
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }
-    let current = current_project()?;
-    let project = resume_project(
-        source,
-        &snapshot,
+    let current =
+        continuation_caller_directory(restore_source && source.provider == Provider::Codex)?;
+    let (project, matches) = resume_workspace(
+        &read,
+        request,
         &current,
         args.allow_workspace_mismatch,
-        request.picker_selection.as_ref(),
+        restore_source,
     )?;
-    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     let context = ResumeContext {
         registry,
         args,
         task_binding,
         source,
-        snapshot: &snapshot,
+        snapshot: &read.snapshot,
         project: &project,
         target,
         json_output,
@@ -511,6 +511,41 @@ pub(super) fn resume_project(
     )
 }
 
+fn resume_workspace(
+    read: &omnis_adapters::IndexRead,
+    request: &ResolvedResumeRequest,
+    current: &Path,
+    allow_workspace_mismatch: bool,
+    restore_source: bool,
+) -> Result<(PathBuf, bool)> {
+    let selection = request.picker_selection.as_ref();
+    if restore_source && request.source.provider == Provider::Codex {
+        let directory = super::verified_codex_directory(read);
+        let target = match selection {
+            Some(selection) => selected_native_workspace(selection, current)?,
+            None => current.to_path_buf(),
+        };
+        let (project, matches) = codex_continuation_directory(
+            directory.as_deref(),
+            &target,
+            selection,
+            allow_workspace_mismatch,
+        )?;
+        let matches = matches
+            && super::codex_repository_matches(&read.snapshot, directory.as_deref(), &project)?;
+        return Ok((project, matches));
+    }
+    let project = resume_project(
+        &request.source,
+        &read.snapshot,
+        current,
+        allow_workspace_mismatch,
+        selection,
+    )?;
+    let matches = workspace_state_matches(&read.snapshot.workspace, &project)?;
+    Ok((project, matches))
+}
+
 fn resume_native_without_snapshot(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
@@ -522,7 +557,7 @@ fn resume_native_without_snapshot(
     if args.materialize_only {
         bail!("`--materialize-only` requires a supported native import");
     }
-    let current = current_project()?;
+    let current = continuation_caller_directory(request.target == Provider::Codex)?;
     let (project, mut repository_matches) = if let Some(selection) = &request.picker_selection {
         let project = selected_native_workspace(selection, &current)?;
         let repository_matches = workspace_paths_match(&project, &current);
@@ -570,7 +605,7 @@ fn resume_native_without_snapshot(
                         .remove(&file)
                 },
             )?;
-            repository_matches &= matches;
+            repository_matches = matches;
             plan
         } else {
             request.agent_target().launch(plan)?
@@ -829,12 +864,17 @@ pub(super) fn selected_native_workspace(
     current: &Path,
 ) -> Result<PathBuf> {
     let chosen = selection.workspace_override.as_deref();
-    let listed = omnis_core::canonicalize_path(
-        chosen
-            .or(selection.project_path.as_deref())
-            .context("selected session has no recorded workspace")?,
-    )
-    .context("selected session workspace no longer exists")?;
+    let directory = chosen
+        .or(selection.project_path.as_deref())
+        .context("selected session has no recorded workspace")?;
+    if selection.session.provider == Provider::Codex
+        && chosen.is_none()
+        && (!directory.is_absolute() || omnis_core::may_reach_network(directory))
+    {
+        bail!("selected session workspace changed during discovery");
+    }
+    let listed = omnis_core::canonicalize_path(directory)
+        .context("selected session workspace no longer exists")?;
     let selected = workspace_root(listed)?;
     if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
     {
@@ -882,30 +922,21 @@ fn codex_native_launch(
             .context("selected Codex rollout has no source path")?;
         omnis_adapters::CodexAdapter::rollout_workspaces(source, path, revision)
     })?;
+    let (directory, matches) = codex_continuation_directory(
+        workspace.as_deref(),
+        project,
+        selection,
+        allow_workspace_mismatch,
+    )?;
     let override_dir = selection.is_some_and(|selection| selection.workspace_override.is_some())
         || (selection.is_none() && allow_workspace_mismatch);
-    let matches = workspace.as_deref().is_some_and(|dir| {
-        !omnis_core::may_reach_network(dir) && workspace_paths_match(dir, project)
-    });
-    if !matches && !override_dir {
-        let workspace = workspace.context(
-            "source session has no verified workspace; use `--allow-workspace-mismatch` to choose the current workspace",
-        )?;
-        if selection.is_some() {
-            bail!("selected session workspace changed during discovery");
-        }
-        bail!(
-            "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
-            safe_terminal_line(&workspace.display().to_string()),
-            project.display(),
-        );
-    }
     let startup_matches = startup.as_deref().is_some_and(|startup| {
-        startup.as_os_str() == project.as_os_str()
+        startup.as_os_str() == directory.as_os_str()
             || (startup.is_absolute()
                 && !omnis_core::may_reach_network(startup)
-                && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == project))
+                && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == directory))
     });
+    plan.cwd = Some(directory);
     let native_args = std::mem::take(&mut plan.args);
     let mut plan = target.launch(plan)?;
     if (override_dir || !startup_matches)
@@ -929,6 +960,53 @@ fn codex_native_launch(
         "selected Codex rollout changed before launch"
     );
     Ok((plan, matches))
+}
+
+fn continuation_caller_directory(codex: bool) -> Result<PathBuf> {
+    if codex {
+        return omnis_core::canonicalize_path(std::env::current_dir()?)
+            .context("resolving current working directory");
+    }
+    current_project()
+}
+
+fn codex_continuation_directory(
+    workspace: Option<&Path>,
+    project: &Path,
+    selection: Option<&session_picker::PickerSelection>,
+    allow_workspace_mismatch: bool,
+) -> Result<(PathBuf, bool)> {
+    let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
+    let use_caller = selection.is_none() && allow_workspace_mismatch;
+    let matches = workspace.is_some_and(|dir| {
+        dir.is_absolute()
+            && !omnis_core::may_reach_network(dir)
+            && workspace_paths_match(dir, project)
+    });
+    if !matches && chosen.is_none() && !use_caller {
+        let workspace = workspace.context(
+            "source session has no verified workspace; use `--allow-workspace-mismatch` to choose the current workspace",
+        )?;
+        if selection.is_some() {
+            bail!("selected session workspace changed during discovery");
+        }
+        bail!(
+            "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
+            safe_terminal_line(&workspace.display().to_string()),
+            project.display(),
+        );
+    }
+    let selected = chosen.or(workspace.filter(|_| matches && !use_caller));
+    let Some(directory) = selected else {
+        return Ok((project.to_path_buf(), matches));
+    };
+    let directory = omnis_core::canonicalize_path(directory)
+        .context("selected Codex working directory is unavailable")?;
+    anyhow::ensure!(
+        directory.is_dir() && workspace_paths_match(&directory, project),
+        "selected Codex working directory is outside the verified workspace or is not a directory"
+    );
+    Ok((directory, matches))
 }
 
 fn picked_codex_directories(
@@ -1020,14 +1098,15 @@ impl ResumeContext<'_> {
     }
 
     fn save_handoff_after_failure(&self) {
-        if self.source.provider == self.target || self.args.dry_run || self.json_output {
+        if self.args.dry_run || self.json_output {
             return;
         }
         // If the submitted history has a handoff link, the surviving session needs that exact file.
-        let file = self
-            .recovery_file
-            .take()
-            .map_or_else(|| write_temp_handoff(self.snapshot, None), Ok);
+        let file = match self.recovery_file.take() {
+            Some(file) => Ok(file),
+            None if self.can_use_handoff() => write_temp_handoff(self.snapshot, None),
+            None => return,
+        };
         match file {
             Ok(file) => crate::recovery::keep_handoff(file),
             Err(error) => {

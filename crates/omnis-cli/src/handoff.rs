@@ -21,10 +21,10 @@ pub(super) fn run(
     revision: Option<SourceRevision>,
     json_output: bool,
 ) -> Result<()> {
-    let snapshot = registry
+    let read = registry
         .read_selected_session_indexed(source, revision)
         .with_context(|| format!("reading `{source}`"))?;
-    let snapshot = sanitize_snapshot(snapshot);
+    let snapshot = sanitize_snapshot(read.snapshot);
     let harness = provider_name(snapshot.session.provider);
     let document = format!(
         "This session has been handed off from **{harness}** through OmniSession.\n\n\

@@ -39,7 +39,9 @@ When discovery is incomplete or unverified, `omni index` and the picker update t
 
 Workspace matching uses canonical paths and repository fingerprints ([RFC 002](rfcs/002-workspace-identity.md)). Provider SQLite stores are read with `query_only`, and snapshot-based adapters copy available WAL files into private temporary storage. Redaction covers recognized credential fields and patterns and cannot prove every secret is absent; see [SECURITY.md](../SECURITY.md#redaction-and-handoffs).
 
-Codex discovery, project search, and native resume use the workspace verified for the selected file revision. A complete scan of workspace records can establish the surviving directory even when search retains only part of the conversation. If a damaged record could have changed the directory, the workspace stays unknown until a later readable turn establishes it. Direct resume can use the current directory when the user passes `--allow-workspace-mismatch`. A picker transfer stops if the selected file changes before OmniSession reads it for the handoff.
+Codex discovery and search use the workspace verified for the selected file revision. Indexing tracks directory changes even when it keeps only part of the conversation. If a damaged record could have changed the directory, the workspace stays unknown until a surviving turn records it again. A rollback restores the directory of the last surviving turn that established one.
+
+When Codex resumes a session or restores an archive, OmniSession compares repository roots and starts Codex in the verified working directory, including a subdirectory within the repository. If the workspace is unknown, the user can choose where to continue with `--allow-workspace-mismatch`. A picker transfer stops if the selected file changes before OmniSession reads it for the handoff.
 
 After a rollback, indexing checks whether the opening request that supplied the search title still survives. It can replace a title derived from a discarded local request and preserve a name assigned by the provider. If a fork's parent history is unavailable, a surviving local request cannot establish the inherited title.
 

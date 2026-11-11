@@ -600,34 +600,9 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     assert!(!failed.status.success(), "divergent read-back must fail");
     fixture.assert_nothing_left_behind("rolled-back partial native fork");
 
-    let assert_recovery_file = || {
-        let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
-        assert!(!events.contains(missing));
-        let path = events
-            .lines()
-            .find_map(|line| {
-                let event: Value = serde_json::from_str(line).unwrap();
-                let payload = &event["payload"];
-                if payload["role"] != "assistant" {
-                    return None;
-                }
-                let text = payload["content"][0]["text"].as_str()?;
-                text.strip_prefix("[OmniSession recovery file]")?
-                    .lines()
-                    .last()
-                    .map(PathBuf::from)
-            })
-            .expect("the receiving agent needs the recovery path in its history");
-        assert!(path.starts_with(fixture.root.join("tmp")));
-        let document = fs::read_to_string(&path).unwrap();
-        assert!(document.contains(missing));
-        assert!(!document.contains(credential));
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
-    };
     let run = fixture.run(&args, &faithful);
     assert!(run.status.success(), "{}", run.stderr);
-    assert_recovery_file();
+    fixture.assert_linked_recovery_file(missing, credential);
 
     for mode in ["lost-completion", "failed-completion"] {
         let run = fixture.run(
@@ -652,8 +627,63 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
             None,
             "an imported thread still exists"
         );
-        assert_recovery_file();
+        fixture.assert_linked_recovery_file(missing, credential);
     }
+}
+
+#[test]
+fn archived_codex_keeps_the_submitted_recovery_file_after_a_lost_completion() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.root.join(format!(
+        "codex/archived_sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"
+    ));
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let missing = "Consult the saved migration plan.";
+    let credential = "synthetic-private-value";
+    let prompt = format!("{}{missing} password={credential}", "word ".repeat(26_000));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+
+    let reference = format!("codex:{SOURCE_ID}");
+    let rolled_back = fixture.run(&strings(&["resume", &reference, "--materialize-only"]), &[]);
+    assert!(!rolled_back.status.success(), "{}", rolled_back.stderr);
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    fixture.assert_nothing_left_behind("confirmed archive rollback");
+
+    let lost = fixture.run(
+        &strings(&["resume", &reference]),
+        &[
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_IMPORT", "lost-completion"),
+        ],
+    );
+    assert!(!lost.status.success(), "{}", lost.stderr);
+    assert!(
+        lost.stderr.contains("may have created a thread"),
+        "{}",
+        lost.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_linked_recovery_file(missing, credential);
+    fixture.assert_recovery_saved("uncertain archive restore", &lost, missing);
+    assert_eq!(fs::read(source).unwrap(), bytes);
 }
 
 #[test]
@@ -700,6 +730,61 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
     );
     assert!(!fixture.generated_rollout().exists());
     assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[test]
+fn archived_codex_with_unknown_workspace_requires_a_destination() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace,
+            "history_mode":"paginated","history_base":{"thread_id":THREAD_ID,"end_byte_offset":512,"end_ordinal_exclusive":2}}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+    let run = |args: &[&str]| fixture.command().arg("--json").args(args).output().unwrap();
+    for indexed in [false, true] {
+        if indexed {
+            assert!(run(&["index", "--provider", "codex"]).status.success());
+        }
+        let blocked = run(&["fork", &reference, "--in", "codex", "--dry-run"]);
+        assert!(!blocked.status.success());
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch"));
+        for args in [
+            vec!["inspect", &reference, "--target", "codex"],
+            vec![
+                "fork",
+                &reference,
+                "--in",
+                "codex",
+                "--allow-workspace-mismatch",
+                "--dry-run",
+            ],
+        ] {
+            let result = run(&args);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+            let fidelity = output.get("fidelity").unwrap_or(&output);
+            assert_eq!(fidelity["repository_matches"], false);
+        }
+    }
+    assert_eq!(fs::read(source).unwrap(), bytes);
 }
 
 #[test]
@@ -762,6 +847,7 @@ fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
         run.stderr
     );
     assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_recovery_saved("uncertain complete archive restore", &run, SOURCE_QUESTION);
 
     let run = fixture.run(
         &strings(&["resume", &reference]),
@@ -2419,6 +2505,35 @@ impl Fixture {
         } else {
             self.assert_recovery_saved(label, run, SOURCE_QUESTION);
         }
+    }
+
+    fn assert_linked_recovery_file(&self, missing: &str, credential: &str) {
+        let events = fs::read_to_string(self.generated_rollout()).unwrap();
+        assert!(!events.contains(missing));
+        let path = events
+            .lines()
+            .find_map(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                let payload = &event["payload"];
+                if payload["role"] != "assistant" {
+                    return None;
+                }
+                let text = payload["content"][0]["text"].as_str()?;
+                text.strip_prefix("[OmniSession recovery file]")?
+                    .lines()
+                    .last()
+                    .map(PathBuf::from)
+            })
+            .expect("the receiving agent needs the recovery path in its history");
+        assert!(path.starts_with(self.root.join("tmp")));
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains(missing));
+        assert!(!document.contains(credential));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn assert_recovery_saved(&self, label: &str, run: &Run, expected: &str) {

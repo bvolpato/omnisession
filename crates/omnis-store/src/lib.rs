@@ -26,7 +26,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod codex_workspace;
-pub use codex_workspace::{CodexWorkspace, CodexWorkspaceUpdate};
+pub use codex_workspace::{CodexWorkspace, CodexWorkspaceIndex, CodexWorkspaceUpdate};
 
 pub mod search_query;
 
@@ -4317,10 +4317,12 @@ fn prepare_indexed_session(
         INSERT INTO session_index (
             provider, session_id, title, project_path, git_branch, created_at, updated_at,
             updated_at_approximate, event_count, indexed_at, source_file_id, source_contents_id
-        ) SELECT ?1,?2,?3,CASE WHEN w.trajectory_id IS NULL THEN ?4 ELSE w.project_path END,
-                 CASE WHEN w.trajectory_id IS NULL THEN ?5 ELSE w.git_branch END,?6,?7,?8,?9,?10,?11,?12
+        ) SELECT ?1,?2,?3,CASE WHEN p.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NULL THEN ?4 ELSE w.project_path END,
+                 CASE WHEN p.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NULL THEN ?5 ELSE w.git_branch END,?6,?7,?8,?9,?10,?11,?12
           FROM (SELECT 1) LEFT JOIN codex_indexed_workspaces w
-            ON ?1='codex' AND w.source_file_id=?11 AND w.source_contents_id IS ?12 WHERE 1";
+            ON ?1='codex' AND w.source_file_id=?11 AND w.source_contents_id IS ?12
+          LEFT JOIN codex_workspace_rechecks p ON ?1='codex' AND p.source_file_id=?11 AND p.source_contents_id=?12
+            AND p.trajectory_id=(SELECT id FROM session_trajectories WHERE provider=?1 AND session_id=?2) WHERE 1";
     const ON_CONFLICT: &str = "ON CONFLICT (provider, session_id) DO UPDATE SET
         title = excluded.title,
         project_path = excluded.project_path,
@@ -6384,6 +6386,94 @@ mod tests {
             (saved.project_path, saved.git_branch),
             (workspace.project_path, workspace.git_branch)
         );
+    }
+
+    #[test]
+    fn an_old_sample_stays_unscoped_until_its_exact_workspace_is_verified() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("store.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let (header, workspace, doc) = publish_workspace_fixture(&store);
+        let revision = workspace.source_revision;
+        let file = revision.file.unwrap();
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "UPDATE session_trajectories SET document_version=6,source_complete=0,complete=0;
+             DROP TABLE codex_workspace_rechecks;",
+            )
+            .unwrap();
+        let index =
+            super::CodexWorkspace::discovery_index_from(&store.connection.borrow(), Some(file))
+                .unwrap();
+        assert!(index.verified.is_empty());
+        assert_eq!(index.pending.get(&file), Some(&revision));
+        assert!(
+            super::CodexWorkspace::discovery_index_from(
+                &store.connection.borrow(),
+                Some(Uuid::from_u128(99))
+            )
+            .unwrap()
+            .pending
+            .is_empty()
+        );
+        drop(store);
+
+        let store = Store::open(&database).unwrap();
+        let state = store
+            .trajectory_index_state(&header.session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.document_version, 5);
+        assert_eq!(state.source_revision, revision);
+        assert!(!state.source_complete);
+        store.upsert_indexed_session(&header).unwrap();
+        let catalog = store.indexed_session(&header.session).unwrap().unwrap();
+        assert_eq!((catalog.project_path, catalog.git_branch), (None, None));
+
+        let replacement = IndexedSession {
+            source_revision: Some(SourceRevision {
+                contents: Some(Uuid::from_u128(42)),
+                ..revision
+            }),
+            ..header.clone()
+        };
+        store.upsert_indexed_session(&replacement).unwrap();
+        assert_eq!(
+            store.indexed_session(&header.session).unwrap(),
+            Some(replacement)
+        );
+        store.upsert_indexed_session(&header).unwrap();
+        store
+            .upsert_selected_session_document_with_workspace(
+                &header,
+                &store.observe_selected_session(&header.session).unwrap(),
+                TrajectoryDocument {
+                    source_complete: false,
+                    document_version: 6,
+                    ..doc
+                },
+                Some(&super::CodexWorkspaceUpdate::Verified(workspace.clone())),
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&database).unwrap();
+        let refreshed =
+            super::CodexWorkspace::discovery_index_from(&store.connection.borrow(), Some(file))
+                .unwrap();
+        assert!(refreshed.pending.is_empty());
+        assert_eq!(
+            refreshed.verified[&file].project_path,
+            workspace.project_path
+        );
+        let state = store
+            .trajectory_index_state(&header.session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.document_version, 6);
+        assert!(!state.source_complete);
     }
 
     #[test]

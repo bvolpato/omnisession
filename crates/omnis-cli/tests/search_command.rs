@@ -174,10 +174,11 @@ fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
-    for (from_creation, query) in [
-        (true, "plumworkspacereply"),
-        (false, "plumworkspacereply"),
-        (true, "saffroncreationbranch"),
+    for (from_creation, query, damaged) in [
+        (true, "plumworkspacereply", false),
+        (false, "plumworkspacereply", false),
+        (false, "plumworkspacereply", true),
+        (true, "saffroncreationbranch", false),
     ] {
         let fixture = Fixture::new();
         let moved = fixture.root.join("other-workspace");
@@ -189,12 +190,28 @@ fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
             fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
             Compression::fast(),
         );
+        let header = json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}});
+        writeln!(writer, "{header}").unwrap();
+        if damaged {
+            writer
+                .write_all(b"{\"type\":\"turn_context\",\"payload\":\n")
+                .unwrap();
+        }
         for record in [
-            json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}}),
             json!({"type":"turn_context","payload":{"cwd":moved}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find my active request"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"plumworkspacereply"}]}}),
         ] {
             writeln!(writer, "{record}").unwrap();
+        }
+        if damaged {
+            for discarded in [
+                json!({"type":"turn_context","payload":{"cwd":fixture.workspace}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Discard this turn"}]}}),
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+            ] {
+                writeln!(writer, "{discarded}").unwrap();
+            }
         }
         writer.finish().unwrap();
         let project = if from_creation {

@@ -4,13 +4,14 @@ use std::{
     collections::VecDeque,
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 
+use super::workspace_check::WorkspaceScan;
 use crate::support::{
     JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
@@ -143,23 +144,39 @@ pub(super) enum Sample {
         records: Vec<Value>,
         omitted: usize,
         unreadable: JsonLineSkips,
+        directory: Option<PathBuf>,
     },
     Reconstruct,
 }
 
+pub(super) enum WorkspaceRecord {
+    Candidate,
+    Compacted,
+    Other,
+}
+
 pub(super) fn workspace_record_candidate(line: &[u8]) -> bool {
+    matches!(workspace_record_kind(line), WorkspaceRecord::Candidate)
+}
+
+pub(super) fn workspace_record_kind(line: &[u8]) -> WorkspaceRecord {
     if !line.trim_ascii_start().starts_with(b"{") {
-        return false;
+        return WorkspaceRecord::Other;
     }
     match string_field(line, "type").as_deref() {
-        Some("event_msg") => matches!(
-            field(line, "payload")
-                .and_then(|payload| string_field(payload, "type"))
-                .as_deref(),
-            None | Some("thread_rolled_back" | "thread_settings_applied")
-        ),
-        None | Some("turn_context" | "session_meta") => true,
-        Some(_) => false,
+        Some("compacted") => WorkspaceRecord::Compacted,
+        None | Some("turn_context" | "session_meta") => WorkspaceRecord::Candidate,
+        Some("event_msg")
+            if matches!(
+                field(line, "payload")
+                    .and_then(|payload| string_field(payload, "type"))
+                    .as_deref(),
+                None | Some("thread_rolled_back" | "thread_settings_applied")
+            ) =>
+        {
+            WorkspaceRecord::Candidate
+        }
+        _ => WorkspaceRecord::Other,
     }
 }
 
@@ -193,7 +210,11 @@ fn field<'a>(line: &'a [u8], target: &str) -> Option<&'a [u8]> {
 
 /// Read small rollouts once. Larger compressed files have no seekable tail, so sample the
 /// decoded stream and inspect every record for a rollback that would invalidate those edges.
-pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
+pub(super) fn sample(
+    path: &Path,
+    budget: u64,
+    creation_directory: Option<&Path>,
+) -> Result<Sample> {
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
     // Indexing normally supplies 16 MiB. Keep a larger caller budget from forcing a huge buffer.
@@ -205,18 +226,14 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
     let mut head = Vec::new();
     let mut tail = VecDeque::new();
     let mut count = 0;
-    let mut reconstruct = false;
+    let mut workspace = WorkspaceScan::new(creation_directory);
     let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
         workspace_record_candidate,
         |loc, record, _| {
             count += 1;
-            reconstruct |= record["type"] == "compacted"
-                || (record["type"] == "event_msg"
-                    && record["payload"]["type"] == "thread_rolled_back")
-                || (record["type"] == "session_meta"
-                    && !record["payload"]["history_base"].is_null());
+            workspace.observe(&record)?;
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push(record);
             } else {
@@ -235,7 +252,7 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
             Ok(())
         },
     )?;
-    if reconstruct || unreadable.workspace_gaps() > 0 {
+    if workspace.reconstruct_history || unreadable.workspace_gaps() > 0 {
         return Ok(Sample::Reconstruct);
     }
     head.extend(tail.into_iter().filter_map(|(offset, record)| {
@@ -244,6 +261,7 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
     Ok(Sample::Edges {
         omitted: count - head.len(),
         unreadable,
+        directory: workspace.directory,
         records: head,
     })
 }
