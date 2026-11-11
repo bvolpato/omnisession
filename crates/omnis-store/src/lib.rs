@@ -918,6 +918,7 @@ pub struct LegacyCodexOpenerCandidate {
 )]
 pub struct TrajectoryDocument<'a> {
     pub redacted_text: &'a str,
+    pub desktop_step_proof: Option<&'a [Uuid]>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     pub source_byte_count: usize,
@@ -3017,6 +3018,7 @@ impl Store {
                 derived_title: None,
                 title_is_verified: false,
                 local_opener: LocalOpenerEvidence::Unknown,
+                desktop_step_proof: None,
                 withdrawn_title: None,
                 title_authoritative: false,
             },
@@ -5568,6 +5570,56 @@ fn record_verified_document_home(
             "DELETE FROM scoped_native_documents WHERE provider=?1 AND session_id=?2 AND source_file=?3
              AND source_home=(SELECT home FROM native_catalog_homes WHERE provider=?1 AND session_id=?2 AND verified)",
         ).and_then(|mut statement| statement.execute(params![write.session.provider.to_string(),write.session.id,file.as_bytes()])).map_err(database_error)?;
+    }
+    record_primary_desktop_receipt(transaction, write)
+}
+
+fn record_primary_desktop_receipt(
+    tx: &Transaction<'_>,
+    write: &PreparedTrajectoryWrite<'_, '_>,
+) -> Result<()> {
+    if write.session.provider != Provider::AntigravityDesktop
+        || write.document.origin != SessionTrajectoryOrigin::Native
+    {
+        return Ok(());
+    }
+    let (Some(file), Some(contents)) = (
+        write.document.source_revision.file,
+        write.document.source_revision.contents,
+    ) else {
+        return Ok(());
+    };
+    let home = tx
+        .query_row(
+            "SELECT origin.source_home FROM session_trajectories doc
+         JOIN native_search_document_homes origin ON origin.trajectory_id=doc.id
+         JOIN native_catalog_homes locator USING(provider,session_id)
+         WHERE doc.provider='antigravity-desktop' AND doc.session_id=?1 AND doc.origin='native'
+           AND origin.verification=1 AND origin.source_home=locator.home AND locator.verified
+           AND origin.source_file=?2 AND doc.source_file_id=?2 AND doc.source_contents_id=?3
+           AND doc.content_hash=?4 AND doc.document_version=?5 AND doc.source_complete=?6",
+            params![
+                write.session.id,
+                file.as_bytes(),
+                contents.as_bytes(),
+                write.content_hash,
+                write.document.document_version,
+                write.source_complete
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    if let Some(home) = home {
+        scoped_native_documents::desktop_receipts::save(
+            tx,
+            &write.session.id,
+            &home,
+            file,
+            contents,
+            &write.content_hash,
+            write.document.desktop_step_proof,
+        )?;
     }
     Ok(())
 }
@@ -9049,6 +9101,7 @@ mod tests {
                         title_authoritative: false,
                         title_is_verified: false,
                         local_opener: LocalOpenerEvidence::Unknown,
+                        desktop_step_proof: None,
                         withdrawn_title: None,
                         source_revision: SourceRevision::default(),
                         redacted_text: text,
@@ -9095,6 +9148,7 @@ mod tests {
             title_authoritative: false,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9197,6 +9251,7 @@ mod tests {
             title_authoritative: false,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9309,6 +9364,7 @@ mod tests {
             title_authoritative: false,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: text,
@@ -9372,6 +9428,7 @@ mod tests {
             title_authoritative: false,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "removed",
@@ -9647,6 +9704,7 @@ mod tests {
             let document = TrajectoryDocument {
                 title_is_verified: false,
                 local_opener: LocalOpenerEvidence::Unknown,
+                desktop_step_proof: None,
                 withdrawn_title: None,
                 source_revision: SourceRevision::default(),
                 redacted_text: text,
@@ -9718,6 +9776,7 @@ mod tests {
                     title_authoritative,
                     title_is_verified: false,
                     local_opener: LocalOpenerEvidence::Unknown,
+                    desktop_step_proof: None,
                     withdrawn_title: None,
                 };
                 store
@@ -9787,6 +9846,7 @@ mod tests {
             derived_title: None,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: false,
         }
@@ -10773,6 +10833,7 @@ mod tests {
         write_selected_catalog_document(&store, &appended, local, false);
         let withdrawn = TrajectoryDocument {
             local_opener: LocalOpenerEvidence::Withdrawn,
+            desktop_step_proof: None,
             withdrawn_title: Some(name),
             derived_title: None,
             title_is_verified: false,
@@ -10868,6 +10929,7 @@ mod tests {
         for full in [false, true] {
             let negative = TrajectoryDocument {
                 local_opener: LocalOpenerEvidence::Withdrawn,
+                desktop_step_proof: None,
                 withdrawn_title: Some(name),
                 truncation_strategy: if full { "none" } else { "source_incomplete" },
                 ..rollout_document("updated searchable content", time, revision, full, 6)
@@ -12789,6 +12851,7 @@ mod tests {
             derived_title: Some("Previous title"),
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: true,
             ..rollout_document("original", older, first, true, 2)
@@ -12861,6 +12924,7 @@ mod tests {
             derived_title: Some("Original title"),
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: true,
             ..rollout_document("retiredmarker", time, first, true, 2)
@@ -13119,6 +13183,7 @@ mod tests {
             derived_title: None,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13166,6 +13231,7 @@ mod tests {
             derived_title: None,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13217,6 +13283,7 @@ mod tests {
             derived_title: Some("Synthetic native title"),
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13234,6 +13301,7 @@ mod tests {
             derived_title: Some("Synthetic imported title"),
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13309,6 +13377,7 @@ mod tests {
             derived_title: None,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13355,6 +13424,7 @@ mod tests {
             derived_title: None,
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
+            desktop_step_proof: None,
             withdrawn_title: None,
             title_authoritative: false,
         };

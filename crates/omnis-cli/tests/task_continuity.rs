@@ -1222,6 +1222,134 @@ fn desktop_restores_history_from_the_selected_home_after_another_home_completes(
     assert_eq!(search(&a, "asuffix", &[]), 0);
 }
 
+fn desktop_search_coverage(
+    root: &Path,
+    workspace: &Path,
+    home: &Path,
+    query: &str,
+    flags: &[&str],
+) -> Option<String> {
+    let report = successful_json(
+        command(root, workspace)
+            .env("ANTIGRAVITY_DESKTOP_HOME", home)
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity-desktop",
+                query,
+            ])
+            .args(flags),
+    );
+    report["results"].as_array().unwrap().first().map(|hit| {
+        assert_eq!(hit["match"], "conversation", "{report}");
+        hit["coverage"].as_str().unwrap().to_owned()
+    })
+}
+
+fn write_opaque_desktop_step(db: &rusqlite::Connection, index: u32) {
+    let step = IdeStep {
+        r#type: 999,
+        user_input: None,
+    };
+    db.execute(
+        "INSERT OR REPLACE INTO steps VALUES (?1, ?2)",
+        rusqlite::params![index, prost::Message::encode_to_vec(&step)],
+    )
+    .unwrap();
+}
+
+#[test]
+fn desktop_partial_recovery_updates_bounded_and_opaque_search_documents() {
+    for bounded in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let workspace = root.join("workspace");
+        let home = write_synthetic_antigravity_ide(&root.join("a"), &workspace);
+        let db =
+            rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+                .unwrap();
+        let search =
+            |word, flags: &[&str]| desktop_search_coverage(root, &workspace, &home, word, flags);
+        if bounded {
+            write_desktop_step(&db, 0, &"padding ".repeat(11_000));
+        } else {
+            write_desktop_step(&db, 0, "Synthetic opener");
+            write_opaque_desktop_step(&db, 2);
+        }
+        let initial_steps = if bounded { 2 } else { 3 };
+        write_desktop_step(&db, 1, "originaltail");
+        set_desktop_summary(&home, "Desktop session", initial_steps);
+        assert_eq!(
+            search("originaltail", &[]).as_deref(),
+            Some(if bounded { "head-tail" } else { "preview" })
+        );
+        if !bounded {
+            let other = write_synthetic_antigravity_ide(&root.join("b"), &workspace);
+            let other_db = rusqlite::Connection::open(
+                other.join("conversations").join(format!("{SESSION_ID}.db")),
+            )
+            .unwrap();
+            write_desktop_step(&other_db, 1, "foreignbody");
+            set_desktop_summary(&other, "Other session", 2);
+            assert_eq!(
+                desktop_search_coverage(root, &workspace, &other, "foreignbody", &[]).as_deref(),
+                Some("complete")
+            );
+        }
+
+        write_desktop_step(&db, initial_steps, "recoveredtail");
+        set_desktop_summary(&home, "Desktop session", initial_steps + 2);
+        assert_eq!(search("recoveredtail", &[]).as_deref(), Some("preview"));
+        assert_eq!(
+            search("recoveredtail", &["--cached"]).as_deref(),
+            Some("preview")
+        );
+        assert_eq!(
+            search("originaltail", &["--cached"]).as_deref(),
+            Some("preview")
+        );
+    }
+}
+
+#[test]
+fn desktop_partial_recovery_preserves_message_boundaries_and_tracks_opaque_steps() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let workspace = root.join("workspace");
+    let home = write_synthetic_antigravity_ide(root, &workspace);
+    let db =
+        rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+            .unwrap();
+    let search =
+        |word, flags: &[&str]| desktop_search_coverage(root, &workspace, &home, word, flags);
+    write_desktop_step(&db, 0, "firstbody");
+    write_desktop_step(&db, 1, "island\n\nbridge");
+    set_desktop_summary(&home, "Desktop session", 2);
+    assert_eq!(search("island-bridge", &[]).as_deref(), Some("complete"));
+
+    db.execute("DELETE FROM steps WHERE idx=1", []).unwrap();
+    write_desktop_step(&db, 2, "island\n\nrecoverednote\n\nbridge");
+    set_desktop_summary(&home, "Desktop session", 4);
+    assert!(search("recoverednote", &[]).is_none());
+    assert!(search("island-bridge", &["--cached"]).is_some());
+
+    write_desktop_step(&db, 1, "island\n\nbridge");
+    write_opaque_desktop_step(&db, 2);
+    assert_eq!(search("island-bridge", &[]).as_deref(), Some("preview"));
+    assert_eq!(
+        search("island-bridge", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+    write_desktop_step(&db, 2, "thirdstep");
+    write_desktop_step(&db, 3, "finalstep");
+    assert_eq!(search("finalstep", &[]).as_deref(), Some("complete"));
+    assert_eq!(
+        search("island-bridge", &["--cached"]).as_deref(),
+        Some("complete")
+    );
+}
+
 #[test]
 fn desktop_search_accepts_a_richer_partial_after_a_complete_read() {
     let temporary = tempfile::tempdir().unwrap();
@@ -1232,22 +1360,7 @@ fn desktop_search_accepts_a_richer_partial_after_a_complete_read() {
         rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
             .unwrap();
     let search = |query: &str, flags: &[&str]| {
-        let report = successful_json(
-            command(root, &workspace)
-                .env("ANTIGRAVITY_DESKTOP_HOME", &home)
-                .args([
-                    "--json",
-                    "search",
-                    "--provider",
-                    "antigravity-desktop",
-                    query,
-                ])
-                .args(flags),
-        );
-        report["results"].as_array().unwrap().first().map(|hit| {
-            assert_eq!(hit["match"], "conversation", "{report}");
-            hit["coverage"].as_str().unwrap().to_owned()
-        })
+        desktop_search_coverage(root, &workspace, &home, query, flags)
     };
     write_desktop_step(&database, 0, "firstbody");
     write_desktop_step(&database, 1, "secondbody");

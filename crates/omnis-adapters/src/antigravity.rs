@@ -26,7 +26,8 @@ use crate::{
 };
 
 const SUMMARY_DATABASE: &str = "conversation_summaries.db";
-const STEP_LIMIT_RECORD: &str = "omnisession.antigravity_step_limit";
+pub(super) const STEP_LIMIT_RECORD: &str = "omnisession.antigravity_step_limit";
+pub(super) const MAX_DATABASE_STEPS: usize = 100_000;
 const PREVIEW_RECORDS: usize = 1_024;
 
 #[derive(Clone, Debug)]
@@ -928,7 +929,7 @@ impl Default for DatabaseReadLimits {
             row_bytes: 16 * 1024 * 1024,
             wire_bytes: 64 * 1024 * 1024,
             history_bytes: 64 * 1024 * 1024,
-            records: 100_000,
+            records: MAX_DATABASE_STEPS,
         }
     }
 }
@@ -956,7 +957,7 @@ fn push_database_steps_with_limits(
     let wal = snapshot.verify_wal();
     let mut statement = snapshot
         .connection
-        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;
+        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END, idx FROM steps ORDER BY idx LIMIT ?2")?;
     let mut rows = statement.query(rusqlite::params![
         i64::try_from(limits.row_bytes)?,
         i64::try_from(limits.records)?,
@@ -998,6 +999,7 @@ fn push_database_steps_with_limits(
                 Some(event.record_type),
                 None,
             );
+            builder.record_desktop_step_hash(row.get_ref(2)?.as_i64().ok(), &payload);
         }
     }
     if omitted > 0 || unsupported > 0 {

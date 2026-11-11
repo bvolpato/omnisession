@@ -1425,6 +1425,7 @@ struct PreparedIndex {
     guard: TrajectorySourceGuard,
     candidate: IndexCandidate,
     document: SearchDocument,
+    desktop_step_proof: Option<Vec<uuid::Uuid>>,
     source: SearchSource,
     source_complete: bool,
     provider_limited: bool,
@@ -1490,6 +1491,7 @@ impl PreparedIndex {
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
+            desktop_step_proof: self.desktop_step_proof.as_deref(),
             redacted_text: &self.document.text,
             source_updated_at: self.source.updated_at,
             source_revision: self.source_revision,
@@ -1543,6 +1545,21 @@ fn verified_source(
 }
 
 impl SearchSource {
+    pub(super) fn desktop_step_proof(
+        &self,
+        snapshot: &CanonicalSnapshot,
+    ) -> Option<Vec<uuid::Uuid>> {
+        let observed = self.observation.as_ref()?;
+        if observed.session.session != snapshot.session
+            || snapshot.session.provider != Provider::AntigravityDesktop
+            || observed.revision.file.is_none()
+            || observed.revision.contents.is_none()
+        {
+            return None;
+        }
+        AntigravityDesktopAdapter::step_proof(snapshot)
+    }
+
     fn native_home(&self) -> Option<&std::ffi::OsStr> {
         self.observation
             .as_ref()
@@ -1759,6 +1776,7 @@ fn prepare_session(
         guard: guard_observed_home(guard, source.observation.as_ref()),
         candidate: candidate.clone(),
         document,
+        desktop_step_proof: source.desktop_step_proof(&snapshot),
         source,
         source_complete,
         provider_limited,
@@ -2291,6 +2309,7 @@ mod tests {
             .upsert_trajectory_document(
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
+                    desktop_step_proof: None,
                     source_revision: SourceRevision::default(),
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
@@ -2565,6 +2584,7 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
+                desktop_step_proof: None,
                 workspace: None,
                 guard: TrajectorySourceGuard::NewerSource,
                 candidate: IndexCandidate {

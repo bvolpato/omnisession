@@ -2307,6 +2307,23 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn record_desktop_step_hash(&mut self, index: Option<i64>, wire: &[u8]) {
+        if self.provider != Provider::AntigravityDesktop
+            || self.events.len() > crate::antigravity::MAX_DATABASE_STEPS
+        {
+            return;
+        }
+        if let (Some(index), Some(event)) = (index, self.events.last_mut())
+            && event.sequence + 1 == self.next_sequence
+        {
+            let mut key = [0; 9];
+            key[..8].copy_from_slice(&index.to_be_bytes());
+            key[8] = u8::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
+            let row = Uuid::new_v5(&self.thread_id, &key);
+            event.raw_blob_hash = Some(Uuid::new_v5(&row, wire).to_string());
+        }
+    }
+
     pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
         if let Some(preview) = &mut self.preview {
             return retain_latest_matching(&mut preview.outline, limit, |event| event.tool);

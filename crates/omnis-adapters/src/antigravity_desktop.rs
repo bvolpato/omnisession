@@ -64,6 +64,40 @@ impl AntigravityDesktopAdapter {
         }
     }
 
+    /// Returns ordered fingerprints of the native database rows represented by this read.
+    /// Each fingerprint binds the SQLite index, the native bytes, and whether the row is opaque.
+    #[must_use]
+    pub fn step_proof(snapshot: &CanonicalSnapshot) -> Option<Vec<Uuid>> {
+        if snapshot.session.provider != Provider::AntigravityDesktop {
+            return None;
+        }
+        let mut steps = Vec::new();
+        for event in &snapshot.events {
+            if event.source.provider != snapshot.session.provider
+                || event.source.native_session_id != snapshot.session.id
+            {
+                return None;
+            }
+            if event.source.raw_record_type.as_deref()
+                == Some(crate::antigravity::STEP_LIMIT_RECORD)
+            {
+                let missing = event.payload["declared_steps"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(event.payload["stored_steps"].as_u64().unwrap_or(0));
+                if event.payload["omitted_events"].as_u64().unwrap_or(0) > missing {
+                    return None;
+                }
+            } else {
+                if steps.len() == crate::antigravity::MAX_DATABASE_STEPS {
+                    return None;
+                }
+                steps.push(event.raw_blob_hash.as_ref()?.parse().ok()?);
+            }
+        }
+        Some(steps)
+    }
+
     fn root(&self) -> Result<&Path> {
         self.root
             .as_deref()
@@ -614,6 +648,42 @@ mod tests {
                 synthetic_step(21, None),
             ],
         );
+    }
+
+    #[test]
+    fn desktop_step_proof_tracks_native_rows_across_search_and_direct_reads() {
+        let root = tempfile::tempdir().unwrap();
+        write_conversation(root.path(), SESSION_ID);
+        let database = root
+            .path()
+            .join("conversations")
+            .join(format!("{SESSION_ID}.db"));
+        let adapter = AntigravityDesktopAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
+        let proof = || {
+            AntigravityDesktopAdapter::step_proof(&adapter.read_session(&session).unwrap()).unwrap()
+        };
+        let original = proof();
+        assert_eq!(original.len(), 3);
+        let indexed = adapter.index_session(&session, Some(&database), 1).unwrap();
+        assert_eq!(
+            AntigravityDesktopAdapter::step_proof(&indexed.snapshot).unwrap(),
+            original
+        );
+        let writer = rusqlite::Connection::open(database).unwrap();
+        writer
+            .execute_batch(
+                "DELETE FROM steps WHERE idx=1;
+             INSERT INTO steps SELECT 3, step_type, step_payload FROM steps WHERE idx=0;",
+            )
+            .unwrap();
+        let restored = proof();
+        assert_eq!(restored[..2], [original[0], original[2]]);
+        assert_ne!(restored[2], original[0]);
+        writer.execute_batch(
+            "UPDATE steps SET step_payload=(SELECT step_payload FROM steps WHERE idx=0) WHERE idx=2;",
+        ).unwrap();
+        assert_ne!(proof()[1], original[2]);
     }
 
     fn write_summaries(root: &Path, summaries: Vec<(&str, ProtoTrajectorySummary)>) {

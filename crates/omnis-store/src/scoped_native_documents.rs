@@ -1,5 +1,6 @@
 pub(super) mod chunks;
 mod coverage;
+pub(super) mod desktop_receipts;
 mod text;
 
 use std::borrow::Cow;
@@ -45,6 +46,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
              ALTER TABLE scoped_native_documents ADD COLUMN source_updated_at INTEGER NOT NULL DEFAULT 0")
             .map_err(database_error)?;
     }
+    desktop_receipts::initialize(tx)?;
     chunks::initialize(tx)
 }
 
@@ -137,6 +139,17 @@ fn save_scoped(
             document.redacted_text,write.source_complete,write.complete,document.provider_limited,document.derived_title,document.source_updated_at.timestamp_millis(),
         ])
     }).map_err(database_error)?;
+    if write.session.provider == crate::Provider::AntigravityDesktop {
+        desktop_receipts::save(
+            tx,
+            id,
+            home,
+            file,
+            contents,
+            &write.content_hash,
+            document.desktop_step_proof,
+        )?;
+    }
     Ok(changed)
 }
 
