@@ -1263,8 +1263,12 @@ pub(super) fn selected_detail_lines(
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     match preview {
-        Some(PreviewValue::Ready { preview, .. }) => {
-            append_preview_lines(&mut lines, preview, width, height);
+        Some(PreviewValue::Ready {
+            preview,
+            can_use_first_title,
+            ..
+        }) => {
+            append_preview_lines(&mut lines, preview, *can_use_first_title, width, height);
         }
         Some(PreviewValue::Unavailable) => {
             lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
@@ -1595,6 +1599,7 @@ pub(super) fn format_timestamp(timestamp: Option<DateTime<Utc>>, approximate: bo
 pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
+    can_use_first_title: bool,
     width: usize,
     height: usize,
 ) {
@@ -1605,26 +1610,41 @@ pub(super) fn append_preview_lines(
     } else {
         2
     };
+    let first_label = if can_use_first_title {
+        "FIRST MESSAGE"
+    } else {
+        "FIRST AVAILABLE MESSAGE"
+    };
     match (&preview.first, &preview.latest) {
         (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
         (Some(first), Some(_)) if preview.message_count == 1 => {
-            append_message_excerpt(lines, "ONLY MESSAGE", first, width, excerpt_lines);
+            let label = if can_use_first_title {
+                "ONLY MESSAGE"
+            } else {
+                "AVAILABLE MESSAGE"
+            };
+            append_message_excerpt(lines, label, first, width, excerpt_lines);
         }
         (Some(first), Some(latest)) => {
-            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+            append_message_excerpt(lines, first_label, first, width, excerpt_lines);
             if height >= 15 {
                 lines.push(detail_line(String::new(), DetailStyle::Normal));
             }
             append_message_excerpt(lines, "LATEST MESSAGE", latest, width, excerpt_lines);
         }
         (Some(first), None) => {
-            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+            append_message_excerpt(lines, first_label, first, width, excerpt_lines);
         }
     }
 }
 
 pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
-    let PreviewValue::Ready { preview, .. } = preview else {
+    let PreviewValue::Ready {
+        preview,
+        can_use_first_title: true,
+        ..
+    } = preview
+    else {
         return None;
     };
     preview

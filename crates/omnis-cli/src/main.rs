@@ -190,6 +190,9 @@ fn store_search_document(
             origin,
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
+            title_authoritative: omnis_core::session_search_title_is_authoritative(
+                snapshot, full_read,
+            ),
         },
         guard,
     )])?;

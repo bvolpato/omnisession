@@ -734,10 +734,8 @@ pub struct SessionPreview {
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    let title = snapshot
-        .title
-        .clone()
-        .filter(|title| !title.trim().is_empty())
+    let title = provider_search_title(snapshot)
+        .map(str::to_owned)
         .or_else(|| {
             // Only the first message is needed, so later messages are never redacted.
             preview_messages(snapshot)
@@ -751,6 +749,49 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
         .take(SEARCH_TITLE_CHARACTER_LIMIT)
         .collect::<String>();
     (!title.is_empty()).then_some(title)
+}
+
+fn provider_search_title(snapshot: &CanonicalSnapshot) -> Option<&str> {
+    snapshot.title.as_deref().filter(|title| {
+        title
+            .chars()
+            .any(|ch| !ch.is_whitespace() && !ch.is_control())
+    })
+}
+
+/// Returns whether this read can confirm the search title or its absence.
+///
+/// A provider title is enough on its own. A title derived from a message needs the start
+/// of the visible conversation.
+#[must_use]
+pub fn session_search_title_is_authoritative(
+    snapshot: &CanonicalSnapshot,
+    full_read: bool,
+) -> bool {
+    provider_search_title(snapshot).is_some()
+        || session_message_prefix_is_known(snapshot, full_read)
+}
+
+/// Returns whether this read covers the first visible message or confirms there are none.
+///
+/// A bounded read can skip the first message. A full read can also omit earlier history.
+#[must_use]
+pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: bool) -> bool {
+    if !full_read {
+        return false;
+    }
+    let events = || snapshot.events.iter().filter(|event| !is_secret(event));
+    if events().any(|event| omitted_history(event) == Some(OmittedHistory::MayIncludeMessages)) {
+        return false;
+    }
+    let first_checkpoint = events()
+        .filter(|event| source_compaction_text(event).is_some())
+        .map(|event| (event.sequence, event.event_id))
+        .min();
+    first_checkpoint.is_none_or(|checkpoint| {
+        events()
+            .any(|event| (event.sequence, event.event_id) < checkpoint && is_preview_message(event))
+    })
 }
 
 /// Selects first and latest visible messages without retaining full conversation.
@@ -2559,17 +2600,37 @@ fn is_secret(event: &OmniEvent) -> bool {
 }
 
 fn reports_omitted_events(event: &OmniEvent) -> bool {
-    event.kind == EventKind::ProviderEvent
-        && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
-            || ["omitted_events", "unsupported_text_records"]
-                .iter()
-                .any(|key| {
-                    event
-                        .payload
-                        .get(key)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|count| count > 0)
-                }))
+    omitted_history(event).is_some()
+}
+
+#[derive(Eq, PartialEq)]
+enum OmittedHistory {
+    ToolsOnly,
+    MayIncludeMessages,
+}
+
+fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
+    if event.kind != EventKind::ProviderEvent {
+        return None;
+    }
+    if event.payload["native_history_unverified"].as_bool() == Some(true)
+        || event.payload["unsupported_text_records"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    {
+        return Some(OmittedHistory::MayIncludeMessages);
+    }
+    let omitted = event.payload["omitted_events"]
+        .as_u64()
+        .filter(|count| *count > 0)?;
+    if event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("omnisession.codex_tool_limit")
+        && event.payload["omitted_tool_events"].as_u64() == Some(omitted)
+    {
+        Some(OmittedHistory::ToolsOnly)
+    } else {
+        Some(OmittedHistory::MayIncludeMessages)
+    }
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -4835,6 +4896,110 @@ mod tests {
             session_search_title(&snapshot).as_deref(),
             Some("Provider summary")
         );
+    }
+
+    #[test]
+    fn title_authority_distinguishes_sampled_requests_from_provider_titles() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            8,
+            EventKind::MessageUser,
+            json!({"text": "A later request"}),
+        )]);
+        assert!(session_search_title(&snapshot).is_some());
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        snapshot.title = Some("\u{1b}\t".to_owned());
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        snapshot.title = Some("Provider title".to_owned());
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        assert!(!super::session_message_prefix_is_known(&snapshot, false));
+        assert!(super::session_message_prefix_is_known(&snapshot, true));
+    }
+
+    #[test]
+    fn title_authority_distinguishes_tool_only_omissions_from_missing_messages() {
+        let mut notice = event(
+            1,
+            EventKind::ProviderEvent,
+            json!({
+                "omitted_events": 42, "omitted_tool_events": 42, "event_kind": "tool",
+            }),
+        );
+        notice.source.raw_record_type = Some("omnisession.codex_tool_limit".to_owned());
+        let mut snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageAssistant,
+                json!({"text": "Assistant first"}),
+            ),
+            notice,
+        ]);
+        assert!(session_search_title(&snapshot).is_none());
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
+        for (record_type, payload, authoritative) in [
+            (
+                "omnisession.codex_history_base",
+                json!({"native_history_unverified": true}),
+                false,
+            ),
+            (
+                "omnisession.codex_history_base",
+                json!({"omitted_events": 1}),
+                false,
+            ),
+            (
+                "omnisession.record_size_limit",
+                json!({"omitted_events": 1, "omitted_records": 1}),
+                false,
+            ),
+            (
+                "omnisession.codex_tool_limit",
+                json!({"omitted_events": 2, "omitted_tool_events": 1}),
+                false,
+            ),
+            ("omnisession.codex_attached_parent_context", json!({}), true),
+            ("omnisession.codex_subagent_model_context", json!({}), true),
+        ] {
+            let mut notice = event(2, EventKind::ProviderEvent, payload);
+            notice.source.raw_record_type = Some(record_type.to_owned());
+            snapshot.events.push(notice);
+            assert_eq!(
+                super::session_search_title_is_authoritative(&snapshot, true),
+                authoritative,
+                "{record_type}"
+            );
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn title_authority_requires_a_visible_message_before_a_compacted_prefix() {
+        let mut snapshot = snapshot_with_events(vec![
+            compaction(1, Provider::Codex, "A checkpoint from earlier history"),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "A later request"}),
+            ),
+        ]);
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
+        snapshot.events.push(event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Original request"}),
+        ));
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
     }
 
     #[test]

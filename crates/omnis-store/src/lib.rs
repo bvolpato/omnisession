@@ -245,9 +245,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
-            WHEN ?15 AND excluded.source_complete AND excluded.truncation_strategy IN (
-                'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
-            ) THEN excluded.derived_title
+            WHEN ?15 AND ?16 THEN excluded.derived_title
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version AND (
@@ -273,6 +271,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                                OR excluded.truncation_strategy <>
                                    session_trajectories.truncation_strategy
                                OR excluded.origin <> session_trajectories.origin
+                               OR (?15 AND ?16 AND excluded.derived_title IS NOT
+                                   session_trajectories.derived_title)
                            )
                        )
                    )
@@ -479,6 +479,8 @@ pub struct TrajectoryDocument<'a> {
     pub origin: SessionTrajectoryOrigin,
     pub document_version: u32,
     pub derived_title: Option<&'a str>,
+    /// Whether this read establishes the first title, including when the session has none.
+    pub title_authoritative: bool,
 }
 
 /// Restricts a write to the source state the reader saw before opening the transcript.
@@ -1564,6 +1566,7 @@ impl Store {
                 origin,
                 document_version: 0,
                 derived_title: None,
+                title_authoritative: false,
             },
         )
     }
@@ -1709,6 +1712,7 @@ impl Store {
                 write.session,
                 write.document.source_updated_at,
             )?;
+            let observed = matches!(write.guard, TrajectorySourceGuard::Observed(_));
             let trajectory_id = upsert_parent
                 .query_row(
                     params![
@@ -1725,8 +1729,12 @@ impl Store {
                         write.document.origin.as_str(),
                         i64::from(write.document.origin == SessionTrajectoryOrigin::ImportedBundle),
                         i64::from(write.document.document_version),
-                        write.document.derived_title,
-                        matches!(write.guard, TrajectorySourceGuard::Observed(_)),
+                        write
+                            .document
+                            .derived_title
+                            .filter(|_| !observed || write.document.title_authoritative),
+                        observed,
+                        write.document.title_authoritative,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4255,6 +4263,7 @@ mod tests {
                 origin: SessionTrajectoryOrigin::Native,
                 document_version,
                 derived_title,
+                title_authoritative: false,
             };
         store
             .upsert_session_trajectory(&session, "legacy redaction marker", source_updated_at, true)
@@ -4321,7 +4330,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_reads_keep_known_titles_until_the_full_source_can_clear_them() {
+    fn observed_writes_change_titles_only_when_the_first_title_is_known() {
         let temporary = tempdir().unwrap();
         let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
         let session = SessionRef::new(Provider::Codex, "sampled-title");
@@ -4329,40 +4338,50 @@ mod tests {
         let mut prior = None;
         let original = Some("Original request");
         let updated = Some("Updated request");
-        for (offset, full_read, strategy, title, expected) in [
-            (0, true, "none", original, original),
-            (1, false, "none", None, original),
-            (2, false, "none", updated, updated),
-            (3, true, "source_incomplete", None, updated),
-            (3, true, "document_head_tail", None, None),
-        ] {
-            let time = first + chrono::Duration::seconds(offset);
-            let text = "Synthetic visible text";
-            let document = TrajectoryDocument {
-                redacted_text: text,
-                source_updated_at: time,
-                source_byte_count: text.len() + usize::from(strategy == "document_head_tail"),
-                indexed_byte_count: text.len(),
-                source_complete: full_read,
-                truncation_strategy: strategy,
-                origin: SessionTrajectoryOrigin::Native,
-                document_version: 4,
-                derived_title: title,
-            };
-            store
-                .upsert_observed_trajectory_documents(&[(
-                    &session,
-                    document,
-                    super::TrajectorySourceGuard::Observed(prior),
-                )])
-                .unwrap();
-            assert_eq!(
-                store.trajectory_title(&session).unwrap().as_deref(),
-                expected,
-                "time offset {offset}, strategy {strategy}"
-            );
-            prior = Some(time);
-        }
+        let reads = [
+            (0, false, "none", false, updated),
+            (0, true, "none", true, original),
+            (1, false, "none", false, None),
+            (2, false, "none", false, updated),
+            // Both reads omit events. The second read omitted only tools.
+            (3, true, "source_incomplete", false, updated),
+            (3, true, "source_incomplete", true, None),
+            (4, false, "none", true, updated),
+            (4, true, "document_head_tail", true, None),
+        ];
+        let titles = reads.map(
+            |(offset, full_read, strategy, title_authoritative, title)| {
+                let time = first + chrono::Duration::seconds(offset);
+                let text = "Synthetic visible text";
+                let document = TrajectoryDocument {
+                    redacted_text: text,
+                    source_updated_at: time,
+                    source_byte_count: text.len() + usize::from(strategy == "document_head_tail"),
+                    indexed_byte_count: text.len(),
+                    source_complete: full_read,
+                    truncation_strategy: strategy,
+                    origin: SessionTrajectoryOrigin::Native,
+                    document_version: 4,
+                    derived_title: title,
+                    title_authoritative,
+                };
+                store
+                    .upsert_observed_trajectory_documents(&[(
+                        &session,
+                        document,
+                        super::TrajectorySourceGuard::Observed(prior),
+                    )])
+                    .unwrap();
+                prior = Some(time);
+                store.trajectory_title(&session).unwrap()
+            },
+        );
+        assert_eq!(
+            titles.each_ref().map(Option::as_deref),
+            [
+                None, original, original, original, original, None, updated, None
+            ]
+        );
     }
 
     #[test]
@@ -4409,6 +4428,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 2,
             derived_title: None,
+            title_authoritative: false,
         };
         // Earlier writers stored provider omissions as an incomplete read.
         store
@@ -4450,6 +4470,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
         // The last document spans more chunks than one insert statement holds.
         let mut last = "synthetic filler text. ".repeat(
@@ -4495,6 +4516,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 7,
             derived_title: Some("Synthetic native title"),
+            title_authoritative: true,
         };
         let imported_document = TrajectoryDocument {
             redacted_text: imported_text,
@@ -4506,6 +4528,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::ImportedBundle,
             document_version: 8,
             derived_title: Some("Synthetic imported title"),
+            title_authoritative: true,
         };
 
         store
@@ -4575,6 +4598,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
 
         assert!(
@@ -4615,6 +4639,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
 
         assert!(

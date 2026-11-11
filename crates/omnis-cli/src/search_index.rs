@@ -19,8 +19,8 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
-    workspace_paths_match,
+    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title,
+    session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -554,6 +554,7 @@ struct PreparedIndex {
     source_complete: bool,
     origin: SessionTrajectoryOrigin,
     title: Option<String>,
+    title_authoritative: bool,
 }
 
 impl PreparedIndex {
@@ -583,6 +584,7 @@ impl PreparedIndex {
             origin: self.origin,
             document_version: SEARCH_DOCUMENT_VERSION,
             derived_title: self.title.as_deref(),
+            title_authoritative: self.title_authoritative,
         }
     }
 }
@@ -631,6 +633,7 @@ fn prepare_session(
         source_complete,
         origin,
         title: session_search_title(&snapshot),
+        title_authoritative: session_search_title_is_authoritative(&snapshot, source_complete),
     })
 }
 
@@ -993,6 +996,7 @@ mod tests {
                     origin: SessionTrajectoryOrigin::Native,
                     document_version: 2,
                     derived_title: None,
+                    title_authoritative: false,
                 },
             )
             .unwrap();
@@ -1239,6 +1243,7 @@ mod tests {
                 source_complete: true,
                 origin: SessionTrajectoryOrigin::Native,
                 title: Some(id.to_owned()),
+                title_authoritative: true,
             }
         };
         let mut batch = vec![prepared("first"), prepared("broken"), prepared("last")];

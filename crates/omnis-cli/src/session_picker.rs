@@ -649,7 +649,14 @@ impl PickerState {
                 self.preview_titles.insert(session_key.clone(), value);
                 true
             }
-        } else if matches!(value, PreviewValue::Ready { complete: true, .. }) {
+        } else if matches!(
+            value,
+            PreviewValue::Ready {
+                complete: true,
+                can_use_first_title: true,
+                ..
+            }
+        ) {
             self.preview_titles.remove(&session_key).is_some()
         } else {
             false
@@ -945,6 +952,7 @@ enum PreviewValue {
         preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
         complete: bool,
+        can_use_first_title: bool,
     },
     Unavailable,
 }
@@ -3382,6 +3390,7 @@ mod tests {
             PreviewValue::Ready {
                 preview: Box::new(synthetic_preview("Start with cursor pagination.")),
                 continuation: None,
+                can_use_first_title: true,
                 complete: false,
             },
             &[],
@@ -3434,10 +3443,23 @@ mod tests {
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
+            can_use_first_title: true,
             complete: false,
         };
-        state.remember_preview_title(&key, &value, PreviewIndexTitle::Written(None));
+        let sampled = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("A later pagination request")),
+            continuation: None,
+            complete: false,
+            can_use_first_title: false,
+        };
+        state.remember_preview_title(&key, &sampled, PreviewIndexTitle::Written(None));
+        assert!(state.visible_indices().is_empty());
+        assert_eq!(
+            display_title(&state.entries[0].session, Some(&sampled)),
+            "Untitled session"
+        );
 
+        state.remember_preview_title(&key, &value, PreviewIndexTitle::Written(None));
         assert_eq!(state.visible_indices().len(), 1);
         state.remember_indexed_titles([(key.session.clone(), Some("A separate title".to_owned()))]);
         state.remember_indexed_titles([(key.session.clone(), None)]);
@@ -4022,6 +4044,7 @@ mod tests {
                     git_head: Some("0123456789abcdef".to_owned()),
                 }),
                 continuation: None,
+                can_use_first_title: true,
                 complete: false,
             },
             &[],
@@ -4297,6 +4320,7 @@ mod tests {
                 git_head: None,
             }),
             continuation: None,
+            can_use_first_title: true,
             complete: false,
         };
 
@@ -4348,6 +4372,7 @@ mod tests {
                 role: HandoffRole::User,
                 text: "Fix the retry race after this fork".to_owned(),
             }),
+            can_use_first_title: true,
             complete: true,
         };
 

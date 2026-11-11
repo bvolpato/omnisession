@@ -521,6 +521,8 @@ pub(super) fn spawn_preview_updates(
                             }),
                             preview: Box::new(session_preview(&snapshot)),
                             complete,
+                            can_use_first_title: key.session.provider != Provider::Codex
+                                || omnis_core::session_message_prefix_is_known(&snapshot, complete),
                         }
                     })
                 };
