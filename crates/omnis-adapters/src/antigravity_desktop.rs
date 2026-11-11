@@ -263,6 +263,7 @@ fn native_session(
             usize::try_from(summary.step_count).unwrap_or(usize::MAX)
         }),
         source_path: Some(database),
+        source_revision: None,
     }
 }
 

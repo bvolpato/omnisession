@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -24,9 +24,9 @@ use omnis_core::{
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
-    SessionTrajectoryOrigin, Store, TrajectoryDocument, TrajectoryIndexFailure,
-    TrajectoryIndexState, TrajectorySourceGuard,
+    IndexedSession, IndexedTrajectoryTitle, MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+    MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SelectedSessionObservation, SessionTrajectoryOrigin,
+    Store, TrajectoryDocument, TrajectoryIndexFailure, TrajectoryIndexState, TrajectorySourceGuard,
 };
 
 use crate::read_session;
@@ -45,17 +45,53 @@ pub(crate) struct IndexCandidate {
     pub(crate) session: SessionRef,
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
+    source_revision: SourceRevision,
+    metadata: Option<IndexedSession>,
 }
 
 impl IndexCandidate {
-    fn source_file(&self) -> Option<uuid::Uuid> {
-        if self.session.provider == Provider::Codex {
-            self.source_path
-                .as_deref()
-                .and_then(omnis_adapters::CodexAdapter::index_file_id)
-        } else {
-            None
+    fn selected_codex(
+        &self,
+        registry: &AdapterRegistry,
+        revision: SourceRevision,
+    ) -> Option<NativeSession> {
+        let session = registry
+            .find_native_session(Provider::Codex, &self.session.id)
+            .ok()??;
+        let selected =
+            omnis_adapters::CodexAdapter::index_file_revision(session.source_path.as_deref()?)?;
+        (revision.file.is_some()
+            && selected == revision
+            && session.source_revision == Some(revision))
+        .then_some(session)
+    }
+
+    fn record_failure(
+        &self,
+        registry: &AdapterRegistry,
+        store: &Store,
+        guard: TrajectorySourceGuard,
+        error: &anyhow::Error,
+    ) -> Option<IndexedTrajectoryTitle> {
+        let revision = self.source_revision;
+        if retryable_read_failure(error)
+            || (self.session.provider == Provider::Codex
+                && self.selected_codex(registry, revision).is_none())
+        {
+            return None;
         }
+        let failure = TrajectoryIndexFailure {
+            source_updated_at: self.updated_at,
+            source_file: revision.file,
+            source_contents: revision.contents,
+            document_version: SEARCH_DOCUMENT_VERSION,
+        };
+        store
+            .record_observed_trajectory_index_failure(&self.session, &failure, guard)
+            .ok()?;
+        (self.session.provider == Provider::Codex)
+            .then(|| store.indexed_trajectory_title(&self.session).ok().flatten())
+            .flatten()
     }
 
     // Sessions without a discovered source file are skipped so oversized files are never read
@@ -68,6 +104,9 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
+            source_revision: session.source_revision.unwrap_or_default(),
+            metadata: (provider == Provider::Codex)
+                .then(|| crate::indexed_session_metadata(session)),
         })
     }
 
@@ -95,7 +134,7 @@ pub(crate) struct IndexProgress {
     pub(crate) indexed: usize,
     pub(crate) total: usize,
     pub(crate) failed: usize,
-    pub(crate) titles: Vec<(SessionRef, String)>,
+    pub(crate) titles: Vec<IndexedTrajectoryTitle>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -148,15 +187,21 @@ pub(crate) fn observe_source(
     }
 }
 
-pub(crate) fn needs_index(
+#[cfg(test)]
+fn needs_index(candidate: &IndexCandidate, state: Option<&TrajectoryIndexState>) -> bool {
+    needs_index_at(candidate, candidate.source_revision, state)
+}
+
+fn needs_index_at(
     candidate: &IndexCandidate,
+    revision: SourceRevision,
     state: Option<&TrajectoryIndexState>,
 ) -> bool {
     let Some(state) = state else {
         return true;
     };
-    // The index stores millisecond timestamps, so compare at that precision.
-    candidate.source_file() != state.source_revision.file
+    revision.file != state.source_revision.file
+        || revision.contents != state.source_revision.contents
         || state.document_version < SEARCH_DOCUMENT_VERSION
         || candidate.updated_at.is_some_and(|updated_at| {
             source_time_changed(
@@ -172,8 +217,13 @@ pub(crate) fn needs_index(
 ///
 /// Retry when the source time or document version changes. Without a source time, only the
 /// document version can show that a retry is due.
-fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
-    candidate.source_file() == failure.source_file
+fn failure_is_current(
+    candidate: &IndexCandidate,
+    revision: SourceRevision,
+    failure: &TrajectoryIndexFailure,
+) -> bool {
+    revision.file == failure.source_file
+        && revision.contents == failure.source_contents
         && failure.document_version >= SEARCH_DOCUMENT_VERSION
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
@@ -237,28 +287,57 @@ pub(crate) fn ordered_candidates(
 struct Pending {
     stale: Vec<(IndexCandidate, TrajectorySourceGuard)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
+    recovered: Vec<(
+        IndexCandidate,
+        TrajectoryIndexState,
+        Option<TrajectoryIndexFailure>,
+    )>,
+    hidden: Vec<IndexedTrajectoryTitle>,
     summary: IndexSummary,
 }
 
 fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
+    let conflicts = if candidates
+        .iter()
+        .any(|candidate| candidate.session.provider == Provider::Codex)
+    {
+        store.conflicting_codex_catalog_rows()?
+    } else {
+        HashSet::new()
+    };
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
         candidates: candidates.len(),
         ..IndexSummary::default()
     };
     let mut stale = Vec::new();
+    let mut recovered = Vec::new();
+    let mut hidden = Vec::new();
     for candidate in candidates {
         let prior = states.get(&candidate.session);
-        if !needs_index(&candidate, prior) {
+        let revision = candidate.source_revision;
+        let failure = failures.get(&candidate.session);
+        if !needs_index_at(&candidate, revision, prior) {
+            if candidate.session.provider == Provider::Codex
+                && let Some(prior) = prior
+                && (conflicts.contains(&candidate.session)
+                    || failure
+                        .is_some_and(|failure| !failure_is_current(&candidate, revision, failure)))
+            {
+                recovered.push((candidate, *prior, failure.copied()));
+            }
             continue;
         }
         if !retry_failed
-            && failures
-                .get(&candidate.session)
-                .is_some_and(|failure| failure_is_current(&candidate, failure))
+            && failure.is_some_and(|failure| failure_is_current(&candidate, revision, failure))
         {
             summary.failed_skipped += 1;
+            if candidate.session.provider == Provider::Codex
+                && let Some(title) = store.indexed_trajectory_title(&candidate.session)?
+            {
+                hidden.push(title);
+            }
         } else {
             let guard = source_guard(candidate.session.provider, prior);
             stale.push((candidate, guard));
@@ -268,8 +347,78 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
     Ok(Pending {
         stale,
         failures,
+        recovered,
+        hidden,
         summary,
     })
+}
+
+fn restore_cached_sources(
+    registry: &AdapterRegistry,
+    store: &Store,
+    recovered: Vec<(
+        IndexCandidate,
+        TrajectoryIndexState,
+        Option<TrajectoryIndexFailure>,
+    )>,
+) -> Result<Vec<IndexedTrajectoryTitle>> {
+    let mut titles = Vec::new();
+    for (candidate, prior, failure) in recovered {
+        let observed = store.indexed_session(&candidate.session)?;
+        let revision = SourceRevision {
+            missing_ancestor: None,
+            ..prior.source_revision
+        };
+        if let Some(selected) = candidate.selected_codex(registry, revision)
+            && store
+                .restore_indexed_source(
+                    &crate::indexed_session_metadata(&selected),
+                    prior,
+                    observed.as_ref(),
+                    failure,
+                )
+                .is_ok()
+        {
+            titles.extend(store.indexed_trajectory_title(&candidate.session)?);
+        }
+    }
+    Ok(titles)
+}
+
+fn observe_replacements(
+    store: &Store,
+    stale: &[(IndexCandidate, TrajectorySourceGuard)],
+    failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
+) -> Result<HashMap<SessionRef, SelectedSessionObservation>> {
+    let mut observations = HashMap::new();
+    if !stale
+        .iter()
+        .any(|(candidate, _)| candidate.metadata.is_some())
+    {
+        return Ok(observations);
+    }
+    let catalog = store
+        .indexed_sessions_for_provider(Provider::Codex)?
+        .into_iter()
+        .map(|row| (row.session.clone(), row))
+        .collect::<HashMap<_, _>>();
+    for (candidate, guard) in stale {
+        let Some(metadata) = &candidate.metadata else {
+            continue;
+        };
+        if failures.contains_key(&candidate.session)
+            || matches!(guard, TrajectorySourceGuard::Observed(Some(prior)) if prior.source_revision.file != candidate.source_revision.file)
+            || catalog
+                .get(&candidate.session)
+                .is_some_and(|stored| stored != metadata)
+        {
+            observations.insert(
+                candidate.session.clone(),
+                store.observe_selected_session(&candidate.session)?,
+            );
+        }
+    }
+    Ok(observations)
 }
 
 /// Counts candidates whose search document is missing or out of date. Unchanged sessions that
@@ -279,10 +428,13 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
 ///
 /// Returns an error when the index state cannot be read.
 pub(crate) fn pending_summary(
+    registry: &AdapterRegistry,
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    Ok(pending(store, candidates, false)?.summary)
+    let pending = pending(store, candidates, false)?;
+    restore_cached_sources(registry, store, pending.recovered)?;
+    Ok(pending.summary)
 }
 
 /// Indexes stale sessions in candidate order, reporting progress and derived titles in batches.
@@ -304,10 +456,15 @@ pub(crate) fn index_candidates(
     let Pending {
         stale,
         failures,
+        recovered,
+        mut hidden,
         mut summary,
     } = pending(store, candidates, retry_failed)?;
+    let observations = observe_replacements(store, &stale, &failures)?;
+    hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
         total: stale.len(),
+        titles: hidden,
         ..IndexProgress::default()
     });
     let mut titles = Vec::new();
@@ -315,28 +472,39 @@ pub(crate) fn index_candidates(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |(candidate, guard): &(IndexCandidate, TrajectorySourceGuard)| {
-        reads_transcript_file(candidate.session.provider)
-            .then(|| prepare_session(registry, candidate, *guard))
+    let read = |(candidate, guard): &(IndexCandidate, TrajectorySourceGuard)| {
+        prepare_session(registry, candidate, *guard)
+    };
+    let prepare = |item: &(IndexCandidate, TrajectorySourceGuard)| {
+        reads_transcript_file(item.0.session.provider).then(|| read(item))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |(candidate, guard), prepared| {
+        |item, prepared| {
+            let (candidate, guard) = item;
             if stop() {
                 flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
-            let result = prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard));
-            // A successful read makes a recorded failure obsolete even when storing the document
-            // fails. Best effort: a leftover record no longer applies once the source changes.
-            if result.is_ok() && failures.contains_key(&candidate.session) {
-                let _ = store.clear_trajectory_index_failure(&candidate.session);
-            }
-            match result {
+            match prepared.unwrap_or_else(|| read(item)) {
+                Ok(prepared) if observations.contains_key(&candidate.session) => {
+                    publish_replacement(
+                        registry,
+                        store,
+                        &prepared,
+                        &observations[&candidate.session],
+                        &mut summary,
+                        &mut titles,
+                    );
+                }
                 Ok(prepared) => {
+                    if let Some(failure) = failures.get(&candidate.session) {
+                        let _ = store
+                            .clear_observed_trajectory_index_failure(&candidate.session, failure);
+                    }
                     if !batch.is_empty()
                         && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
@@ -350,17 +518,7 @@ pub(crate) fn index_candidates(
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    // Best effort: an unrecorded failure is only read again on the next pass.
-                    if !retryable_read_failure(&error) {
-                        let _ = store.record_trajectory_index_failure(
-                            &candidate.session,
-                            &TrajectoryIndexFailure {
-                                source_updated_at: candidate.updated_at,
-                                source_file: candidate.source_file(),
-                                document_version: SEARCH_DOCUMENT_VERSION,
-                            },
-                        );
-                    }
+                    titles.extend(candidate.record_failure(registry, store, *guard, &error));
                 }
             }
             if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
@@ -380,6 +538,64 @@ pub(crate) fn index_candidates(
     flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
     report(progress(&summary, &mut titles));
     Ok(summary)
+}
+
+fn publish_replacement(
+    registry: &AdapterRegistry,
+    store: &Store,
+    prepared: &PreparedIndex,
+    observation: &SelectedSessionObservation,
+    summary: &mut IndexSummary,
+    titles: &mut Vec<IndexedTrajectoryTitle>,
+) {
+    let session = &prepared.candidate.session;
+    match publish_selected_read(registry, store, prepared, observation) {
+        Ok(title) => {
+            summary.indexed += 1;
+            titles.extend(title);
+        }
+        Err(error) => {
+            summary.failed += 1;
+            if let Some(failure) = observation.failure
+                && !matches!(
+                    error.downcast_ref::<omnis_store::StoreError>(),
+                    Some(omnis_store::StoreError::TrajectorySourceChanged)
+                )
+            {
+                if observation.state.is_none() {
+                    let _ = store.clear_observed_trajectory_index_failure(session, &failure);
+                } else {
+                    let _ = store.retry_observed_trajectory_index_failure(session, &failure);
+                }
+            }
+        }
+    }
+}
+
+fn publish_selected_read(
+    registry: &AdapterRegistry,
+    store: &Store,
+    read: &PreparedIndex,
+    observation: &SelectedSessionObservation,
+) -> Result<Option<IndexedTrajectoryTitle>> {
+    let revision = SourceRevision {
+        missing_ancestor: None,
+        ..read.source_revision
+    };
+    anyhow::ensure!(
+        TrajectorySourceGuard::Observed(observation.state) == read.guard,
+        "cached source changed during indexing"
+    );
+    let selected = read
+        .candidate
+        .selected_codex(registry, revision)
+        .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+    store.upsert_selected_session_document(
+        &crate::indexed_session_metadata(&selected),
+        observation,
+        read.store_document(),
+    )?;
+    Ok(store.indexed_trajectory_title(&read.candidate.session)?)
 }
 
 /// Whether each session of `provider` is one transcript file, which worker threads may read
@@ -511,7 +727,7 @@ fn flush_batch(
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
-    titles: &mut Vec<(SessionRef, String)>,
+    titles: &mut Vec<IndexedTrajectoryTitle>,
 ) {
     if batch.is_empty() {
         return;
@@ -530,8 +746,8 @@ fn flush_batch(
     if stored.is_ok() {
         summary.indexed += batch.len();
         for prepared in batch.drain(..) {
-            if let Some(title) = prepared.title {
-                titles.push((prepared.candidate.session, title));
+            if let Ok(Some(title)) = store.indexed_trajectory_title(&prepared.candidate.session) {
+                titles.push(title);
             }
         }
     } else {
@@ -543,18 +759,31 @@ fn flush_batch(
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                if let Ok(fresh) = observe_source(store, &prepared.candidate.session)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|guard| prepare_session(registry, &prepared.candidate, guard))
-                {
-                    prepared = fresh;
-                    stored = prepared.store(store);
+                let session = &prepared.candidate.session;
+                let fresh = (|| -> Result<_> {
+                    let observation = store.observe_selected_session(session)?;
+                    let selected = registry
+                        .find_native_session(session.provider, &session.id)?
+                        .and_then(|native| IndexCandidate::from_session(&native))
+                        .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+                    let read = prepare_session(
+                        registry,
+                        &selected,
+                        TrajectorySourceGuard::Observed(observation.state),
+                    )?;
+                    publish_selected_read(registry, store, &read, &observation)?;
+                    Ok(read)
+                })();
+                if let Ok(read) = fresh {
+                    prepared = read;
+                    stored = Ok(());
                 }
             }
             if stored.is_ok() {
                 summary.indexed += 1;
-                if let Some(title) = prepared.title {
-                    titles.push((prepared.candidate.session, title));
+                if let Ok(Some(title)) = store.indexed_trajectory_title(&prepared.candidate.session)
+                {
+                    titles.push(title);
                 }
             } else {
                 summary.failed += 1;
@@ -563,7 +792,7 @@ fn flush_batch(
     }
 }
 
-fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> IndexProgress {
+fn progress(summary: &IndexSummary, titles: &mut Vec<IndexedTrajectoryTitle>) -> IndexProgress {
     IndexProgress {
         indexed: summary.indexed + summary.failed,
         total: summary.stale,
@@ -618,8 +847,10 @@ fn prepare_session(
         snapshot,
         source_complete,
         source_revision,
+        ..
     } = if imported {
         read_session(registry, &candidate.session).map(|snapshot| IndexRead {
+            native_session: None,
             snapshot,
             source_complete: true,
             source_revision: SourceRevision::default(),
@@ -631,6 +862,12 @@ fn prepare_session(
             FULL_READ_SOURCE_BYTES,
         )
     }?;
+    if candidate.session.provider == Provider::Codex && candidate.source_revision.file.is_some() {
+        anyhow::ensure!(
+            source_revision.matches_file_contents(candidate.source_revision),
+            "selected Codex rollout changed during indexing"
+        );
+    }
     let document = trajectory_search_document(&snapshot);
     // Codex reads the rollout's actual mtime again. Discovery may predate a restore.
     let source_updated_at = if candidate.session.provider == Provider::Codex {
@@ -733,6 +970,11 @@ mod tests {
         IndexCandidate {
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
+            metadata: None,
+            source_revision: source_path
+                .as_deref()
+                .and_then(CodexAdapter::index_file_revision)
+                .unwrap_or_default(),
             source_path,
         }
     }
@@ -839,7 +1081,7 @@ mod tests {
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
             source_updated_at: now,
-            source_revision: SourceRevision::default(),
+            source_revision: candidate(Some(now), Some(path.clone())).source_revision,
             source_complete: false,
             document_version: SEARCH_DOCUMENT_VERSION,
         };
@@ -848,6 +1090,10 @@ mod tests {
             &candidate(Some(now), Some(path)),
             Some(&sampled)
         ));
+        let sampled = TrajectoryIndexState {
+            source_revision: SourceRevision::default(),
+            ..sampled
+        };
         let compressed = candidate(Some(now), Some(temporary.path().join("rollout.jsonl.zst")));
         // Codex preserves the rollout mtime during compression. A v4 picker document can
         // have only the edges of a session that fits the decoded full-read budget.
@@ -876,22 +1122,34 @@ mod tests {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
             source_file: None,
+            source_contents: None,
             source_updated_at: Some(now),
             document_version: SEARCH_DOCUMENT_VERSION,
         };
 
-        assert!(failure_is_current(&candidate(Some(now), None), &failure));
-        assert!(failure_is_current(&candidate(None, None), &failure));
+        assert!(failure_is_current(
+            &candidate(Some(now), None),
+            SourceRevision::default(),
+            &failure
+        ));
+        assert!(failure_is_current(
+            &candidate(None, None),
+            SourceRevision::default(),
+            &failure
+        ));
         assert!(!failure_is_current(
             &candidate(Some(now - chrono::Duration::days(1)), None),
+            SourceRevision::default(),
             &failure
         ));
         assert!(!failure_is_current(
             &candidate(Some(now + chrono::Duration::milliseconds(1)), None),
+            SourceRevision::default(),
             &failure
         ));
         assert!(!failure_is_current(
             &candidate(Some(now), None),
+            SourceRevision::default(),
             &TrajectoryIndexFailure {
                 source_updated_at: None,
                 ..failure
@@ -899,6 +1157,7 @@ mod tests {
         ));
         assert!(!failure_is_current(
             &candidate(Some(now), None),
+            SourceRevision::default(),
             &TrajectoryIndexFailure {
                 document_version: 0,
                 ..failure
@@ -936,6 +1195,7 @@ mod tests {
             updated_at_approximate: false,
             event_count: 0,
             source_path: source_path.map(PathBuf::from),
+            source_revision: None,
         };
 
         assert!(
@@ -967,6 +1227,7 @@ mod tests {
             updated_at_approximate: false,
             event_count: 0,
             source_path: Some(PathBuf::from("/synthetic")),
+            source_revision: None,
         };
 
         let ordered = ordered_candidates(
@@ -1117,7 +1378,11 @@ mod tests {
         assert_eq!(
             reports
                 .iter()
-                .flat_map(|report| report.titles.iter().cloned())
+                .flat_map(|report| report.titles.iter())
+                .filter_map(|entry| entry
+                    .title
+                    .clone()
+                    .map(|title| (entry.session.clone(), title)))
                 .collect::<Vec<_>>(),
             vec![(
                 SessionRef::new(Provider::Codex, id),
@@ -1155,20 +1420,39 @@ mod tests {
             (registry, ordered_candidates(&listed, None))
         };
 
+        let index = |registry: &AdapterRegistry, candidates: &[IndexCandidate]| {
+            index_candidates(
+                registry,
+                &store,
+                candidates.to_vec(),
+                false,
+                &|| false,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
         let (registry, original) = write_rollout("oldneedle", 1_800_100_000);
-        index_candidates(
-            &registry,
-            &store,
-            original.clone(),
-            false,
-            &|| false,
-            &mut |_| {},
-        )
-        .unwrap();
+        index(&registry, &original);
         let guard = observe_source(&store, &original[0].session).unwrap();
         let delayed = prepare_session(&registry, &original[0], guard).unwrap();
 
         let (registry, restored) = write_rollout("backupneedle", 1_800_000_000);
+        let error = prepare_session(&registry, &original[0], guard)
+            .err()
+            .expect("discovery now refers to a replaced rollout");
+        assert!(retryable_read_failure(&error));
+        original[0].record_failure(
+            &registry,
+            &store,
+            guard,
+            &anyhow::anyhow!("delayed read failure"),
+        );
+        assert!(
+            store
+                .trajectory_index_failure(&original[0].session)
+                .unwrap()
+                .is_none()
+        );
         let restored_time = restored[0].updated_at.unwrap();
         assert!(
             !store
@@ -1180,18 +1464,7 @@ mod tests {
                 .session_trajectory_source_is_current(&restored[0].session, restored_time)
                 .unwrap()
         );
-        let index = || {
-            index_candidates(
-                &registry,
-                &store,
-                restored.clone(),
-                false,
-                &|| false,
-                &mut |_| {},
-            )
-            .unwrap()
-        };
-        assert_eq!(index().indexed, 1);
+        assert_eq!(index(&registry, &restored).indexed, 1);
         assert!(matches!(
             delayed.store(&store),
             Err(omnis_store::StoreError::TrajectorySourceChanged)
@@ -1207,22 +1480,16 @@ mod tests {
         );
         assert_eq!(recovered.indexed, 1);
         assert_eq!(
-            titles,
+            titles
+                .into_iter()
+                .map(|entry| (entry.session, entry.title.unwrap()))
+                .collect::<Vec<_>>(),
             [(restored[0].session.clone(), "backupneedle".to_owned())]
         );
-        assert!(
-            store
-                .search_session_trajectories("oldneedle", 10)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store
-                .search_session_trajectories("backupneedle", 10)
-                .unwrap(),
-            [restored[0].session.clone()]
-        );
-        assert_eq!(index().stale, 0);
+        let hits = |term| store.search_session_trajectories(term, 10).unwrap();
+        assert!(hits("oldneedle").is_empty());
+        assert_eq!(hits("backupneedle"), [restored[0].session.clone()]);
+        assert_eq!(index(&registry, &restored).stale, 0);
     }
 
     #[test]
@@ -1247,6 +1514,8 @@ mod tests {
                     session: SessionRef::new(Provider::Codex, id),
                     updated_at: Some(now),
                     source_path: None,
+                    source_revision: SourceRevision::default(),
+                    metadata: None,
                 },
                 document: SearchDocument {
                     source_byte_count: text.len(),
@@ -1278,7 +1547,10 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!((summary.indexed, summary.failed), (2, 1));
         assert_eq!(
-            titles,
+            titles
+                .into_iter()
+                .map(|entry| (entry.session, entry.title.unwrap()))
+                .collect::<Vec<_>>(),
             vec![
                 (
                     SessionRef::new(Provider::Codex, "first"),
@@ -1403,7 +1675,7 @@ mod tests {
         assert!(stopped.stopped);
         assert_eq!((stopped.stale, stopped.indexed), (3, 1));
         assert_eq!(
-            pending_summary(&store, candidates.clone())
+            pending_summary(&registry, &store, candidates.clone())
                 .expect("pending summary")
                 .stale,
             2
@@ -1499,6 +1771,8 @@ mod tests {
                     .map(|index| IndexCandidate {
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
+                        metadata: None,
+                        source_revision: SourceRevision::default(),
                         source_path: None,
                     })
                     .collect(),
@@ -1570,6 +1844,10 @@ mod tests {
 
         fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
             self.inner.list_sessions(project)
+        }
+
+        fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+            self.inner.find_native_session(id)
         }
 
         fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -1655,7 +1933,7 @@ mod tests {
         assert_eq!(pass(&candidates, false), (1, 0, 1, 0, 1));
         assert_eq!(pass(&candidates, false), (0, 0, 0, 1, 1));
         assert_eq!(
-            pending_summary(&store, candidates.clone())
+            pending_summary(&registry, &store, candidates.clone())
                 .expect("pending summary")
                 .failed_skipped,
             1
@@ -1668,10 +1946,11 @@ mod tests {
             .unwrap()
             .set_modified(modified.into())
             .unwrap();
-        let changed = [IndexCandidate {
-            updated_at: Some(modified),
-            ..candidates[0].clone()
-        }];
+        let updated = registry
+            .find_native_session(Provider::Codex, id)
+            .unwrap()
+            .unwrap();
+        let changed = ordered_candidates(&[updated], None);
         assert_eq!(pass(&changed, false), (1, 0, 1, 0, 2));
         assert_eq!(pass(&changed, false), (0, 0, 0, 1, 2));
 

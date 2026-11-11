@@ -913,3 +913,142 @@ fn unreadable_active_headers_fall_back_to_verified_archives_and_siblings() -> an
     }
     Ok(())
 }
+
+#[test]
+fn cached_lookup_finds_a_new_archive_after_all_old_headers_fail() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let day = home.path().join("sessions/2026/03/10");
+    fs::create_dir_all(&day)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let active = day.join(&name);
+    let folder = home.path().join("archived_sessions");
+    fs::create_dir_all(folder.join("older"))?;
+    let rows = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}}),
+        message("user", "preserved request")
+    );
+    fs::write(active.with_extension("jsonl.zst"), [0x28, 0xb5, 0x2f])?;
+    for archive in [folder.join(&name), folder.join("older").join(&name)] {
+        fs::write(&active, &rows)?;
+        let picker = CodexAdapter::with_root(home.path());
+        let direct = CodexAdapter::with_root(home.path());
+        let session = picker.list_sessions(None)?.pop().unwrap().session;
+        assert_eq!(
+            direct.native_resume_support(&session)?,
+            NativeResumeSupport::Direct
+        );
+        fs::rename(&active, &archive)?;
+        let read = picker.index_session(&session, Some(&archive), u64::MAX)?;
+        assert_eq!(visible_text(&read.snapshot), ["preserved request"]);
+        assert_eq!(
+            visible_text(&direct.read_session(&session)?),
+            ["preserved request"]
+        );
+        assert_eq!(
+            direct.native_resume_support(&session)?,
+            NativeResumeSupport::ImportOnly
+        );
+        assert_eq!(
+            direct
+                .find_native_session(SESSION_ID)?
+                .unwrap()
+                .source_path
+                .as_deref(),
+            Some(archive.as_path())
+        );
+        fs::remove_file(&archive)?;
+        assert!(format!("{:#}", direct.read_session(&session).unwrap_err()).contains("frame"));
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir()?;
+            let outside_rollout = outside.path().join(&name);
+            fs::write(&outside_rollout, &rows)?;
+            std::os::unix::fs::symlink(&outside_rollout, &archive)?;
+            assert!(
+                picker
+                    .index_session(&session, Some(&archive), u64::MAX)
+                    .is_err()
+            );
+            fs::remove_file(&archive)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let archive = home
+        .path()
+        .join("archived_sessions")
+        .join(format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl"));
+    let active_dir = home.path().join("sessions/2026/03/11");
+    let name = format!("rollout-2026-03-11T11-00-00-{SESSION_ID}.jsonl");
+    let active = active_dir.join(&name);
+    let rows = |id, text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":id}}),
+            message("user", text)
+        )
+    };
+    fs::create_dir_all(archive.parent().unwrap())?;
+    fs::create_dir_all(&active_dir)?;
+    fs::write(&archive, rows(SESSION_ID, "archive"))?;
+    let worker = CodexAdapter::with_root(home.path());
+    let session = worker.list_sessions(None)?.pop().unwrap().session;
+    let index = |path: &Path| worker.index_session(&session, Some(path), u64::MAX);
+    let outside = home.path().join("other");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join(&name), rows(SESSION_ID, "unrelated"))?;
+    assert_eq!(
+        visible_text(&index(&outside.join(&name))?.snapshot),
+        ["archive"]
+    );
+    #[cfg(unix)]
+    {
+        let link = active_dir.join("alias");
+        std::os::unix::fs::symlink(&outside, &link)?;
+        assert_eq!(
+            visible_text(&index(&link.join(&name))?.snapshot),
+            ["archive"]
+        );
+    }
+    let other_id = "11111111-1111-4111-8111-111111111111";
+    let other = active.with_file_name(name.replace(SESSION_ID, other_id));
+    fs::write(&other, rows(other_id, "another session"))?;
+    assert_eq!(visible_text(&index(&other)?.snapshot), ["archive"]);
+    fs::write(&active, rows(other_id, "mismatched header"))?;
+    assert_eq!(visible_text(&index(&active)?.snapshot), ["archive"]);
+    fs::remove_file(&active)?;
+
+    // The other picker discovers the new rollout after the worker cached its archive.
+    let worker = CodexAdapter::with_root(home.path());
+    worker.find_native_session(SESSION_ID)?;
+    fs::write(&active, rows(SESSION_ID, "active"))?;
+    let fresh = CodexAdapter::with_root(home.path())
+        .find_native_session(SESSION_ID)?
+        .unwrap();
+    assert_eq!(fresh.source_path.as_deref(), Some(active.as_path()));
+    let read = worker.index_session(&session, fresh.source_path.as_deref(), u64::MAX)?;
+    assert_eq!(visible_text(&read.snapshot), ["active"]);
+    assert_eq!(visible_text(&worker.read_session(&session)?), ["active"]);
+    assert_eq!(
+        worker.native_resume_support(&session)?,
+        NativeResumeSupport::Direct
+    );
+    assert_eq!(
+        visible_text(
+            &worker
+                .index_session(&session, Some(&archive), u64::MAX)?
+                .snapshot
+        ),
+        ["active"]
+    );
+    Ok(())
+}

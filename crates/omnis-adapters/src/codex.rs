@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -27,7 +27,7 @@ use crate::{
 mod rollout_cache;
 mod rollout_file;
 
-use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 
 const SCAN_LIMIT: usize = 10_000;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
@@ -52,6 +52,15 @@ impl CodexFileScan {
             .into_iter()
             .flatten()
             .map(|&i| self.files[i].as_path())
+    }
+
+    fn remember(&mut self, id: &str, path: &Path, active: &Path) {
+        let indices = self.candidates.entry(id.to_owned()).or_default();
+        let rank = rollout_priority(path, active);
+        let position =
+            indices.partition_point(|&i| rollout_priority(&self.files[i], active) > rank);
+        indices.insert(position, self.files.len());
+        self.files.push(path.to_owned());
     }
 }
 
@@ -105,21 +114,22 @@ pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
-    session_scan: Arc<OnceLock<CodexFileScan>>,
+    session_scan: Arc<Mutex<Option<Arc<CodexFileScan>>>>,
     listing: Arc<OnceLock<CodexListing>>,
     titles: Arc<OnceLock<TitleIndex>>,
 }
 
 impl CodexAdapter {
-    /// Identifies a physical rollout even if another file shares its thread ID and modification time.
+    /// Identifies a rollout file across appends and distinguishes same-path replacements.
     #[must_use]
     pub fn index_file_id(path: &Path) -> Option<Uuid> {
-        path_uuid(path)?;
-        let canonical = fs::canonicalize(path).ok()?;
-        Some(Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            canonical.as_os_str().as_encoded_bytes(),
-        ))
+        Self::index_file_revision(path)?.file
+    }
+
+    /// Observes which file and contents a reader can use without reading the transcript.
+    #[must_use]
+    pub fn index_file_revision(path: &Path) -> Option<SourceRevision> {
+        Some(ObservedRollout::read(path)?.revision)
     }
 
     /// The decoded size of a compressed rollout can differ from its filesystem metadata.
@@ -146,9 +156,56 @@ impl CodexAdapter {
         scan_session_files(home, SCAN_LIMIT)
     }
 
-    fn session_scan(&self) -> &CodexFileScan {
-        self.session_scan
-            .get_or_init(|| self.discover_session_scan())
+    /// Returns the scan and whether this caller reused a cached snapshot.
+    /// Readers that rejected the same snapshot share one refresh.
+    fn session_scan(&self, rejected: Option<&Arc<CodexFileScan>>) -> (Arc<CodexFileScan>, bool) {
+        let mut entry = self
+            .session_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = entry.as_ref()
+            && !rejected.is_some_and(|old| Arc::ptr_eq(old, cached))
+        {
+            return (Arc::clone(cached), true);
+        }
+        let scan = Arc::new(self.discover_session_scan());
+        *entry = Some(Arc::clone(&scan));
+        (scan, false)
+    }
+
+    fn scan_for_lookup(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+        home: &Path,
+        canonical_home: &Path,
+    ) -> (Arc<CodexFileScan>, bool) {
+        let (scan, reused) = self.session_scan(None);
+        let Some(path) = source_path else {
+            return (scan, reused);
+        };
+        if scan.paths(id).any(|known| known == path)
+            || path_uuid(path).as_deref() != Some(id)
+            || !live_rollout_path(home, canonical_home, path)
+        {
+            return (scan, reused);
+        }
+
+        // Another picker can discover a new active file while this worker still has a readable archive.
+        drop(scan);
+        let mut entry = self
+            .session_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scan = entry.as_mut().expect("the session scan was initialized");
+        // Limit the number of paths that a long-running picker can add between scans.
+        if scan.files.len() >= SCAN_LIMIT * 2 {
+            *scan = Arc::new(self.discover_session_scan());
+        }
+        if !scan.paths(id).any(|known| known == path) {
+            Arc::make_mut(scan).remember(id, path, &home.join("sessions"));
+        }
+        (Arc::clone(scan), reused)
     }
 
     fn title_index(&self) -> &TitleIndex {
@@ -207,7 +264,7 @@ impl CodexAdapter {
     }
 
     fn build_listing(&self) -> CodexListing {
-        let scan = self.session_scan();
+        let (scan, _) = self.session_scan(None);
         let title_index = self.title_index();
         let mut cache = self
             .rollout_cache
@@ -240,7 +297,7 @@ impl CodexAdapter {
             cache.save();
         }
         let mut notes = listing_notes(
-            scan,
+            &scan,
             sessions.len(),
             subagents,
             invalid.unreadable,
@@ -255,15 +312,15 @@ impl CodexAdapter {
         CodexListing { sessions, notes }
     }
 
-    fn find_session(&self, id: &str) -> Result<CodexSession> {
-        let mut session = self.require_rollout(id)?.session;
+    fn find_session(&self, id: &str, source_path: Option<&Path>) -> Result<CodexSession> {
+        let mut session = self.require_rollout(id, source_path)?.session;
         session.title = self.title_index().titles.get(id).cloned();
         Ok(session)
     }
 
-    fn require_rollout(&self, id: &str) -> Result<SelectedRollout> {
+    fn require_rollout(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedRollout> {
         Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
-        self.selected_rollout(id)?
+        self.selected_rollout(id, source_path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 
@@ -279,7 +336,7 @@ impl CodexAdapter {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let Some(selected) = self.selected_rollout(id)? else {
+        let Some(selected) = self.selected_rollout(id, None)? else {
             return Ok(None);
         };
         let records = rollout_file::header(&selected.session.path)?;
@@ -292,59 +349,37 @@ impl CodexAdapter {
             .map(str::to_owned))
     }
 
-    fn selected_rollout(&self, id: &str) -> Result<Option<SelectedRollout>> {
+    fn selected_rollout(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+    ) -> Result<Option<SelectedRollout>> {
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(None);
         };
-        let mut paths = self
-            .session_scan()
-            .paths(id)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        if !paths.iter().any(|path| path.is_file()) {
-            // A native fork or archive can move or create a rollout after the first scan.
-            paths = self
-                .discover_session_scan()
-                .paths(id)
-                .map(Path::to_path_buf)
-                .collect();
-        }
-        let active = home.join("sessions");
-        let archive = home.join("archived_sessions");
-        let mut alternatives = Vec::new();
-        for path in &paths {
-            if path.starts_with(&archive)
-                && let Some(plain) = restored_rollout(home, path)
-            {
-                alternatives.extend(representations(&plain));
-            }
-            if let Some(name) = rollout_file::jsonl_file_name(path) {
-                alternatives.extend(representations(&path.with_file_name(name)));
-            }
-        }
-        paths.extend(alternatives);
-        paths.sort_unstable_by(|a, b| {
-            rollout_priority(b, &active).cmp(&rollout_priority(a, &active))
-        });
-        paths.dedup();
         let Ok(canonical_home) = fs::canonicalize(home) else {
             return Ok(None);
         };
         let mut invalid = InvalidHeaders::default();
-        let live = paths.iter().map(PathBuf::as_path).filter(|path| {
-            path.strip_prefix(home).is_ok_and(|relative| {
-                path.is_file()
-                    && fs::canonicalize(path)
-                        .is_ok_and(|actual| actual == canonical_home.join(relative))
-            })
-        });
-        let selected = select_rollout(live, CodexSession::parse_metadata_path_result, &mut invalid);
-        if selected.is_none()
-            && let Some(error) = invalid.first_error
+        let (scan, cached) = self.scan_for_lookup(id, source_path, home, &canonical_home);
+        if let Some(selected) =
+            select_live_rollout(home, &canonical_home, scan.paths(id), &mut invalid)
         {
-            return Err(error);
+            return Ok(Some(selected));
         }
-        Ok(selected)
+        if cached {
+            // A remaining malformed sibling does not prove that the last valid file is still here.
+            let (fresh, _) = self.session_scan(Some(&scan));
+            if !fresh.paths(id).eq(scan.paths(id)) {
+                invalid = InvalidHeaders::default();
+                if let Some(selected) =
+                    select_live_rollout(home, &canonical_home, fresh.paths(id), &mut invalid)
+                {
+                    return Ok(Some(selected));
+                }
+            }
+        }
+        invalid.first_error.map_or(Ok(None), Err)
     }
 
     /// Finds user sessions created after a native fork command started.
@@ -398,7 +433,7 @@ impl CodexAdapter {
                 let mut invalid = InvalidHeaders::default();
                 let Some(selected) = select_rollout(
                     indices.iter().map(|&i| paths[i].as_path()),
-                    CodexSession::parse_metadata_path_result,
+                    CodexSession::parse_observed_metadata,
                     &mut invalid,
                 ) else {
                     if let Some(error) = invalid.first_error {
@@ -446,24 +481,18 @@ impl Default for CodexAdapter {
 
 /// Reads a rollout's listing metadata, reusing the cached header while the rollout is unchanged.
 fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Option<CodexSession>> {
-    let Some(cache) = cache else {
-        return CodexSession::parse_metadata_path_result(path);
-    };
-    // Stat before reading, so a rollout written in between is parsed again next time.
-    let Some((metadata, stamp)) = fs::metadata(path)
-        .ok()
-        .and_then(|metadata| RolloutStamp::new(&metadata).map(|stamp| (metadata, stamp)))
-    else {
-        return CodexSession::parse_metadata_path_result(path);
+    let observed =
+        ObservedRollout::read(path).context("selected Codex rollout changed during discovery")?;
+    let (Some(cache), Some(stamp)) = (cache, observed.stamp) else {
+        return CodexSession::parse_with_observation(path, observed);
     };
     if let Some(cached) = cache.get(path, stamp) {
-        let updated_at = metadata.modified().ok().map(DateTime::<Utc>::from);
         return Ok(cached
             .header
             .clone()
-            .map(|header| CodexSession::from_header(path, header, updated_at)));
+            .map(|header| CodexSession::from_header(path, header, observed)));
     }
-    let session = CodexSession::parse_metadata_path_result(path)?;
+    let session = CodexSession::parse_with_observation(path, observed)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
     Ok(session)
 }
@@ -531,6 +560,56 @@ fn ranked_rollouts(files: &[PathBuf], active: &Path) -> HashMap<String, Vec<usiz
         });
     }
     candidates
+}
+
+fn select_live_rollout<'a>(
+    home: &Path,
+    canonical_home: &Path,
+    candidates: impl Iterator<Item = &'a Path>,
+    invalid: &mut InvalidHeaders,
+) -> Option<SelectedRollout> {
+    let active = home.join("sessions");
+    let archive = home.join("archived_sessions");
+    let mut paths = Vec::new();
+    for path in candidates {
+        let Some(name) = rollout_file::jsonl_file_name(path) else {
+            continue;
+        };
+        paths.extend(representations(&path.with_file_name(name)));
+        if path.starts_with(&active) {
+            paths.extend(representations(&archive.join(name)));
+        } else if path.starts_with(&archive)
+            && let Some(plain) = restored_rollout(home, path)
+        {
+            paths.extend(representations(&plain));
+        }
+    }
+    paths.sort_unstable_by(|a, b| rollout_priority(b, &active).cmp(&rollout_priority(a, &active)));
+    paths.dedup();
+    let live = paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| live_rollout_path(home, canonical_home, path));
+    select_rollout(live, CodexSession::parse_observed_metadata, invalid)
+}
+
+fn live_rollout_path(home: &Path, canonical_home: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(home) else {
+        return false;
+    };
+    let Ok(tail) = relative
+        .strip_prefix("sessions")
+        .or_else(|_| relative.strip_prefix("archived_sessions"))
+    else {
+        return false;
+    };
+    // Discovery accepts a file below at most five directories in either rollout root.
+    tail.components().count() <= 6
+        && tail
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path.is_file()
+        && fs::canonicalize(path).is_ok_and(|actual| actual == canonical_home.join(relative))
 }
 
 // Codex restores archived files into the active directory named by their original date.
@@ -714,6 +793,7 @@ struct CodexSession {
     id: String,
     title: Option<String>,
     path: PathBuf,
+    observed_revision: Option<SourceRevision>,
     project_path: Option<PathBuf>,
     git_branch: Option<String>,
     cli_version: Option<String>,
@@ -723,14 +803,41 @@ struct CodexSession {
 }
 
 impl CodexSession {
-    fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
-        let records = rollout_file::header(path)?;
-        Ok(records
-            .first()
-            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record)))
+    fn parse_observed_metadata(path: &Path) -> Result<Option<Self>> {
+        let observed = ObservedRollout::read(path)
+            .context("selected Codex rollout changed during header lookup")?;
+        Self::parse_with_observation(path, observed)
     }
 
-    fn parse_metadata_record(path: PathBuf, record: &Value) -> Option<Self> {
+    fn read_unchanged<T>(self, read: impl FnOnce(Self, SourceRevision) -> Result<T>) -> Result<T> {
+        let path = self.path.clone();
+        let revision = self
+            .observed_revision
+            .context("selected Codex rollout changed during lookup")?;
+        let result = read(self, revision);
+        anyhow::ensure!(
+            CodexAdapter::index_file_revision(&path) == Some(revision),
+            "selected Codex rollout changed during the read"
+        );
+        result
+    }
+
+    fn parse_with_observation(path: &Path, observed: ObservedRollout) -> Result<Option<Self>> {
+        let records = rollout_file::header(path)?;
+        anyhow::ensure!(
+            CodexAdapter::index_file_revision(path) == Some(observed.revision),
+            "selected Codex rollout changed during header lookup"
+        );
+        Ok(records
+            .first()
+            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, observed)))
+    }
+
+    fn parse_metadata_record(
+        path: PathBuf,
+        record: &Value,
+        observed: ObservedRollout,
+    ) -> Option<Self> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
         }
@@ -740,14 +847,11 @@ impl CodexSession {
         if path_uuid(&path).as_deref() != Some(id) {
             return None;
         }
-        let updated_at = fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(DateTime::<Utc>::from);
         Some(Self {
             id: id.to_owned(),
             title: None,
             path,
+            observed_revision: Some(observed.revision),
             project_path: string_at(payload, &[&["cwd"]]).map(PathBuf::from),
             git_branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
                 .map(str::to_owned),
@@ -763,21 +867,22 @@ impl CodexSession {
             .is_some()
                 || value_at(payload, &[&["source", "subagent"]]).is_some(),
             created_at: parse_timestamp(record.get("timestamp")),
-            updated_at,
+            updated_at: observed.modified,
         })
     }
 
-    fn from_header(path: &Path, header: RolloutHeader, updated_at: Option<DateTime<Utc>>) -> Self {
+    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Self {
         Self {
             id: header.id,
             title: None,
             path: path.to_path_buf(),
+            observed_revision: Some(observed.revision),
             project_path: header.project_path,
             git_branch: header.git_branch,
             cli_version: header.cli_version,
             is_subagent: header.is_subagent,
             created_at: header.created_at,
-            updated_at,
+            updated_at: observed.modified,
         }
     }
 
@@ -803,6 +908,7 @@ impl CodexSession {
             updated_at_approximate: false,
             event_count: 0,
             source_path: Some(self.path.clone()),
+            source_revision: self.observed_revision,
         }
     }
 
@@ -916,14 +1022,17 @@ impl CodexSession {
         ))
     }
 
-    fn index(self, session: &SessionRef, full_read_bytes: u64) -> Result<IndexRead> {
-        let source_revision = SourceRevision {
-            file: CodexAdapter::index_file_id(&self.path),
-            missing_ancestor: None,
-        };
+    fn index(
+        self,
+        session: &SessionRef,
+        full_read_bytes: u64,
+        source_revision: SourceRevision,
+    ) -> Result<IndexRead> {
+        let native_session = (!self.is_subagent).then(|| self.native_session());
         if full_read_bytes != u64::MAX && rollout_file::compressed(&self.path) {
             let mut read = self.compressed_sample(session, full_read_bytes)?;
             read.source_revision = source_revision;
+            read.native_session = native_session;
             return Ok(read);
         }
         let source_complete = fs::metadata(&self.path)?.len() <= full_read_bytes;
@@ -933,6 +1042,7 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            native_session,
             snapshot,
             source_complete,
             source_revision,
@@ -977,6 +1087,7 @@ impl CodexSession {
             captured_at,
         );
         Ok(IndexRead {
+            native_session: None,
             snapshot,
             source_complete,
             source_revision: SourceRevision::default(),
@@ -1675,7 +1786,7 @@ impl ProviderAdapter for CodexAdapter {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let Some(selected) = self.selected_rollout(id)? else {
+        let Some(selected) = self.selected_rollout(id, None)? else {
             return Ok(None);
         };
         let mut session = selected.session;
@@ -1685,7 +1796,7 @@ impl ProviderAdapter for CodexAdapter {
 
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Codex)?;
-        let selected = self.require_rollout(&session.id)?;
+        let selected = self.require_rollout(&session.id, None)?;
         let path = selected.session.path;
         let archived = self
             .codex_home
@@ -1709,12 +1820,14 @@ impl ProviderAdapter for CodexAdapter {
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
-        self.find_session(&session.id)?.read(session)
+        self.find_session(&session.id, None)?
+            .read_unchanged(|native, _| native.read(session))
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
-        self.find_session(&session.id)?.preview(session)
+        self.find_session(&session.id, None)?
+            .read_unchanged(|native, _| native.preview(session))
     }
 
     fn index_session(
@@ -1724,9 +1837,10 @@ impl ProviderAdapter for CodexAdapter {
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
+        let native = self.find_session(&session.id, source_path)?;
         let changed = source_path.is_some_and(|path| path != native.path);
-        let read = native.index(session, full_read_bytes);
+        let read = native
+            .read_unchanged(|native, revision| native.index(session, full_read_bytes, revision));
         if changed {
             read.context("selected Codex rollout changed during indexing")
         } else {

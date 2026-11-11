@@ -163,6 +163,7 @@ fn synthetic_document(index: usize) -> String {
 fn synthetic_indexed_session(index: usize) -> IndexedSession {
     let timestamp = benchmark_timestamp();
     IndexedSession {
+        source_revision: None,
         session: SessionRef::new(Provider::Claude, format!("refresh-{index:04}")),
         title: Some(format!("Synthetic refresh session {index}")),
         project_path: None,

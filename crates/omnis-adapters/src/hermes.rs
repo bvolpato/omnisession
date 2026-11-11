@@ -111,6 +111,7 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                native_session: None,
                 source_revision: SourceRevision::default(),
                 snapshot: builder.snapshot(
                     session.clone(),
@@ -231,6 +232,7 @@ impl ProviderAdapter for HermesAdapter {
                     updated_at_approximate: false,
                     event_count: metadata.message_count,
                     source_path: Some(database.clone()),
+                    source_revision: None,
                 });
             }
             sort_sessions(&mut sessions);

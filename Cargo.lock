@@ -911,6 +911,7 @@ dependencies = [
  "tempfile",
  "uuid",
  "wait-timeout",
+ "winapi-util",
  "zstd",
 ]
 
@@ -925,6 +926,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "directories",
+ "flate2",
  "fs2",
  "hex",
  "md-5",

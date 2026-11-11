@@ -207,6 +207,7 @@ mod tests {
                 updated_at_approximate: false,
                 event_count: 0,
                 source_path: None,
+                source_revision: None,
             },
             None,
         )

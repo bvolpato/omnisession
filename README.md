@@ -78,7 +78,7 @@ omni inspect <session> --target grok   # what gets preserved, summarized, or omi
 
 - **Run `omni`.** Sessions from every installed agent appear in one list, current workspace first. Related sessions stay grouped as a tree across agents.
 - **Fuzzy and full-text.** Titles, folders, branches, and IDs match fuzzily as you type. Conversation text matches come from a local, redacted full-text index. Quoted text matches exactly.
-- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index. If you restore a Codex rollout with an older file modification time, the next index refresh picks up its contents.
+- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index. The next index refresh picks up a restored Codex file even if its modification time stays the same or moves backward.
 - **Scriptable.** `omni search` works without the picker, and `--json` returns structured results.
 
 ```sh
@@ -234,7 +234,7 @@ The mouse works too: click selects, double-click opens, and the wheel scrolls.
 
 While the picker is open, it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MiB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
 
-Unreadable sessions are skipped by later index runs until their source changes; `omni index --retry-failed` reads them again.
+If a session remains unreadable, later index runs skip it until its source changes. Use `omni index --retry-failed` to try again. If an in-place restore preserves the operating system's file identity, size, and all available timestamps, use `omni show codex:<id>` to read the contents and refresh the cached text and workspace. This can apply to same-size restores on Windows that preserve the write time.
 
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 

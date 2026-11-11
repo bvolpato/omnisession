@@ -856,6 +856,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 updated_at_approximate: false,
                 event_count,
                 source_path: None,
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);

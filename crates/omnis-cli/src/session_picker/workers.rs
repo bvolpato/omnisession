@@ -1,10 +1,11 @@
 use super::{
-    AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
-    NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
-    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionRef,
-    SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
-    TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
-    first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
+    AdapterRegistry, CachedPickerEntries, Command, DateTime, HandoffRecord, HashSet,
+    IndexedSession, LATEST_RELEASE_URL, NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path,
+    PathBuf, PickerEntry, PickerState, PreviewKey, PreviewRequest, PreviewSource, PreviewValue,
+    Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionTrajectoryOrigin,
+    SessionTrajectorySearchPage, Stdio, Store, SyncSender, TRAJECTORY_SEARCH_LIMIT,
+    TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env, first_user_message_after,
+    mpsc, normalized_picker_entries, populate_approximate_updated_at, preview_revision,
     session_preview, thread,
 };
 
@@ -13,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use anyhow::Context;
 use omnis_adapters::ProviderAdapter;
 use omnis_ir::SourceRevision;
 
@@ -43,11 +45,12 @@ impl SessionCacheUpdate {
 }
 
 pub(super) enum PickerUpdate {
-    Cached(Result<Vec<PickerEntry>, String>),
+    Cached(Result<CachedPickerEntries, String>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
         key: PreviewKey,
         value: PreviewValue,
+        read_revision: Option<SourceRevision>,
     },
     TrajectorySearch {
         generation: u64,
@@ -57,7 +60,6 @@ pub(super) enum PickerUpdate {
     RefreshStarted(Provider),
     AvailableUpdate(Option<String>),
     Warning(String),
-    Titles(Vec<(SessionRef, String)>),
     Indexing(IndexProgress),
     /// Unreadable sessions among the latest indexing candidates.
     IndexFailures(usize),
@@ -65,7 +67,7 @@ pub(super) enum PickerUpdate {
 
 pub(super) struct PickerWorkers {
     pub(super) receiver: Receiver<PickerUpdate>,
-    pub(super) preview_sender: Sender<Vec<PreviewKey>>,
+    pub(super) preview_sender: Sender<Vec<PreviewRequest>>,
     pub(super) trajectory_search_sender: SyncSender<TrajectorySearchRequest>,
     pub(super) search_index_sender: Sender<Vec<IndexCandidate>>,
     search_index_stop: Arc<AtomicBool>,
@@ -80,7 +82,7 @@ impl Drop for PickerWorkers {
 
 pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (sender, receiver) = mpsc::channel();
-    let (preview_sender, preview_receiver) = mpsc::channel::<Vec<PreviewKey>>();
+    let (preview_sender, preview_receiver) = mpsc::channel::<Vec<PreviewRequest>>();
     let (trajectory_search_sender, trajectory_search_receiver) =
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<SessionCacheUpdate>();
@@ -246,26 +248,10 @@ pub(super) fn spawn_cache_updates(
             spawn_all_provider_updates(&sender, &index_sender, &current_project);
             return;
         };
-        let cached = match cached_picker_entries(&store, &current_project) {
-            Ok((entries, warnings)) => {
-                for warning in warnings {
-                    if sender.send(PickerUpdate::Warning(warning)).is_err() {
-                        return;
-                    }
-                }
-                Ok(entries)
-            }
-            Err(error) => Err(error.to_string()),
-        };
+        let cached =
+            cached_picker_entries(&store, &current_project).map_err(|error| error.to_string());
         let cache_loaded = cached.is_ok();
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
-            return;
-        }
-        if let Ok(titles) = store.trajectory_titles()
-            && sender
-                .send(PickerUpdate::Titles(titles.into_iter().collect()))
-                .is_err()
-        {
             return;
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
@@ -417,24 +403,51 @@ pub(super) fn spawn_provider_update(
     });
 }
 
-fn read_picker_preview(
+pub(super) fn read_picker_preview(
     registry: &AdapterRegistry,
     key: &PreviewKey,
+    source_path: Option<&Path>,
 ) -> anyhow::Result<omnis_adapters::IndexRead> {
     let session = &key.session;
+    if session.provider == Provider::Codex {
+        let budget = if key.continuation_after.is_some() {
+            u64::MAX
+        } else {
+            search_index::FULL_READ_SOURCE_BYTES
+        };
+        let read = registry.index_session(session, source_path, budget)?;
+        let revision = preview_revision(read.source_revision);
+        match &key.source {
+            Some(PreviewSource::CodexFile(expected)) if *expected != revision => {
+                anyhow::bail!("Codex rollout changed before its preview was read");
+            }
+            Some(PreviewSource::CachedCodex(expected)) => {
+                let header = read
+                    .native_session
+                    .as_ref()
+                    .context("cached Codex preview has no verified catalog metadata")?;
+                let effective = &read.snapshot.workspace.current_dir;
+                let workspace = if effective.as_os_str().is_empty() {
+                    header.project_path.as_deref()
+                } else {
+                    Some(effective.as_path())
+                };
+                anyhow::ensure!(
+                    workspace.map(Path::as_os_str) == expected.as_deref().map(Path::as_os_str),
+                    "cached Codex workspace changed before its preview was read"
+                );
+            }
+            _ => {}
+        }
+        return Ok(read);
+    }
     if session.provider == Provider::Imported || key.continuation_after.is_some() {
         return full_index_read(registry, session);
-    }
-    if session.provider == Provider::Codex {
-        return registry.index_session(
-            session,
-            key.source_path.as_deref(),
-            search_index::FULL_READ_SOURCE_BYTES,
-        );
     }
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
+            native_session: None,
             snapshot,
             source_complete: false,
             source_revision: SourceRevision::default(),
@@ -443,37 +456,30 @@ fn read_picker_preview(
 
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
-    receiver: Receiver<Vec<PreviewKey>>,
+    receiver: Receiver<Vec<PreviewRequest>>,
 ) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
         let mut store_warning_sent = false;
-        let mut store = match Store::open_default() {
+        let mut open_store = || match Store::open_default() {
             Ok(store) => Some(store),
             Err(error) => {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index unavailable: {error}"
-                )));
-                store_warning_sent = true;
+                if !store_warning_sent {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "trajectory index unavailable: {error}"
+                    )));
+                    store_warning_sent = true;
+                }
                 None
             }
         };
+        let mut store = open_store();
         while let Ok(keys) = receiver.recv() {
             if store.is_none() {
-                match Store::open_default() {
-                    Ok(opened) => store = Some(opened),
-                    Err(error) => {
-                        if !store_warning_sent {
-                            let _ = sender.send(PickerUpdate::Warning(format!(
-                                "trajectory index unavailable: {error}"
-                            )));
-                            store_warning_sent = true;
-                        }
-                    }
-                }
+                store = open_store();
             }
             let mut queue = VecDeque::from(keys);
-            while let Some(key) = queue.pop_front() {
+            while let Some(PreviewRequest { key, source_path }) = queue.pop_front() {
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
@@ -489,12 +495,16 @@ pub(super) fn spawn_preview_updates(
                         }
                     }
                 });
+                let mut read_revision = None;
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let read = read_picker_preview(&registry, &key);
+                    let read = read_picker_preview(&registry, &key, source_path.as_deref());
                     read.map_or(PreviewValue::Unavailable, |read| {
+                        if read.source_revision.file.is_some() {
+                            read_revision = Some(preview_revision(read.source_revision));
+                        }
                         let snapshot = read.snapshot;
                         let complete = read.source_complete;
                         if let Some((store, guard)) = writer
@@ -525,7 +535,14 @@ pub(super) fn spawn_preview_updates(
                         }
                     })
                 };
-                if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                if sender
+                    .send(PickerUpdate::Preview {
+                        key,
+                        value,
+                        read_revision,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -550,7 +567,7 @@ pub(super) fn spawn_trajectory_search_updates(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
                     store
-                        .search_session_trajectory_page_for_sessions(
+                        .search_selected_trajectory_page(
                             &request.query,
                             TRAJECTORY_SEARCH_LIMIT,
                             &request.eligible_sessions,
@@ -582,9 +599,13 @@ pub(super) fn receive_updates(
     while let Ok(update) = receiver.try_recv() {
         changed = true;
         match update {
-            PickerUpdate::Cached(Ok(entries)) => {
+            PickerUpdate::Cached(Ok(cached)) => {
                 state.cache_loaded = true;
-                state.replace_all_entries(entries);
+                state.replace_all_entries(cached.entries);
+                state.remember_source_titles(cached.titles);
+                for warning in cached.warnings {
+                    record_picker_warning(warnings, warning);
+                }
             }
             PickerUpdate::Cached(Err(error)) => {
                 state.cache_loaded = true;
@@ -595,10 +616,15 @@ pub(super) fn receive_updates(
             PickerUpdate::Lineage(Err(error)) => {
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
-            PickerUpdate::Preview { key, value } => {
-                state.remember_preview_title(&key, &value);
-                state.previews.insert(key, value, &state.preview_window);
-                state.trajectory_index_changed();
+            PickerUpdate::Preview {
+                mut key,
+                value,
+                read_revision,
+            } => {
+                if state.remember_preview_title(&mut key, &value, read_revision) {
+                    state.previews.insert(key, value, &state.preview_window);
+                    state.trajectory_index_changed();
+                }
             }
             PickerUpdate::TrajectorySearch { generation, result } => {
                 if generation == state.trajectory_search_generation {
@@ -626,11 +652,10 @@ pub(super) fn receive_updates(
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
             }
-            PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
             PickerUpdate::Indexing(progress) => {
                 state.index_progress = Some((progress.indexed, progress.total));
                 if !progress.titles.is_empty() {
-                    state.remember_derived_titles(progress.titles);
+                    state.remember_source_titles(progress.titles);
                 }
                 state.trajectory_index_changed();
             }
@@ -668,18 +693,7 @@ pub(super) fn record_index_failures(warnings: &mut Vec<String>, count: usize) {
     }
 }
 
-pub(super) fn indexed_session(session: &NativeSession) -> IndexedSession {
-    IndexedSession {
-        session: session.session.clone(),
-        title: session.title.clone(),
-        project_path: session.project_path.clone(),
-        git_branch: session.git_branch.clone(),
-        created_at: session.created_at,
-        updated_at: session.updated_at,
-        updated_at_approximate: session.updated_at_approximate,
-        event_count: session.event_count,
-    }
-}
+pub(super) use crate::indexed_session_metadata as indexed_session;
 
 pub(super) fn native_session(session: IndexedSession) -> NativeSession {
     NativeSession {
@@ -692,5 +706,6 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         updated_at_approximate: session.updated_at_approximate,
         event_count: session.event_count,
         source_path: None,
+        source_revision: session.source_revision,
     }
 }

@@ -63,10 +63,14 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
+    /// The file revision observed with this session's metadata.
+    pub source_revision: Option<SourceRevision>,
 }
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Catalog metadata from the selected file, when the reader verified it.
+    pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
     pub source_revision: SourceRevision,
@@ -237,6 +241,7 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            native_session: None,
             snapshot,
             source_complete,
             source_revision: SourceRevision::default(),

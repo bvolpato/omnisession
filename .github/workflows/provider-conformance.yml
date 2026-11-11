@@ -12,6 +12,7 @@ on:
       - "scripts/test-provider-compatibility.sh"
       - "scripts/test-provider-conformance.ps1"
       - "scripts/test-provider-conformance.sh"
+      - "scripts/test-provider-replies.py"
       - "website/app/providers.generated.ts"
       - ".github/workflows/provider-conformance.yml"
   workflow_call:
@@ -161,6 +162,11 @@ jobs:
         id: adapters
         if: ${{ always() }}
         run: scripts/test-provider-conformance.sh adapters
+      - name: Continue imported Claude and Codex sessions on loopback
+        id: replies
+        if: ${{ always() }}
+        working-directory: ${{ runner.temp }}
+        run: PATH="provider-clis/bin:$PATH" "$GITHUB_WORKSPACE/scripts/test-provider-conformance.sh" replies
       - name: Run installed Claude conformance
         id: claude
         if: ${{ always() }}
@@ -195,6 +201,7 @@ jobs:
         env:
           MATRIX_OUTCOME: ${{ steps.matrix.outcome }}
           ADAPTER_OUTCOME: ${{ steps.adapters.outcome }}
+          REPLIES_OUTCOME: ${{ steps.replies.outcome }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           CODEX_OUTCOME: ${{ steps.codex.outcome }}
           OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
@@ -213,7 +220,7 @@ jobs:
           }
 
           outcomes=(
-            "$MATRIX_OUTCOME" "$ADAPTER_OUTCOME" "$CLAUDE_OUTCOME"
+            "$MATRIX_OUTCOME" "$ADAPTER_OUTCOME" "$REPLIES_OUTCOME" "$CLAUDE_OUTCOME"
             "$CODEX_OUTCOME" "$OPENCODE_OUTCOME" "$GROK_OUTCOME"
             "$HERMES_OUTCOME" "$PI_OUTCOME" "$OMP_OUTCOME"
           )

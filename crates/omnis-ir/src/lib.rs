@@ -280,11 +280,20 @@ pub struct WorkspaceSnapshot {
     pub available_tools: Vec<String>,
 }
 
-/// The selected provider file and the missing source that can complete this index entry.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The selected provider file, its contents revision, and any missing source needed for indexing.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SourceRevision {
     pub file: Option<Uuid>,
+    pub contents: Option<Uuid>,
     pub missing_ancestor: Option<Uuid>,
+}
+
+impl SourceRevision {
+    /// Checks whether both reads observed the same provider file and contents revision.
+    #[must_use]
+    pub fn matches_file_contents(self, other: Self) -> bool {
+        self.file.is_some() && self.file == other.file && self.contents == other.contents
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
