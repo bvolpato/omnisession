@@ -10,14 +10,62 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: &str = "1.0";
 
+/// Tool payloads can contain entire files or logs. Search retains both edges.
+pub const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
+pub const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 pub const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
+
+/// Measurements of eligible, redacted text after event limits and before document limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchProjection {
+    pub byte_count: usize,
+    /// SHA-256 of the eligible text with its event separators.
+    pub digest: [u8; 32],
+    /// SHA-256 before the final eligible event and its preceding separator.
+    pub before_last_event: [u8; 32],
+}
 
 /// Splits a capped search document at the marker between its two retained windows.
 #[must_use]
 pub fn search_document_windows(text: &str) -> Option<(&str, &str)> {
-    let head_budget =
-        (2 * SEARCH_DOCUMENT_EDGE_BYTE_LIMIT - SEARCH_TRUNCATION_NOTICE.len()).div_ceil(2);
+    search_windows(text, SEARCH_DOCUMENT_EDGE_BYTE_LIMIT)
+}
+
+/// Returns the bounded event length, including its separator, when its complete head and tail
+/// survive at the outside edge of an older document window.
+#[must_use]
+pub fn capped_search_event_at_edge(window: &str, tail: bool) -> Option<usize> {
+    for edge in [
+        SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
+        SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
+    ] {
+        // Each UTF-8 boundary can move inward by at most three bytes.
+        for len in (2 * edge - 6..=2 * edge).rev() {
+            let event = if tail {
+                let Some(start) = window.len().checked_sub(len) else {
+                    continue;
+                };
+                window
+                    .split_at_checked(start)
+                    .filter(|(prefix, _)| prefix.ends_with("\n\n"))
+                    .map(|(_, event)| event)
+            } else {
+                window
+                    .split_at_checked(len)
+                    .filter(|(_, suffix)| suffix.starts_with("\n\n"))
+                    .map(|(event, _)| event)
+            };
+            if event.is_some_and(|text| search_windows(text, edge).is_some()) {
+                return Some(len + 2);
+            }
+        }
+    }
+    None
+}
+
+fn search_windows(text: &str, edge_limit: usize) -> Option<(&str, &str)> {
+    let head_budget = (2 * edge_limit - SEARCH_TRUNCATION_NOTICE.len()).div_ceil(2);
     (head_budget.saturating_sub(3)..=head_budget).find_map(|i| {
         let (head, rest) = text.split_at_checked(i)?;
         Some((head, rest.strip_prefix(SEARCH_TRUNCATION_NOTICE)?))

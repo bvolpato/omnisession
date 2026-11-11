@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus, GitState,
     OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+    SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT, SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
     SEARCH_TRUNCATION_NOTICE, Sensitivity, TransferMode, WorkspaceSnapshot,
 };
 use regex::Regex;
@@ -43,9 +44,6 @@ const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
-const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
-// Tool payloads are mostly file contents and logs, so only their edges are searchable.
-const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 /// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
@@ -1092,6 +1090,8 @@ pub struct SearchDocument {
     pub truncated: bool,
     pub source_complete: bool,
     pub source_byte_count: usize,
+    /// Antigravity search measurements before the document-wide text limit.
+    pub projection: Option<omnis_ir::SearchProjection>,
     pub indexed_byte_count: usize,
     pub truncation_strategy: SearchTruncationStrategy,
 }
@@ -1162,6 +1162,7 @@ fn trajectory_search_document_with_limits(
 /// Builds one bounded search document from canonical events in conversation order.
 pub struct SearchDocumentBuilder {
     retained: HeadTailText,
+    projection_hashes: Option<(Sha256, Sha256)>,
     event_edge_limit: usize,
     source_byte_count: usize,
     has_text: bool,
@@ -1182,6 +1183,7 @@ impl SearchDocumentBuilder {
     const fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
         Self {
             retained: HeadTailText::new(document_edge_limit),
+            projection_hashes: None,
             event_edge_limit,
             source_byte_count: 0,
             has_text: false,
@@ -1206,6 +1208,16 @@ impl SearchDocumentBuilder {
         if text.text.trim().is_empty() {
             return;
         }
+        if !self.has_text && event.source.provider == Provider::Antigravity {
+            self.projection_hashes = Some((Sha256::new(), Sha256::new()));
+        }
+        if let Some((full, preceding)) = &mut self.projection_hashes {
+            preceding.clone_from(full);
+            if self.has_text {
+                full.update(b"\n\n");
+            }
+            full.update(text.text.as_bytes());
+        }
         if self.has_text {
             self.source_byte_count = self.source_byte_count.saturating_add(2);
             self.retained.push("\n\n");
@@ -1228,6 +1240,13 @@ impl SearchDocumentBuilder {
     #[must_use]
     pub fn finish(self) -> SearchDocument {
         let document_truncated = self.retained.truncated();
+        let projection =
+            self.projection_hashes
+                .map(|(full, preceding)| omnis_ir::SearchProjection {
+                    byte_count: self.retained.total_byte_count,
+                    digest: full.finalize().into(),
+                    before_last_event: preceding.finalize().into(),
+                });
         let text = self.retained.finish();
         let truncation_strategy = search_truncation_strategy(
             self.source_incomplete,
@@ -1235,6 +1254,7 @@ impl SearchDocumentBuilder {
             document_truncated,
         );
         SearchDocument {
+            projection,
             indexed_byte_count: text.len(),
             text,
             truncated: truncation_strategy != SearchTruncationStrategy::None,

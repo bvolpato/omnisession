@@ -350,14 +350,15 @@ fn read_budget(
         } else {
             FULL_READ_SOURCE_BYTES
         },
-        // The guard observes any document published after the pending scan.
-        prior_search_bytes: match (candidate.session.provider, guard) {
-            (
-                Provider::Antigravity,
-                TrajectorySourceGuard::Verified {
-                    source_byte_count, ..
-                },
-            ) => source_byte_count,
+        // The guard identifies the stored document, including a write after the pending scan.
+        prior_search_bytes: match guard {
+            TrajectorySourceGuard::Verified {
+                source_byte_count, ..
+            } if candidate.session.provider == Provider::Antigravity
+                && guard.matches_document_file(candidate.source_revision) == Some(true) =>
+            {
+                source_byte_count
+            }
             _ => None,
         },
     }
@@ -995,6 +996,7 @@ impl PreparedIndex {
             source_updated_at: self.source_updated_at,
             source_revision: self.candidate.source_revision,
             source_byte_count: self.document.source_byte_count,
+            projection: self.document.projection,
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,
@@ -1479,6 +1481,7 @@ mod tests {
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
                     source_byte_count: 21,
+                    projection: None,
                     indexed_byte_count: 21,
                     truncation_strategy: "none",
                     source_complete: false,
@@ -2037,6 +2040,7 @@ mod tests {
                 guard: TrajectorySourceGuard::NewerSource,
                 verified_metadata: None,
                 document: SearchDocument {
+                    projection: None,
                     source_byte_count: text.len(),
                     indexed_byte_count: text.len(),
                     text,
@@ -2298,6 +2302,7 @@ mod tests {
                     redacted_text: "old",
                     source_updated_at: now,
                     source_byte_count: 3,
+                    projection: None,
                     indexed_byte_count: 3,
                     truncation_strategy: "none",
                     source_complete: true,

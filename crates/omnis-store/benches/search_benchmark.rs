@@ -194,6 +194,7 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         redacted_text: text,
         source_updated_at: benchmark_timestamp(),
         source_byte_count: text.len(),
+        projection: None,
         indexed_byte_count: text.len(),
         truncation_strategy: "none",
         source_complete: true,

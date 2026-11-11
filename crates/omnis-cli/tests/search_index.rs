@@ -307,6 +307,57 @@ fn preferred_antigravity_history_does_not_inherit_cached_text_from_a_different_f
 }
 
 #[test]
+fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, preferred) = antigravity_history(&env, 2);
+    let lookup = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            "--provider",
+            "antigravity",
+            "--all-projects",
+            term,
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&env, state, &args)["results"].clone()
+    };
+    fs::write(
+        preferred.with_file_name("transcript.jsonl"),
+        r#"{"type":"PLANNER_RESPONSE","content":"fallbackonly"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        lookup("warm", "fallbackonly", false)[0]["coverage"],
+        "complete"
+    );
+    fs::write(
+        preferred,
+        concat!(
+            r#"{"type":"PLANNER_RESPONSE","content":"preferredreply"}"#,
+            "\n",
+            r#"{"type":"USER_INPUT","content":"torn"#,
+        ),
+    )
+    .unwrap();
+    for state in ["cold", "warm"] {
+        assert_eq!(
+            lookup(state, "preferredreply", false)[0]["coverage"],
+            "preview",
+            "{state}"
+        );
+        assert_eq!(
+            lookup(state, "preferredreply", true)[0]["coverage"],
+            "preview",
+            "{state}"
+        );
+        assert_eq!(lookup(state, "fallbackonly", true), json!([]), "{state}");
+    }
+}
+
+#[test]
 fn an_oversized_reply_preserves_verified_search_after_show_or_indexing() {
     use std::io::{Read, Write};
 
@@ -1534,10 +1585,10 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
     let root = tempdir().unwrap();
     let environment = TestEnvironment::new(root.path(), root.path().to_owned());
     let (session, path) = antigravity_history(&environment, 63);
-    let filler = " ordinary".repeat(4_000);
     let rewrite = |first: &str, grow_private_field: bool| {
         let mut file = BufWriter::new(fs::File::create(&path).unwrap());
         for index in 0..62 {
+            let filler = format!(" ordinary {index:02}").repeat(3_000);
             let marker = if index == 0 { first } else { "" };
             writeln!(
                 file,
@@ -1545,8 +1596,12 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
             )
             .unwrap();
         }
-        file.write_all(br#"{"type":"PLANNER_RESPONSE","content":"verifiedreply","thinking":""#)
-            .unwrap();
+        write!(
+            file,
+            r#"{{"type":"PLANNER_RESPONSE","content":"{} verifiedreply","thinking":""#,
+            " ordinary".repeat(9_000)
+        )
+        .unwrap();
         if grow_private_field {
             std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
         }
@@ -1585,6 +1640,14 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
         assert_eq!(hits(state, "verifiedreply", false), 1);
         assert_eq!(indexed_bytes(state), 2 * 1024 * 1024);
     }
+
+    Connection::open(environment.home.join("shown/store.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET projected_byte_count=NULL, projected_prefix_hash=NULL",
+            [],
+        )
+        .unwrap();
 
     rewrite("", true);
     state_json(&environment, "fresh", &["show", &session]);
