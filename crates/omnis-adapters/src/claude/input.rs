@@ -224,6 +224,44 @@ impl Observation<'_> {
     }
 }
 
+// A restored file can contain the entire native JSONL stream twice. Check the
+// line boundary before reading the two byte ranges on the same open file.
+fn repeated_half(file: &mut File, length: u64) -> Result<Option<u64>> {
+    if length < MAX_PREVIEW_TAIL_SIZE || !length.is_multiple_of(2) {
+        return Ok(None);
+    }
+    let half = length / 2;
+    let mut newline = [0];
+    file.seek(SeekFrom::Start(half - 1))?;
+    file.read_exact(&mut newline)?;
+    if newline[0] != b'\n' {
+        return Ok(None);
+    }
+    let mut first = [0; 8192];
+    let mut second = [0; 8192];
+    let mut offset = 0;
+    while offset < half {
+        let count = usize::try_from((half - offset).min(first.len() as u64))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut first[..count])?;
+        file.seek(SeekFrom::Start(half + offset))?;
+        file.read_exact(&mut second[..count])?;
+        if first[..count] != second[..count] {
+            return Ok(None);
+        }
+        offset += count as u64;
+    }
+    Ok(Some(half))
+}
+
+fn unchanged(file: &File, before: &std::fs::Metadata) -> Result<()> {
+    let after = file.metadata()?;
+    if after.len() != before.len() || after.modified()? != before.modified()? {
+        bail!("Claude transcript changed while verifying a restored copy");
+    }
+    Ok(())
+}
+
 pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, InputCoverage)> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -232,8 +270,34 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
     }
     let length = metadata.len();
     let mut transcript = ClaudeTranscript::default();
+    if (!preview || length <= MAX_PREVIEW_TAIL_SIZE * 2)
+        && let Some(half) = repeated_half(&mut file, length)?
+    {
+        let mut known = true;
+        let coverage = visit(&mut file, half, false, 2, |observation| {
+            if let Observation::Record(row) = observation {
+                known &= copies::has_known_links(row, &transcript.records);
+            }
+            observation.apply(&mut transcript);
+        })?;
+        if known
+            && !transcript.records.is_empty()
+            && transcript.duplicate_records.is_empty()
+            && coverage.malformed == 0
+            && coverage.oversized == 0
+            && transcript
+                .compactions
+                .by_summary
+                .values()
+                .all(|summary| summary.error.is_none())
+        {
+            unchanged(&file, &metadata)?;
+            return Ok((transcript, coverage));
+        }
+        transcript = ClaudeTranscript::default();
+    }
     let mut probe = copies::Probe::default();
-    let coverage = visit(&mut file, length, preview, |observation| {
+    let coverage = visit(&mut file, length, preview, 1, |observation| {
         if let Observation::Record(row) = observation {
             probe.observe(row, &transcript.records);
         }
@@ -247,7 +311,7 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
     transcript = ClaudeTranscript::default();
     let mut index = copies::Occurrences::default();
     let mut position = 0;
-    visit(&mut file, length, preview, |observation| {
+    visit(&mut file, length, preview, 1, |observation| {
         match observation {
             Observation::Record(row) => index.observe(row),
             Observation::Tail(_) => index.start_tail(),
@@ -259,14 +323,11 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
     if start != proposed {
         transcript = ClaudeTranscript::default();
         position = 0;
-        visit(&mut file, length, preview, |observation| {
+        visit(&mut file, length, preview, 1, |observation| {
             observation.apply_from(start, &mut position, &mut transcript);
         })?;
     }
-    let after = file.metadata()?;
-    if after.len() != metadata.len() || after.modified()? != metadata.modified()? {
-        bail!("Claude transcript changed while verifying a restored copy");
-    }
+    unchanged(&file, &metadata)?;
     Ok((transcript, coverage))
 }
 
@@ -274,6 +335,7 @@ fn visit(
     file: &mut File,
     length: u64,
     preview: bool,
+    physical_copies: usize,
     mut observe: impl FnMut(Observation<'_>),
 ) -> Result<InputCoverage> {
     file.rewind()?;
@@ -316,12 +378,12 @@ fn visit(
         let mut progress_links = 0;
         coverage.scan(file, length, true, |record| {
             if record["type"] == "progress" {
-                progress_links += usize::from(record["uuid"].is_string());
+                progress_links += physical_copies * usize::from(record["uuid"].is_string());
                 if progress_links > MAX_PROGRESS_LINKS {
                     bail!("Claude progress links exceed safe record limit");
                 }
             } else {
-                records += 1;
+                records += physical_copies;
                 if records > MAX_PROVIDER_RECORDS {
                     bail!("provider file exceeds safe record limit");
                 }

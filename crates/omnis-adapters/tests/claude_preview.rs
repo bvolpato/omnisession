@@ -99,3 +99,47 @@ fn a_disconnected_preview_keeps_the_known_assistant_record_repeated_in_its_tail(
     assert_eq!(text, ["Inspect", "Repeated in the tail"]);
     assert!(omnis_core::import_trajectory(&snapshot).truncated);
 }
+
+#[test]
+fn repeated_native_bytes_keep_physical_limits_and_omissions() {
+    let root = tempfile::tempdir().unwrap();
+    let session = SessionRef::new(Provider::Claude, Uuid::from_u128(99).to_string());
+    let source = root.path().join(format!("{}.jsonl", session.id));
+    let adapter = ClaudeAdapter::with_root(root.path());
+    let prompt = json!({"type":"user","uuid":Uuid::from_u128(1),"parentUuid":null,"message":{"content":"First request"}});
+    let padding = json!({"type":"progress","uuid":Uuid::from_u128(2),"parentUuid":Uuid::from_u128(1),"padding":"x".repeat(2 * 1024 * 1024)});
+    let half = format!("{prompt}\n{padding}\n");
+    let write = |tail: &str| std::fs::write(&source, format!("{half}{tail}").repeat(2)).unwrap();
+
+    write("{\n");
+    let snapshot = adapter.read_session(&session).unwrap();
+    let notice = snapshot
+        .events
+        .iter()
+        .find(|event| {
+            event.source.raw_record_type.as_deref() == Some("omnisession.malformed_jsonl")
+        })
+        .unwrap();
+    assert_eq!(notice.payload["omitted_events"], 2);
+
+    let implicit = json!({"type":"user","message":{"content":"Legacy turn"}});
+    write(&format!("{implicit}\n"));
+    let snapshot = adapter.read_session(&session).unwrap();
+    assert_eq!(
+        snapshot
+            .events
+            .iter()
+            .filter(|event| event.payload["text"] == "Legacy turn")
+            .count(),
+        2
+    );
+
+    write(&"{}\n".repeat(50_000));
+    assert!(
+        adapter
+            .read_session(&session)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds safe record limit")
+    );
+}

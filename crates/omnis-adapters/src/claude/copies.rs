@@ -26,6 +26,20 @@ fn parent_field(row: &Value) -> &'static str {
     }
 }
 
+pub(super) fn has_known_links(row: &Value, records: &HashMap<Uuid, ClaudeRecord>) -> bool {
+    if !is_main_record(row) {
+        return true;
+    }
+    let field = parent_field(row);
+    if identified(row).is_none() {
+        return !conversation(row) && field != "logicalParentUuid";
+    }
+    let known = |key| record_uuid(row, key).is_some_and(|id| records.contains_key(&id));
+    let root = field == "parentUuid" && row.get(field).is_some_and(Value::is_null);
+    (root || known(field))
+        && (row["sourceToolAssistantUUID"].is_null() || known("sourceToolAssistantUUID"))
+}
+
 #[derive(Default)]
 pub(super) struct Probe {
     start: Option<usize>,
