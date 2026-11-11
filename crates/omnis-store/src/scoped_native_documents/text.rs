@@ -49,7 +49,7 @@ pub(super) fn archived_text(
     let mut statement = tx
         .prepare_cached(
             "SELECT chunk_index,stored_text FROM session_trajectory_chunk_rows
-             WHERE trajectory_id=?1 ORDER BY chunk_index",
+             WHERE trajectory_id=?1 AND chunk_index < ?2 ORDER BY chunk_index",
         )
         .map_err(database_error)?;
     // Older stores used byte overlap or disjoint chunks. The document digest identifies the format.
@@ -69,7 +69,9 @@ fn join_chunks(
     length: usize,
     overlap: Overlap,
 ) -> Result<Option<String>> {
-    let mut rows = statement.query([trajectory_id]).map_err(database_error)?;
+    let mut rows = statement
+        .query([trajectory_id, crate::FIRST_PRIMARY_LEGACY_CHUNK])
+        .map_err(database_error)?;
     let mut text = String::new();
     let mut scratch = Vec::new();
     let mut index = 0_i64;
@@ -125,6 +127,10 @@ mod tests {
             [&first],
         )
         .unwrap();
+        tx.execute(
+            "INSERT INTO session_trajectory_chunk_rows VALUES(1,?1,'independent older search evidence')",
+            [crate::FIRST_PRIMARY_LEGACY_CHUNK],
+        ).unwrap();
         for repeated_chars in [4_096, 16_384 / 3, 0] {
             let second = format!("{}tail", "青".repeat(repeated_chars));
             tx.execute(

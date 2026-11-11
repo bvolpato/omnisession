@@ -13,6 +13,7 @@ pub(super) struct Primary {
     coverage: PriorCoverage,
     bytes: i64,
     hash: Vec<u8>,
+    has_legacy: bool,
 }
 
 impl Primary {
@@ -22,7 +23,7 @@ impl Primary {
     ) -> Result<Option<Self>> {
         let mut statement = tx.prepare_cached(
             "SELECT doc.id, origin.source_home, doc.source_file_id, doc.source_contents_id,
-                    doc.source_complete OR doc.provider_limited, doc.truncation_strategy, doc.source_byte_count, doc.indexed_byte_count, doc.content_hash
+                    doc.source_complete OR doc.provider_limited, doc.truncation_strategy, doc.source_byte_count, doc.document_version, doc.indexed_byte_count, doc.content_hash, doc.legacy_search_text IS NOT NULL
              FROM session_trajectories doc LEFT JOIN native_search_document_homes origin
                ON doc.id=origin.trajectory_id AND doc.source_file_id=origin.source_file AND origin.verification=1
              WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native'",
@@ -36,8 +37,9 @@ impl Primary {
                         verified_home: row.get(1)?,
                         file: optional_uuid(row, 2)?,
                         coverage: PriorCoverage::from_row(row, 3)?,
-                        bytes: row.get(7)?,
-                        hash: row.get(8)?,
+                        bytes: row.get(8)?,
+                        hash: row.get(9)?,
+                        has_legacy: row.get(10)?,
                     })
                 },
             )
@@ -60,17 +62,17 @@ impl Primary {
         }
     }
 
-    pub(super) fn accepts_partial(
+    pub(super) fn partial_write(
         &self,
         tx: &Transaction<'_>,
         write: &PreparedTrajectoryWrite<'_, '_>,
         rewritten: &[(i64, &str)],
         has_gap: bool,
-    ) -> Result<bool> {
-        self.coverage.accepts_partial(
+    ) -> Result<PartialWrite> {
+        self.coverage.partial_write(
             tx,
             write,
-            has_gap,
+            has_gap || self.has_legacy,
             self.verified_home.as_deref(),
             &self.hash,
             || self.text(tx, rewritten),
@@ -78,15 +80,27 @@ impl Primary {
     }
 }
 
-pub(super) fn scoped_accepts_partial(
+pub(super) enum PartialWrite {
+    Keep,
+    Replace,
+    KeepBoth,
+}
+
+impl From<bool> for PartialWrite {
+    fn from(accepts: bool) -> Self {
+        if accepts { Self::Replace } else { Self::Keep }
+    }
+}
+
+pub(super) fn scoped_partial_write(
     tx: &Transaction<'_>,
     write: &PreparedTrajectoryWrite<'_, '_>,
     home: &[u8],
     file: Uuid,
     has_gap: bool,
-) -> Result<bool> {
+) -> Result<PartialWrite> {
     let mut statement = tx.prepare_cached(
-        "SELECT source_contents, source_complete OR provider_limited, truncation_strategy, source_byte_count, stored_text
+        "SELECT source_contents, source_complete OR provider_limited, truncation_strategy, source_byte_count, document_version, stored_text, legacy_search_text IS NOT NULL
          FROM scoped_native_documents
          WHERE provider=?1 AND session_id=?2 AND source_home=?3 AND source_file=?4",
     ).map_err(database_error)?;
@@ -99,22 +113,22 @@ pub(super) fn scoped_accepts_partial(
         ])
         .map_err(database_error)?;
     let Some(row) = rows.next().map_err(database_error)? else {
-        return Ok(true);
+        return Ok(PartialWrite::Replace);
     };
     let prior = PriorCoverage::from_row(row, 0).map_err(database_error)?;
     let text = row
-        .get_ref(4)
+        .get_ref(5)
         .map_err(database_error)?
         .as_str()
         .map_err(|_| StoreError::CorruptStore)?;
-    prior.accepts_partial(
-        tx,
-        write,
-        has_gap,
-        Some(home),
-        &Sha256::digest(text),
-        || Ok(Some(Cow::Borrowed(text))),
-    )
+    let has_legacy: bool = row.get(6).map_err(database_error)?;
+    let hash = Sha256::digest(text);
+    match prior.partial_write(tx, write, has_gap || has_legacy, Some(home), &hash, || {
+        Ok(Some(Cow::Borrowed(text)))
+    })? {
+        PartialWrite::Replace if has_legacy => Ok(PartialWrite::KeepBoth),
+        decision => Ok(decision),
+    }
 }
 
 struct PriorCoverage {
@@ -122,6 +136,7 @@ struct PriorCoverage {
     full_or_limited: bool,
     document_truncated: bool,
     source_bytes: usize,
+    version: Option<u32>,
 }
 
 impl PriorCoverage {
@@ -129,6 +144,7 @@ impl PriorCoverage {
         let bytes: i64 = row.get(column + 3)?;
         Ok(Self {
             contents: optional_uuid(row, column)?,
+            version: row.get(column + 4)?,
             source_bytes: usize::try_from(bytes)
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column + 3, bytes))?,
             full_or_limited: row.get(column + 1)?,
@@ -139,7 +155,7 @@ impl PriorCoverage {
         })
     }
 
-    fn accepts_partial<'a>(
+    fn partial_write<'a>(
         &self,
         tx: &Transaction<'_>,
         write: &PreparedTrajectoryWrite<'_, '_>,
@@ -147,9 +163,9 @@ impl PriorCoverage {
         home: Option<&[u8]>,
         hash: &[u8],
         prior_text: impl Fn() -> Result<Option<Cow<'a, str>>>,
-    ) -> Result<bool> {
+    ) -> Result<PartialWrite> {
         if !has_gap && self.contents != write.document.source_revision.contents {
-            return Ok(true);
+            return Ok(PartialWrite::Replace);
         }
         let prior_steps = match (home, self.contents, write.document.source_revision.file) {
             (Some(home), Some(contents), Some(file))
@@ -160,35 +176,48 @@ impl PriorCoverage {
             _ => None,
         };
         let incoming = write.document.desktop_step_proof;
+        let fixed_version = match write.session.provider {
+            crate::Provider::Antigravity => 11,
+            crate::Provider::AntigravityDesktop => 12,
+            _ => return Ok(PartialWrite::Keep),
+        };
+        let rows_survive = prior_steps.as_deref().is_none_or(|previous| {
+            incoming.is_some_and(|rows| retains_steps(previous, rows, false))
+        });
         if has_gap
             && home.is_some()
+            && self.version.is_none_or(|version| version < fixed_version)
+            && rows_survive
             && hash != write.content_hash
             && let Some(projection) = write.document.legacy_utf8_text
-            && prior_steps
-                .as_deref()
-                .is_none_or(|previous| incoming.is_some_and(|rows| rows.starts_with(previous)))
             && prior_text()?.is_some_and(|previous| {
-                projection.retains_legacy_utf8_prefix(
+                projection.retains_legacy_utf8_rows(
                     self.source_bytes,
                     &previous,
                     write.document.redacted_text,
                 )
             })
         {
-            return Ok(true);
+            if self.contents == write.document.source_revision.contents || prior_steps.is_some() {
+                return Ok(PartialWrite::Replace);
+            }
+            if !self.full_or_limited && write.document.source_byte_count > self.source_bytes {
+                return Ok(PartialWrite::KeepBoth);
+            }
         }
         if write.session.provider != crate::Provider::AntigravityDesktop {
             if self.full_or_limited {
-                return Ok(false);
+                return Ok(PartialWrite::Keep);
             }
-            return Ok(hash == write.content_hash
+            return Ok((hash == write.content_hash
                 || prior_text()?.is_some_and(|previous| {
                     retains_legacy_preview(&previous, write.document.redacted_text)
-                }));
+                }))
+            .into());
         }
         if let (Some(previous), Some(incoming)) = (prior_steps, incoming) {
             if !retains_steps(&previous, incoming, self.full_or_limited) {
-                return Ok(false);
+                return Ok(PartialWrite::Keep);
             }
             // A whole-document limit can displace indexed text even when every old step survives.
             if !self.document_truncated
@@ -197,25 +226,29 @@ impl PriorCoverage {
                     .truncation_strategy
                     .contains("document_head_tail")
             {
-                return Ok(true);
+                return Ok(PartialWrite::Replace);
             }
             if hash == write.content_hash {
-                return Ok(true);
+                return Ok(PartialWrite::Replace);
             }
             if let Some(projection) = write.document.desktop_projection {
-                return Ok(prior_text()?.is_some_and(|text| {
-                    projection.retains(&previous, &text, write.document.redacted_text)
-                }));
+                return Ok(prior_text()?
+                    .is_some_and(|text| {
+                        projection.retains(&previous, &text, write.document.redacted_text)
+                    })
+                    .into());
             }
         } else if self.full_or_limited {
-            return Ok(false);
+            return Ok(PartialWrite::Keep);
         }
         if hash == write.content_hash {
-            return Ok(true);
+            return Ok(PartialWrite::Replace);
         }
-        Ok(prior_text()?.is_some_and(|previous| {
-            retains_standalone_text(&previous, write.document.redacted_text)
-        }))
+        Ok(prior_text()?
+            .is_some_and(|previous| {
+                retains_standalone_text(&previous, write.document.redacted_text)
+            })
+            .into())
     }
 }
 

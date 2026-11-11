@@ -1224,7 +1224,13 @@ fn trajectory_search_document_with_limits(
         ..
     } = visible_history(snapshot);
 
-    let mut legacy = None;
+    let mut legacy = legacy_utf8_projection::LegacyRenderer::new(
+        source_incomplete
+            && matches!(
+                snapshot.session.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            ),
+    );
     let mut desktop_projection = (snapshot.session.provider == Provider::AntigravityDesktop)
         .then(|| DesktopProjection::new(document_edge_limit));
     for event in events {
@@ -1232,8 +1238,7 @@ fn trajectory_search_document_with_limits(
         if let Some(event_text) = search_event_text(event, event_edge_limit)
             && !event_text.text.trim().is_empty()
         {
-            legacy_utf8_projection::observe(
-                &mut legacy,
+            legacy.observe(
                 &retained,
                 included_events != 0,
                 source_byte_count,
@@ -1262,7 +1267,7 @@ fn trajectory_search_document_with_limits(
         search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
     SearchDocument {
         desktop_projection,
-        legacy_utf8_text: legacy.and_then(|old| old.finish(&text, source_byte_count)),
+        legacy_utf8_text: legacy.finish(&text, source_byte_count, document_edge_limit),
         indexed_byte_count: text.len(),
         text,
         truncated: truncation_strategy != SearchTruncationStrategy::None,
@@ -5822,7 +5827,21 @@ mod tests {
                 .unwrap()
                 .retains(&old_ids, &with_middle.text, &with_another_opaque.text,)
         );
+        assert!(
+            with_another_opaque
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .same_visible_rows(&old_ids)
+        );
         let after_restore = project(&[head, opaque, (5, Some("new")), middle, tail]);
+        assert!(
+            !after_restore
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .same_visible_rows(&old_ids)
+        );
         assert!(!after_restore.desktop_projection.as_ref().unwrap().retains(
             &old_ids,
             &with_middle.text,
@@ -5833,7 +5852,7 @@ mod tests {
     #[test]
     fn historical_search_projection_matches_the_old_utf8_split_before_and_after_the_cap() {
         let project = |texts: &[&str], edge| {
-            let events = texts
+            let mut events: Vec<_> = texts
                 .iter()
                 .enumerate()
                 .map(|(sequence, text)| {
@@ -5844,43 +5863,77 @@ mod tests {
                     )
                 })
                 .collect();
-            trajectory_search_document_with_limits(&snapshot_with_events(events), 4096, edge)
+            events.push(event(
+                100,
+                EventKind::ProviderEvent,
+                json!({"omitted_events": 1}),
+            ));
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::Antigravity;
+            trajectory_search_document_with_limits(&snapshot, 4096, edge)
         };
         let head = "p".repeat(56);
         let crossing = format!("🦀{} goldfinch", "a".repeat(24));
         let prior = project(&[&head, &crossing, "bluebird"], 60);
         let expected_prior = format!("{head}\n\n\n\n{crossing}bluebird");
         assert_eq!(
-            prior.legacy_utf8_text.as_deref(),
+            prior
+                .legacy_utf8_text
+                .as_ref()
+                .and_then(super::LegacyUtf8Projection::historical_text),
             Some(expected_prior.as_str())
         );
         let appended = project(&[&head, &crossing, "bluebird", "new"], 60);
         let legacy = appended.legacy_utf8_text.as_ref().unwrap();
-        assert!(legacy.retains_legacy_utf8_prefix(
+        assert!(legacy.retains_legacy_utf8_rows(
             prior.source_byte_count,
             &expected_prior,
             &appended.text
         ));
-        assert!(!legacy.retains_legacy_utf8_prefix(
+        assert!(!legacy.retains_legacy_utf8_rows(
             prior.source_byte_count - 1,
             &expected_prior,
             &appended.text
         ));
-        assert!(!legacy.retains_legacy_utf8_prefix(
+        assert!(!legacy.retains_legacy_utf8_rows(
             prior.source_byte_count,
             "goldfinchbluebird",
             &appended.text
         ));
+        let inserted = project(&[&head, &crossing, "mid", "bluebird", "tail"], 60);
+        assert!(
+            inserted
+                .legacy_utf8_text
+                .as_ref()
+                .unwrap()
+                .retains_legacy_utf8_rows(prior.source_byte_count, &expected_prior, &inserted.text)
+        );
+        let shifted = project(&["more", &head, &crossing, "bluebird"], 60);
+        let shifted_rows = shifted.legacy_utf8_text.as_ref().unwrap();
+        assert!(shifted_rows.historical_text().is_none());
+        assert!(shifted_rows.retains_legacy_utf8_rows(
+            prior.source_byte_count,
+            &expected_prior,
+            &shifted.text
+        ));
+        let changed = project(&[&head, &crossing, "mid", "bluebirdX", "tail"], 60);
+        assert!(
+            !changed
+                .legacy_utf8_text
+                .as_ref()
+                .unwrap()
+                .retains_legacy_utf8_rows(prior.source_byte_count, &expected_prior, &changed.text)
+        );
         for bytes in [120, 121, 125] {
             let last = "t".repeat(bytes - prior.source_byte_count - 2);
             let doc = project(&[&head, &crossing, "bluebird", &last], 60);
             assert_eq!(doc.source_byte_count, bytes);
             let expected = super::head_tail_text(&format!("{expected_prior}\n\n{last}"), 60).0;
             let rendered = doc.legacy_utf8_text.as_ref().unwrap();
-            assert_eq!(**rendered, expected);
-            assert!(rendered.retains_legacy_utf8_prefix(bytes, &expected, &doc.text));
+            assert_eq!(rendered.historical_text(), Some(expected.as_str()));
+            assert!(rendered.retains_legacy_utf8_rows(bytes, &expected, &doc.text));
             assert_eq!(
-                rendered.retains_legacy_utf8_prefix(
+                rendered.retains_legacy_utf8_rows(
                     prior.source_byte_count,
                     &expected_prior,
                     &doc.text
@@ -5890,7 +5943,13 @@ mod tests {
         }
 
         let exact = project(&["abcde🦀1234567"], 8);
-        assert_eq!(exact.legacy_utf8_text.as_deref(), Some("abcde1234567"));
+        assert_eq!(
+            exact
+                .legacy_utf8_text
+                .as_ref()
+                .and_then(super::LegacyUtf8Projection::historical_text),
+            Some("abcde1234567")
+        );
         let ascii = project(&["abcdeABCD1234567"], 8);
         assert!(ascii.legacy_utf8_text.is_none());
     }

@@ -34,6 +34,7 @@ pub use codex_workspace::{CodexWorkspace, CodexWorkspaceIndex, CodexWorkspaceUpd
 
 mod desktop_declarations;
 mod discovery;
+mod primary_legacy;
 mod scoped_native_documents;
 mod scoped_native_search;
 pub mod search_query;
@@ -56,6 +57,7 @@ const PAGE_CACHE_KIBIBYTES: i64 = -64 * 1024;
 const TRAJECTORY_PHRASE_MAX_TOKENS: usize = 64;
 const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 const TRAJECTORY_SEARCH_RESULT_LIMIT: usize = 512;
+const FIRST_PRIMARY_LEGACY_CHUNK: i64 = 1 << 31;
 const TRAJECTORY_CHUNK_BYTE_LIMIT: usize = 64 * 1024;
 const MAX_UTF8_BYTES_PER_CHARACTER: usize = 4;
 /// Maximum number of trajectory documents accepted by one atomic write.
@@ -246,6 +248,8 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
              ON chunks.id = session_trajectory_chunks_fts.rowid
          INNER JOIN session_trajectories AS trajectories
              ON trajectories.id = chunks.trajectory_id
+            AND (chunks.chunk_index < {FIRST_PRIMARY_LEGACY_CHUNK} OR NOT EXISTS (
+                SELECT 1 FROM primary_legacy_chunk_updates WHERE trajectory_id=trajectories.id))
          INNER JOIN eligible
              ON eligible.provider = trajectories.provider
             AND eligible.session_id = trajectories.session_id
@@ -3554,12 +3558,7 @@ impl Store {
     ) -> Result<usize> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        let unowned = match context {
-            TrajectoryWriteContext::Discovered(names) => {
-                check_discovered_catalog(&transaction, names)?
-            }
-            _ => std::collections::HashSet::new(),
-        };
+        let unowned = check_discovered_catalog(&transaction, context)?;
         let selected_metadata = match context {
             TrajectoryWriteContext::Selected(metadata) => Some(metadata),
             _ => None,
@@ -3582,13 +3581,16 @@ impl Store {
             write
                 .guard
                 .check(&transaction, write.session, Some(document))?;
-            let verified_partial =
+            let (verified_partial, retain_text) =
                 match scoped_native_documents::write(&transaction, write, context, &rewritten)? {
                     scoped_native_documents::WriteResult::Handled(changed) => {
                         scoped_documents += changed;
                         continue;
                     }
-                    scoped_native_documents::WriteResult::Primary(verified) => verified,
+                    scoped_native_documents::WriteResult::Primary {
+                        verified_partial,
+                        retain_text,
+                    } => (verified_partial, retain_text),
                 };
             codex_title_recheck::accept(&transaction, write, selected_metadata)?;
             let observed = matches!(write.guard, TrajectorySourceGuard::Observed(_));
@@ -3637,6 +3639,7 @@ impl Store {
             codex_title_recheck::retire(&transaction, write)?;
             write.record_workspace(&transaction)?;
             record_verified_document_home(&transaction, write, context)?;
+            primary_legacy::retain(&transaction, trajectory_id, retain_text.as_deref())?;
             clear_observed_native_failure(&transaction, write)?;
         }
         drop(upsert_parent);
@@ -5060,6 +5063,7 @@ impl Store {
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         initialize_discovery_schema(&transaction)?;
+        primary_legacy::initialize(&transaction)?;
         desktop_declarations::initialize(&transaction)?;
         scoped_native_documents::initialize(&transaction)?;
         if stored_format < STORE_FORMAT {
@@ -5854,9 +5858,12 @@ fn same_codex_catalog_source(left: &IndexedSession, right: &IndexedSession) -> b
 
 fn check_discovered_catalog<'a>(
     connection: &Connection,
-    observed: &[&'a IndexedSession],
+    context: TrajectoryWriteContext<'a>,
 ) -> Result<std::collections::HashSet<&'a SessionRef>> {
     let mut unowned = std::collections::HashSet::new();
+    let TrajectoryWriteContext::Discovered(observed) = context else {
+        return Ok(unowned);
+    };
     for selected in observed {
         let (current, legacy) = selected_catalog_rows(connection, &selected.session)?;
         if let Some(current) = current
@@ -7554,12 +7561,12 @@ fn chunk_text_kept_with_trajectories(transaction: &Transaction<'_>) -> Result<()
                  WHERE redacted_text <> ''
                    AND NOT EXISTS (
                        SELECT 1 FROM session_trajectory_chunk_rows
-                       WHERE trajectory_id = session_trajectories.id
+                       WHERE trajectory_id = session_trajectories.id AND chunk_index < ?1
                    )",
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([FIRST_PRIMARY_LEGACY_CHUNK], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(database_error)?;
@@ -7600,8 +7607,8 @@ fn replace_trajectory_chunks(
     transaction
         .execute(
             "DELETE FROM session_trajectory_chunk_rows
-             WHERE trajectory_id IN (SELECT value FROM json_each(?1))",
-            params![trajectory_ids],
+             WHERE trajectory_id IN (SELECT value FROM json_each(?1)) AND chunk_index < ?2",
+            params![trajectory_ids, FIRST_PRIMARY_LEGACY_CHUNK],
         )
         .map_err(database_error)?;
     insert_trajectory_chunks(transaction, documents)
@@ -7642,6 +7649,7 @@ fn insert_trajectory_chunks(
     insert_chunks_into(
         transaction,
         documents,
+        0,
         "INSERT INTO session_trajectory_chunk_rows(trajectory_id, chunk_index, stored_text) VALUES ",
     )
 }
@@ -7649,6 +7657,7 @@ fn insert_trajectory_chunks(
 fn insert_chunks_into(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
+    first_chunk_index: i64,
     insert_sql: &str,
 ) -> Result<()> {
     rebuild_full_text_index_after_unreadable_chunk(transaction)?;
@@ -7657,7 +7666,7 @@ fn insert_chunks_into(
         for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
             let chunk_index =
                 i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
-            rows.push((*trajectory_id, chunk_index));
+            rows.push((*trajectory_id, first_chunk_index + chunk_index));
             texts.push(chunk);
         }
     }
@@ -11733,6 +11742,7 @@ mod tests {
              DELETE FROM session_trajectory_migrations
              WHERE name IN ('recheck_v5_codex_coverage', 'reverify_legacy_codex_titles');
              DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
+             DROP TRIGGER clear_replaced_primary_legacy_text;
              ALTER TABLE session_trajectories DROP COLUMN source_file_id;
              ALTER TABLE session_trajectories DROP COLUMN source_contents_id;
              ALTER TABLE session_trajectories DROP COLUMN missing_ancestor_id;",
@@ -13163,6 +13173,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
+                 DROP TRIGGER clear_replaced_primary_legacy_text;
                  ALTER TABLE session_trajectories DROP COLUMN source_file_id;
                  ALTER TABLE session_trajectories DROP COLUMN missing_ancestor_id;
                  ALTER TABLE session_trajectories DROP COLUMN source_contents_id;

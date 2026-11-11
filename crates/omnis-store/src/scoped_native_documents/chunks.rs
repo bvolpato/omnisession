@@ -1,3 +1,5 @@
+mod primary;
+
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::{Result, database_error, insert_chunks_into};
@@ -30,13 +32,6 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
          AFTER INSERT ON scoped_native_documents BEGIN
              INSERT INTO scoped_native_chunk_updates VALUES(new.id);
          END;
-         CREATE TRIGGER IF NOT EXISTS queue_scoped_chunks_after_update
-         AFTER UPDATE OF stored_text ON scoped_native_documents WHEN old.stored_text <> new.stored_text BEGIN
-             DELETE FROM scoped_native_chunk_rows WHERE document_id = new.id;
-             INSERT INTO scoped_native_chunk_updates SELECT new.id
-             WHERE NOT EXISTS (SELECT 1 FROM scoped_native_chunk_updates WHERE document_id=new.id);
-         END;
-
          CREATE TRIGGER IF NOT EXISTS scoped_native_chunks_after_insert
          AFTER INSERT ON scoped_native_chunk_rows BEGIN
              INSERT INTO session_trajectory_chunks_fts(rowid, redacted_text)
@@ -59,6 +54,27 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
              SELECT 1 WHERE NOT omnis_chunk_readable(old.stored_text);
          END;",
     ).map_err(database_error)?;
+    let tracks_legacy_text = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='queue_scoped_search_text_changes')
+                AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='queue_scoped_chunks_after_update')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?;
+    if !tracks_legacy_text {
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS queue_scoped_chunks_after_update;
+             CREATE TRIGGER IF NOT EXISTS queue_scoped_search_text_changes
+             AFTER UPDATE OF stored_text, legacy_search_text ON scoped_native_documents
+             WHEN old.stored_text IS NOT new.stored_text OR old.legacy_search_text IS NOT new.legacy_search_text BEGIN
+                 INSERT INTO scoped_native_chunk_updates SELECT new.id WHERE NOT EXISTS
+                     (SELECT 1 FROM scoped_native_chunk_updates WHERE document_id=new.id);
+             END;
+             INSERT OR IGNORE INTO scoped_native_chunk_updates
+                 SELECT id FROM scoped_native_documents WHERE legacy_search_text IS NOT NULL;",
+        ).map_err(database_error)?;
+    }
     let shared = tx
         .query_row(
             "SELECT instr(sql,'scoped_native_chunk_rows') > 0 FROM sqlite_schema
@@ -85,33 +101,47 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     }
     if !existing {
         tx.execute_batch(
-            "INSERT INTO scoped_native_chunk_updates SELECT id FROM scoped_native_documents",
+            "INSERT OR IGNORE INTO scoped_native_chunk_updates SELECT id FROM scoped_native_documents",
         )
         .map_err(database_error)?;
     }
+    primary::initialize(tx)?;
     flush(tx)
 }
 
 // A batch may rewrite a document more than once. Index its final text in the same transaction.
 pub(crate) fn flush(tx: &Transaction<'_>) -> Result<()> {
+    primary::flush(tx)?;
     let mut pending = tx
         .prepare_cached(
-            "SELECT doc.id, doc.stored_text FROM scoped_native_chunk_updates u
+            "SELECT doc.id, doc.stored_text, doc.legacy_search_text FROM scoped_native_chunk_updates u
          JOIN scoped_native_documents doc ON doc.id = u.document_id LIMIT 1",
         )
         .map_err(database_error)?;
-    while let Some((id, text)) = pending
+    while let Some((id, text, legacy)) = pending
         .query_row([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .optional()
         .map_err(database_error)?
     {
-        insert_chunks_into(
-            tx,
-            &[(id, &text)],
-            "INSERT INTO scoped_native_chunk_rows(document_id, chunk_index, stored_text) VALUES ",
-        )?;
+        tx.execute(
+            "DELETE FROM scoped_native_chunk_rows WHERE document_id=?1",
+            [id],
+        )
+        .map_err(database_error)?;
+        let insert =
+            "INSERT INTO scoped_native_chunk_rows(document_id, chunk_index, stored_text) VALUES ";
+        insert_chunks_into(tx, &[(id, &text)], 0, insert)?;
+        if let Some(legacy) = legacy {
+            let first_legacy_index = i64::try_from(text.len())
+                .map_err(|_| crate::StoreError::TrajectoryBatchTooLarge)?;
+            insert_chunks_into(tx, &[(id, &legacy)], first_legacy_index, insert)?;
+        }
         tx.execute(
             "DELETE FROM scoped_native_chunk_updates WHERE document_id=?1",
             params![id],
@@ -133,14 +163,17 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
         let tx = conn.transaction().unwrap();
         tx.execute_batch(
-            "CREATE TABLE session_trajectories(id INTEGER PRIMARY KEY, redacted_text TEXT, content_hash BLOB);
-             INSERT INTO session_trajectories VALUES(1,'primaryquartz',NULL);
-             CREATE TABLE scoped_native_documents(id INTEGER PRIMARY KEY, stored_text TEXT);",
+            "CREATE TABLE session_trajectories(id INTEGER PRIMARY KEY, redacted_text TEXT, content_hash BLOB, legacy_search_text TEXT);
+             INSERT INTO session_trajectories VALUES(1,'primaryquartz',NULL,NULL);
+             CREATE TABLE scoped_native_documents(id INTEGER PRIMARY KEY, stored_text TEXT, legacy_search_text TEXT);",
         ).unwrap();
         initialize_trajectory_chunk_schema(&tx).unwrap();
         let text = format!("{} archiveddiamond", "漢字 ".repeat(25000));
-        tx.execute("INSERT INTO scoped_native_documents VALUES(1, ?1)", [&text])
-            .unwrap();
+        tx.execute(
+            "INSERT INTO scoped_native_documents(id,stored_text) VALUES(1, ?1)",
+            [&text],
+        )
+        .unwrap();
         initialize(&tx).unwrap();
         let hits = |term| {
             tx.query_row(
@@ -162,6 +195,30 @@ mod tests {
         flush(&tx).unwrap();
         assert_eq!(hits("archiveddiamond"), 0);
         assert_eq!(hits("intermediatequartz"), 0);
+        assert_eq!(hits("scopedsapphire"), 1);
+        tx.execute_batch(
+            "CREATE TRIGGER queue_scoped_chunks_after_update AFTER UPDATE OF stored_text ON scoped_native_documents
+             BEGIN INSERT OR IGNORE INTO scoped_native_chunk_updates VALUES(new.id); END;
+             UPDATE scoped_native_documents SET legacy_search_text='oldgarnet';
+             DELETE FROM scoped_native_chunk_updates;",
+        ).unwrap();
+        initialize(&tx).unwrap();
+        let excerpt: String = tx.query_row(
+            "SELECT snippet(session_trajectory_chunks_fts, 0, '[', ']', '…', 8)
+             FROM session_trajectory_chunks_fts WHERE session_trajectory_chunks_fts MATCH 'oldgarnet'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(excerpt, "[oldgarnet]");
+        assert_eq!(hits("oldgarnet"), 1);
+        assert_eq!(hits("scopedsapphire"), 1);
+        assert_eq!(hits("\"scopedsapphire oldgarnet\""), 0);
+        tx.execute(
+            "UPDATE scoped_native_documents SET legacy_search_text=NULL",
+            [],
+        )
+        .unwrap();
+        flush(&tx).unwrap();
+        assert_eq!(hits("oldgarnet"), 0);
         assert_eq!(hits("scopedsapphire"), 1);
         check();
         tx.execute_batch("SAVEPOINT removal; DELETE FROM scoped_native_documents;")

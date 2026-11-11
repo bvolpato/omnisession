@@ -37,6 +37,16 @@ impl DesktopProjection {
         true
     }
 
+    /// Checks that the previous rows survive in order and every additional row contributes no text.
+    #[must_use]
+    pub fn same_visible_rows(&self, previous: &[Uuid]) -> bool {
+        let mut pending = previous.iter().peekable();
+        self.rows
+            .iter()
+            .all(|(id, range)| pending.next_if_eq(&id).is_some() || range.is_empty())
+            && pending.next().is_none()
+    }
+
     /// Checks whether the new indexed text retains each previously searchable row fragment.
     /// Both texts must come from the same per-event projection and native row identities.
     #[must_use]

@@ -368,7 +368,8 @@ impl CodexAdapter {
             let document = omnis_core::trajectory_search_document(&snapshot);
             let historical_text = document
                 .legacy_utf8_text
-                .as_deref()
+                .as_ref()
+                .and_then(|projection| projection.historical_text())
                 .unwrap_or(&document.text);
             if Sha256::digest(historical_text.as_bytes())[..] != *expected_hash {
                 return Ok(None);

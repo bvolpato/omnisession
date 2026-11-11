@@ -1260,6 +1260,58 @@ fn write_opaque_desktop_step(db: &rusqlite::Connection, index: u32) {
 }
 
 #[test]
+fn antigravity_partial_restore_preserves_a_genuine_joined_word() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let workspace = root.join("workspace");
+    let home = write_synthetic_antigravity_ide(root, &workspace);
+    let db =
+        rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+            .unwrap();
+    let catalog = rusqlite::Connection::open(home.join("conversation_summaries.db")).unwrap();
+    catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT)").unwrap();
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'Search history', 17, '2026-01-01T00:00:00Z', '[]')", [SESSION_ID]).unwrap();
+    let padding = "padding ".repeat(7_999) + "paddingx";
+    for index in 0..16 {
+        write_desktop_step(&db, index, &padding);
+    }
+    let prefix_len = (1 << 20) - 16 * (padding.len() + 2) - 2;
+    let prefix = "fill ".repeat(prefix_len / 5) + &"x".repeat(prefix_len % 5);
+    write_desktop_step(&db, 16, &format!("{prefix}\n\n🦅 goldfinchbluebird"));
+    let search = |word, flags: &[&str]| {
+        let result = successful_json(
+            command(root, &workspace)
+                .env("ANTIGRAVITY_CLI_HOME", &home)
+                .args([
+                    "--json",
+                    "search",
+                    "--all-projects",
+                    "--provider",
+                    "antigravity",
+                    word,
+                ])
+                .args(flags),
+        );
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["match"] == "conversation")
+    };
+    assert!(search("goldfinchbluebird", &[]));
+    write_desktop_step(&db, 16, &format!("{prefix}🦅 goldfinch"));
+    write_desktop_step(&db, 17, "bluebird");
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count=19", [])
+        .unwrap();
+    assert!(search("goldfinchbluebird", &[]));
+    assert!(search("goldfinchbluebird", &["--cached"]));
+    write_desktop_step(&db, 18, "restored");
+    assert!(search("bluebird", &[]));
+    assert!(!search("goldfinchbluebird", &["--cached"]));
+}
+
+#[test]
 fn desktop_partial_recovery_updates_bounded_and_opaque_search_documents() {
     for bounded in [true, false] {
         let temp = tempfile::tempdir().unwrap();

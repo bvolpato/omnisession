@@ -249,6 +249,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
     // This historical schema predates physical source IDs and native document ownership.
     raw.execute_batch(
         "DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
+         DROP TRIGGER clear_replaced_primary_legacy_text;
          DROP TABLE detached_native_documents; DROP TABLE native_search_document_homes;",
     )
     .unwrap();
