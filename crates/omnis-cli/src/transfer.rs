@@ -75,6 +75,8 @@ fn resume_request(
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
@@ -1726,6 +1728,8 @@ fn ask_after_failed_import(
     let source = context.source.provider;
     let fork_in = (source != context.target && runnable_target_providers().contains(&source))
         .then(|| provider_name(source));
+    #[cfg(windows)]
+    crate::provider_launch::release_codex_identity();
     import_choice::ask(
         provider,
         &safe_terminal_line(&format!("{error:#}")),

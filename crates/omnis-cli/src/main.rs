@@ -2837,6 +2837,8 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
 }
 
 fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<FidelityReport> {
+    #[cfg(windows)]
+    let _identity = provider_launch::codex_identity_scope();
     let source = resolve_session_ref(registry, &args.session)?;
     let read = registry
         .read_selected_session_indexed(&source, None)
@@ -3935,6 +3937,8 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     let child = command
         .spawn()
         .with_context(|| format!("launching `{}`", plan.program))?;
+    #[cfg(windows)]
+    provider_launch::release_codex_identity();
     Ok(LaunchedProvider {
         child,
         #[cfg(windows)]

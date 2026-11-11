@@ -1721,8 +1721,11 @@ fn declared_native_codex_target_must_resolve_to_the_primary_binary() {
     fs::remove_file(&primary).unwrap();
     std::os::unix::fs::symlink(&native, &primary).unwrap();
     let source = format!("codex:{CODEX_SESSION_ID}");
+    let linked = fixture.root.join("bin/unknown-release");
+    fs::hard_link(&native, &linked).unwrap();
     for (program, diagnostic) in [
-        (native, REMOTE_CODEX_ERROR),
+        (native.clone(), REMOTE_CODEX_ERROR),
+        (linked.clone(), REMOTE_CODEX_ERROR),
         (
             fixture.root.join("bin/wrapper"),
             "requires the resolved executable",
@@ -1732,6 +1735,11 @@ fn declared_native_codex_target_must_resolve_to_the_primary_binary() {
             "[profiles.routed]\nagent = 'codex'\nprogram = {}\nnative_codex_target = true\nargs = ['--remote', 'origin']\n",
             json!(program)
         ));
+        let listing = codex_plan(&fixture, &["profiles"]);
+        assert_eq!(
+            listing["profiles"][0]["ready"],
+            diagnostic == REMOTE_CODEX_ERROR
+        );
         let output = codex_run(
             &fixture,
             &["resume", &source, "--in", "routed", "--no-fork"],
@@ -1739,6 +1747,20 @@ fn declared_native_codex_target_must_resolve_to_the_primary_binary() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
     }
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\nprogram = {}\nnative_codex_target = true\n",
+        json!(linked)
+    ));
+    fs::remove_file(&native).unwrap();
+    fs::copy("/usr/bin/true", &native).unwrap();
+    let listing = codex_plan(&fixture, &["profiles"]);
+    assert_eq!(listing["profiles"][0]["ready"], false);
+    assert!(
+        listing["profiles"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("requires the resolved executable")
+    );
 }
 
 #[test]
