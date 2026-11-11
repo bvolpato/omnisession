@@ -198,6 +198,19 @@ pub trait ProviderAdapter: Send + Sync {
         self.preview_session(session)
     }
 
+    /// Returns the transcript file when discovery uses its modification time for search freshness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be resolved to its provider-owned file.
+    fn search_timestamp_file(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Reads history for indexing within a full-read byte budget.
     ///
     /// Shared-database adapters measure the selected session's content instead of the database.
@@ -391,6 +404,32 @@ impl AdapterRegistry {
     ) -> Result<CanonicalSnapshot> {
         self.adapter(session.provider)?
             .preview_session_at(session, source_path)
+    }
+
+    /// Reads a source and its indexing time. A file change during the read leaves the time unset.
+    ///
+    /// For adapters without a file clock, the reader supplies the provider's timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be resolved or read.
+    pub fn observe_search_read<T>(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        read: impl FnOnce(&dyn ProviderAdapter, Option<&Path>) -> Result<(T, DateTime<Utc>)>,
+    ) -> Result<(T, Option<DateTime<Utc>>)> {
+        let adapter = self.adapter(session.provider)?;
+        let Some(path) = adapter.search_timestamp_file(session, source_path)? else {
+            let (value, time) = read(adapter, source_path)?;
+            return Ok((value, Some(time)));
+        };
+        let before = support::SnapshotFileStamp::read(&path).ok();
+        let (value, _) = read(adapter, Some(&path))?;
+        let modified = before
+            .filter(|stamp| support::SnapshotFileStamp::read(&path).as_ref().ok() == Some(stamp))
+            .map(|stamp| DateTime::from(stamp.modified));
+        Ok((value, modified))
     }
 
     /// Dispatches a budgeted search indexing read.

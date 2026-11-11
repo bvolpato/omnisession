@@ -1055,6 +1055,15 @@ impl ProviderAdapter for PiAdapter {
         snapshot_from_open_file(session, &path)
     }
 
+    fn search_timestamp_file(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        validate_provider(session, self.provider)?;
+        self.session_path(&session.id, source_path).map(Some)
+    }
+
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         self.preview_session_at(session, None)
     }

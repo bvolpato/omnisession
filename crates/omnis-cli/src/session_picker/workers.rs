@@ -2,10 +2,10 @@ use super::{
     AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
     NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
     PreviewIndexTitle, PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL,
-    Sender, SessionRef, SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store,
-    SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque,
-    cached_picker_entries, env, first_user_message_after, mpsc, normalized_picker_entries,
-    populate_approximate_updated_at, session_preview, thread, trajectory_search_document,
+    Sender, SessionRef, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
+    TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
+    first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
+    session_preview, thread,
 };
 
 use std::sync::{
@@ -13,10 +13,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use omnis_adapters::ProviderAdapter;
+use omnis_adapters::{IndexRead, ProviderAdapter};
 
 use crate::{
-    read_session,
+    read_search_snapshot,
     search_index::{self, IndexCandidate, IndexProgress},
 };
 
@@ -420,28 +420,27 @@ pub(super) fn spawn_provider_update(
 fn read_picker_preview(
     registry: &AdapterRegistry,
     key: &PreviewKey,
-) -> anyhow::Result<(omnis_ir::CanonicalSnapshot, bool)> {
+) -> anyhow::Result<(IndexRead, Option<DateTime<Utc>>)> {
     let session = &key.session;
-    if session.provider == Provider::Imported {
-        return read_session(registry, session).map(|snapshot| (snapshot, true));
-    }
-    if key.continuation_after.is_some() {
-        return registry
-            .read_session(session)
-            .map(|snapshot| (snapshot, true));
-    }
-    if session.provider == Provider::Codex {
+    let full_read = key.continuation_after.is_some() || session.provider == Provider::Imported;
+    if !full_read && session.provider == Provider::Codex {
         let path = registry
             .find_native_session(session.provider, &session.id)?
             .and_then(|native| native.source_path)
             .ok_or_else(|| anyhow::anyhow!("Codex rollout was not found"))?;
-        return registry
-            .index_session(session, Some(&path), search_index::FULL_READ_SOURCE_BYTES)
-            .map(|read| (read.snapshot, read.source_complete));
+        let read =
+            registry.index_session(session, Some(&path), search_index::FULL_READ_SOURCE_BYTES)?;
+        let source_time = read.snapshot.captured_at;
+        return Ok((read, Some(source_time)));
     }
-    registry
-        .preview_session(session)
-        .map(|snapshot| (snapshot, false))
+    let (snapshot, source_time) = read_search_snapshot(registry, session, full_read)?;
+    Ok((
+        IndexRead {
+            snapshot,
+            source_complete: full_read,
+        },
+        source_time,
+    ))
 }
 
 pub(super) fn spawn_preview_updates(
@@ -489,22 +488,19 @@ pub(super) fn spawn_preview_updates(
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
-                    let imported = key.session.provider == Provider::Imported;
                     let read = read_picker_preview(&registry, &key);
-                    read.map_or(PreviewValue::Unavailable, |(snapshot, complete)| {
-                        if let Some((store, guard)) = writer {
-                            let document = trajectory_search_document(&snapshot);
+                    read.map_or(PreviewValue::Unavailable, |(read, source_time)| {
+                        let IndexRead {
+                            snapshot,
+                            source_complete: complete,
+                        } = read;
+                        if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
                             match crate::store_search_document(
                                 store,
                                 &key.session,
                                 &snapshot,
-                                &document,
                                 complete,
-                                if imported {
-                                    SessionTrajectoryOrigin::ImportedBundle
-                                } else {
-                                    SessionTrajectoryOrigin::Native
-                                },
+                                source_time,
                                 guard,
                             ) {
                                 Ok(title) => indexed_title = PreviewIndexTitle::Written(title),

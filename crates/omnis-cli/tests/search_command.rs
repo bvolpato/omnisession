@@ -83,6 +83,129 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
 }
 
 #[test]
+fn upgraded_search_documents_refresh_on_direct_reads_and_for_imported_bundles() {
+    let fixture = Fixture::new();
+    let source = format!("claude:{CLAUDE_ID}");
+    let bundle_path = fixture.root.join("bundle.json");
+    let bundle_path = bundle_path.to_str().unwrap();
+    fixture.run_json(&["index", "--provider", "claude"]);
+    fixture.run_json(&["export", &source, "--output", bundle_path]);
+    let receipt = fixture.run_json(&["import", bundle_path]);
+    let imported = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+    let other_bundle = fixture.root.join("other-bundle.json");
+    let receipt = fixture.run_json(&[
+        "export",
+        &format!("codex:{OTHER_CODEX_ID}"),
+        "--output",
+        other_bundle.to_str().unwrap(),
+    ]);
+    let other_import = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+
+    let database = fixture.root.join("state/store.sqlite3");
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute("UPDATE session_trajectories SET document_version = 0", [])
+        .unwrap();
+    let store = omnis_store::Store::open(&database).unwrap();
+    for (session, state) in store.trajectory_index_states().unwrap() {
+        store
+            .upsert_session_trajectory(&session, "oldprojectiononly", state.source_updated_at, true)
+            .unwrap();
+    }
+    drop(store);
+
+    fixture.run_json(&["index", "--provider", "codex"]);
+    fixture.run_json(&["list", "--provider", "codex"]);
+    fixture.run_json(&["show", &format!("codex:{CODEX_ID}")]);
+    let scoped = fixture.search_json(&["oldprojectiononly", "--no-index", "--provider", "codex"]);
+    assert_eq!(scoped["index"]["indexed"], 0);
+    let existing =
+        fixture.search_json(&["oldprojectiononly", "--no-index", "--provider", "imported"]);
+    assert_eq!(result_sessions(&existing), [imported.as_str()]);
+    let cached = |query| result_sessions(&fixture.search_json(&[query, "--cached"]));
+    assert_eq!(cached("zebracorn"), [imported.as_str()]);
+    assert_eq!(cached("oldprojectiononly"), [source.as_str()]);
+    let other = fixture.search_json(&[
+        "oldprojectiononly",
+        "--no-index",
+        "--provider",
+        "imported",
+        "--all-projects",
+    ]);
+    assert_eq!(result_sessions(&other), [other_import]);
+    fixture.run_json(&["show", &source]);
+    let mut matches = cached("zebracorn");
+    matches.sort();
+    assert_eq!(matches, [source, imported]);
+    assert!(cached("oldprojectiononly").is_empty());
+}
+
+#[test]
+fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
+    let fixture = Fixture::new();
+    let source = format!("claude:{CLAUDE_ID}");
+    let file = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    let file_time = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::create_dir(fixture.root.join("state")).unwrap();
+    let database = fixture.root.join("state/store.sqlite3");
+    let store = omnis_store::Store::open(&database).unwrap();
+    let session = omnis_ir::SessionRef::new(omnis_ir::Provider::Claude, CLAUDE_ID);
+    let preview = "sampledpreview";
+    store
+        .upsert_trajectory_document(
+            &session,
+            &omnis_store::TrajectoryDocument {
+                redacted_text: preview,
+                indexed_byte_count: preview.len(),
+                source_byte_count: preview.len(),
+                source_updated_at: file_time.into(),
+                truncation_strategy: "none",
+                source_complete: false,
+                origin: omnis_store::SessionTrajectoryOrigin::Native,
+                document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+                derived_title: None,
+            },
+        )
+        .unwrap();
+    fixture.run_json(&["show", &source]);
+    assert_eq!(
+        store.search_session_trajectories("zebracorn", 10).unwrap(),
+        std::slice::from_ref(&session)
+    );
+    assert!(
+        store
+            .search_session_trajectories(preview, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let restored = fs::read_to_string(&file)
+        .unwrap()
+        .replace("zebracorn", "backdatedfixture");
+    fs::write(&file, restored).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(file_time - std::time::Duration::from_secs(86_400))
+        .unwrap();
+    fixture.run_json(&["show", &source]);
+    assert_eq!(
+        store
+            .search_session_trajectories("backdatedfixture", 10)
+            .unwrap(),
+        [session]
+    );
+    assert!(
+        store
+            .search_session_trajectories("zebracorn", 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn incomplete_discovery_preserves_cached_metadata_and_history() {
     let fixture = Fixture::new();
     let index = || {
@@ -500,6 +623,16 @@ impl Fixture {
             command.env(variable, self.root.join("missing").join(variable));
         }
         command
+    }
+
+    fn run_json(&self, args: &[&str]) -> Value {
+        let output = self.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn search(&self, args: &[&str]) -> Output {

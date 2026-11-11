@@ -31,12 +31,11 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    session_preview, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
-    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin,
-    SessionTrajectorySearchPage, Store,
+    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

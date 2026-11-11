@@ -245,8 +245,11 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
-            WHEN ?15 AND excluded.source_complete AND excluded.truncation_strategy IN (
+            WHEN excluded.source_complete AND excluded.truncation_strategy IN (
                 'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
+            ) AND (
+                ?15 OR excluded.document_version > session_trajectories.document_version
+                OR session_trajectories.source_complete = 0
             ) THEN excluded.derived_title
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
@@ -491,6 +494,15 @@ pub enum TrajectorySourceGuard {
 }
 
 impl TrajectorySourceGuard {
+    /// Whether a native reader identifies a search source by its file modification time.
+    #[must_use]
+    pub const fn uses_file_time(provider: Provider) -> bool {
+        matches!(
+            provider,
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::OhMyPi
+        )
+    }
+
     fn check(
         self,
         transaction: &Transaction<'_>,
@@ -1063,6 +1075,19 @@ impl Store {
     ///
     /// Returns an error when bundle index state cannot be read. Malformed IDs are skipped.
     pub fn bundle_ids_missing_imported_source(&self) -> Result<Vec<Uuid>> {
+        self.bundle_ids_needing_imported_source(Some(0))
+    }
+
+    /// Returns bundle UUIDs with missing metadata. With a document version, also includes
+    /// bundles whose search document is missing or older than that version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored index cannot be read.
+    pub fn bundle_ids_needing_imported_source(
+        &self,
+        document_version: Option<u32>,
+    ) -> Result<Vec<Uuid>> {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
@@ -1073,17 +1098,17 @@ impl Store {
                     SELECT 1 FROM session_index
                     WHERE provider = 'imported'
                       AND session_id = bundles.bundle_id
-                ) OR NOT EXISTS (
+                ) OR (?1 IS NOT NULL AND NOT EXISTS (
                     SELECT 1 FROM session_trajectories
                     WHERE provider = 'imported'
-                      AND session_id = bundles.bundle_id
-                )
+                      AND session_id = bundles.bundle_id AND document_version >= ?1
+                ))
                 ORDER BY bundles.bundle_id
                 ",
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([document_version], |row| row.get::<_, String>(0))
             .map_err(database_error)?;
         let values = rows
             .collect::<std::result::Result<Vec<String>, _>>()
@@ -1779,7 +1804,7 @@ impl Store {
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
-                    session.provider == Provider::Codex,
+                    TrajectorySourceGuard::uses_file_time(session.provider),
                 ],
                 |row| row.get::<_, bool>(0),
             )
@@ -1812,7 +1837,7 @@ impl Store {
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
-                    session.provider == Provider::Codex,
+                    TrajectorySourceGuard::uses_file_time(session.provider),
                 ],
                 |row| row.get::<_, bool>(0),
             )
@@ -4317,6 +4342,24 @@ mod tests {
                 .get(&session)
                 .map(String::as_str),
             Some("Synthetic title")
+        );
+        let mut incomplete = document("partial projection", 3, None, later);
+        incomplete.source_complete = false;
+        store
+            .upsert_trajectory_document(&session, &incomplete)
+            .expect("rebuild preview");
+        assert_eq!(
+            store.trajectory_titles().expect("preview title")[&session],
+            "Synthetic title"
+        );
+        store
+            .upsert_trajectory_document(&session, &document("updated projection", 3, None, later))
+            .expect("rebuild without a title");
+        assert!(
+            !store
+                .trajectory_titles()
+                .expect("titles")
+                .contains_key(&session)
         );
     }
 

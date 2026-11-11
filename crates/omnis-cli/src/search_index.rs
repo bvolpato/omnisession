@@ -88,14 +88,13 @@ pub(crate) struct IndexSummary {
     pub(crate) stopped: bool,
 }
 
-// Codex reports the rollout's modification time for both discovery and reads. Restoring a
-// backup can move it backwards. Other adapters can use different clocks for the two paths.
+// Restoring a transcript can move its modification time backwards.
 pub(crate) fn source_time_changed(
     provider: Provider,
     current: DateTime<Utc>,
     cached: DateTime<Utc>,
 ) -> bool {
-    if provider == Provider::Codex {
+    if TrajectorySourceGuard::uses_file_time(provider) {
         current.timestamp_millis() != cached.timestamp_millis()
     } else {
         current.timestamp_millis() > cached.timestamp_millis()
@@ -106,7 +105,7 @@ pub(crate) fn source_guard(
     provider: Provider,
     prior: Option<&TrajectoryIndexState>,
 ) -> TrajectorySourceGuard {
-    if provider == Provider::Codex {
+    if TrajectorySourceGuard::uses_file_time(provider) {
         TrajectorySourceGuard::Observed(prior.map(|state| state.source_updated_at))
     } else {
         TrajectorySourceGuard::NewerSource
@@ -117,7 +116,7 @@ pub(crate) fn observe_source(
     store: &Store,
     session: &SessionRef,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
-    if session.provider == Provider::Codex {
+    if TrajectorySourceGuard::uses_file_time(session.provider) {
         Ok(source_guard(
             session.provider,
             store.trajectory_index_state(session)?.as_ref(),
@@ -185,7 +184,7 @@ pub(crate) fn ordered_candidates(
     sessions: &[NativeSession],
     current_project: Option<&Path>,
 ) -> Vec<IndexCandidate> {
-    let mut workspace_matches = HashMap::<&Path, bool>::new();
+    let mut workspace_matches = HashMap::new();
     let mut ordered = sessions
         .iter()
         .filter_map(|session| {
@@ -194,7 +193,7 @@ pub(crate) fn ordered_candidates(
                 (current_project, session.project_path.as_deref())
             {
                 *workspace_matches
-                    .entry(path)
+                    .entry(path.as_os_str())
                     .or_insert_with(|| workspace_paths_match(path, project))
             } else {
                 false
@@ -593,31 +592,41 @@ fn prepare_session(
     guard: TrajectorySourceGuard,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
+    let (read, source_updated_at) = if imported {
+        let snapshot = read_session(registry, &candidate.session)?;
+        let updated_at = snapshot.captured_at;
+        (
+            IndexRead {
+                snapshot,
+                source_complete: true,
+            },
+            Some(updated_at),
+        )
+    } else {
+        registry.observe_search_read(
+            &candidate.session,
+            candidate.source_path.as_deref(),
+            |adapter, path| {
+                let read =
+                    adapter.index_session(&candidate.session, path, FULL_READ_SOURCE_BYTES)?;
+                let captured = read.snapshot.captured_at;
+                // Codex observes the selected rollout again when it reads. Discovery may predate a restore.
+                let updated_at = if candidate.session.provider == Provider::Codex {
+                    captured
+                } else {
+                    candidate.updated_at.unwrap_or(captured).max(captured)
+                };
+                Ok((read, updated_at))
+            },
+        )?
+    };
     let IndexRead {
         snapshot,
         source_complete,
-    } = if imported {
-        read_session(registry, &candidate.session).map(|snapshot| IndexRead {
-            snapshot,
-            source_complete: true,
-        })
-    } else {
-        registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            FULL_READ_SOURCE_BYTES,
-        )
-    }?;
+    } = read;
     let document = trajectory_search_document(&snapshot);
-    // Codex reads the rollout's actual mtime again. Discovery may predate a restore.
-    let source_updated_at = if candidate.session.provider == Provider::Codex {
-        snapshot.captured_at
-    } else {
-        candidate
-            .updated_at
-            .unwrap_or(snapshot.captured_at)
-            .max(snapshot.captured_at)
-    };
+    let source_updated_at = source_updated_at
+        .ok_or_else(|| anyhow::anyhow!("transcript changed during search read"))?;
     let origin = if imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
@@ -931,11 +940,14 @@ mod tests {
             source_path: Some(PathBuf::from("/synthetic")),
         };
 
+        let mut network_spelling = std::ffi::OsString::from("//");
+        network_spelling.push(current.strip_prefix("/").unwrap_or(&current));
         let ordered = ordered_candidates(
             &[
                 session("current-older", &current, 30),
                 session("other-newest", &other, 1),
                 session("current-newer", &current, 5),
+                session("network-newest", Path::new(&network_spelling), 0),
             ],
             Some(&current),
         );
@@ -945,7 +957,12 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.session.id.as_str())
                 .collect::<Vec<_>>(),
-            ["current-newer", "current-older", "other-newest"]
+            [
+                "current-newer",
+                "current-older",
+                "network-newest",
+                "other-newest"
+            ]
         );
     }
 
