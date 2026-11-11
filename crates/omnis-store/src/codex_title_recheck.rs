@@ -1,0 +1,170 @@
+use super::{
+    LocalOpenerEvidence, PreparedTrajectoryWrite, Result, SelectedMetadata,
+    SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, database_error,
+};
+use omnis_ir::{Provider, SessionRef};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use uuid::Uuid;
+
+// The catalog can advance to an appended revision while the old document still awaits its read.
+const MATCHING_PROOF: &str = "
+    FROM legacy_codex_title_proofs p
+    JOIN session_trajectories t ON t.id=p.trajectory_id
+    JOIN session_index c ON c.provider=t.provider AND c.session_id=t.session_id
+    WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native' AND NOT t.protected_by_bundle
+      AND t.source_file_id=?2 AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id
+      AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown' AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
+      AND t.derived_title=p.previous_title AND c.title IS NULL AND c.source_file_id=p.source_file_id
+      AND c.source_contents_id IS NOT NULL";
+
+pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_codex_title_proofs(
+            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id)=16),
+            source_contents_id BLOB NOT NULL CHECK(length(source_contents_id)=16),
+            previous_title TEXT NOT NULL);",
+        )
+        .map_err(database_error)?;
+    let has_origin: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_trajectories') WHERE name='derived_title_is_local_opener')",
+        [], |row| row.get(0),
+    ).map_err(database_error)?;
+    if has_origin {
+        transaction.execute_batch(
+            "INSERT OR IGNORE INTO legacy_codex_title_proofs
+             SELECT t.id,t.source_file_id,t.source_contents_id,t.derived_title
+             FROM session_trajectories t JOIN session_index c ON c.provider=t.provider AND c.session_id=t.session_id
+             WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle AND t.document_version=6
+               AND t.source_file_id=c.source_file_id AND t.source_contents_id=c.source_contents_id AND c.title IS NULL
+               AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown' AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
+               AND length(t.derived_title)>0;"
+        ).map_err(database_error)?;
+    }
+    for (name, operation) in [
+        ("insert", "INSERT"),
+        (
+            "update",
+            "UPDATE OF title,source_file_id,source_contents_id",
+        ),
+    ] {
+        transaction.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS legacy_codex_title_catalog_{name} AFTER {operation} ON session_index
+             WHEN NEW.provider='codex' AND EXISTS(SELECT 1 FROM legacy_codex_title_proofs)
+             BEGIN DELETE FROM legacy_codex_title_proofs WHERE trajectory_id=(
+                 SELECT id FROM session_trajectories WHERE provider=NEW.provider AND session_id=NEW.session_id)
+               AND (NEW.title IS NOT NULL OR NEW.source_file_id IS NOT source_file_id OR NEW.source_contents_id IS NULL);
+             END;"
+        )).map_err(database_error)?;
+    }
+    Ok(())
+}
+
+pub(super) fn candidate(
+    connection: &Connection,
+    session: &SessionRef,
+    file: Uuid,
+) -> Result<Option<String>> {
+    if session.provider != Provider::Codex {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            &format!("SELECT p.previous_title {MATCHING_PROOF}"),
+            params![session.id, file.into_bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+pub(super) fn accept(
+    transaction: &Transaction<'_>,
+    write: &PreparedTrajectoryWrite<'_, '_>,
+    selected: Option<SelectedMetadata<'_>>,
+) -> Result<()> {
+    let document = &write.document;
+    if !document.local_opener.rechecks_legacy_title() {
+        return Ok(());
+    }
+    let TrajectorySourceGuard::Observed(Some(observed)) = write.guard else {
+        return Err(StoreError::TrajectorySourceChanged);
+    };
+    let incoming = document.source_revision;
+    let old = observed.source_revision;
+    let (Some(file), Some(contents), Some(old_contents), Some(prior)) = (
+        incoming.file,
+        incoming.contents,
+        old.contents,
+        document.withdrawn_title,
+    ) else {
+        return Err(StoreError::TrajectorySourceChanged);
+    };
+    if write.session.provider != Provider::Codex
+        || document.origin != SessionTrajectoryOrigin::Native
+        || old.file != Some(file)
+        || old.missing_ancestor.is_some()
+        || incoming.missing_ancestor.is_some()
+        || selected.is_some_and(|metadata| metadata.selected.title.is_some())
+    {
+        return Err(StoreError::TrajectorySourceChanged);
+    }
+    let sql = format!(
+        "UPDATE session_trajectories SET derived_title_is_local_opener=NULL WHERE id=(
+           SELECT p.trajectory_id {MATCHING_PROOF} AND p.source_contents_id=?3 AND p.previous_title=?4
+           AND t.source_updated_at=?5 AND t.document_version<=?6
+           AND (c.source_contents_id=p.source_contents_id OR c.source_contents_id=?7))"
+    );
+    let changed = transaction
+        .execute(
+            &sql,
+            params![
+                write.session.id,
+                file.into_bytes(),
+                old_contents.into_bytes(),
+                prior,
+                observed.source_updated_at.timestamp_millis(),
+                document.document_version,
+                contents.into_bytes(),
+            ],
+        )
+        .map_err(database_error)?;
+    if changed == 0 {
+        return Err(StoreError::TrajectorySourceChanged);
+    }
+    Ok(())
+}
+
+pub(super) fn retire(
+    transaction: &Transaction<'_>,
+    write: &PreparedTrajectoryWrite<'_, '_>,
+) -> Result<()> {
+    let document = &write.document;
+    if write.session.provider != Provider::Codex {
+        return Ok(());
+    }
+    let named = document.local_opener == LocalOpenerEvidence::Unknown
+        && document.title_is_verified
+        && document.derived_title.is_some()
+        && document.origin == SessionTrajectoryOrigin::Native;
+    let revision = document.source_revision;
+    transaction.prepare_cached(
+        "DELETE FROM legacy_codex_title_proofs AS p WHERE trajectory_id=(
+             SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
+         AND (?2 OR NOT EXISTS (SELECT 1 FROM session_trajectories t WHERE t.id=p.trajectory_id
+              AND t.origin='native' AND NOT t.protected_by_bundle AND t.derived_title=p.previous_title
+              AND t.derived_title_is_local_opener IS 0 AND t.missing_ancestor_id IS NULL
+              AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id)
+              OR (?3 AND p.source_file_id=?4 AND p.source_contents_id=?5))"
+    ).map_err(database_error)?.execute(
+        params![
+            write.session.id,
+            document.local_opener.rechecks_legacy_title(),
+            named,
+            revision.file.map(Uuid::into_bytes),
+            revision.contents.map(Uuid::into_bytes),
+        ],
+    ).map_err(database_error)?;
+    Ok(())
+}

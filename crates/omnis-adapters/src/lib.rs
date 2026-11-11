@@ -17,7 +17,7 @@ mod support;
 mod test_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -274,6 +274,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// session can be treated as deleted only after complete discovery. The default preserves it.
     fn discovery_is_complete(&self) -> bool {
         false
+    }
+
+    /// Returns the cached Codex sessions that their recorded rollout selections rule out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider's current selections cannot be checked.
+    fn unavailable_codex_rollouts(
+        &self,
+        _prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
     }
 
     /// Reads one provider-native session into canonical events.

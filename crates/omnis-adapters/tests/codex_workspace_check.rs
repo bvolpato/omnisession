@@ -58,6 +58,106 @@ fn selected_workspace_retains_only_known_directories_across_encodings() -> Resul
 }
 
 #[test]
+fn workspace_settings_belong_to_the_thread_and_survive_turn_rollback() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let id = "a4444444-4444-4444-8444-444444444444";
+    let creation = root.path().join("creation");
+    let saved = root.path().join("saved");
+    let header = json!({"type":"session_meta","payload":{"id":id,"cwd":creation,"git":{"branch":"creation"}}});
+    let context = json!({"type":"turn_context","payload":{"cwd":creation}});
+    let request = json!({"type":"event_msg","payload":{"type":"user_message","message":"request"}});
+    let rollback =
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+    let settings = |owner: &str, cwd: &Path| {
+        json!({"type":"event_msg","payload":{
+            "type":"thread_settings_applied", "thread_id":owner, "thread_settings":{
+                "cwd":cwd, "model":"fixture", "model_provider_id":"synthetic",
+                "approval_policy":"never", "approvals_reviewer":"user", "permission_profile":{"type":"disabled"},
+                "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}
+            }
+        }})
+    };
+    let owned = settings(id, &saved);
+    let alternate_id = id.replace('-', "").to_ascii_uppercase();
+    let alternate_owner = settings(&alternate_id, &saved);
+    let foreign = settings("55555555-5555-4555-8555-555555555555", &saved);
+    let replacement = settings(id, &creation);
+    let mut invalid = owned.clone();
+    invalid["payload"]["thread_settings"] = json!({"cwd":saved});
+    let torn_turn = r#"{"type":"turn_context","payload":"#;
+    let torn_settings =
+        r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":"#;
+    let torn_alternate = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"thread_settings_applied","thread_id":"{alternate_id}","thread_settings":"#
+    );
+    let cases = [
+        (
+            format!("{context}\n{request}\n{owned}"),
+            Some(saved.as_path()),
+        ),
+        (
+            format!("{owned}\n{context}\n{request}\n{rollback}"),
+            Some(saved.as_path()),
+        ),
+        (
+            format!("{context}\n{request}\n{owned}\n{replacement}\n{rollback}"),
+            Some(creation.as_path()),
+        ),
+        (
+            format!("{owned}\n{foreign}\n{context}"),
+            Some(saved.as_path()),
+        ),
+        (format!("{foreign}\n{context}"), Some(creation.as_path())),
+        (
+            format!("{alternate_owner}\n{context}"),
+            Some(saved.as_path()),
+        ),
+        (format!("{owned}\n{invalid}\n{context}"), None),
+        (format!("{owned}\n{torn_alternate}\n{context}"), None),
+        (
+            format!("{owned}\n{torn_turn}\n{context}"),
+            Some(saved.as_path()),
+        ),
+        (format!("{owned}\n{torn_settings}\n{context}"), None),
+        (
+            format!("{torn_settings}\n{owned}\n{context}"),
+            Some(saved.as_path()),
+        ),
+    ];
+    let session = SessionRef::new(Provider::Codex, id);
+    for ext in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let home = root.path().join(ext);
+        let folder = home.join("sessions");
+        fs::create_dir_all(&folder)?;
+        let path = folder.join(format!("rollout-{id}.{ext}"));
+        let adapter = CodexAdapter::with_root(&home);
+        for (rows, expected) in &cases {
+            let revision = write_rollout(&path, &format!("{header}\n{rows}\n"))?;
+            let (directory, startup) = CodexAdapter::rollout_workspaces(&session, &path, revision)?;
+            assert_eq!(directory.as_deref(), *expected, "{ext}: {rows}");
+            assert!(startup.is_none(), "{ext}: {rows}");
+            let sampled = adapter.index_session(&session, Some(&path), 1)?;
+            assert_eq!(
+                sampled.workspace_projection,
+                CodexWorkspaceProjection::Observed(directory)
+            );
+            for snapshot in [sampled.snapshot, adapter.read_session(&session)?] {
+                assert_eq!(
+                    snapshot.workspace.current_dir,
+                    expected.unwrap_or(Path::new("")),
+                    "{ext}: {rows}"
+                );
+                assert_eq!(
+                    snapshot.workspace.git.branch.as_deref(),
+                    (*expected == Some(creation.as_path())).then_some("creation")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn selected_workspace_checks_the_source_and_uses_surviving_turns() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let session = SessionRef::new(Provider::Codex, ID);

@@ -23,7 +23,7 @@ impl CodexAdapter {
             .then(|| omnis_store::CodexWorkspace::discovery_index(None).ok())
             .flatten()
             .unwrap_or_default();
-        let cached_header = self.listing.get().is_some();
+        let (listing, cached_header) = self.listing(true);
         let mut sessions = Vec::new();
         let mut unknown = Vec::new();
         let mut matches = HashMap::<OsString, bool>::new();
@@ -39,7 +39,7 @@ impl CodexAdapter {
                 })
             })
         };
-        for raw in self.sessions() {
+        for raw in &listing.sessions {
             let mut session = raw.native_session();
             let verified = session.apply_codex_workspace_index(&workspaces, cached_header);
             if in_project(session.project_path.as_deref()) {
@@ -73,6 +73,7 @@ impl CodexAdapter {
         let mut unchecked = 0;
         for session in unknown {
             if let Some(revision) = session.source_revision
+                && !workspaces.needs_recheck(revision)
                 && let Some(hint) = revision.file.and_then(|file| hints.get(&file))
                 && revision.matches_file_contents(hint.source_revision)
                 && in_project(hint.project_path.as_deref())
@@ -138,6 +139,7 @@ impl WorkspaceProbe {
         if session.project_path.is_some()
             && memchr::memmem::find(&bytes, b"turn_context").is_none()
             && memchr::memmem::find(&bytes, b"history_base").is_none()
+            && memchr::memmem::find(&bytes, b"thread_settings_applied").is_none()
             && memchr::memmem::find(&bytes, b"\\u").is_none()
         {
             return Ok(None);
@@ -147,6 +149,8 @@ impl WorkspaceProbe {
         builder.plan_preview(None);
         let mut inherited = false;
         let skipped = rollout_file::read_records(bytes.as_slice(), |record, skipped| {
+            history.settings.observe_gaps(skipped);
+            history.settings.observe(&session.session.id, &record);
             history.observe_workspace_gaps(skipped.workspace_gaps());
             if history.records_seen == 0 {
                 ensure!(
@@ -170,9 +174,11 @@ impl WorkspaceProbe {
             }
             Ok(())
         })?;
+        history.settings.observe_gaps(skipped);
         history.observe_workspace_gaps(skipped.workspace_gaps());
         ensure!(
             !inherited
+                || history.settings.has_owned()
                 || history
                     .workspace_record
                     .is_some_and(|position| position > 1),
@@ -186,6 +192,6 @@ impl WorkspaceProbe {
                         .is_some_and(|actual| actual.matches_file_contents(expected))),
             "Codex rollout changed during workspace search"
         );
-        Ok(history.project_path)
+        Ok(history.settings.directory(history.project_path))
     }
 }

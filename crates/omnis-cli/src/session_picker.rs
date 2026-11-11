@@ -565,6 +565,21 @@ impl PickerState {
         self.notice = None;
     }
 
+    fn finish_delete(&mut self, session: &SessionRef, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                self.remove_session(session);
+                self.delete_dialog = None;
+                self.notice = Some(format!("Deleted source session {session}"));
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.delete_dialog {
+                    dialog.phase = DeletePhase::Failed(safe_terminal_line(&error.to_string()));
+                }
+            }
+        }
+    }
+
     fn remove_session(&mut self, session: &SessionRef) {
         let key = session.to_string();
         self.deleted_sessions.insert(key.clone());
@@ -1503,16 +1518,12 @@ fn require_terminal(otherwise: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn pick_session(
+pub(super) fn pick_session(
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &crate::ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    initial_provider: Option<Provider>,
-    all_projects: bool,
     materialize: Option<CanMaterialize<'_>>,
-    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
@@ -1524,7 +1535,13 @@ pub fn pick_session(
     theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
-    let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    let target = args.target;
+    let mut state = PickerState::new(
+        Vec::new(),
+        current_project,
+        args.source_provider,
+        args.all_projects,
+    );
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
@@ -1578,30 +1595,17 @@ pub fn pick_session(
                     .unwrap_or(current_project)
                     .to_path_buf();
                 render_state.render(&state, target, &warnings, pending.len())?;
-                match delete_session(&session, Some(&workspace)) {
-                    Ok(()) => {
-                        state.remove_session(&session);
-                        state.delete_dialog = None;
-                        state.notice = Some(format!("Deleted source session {session}"));
-                    }
-                    Err(error) => {
-                        let message = safe_terminal_line(&error.to_string());
-                        if let Some(dialog) = &mut state.delete_dialog {
-                            dialog.phase = DeletePhase::Failed(message);
-                        }
-                    }
-                }
+                state.finish_delete(&session, delete_session(&session, Some(&workspace)));
                 render_state.invalidate();
                 dirty = true;
             }
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
-                target,
+                args,
                 available_targets,
                 new_session_targets,
                 materialize,
-                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1628,12 +1632,13 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &crate::ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
     materialize: Option<CanMaterialize<'_>>,
-    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
+    let target = args.target;
+    let requested_mode = args.mode;
     if state.new_session_selected() {
         if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
@@ -1688,18 +1693,22 @@ fn select_picker_row(
     )? {
         TargetOutcome::Selected(choice) => {
             // An imported row can carry another machine's workspace, so never resolve a network path.
-            let workspace_override = if project_path
-                .as_deref()
-                .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
-            {
-                None
-            } else {
-                match pick_workspace(&session, project_path.as_deref(), current_project)? {
-                    WorkspaceOutcome::Selected(path) => Some(path),
-                    WorkspaceOutcome::Back => return Ok(RowSelection::Back),
-                    WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
-                }
-            };
+            let workspace_override =
+                if session.provider == Provider::Codex && args.allow_workspace_mismatch {
+                    Some(std::env::current_dir().context("reading the chosen target directory")?)
+                } else if project_path.as_deref().is_some_and(|path| {
+                    (session.provider != Provider::Codex || path.is_absolute())
+                        && !omnis_core::may_reach_network(path)
+                        && path.is_dir()
+                }) {
+                    None
+                } else {
+                    match pick_workspace(&session, project_path.as_deref(), current_project)? {
+                        WorkspaceOutcome::Selected(path) => Some(path),
+                        WorkspaceOutcome::Back => return Ok(RowSelection::Back),
+                        WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+                    }
+                };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
                     source_revision,
@@ -3518,8 +3527,15 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], None, None)
-            .expect("row selection");
+        let selection = select_picker_row(
+            &state,
+            temporary.path(),
+            &crate::ResumeArgs::default(),
+            &[],
+            &[],
+            None,
+        )
+        .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
     }

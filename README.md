@@ -285,6 +285,8 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 
 If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
 
+If a Codex source has no verified working directory, run the fork again from the directory where you want to continue and pass `--allow-workspace-mismatch`. This also applies when the new session opens in another agent.
+
 If a native cross-agent import or a Codex archive restore fails and its target may still exist or appear later, OmniSession keeps the private handoff and prints its path. A surviving session can still open the file linked in its imported history. If OmniSession reports a target session ID, check that session before retrying. You can also give the saved path to the next agent when you continue manually.
 
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.

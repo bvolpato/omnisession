@@ -317,6 +317,9 @@ fn failure_is_current(
 /// Whether a read failed only because a database was busy or a source changed while it was read,
 /// so a later pass can succeed even when the source time does not move.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
+    if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error) {
+        return true;
+    }
     error.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::Error>()
@@ -998,36 +1001,56 @@ impl IndexedTitle {
             self.uncertain_rollback,
             RollbackTitle::UnknownAfterWithdrawal(_)
         );
-        if !self.check_local_rollback && !uncertain {
-            return Ok(());
-        }
         let Some(file) = revision.file else {
             return Ok(());
         };
-        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
-            return Ok(());
-        };
-        let selected_path = || -> Result<PathBuf> {
+        let selected_path = |require_unnamed: bool| -> Result<PathBuf> {
             registry
                 .find_native_session(Provider::Codex, &session.id)?
                 .filter(|selected| {
-                    selected
-                        .source_revision
-                        .is_some_and(|selected| selected.matches_file_contents(revision))
+                    (!require_unnamed || selected.title.is_none())
+                        && selected
+                            .source_revision
+                            .is_some_and(|selected| selected.matches_file_contents(revision))
                 })
                 .and_then(|selected| selected.source_path)
                 .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
+        };
+        if (uncertain || self.local_opener == LocalOpenerEvidence::Current)
+            && let Some(prior) = store.legacy_codex_opener_candidate(session, file)?
+            && omnis_adapters::CodexAdapter::verify_legacy_local_opener(
+                &selected_path(true)?,
+                session,
+                revision,
+                &prior,
+            )?
+        {
+            selected_path(true)?;
+            self.withdrawn = Some(prior);
+            self.local_opener = if uncertain {
+                LocalOpenerEvidence::RecheckedWithdrawn
+            } else {
+                LocalOpenerEvidence::RecheckedCurrent
+            };
+            return Ok(());
+        }
+        if !self.check_local_rollback && !uncertain {
+            return Ok(());
+        }
+        let Some(prior) = store.withdrawable_trajectory_title(session, file, uncertain)? else {
+            return Ok(());
         };
         if uncertain {
             if self.uncertain_rollback.withdraws(&prior)
                 || (self.uncertain_rollback.needs_withdrawal_check(&prior)
                     && omnis_adapters::CodexAdapter::verify_earlier_opener_withdrawal(
-                        &selected_path()?,
+                        &selected_path(false)?,
                         session,
                         revision,
                         &prior,
                     )?)
             {
+                selected_path(false)?;
                 self.withdrawn = Some(prior);
                 self.local_opener = LocalOpenerEvidence::Withdrawn;
             }
@@ -1038,11 +1061,12 @@ impl IndexedTitle {
             return Ok(());
         }
         if omnis_adapters::CodexAdapter::rollout_withdrew_search_title(
-            &selected_path()?,
+            &selected_path(false)?,
             session,
             revision,
             &prior,
         )? {
+            selected_path(false)?;
             if matches_projection {
                 self.current = None;
             }

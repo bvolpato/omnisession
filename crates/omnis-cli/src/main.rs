@@ -171,7 +171,16 @@ impl IndexedSessionReader for AdapterRegistry {
             };
             Ok((store, prior, observation))
         });
-        let read = full_index_read(self, session, expected)?;
+        let read = full_index_read(self, session, expected).inspect_err(|error| {
+            if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error)
+                && let Ok((store, _, Some(observed))) = &cache
+                && let Some(metadata) = &observed.metadata
+                && let Err(error) =
+                    remove_confirmed_unavailable(self, store, vec![metadata.clone()])
+            {
+                eprintln!("warning: local trajectory index write: {error}");
+            }
+        })?;
         let snapshot = &read.snapshot;
         match cache {
             Ok((store, prior, observation)) => {
@@ -261,6 +270,7 @@ fn codex_workspace_update(
             (!directory.as_os_str().is_empty()).then_some(directory.as_path())
         }
     };
+    let directory = directory.filter(|path| path.is_absolute());
     let git_branch = directory
         .filter(|path| path.as_os_str() == snapshot.workspace.current_dir.as_os_str())
         .and(snapshot.workspace.git.branch.clone());
@@ -280,7 +290,9 @@ fn verified_codex_directory(read: &omnis_adapters::IndexRead) -> Option<PathBuf>
         read.source_complete,
         &read.workspace_projection,
     )? {
-        omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace.project_path,
+        omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace
+            .project_path
+            .filter(|dir| !omnis_core::may_reach_network(dir)),
         omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => None,
     }
 }
@@ -551,11 +563,14 @@ fn discover_sessions(
                         && registry
                             .adapter(provider)
                             .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if complete {
-                        store.replace_indexed_sessions(provider, &indexed)
-                    } else {
-                        store.merge_indexed_sessions(provider, &indexed)
-                    };
+                    let refreshed = cache_discovered_sessions(
+                        registry,
+                        store,
+                        provider,
+                        &indexed,
+                        complete,
+                        project.is_none(),
+                    );
                     if let Err(error) = refreshed {
                         warnings.push(format!("{provider} session cache: {error}"));
                     }
@@ -576,6 +591,69 @@ fn discover_sessions(
         }
     }
     (sessions, warnings)
+}
+
+fn cache_discovered_sessions(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Provider,
+    indexed: &[IndexedSession],
+    complete: bool,
+    all_projects: bool,
+) -> Result<()> {
+    if complete {
+        return Ok(store.replace_indexed_sessions(provider, indexed)?);
+    }
+    store.merge_indexed_sessions(provider, indexed)?;
+    if provider == Provider::Codex && all_projects {
+        remove_unavailable_search_sessions(
+            registry,
+            store,
+            indexed.iter().map(|row| (row.session.id.as_str(), None)),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_unavailable_search_sessions<'a>(
+    registry: &AdapterRegistry,
+    store: &Store,
+    found: impl Iterator<Item = (&'a str, Option<Uuid>)>,
+    project: Option<&Path>,
+) -> Result<()> {
+    let mut absent = store.indexed_sessions_for_provider(Provider::Codex)?;
+    if absent.is_empty() {
+        return Ok(());
+    }
+    let found: HashMap<_, _> = found.collect();
+    let mut matches = HashMap::new();
+    absent.retain(|row| {
+        found.get(row.session.id.as_str()).is_none_or(|file| {
+            file.zip(row.source_revision.and_then(|source| source.file))
+                .is_some_and(|(selected, prior)| selected != prior)
+        }) && cached_project_matches(row.project_path.as_deref(), project, &mut matches)
+    });
+    remove_confirmed_unavailable(registry, store, absent)
+}
+
+fn remove_confirmed_unavailable(
+    registry: &AdapterRegistry,
+    store: &Store,
+    mut absent: Vec<IndexedSession>,
+) -> Result<()> {
+    if !absent.is_empty() {
+        let sources = absent
+            .iter()
+            .map(|row| (row.session.id.clone(), row.source_revision))
+            .collect::<Vec<_>>();
+        let unavailable = registry
+            .adapter(Provider::Codex)?
+            .unavailable_codex_rollouts(&sources)?;
+        absent.retain(|row| unavailable.contains(&row.session.id));
+        store.remove_unavailable_codex_sessions(&absent)?;
+    }
+    Ok(())
 }
 
 const SEARCH_TEXT_WIDTH: usize = 80;
@@ -621,15 +699,11 @@ fn cached_search_sessions(
         .into_iter()
         .filter(|session| session.session.provider != Provider::Imported)
         .filter(|session| {
-            args.all_projects
-                || session.project_path.as_deref().is_some_and(|path| {
-                    if let Some(&matches) = workspace_matches.get(path.as_os_str()) {
-                        return matches;
-                    }
-                    let matches = workspace_paths_match(path, project);
-                    workspace_matches.insert(path.as_os_str().to_owned(), matches);
-                    matches
-                })
+            cached_project_matches(
+                session.project_path.as_deref(),
+                (!args.all_projects).then_some(project),
+                &mut workspace_matches,
+            )
         })
         .map(|session| NativeSession {
             source_revision: session.source_revision.or_else(|| {
@@ -661,6 +735,55 @@ fn cached_search_sessions(
     Ok((sessions, warnings, titles))
 }
 
+fn cached_project_matches(
+    path: Option<&Path>,
+    project: Option<&Path>,
+    matches: &mut HashMap<OsString, bool>,
+) -> bool {
+    project.is_none_or(|project| {
+        path.is_some_and(|path| {
+            if let Some(&found) = matches.get(path.as_os_str()) {
+                return found;
+            }
+            let found = workspace_paths_match(path, project);
+            matches.insert(path.as_os_str().to_owned(), found);
+            found
+        })
+    })
+}
+
+fn live_search_sessions(
+    registry: &AdapterRegistry,
+    store: &Store,
+    args: &SearchArgs,
+    project: &Path,
+) -> (Vec<NativeSession>, Vec<String>) {
+    let project = (!args.all_projects).then_some(project);
+    let (sessions, mut warnings) =
+        discover_sessions(registry, args.provider, project, None, !args.no_index);
+    if args
+        .provider
+        .is_none_or(|provider| provider == Provider::Codex)
+    {
+        let found = sessions
+            .iter()
+            .filter(|row| row.session.provider == Provider::Codex)
+            .map(|row| {
+                // Ordinary indexing publishes the replacement. A metadata-only search must
+                // retire a superseded file without reading its replacement's conversation.
+                let file = row
+                    .source_revision
+                    .filter(|_| args.no_index)
+                    .and_then(|source| source.file);
+                (row.session.id.as_str(), file)
+            });
+        if let Err(error) = remove_unavailable_search_sessions(registry, store, found, project) {
+            warnings.push(format!("codex session cache: {error}"));
+        }
+    }
+    (sessions, warnings)
+}
+
 /// One ranked result. Conversation-only matches carry their full-text match.
 struct SearchHit<'a> {
     session: &'a NativeSession,
@@ -686,13 +809,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         let (sessions, warnings, titles) = cached_search_sessions(&store, args, &project)?;
         (sessions, warnings, Some(titles))
     } else {
-        let (sessions, warnings) = discover_sessions(
-            registry,
-            args.provider,
-            (!args.all_projects).then_some(project.as_path()),
-            None,
-            !args.no_index,
-        );
+        let (sessions, warnings) = live_search_sessions(registry, &store, args, &project);
         (sessions, warnings, None)
     };
     if args.cached {
@@ -2027,10 +2144,29 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
     });
     let mut matches = Vec::new();
     let mut failures = Vec::new();
+    let mut codex_unavailable = false;
     for (provider, result) in discovered {
         match result {
             Ok(session) => matches.extend(session.map(|session| session.session)),
-            Err(error) => failures.push(format!("{provider}: {error}")),
+            Err(error) => {
+                codex_unavailable |= provider == Provider::Codex
+                    && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(&error);
+                failures.push(format!("{provider}: {error}"));
+            }
+        }
+    }
+    if matches.is_empty() && codex_unavailable {
+        let session = SessionRef::new(Provider::Codex, selector);
+        let cleanup = Store::open_default()
+            .map_err(anyhow::Error::from)
+            .and_then(|store| {
+                if let Some(prior) = store.indexed_session(&session)? {
+                    remove_confirmed_unavailable(registry, &store, vec![prior])?;
+                }
+                Ok(())
+            });
+        if let Err(error) = cleanup {
+            eprintln!("warning: local trajectory index write: {error}");
         }
     }
     let selected = select_discovered_session(selector, matches, &failures)?;
@@ -2148,18 +2284,16 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(read.snapshot.session.provider);
     let current = current_project()?;
-    let matches = if source.provider == Provider::Codex && target == Provider::Codex {
-        codex_repository_matches(
-            &read.snapshot,
-            verified_codex_directory(&read).as_deref(),
-            &current,
-        )?
+    let directory = verified_codex_directory(&read);
+    let matches = if source.provider == Provider::Codex {
+        codex_repository_matches(&read.snapshot, directory.as_deref(), &current)?
     } else {
         workspace_state_matches(&read.snapshot.workspace, &current)?
     };
     let restore_source =
         transfer::requires_import_for_native_resume(registry, &source, target.into())?;
-    let report = inspect_report(&read.snapshot, target, matches, restore_source)?;
+    let project = directory.as_deref().filter(|_| matches).unwrap_or(&current);
+    let report = inspect_report(&read.snapshot, target, matches, restore_source, project);
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2173,30 +2307,18 @@ fn inspect_report(
     target: Provider,
     repository_matches: bool,
     restore_source: bool,
-) -> Result<FidelityReport> {
+    project: &Path,
+) -> FidelityReport {
     if snapshot.session.provider == target && !restore_source {
-        return Ok(fidelity_report_for_snapshot(
-            snapshot,
-            target,
-            repository_matches,
-        ));
+        return fidelity_report_for_snapshot(snapshot, target, repository_matches);
     }
     if !may_attempt_native_import(target) {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
-            target,
-            repository_matches,
-        ));
+        return build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
     }
-    let project = current_project()?;
-    let Some(stats) = inspect_import_stats(snapshot, target, &project) else {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
-            target,
-            repository_matches,
-        ));
+    let Some(stats) = inspect_import_stats(snapshot, target, project) else {
+        return build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
     };
-    Ok(match stats {
+    match stats {
         Err(error) => {
             let mut report =
                 build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
@@ -2225,7 +2347,7 @@ fn inspect_report(
                 native_tool_records,
             )
         }
-    })
+    }
 }
 
 fn inspect_import_stats(
@@ -2436,7 +2558,7 @@ fn bind_task_session(
     let lineage = prior
         .as_ref()
         .filter(|prior| prior.session != *session)
-        .and_then(|prior| match registry.read_session_indexed(&prior.session) {
+        .and_then(|prior| match registry.read_selected_session_indexed(&prior.session, None) {
             Ok(source) => Some((prior, source)),
             Err(error) => {
                 eprintln!(
@@ -2447,12 +2569,17 @@ fn bind_task_session(
                 None
             }
         });
-    if let Some((prior, source)) = lineage {
-        let report = fidelity_report_for_snapshot(
-            &source,
-            session.provider,
-            workspace_state_matches(&source.workspace, project)?,
-        );
+    if let Some((prior, read)) = lineage {
+        let matches = if prior.session.provider == Provider::Codex {
+            codex_repository_matches(
+                &read.snapshot,
+                verified_codex_directory(&read).as_deref(),
+                project,
+            )?
+        } else {
+            workspace_state_matches(&read.snapshot.workspace, project)?
+        };
+        let report = fidelity_report_for_snapshot(&read.snapshot, session.provider, matches);
         store
             .record_handoff_and_bind(
                 selected.id,
@@ -2499,15 +2626,25 @@ fn validate_session_workspace(
     session: &SessionRef,
     project: &Path,
 ) -> Result<()> {
-    let snapshot = registry
-        .read_session_indexed(session)
+    let read = registry
+        .read_selected_session_indexed(session, None)
         .with_context(|| format!("validating `{session}`"))?;
-    if source_workspace_matches_for_session(session, &snapshot, project)? {
+    let directory = if session.provider == Provider::Codex {
+        let directory = verified_codex_directory(&read).with_context(|| {
+            format!("session `{session}` has no verified workspace for this task")
+        })?;
+        if workspace_paths_match(&directory, project) {
+            return Ok(());
+        }
+        directory
+    } else if source_workspace_matches_for_session(session, &read.snapshot, project)? {
         return Ok(());
-    }
+    } else {
+        read.snapshot.workspace.root
+    };
     bail!(
         "session `{session}` belongs to `{}`, not `{}`",
-        snapshot.workspace.root.display(),
+        directory.display(),
         project.display()
     )
 }
