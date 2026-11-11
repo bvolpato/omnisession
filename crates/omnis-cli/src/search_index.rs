@@ -75,6 +75,17 @@ impl IndexCandidate {
             .and_then(|path| fs::metadata(path).ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > FULL_READ_SOURCE_BYTES)
     }
+
+    fn source_time(&self) -> Option<DateTime<Utc>> {
+        // Cursor's reader returns the Unix epoch when both native timestamps are absent.
+        self.updated_at.or_else(|| {
+            matches!(
+                self.session.provider,
+                Provider::CursorCli | Provider::CursorIde
+            )
+            .then_some(DateTime::UNIX_EPOCH)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -155,7 +166,7 @@ pub(crate) fn needs_index(
     }
     state.document_version < SEARCH_DOCUMENT_VERSION
         || (!state.source_time_precise && candidate.session.provider != Provider::Imported)
-        || candidate.updated_at.is_some_and(|updated_at| {
+        || candidate.source_time().is_some_and(|updated_at| {
             source_time_changed(candidate.session.provider, updated_at, state)
         })
         // Shared database size cannot show whether a per-session preview still needs its budget.
@@ -174,7 +185,7 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
         && (failure.source_time_precise
             || failure.source_updated_at.is_none()
             || candidate.session.provider == Provider::Imported)
-        && candidate.updated_at.is_none_or(|updated_at| {
+        && candidate.source_time().is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
                 if candidate.session.provider == Provider::Imported {
                     updated_at.timestamp_millis() == failed_source.timestamp_millis()
@@ -386,7 +397,7 @@ pub(crate) fn index_candidates(
                         let _ = store.record_trajectory_index_failure(
                             &candidate.session,
                             &TrajectoryIndexFailure {
-                                source_updated_at: candidate.updated_at,
+                                source_updated_at: candidate.source_time(),
                                 source_time_precise: true,
                                 document_version: SEARCH_DOCUMENT_VERSION,
                             },
@@ -896,6 +907,42 @@ mod tests {
         assert!(needs_index(&exact_millisecond, Some(&legacy)));
         assert!(!needs_index(&exact_millisecond, Some(&stored)));
         assert_eq!(read_budget(Provider::Codex, Some(&legacy)), u64::MAX);
+    }
+
+    #[test]
+    fn losing_cursor_timestamps_retries_the_session_once() {
+        let recorded = Utc::now();
+        let mut undated = candidate(None, None);
+        undated.session.provider = Provider::CursorIde;
+        let cached = TrajectoryIndexState {
+            source_updated_at: recorded,
+            source_time_precise: true,
+            source_complete: true,
+            provider_limited: false,
+            document_version: SEARCH_DOCUMENT_VERSION,
+        };
+        let failure = TrajectoryIndexFailure {
+            source_updated_at: Some(recorded),
+            source_time_precise: true,
+            document_version: SEARCH_DOCUMENT_VERSION,
+        };
+        assert!(needs_index(&undated, Some(&cached)));
+        assert!(!failure_is_current(&undated, &failure));
+        let missing = DateTime::UNIX_EPOCH;
+        assert!(!needs_index(
+            &undated,
+            Some(&TrajectoryIndexState {
+                source_updated_at: missing,
+                ..cached
+            })
+        ));
+        assert!(failure_is_current(
+            &undated,
+            &TrajectoryIndexFailure {
+                source_updated_at: Some(missing),
+                ..failure
+            }
+        ));
     }
 
     #[test]

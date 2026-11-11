@@ -285,7 +285,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                    AND (
                        excluded.complete > session_trajectories.complete
                        OR (
-                           excluded.complete = session_trajectories.complete
+                           (excluded.complete = session_trajectories.complete OR ?18)
                            AND (
                                excluded.content_hash <> session_trajectories.content_hash
                                OR excluded.source_byte_count <>
@@ -1921,6 +1921,10 @@ impl Store {
                         write.guard != TrajectorySourceGuard::NewerSource,
                         source_submillis(write.session.provider, write.document.source_updated_at),
                         write.document.provider_limited,
+                        // A full native read may now need more truncation than its predecessor.
+                        write.source_complete
+                            && write.document.origin == SessionTrajectoryOrigin::Native
+                            && matches!(write.guard, TrajectorySourceGuard::ObservedDocument(_)),
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4752,6 +4756,75 @@ mod tests {
         assert_eq!(
             first.search_session_trajectories("restored", 1).unwrap(),
             [session]
+        );
+    }
+
+    #[test]
+    fn a_verified_full_read_can_replace_text_that_now_needs_truncation() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Hermes, "same-clock-edit");
+        let original = TrajectoryDocument {
+            redacted_text: "removed",
+            source_updated_at: Utc::now(),
+            source_byte_count: 7,
+            indexed_byte_count: 7,
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 6,
+            derived_title: None,
+        };
+        store
+            .upsert_trajectory_document(&session, &original)
+            .unwrap();
+        let replacement = TrajectoryDocument {
+            redacted_text: "newtail",
+            source_byte_count: 100,
+            truncation_strategy: "event_head_tail",
+            ..original
+        };
+        let observed = store.observe_trajectory_document(&session).unwrap();
+        let write = |document, guard| {
+            store
+                .upsert_observed_trajectory_documents_counted(&[(&session, document, guard)])
+                .unwrap()
+        };
+        assert_eq!(
+            write(
+                TrajectoryDocument {
+                    source_complete: false,
+                    ..replacement
+                },
+                observed
+            ),
+            0
+        );
+        assert_eq!(
+            write(
+                replacement,
+                super::TrajectorySourceGuard::Observed(Some(original.source_updated_at))
+            ),
+            0
+        );
+        assert_eq!(write(replacement, observed), 1);
+        assert!(
+            store
+                .search_session_trajectories("removed", 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.search_session_trajectories("newtail", 1).unwrap(),
+            std::slice::from_ref(&session)
+        );
+        assert_eq!(
+            write(
+                replacement,
+                store.observe_trajectory_document(&session).unwrap()
+            ),
+            0
         );
     }
 
