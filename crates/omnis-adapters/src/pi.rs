@@ -356,7 +356,7 @@ impl PiFileStamp {
 fn topology_path(
     index: &PiTranscriptIndex,
     allow_missing_ancestors: bool,
-) -> Result<Vec<&PiTopologyEntry>> {
+) -> Result<Vec<(JsonLineLocation, bool)>> {
     let mut path = Vec::new();
     let mut seen = HashSet::new();
     let mut current = index.leaf.as_deref();
@@ -375,13 +375,14 @@ fn topology_path(
     }
     path.reverse();
 
-    order_compaction(
-        &mut path,
+    Ok(order_compaction(
+        path,
         |(_, entry)| entry.is_compaction,
         |(_, entry)| entry.first_kept_entry_id.as_deref(),
         |(id, _)| Some(*id),
-    );
-    Ok(path.into_iter().map(|(_, entry)| entry).collect())
+    )
+    .map(|((_, entry), retained)| (entry.location, retained))
+    .collect())
 }
 
 fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc> {
@@ -392,7 +393,7 @@ fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc>
         .unwrap_or(fallback)
 }
 
-fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<&Value>> {
+fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<(&Value, bool)>> {
     let entries = records
         .iter()
         .skip(1)
@@ -428,32 +429,40 @@ fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<
         current = entry.get("parentId").and_then(Value::as_str);
     }
     path.reverse();
-    order_compaction(
-        &mut path,
+    Ok(order_compaction(
+        path,
         |entry| entry["type"] == "compaction",
         |entry| entry["firstKeptEntryId"].as_str(),
         |entry| entry["id"].as_str(),
-    );
-    Ok(path)
+    )
+    .collect())
 }
 
-/// The native import starts at the latest summary. Recovery also needs the earlier branch history.
+/// Move the latest compaction ahead of its retained entries, following Pi's `buildContextEntries`.
+/// Flag any older compactions in that range so their summaries stay in the retained conversation.
 fn order_compaction<T>(
-    path: &mut [T],
+    mut path: Vec<T>,
     is_compaction: impl Fn(&T) -> bool,
     first_kept_id: impl Fn(&T) -> Option<&str>,
     entry_id: impl Fn(&T) -> Option<&str>,
-) {
-    if let Some(latest) = path.iter().rposition(&is_compaction)
-        && let Some(first_kept) = first_kept_id(&path[latest])
-        && let Some(start) = path[..latest]
-            .iter()
-            .position(|entry| entry_id(entry) == Some(first_kept))
-    {
-        // Pi resumes with the latest summary followed by the retained turns. Older summaries
-        // inside that range belong to the history before the latest summary.
-        path[start..=latest].sort_by_key(|entry| !is_compaction(entry));
-    }
+) -> impl Iterator<Item = (T, bool)> {
+    let latest = path.iter().rposition(&is_compaction);
+    let boundary = latest.map(|latest| {
+        let start = first_kept_id(&path[latest])
+            .and_then(|id| {
+                path[..latest]
+                    .iter()
+                    .position(|entry| entry_id(entry) == Some(id))
+            })
+            .unwrap_or(latest);
+        path[start..=latest].rotate_right(1);
+        start
+    });
+    path.into_iter().enumerate().map(move |(index, entry)| {
+        let retained_compaction =
+            boundary.is_some_and(|start| index > start) && is_compaction(&entry);
+        (entry, retained_compaction)
+    })
 }
 
 fn text_blocks(value: Option<&Value>) -> Vec<String> {
@@ -478,23 +487,29 @@ fn entry_timestamp(entry: &Value) -> Option<DateTime<Utc>> {
     parse_timestamp(entry.get("timestamp"))
 }
 
-fn emit_entry(builder: &mut EventBuilder, entry: &Value) {
+fn emit_entry(builder: &mut EventBuilder, entry: &Value, retained_compaction: bool) {
     let timestamp = entry_timestamp(entry);
     let raw_type = raw_type(entry);
     match raw_type.as_deref() {
         Some("message") => emit_message(builder, entry, timestamp, raw_type),
-        Some("compaction") => builder.push(
-            EventKind::CompactionCreated,
-            json!({
-                "summary": entry.get("summary").cloned().unwrap_or(Value::Null),
-                "first_kept_entry_id": entry.get("firstKeptEntryId").cloned().unwrap_or(Value::Null),
-                "tokens_before": entry.get("tokensBefore").cloned().unwrap_or(Value::Null),
-            }),
-            timestamp,
-            ReplayPolicy::Contextual,
-            raw_type,
-            None,
-        ),
+        Some("compaction") => {
+            let mut payload = json!({
+                "summary": entry.get("summary"),
+                "first_kept_entry_id": entry.get("firstKeptEntryId"),
+                "tokens_before": entry.get("tokensBefore"),
+            });
+            if retained_compaction {
+                payload["retained_by_compaction"] = Value::Bool(true);
+            }
+            builder.push(
+                EventKind::CompactionCreated,
+                payload,
+                timestamp,
+                ReplayPolicy::Contextual,
+                raw_type,
+                None,
+            );
+        }
         Some("branch_summary") => emit_branch_summary(builder, entry, timestamp, raw_type),
         Some("custom_message") => emit_custom_message(builder, entry, timestamp, raw_type),
         Some("model_change" | "thinking_level_change" | "label" | "session_info" | "custom") => {
@@ -881,8 +896,8 @@ fn snapshot_from_records(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for entry in session_path(records, false)? {
-        emit_entry(&mut builder, entry);
+    for (entry, retained) in session_path(records, false)? {
+        emit_entry(&mut builder, entry, retained);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     Ok(builder.snapshot(
@@ -923,17 +938,14 @@ fn snapshot_from_open_file(
     let captured_at = index
         .latest_timestamp
         .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
-    let locations = topology_path(&index, false)?
-        .into_iter()
-        .map(|entry| entry.location)
-        .collect::<Vec<_>>();
+    let locations = topology_path(&index, false)?;
     let title = index.latest_title.take();
     drop(index);
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     let mut record_line = Vec::new();
     let mut read_position = reader.stream_position()?;
-    for location in locations {
+    for (location, retained) in locations {
         let entry =
             match read_json_line_at(&mut reader, location, &mut read_position, &mut record_line) {
                 Ok(entry) => entry,
@@ -942,7 +954,7 @@ fn snapshot_from_open_file(
                     return Err(error);
                 }
             };
-        emit_entry(&mut builder, &entry);
+        emit_entry(&mut builder, &entry, retained);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     stamp.ensure_unchanged(reader.get_ref())?;
@@ -964,8 +976,8 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for entry in session_path(records, true)? {
-        emit_entry(&mut builder, entry);
+    for (entry, retained) in session_path(records, true)? {
+        emit_entry(&mut builder, entry, retained);
     }
     Ok(builder.snapshot(
         session.clone(),
@@ -1199,22 +1211,64 @@ mod tests {
     }
 
     #[test]
-    fn active_branch_orders_overlapping_compactions_before_retained_turns() {
-        let records = vec![
-            json!({"type": "session", "version": 3, "id": "session", "cwd": "/workspace"}),
-            json!({"type": "message", "id": "root", "parentId": null}),
-            json!({"type": "message", "id": "kept", "parentId": "root"}),
-            json!({"type": "compaction", "id": "older", "parentId": "kept", "firstKeptEntryId": "kept"}),
-            json!({"type": "message", "id": "abandoned", "parentId": "root"}),
-            json!({"type": "compaction", "id": "compact", "parentId": "older", "firstKeptEntryId": "kept"}),
-            json!({"type": "message", "id": "leaf", "parentId": "compact"}),
-        ];
-        let ids = session_path(&records, false)
-            .expect("session tree")
-            .into_iter()
-            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["root", "older", "compact", "kept", "leaf"]);
+    fn latest_compaction_keeps_older_summaries_in_place_even_when_its_own_text_is_empty() {
+        let message = |id: &str, parent: &str| {
+            json!({
+                "type": "message", "id": id, "parentId": parent, "message": {"role": "user", "content": id}
+            })
+        };
+        for summary in ["latest summary", ""] {
+            let records = [
+                json!({"type":"session","version":3,"id":"session","cwd":"/workspace"}),
+                json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"recover earlier decision"}}),
+                message("first retained", "root"),
+                json!({"type":"compaction","id":"older","parentId":"first retained","firstKeptEntryId":"first retained","summary":"older summary"}),
+                message("second retained", "older"),
+                message("discarded sibling", "root"),
+                json!({"type":"compaction","id":"latest","parentId":"second retained","firstKeptEntryId":"first retained","summary":summary}),
+                message("final turn", "latest"),
+            ];
+            let session = SessionRef::new(Provider::Pi, "session");
+            let snapshot = snapshot_from_records(&session, &records, 0).unwrap();
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            let conversation = omnis_core::import_conversation(&snapshot);
+            for texts in [
+                trajectory
+                    .items
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                conversation
+                    .messages
+                    .iter()
+                    .map(|msg| msg.text.as_str())
+                    .collect(),
+            ] {
+                let turns = texts
+                    .iter()
+                    .filter(|text| !text.starts_with("[OmniSession"))
+                    .map(|text| text.lines().last().unwrap())
+                    .collect::<Vec<_>>();
+                let mut expected = vec![
+                    "first retained",
+                    "older summary",
+                    "second retained",
+                    "final turn",
+                ];
+                if !summary.is_empty() {
+                    expected.insert(0, summary);
+                }
+                assert_eq!(turns, expected);
+            }
+            assert_eq!(trajectory.truncated, summary.is_empty());
+            assert!(omnis_core::needs_recovery_handoff(&snapshot, false));
+            assert!(omnis_core::readback_trajectory(&snapshot).is_none());
+            let mut handoff = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut handoff).unwrap();
+            let history = String::from_utf8(handoff).unwrap();
+            assert!(history.contains("recover earlier decision"));
+            assert!(!history.contains("discarded sibling"));
+        }
     }
 
     #[test]

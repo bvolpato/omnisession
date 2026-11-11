@@ -45,7 +45,7 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -1717,7 +1717,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         timestamp: event.timestamp,
                         tool: None,
                     },
-                    is_compaction: true,
+                    is_compaction: is_source_compaction_boundary(event),
                 },
                 truncated,
             ))
@@ -2543,13 +2543,20 @@ fn visible_import_events(
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
     let mut events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
-    if use_latest_compaction
-        && let Some(start) = events
-            .iter()
-            .rposition(|event| source_compaction_text(event).is_some())
+    let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    if let Some(start) = events
+        .iter()
+        .rposition(|event| is_source_compaction_boundary(event))
     {
-        events.drain(..start);
+        // A Pi extension can compact without supplying summary text for the displaced turns.
+        if source_compaction_text(events[start]).is_none() {
+            source_incomplete |= events[..start]
+                .iter()
+                .any(|event| recovery::has_recovery_content(event));
+        }
+        if use_latest_compaction {
+            events.drain(..start);
+        }
     }
     (events, source_incomplete)
 }
@@ -2614,6 +2621,20 @@ fn compaction_text_with_truncation(
     );
     let truncated = text.chars().count() > character_limit;
     Some((bounded_text(&text, character_limit), truncated))
+}
+
+fn is_source_compaction_boundary(event: &OmniEvent) -> bool {
+    if matches!(event.source.provider, Provider::Pi | Provider::OhMyPi) {
+        return event.kind == EventKind::CompactionCreated
+            && event.replay_policy == ReplayPolicy::Contextual
+            && !is_secret(event)
+            && event
+                .payload
+                .get("retained_by_compaction")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true);
+    }
+    source_compaction_text(event).is_some()
 }
 
 fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
