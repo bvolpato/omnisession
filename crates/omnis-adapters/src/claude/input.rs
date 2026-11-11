@@ -134,7 +134,7 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
             }
             Ok(true)
         })?;
-        transcript.branch.sampled_tail = true;
+        transcript.branch.start_sampled_tail();
         for record in tail {
             transcript.observe(&record);
         }

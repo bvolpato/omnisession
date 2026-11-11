@@ -57,6 +57,57 @@ fn claude_progress_records_do_not_hide_the_final_reply() {
 }
 
 #[test]
+fn claude_sampled_preview_keeps_only_the_selected_tail_branch() {
+    use std::io::Write;
+
+    use serde_json::json;
+    use uuid::Uuid;
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let mut file = fs::File::create(&source).unwrap();
+    let id = Uuid::from_u128;
+    let message = |role: &str, n, parent, text: &str| json!({"type": role, "uuid": id(n), "parentUuid": parent, "message": {"content": text}});
+    let bridge = |kind, n, parent| json!({"type": kind, "uuid": id(n), "parentUuid": id(parent)});
+    let padding = json!({"type": "progress", "padding": "x".repeat(4 * 1024 * 1024)});
+    for record in [
+        message("user", 1, None, "head"),
+        padding.clone(),
+        message("user", 2, Some(id(1)), "middle request"),
+        message("user", 3, Some(id(1)), "other request"),
+        bridge("progress", 11, 1),
+        padding,
+        message("assistant", 4, Some(id(2)), "discarded reply"),
+        bridge("attachment", 5, 3),
+        message("assistant", 6, Some(id(5)), "other reply"),
+        bridge("progress", 7, 2),
+        bridge("attachment", 8, 7),
+        message("assistant", 9, Some(id(8)), "selected reply"),
+        bridge("progress", 10, 11),
+    ] {
+        writeln!(file, "{record}").unwrap();
+    }
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for (budget, expected) in [
+        (u64::MAX, vec!["head", "middle request", "selected reply"]),
+        (1, vec!["head", "selected reply"]),
+    ] {
+        let indexed = adapter
+            .index_session(&session, Some(&source), budget)
+            .unwrap();
+        assert_eq!(indexed.source_complete, budget == u64::MAX);
+        let text = indexed
+            .snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, expected);
+    }
+}
+
+#[test]
 fn claude_reports_malformed_records_and_an_incomplete_tail() {
     let temporary = TempDir::new().unwrap();
     let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
