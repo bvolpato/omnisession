@@ -18,6 +18,7 @@ memchr.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
+command-group.workspace = true
 directories.workspace = true
 fs2.workspace = true
 hex.workspace = true

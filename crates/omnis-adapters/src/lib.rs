@@ -41,7 +41,7 @@ pub use opencode::{
     read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
-pub use provider_process::provider_process;
+pub use provider_process::{bounded_provider_output, provider_process};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

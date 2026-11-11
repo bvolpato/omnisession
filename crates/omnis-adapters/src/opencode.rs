@@ -15,7 +15,7 @@ use wait_timeout::ChildExt;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
-    provider_process,
+    bounded_provider_output, provider_process,
     support::{
         EventBuilder, omitted_images_text, parse_timestamp, paths_match, provider_executable,
         sort_sessions, string_at, validate_provider, value_at,
@@ -306,35 +306,30 @@ fn run_json(
     cwd: Option<&Path>,
     lookup_id: Option<&str>,
 ) -> Result<Option<Value>> {
-    const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
+    const MAX_OUTPUT_SIZE: usize = 128 * 1024 * 1024;
+    const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
     ensure_provider_executable(binary)?;
-    let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
     // The 2.x API writes the HTTP status to stderr and the typed error to stdout.
     let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
-    let mut diagnostic = exact_api.then(tempfile::tempfile).transpose()?;
     let args = opencode_command_args(binary, arguments)?;
     let mut command = provider_process(binary)?;
-    command
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output_file.try_clone()?))
-        .stderr(match &diagnostic {
-            Some(file) => Stdio::from(file.try_clone()?),
-            None => Stdio::null(),
-        });
-    // Import read-back exports run while omni holds Ctrl+C. Their own process group keeps a
-    // terminal Ctrl+C from killing them mid-read, and the bounded wait below still reaps them.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.args(&args).stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let output = match bounded_provider_output(
+        &mut command,
+        Duration::from_secs(30),
+        Some(MAX_OUTPUT_SIZE),
+        exact_api.then_some(DIAGNOSTIC_LIMIT),
+    ) {
+        Ok(output) => output,
         // A missing working directory also reports NotFound, and that is a real failure.
         Err(error)
             if lookup_id.is_none()
-                && error.kind() == ErrorKind::NotFound
+                && error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == ErrorKind::NotFound)
                 && cwd.is_none_or(Path::is_dir) =>
         {
             return Ok(None);
@@ -344,23 +339,14 @@ fn run_json(
                 .with_context(|| format!("failed to execute `opencode {}`", arguments.join(" ")));
         }
     };
-    let status = match child.wait_timeout(Duration::from_secs(30)) {
-        Ok(Some(status)) => status,
-        waited => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return match waited {
-                Err(error) => Err(error).context("waiting for OpenCode command"),
-                Ok(_) => Err(anyhow!("`opencode {}` timed out", arguments.join(" "))),
-            };
-        }
-    };
+    let status = output.status;
     if !status.success() {
         if status.code() == Some(1)
-            && let (Some(id), Some(stderr)) = (lookup_id, diagnostic.as_mut())
-            && read_diagnostic(stderr)?.as_deref().map(str::trim) == Some("HTTP 404 Not Found")
-            && let Some(text) = read_diagnostic(&mut output_file)?
-            && let Ok(error) = serde_json::from_str::<Value>(&text)
+            && let Some(id) = lookup_id
+            && exact_api
+            && output.stderr.trim_ascii() == b"HTTP 404 Not Found"
+            && output.stdout.len() <= DIAGNOSTIC_LIMIT
+            && let Ok(error) = serde_json::from_slice::<Value>(&output.stdout)
             && error["_tag"] == "SessionNotFoundError"
             && error["sessionID"] == id
         {
@@ -372,31 +358,11 @@ fn run_json(
             status
         ));
     }
-    if output_file.metadata()?.len() > MAX_OUTPUT_SIZE {
-        return Err(anyhow!("OpenCode JSON exceeds safe read limit"));
-    }
-    output_file.rewind()?;
-    let mut output = Vec::new();
-    output_file
-        .take(MAX_OUTPUT_SIZE + 1)
-        .read_to_end(&mut output)?;
     parse_command_json(
-        &output,
+        &output.stdout,
         lookup_id.is_none() && matches!(arguments.first(), Some(&"session" | &"db" | &"api")),
     )
     .map(Some)
-}
-
-fn read_diagnostic(file: &mut std::fs::File) -> Result<Option<String>> {
-    const MAX_SIZE: usize = 8 * 1024;
-    file.rewind()?;
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(MAX_SIZE + 1)?)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SIZE {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok())
 }
 
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
@@ -1073,6 +1039,7 @@ esac"#,
 case "$3:$5" in
     session.list:*) echo '{"data":[]}' ;;
     session.get:sessionID=ses_hidden) echo '{"data":{"id":"ses_hidden","location":{"directory":"/project"}}}' ;;
+    session.get:sessionID=ses_verbose) printf '%09000d' 0 >&2; echo '{"data":{"id":"ses_verbose"}}' ;;
     session.get:sessionID=ses_missing) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_missing"}'; exit 1 ;;
     session.get:sessionID=ses_wrong) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_other"}'; exit 1 ;;
     session.get:sessionID=ses_server) echo 'HTTP 500 Internal Server Error' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_server"}'; exit 1 ;;
@@ -1122,6 +1089,12 @@ esac"#,
                     super::find_opencode_session_with_binary(&binary, "ses_hidden", None).is_err()
                 );
             } else {
+                assert!(
+                    adapter
+                        .find_native_session("ses_verbose")
+                        .unwrap()
+                        .is_some()
+                );
                 assert!(
                     adapter
                         .find_native_session("ses_missing")
