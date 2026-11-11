@@ -1967,3 +1967,118 @@ fn anchored_control_runs_preserve_complete_turns_and_apply_withdrawals_in_order(
     }
     Ok(())
 }
+
+#[test]
+fn partial_replies_do_not_hide_numbered_requests_or_change_earlier_rollbacks() -> anyhow::Result<()>
+{
+    let day = "sessions";
+    let stamp = "2026-01-01T00-00-00";
+    for (count, owner) in [(0, PARENT), (1, PARENT), (2, PARENT), (1, REVERT)] {
+        let home = tempfile::tempdir()?;
+        let start = |n| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_started","turn_id":format!("t{n}")}});
+        let done = |n, t| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("t{t}")}});
+        let rows = [
+            header(PARENT, 0, None),
+            start(1),
+            turn(2, "user", "A"),
+            turn(3, "assistant", "A reply"),
+            done(4, 1),
+            start(5),
+            turn(6, "user", "B"),
+            turn(7, "assistant", "B reply"),
+            done(8, 5),
+            json!({"ordinal":9,"type":"event_msg","payload":{"type":"thread_rolled_back","thread_id":owner,"num_turns":count}}),
+            start(10),
+            turn(11, "user", "C"),
+            turn(12, "assistant", "C reply"),
+            done(13, 10),
+        ];
+        let parent = write(home.path(), day, PARENT, PARENT, stamp, &rows);
+        write(
+            home.path(),
+            day,
+            CHILD,
+            CHILD,
+            stamp,
+            &[
+                header(CHILD, 14, Some(bookmark(PARENT, &rows))),
+                turn(15, "user", "leaf"),
+            ],
+        );
+        for gaps in [&[12][..], &[7], &[4, 7], &[7, 8, 9], &[4, 7, 8, 9, 12]] {
+            let mut damaged = encoded(&rows);
+            for n in gaps {
+                damaged =
+                    damaged.replace(&format!("\"ordinal\":{n},"), &format!("\"ordinaX\":{n},"));
+            }
+            fs::write(&parent, damaged)?;
+            let effective = if owner == PARENT { count } else { 0 };
+            let mut expected = Vec::new();
+            if effective < 2 {
+                expected.extend(["A", "A reply"]);
+            }
+            if effective == 0 {
+                expected.extend(["B", "B reply"]);
+            }
+            expected.extend(["C", "C reply", "leaf"]);
+            check_parent_messages(home.path(), &expected, true)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unfinished_turn_with_an_unplaced_request_still_consumes_its_rollback_slot()
+-> anyhow::Result<()> {
+    for leaf_rollback in [false, true] {
+        for (start_owner, turn_id) in [(PARENT, "B"), (REVERT, "B"), (PARENT, "")] {
+            for count in [0, 1, 2] {
+                let home = tempfile::tempdir()?;
+                let mut rows = vec![
+                    header(PARENT, 0, None),
+                    json!({"ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"A"}}),
+                    turn(2, "user", "A"),
+                    json!({"ordinal":3,"type":"event_msg","payload":{"type":"task_complete","turn_id":"A"}}),
+                    json!({"ordinal":4,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"thread_id":start_owner}}),
+                    turn(5, "user", "unplaced B"),
+                ];
+                let rollback = |ordinal| json!({"ordinal":ordinal,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}});
+                if !leaf_rollback {
+                    rows.push(rollback(6));
+                }
+                let parent = write(
+                    home.path(),
+                    "sessions",
+                    PARENT,
+                    PARENT,
+                    "2026-01-01T00-00-00",
+                    &rows,
+                );
+                let mut leaf = vec![header(
+                    CHILD,
+                    rows.len() as u64,
+                    Some(bookmark(PARENT, &rows)),
+                )];
+                if leaf_rollback {
+                    leaf.push(rollback(7));
+                }
+                leaf.push(turn(8, "user", "leaf"));
+                write(
+                    home.path(),
+                    "sessions",
+                    CHILD,
+                    CHILD,
+                    "2026-01-01T00-00-00",
+                    &leaf,
+                );
+                let damaged = encoded(&rows).replace("\"ordinal\":5,", "\"ordinaX\":5,");
+                fs::write(parent, damaged)?;
+                let keep_a =
+                    count == 0 || (count == 1 && start_owner == PARENT && !turn_id.is_empty());
+                let expected: &[&str] = if keep_a { &["A", "leaf"] } else { &["leaf"] };
+                check_parent_messages(home.path(), expected, true)?;
+            }
+        }
+    }
+    Ok(())
+}

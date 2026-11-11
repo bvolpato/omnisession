@@ -32,7 +32,7 @@ mod ancestor_paths;
 mod history_base;
 mod rollout_identity;
 
-use history_base::{HistoryBase, HistoryScope, Lineage};
+use history_base::{HistoryBase, HistoryScope, InheritedRecord, Lineage};
 use rollout_identity::{IdKind, RolloutCatalog, RolloutSelector};
 
 mod current_launch;
@@ -1987,40 +1987,50 @@ impl CodexSession {
         }
         let mut first_gap = None;
         let mut selected_project = None;
-        let mut observe =
-            |record: Value, mut skipped_before: JsonLineSkips, inherited: usize| -> Result<()> {
-                if workspace_record == Some(history.records_seen + 1) {
-                    selected_project =
-                        string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
-                }
-                if builder.tracks_rollback_opener()
-                    && !ordinary_rollback_record(&record, history.records_seen == 0)
-                {
-                    builder.discard_rollback_opener();
-                }
-                if skipped_before.total() + inherited > 0 && first_gap.is_none() {
-                    first_gap = Some(builder.checkpoint());
-                    builder.note_rollback_history_gap();
-                }
-                history.observe_workspace_gaps(skipped_before.workspace_gaps() + inherited);
-                skipped_before.possible_settings += inherited;
-                // The latest settings for this thread survive conversation rollback.
-                history.settings.observe_gaps(skipped_before);
-                history.settings.observe(&self.id, &record);
-                history.push(&mut builder, &record)?;
-                if history
-                    .records_seen
-                    .checked_rem(TOOL_COMPACTION_RECORD_INTERVAL)
-                    == Some(0)
-                {
-                    history.compact(&mut builder);
-                }
-                Ok(())
+        let mut observe = |record: InheritedRecord,
+                           mut skipped_before: JsonLineSkips,
+                           inherited: usize|
+         -> Result<()> {
+            let InheritedRecord::Native(record) = record else {
+                let checkpoint = history
+                    .pending_turn
+                    .take()
+                    .unwrap_or_else(|| history.checkpoint(&builder));
+                history.turns.push(checkpoint);
+                history.last_visible = None;
+                return Ok(());
             };
+            if workspace_record == Some(history.records_seen + 1) {
+                selected_project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
+            }
+            if builder.tracks_rollback_opener()
+                && !ordinary_rollback_record(&record, history.records_seen == 0)
+            {
+                builder.discard_rollback_opener();
+            }
+            if skipped_before.total() + inherited > 0 && first_gap.is_none() {
+                first_gap = Some(builder.checkpoint());
+                builder.note_rollback_history_gap();
+            }
+            history.observe_workspace_gaps(skipped_before.workspace_gaps() + inherited);
+            skipped_before.possible_settings += inherited;
+            // The latest settings for this thread survive conversation rollback.
+            history.settings.observe_gaps(skipped_before);
+            history.settings.observe(&self.id, &record);
+            history.push(&mut builder, &record)?;
+            if history
+                .records_seen
+                .checked_rem(TOOL_COMPACTION_RECORD_INTERVAL)
+                == Some(0)
+            {
+                history.compact(&mut builder);
+            }
+            Ok(())
+        };
         let inherited =
             lineage.visit(|record, skipped| observe(record, JsonLineSkips::default(), skipped))?;
         let mut unreadable = lineage.visit_leaf(&self.id, read, |record, skipped| {
-            observe(record, skipped, inherited)
+            observe(InheritedRecord::Native(record), skipped, inherited)
         })?;
         history.observe_workspace_gaps(unreadable.workspace_gaps() + inherited);
         unreadable.possible_settings += inherited;

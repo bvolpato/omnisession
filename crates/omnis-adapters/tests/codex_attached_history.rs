@@ -1101,3 +1101,63 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn a_nested_fork_retains_ancestors_across_a_placed_metadata_gap() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let mut reply = message(2, "grandparent reply");
+    reply["payload"]["role"] = json!("assistant");
+    reply["payload"]["content"][0]["type"] = json!("output_text");
+    let grandparent = [
+        header(PARENT, 0, None, false),
+        message(1, "grandparent request"),
+        reply,
+    ];
+    write(&dir, &format!("2026-01-01T00-00-00-{PARENT}"), &grandparent)?;
+    for (event, expected) in [
+        (
+            json!({"type":"token_count"}),
+            vec![
+                "grandparent request",
+                "grandparent reply",
+                "middle request",
+                "leaf request",
+            ],
+        ),
+        (
+            json!({"type":"thread_rolled_back","num_turns":1}),
+            vec!["middle request", "leaf request"],
+        ),
+        (
+            json!({"type":"unknown_control"}),
+            vec!["middle request", "leaf request"],
+        ),
+    ] {
+        let middle = [
+            header(CHILD, 3, Some(bookmark(PARENT, &grandparent)), false),
+            json!({"type":"event_msg","payload":event}),
+            json!({"type":"event_msg","ordinal":5,"payload":{"type":"task_started","turn_id":"middle"}}),
+            message(6, "middle request"),
+        ];
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &middle)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, 7, Some(bookmark(CHILD, &middle)), false),
+                message(8, "leaf request"),
+            ],
+        )?;
+        let snapshot = CodexAdapter::with_root(home.path())
+            .read_session(&SessionRef::new(Provider::Codex, REVERT))?;
+        let conversation = omnis_core::import_conversation(&snapshot);
+        let texts: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|msg| msg.text.as_str())
+            .collect();
+        assert_eq!(texts, expected, "{event}");
+    }
+    Ok(())
+}

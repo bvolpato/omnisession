@@ -926,7 +926,6 @@ impl Lineage {
         let Some(damage) = error.downcast_ref::<DamagedPrefixes>() else {
             return Err(error);
         };
-        // Only segments newer than an unrecoverable gap can contribute to the projection.
         for &(index, reason, ref plan) in damage.0.iter().rev() {
             if let Some(verified) = self.segments[index].verified_copy(
                 home,
@@ -940,6 +939,10 @@ impl Lineage {
                 segment.recovery.clone_from(plan);
                 if let Some(plan) = plan {
                     segment.verified_revision = plan.revision;
+                    if plan.preserves_ancestors() {
+                        self.unavailable.get_or_insert(reason);
+                        continue;
+                    }
                 }
                 self.first_available = if segment.recovery.is_some() {
                     index
@@ -1064,7 +1067,10 @@ impl Lineage {
         }))
     }
 
-    pub(super) fn visit(&self, mut visit: impl FnMut(Value, usize) -> Result<()>) -> Result<usize> {
+    pub(super) fn visit(
+        &self,
+        mut visit: impl FnMut(InheritedRecord, usize) -> Result<()>,
+    ) -> Result<usize> {
         let mut skipped = 0;
         let mut damage = Vec::new();
         for (index, segment) in self.segments.iter().enumerate().skip(self.first_available) {
@@ -1119,6 +1125,11 @@ fn access_denied(error: &anyhow::Error) -> bool {
     })
 }
 
+pub(super) enum InheritedRecord {
+    Native(Value),
+    WithheldRequest,
+}
+
 enum PrefixRead {
     Complete(usize),
     Damaged(&'static str),
@@ -1129,7 +1140,7 @@ enum PrefixRead {
 /// too, so an inconsistent bookmark never imports a turn after the fork.
 fn read_prefix(
     segment: &Segment,
-    visit: &mut dyn FnMut(Value, usize) -> Result<()>,
+    visit: &mut dyn FnMut(InheritedRecord, usize) -> Result<()>,
 ) -> Result<PrefixRead> {
     let revision = CodexAdapter::index_file_revision(&segment.path);
     ensure!(
@@ -1171,17 +1182,37 @@ fn unreadable_prefix(path: &Path, error: std::io::Error) -> Result<PrefixRead> {
 #[derive(Clone, Debug, Default)]
 struct RecoveryPlan {
     revision: Option<omnis_ir::SourceRevision>,
-    // Each interval records the first row, exclusive end row, and ordinal of the first row.
-    controls: Vec<(usize, usize, u64)>,
-    prefix_end: usize,
-    discard_through: usize,
+    // Both anchors place every surviving row in the interval, including omitted bodies.
+    positions: Vec<(usize, usize, u64)>,
+    confirmed_turns: Vec<(usize, usize)>,
+    withheld_requests: Vec<usize>,
+    opaque_through: usize,
+    unresolved: bool,
 }
 
 impl RecoveryPlan {
+    fn preserves_ancestors(&self) -> bool {
+        !self.unresolved
+    }
+
     fn ordinal(&self, row: usize) -> Option<u64> {
-        let index = self.controls.partition_point(|&(_, end, _)| end <= row);
-        let &(first, _, ordinal) = self.controls.get(index)?;
+        let index = self.positions.partition_point(|&(_, end, _)| end <= row);
+        let &(first, _, ordinal) = self.positions.get(index)?;
         ordinal.checked_add(u64::try_from(row.checked_sub(first)?).ok()?)
+    }
+
+    fn withheld_request(&self, row: usize, start: VisibleStart) -> bool {
+        self.withheld_requests.binary_search(&row).is_ok()
+            && self
+                .ordinal(row)
+                .is_some_and(|ordinal| start.ordinal().is_none_or(|begin| ordinal >= begin))
+    }
+
+    fn confirmed_turn(&self, row: usize) -> bool {
+        let index = self.confirmed_turns.partition_point(|&(_, end)| end < row);
+        self.confirmed_turns
+            .get(index)
+            .is_some_and(|&(start, _)| row >= start)
     }
 }
 
@@ -1190,69 +1221,172 @@ struct SequenceEvidence {
     plan: RecoveryPlan,
     anchor: Option<(usize, u64)>,
     last_row: usize,
-    controls: bool,
+    continuous: bool,
     pending_rollback: usize,
-    complete: usize,
-    first_gap: Option<usize>,
+    turn: Option<(usize, String, bool)>,
+    unnumbered_messages: Vec<usize>,
+    candidates: Vec<(usize, bool, usize, bool)>,
+    request_slots: Vec<(usize, bool, usize)>,
+    saw_request: bool,
 }
 
 impl SequenceEvidence {
-    fn gap(&mut self) {
-        self.first_gap.get_or_insert(self.complete);
-    }
-
     fn unknown(&mut self, row: usize) {
-        self.gap();
-        self.controls = false;
-        self.plan.discard_through = row;
+        self.plan.unresolved = true;
+        self.continuous = false;
+        self.turn = None;
+        self.plan.opaque_through = row;
     }
 
     fn anchor(&mut self, row: usize, ordinal: u64) {
         if let Some((previous, position)) = self.anchor.replace((row, ordinal))
             && previous + 1 < row
         {
-            if self.controls
+            if self.continuous
                 && self.last_row + 1 == row
                 && ordinal.checked_sub(position) == u64::try_from(row - previous).ok()
             {
-                self.plan.controls.push((previous + 1, row, position + 1));
+                self.plan.positions.push((previous + 1, row, position + 1));
             } else {
-                self.gap();
-                self.plan.discard_through = self.plan.discard_through.max(self.pending_rollback);
+                self.plan.unresolved = true;
+                self.plan.opaque_through = self.plan.opaque_through.max(self.pending_rollback);
             }
         }
-        self.controls = true;
+        self.continuous = true;
         self.pending_rollback = 0;
     }
 
     fn observe(&mut self, path: &Path, record: &Value, row: usize, hidden: bool) {
-        if let Some(ordinal) = record["ordinal"].as_u64() {
+        let ordinal = record["ordinal"].as_u64();
+        if let Some(ordinal) = ordinal {
             self.anchor(row, ordinal);
-            if !hidden && is_owned_completion(record, path) {
-                self.complete = row;
-            }
         } else {
-            let rollback = is_owned_rollback(record, path);
-            self.controls &= self.last_row + 1 == row
-                && !hidden
-                && (is_owned_turn_start(record, path)
-                    || rollback
-                    || is_owned_completion(record, path)
-                    || (record["type"] == "event_msg"
-                        && record["payload"]["type"] == "token_count"
-                        && owned_event(record, path)));
-            if !hidden && rollback {
+            self.continuous &= self.last_row + 1 == row
+                && record["type"].is_string()
+                && record["payload"].is_object();
+            if !hidden && is_owned_rollback(record, path) && record["payload"]["num_turns"] != 0 {
                 self.pending_rollback = row;
             }
+            if !hidden && !recoverable_control(record, path) {
+                if is_message(record) {
+                    self.unnumbered_messages.push(row);
+                } else {
+                    self.plan.unresolved = true;
+                }
+            }
+        }
+        if !hidden {
+            self.observe_turn(path, record, row, ordinal.is_some());
         }
         self.last_row = row;
     }
 
+    fn observe_turn(&mut self, path: &Path, record: &Value, row: usize, numbered: bool) {
+        let payload = &record["payload"];
+        if is_owned_turn_start(record, path) {
+            self.saw_request = false;
+            self.turn = payload["turn_id"]
+                .as_str()
+                .map(|id| (row, id.to_owned(), numbered));
+        } else if is_owned_completion(record, path) {
+            if let Some((start, id, numbered_start)) = self.turn.take()
+                && payload["turn_id"] == id
+                && self
+                    .unnumbered_messages
+                    .last()
+                    .is_some_and(|&missing| missing > start)
+            {
+                self.candidates.push((start, numbered_start, row, numbered));
+            }
+        } else if is_owned_rollback(record, path)
+            || payload["type"] == "turn_aborted"
+            || !owned_event(record, path)
+            || self.turn.as_ref().is_some_and(|(_, id, _)| {
+                [record, payload]
+                    .iter()
+                    .any(|object| object.get("turn_id").is_some_and(|value| value != id))
+            })
+        {
+            self.turn = None;
+        }
+        if let Some((start, _, numbered_start)) = &self.turn
+            && is_user_message(record)
+            && !std::mem::replace(&mut self.saw_request, true)
+            && !numbered
+        {
+            self.request_slots.push((*start, *numbered_start, row));
+        }
+    }
+
     fn finish(mut self, end_row: usize, end_ordinal: u64) -> RecoveryPlan {
         self.anchor(end_row, end_ordinal);
-        self.plan.prefix_end = self.first_gap.unwrap_or(usize::MAX);
+        for (start, numbered_start, end, numbered_end) in self.candidates {
+            if (numbered_start || self.plan.ordinal(start).is_some())
+                && (numbered_end || self.plan.ordinal(end).is_some())
+            {
+                self.plan.confirmed_turns.push((start, end));
+            }
+        }
+        for (start, numbered_start, row) in self.request_slots {
+            if (numbered_start || self.plan.ordinal(start).is_some())
+                && row > self.plan.opaque_through
+                && self.plan.ordinal(row).is_some()
+                && !self.plan.confirmed_turn(row)
+            {
+                self.plan.withheld_requests.push(row);
+            }
+        }
+        self.plan.unresolved |= self.unnumbered_messages.iter().any(|&row| {
+            self.plan.ordinal(row).is_none()
+                || (!self.plan.confirmed_turn(row)
+                    && self.plan.withheld_requests.binary_search(&row).is_err())
+        });
         self.plan
     }
+}
+
+fn is_user_message(record: &Value) -> bool {
+    let payload = &record["payload"];
+    match (record["type"].as_str(), payload["type"].as_str()) {
+        (Some("response_item"), Some("message")) if payload["role"] == "user" => {
+            payload["content"].as_str().map_or_else(
+                || {
+                    super::message_parts(payload)
+                        .0
+                        .iter()
+                        .all(|part| !super::is_contextual_user_text(part))
+                },
+                |text| !super::is_contextual_user_text(text),
+            )
+        }
+        (Some("event_msg"), Some("user_message")) => !super::is_contextual_user_text(
+            super::string_at(payload, &[&["message"], &["text"]]).unwrap_or(""),
+        ),
+        _ => false,
+    }
+}
+
+fn is_message(record: &Value) -> bool {
+    (record["type"] == "response_item"
+        && record["payload"]["type"] == "message"
+        && matches!(
+            record["payload"]["role"].as_str(),
+            Some("user" | "assistant")
+        ))
+        || (record["type"] == "event_msg"
+            && matches!(
+                record["payload"]["type"].as_str(),
+                Some("user_message" | "agent_message")
+            ))
+}
+
+fn recoverable_control(record: &Value, path: &Path) -> bool {
+    is_owned_turn_start(record, path)
+        || is_owned_completion(record, path)
+        || is_owned_rollback(record, path)
+        || (record["type"] == "event_msg"
+            && record["payload"]["type"] == "token_count"
+            && owned_event(record, path))
 }
 
 fn is_owned_completion(record: &Value, path: &Path) -> bool {
@@ -1272,7 +1406,6 @@ struct PrefixCursor {
     max_reserved_gap: u64,
     malformed: bool,
     damage: Option<&'static str>,
-    visible: bool,
     damaged_preamble_settings: bool,
     evidence: SequenceEvidence,
 }
@@ -1284,7 +1417,6 @@ impl PrefixCursor {
             max_reserved_gap: 0,
             malformed: false,
             damage: None,
-            visible: segment.recovery.is_none(),
             damaged_preamble_settings: false,
             evidence: SequenceEvidence::default(),
         }
@@ -1299,7 +1431,14 @@ impl PrefixCursor {
     ) -> Result<bool> {
         let hidden = start.hides_parsed_row(row, record);
         let preamble = start.hides_row(row);
-        let inferred = segment.recovery.as_ref().and_then(|plan| plan.ordinal(row));
+        let inferred = segment.recovery.as_ref().and_then(|plan| {
+            plan.ordinal(row).filter(|_| {
+                recoverable_control(record, &segment.path)
+                    || (plan.confirmed_turn(row)
+                        && is_message(record)
+                        && owned_event(record, &segment.path))
+            })
+        });
         let ordinal = inferred.or(segment.record_ordinal(
             record,
             self.next,
@@ -1321,7 +1460,6 @@ impl PrefixCursor {
                 && start.ordinal().is_none_or(|begin| ordinal >= begin)
             {
                 self.damage = None;
-                self.visible = true;
                 self.damaged_preamble_settings = false;
             }
             if !hidden && self.damage.is_none() {
@@ -1339,18 +1477,13 @@ impl PrefixCursor {
                 self.max_reserved_gap = self.max_reserved_gap.max(first.saturating_sub(self.next));
             }
         }
-        let completed_prefix = segment
-            .recovery
-            .as_ref()
-            .is_some_and(|plan| row <= plan.prefix_end);
         let permitted = segment.recovery.as_ref().is_none_or(|plan| {
-            row > plan.discard_through
+            row > plan.opaque_through
                 && (record["payload"]["type"] != "thread_rolled_back"
                     || owned_event(record, &segment.path))
         });
         let include = !hidden
             && permitted
-            && (self.visible || completed_prefix)
             && (self.damage.is_none()
                 || (ordinal.is_some()
                     && segment.recovery.is_some()
@@ -1382,17 +1515,19 @@ fn is_owned_rollback(record: &Value, path: &Path) -> bool {
 }
 
 fn owned_event(record: &Value, path: &Path) -> bool {
-    record["payload"].get("thread_id").is_none_or(|owner| {
-        owner
-            .as_str()
-            .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
+    [record, &record["payload"]].iter().all(|object| {
+        object.get("thread_id").is_none_or(|owner| {
+            owner
+                .as_str()
+                .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
+        })
     })
 }
 
 fn read_prefix_from(
     segment: &Segment,
     source: &mut dyn Read,
-    visit: &mut dyn FnMut(Value, usize) -> Result<()>,
+    visit: &mut dyn FnMut(InheritedRecord, usize) -> Result<()>,
 ) -> Result<PrefixRead> {
     let Some(visible_start) = segment.visible_start else {
         return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
@@ -1458,7 +1593,14 @@ fn read_prefix_from(
                     }
                 };
                 if cursor.observe(segment, visible_start, &record, row)? {
-                    visit(record, skipped)?;
+                    visit(InheritedRecord::Native(record), skipped)?;
+                } else if !visible_start.hides_parsed_row(row, &record)
+                    && segment
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|plan| plan.withheld_request(row, visible_start))
+                {
+                    visit(InheritedRecord::WithheldRequest, skipped)?;
                 }
             }
         }
