@@ -4466,6 +4466,41 @@ mod tests {
     }
 
     #[test]
+    fn selected_detail_distinguishes_empty_samples_from_empty_conversations() {
+        let project = Path::new("/workspace");
+        for complete in [true, false] {
+            let mut state = PickerState::new(
+                vec![session(Provider::Grok, "session", project, None)],
+                project,
+                None,
+                false,
+            );
+            let key = state.preview_key(&state.entries[0]);
+            let preview = SessionPreview {
+                first: None,
+                latest: None,
+                message_count: 0,
+                ..synthetic_preview("unused")
+            };
+            state.previews.insert(
+                key,
+                PreviewValue::Ready {
+                    preview: Box::new(preview),
+                    continuation: None,
+                    complete,
+                },
+                &[],
+            );
+            let lines = selected_detail_lines(&state, 100, 40);
+            let contains = |text: &str| lines.iter().any(|line| line.text.contains(text));
+            assert_eq!(contains("Preview incomplete"), !complete);
+            assert_eq!(contains("Message count unknown"), !complete);
+            assert_eq!(contains("No visible messages"), complete);
+            assert_eq!(contains("0 messages"), complete);
+        }
+    }
+
+    #[test]
     fn selected_detail_shows_first_and_latest_messages() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(

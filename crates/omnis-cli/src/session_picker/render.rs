@@ -1264,7 +1264,7 @@ pub(super) fn selected_detail_lines(
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     match preview {
         Some(PreviewValue::Ready { preview, .. }) => {
-            append_preview_lines(&mut lines, preview, width, height);
+            append_preview_lines(&mut lines, preview, preview_complete, width, height);
         }
         Some(PreviewValue::Unavailable) => {
             lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
@@ -1301,11 +1301,15 @@ pub(super) fn append_session_metadata(
         return;
     }
     let event_count = discovered_event_count.max(preview.event_count);
-    let trajectory = format!(
-        "{} messages · {} tools · {event_count} events",
-        grouped_number(preview.message_count),
-        grouped_number(preview.tool_event_count),
-    );
+    let trajectory = if !preview_complete && preview.message_count == 0 {
+        "Message count unknown".to_owned()
+    } else {
+        format!(
+            "{} messages · {} tools · {event_count} events",
+            grouped_number(preview.message_count),
+            grouped_number(preview.tool_event_count),
+        )
+    };
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_field(
         "Trajectory",
@@ -1595,6 +1599,7 @@ pub(super) fn format_timestamp(timestamp: Option<DateTime<Utc>>, approximate: bo
 pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
+    complete: bool,
     width: usize,
     height: usize,
 ) {
@@ -1606,6 +1611,10 @@ pub(super) fn append_preview_lines(
         2
     };
     match (&preview.first, &preview.latest) {
+        (None, _) if !complete => lines.push(detail_line(
+            "Preview incomplete. No messages were visible in the sample.",
+            DetailStyle::Muted,
+        )),
         (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
         (Some(first), Some(_)) if preview.message_count == 1 => {
             append_message_excerpt(lines, "ONLY MESSAGE", first, width, excerpt_lines);

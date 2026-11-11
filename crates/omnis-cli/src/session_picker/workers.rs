@@ -677,7 +677,11 @@ fn preview_update(
                     .continuation_after
                     .and_then(|handoff_at| first_user_message_after(snapshot, handoff_at)),
                 preview: Box::new(session_preview(snapshot)),
-                complete,
+                complete: complete
+                    && !snapshot
+                        .events
+                        .iter()
+                        .any(omnis_core::reports_omitted_events),
             }
         })
     };
