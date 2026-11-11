@@ -1223,6 +1223,65 @@ fn desktop_restores_history_from_the_selected_home_after_another_home_completes(
 }
 
 #[test]
+fn desktop_search_accepts_a_richer_partial_after_a_complete_read() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    let home = write_synthetic_antigravity_ide(root, &workspace);
+    let database =
+        rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+            .unwrap();
+    let search = |query: &str, flags: &[&str]| {
+        let report = successful_json(
+            command(root, &workspace)
+                .env("ANTIGRAVITY_DESKTOP_HOME", &home)
+                .args([
+                    "--json",
+                    "search",
+                    "--provider",
+                    "antigravity-desktop",
+                    query,
+                ])
+                .args(flags),
+        );
+        report["results"].as_array().unwrap().first().map(|hit| {
+            assert_eq!(hit["match"], "conversation", "{report}");
+            hit["coverage"].as_str().unwrap().to_owned()
+        })
+    };
+    write_desktop_step(&database, 0, "firstbody");
+    write_desktop_step(&database, 1, "secondbody");
+    set_desktop_summary(&home, "Desktop session", 2);
+    assert_eq!(search("secondbody", &[]).as_deref(), Some("complete"));
+
+    set_desktop_summary(&home, "Desktop session", 4);
+    assert_eq!(search("secondbody", &[]).as_deref(), Some("complete"));
+    database
+        .execute("DELETE FROM steps WHERE idx=1", [])
+        .unwrap();
+    assert_eq!(search("secondbody", &[]).as_deref(), Some("complete"));
+    write_desktop_step(&database, 0, "unrelatedbody");
+    assert!(search("unrelatedbody", &[]).is_none());
+    assert_eq!(
+        search("secondbody", &["--cached"]).as_deref(),
+        Some("complete")
+    );
+
+    write_desktop_step(&database, 0, "firstbody");
+    write_desktop_step(&database, 1, "secondbody");
+    write_desktop_step(&database, 2, "thirdbody");
+    assert_eq!(search("thirdbody", &[]).as_deref(), Some("preview"));
+    assert_eq!(
+        search("thirdbody", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+    assert_eq!(
+        search("secondbody", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+}
+
+#[test]
 fn desktop_partial_search_follows_the_selected_file_and_restored_middle_steps() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

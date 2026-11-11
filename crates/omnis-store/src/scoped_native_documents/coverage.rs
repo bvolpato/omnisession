@@ -21,7 +21,7 @@ impl Primary {
     ) -> Result<Option<Self>> {
         let mut statement = tx.prepare_cached(
             "SELECT doc.id, origin.source_home, doc.source_file_id, doc.source_contents_id,
-                    doc.source_complete OR doc.provider_limited, doc.indexed_byte_count, doc.content_hash
+                    doc.source_complete OR doc.provider_limited, doc.complete, doc.indexed_byte_count, doc.content_hash
              FROM session_trajectories doc LEFT JOIN native_search_document_homes origin
                ON doc.id=origin.trajectory_id AND doc.source_file_id=origin.source_file AND origin.verification=1
              WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native'",
@@ -35,8 +35,8 @@ impl Primary {
                         verified_home: row.get(1)?,
                         file: optional_uuid(row, 2)?,
                         coverage: PriorCoverage::from_row(row, 3)?,
-                        bytes: row.get(5)?,
-                        hash: row.get(6)?,
+                        bytes: row.get(6)?,
+                        hash: row.get(7)?,
                     })
                 },
             )
@@ -66,13 +66,13 @@ impl Primary {
         rewritten: &[(i64, &str)],
         has_gap: bool,
     ) -> Result<bool> {
-        self.coverage.accepts_partial(write, has_gap, || {
+        self.coverage.accepts_partial(write, has_gap, |strict| {
             if self.hash == write.content_hash {
-                return Ok(true);
+                return Ok(!strict);
             }
             Ok(self
                 .text(tx, rewritten)?
-                .is_some_and(|text| retains_text(&text, write.document.redacted_text)))
+                .is_some_and(|text| retains_text(&text, write.document.redacted_text, strict)))
         })
     }
 }
@@ -85,7 +85,7 @@ pub(super) fn scoped_accepts_partial(
     has_gap: bool,
 ) -> Result<bool> {
     let mut statement = tx.prepare_cached(
-        "SELECT source_contents, source_complete OR provider_limited, stored_text FROM scoped_native_documents
+        "SELECT source_contents, source_complete OR provider_limited, complete, stored_text FROM scoped_native_documents
          WHERE provider=?1 AND session_id=?2 AND source_home=?3 AND source_file=?4",
     ).map_err(database_error)?;
     let accepts = statement
@@ -97,10 +97,11 @@ pub(super) fn scoped_accepts_partial(
                 file.as_bytes()
             ],
             |row| {
-                PriorCoverage::from_row(row, 0)?.accepts_partial(write, has_gap, || {
+                PriorCoverage::from_row(row, 0)?.accepts_partial(write, has_gap, |strict| {
                     Ok(retains_text(
-                        row.get_ref(2)?.as_str()?,
+                        row.get_ref(3)?.as_str()?,
                         write.document.redacted_text,
+                        strict,
                     ))
                 })
             },
@@ -113,6 +114,7 @@ pub(super) fn scoped_accepts_partial(
 struct PriorCoverage {
     contents: Option<Uuid>,
     full_or_limited: bool,
+    complete: bool,
 }
 
 impl PriorCoverage {
@@ -120,6 +122,7 @@ impl PriorCoverage {
         Ok(Self {
             contents: optional_uuid(row, column)?,
             full_or_limited: row.get(column + 1)?,
+            complete: row.get(column + 2)?,
         })
     }
 
@@ -127,20 +130,27 @@ impl PriorCoverage {
         &self,
         write: &PreparedTrajectoryWrite<'_, '_>,
         has_gap: bool,
-        retains_text: impl FnOnce() -> std::result::Result<bool, E>,
+        retains_text: impl FnOnce(bool) -> std::result::Result<bool, E>,
     ) -> std::result::Result<bool, E> {
         if !has_gap && self.contents != write.document.source_revision.contents {
             return Ok(true);
         }
-        if self.full_or_limited {
+        if self.full_or_limited
+            && !(self.complete
+                && has_gap
+                && write.session.provider == crate::Provider::AntigravityDesktop)
+        {
             return Ok(false);
         }
-        retains_text()
+        retains_text(self.full_or_limited)
     }
 }
 
-fn retains_text(previous: &str, incoming: &str) -> bool {
-    if incoming.starts_with(previous) {
+fn retains_text(previous: &str, incoming: &str, strict: bool) -> bool {
+    if strict && incoming.len() <= previous.len() {
+        return false;
+    }
+    if previous.is_empty() || (!strict && incoming.starts_with(previous)) {
         return true;
     }
     if incoming.len() < previous.len() {
@@ -162,15 +172,24 @@ mod tests {
         let previous = "first\n\nrepeat\n\nrepeat\n\nlast";
         assert!(retains_text(
             previous,
-            "new\n\nfirst\n\nrepeat\n\nadded\n\nrepeat\n\nlast"
+            "new\n\nfirst\n\nrepeat\n\nadded\n\nrepeat\n\nlast",
+            true
+        ));
+        assert!(!retains_text(previous, previous, true));
+        assert!(!retains_text(
+            previous,
+            &format!("{previous} altered"),
+            true
         ));
         assert!(!retains_text(
             previous,
-            "first\n\nrepeat\n\ninserted longer paragraph\n\nlast"
+            "first\n\nrepeat\n\ninserted longer paragraph\n\nlast",
+            true
         ));
         assert!(!retains_text(
             previous,
-            "first\n\nlast\n\nrepeat\n\nrepeat\n\nmore"
+            "first\n\nlast\n\nrepeat\n\nrepeat\n\nmore",
+            true
         ));
     }
 }
