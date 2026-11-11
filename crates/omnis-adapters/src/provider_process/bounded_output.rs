@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     io::{self, Read},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, Output},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -17,7 +17,7 @@ use wait_timeout::ChildExt;
 
 mod json_response;
 mod response;
-use response::{Response, ResponseState, collect_response, piped_output};
+use response::{Response, ResponseState, piped_output};
 pub use response::{
     bounded_provider_help_output, bounded_provider_line_output, bounded_provider_text_output,
 };
@@ -94,9 +94,13 @@ fn spawn_group(command: &mut Command) -> io::Result<ProviderProcess> {
     }
     let mut group = command.group();
     #[cfg(windows)]
-    if probe.is_some() {
-        // Windows also stops the job if a second interrupt forces an immediate exit.
-        group.kill_on_drop(true);
+    {
+        // The job builder sets the creation flags when it starts the process suspended.
+        group.creation_flags(super::WINDOWS_HELPER_CREATION_FLAGS);
+        if probe.is_some() {
+            // A second interrupt may exit omni before it can stop the probe explicitly.
+            group.kill_on_drop(true);
+        }
     }
     Ok(ProviderProcess {
         group: group.spawn()?,
@@ -153,6 +157,8 @@ pub(crate) fn bounded_terminal_output(
     stderr_limit: Option<usize>,
     large_output_timeout: Option<Duration>,
 ) -> Result<Output> {
+    use std::process::Stdio;
+
     use rustix_openpty::rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
 
     let terminal = rustix_openpty::openpty(None, None).context("opening provider stdout PTY")?;
@@ -175,7 +181,7 @@ pub(crate) fn bounded_terminal_output(
             maximum,
         })
     });
-    collect_response(
+    response::collect_response(
         child?,
         Some(TerminalOutput {
             file: terminal.controller.into(),

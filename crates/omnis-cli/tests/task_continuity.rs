@@ -594,6 +594,46 @@ fn inspection_rejects_a_provider_whose_interpreter_is_missing() {
 
 #[cfg(unix)]
 #[test]
+fn inspection_checks_the_permission_mode_before_offering_a_handoff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let omp = root.join("omp");
+    fs::write(
+        &omp,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo omp/1.0.0 ;;\n  --help) echo '  --approval-mode write' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omp, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("claude:{SESSION_ID}");
+
+    for args in [
+        vec!["inspect", &source, "--target", "omp"],
+        vec!["resume", &source, "--in", "omp", "--dry-run"],
+    ] {
+        let mut omni = command(root, &workspace);
+        omni.env("OMNI_MODE", "always-ask")
+            .env("OMNI_OMP_BIN", &omp)
+            .args(["--json"])
+            .args(args);
+        let denied = omni.output().unwrap();
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("cannot validate `always-ask`"));
+
+        let report = successful_json(omni.args(["--mode", "default"]));
+        assert_eq!(
+            report.get("fidelity").unwrap_or(&report)["mode"],
+            "semantic_handoff"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn inspection_requires_a_successful_launcher_probe() {
     use std::os::unix::fs::PermissionsExt;
 

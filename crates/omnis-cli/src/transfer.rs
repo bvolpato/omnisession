@@ -28,11 +28,11 @@ use super::{
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
     cursor_ide_import, cursor_import, delete_native_session, display_command,
     fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import, json, launch_json,
-    opencode_import, pi_import, print_fidelity, progress_line,
-    read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
-    resolve_session_ref, resolved_provider_binary, run_launch, runnable_target_providers,
-    safe_terminal_line, self_update, session_picker, source_workspace_matches_for_session,
-    spawn_launch, wait_for_launch, workspace_paths_match, workspace_root, workspace_state_matches,
+    opencode_import, pi_import, print_fidelity, progress_line, redact_secrets,
+    render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
+    runnable_target_providers, safe_terminal_line, self_update, session_picker,
+    source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
+    workspace_root, workspace_state_matches,
 };
 
 pub(super) fn resume(
@@ -454,32 +454,30 @@ fn resume_native_without_snapshot(
         && !request.resume_in_place
         && resolved_provider_binary(Provider::OpenCode)
             .is_ok_and(|bin| omnis_adapters::is_opencode_v2(&bin));
-    let (plan, opencode_v2_fork) = if is_opencode_v2_fork {
-        plan_opencode_v2_fork(
+    let preview = json_output || args.dry_run;
+    if is_opencode_v2_fork && !preview {
+        return resume_opencode_v2_fork(
             registry,
             request,
             &project,
-            json_output || args.dry_run,
             mode_args,
-        )?
-    } else {
-        let plan = registry
-            .launch_plan(
-                &request.source,
-                &LaunchTarget {
-                    cwd: Some(project.clone()),
-                    fork: !request.resume_in_place,
-                    prompt: None,
-                },
-            )
-            .with_context(|| format!("planning resume for `{}`", request.source))?;
-        (
-            with_launch_mode(request.agent_target().launch(plan)?, mode_args),
-            None,
-        )
-    };
-
-    if json_output || args.dry_run {
+            &report,
+            task_binding,
+        );
+    }
+    let mut session = request.source.clone();
+    if is_opencode_v2_fork {
+        session.id = format!("{}-fork", session.id);
+    }
+    let plan = native_launch_plan(
+        registry,
+        request.agent_target(),
+        &session,
+        &project,
+        !request.resume_in_place && !is_opencode_v2_fork,
+        mode_args,
+    )?;
+    if preview {
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
 
@@ -488,27 +486,18 @@ fn resume_native_without_snapshot(
     flush_stdout()?;
     let tracks_native_fork = matches!(request.target, Provider::Codex | Provider::Grok);
     let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
-    let launch_result = run_launch(&plan);
-    if launch_result.is_ok() {
-        if let Some(child) = &opencode_v2_fork {
-            record_native_fork_lineage(&request.source, child, &report, task_binding)?;
-        } else if let Some(started_at) = fork_started_at {
-            link_native_fork(
-                registry,
-                &request.source,
-                plan.cwd.as_deref(),
-                started_at,
-                &report,
-                task_binding,
-            )?;
-        }
+    run_launch(&plan)?;
+    if let Some(started_at) = fork_started_at {
+        link_native_fork(
+            registry,
+            &request.source,
+            plan.cwd.as_deref(),
+            started_at,
+            &report,
+            task_binding,
+        )?;
     }
-    launch_result?;
-    if !request.resume_in_place
-        && !tracks_native_fork
-        && opencode_v2_fork.is_none()
-        && task_binding.is_some()
-    {
+    if !request.resume_in_place && !tracks_native_fork && task_binding.is_some() {
         eprintln!(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
@@ -553,52 +542,90 @@ fn print_native_resume_plan(
     Ok(())
 }
 
-fn plan_opencode_v2_fork(
+fn native_launch_plan(
+    registry: &AdapterRegistry,
+    agent: AgentTarget,
+    session: &SessionRef,
+    project: &Path,
+    fork: bool,
+    mode_args: &[String],
+) -> Result<LaunchPlan> {
+    let plan = registry
+        .launch_plan(
+            session,
+            &LaunchTarget {
+                cwd: Some(project.to_path_buf()),
+                fork,
+                prompt: None,
+            },
+        )
+        .with_context(|| format!("planning resume for `{session}`"))?;
+    Ok(with_launch_mode(agent.launch(plan)?, mode_args))
+}
+
+fn resume_opencode_v2_fork(
     registry: &AdapterRegistry,
     request: &ResolvedResumeRequest,
     project: &Path,
-    preview: bool,
     mode_args: &[String],
-) -> Result<(LaunchPlan, Option<SessionRef>)> {
-    let plan_child = |child: &SessionRef| -> Result<LaunchPlan> {
-        let plan = registry.launch_plan(
-            child,
-            &LaunchTarget {
-                cwd: Some(project.to_path_buf()),
-                fork: false,
-                prompt: None,
-            },
-        )?;
-        Ok(with_launch_mode(
-            request.agent_target().launch(plan)?,
-            mode_args,
-        ))
-    };
-    if preview {
-        let child = SessionRef::new(Provider::OpenCode, format!("{}-fork", request.source.id));
-        return Ok((plan_child(&child)?, None));
-    }
+    report: &FidelityReport,
+    task_binding: Option<&BindingRecord>,
+) -> Result<()> {
     let binary = resolved_provider_binary(Provider::OpenCode)?;
-    // Keep the POST, exact child read-back, and any rollback under one native operation.
-    let _mutation = super::interrupt::ProtectedCommand::enter();
-    let child_id = omnis_adapters::fork_opencode_session_with_binary(
+    print_fidelity(report)?;
+    flush_stdout()?;
+    let operation = "OpenCode native fork";
+    let interrupt = ImportInterrupt::for_operation(operation.to_owned());
+    let fork = omnis_adapters::fork_opencode_session_with_binary(
         &binary,
         &request.source.id,
         Some(project),
     )
-    .with_context(|| format!("forking `{}`", request.source))?;
+    .with_context(|| format!("forking `{}`", request.source));
+    let child_id = match fork {
+        Ok(id) => id,
+        // Only the POST response identifies the new child. Never guess an ID to delete.
+        Err(error) => {
+            let error = error.context(format!(
+                "The fork of `{}` did not return a verified child ID. Check `opencode session list` before retrying.",
+                request.source
+            ));
+            return Err(interrupt.materialization_failed(error, || None)?);
+        }
+    };
     let child = SessionRef::new(Provider::OpenCode, child_id);
-    let planned = read_opencode_session_with_binary_at(&binary, &child, Some(project))
-        .with_context(|| format!("reading forked child `{child}`"))
-        .and_then(|_| plan_child(&child));
-    match planned {
-        Ok(plan) => Ok((plan, Some(child))),
-        Err(error) => Err(error_after_rollback(
-            error,
-            delete_opencode_session(&binary, &child, Some(project)),
-            "OpenCode",
-        )),
-    }
+    let rollback = || -> Result<()> {
+        delete_opencode_session_at(OpenCodeGeneration::V2, &binary, &child, Some(project))
+            .map_err(|error| anyhow!("could not remove fork `{child}`: {error:#}"))
+    };
+    let fail = |error| failed_operation(error, rollback(), operation);
+    let args = OpenCodeGeneration::V2.args(&["export", &child.id]);
+    let readback = opencode_helper_command(&binary, &args, Some(project))
+        .and_then(|mut export| {
+            omnis_adapters::read_opencode_export(&mut export, &child, OPENCODE_IMPORT_TIMEOUT)
+        })
+        .with_context(|| format!("reading forked child `{child}`"));
+    interrupt.check(ImportCheckpoint::Materialized, &child, rollback)?;
+    readback.map_err(fail)?;
+    let plan = native_launch_plan(
+        registry,
+        request.agent_target(),
+        &child,
+        project,
+        false,
+        mode_args,
+    );
+    interrupt.check(ImportCheckpoint::Planned, &child, rollback)?;
+    let plan = plan.map_err(fail)?;
+    let lineage = record_transfer_lineage(&request.source, &child, report, task_binding)
+        .context("recording OpenCode fork lineage")
+        .map_err(fail)?;
+    println!("Linked OpenCode fork `{child}` under `{}`.", request.source);
+    println!("Launching {}...", request.agent_target());
+    let flushed = flush_stdout();
+    interrupt.finish_recorded(&child, rollback, lineage)?;
+    flushed?;
+    run_launch(&plan)
 }
 
 fn link_native_fork(
@@ -840,7 +867,7 @@ pub(super) fn check_launch_profile(target: AgentTarget) -> Result<()> {
 /// Permission mode flags `provider` starts with, after saying which mode that is. `requested` is
 /// the target page or `--mode` choice, and a mode the installed agent lacks steps down to the
 /// nearest one it has.
-fn launch_mode_args(
+pub(super) fn launch_mode_args(
     target: AgentTarget,
     requested: Option<ModeKind>,
     quiet: bool,
@@ -1436,11 +1463,15 @@ const INJECTED_IMPORT_INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 pub(super) struct ImportInterrupt {
     guard: InterruptGuard,
     injected: Option<ImportCheckpoint>,
-    provider: &'static str,
+    operation: String,
 }
 
 impl ImportInterrupt {
     pub(super) fn install(provider: &'static str) -> Self {
+        Self::for_operation(format!("{provider} native import"))
+    }
+
+    fn for_operation(operation: String) -> Self {
         let injected = match env::var(INJECTED_IMPORT_INTERRUPT).as_deref() {
             Ok("materialized") => Some(ImportCheckpoint::Materialized),
             Ok("planned") => Some(ImportCheckpoint::Planned),
@@ -1450,7 +1481,7 @@ impl ImportInterrupt {
         Self {
             guard: InterruptGuard::install(),
             injected,
-            provider,
+            operation,
         }
     }
 
@@ -1474,19 +1505,24 @@ impl ImportInterrupt {
             return Ok(error);
         }
         if rollback_failed(&error) {
-            return Err(error.context(format!("{} native import failed", self.provider)));
+            return Err(error.context(format!("{} failed", self.operation)));
         }
         match published() {
-            Some((target, Ok(()))) => Err(interrupted_import(self.provider, &target, Ok(()), None)),
-            Some((_, Err(rollback_error))) => Err(error_after_rollback(
-                error.context(format!("{} native import was interrupted", self.provider)),
+            Some((target, Ok(()))) => Err(interrupted_native_operation(
+                &self.operation,
+                &target,
+                Ok(()),
+                None,
+            )),
+            Some((_, Err(rollback_error))) => Err(failed_operation(
+                error.context(format!("{} was interrupted", self.operation)),
                 Err(rollback_error),
-                self.provider,
+                &self.operation,
             )),
             None => {
                 eprintln!(
-                    "Interrupted; {} native import did not complete ({}). Source session was not changed.",
-                    self.provider,
+                    "Interrupted; {} did not complete ({}). Source session was not changed.",
+                    self.operation,
                     safe_terminal_line(&error.to_string())
                 );
                 Err(Interrupted.into())
@@ -1502,7 +1538,12 @@ impl ImportInterrupt {
         rollback: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         if self.guard.requested() || self.injected_by(checkpoint) {
-            return Err(interrupted_import(self.provider, target, rollback(), None));
+            return Err(interrupted_native_operation(
+                &self.operation,
+                target,
+                rollback(),
+                None,
+            ));
         }
         Ok(())
     }
@@ -1510,8 +1551,19 @@ impl ImportInterrupt {
     /// Restores the default Ctrl+C action before launch. If Ctrl+C arrived first, rolls back the
     /// generated target and the lineage recorded for it instead.
     fn finish(
-        mut self,
+        self,
         context: &ResumeContext<'_>,
+        target: &SessionRef,
+        rollback: impl FnOnce() -> Result<()>,
+        lineage: RecordedLineage,
+    ) -> Result<()> {
+        self.finish_recorded(target, rollback, lineage)?;
+        context.retain_recovery_file();
+        Ok(())
+    }
+
+    fn finish_recorded(
+        mut self,
         target: &SessionRef,
         rollback: impl FnOnce() -> Result<()>,
         lineage: RecordedLineage,
@@ -1519,30 +1571,29 @@ impl ImportInterrupt {
         let injected = self.injected_by(ImportCheckpoint::Recorded);
         // Restoring before the last check means a later Ctrl+C runs the default action.
         if self.guard.restore_default() || injected {
-            return Err(interrupted_import(
-                self.provider,
+            return Err(interrupted_native_operation(
+                &self.operation,
                 target,
                 rollback(),
                 Some(lineage),
             ));
         }
-        context.retain_recovery_file();
         Ok(())
     }
 }
 
-fn interrupted_import(
-    provider: &str,
+fn interrupted_native_operation(
+    operation: &str,
     target: &SessionRef,
     rollback: Result<()>,
     lineage: Option<RecordedLineage>,
 ) -> anyhow::Error {
     if let Err(rollback_error) = rollback {
         // The generated session may remain, so any recorded lineage still describes it.
-        return error_after_rollback(
-            anyhow!("{provider} native import was interrupted"),
+        return failed_operation(
+            anyhow!("{operation} was interrupted"),
             Err(rollback_error),
-            provider,
+            operation,
         );
     }
     if let Some(Err(error)) = lineage.map(|lineage| lineage.undo(target)) {
@@ -2720,12 +2771,16 @@ pub(super) fn error_after_rollback(
     rollback: Result<()>,
     provider: &str,
 ) -> anyhow::Error {
+    failed_operation(error, rollback, &format!("{provider} import"))
+}
+
+fn failed_operation(error: anyhow::Error, rollback: Result<()>, operation: &str) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
         Err(rollback_error) => rollback_failure(
             error,
             format!(
-                "{provider} import failed and rollback also failed: {}",
+                "{operation} failed and rollback also failed: {}",
                 safe_terminal_line(&rollback_error.to_string())
             ),
         ),

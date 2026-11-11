@@ -286,29 +286,106 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
     let Some((flag, values)) = mode.help_words.split_first() else {
         return true;
     };
-    let lines = help.lines().collect::<Vec<_>>();
-    lines.iter().enumerate().any(|(index, line)| {
-        let lists_flag = line
-            .split_whitespace()
-            .take_while(|field| field.starts_with('-'))
-            .flat_map(|field| {
-                field
-                    .split_once(['=', '<', '[', ':'])
-                    .map_or(field, |(names, _)| names)
-                    .split([',', '|'])
-            })
-            .any(|name| name == *flag);
-        if !lists_flag {
-            return false;
+    let mut in_entry = false;
+    let mut found = vec![false; values.len()];
+    let mut option_indent = None;
+    let mut long_alias_indent = None;
+    let mut description_column = usize::MAX;
+    for line in help.lines() {
+        let text = line.trim_start();
+        if text.is_empty() {
+            continue;
         }
-        let entry = lines[index..]
-            .iter()
-            .enumerate()
-            .take_while(|(offset, line)| *offset == 0 || !line.trim_start().starts_with('-'))
-            .flat_map(|(_, line)| words(line))
-            .collect::<Vec<_>>();
-        values.iter().all(|value| entry.contains(value))
+        let leading = line.len() - text.len();
+        let indent = help_column(&line[..leading]);
+        let option = text
+            .strip_prefix('-')
+            .filter(|name| name.starts_with(|character: char| !character.is_whitespace()));
+        if let Some((declaration, description)) = option.map(|_| option_columns(text))
+            && (indent < description_column
+                || (long_alias_indent == Some(indent)
+                    && text.starts_with("--")
+                    && description.is_none_or(|column| {
+                        let gap = &text[declaration.len()..column];
+                        gap.len() > 1 || gap.contains('\t')
+                    })))
+        {
+            in_entry = declaration.split_whitespace().any(|field| {
+                for item in field.split([',', '|']) {
+                    if let Some((name, _)) = item.split_once(['=', '<', '[', ':']) {
+                        if name == *flag {
+                            return true;
+                        }
+                        // An unquoted option value can itself contain commas and pipes.
+                        if !item.ends_with(['>', ']']) {
+                            break;
+                        }
+                    } else if item == *flag {
+                        return true;
+                    }
+                }
+                false
+            });
+            found.fill(false);
+            option_indent = Some(indent);
+            // Short options often appear as `-x, --example`. A long-only row can
+            // start in that same column, even after a short description.
+            long_alias_indent = (!text.starts_with("--")).then_some(indent + "-x, ".len());
+            description_column =
+                description.map_or(usize::MAX, |byte| help_column(&line[..leading + byte]));
+        } else if option_indent.is_some_and(|previous| indent > previous) {
+            description_column = description_column.min(indent);
+        } else {
+            in_entry = false;
+            option_indent = None;
+            long_alias_indent = None;
+            description_column = usize::MAX;
+        }
+        if in_entry {
+            for (value, seen) in values.iter().zip(&mut found) {
+                *seen |= words(text).any(|word| word == *value);
+            }
+            if found.iter().all(|seen| *seen) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn help_column(prefix: &str) -> usize {
+    prefix.chars().fold(0, |column, character| {
+        if character == '\t' {
+            column + (8 - column % 8)
+        } else {
+            column + unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+        }
     })
+}
+
+/// Separates an option's names and arguments from its description. A short and a long
+/// alias can each have a required or optional argument, as in `-p MODE, --policy MODE`.
+fn option_columns(text: &str) -> (&str, Option<usize>) {
+    let mut end = 0;
+    for field in text.split_whitespace() {
+        let rest = &text[end..];
+        let column = text.len() - rest.trim_start().len();
+        let argument = field.split([',', '|']).next().unwrap_or(field);
+        let is_argument = argument.starts_with(['<', '[', '{'])
+            || (!argument.is_empty()
+                && argument.bytes().all(|byte| {
+                    byte.is_ascii_uppercase() || byte.is_ascii_digit() || b"_-.".contains(&byte)
+                }))
+            || field.ends_with([',', '|']);
+        let padded = column - end > 1 || rest.starts_with('\t');
+        if (padded && !text[..end].ends_with([',', '|']))
+            || !(field.starts_with('-') || is_argument)
+        {
+            return (&text[..end], Some(column));
+        }
+        end = column + field.len();
+    }
+    (&text[..end], None)
 }
 
 const MAX_CACHED_BINARIES: usize = 64;
@@ -335,7 +412,7 @@ impl InstalledModes {
     ) -> Self {
         let identity = binary_identity(binary);
         let specification = json!({
-            "option_entries": modes(provider)
+            "option_declarations": modes(provider)
                 .iter()
                 .map(|mode| (mode.kind.id(), mode.help_words))
                 .collect::<Vec<_>>()
@@ -587,6 +664,31 @@ mod tests {
         assert!(help_lists("  -a, --auto    auto-approve", yolo));
         assert!(!help_lists("  --preview    use with --auto", yolo));
         assert!(!help_lists("  --example=--auto    sample input", yolo));
+        let accept = find_mode(Provider::Claude, ModeKind::AcceptEdits).unwrap();
+        for declaration in [
+            "-p MODE, --permission-mode MODE",
+            "-p MODE,--permission-mode MODE",
+            "-p <MODE>,   --permission-mode=<MODE>",
+            "-p [MODE] | --permission-mode [MODE]",
+        ] {
+            let help = format!("  {declaration}\n                         Choices: acceptEdits");
+            assert!(help_lists(&help, accept), "{declaration}");
+        }
+        assert!(help_lists(
+            "  -v  Give version\n      --permission-mode MODE  Choices: acceptEdits",
+            accept,
+        ));
+        let wrapped_example =
+            "  --preview MODE  Use with\n                  --permission-mode acceptEdits";
+        assert!(!help_lists(wrapped_example, accept));
+        assert!(!help_lists(
+            "  --preview MODE\tUse with\n\t\t\t--permission-mode acceptEdits",
+            accept,
+        ));
+        assert!(!help_lists(
+            "  -v  Use with\n      --permission-mode acceptEdits",
+            accept,
+        ));
     }
 
     #[cfg(unix)]

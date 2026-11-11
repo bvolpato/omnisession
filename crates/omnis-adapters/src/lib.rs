@@ -42,6 +42,8 @@ pub use opencode::{
     read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
+#[cfg(windows)]
+pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
 pub use provider_process::{
     ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
     bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,

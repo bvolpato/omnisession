@@ -95,7 +95,7 @@ omni search pagination --cached      # search without reading provider stores
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns, and known provider authentication files are never read. Redaction cannot prove every secret is absent, so review sensitive sessions before you transfer them.
 - **Task identity.** Workspace selection and exact session IDs decide task bindings. Recency does not.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
-- **Cancel before launch.** During a native import, `Ctrl+C` stops the launch and attempts to roll back the generated target. If an OpenCode worker can still publish it, OmniSession reports the target ID and retains the recovery file.
+- **Cancel before launch.** During a native import, `Ctrl+C` stops the launch and attempts to roll back the generated target. If an OpenCode worker can still publish it, OmniSession reports the target ID and retains the recovery file. If you interrupt an OpenCode 2 native fork, OmniSession removes the child ID returned by the provider and verifies its removal. If the provider did not return a child ID, check `opencode session list` before retrying.
 
 Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
 
@@ -170,7 +170,7 @@ The Windows installer verifies the release checksum, installs `omni`, and adds i
 
 - Windows packaging, installer, CLI, and synthetic-store checks run in native Windows CI. Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
 - Other agents do not declare cross-agent import on Windows. Picker targets without declared import continue through semantic handoff, while explicit `omni resume --in` still attempts native import.
-- `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, and native imports, and import helpers run on a hidden console of their own, so neither key reaches them.
+- `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, native imports, and OpenCode 2 forks. Provider probes and native import helpers run on a hidden console of their own.
 - Native Windows and WSL provider stores are not interchangeable.
 
 </details>
@@ -424,6 +424,8 @@ OmniSession has no telemetry or hosted service. The release check contacts GitHu
 
 **What carries over, and will tool calls run again?**
 Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits. For a portable bundle, inspection checks whether the target can import it or receive a handoff, even when the bundle came from the same agent.
+
+Inspection checks the permission mode that `resume` would use, including your `OMNI_MODE` preference. Use `omni inspect <session> --target <agent> --mode <mode>` to check an explicit override.
 
 Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`. For an existing Cursor IDE chat, both commands check the desktop launcher. Cursor opens the workspace, where you select the chat from Show Chat History.
 

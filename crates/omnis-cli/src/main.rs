@@ -18,7 +18,6 @@ use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
     AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
     ProviderInstallation, installed_opencode_model_with_binary,
-    read_opencode_session_with_binary_at,
 };
 use omnis_core::{
     build_fidelity_report, build_native_fork_report,
@@ -1079,6 +1078,13 @@ struct InspectArgs {
     session: String,
     #[arg(long, value_name = "AGENT", help = "Target agent or launch profile")]
     target: Option<AgentTarget>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help = "Check the permission mode used to launch the target (default: OMNI_MODE or the agent default)"
+    )]
+    mode: Option<launch_mode::ModeKind>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -1862,6 +1868,9 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
             "--target",
         )?,
     };
+    transfer::reject_unsupported_target(target.provider)?;
+    transfer::check_launch_profile(target)?;
+    transfer::launch_mode_args(target, args.mode, true)?;
     let project = current_project()?;
     let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     inspect_report(
@@ -1883,8 +1892,6 @@ fn inspect_report(
     project: &Path,
 ) -> Result<FidelityReport> {
     let target = agent.provider;
-    transfer::reject_unsupported_target(target)?;
-    transfer::check_launch_profile(agent)?;
     if source == target {
         if target == Provider::CursorIde {
             cursor_ide_binary()?;

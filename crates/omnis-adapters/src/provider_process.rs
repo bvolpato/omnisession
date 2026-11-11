@@ -2,6 +2,16 @@
 
 use std::{path::Path, process::Command};
 
+/// Starts a Windows console helper in its own process group on a hidden console.
+/// Terminal Ctrl+C and Ctrl+Break then reach the interactive parent without interrupting
+/// the helper during a native write or rollback.
+#[cfg(windows)]
+pub const WINDOWS_HELPER_CREATION_FLAGS: u32 = {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+};
+
 mod bounded_output;
 pub use bounded_output::{
     ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,

@@ -15,12 +15,14 @@ use wait_timeout::ChildExt;
 
 use super::{SESSION_ID, command, write_synthetic_claude};
 
+#[path = "probe_signals/opencode_fork.rs"]
+mod opencode_fork;
+
 const BLOCKING_LAUNCHER: &str = r#"#!/bin/sh
 case " $* " in
     *' --version '*)
-        if [ "$PHASE" != launch ] || [ ! -e "$MODELS_DONE" ]; then echo '2.0.0'; exit; fi ;;
-    *' models '*)
-        if [ "$PHASE" = launch ]; then : > "$MODELS_DONE"; echo 'synthetic/model'; exit; fi ;;
+        if [ "$PHASE" != version ]; then echo '2.0.0'; exit; fi ;;
+    *' models '*) ;;
     *' --show-toplevel '*) ;;
     *) exit 1 ;;
 esac
@@ -43,7 +45,7 @@ fn cancellation_stops_resume_preparation_workers_and_preserves_normal_git_termin
         ),
         (
             "opencode",
-            "launch",
+            "version",
             vec!["resume", &source, "--in", "opencode"],
         ),
     ] {
@@ -80,7 +82,6 @@ fn cancellation_stops_resume_preparation_workers_and_preserves_normal_git_termin
             .env("FIFO", &fifo)
             .env("READY", &ready)
             .env("PHASE", phase)
-            .env("MODELS_DONE", root.join("models-done"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -229,21 +229,11 @@ impl HelperProcess for Command {
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(
             self,
-            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            omnis_adapters::WINDOWS_HELPER_CREATION_FLAGS,
         );
         self
     }
 }
-
-/// Process creation flag that makes the child lead a new console process group with Ctrl+C
-/// disabled.
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-/// Process creation flag that gives a console child a hidden console of its own instead of the
-/// parent's console.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Waits up to `timeout` for a helper, killing and reaping it when it is still running or the wait
 /// failed.
