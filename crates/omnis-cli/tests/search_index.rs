@@ -1160,6 +1160,8 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
         temporary_directory.path(),
     );
     assert_task_and_resume(&environment, &imported);
+    #[cfg(unix)]
+    assert_first_run_codex_probes(&environment, &imported);
     assert_missing_uuid(&environment);
     assert_uuid_collision_fails(&environment, bundle, temporary_directory.path());
 }
@@ -1370,7 +1372,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     );
 
     let switched = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&workspace)
         .args(["--json", "switch", "codex", "--dry-run"])
         .output()
@@ -1381,6 +1383,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         String::from_utf8_lossy(&switched.stderr)
     );
     assert!(!String::from_utf8_lossy(&switched.stdout).contains("Cross-Workspace Override"));
+    environment.assert_first_run_handoff(&serde_json::from_slice(&switched.stdout).unwrap());
     let listed = environment
         .command()
         .current_dir(&workspace)
@@ -1763,7 +1766,7 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
 
     assert!(!environment.home.join(".codex").exists());
     let resume = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&environment.workspace)
         .args(["--json", "resume", &source, "--dry-run"])
         .output()
@@ -1777,10 +1780,68 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
     assert_eq!(resumed["source"], json!(imported));
     assert_eq!(resumed["target"], "codex");
     assert_eq!(resumed["dry_run"], true);
+    environment.assert_first_run_handoff(&resumed);
     let resumed_text = String::from_utf8_lossy(&resume.stdout);
     assert!(!resumed_text.contains(SECRET_VALUE));
     assert!(!resumed_text.contains(HIDDEN_REASONING_MARKER));
     assert!(!resumed_text.contains(HIDDEN_APPROVAL_MARKER));
+}
+
+#[cfg(unix)]
+fn assert_first_run_codex_probes(environment: &TestEnvironment, imported: &SessionRef) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = environment.home.join("codex-cli");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+store=${CODEX_HOME:-$HOME/.codex}
+case "$1" in
+    --version|--help)
+        mkdir -p "$store" || exit 1
+        echo "$1" >> "$HOME/probes"
+        if [ "$1" = --version ]; then echo 'codex-cli 0.137.0';
+        else echo '  --dangerously-bypass-approvals-and-sandbox  Skip approvals'; fi ;;
+    *) printf '%s\n' "$store" "$@" > "$HOME/launch" ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = imported.to_string();
+    let run = |dry_run| {
+        let mut command = environment.first_run_codex_command();
+        command
+            .current_dir(&environment.workspace)
+            .env("OMNI_CODEX_BIN", &executable)
+            .env("TMPDIR", &environment.home)
+            .args(["resume", &source, "--in", "codex", "--mode", "yolo"]);
+        if dry_run {
+            command.args(["--json", "--dry-run"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    environment.assert_first_run_handoff(&serde_json::from_slice(&run(true).stdout).unwrap());
+    let probes = fs::read_to_string(environment.home.join("probes")).unwrap();
+    for flag in ["--version", "--help"] {
+        assert!(probes.lines().any(|probe| probe == flag), "{probes}");
+    }
+    assert!(!environment.home.join("launch").exists());
+    run(false);
+    let launch = fs::read_to_string(environment.home.join("launch")).unwrap();
+    let mut args = launch.lines();
+    assert_eq!(
+        Path::new(args.next().unwrap()),
+        environment.home.join(".codex")
+    );
+    assert!(args.any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
 }
 
 fn assert_missing_uuid(environment: &TestEnvironment) {
@@ -1844,6 +1905,8 @@ impl TestEnvironment {
             .env("OMNISESSION_HOME", &self.state_root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
+            .env("CODEX_HOME", self.home.join(".codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("ANTIGRAVITY_CLI_HOME", self.home.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.home.join("antigravity-ide"))
             .env(
@@ -1857,6 +1920,53 @@ impl TestEnvironment {
             .env("OMNI_CODEX_BIN", &self.missing_codex)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command
+    }
+
+    fn first_run_codex_command(&self) -> Command {
+        let mut command = self.command();
+        #[cfg(windows)]
+        {
+            // Windows can resolve its profile through the OS even when USERPROFILE is redirected.
+            let probe = self
+                .command()
+                .env_remove("CODEX_HOME")
+                .args(["--json", "adapters"])
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let providers: Vec<serde_json::Value> = serde_json::from_slice(&probe.stdout).unwrap();
+            let codex = providers
+                .iter()
+                .find(|row| row["provider"] == "codex")
+                .unwrap();
+            let default = Path::new(codex["data_root"].as_str().expect("first-run Codex home"));
+            assert!(default.is_absolute() && default.ends_with(".codex"));
+            if default != self.home.join(".codex") {
+                return command;
+            }
+        }
+        command.env_remove("CODEX_HOME");
+        command
+    }
+
+    fn assert_first_run_handoff(&self, plan: &serde_json::Value) {
+        assert_eq!(plan["fidelity"]["mode"], "semantic_handoff");
+        let args = plan["launch"]["args"].as_array().unwrap();
+        let pin = args
+            .windows(2)
+            .find(|pair| pair[0] == "-c")
+            .expect("SQLite home in launch plan");
+        let settings: toml::Table = toml::from_str(pin[1].as_str().unwrap()).unwrap();
+        let expected = self.home.join(".codex");
+        assert_eq!(
+            Path::new(settings["sqlite_home"].as_str().unwrap()),
+            expected
+        );
+        assert!(!expected.exists());
     }
 }
 

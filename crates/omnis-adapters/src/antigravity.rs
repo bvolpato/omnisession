@@ -138,6 +138,8 @@ impl AntigravityAdapter {
         );
         let history = read?;
         Ok(IndexRead {
+            workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+            rollback_title: crate::RollbackTitle::Unknown,
             verified_prefix_end: history.database_prefix_end.or_else(|| {
                 tail.damage()
                     .filter(|_| !preview)
@@ -174,7 +176,6 @@ impl AntigravityAdapter {
         preview: bool,
         tail: JsonLineTail<'_>,
     ) -> Result<ObservedHistory> {
-        let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
         let mut groups = Vec::new();
@@ -226,13 +227,7 @@ impl AntigravityAdapter {
         }
 
         Ok(ObservedHistory {
-            snapshot: builder.snapshot(
-                session.clone(),
-                nonempty(summary.title.clone()),
-                summary.project_path.clone(),
-                None,
-                captured_at,
-            ),
+            snapshot: summary.snapshot(session, builder),
             search_record_groups: groups,
             database_prefix_end,
         })
@@ -661,15 +656,11 @@ impl ProviderAdapter for AntigravityAdapter {
             self.ensure_history_unchanged(&summary, path, observed, &handle)?;
             return result;
         }
-        let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
-        let mut title_source = EventBuilder::new(Provider::Antigravity, &session.id).snapshot(
-            session.clone(),
-            nonempty(summary.title.clone()),
-            summary.project_path.clone(),
-            None,
-            captured_at,
-        );
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut title_source = summary.snapshot(
+            session,
+            EventBuilder::new(Provider::Antigravity, &session.id),
+        );
         let mut document = SearchDocumentBuilder::default();
         let mut gaps = DamagedRecordPositions::default();
         let mut push = |record| {
@@ -724,6 +715,8 @@ impl ProviderAdapter for AntigravityAdapter {
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
                 verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 snapshot: title_source,
@@ -783,6 +776,16 @@ struct Summary {
 }
 
 impl Summary {
+    fn snapshot(&self, session: &SessionRef, events: EventBuilder) -> CanonicalSnapshot {
+        events.snapshot(
+            session.clone(),
+            nonempty(self.title.clone()),
+            self.project_path.clone(),
+            None,
+            self.updated_at.unwrap_or_else(Utc::now),
+        )
+    }
+
     fn native_session(&self, source_path: Option<PathBuf>) -> NativeSession {
         let session = SessionRef::new(Provider::Antigravity, self.id.clone());
         let revision = source_path.as_deref().and_then(|path| {

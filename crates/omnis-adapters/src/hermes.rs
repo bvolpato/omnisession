@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -117,8 +117,10 @@ impl HermesAdapter {
             Ok(IndexRead {
                 verified_prefix_end: None,
                 search_record_groups: Vec::new(),
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
                 native_session: None,
-                source_revision: omnis_ir::SourceRevision::default(),
+                source_revision: SourceRevision::default(),
                 snapshot: builder.snapshot(
                     session.clone(),
                     metadata.title,

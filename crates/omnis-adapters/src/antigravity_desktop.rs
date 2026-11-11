@@ -110,6 +110,8 @@ impl AntigravityDesktopAdapter {
                 .is_some_and(|metadata| metadata.len() <= budget);
         let (snapshot, verified_prefix_end) = read?;
         Ok(IndexRead {
+            workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+            rollback_title: crate::RollbackTitle::Unknown,
             verified_prefix_end,
             search_record_groups: Vec::new(),
             snapshot,

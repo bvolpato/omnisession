@@ -878,6 +878,8 @@ impl SelectedPiFile {
                 verified_prefix_end: None,
                 search_record_groups: Vec::new(),
                 native_session: None,
+                rollback_title: crate::RollbackTitle::Unknown,
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 snapshot,
                 source_complete: true,
                 provider_limited: false,
