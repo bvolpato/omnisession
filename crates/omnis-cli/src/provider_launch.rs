@@ -208,6 +208,18 @@ fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Resu
     if !is_standalone_codex_entrypoint(provider) {
         return Ok(false);
     }
+    #[cfg(windows)]
+    {
+        compare_windows_copy(paths, metadata[0].len())
+    }
+    #[cfg(not(windows))]
+    {
+        compare_native_copy(paths, &metadata)
+    }
+}
+
+#[cfg(not(windows))]
+fn compare_native_copy(paths: [&Path; 2], metadata: &[fs::Metadata; 2]) -> std::io::Result<bool> {
     #[cfg(unix)]
     let revisions = metadata.each_ref().map(ExecutableRevision::from);
     #[cfg(unix)]
@@ -227,19 +239,10 @@ fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Resu
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(1);
-        }
         options.open(path)
     };
-    let mut files = [open(paths[0])?, open(paths[1])?];
-    let size = files[0].metadata()?.len();
-    if size != files[1].metadata()?.len() || size != metadata[0].len() {
-        return Ok(false);
-    }
-    let matches = native_executable(&mut files[0])? && equal_executable_contents(&mut files, size)?;
+    let files = [open(paths[0])?, open(paths[1])?];
+    let matches = compare_open_copy(files.each_ref(), metadata[0].len())?;
     #[cfg(unix)]
     {
         for ((path, file), before) in paths.iter().zip(&files).zip(revisions) {
@@ -256,7 +259,34 @@ fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Resu
     Ok(matches)
 }
 
-fn native_executable(file: &mut fs::File) -> std::io::Result<bool> {
+fn compare_open_copy(files: [&fs::File; 2], size: u64) -> std::io::Result<bool> {
+    if files[0].metadata()?.len() != size || files[1].metadata()?.len() != size {
+        return Ok(false);
+    }
+    Ok(native_executable(files[0])? && equal_executable_contents(files, size)?)
+}
+
+#[cfg(windows)]
+fn compare_windows_copy(paths: [&Path; 2], size: u64) -> std::io::Result<bool> {
+    let handles = [
+        open_release_handle(paths[0])?,
+        open_release_handle(paths[1])?,
+    ];
+    let paths_match = || {
+        paths.iter().zip(&handles).all(|(path, held)| {
+            same_file::Handle::from_path(path).is_ok_and(|current| &current == held)
+        })
+    };
+    if !paths_match() {
+        return Ok(false);
+    }
+    let matches = scoped_verdict(ProofKind::Copy, &handles, || {
+        compare_open_copy([handles[0].as_file(), handles[1].as_file()], size)
+    })?;
+    Ok(matches && is_standalone_codex_entrypoint(paths[1]) && paths_match())
+}
+
+fn native_executable(mut file: &fs::File) -> std::io::Result<bool> {
     use std::io::Read;
     let mut header = [0; 64];
     file.read_exact(&mut header)?;
@@ -297,7 +327,7 @@ fn native_executable(file: &mut fs::File) -> std::io::Result<bool> {
     }
 }
 
-fn equal_executable_contents(files: &mut [fs::File; 2], mut size: u64) -> std::io::Result<bool> {
+fn equal_executable_contents(mut files: [&fs::File; 2], mut size: u64) -> std::io::Result<bool> {
     use std::io::{Read, Seek};
     files[0].rewind()?;
     let mut left = vec![0; 64 * 1024];
@@ -381,7 +411,7 @@ fn verify_signed_codex(target: &Path) -> Option<bool> {
     };
     const CODEX_REQUIREMENT: &str = r#"-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2""#;
     if !fs::File::open(target)
-        .and_then(|mut file| native_executable(&mut file))
+        .and_then(|file| native_executable(&file))
         .unwrap_or(false)
     {
         return None;
@@ -412,13 +442,13 @@ fn verify_signed_codex(target: &Path) -> Option<bool> {
 #[cfg(windows)]
 struct CodexIdentityCache {
     scopes: usize,
-    proof: Option<(same_file::Handle, bool)>,
+    proofs: [Option<(Vec<same_file::Handle>, bool)>; 2],
 }
 
 #[cfg(windows)]
 thread_local! {
     static CODEX_IDENTITY: std::cell::RefCell<CodexIdentityCache> = const {
-        std::cell::RefCell::new(CodexIdentityCache {scopes:0,proof:None})
+        std::cell::RefCell::new(CodexIdentityCache {scopes:0,proofs:[None,None]})
     };
 }
 
@@ -438,7 +468,7 @@ impl Drop for CodexIdentityScope {
         CODEX_IDENTITY.with_borrow_mut(|cache| {
             cache.scopes -= 1;
             if cache.scopes == 0 {
-                cache.proof = None;
+                cache.proofs = [None, None];
             }
         });
     }
@@ -446,7 +476,48 @@ impl Drop for CodexIdentityScope {
 
 #[cfg(windows)]
 pub(super) fn release_codex_identity() {
-    CODEX_IDENTITY.with_borrow_mut(|cache| cache.proof = None);
+    CODEX_IDENTITY.with_borrow_mut(|cache| cache.proofs = [None, None]);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ProofKind {
+    Release,
+    Copy,
+}
+
+#[cfg(windows)]
+fn scoped_verdict(
+    kind: ProofKind,
+    handles: &[same_file::Handle],
+    verify: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let slot = kind as usize;
+    let cached = CODEX_IDENTITY.with_borrow(|cache| {
+        cache.proofs[slot]
+            .as_ref()
+            .filter(|(known, _)| known.as_slice() == handles)
+            .map(|(_, verified)| *verified)
+    });
+    if let Some(verified) = cached {
+        return Ok(verified);
+    }
+    let verified = verify()?;
+    CODEX_IDENTITY.with_borrow_mut(|cache| {
+        if cache.scopes != 0 {
+            let retained = handles
+                .iter()
+                .map(|handle| {
+                    handle
+                        .as_file()
+                        .try_clone()
+                        .and_then(same_file::Handle::from_file)
+                })
+                .collect::<std::io::Result<Vec<_>>>();
+            cache.proofs[slot] = retained.ok().map(|files| (files, verified));
+        }
+    });
+    Ok(verified)
 }
 
 #[cfg(windows)]
@@ -454,30 +525,10 @@ fn scoped_release_verdict(
     handle: &same_file::Handle,
     verify: impl FnOnce(&fs::File) -> std::io::Result<bool>,
 ) -> bool {
-    let cached = CODEX_IDENTITY.with_borrow(|cache| {
-        cache
-            .proof
-            .as_ref()
-            .filter(|(known, _)| known == handle)
-            .map(|(_, verified)| *verified)
-    });
-    if let Some(verified) = cached {
-        return verified;
-    }
-    let Ok(verified) = verify(handle.as_file()) else {
-        return false;
-    };
-    CODEX_IDENTITY.with_borrow_mut(|cache| {
-        if cache.scopes != 0 {
-            cache.proof = handle
-                .as_file()
-                .try_clone()
-                .and_then(same_file::Handle::from_file)
-                .ok()
-                .map(|locked| (locked, verified));
-        }
-    });
-    verified
+    scoped_verdict(ProofKind::Release, std::slice::from_ref(handle), || {
+        verify(handle.as_file())
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -573,7 +624,7 @@ enum CodexPackage {
 pub(super) fn is_standalone_codex_entrypoint(program: &Path) -> bool {
     codex_package(program) == Some(CodexPackage::Standalone)
         && fs::File::open(program)
-            .and_then(|mut file| native_executable(&mut file))
+            .and_then(|file| native_executable(&file))
             .unwrap_or(false)
 }
 
@@ -958,6 +1009,48 @@ mod tests {
         fs::write(&program, b"abd")?;
         assert!(!check()?);
         assert_eq!(reads.get(), 6);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparation_reuses_the_copy_comparison_until_either_file_is_replaced() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let candidate = temp.path().join("candidate.exe");
+        let provider = temp.path().join("provider.exe");
+        fs::write(&candidate, b"one")?;
+        fs::write(&provider, b"one")?;
+        let reads = std::cell::Cell::new(0);
+        let compare = || -> Result<bool> {
+            let handles = [
+                open_release_handle(&candidate)?,
+                open_release_handle(&provider)?,
+            ];
+            Ok(scoped_verdict(ProofKind::Copy, &handles, || {
+                reads.set(reads.get() + 1);
+                equal_executable_contents([handles[0].as_file(), handles[1].as_file()], 3)
+            })?)
+        };
+        {
+            let _scope = codex_identity_scope();
+            assert!(compare()?);
+            assert!(compare()?);
+            assert_eq!(reads.get(), 1);
+            fs::rename(&candidate, temp.path().join("old-candidate.exe"))?;
+            fs::write(&candidate, b"two")?;
+            assert!(!compare()?);
+            assert_eq!(reads.get(), 2);
+            fs::rename(&provider, temp.path().join("old-provider.exe"))?;
+            fs::write(&provider, b"two")?;
+            assert!(compare()?);
+            assert_eq!(reads.get(), 3);
+            release_codex_identity();
+            fs::write(&candidate, b"six")?;
+            assert!(!compare()?);
+        }
+        fs::write(&provider, b"six")?;
+        assert!(compare()?);
+        assert_eq!(reads.get(), 5);
         Ok(())
     }
 

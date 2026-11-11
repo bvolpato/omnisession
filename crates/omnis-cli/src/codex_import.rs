@@ -177,6 +177,8 @@ pub(crate) fn profiles_for_recorded_provider(
     if plain_codex_supplies(&home, &provider) {
         return Vec::new();
     }
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     let supplies = |profile: &LaunchProfile| {
         profile
             .expanded_args(&crate::launch_profile::environment)

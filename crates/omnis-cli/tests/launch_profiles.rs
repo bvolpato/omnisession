@@ -823,6 +823,26 @@ fn handoff_reports_an_override_only_for_a_different_profile_workspace() {
 }
 
 #[test]
+fn missing_program_reports_the_configured_expression_in_profile_listings() {
+    let expression = "${TOOL_ROOT}/codex";
+    let fixture = Fixture::new(Some(&format!(
+        "[profiles.missing]\nagent = 'codex'\nprogram = '{expression}'\n"
+    )));
+    for args in [vec!["profiles"], vec!["--json", "profiles"]] {
+        let output = fixture
+            .omni()
+            .env("TOOL_ROOT", CREDENTIAL)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_no_credential(&output);
+        let listing = String::from_utf8(output.stdout).unwrap();
+        assert!(listing.contains(&format!("program `{expression}` was not found")));
+    }
+}
+
+#[test]
 fn credential_in_an_argument_is_hidden_from_output_and_reaches_the_program() {
     // Neither variable name looks like a credential, so only the value decides what is hidden.
     let fixture = Fixture::new(Some(

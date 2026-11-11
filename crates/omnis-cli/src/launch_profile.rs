@@ -162,7 +162,7 @@ impl LaunchProfile {
         match &self.program {
             None => installed.contains(&self.agent),
             Some(program) => match expand(program, &environment) {
-                Ok(program) => self.executable(&program).is_ok(),
+                Ok(expanded) => self.executable(program, &expanded).is_ok(),
                 Err(_) => true,
             },
         }
@@ -200,19 +200,21 @@ impl LaunchProfile {
             },
             lookup,
         )?;
-        if self.program.is_some() {
-            self.executable(&plan.program)?;
+        if let Some(configured) = &self.program {
+            self.executable(configured, &plan.program)?;
         }
         Ok(())
     }
 
-    fn executable(&self, expanded: &str) -> Result<PathBuf> {
+    fn executable(&self, configured: &str, expanded: &str) -> Result<PathBuf> {
         let file = resolve_program(expanded, std::env::var_os("PATH").as_deref())
-            .ok_or_else(|| anyhow!("program `{expanded}` was not found or is not executable"))?;
+            .ok_or_else(|| anyhow!("program `{configured}` was not found or is not executable"))?;
         let program = std::path::absolute(&file).unwrap_or(file);
         if self.native_codex_target {
             let primary = crate::provider_launch::resolved_provider_binary(Provider::Codex)
-                .context("cannot find the primary Codex command for `native_codex_target`")?;
+                .map_err(|_| {
+                    anyhow!("cannot find the primary Codex command for `native_codex_target`")
+                })?;
             anyhow::ensure!(
                 crate::provider_launch::manifestless_target(&program, &primary).is_some(),
                 "`native_codex_target` requires the resolved executable of the primary Codex command"
@@ -720,7 +722,7 @@ impl AgentTarget {
         };
         let expanded =
             expand(program, &environment).with_context(|| format!("profile `{self}`, program"))?;
-        profile.executable(&expanded).map(Some)
+        profile.executable(program, &expanded).map(Some)
     }
 
     /// Adds the profile to the launch plan of the agent. A built-in agent leaves it as it is.

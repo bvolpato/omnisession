@@ -42,6 +42,11 @@ pub(super) fn resume(
     json_output: bool,
     task_binding: Option<&BindingRecord>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let _identity = args
+        .source
+        .as_ref()
+        .map(|_| crate::provider_launch::codex_identity_scope());
     if let Some(target) = args.target {
         reject_unsupported_target(target.provider)?;
         check_launch_profile(target)?;
