@@ -30,8 +30,8 @@ use crossterm::{
 use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
-    HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    HandoffMessage, HandoffRole, SessionPreview, SessionWorkspaceMatcher, first_user_message_after,
+    safe_terminal_line, session_preview, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -41,7 +41,7 @@ use omnis_store::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    DELETE_PROVIDERS, PROVIDERS,
+    DELETE_PROVIDERS, PROVIDERS, ResumeArgs,
     fuzzy::{SearchFields, query_terms},
     launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
@@ -213,6 +213,15 @@ struct VisibleCache {
 }
 
 impl PickerState {
+    fn for_resume(current_project: &Path, args: &ResumeArgs) -> Self {
+        Self::new(
+            Vec::new(),
+            current_project,
+            args.source_provider,
+            args.all_projects,
+        )
+    }
+
     fn new(
         sessions: Vec<NativeSession>,
         current_project: &Path,
@@ -621,6 +630,16 @@ impl PickerState {
 
     fn scroll_help(&mut self, delta: isize) {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
+    }
+
+    fn project_path_for_selection(&self, session: &NativeSession) -> Option<PathBuf> {
+        if session.session.provider == Provider::Codex
+            && let Some(PreviewValue::Ready { preview, .. }) =
+                self.previews.get(&self.preview_key(session))
+        {
+            return preview.workspace_root.clone();
+        }
+        session.project_path.clone()
     }
 
     fn remember_preview_workspace(&mut self, key: &PreviewKey, value: &PreviewValue) {
@@ -1161,39 +1180,37 @@ fn cached_picker_entries(
     store: &Store,
     current_project: &Path,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
-    let sessions = store
+    let mut sessions = store
         .indexed_sessions()?
         .into_iter()
         .map(workers::native_session)
-        .collect();
-    let mut entries = picker_entries(sessions, current_project, true);
+        .collect::<Vec<_>>();
+    populate_approximate_updated_at(&mut sessions);
+    let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
-    let current_remote = std::cell::OnceCell::new();
-    for entry in entries.iter_mut().filter(|entry| {
-        entry.session.session.provider == Provider::Imported && !entry.current_workspace
-    }) {
-        let matches = (|| -> Result<bool> {
-            let bundle_id = crate::imported_bundle_id(&entry.session.session)?;
-            let bundle = crate::load_imported_bundle(store, bundle_id)?;
-            crate::source_workspace_matches_with_cache(
-                &entry.session.session,
-                &bundle.snapshot,
-                current_project,
-                &current_remote,
-            )
-        })();
-        match matches {
-            Ok(true) => {
-                entry.session.project_path = Some(current_project.to_path_buf());
-                entry.current_workspace = true;
-                entry.fields = SearchFields::new(&entry.session, None);
-            }
-            Ok(false) => {}
-            Err(error) => workers::record_picker_warning(
-                &mut warnings,
-                format!("{} workspace: {error:#}", entry.session.session),
-            ),
+    let mut paths = SessionWorkspaceMatcher::new(current_project);
+    let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
+    for mut session in sessions {
+        if session.session.provider != Provider::Imported {
+            entries.push(picker_entry(session, &mut paths, true));
+            continue;
         }
+        let current = match imports.matches(&session.session, session.project_path.as_deref()) {
+            Ok(crate::ImportedWorkspaceMatch::Recorded) => true,
+            Ok(crate::ImportedWorkspaceMatch::Relocated) => {
+                session.project_path = Some(current_project.to_path_buf());
+                true
+            }
+            Ok(crate::ImportedWorkspaceMatch::Other) => false,
+            Err(error) => {
+                workers::record_picker_warning(
+                    &mut warnings,
+                    format!("{} workspace: {error:#}", session.session),
+                );
+                false
+            }
+        };
+        entries.push(PickerEntry::new(session, current, true));
     }
     Ok((entries, warnings))
 }
@@ -1203,7 +1220,7 @@ fn normalized_picker_entries(
     current_project: &Path,
     cached: bool,
 ) -> Vec<PickerEntry> {
-    let mut matcher = WorkspaceMatcher::new(current_project);
+    let mut matcher = SessionWorkspaceMatcher::new(current_project);
     sessions
         .into_iter()
         .map(|session| picker_entry(session, &mut matcher, cached))
@@ -1212,44 +1229,25 @@ fn normalized_picker_entries(
 
 fn picker_entry(
     session: NativeSession,
-    matcher: &mut WorkspaceMatcher,
+    matcher: &mut SessionWorkspaceMatcher<'_>,
     cached: bool,
 ) -> PickerEntry {
-    PickerEntry {
-        key: session.session.to_string(),
-        current_workspace: session
-            .project_path
-            .as_deref()
-            .is_some_and(|path| matcher.matches(path)),
-        fields: SearchFields::new(&session, None),
-        session,
-        cached,
-    }
+    let current = session
+        .project_path
+        .as_deref()
+        .is_some_and(|path| matcher.matches(session.session.provider, path));
+    PickerEntry::new(session, current, cached)
 }
 
-struct WorkspaceMatcher {
-    current: PathBuf,
-    matches: HashMap<PathBuf, bool>,
-}
-
-impl WorkspaceMatcher {
-    fn new(current: &Path) -> Self {
+impl PickerEntry {
+    fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
         Self {
-            current: current.to_path_buf(),
-            matches: HashMap::new(),
+            key: session.session.to_string(),
+            current_workspace,
+            fields: SearchFields::new(&session, None),
+            session,
+            cached,
         }
-    }
-
-    fn matches(&mut self, candidate: &Path) -> bool {
-        if candidate == self.current {
-            return true;
-        }
-        if let Some(matches) = self.matches.get(candidate) {
-            return *matches;
-        }
-        let matches = workspace_paths_match(candidate, &self.current);
-        self.matches.insert(candidate.to_path_buf(), matches);
-        matches
     }
 }
 
@@ -1341,16 +1339,11 @@ fn require_terminal(otherwise: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn pick_session(
+pub(super) fn pick_session(
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    initial_provider: Option<Provider>,
-    all_projects: bool,
-    force_cross_provider: bool,
-    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
@@ -1362,7 +1355,8 @@ pub fn pick_session(
     theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
-    let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    let target = args.target;
+    let mut state = PickerState::for_resume(current_project, args);
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
@@ -1435,11 +1429,9 @@ pub fn pick_session(
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
-                target,
+                args,
                 available_targets,
                 new_session_targets,
-                force_cross_provider,
-                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1466,17 +1458,17 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    force_cross_provider: bool,
-    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
-        if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
+        if args.target.is_none()
+            && target_choices(TargetIntent::New, new_session_targets).is_empty()
+        {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(target, None, None, new_session_targets, requested_mode)? {
+        return match requested_target(args, None, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.target(),
                 mode: choice.mode,
@@ -1492,34 +1484,59 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
-    let project_path = match state.previews.get(&state.preview_key(&entry.session)) {
-        Some(PreviewValue::Ready { preview, .. }) if session.provider == Provider::Codex => {
-            preview.workspace_root.clone()
-        }
-        _ => entry.session.project_path.clone(),
-    };
+    let project_path = state.project_path_for_selection(&entry.session);
     let targets = available_targets
         .iter()
         .copied()
-        .filter(|target| !force_cross_provider || target.provider != session.provider)
+        .filter(|target| !args.materialize_only || target.provider != session.provider)
         .collect::<Vec<_>>();
     let preferred_target = crate::continuation_target_provider(&session)?;
-    match requested_target(
-        target,
-        Some(&session),
-        Some(preferred_target),
-        &targets,
-        requested_mode,
-    )? {
+    match requested_target(args, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => {
-            // An imported row can carry another machine's workspace, so never resolve a network path.
-            let workspace_override = if project_path
+            // An imported row can name another machine's workspace.
+            let stored = project_path
                 .as_deref()
-                .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
-            {
+                .filter(|path| !omnis_core::may_reach_network(path));
+            let reopen_cursor_chat = session.provider == Provider::CursorIde
+                && !choice.fork
+                && choice.target().provider == Provider::CursorIde;
+            let cursor_path = stored
+                .filter(|_| preferred_target == Provider::CursorIde)
+                .map(omnis_core::local_cursor_workspace_path)
+                .transpose();
+            let cursor_path = match cursor_path {
+                Ok(path) => path.flatten(),
+                Err(error) if reopen_cursor_chat => {
+                    return Ok(RowSelection::Notice(error.to_string()));
+                }
+                Err(_) => None,
+            };
+            let workspace_file = cursor_path.as_deref().is_some_and(Path::is_file);
+            let has_workspace = if preferred_target == Provider::CursorIde {
+                cursor_path.as_deref().is_some_and(Path::is_dir)
+                    || workspace_file
+                        && (reopen_cursor_chat
+                            || stored.is_some_and(|path| {
+                                omnis_core::cursor_workspace_matches(path, current_project)
+                            }))
+            } else {
+                stored.is_some_and(Path::is_dir)
+            };
+            let workspace_override = if has_workspace {
                 None
             } else {
-                match pick_workspace(&session, project_path.as_deref(), current_project)? {
+                let reason = if workspace_file {
+                    "Choose the folder to use for the target session."
+                } else {
+                    "Saved workspace is unavailable."
+                };
+                match pick_workspace(
+                    &session,
+                    choice.provider,
+                    project_path.as_deref(),
+                    current_project,
+                    reason,
+                )? {
                     WorkspaceOutcome::Selected(path) => Some(path),
                     WorkspaceOutcome::Back => return Ok(RowSelection::Back),
                     WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
@@ -1548,29 +1565,26 @@ fn select_picker_row(
 }
 
 fn requested_target(
-    target: Option<AgentTarget>,
+    args: &ResumeArgs,
     source: Option<&SessionRef>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
-    target.map_or_else(
-        || {
-            source.map_or_else(
-                || pick_new_target(targets, requested_mode),
-                |source| pick_target(source, preferred_target, targets, requested_mode),
-            )
-        },
-        |target| {
-            // `--in` skipped the page, so `--mode` or the agent's default decides.
-            Ok(TargetOutcome::Selected(TargetChoice {
-                provider: target.provider,
-                profile: target.profile,
-                fork: false,
-                mode: None,
-            }))
-        },
-    )
+    let intent = match source {
+        None => TargetIntent::New,
+        Some(source) if args.fork => TargetIntent::Fork(source),
+        Some(source) => TargetIntent::Resume(source),
+    };
+    if let Some(target) = args.target {
+        // `--in` skips the target page. Launch uses `--mode` or the agent's default.
+        return Ok(TargetOutcome::Selected(TargetChoice {
+            provider: target.provider,
+            profile: target.profile,
+            fork: args.fork && intent.source_provider() == Some(target.provider),
+            mode: None,
+        }));
+    }
+    pick_target_for(intent, preferred_target, targets, args.mode, args.no_fork)
 }
 
 fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers) -> bool {
@@ -1679,15 +1693,17 @@ enum WorkspaceOutcome {
 
 fn pick_workspace(
     source: &SessionRef,
+    target: Provider,
     original: Option<&Path>,
     current: &Path,
+    reason: &str,
 ) -> Result<WorkspaceOutcome> {
     let mut input = current.display().to_string();
     let mut message = String::new();
     let mut needs_render = true;
     loop {
         if needs_render {
-            render_workspace(source, original, &input, &message)?;
+            render_workspace(source, original, &input, &message, reason)?;
             needs_render = false;
         }
         let key = match event::read().context("reading workspace picker input")? {
@@ -1709,18 +1725,24 @@ fn pick_workspace(
             KeyCode::Esc => return Ok(WorkspaceOutcome::Back),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
                 let path = resolve_workspace_input(&input, current);
-                if !path.is_dir() {
-                    message.clear();
-                    message.push_str("Folder does not exist or is not a directory.");
-                    continue;
+                let folder = if target == Provider::CursorIde {
+                    omnis_core::cursor_launch_folder(&path)
+                } else if path.is_dir() {
+                    Some(
+                        path.canonicalize()
+                            .context("resolving selected workspace")?,
+                    )
+                } else {
+                    None
+                };
+                if let Some(folder) = folder {
+                    return Ok(WorkspaceOutcome::Selected(folder));
                 }
-                return path
-                    .canonicalize()
-                    .map(WorkspaceOutcome::Selected)
-                    .context("resolving selected workspace");
+                message.clear();
+                message.push_str("Folder does not exist or is not a directory.");
             }
             KeyCode::Tab => {
-                let completion = complete_directory_input(&input, current);
+                let completion = complete_directory_input(&input, current, target);
                 input = completion.value;
                 message = completion.message;
             }
@@ -1751,10 +1773,17 @@ struct PathCompletion {
     message: String,
 }
 
-fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
+fn complete_directory_input(input: &str, current: &Path, target: Provider) -> PathCompletion {
     let resolved = resolve_workspace_input(input, current);
+    let directory = |path: &Path| {
+        if target == Provider::CursorIde {
+            omnis_core::cursor_launch_folder(path)
+        } else {
+            path.is_dir().then(|| path.to_path_buf())
+        }
+    };
     let ends_with_separator = input.ends_with('/') || input.ends_with('\\');
-    if resolved.is_dir() && !ends_with_separator {
+    if !ends_with_separator && directory(&resolved).is_some() {
         return PathCompletion {
             value: format!("{}{MAIN_SEPARATOR}", resolved.display()),
             message: String::new(),
@@ -1774,14 +1803,15 @@ fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
                 .to_owned(),
         )
     };
-    let mut matches = fs::read_dir(&parent)
-        .ok()
+    let mut matches = directory(&parent)
+        .and_then(|folder| fs::read_dir(folder).ok())
         .into_iter()
         .flatten()
         .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&prefix))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with(&prefix) && directory(&entry.path()).is_some()).then_some(name)
+        })
         .collect::<Vec<_>>();
     matches.sort();
     let Some(first) = matches.first() else {
@@ -1840,27 +1870,6 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn pick_target(
-    source: &SessionRef,
-    preferred_target: Option<Provider>,
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(
-        TargetIntent::Resume(source),
-        preferred_target,
-        targets,
-        requested_mode,
-    )
-}
-
-fn pick_new_target(
-    targets: &[AgentTarget],
-    requested_mode: Option<ModeKind>,
-) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, None, targets, requested_mode)
-}
-
 pub fn pick_fork_target(
     source: &SessionRef,
     targets: &[AgentTarget],
@@ -1875,6 +1884,7 @@ pub fn pick_fork_target(
         Some(preferred_target),
         targets,
         requested_mode,
+        false,
     )? {
         TargetOutcome::Selected(choice) => Ok(Some(PickedTarget::Agent {
             target: choice.target(),
@@ -1890,6 +1900,7 @@ fn pick_target_for(
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
+    no_fork: bool,
 ) -> Result<TargetOutcome> {
     if targets.is_empty() && intent.source().is_none() {
         bail!(
@@ -1897,6 +1908,9 @@ fn pick_target_for(
         );
     }
     let mut choices = target_choices(intent, targets);
+    if no_fork {
+        choices.retain(|choice| !choice.fork);
+    }
     seed_requested_mode(&mut choices, requested_mode);
     if choices.is_empty() && intent.source().is_none() {
         bail!("no runnable target agents support this action on the current platform");
@@ -2487,6 +2501,7 @@ fn render_workspace(
     original: Option<&Path>,
     input: &str,
     message: &str,
+    reason: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
@@ -2508,11 +2523,7 @@ fn render_workspace(
         &truncate(&format!("Source: {source}"), width),
     )?;
     queue!(frame, Print("\r\n\r\n"))?;
-    queue_styled(
-        &mut frame,
-        DetailStyle::Warning,
-        "Saved workspace is unavailable.",
-    )?;
+    queue_styled(&mut frame, DetailStyle::Warning, reason)?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(
         &mut frame,
@@ -3336,10 +3347,38 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
-            .expect("row selection");
+        let selection =
+            select_picker_row(&state, temporary.path(), &ResumeArgs::default(), &[], &[])
+                .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
+    }
+
+    #[test]
+    fn explicit_fork_keeps_the_saved_workspace_member_as_its_destination() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let member = temporary.path().join("member");
+        let saved = temporary.path().join("multi.code-workspace");
+        fs::create_dir(&member).unwrap();
+        fs::write(&saved, r#"{"folders":[{"path":"member"}]}"#).unwrap();
+        let state = PickerState::new(
+            vec![session(Provider::CursorIde, "chat", &saved, Some("Chat"))],
+            &member,
+            None,
+            true,
+        );
+        let args = ResumeArgs {
+            target: Some(Provider::CursorIde.into()),
+            fork: true,
+            ..Default::default()
+        };
+
+        let selected = select_picker_row(&state, &member, &args, &[], &[]).unwrap();
+        let RowSelection::Selected(PickerOutcome::Resume(selection)) = selected else {
+            panic!("expected the saved chat");
+        };
+        assert!(selection.fork);
+        assert!(selection.workspace_override.is_none());
     }
 
     #[test]
@@ -5658,8 +5697,16 @@ agent = "codex"
         );
         assert_eq!(target.to_string(), "claude-local");
         // An `--in` choice skips the page and carries the same pair.
-        let requested =
-            requested_target(Some(target), None, None, &[], None).expect("requested target");
+        let requested = requested_target(
+            &ResumeArgs {
+                target: Some(target),
+                ..Default::default()
+            },
+            None,
+            None,
+            &[],
+        )
+        .expect("requested target");
         let TargetOutcome::Selected(choice) = requested else {
             panic!("`--in` selects without a page");
         };
@@ -5797,7 +5844,7 @@ agent = "codex"
         fs::write(temporary.path().join("alphabet.txt"), "ignored").expect("create file");
         let input = temporary.path().join("alp").display().to_string();
 
-        let completion = complete_directory_input(&input, temporary.path());
+        let completion = complete_directory_input(&input, temporary.path(), Provider::Codex);
 
         assert_eq!(
             completion.value,

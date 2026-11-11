@@ -1,8 +1,6 @@
 use std::{
     env, fs,
-    io::{Read, Seek},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -21,14 +19,12 @@ use uuid::Uuid;
 
 use crate::recovery::ImportSource;
 use crate::{
-    interrupt::{HelperProcess, wait_or_kill},
     native_path,
     private_store_lock::{self, PrivateStoreGuard},
     provider_compatibility::MINIMUM_ANTIGRAVITY_VERSION,
 };
 
 pub(crate) type AntigravityWriteGuard = PrivateStoreGuard;
-const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const TRAJECTORY_TYPE_CASCADE: i64 = 4;
 const TRAJECTORY_SOURCE_CLI: i64 = 17;
 const STEP_USER_INPUT: i32 = 14;
@@ -193,7 +189,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         bail!("native Antigravity CLI import is supported only on Linux and macOS");
     }
-    let version = installed_version(binary)?;
+    let version = crate::version_gate::installed_version(binary, Provider::Antigravity)?;
     if !is_supported_version(&version) {
         bail!(
             "Antigravity CLI {version} is too old for native trajectory import; supported versions: >= {MINIMUM_ANTIGRAVITY_VERSION}"
@@ -1148,36 +1144,6 @@ fn sync_directory(path: &Path) -> Result<()> {
         bail!("`{}` is not a directory", path.display());
     }
     Ok(())
-}
-
-fn installed_version(binary: &Path) -> Result<String> {
-    let mut output = NamedTempFile::new().context("creating Antigravity version buffer")?;
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output.reopen()?))
-        .stderr(Stdio::null())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Antigravity version")?
-    else {
-        bail!("Antigravity version probe timed out");
-    };
-    if !status.success() {
-        bail!("Antigravity version probe exited with status {status}");
-    }
-    if output.as_file().metadata()?.len() > MAX_VERSION_OUTPUT {
-        bail!("Antigravity version output exceeds safe limit");
-    }
-    output.as_file_mut().rewind()?;
-    let mut text = String::new();
-    output
-        .as_file_mut()
-        .take(MAX_VERSION_OUTPUT + 1)
-        .read_to_string(&mut text)?;
-    crate::version_gate::find_version(&text).context("Antigravity returned an unrecognized version")
 }
 
 #[cfg(target_os = "linux")]

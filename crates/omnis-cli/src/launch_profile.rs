@@ -676,6 +676,17 @@ impl AgentTarget {
         remember_secret_values(profile);
         Ok(plan)
     }
+
+    /// A replacement program may need a script path or subcommand before it can accept agent flags.
+    pub(crate) fn launch_with_mode(self, plan: LaunchPlan, flags: &[String]) -> Result<LaunchPlan> {
+        let mut plan = self.launch(plan)?;
+        let prefix = self
+            .profile
+            .filter(|profile| profile.overrides_program())
+            .map_or(0, |profile| profile.args.len());
+        plan.args.splice(prefix..prefix, flags.iter().cloned());
+        Ok(plan)
+    }
 }
 
 impl From<Provider> for AgentTarget {

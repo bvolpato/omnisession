@@ -1922,6 +1922,11 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    // The import notification has no response item. A literal reply with the same
+    // text has one, so let the response item supply its role and content.
+    if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
+        return false;
+    }
     let images = ["images", "local_images"]
         .into_iter()
         .filter_map(|field| payload.get(field).and_then(Value::as_array))
