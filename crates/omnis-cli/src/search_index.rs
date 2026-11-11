@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::{
     cursor::MoveToColumn,
@@ -29,7 +29,7 @@ use omnis_store::{
     TrajectoryIndexState, TrajectorySourceGuard,
 };
 
-use crate::read_session;
+use crate::{imported_bundle_id, load_imported_bundle};
 
 // Larger sources index only their sampled head and tail.
 pub(crate) const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -56,7 +56,15 @@ impl IndexCandidate {
             || (provider != Provider::OpenCode && session.source_path.is_some());
         readable.then(|| Self {
             session: session.session.clone(),
-            updated_at: session.updated_at,
+            // The picker can display the age of a shared Cursor database when the session
+            // has no update time. Only the session's own timestamps identify its history.
+            updated_at: if session.updated_at_approximate
+                && matches!(provider, Provider::CursorCli | Provider::CursorIde)
+            {
+                session.created_at
+            } else {
+                session.updated_at
+            },
             source_path: session.source_path.clone(),
         })
     }
@@ -88,32 +96,35 @@ pub(crate) struct IndexSummary {
     pub(crate) stopped: bool,
 }
 
-// Restoring a transcript can move its modification time backwards.
+// A restore can also move a provider's reported event time backwards.
 pub(crate) fn source_time_changed(
     provider: Provider,
     current: DateTime<Utc>,
     cached: &TrajectoryIndexState,
 ) -> bool {
-    if TrajectorySourceGuard::uses_file_time(provider) {
-        !cached.source_time_precise || current != cached.source_updated_at
-    } else {
+    if provider == Provider::Imported {
         current.timestamp_millis() > cached.source_updated_at.timestamp_millis()
+    } else {
+        !cached.source_time_precise || current != cached.source_updated_at
     }
 }
 
 pub(crate) fn source_guard(
-    provider: Provider,
+    store: &Store,
+    session: &SessionRef,
     prior: Option<&TrajectoryIndexState>,
-) -> TrajectorySourceGuard {
-    if TrajectorySourceGuard::uses_file_time(provider) {
-        match prior {
+) -> omnis_store::Result<TrajectorySourceGuard> {
+    if TrajectorySourceGuard::uses_file_time(session.provider) {
+        Ok(match prior {
             Some(state) if !state.source_time_precise => {
                 TrajectorySourceGuard::ObservedLegacy(state.source_updated_at)
             }
             _ => TrajectorySourceGuard::Observed(prior.map(|state| state.source_updated_at)),
-        }
+        })
+    } else if session.provider == Provider::Imported {
+        Ok(TrajectorySourceGuard::NewerSource)
     } else {
-        TrajectorySourceGuard::NewerSource
+        store.observe_trajectory_document(session)
     }
 }
 
@@ -122,12 +133,13 @@ pub(crate) fn observe_source(
     session: &SessionRef,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
     if TrajectorySourceGuard::uses_file_time(session.provider) {
-        Ok(source_guard(
-            session.provider,
+        source_guard(
+            store,
+            session,
             store.trajectory_index_state(session)?.as_ref(),
-        ))
+        )
     } else {
-        Ok(TrajectorySourceGuard::NewerSource)
+        source_guard(store, session, None)
     }
 }
 
@@ -142,7 +154,7 @@ pub(crate) fn needs_index(
         return false;
     }
     state.document_version < SEARCH_DOCUMENT_VERSION
-        || (!state.source_time_precise && TrajectorySourceGuard::uses_file_time(candidate.session.provider))
+        || (!state.source_time_precise && candidate.session.provider != Provider::Imported)
         || candidate.updated_at.is_some_and(|updated_at| {
             source_time_changed(candidate.session.provider, updated_at, state)
         })
@@ -161,13 +173,13 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
     failure.document_version >= SEARCH_DOCUMENT_VERSION
         && (failure.source_time_precise
             || failure.source_updated_at.is_none()
-            || !TrajectorySourceGuard::uses_file_time(candidate.session.provider))
+            || candidate.session.provider == Provider::Imported)
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
-                if TrajectorySourceGuard::uses_file_time(candidate.session.provider) {
-                    updated_at == failed_source
-                } else {
+                if candidate.session.provider == Provider::Imported {
                     updated_at.timestamp_millis() == failed_source.timestamp_millis()
+                } else {
+                    updated_at == failed_source
                 }
             })
         })
@@ -229,7 +241,7 @@ fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
             && (state.document_version < SEARCH_DOCUMENT_VERSION
-                || (TrajectorySourceGuard::uses_file_time(provider) && !state.source_time_precise))
+                || (provider != Provider::Imported && !state.source_time_precise))
     }) {
         u64::MAX
     } else {
@@ -244,7 +256,12 @@ struct Pending {
     summary: IndexSummary,
 }
 
-fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+fn pending(
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+    observe: bool,
+) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
@@ -264,7 +281,11 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            let guard = source_guard(candidate.session.provider, prior);
+            let guard = if observe {
+                source_guard(store, &candidate.session, prior)?
+            } else {
+                TrajectorySourceGuard::NewerSource
+            };
             let budget = read_budget(candidate.session.provider, prior);
             stale.push((candidate, guard, budget));
         }
@@ -287,7 +308,7 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    Ok(pending(store, candidates, false)?.summary)
+    Ok(pending(store, candidates, false, false)?.summary)
 }
 
 /// Indexes stale sessions in candidate order, reporting progress and derived titles in batches.
@@ -310,7 +331,7 @@ pub(crate) fn index_candidates(
         stale,
         failures,
         mut summary,
-    } = pending(store, candidates, retry_failed)?;
+    } = pending(store, candidates, retry_failed, true)?;
     report(IndexProgress {
         total: stale.len(),
         ..IndexProgress::default()
@@ -325,7 +346,7 @@ pub(crate) fn index_candidates(
         // Read an oversized full transcript on the calling thread to bound peak memory.
         (reads_transcript_file(candidate.session.provider)
             && (*budget == FULL_READ_SOURCE_BYTES || !candidate.oversized()))
-        .then(|| prepare_session(registry, candidate, *guard, *budget))
+        .then(|| prepare_session(registry, None, candidate, *guard, *budget))
     };
     prepare_in_order(
         &stale,
@@ -337,8 +358,9 @@ pub(crate) fn index_candidates(
                 summary.stopped = true;
                 return false;
             }
-            let result =
-                prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard, *budget));
+            let result = prepared.unwrap_or_else(|| {
+                prepare_session(registry, Some(store), candidate, *guard, *budget)
+            });
             // A successful read makes a recorded failure obsolete even when storing the document
             // fails. Best effort: a leftover record no longer applies once the source changes.
             if result.is_ok() && failures.contains_key(&candidate.session) {
@@ -557,8 +579,9 @@ fn flush_batch(
                     .and_then(|prior| {
                         prepare_session(
                             registry,
+                            Some(store),
                             &prepared.candidate,
-                            source_guard(session.provider, prior.as_ref()),
+                            source_guard(store, session, prior.as_ref())?,
                             read_budget(session.provider, prior.as_ref()),
                         )
                     })
@@ -633,39 +656,36 @@ impl PreparedIndex {
     }
 }
 
+pub(crate) fn read_imported(
+    store: Option<&Store>,
+    session: &SessionRef,
+) -> anyhow::Result<IndexRead> {
+    let store = store.context("local imported bundle store is unavailable")?;
+    let bundle = load_imported_bundle(store, imported_bundle_id(session)?)?;
+    Ok(IndexRead {
+        snapshot: bundle.snapshot,
+        source_complete: true,
+        provider_limited: false,
+    })
+}
+
 fn prepare_session(
     registry: &AdapterRegistry,
+    imported_store: Option<&Store>,
     candidate: &IndexCandidate,
     guard: TrajectorySourceGuard,
     full_read_bytes: u64,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
     let (read, source_updated_at) = if imported {
-        let snapshot = read_session(registry, &candidate.session)?;
-        let updated_at = snapshot.captured_at;
-        (
-            IndexRead {
-                snapshot,
-                source_complete: true,
-                provider_limited: false,
-            },
-            Some(updated_at),
-        )
+        let read = read_imported(imported_store, &candidate.session)?;
+        let updated_at = read.snapshot.captured_at;
+        (read, Some(updated_at))
     } else {
         registry.observe_search_read(
             &candidate.session,
             candidate.source_path.as_deref(),
-            |adapter, path| {
-                let read = adapter.index_session(&candidate.session, path, full_read_bytes)?;
-                let captured = read.snapshot.captured_at;
-                // Codex observes the selected rollout again when it reads. Discovery may predate a restore.
-                let updated_at = if candidate.session.provider == Provider::Codex {
-                    captured
-                } else {
-                    candidate.updated_at.unwrap_or(captured).max(captured)
-                };
-                Ok((read, updated_at))
-            },
+            |adapter, path| adapter.index_for_search(&candidate.session, path, full_read_bytes),
         )?
     };
     let IndexRead {
@@ -1226,8 +1246,14 @@ mod tests {
         )
         .unwrap();
         let guard = observe_source(&store, &original[0].session).unwrap();
-        let delayed =
-            prepare_session(&registry, &original[0], guard, FULL_READ_SOURCE_BYTES).unwrap();
+        let delayed = prepare_session(
+            &registry,
+            Some(&store),
+            &original[0],
+            guard,
+            FULL_READ_SOURCE_BYTES,
+        )
+        .unwrap();
 
         let (registry, restored) = write_codex_rollout(
             &home,

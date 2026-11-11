@@ -6,15 +6,16 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview, nested_files,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root, read_json,
-        sort_sessions, sqlite_snapshot, string_at, validate_provider, value_at, visit_json_lines,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, SnapshotFileStamp, json_lines_preview,
+        nested_files, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, read_json, sort_sessions, sqlite_snapshot, string_at, validate_provider,
+        value_at, visit_json_lines,
     },
 };
 
@@ -38,13 +39,15 @@ impl GrokAdapter {
             .unwrap_or_default()
     }
 
-    fn find_summary(&self, id: &str) -> Result<(Value, PathBuf)> {
+    fn find_summary(&self, id: &str, hint: Option<&Path>) -> Result<(Value, PathBuf)> {
         let read_matching = |path: PathBuf| {
             let value = read_json(&path).ok()?;
             (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
         };
-        self.direct_summary(id)
+        hint.filter(|p| p.file_name().is_some_and(|name| name == "summary.json"))
+            .and_then(|path| provider_file(self.sessions_root.as_deref()?, path))
             .and_then(read_matching)
+            .or_else(|| self.direct_summary(id).and_then(read_matching))
             .or_else(|| {
                 self.summaries().into_iter().find_map(|path| {
                     let value = read_json(&path).ok()?;
@@ -52,6 +55,43 @@ impl GrokAdapter {
                 })
             })
             .ok_or_else(|| anyhow!("Grok session `{id}` was not found"))
+    }
+
+    fn source_files(&self, summary: &Path) -> Result<Vec<PathBuf>> {
+        let root = self
+            .sessions_root
+            .as_deref()
+            .context("Grok sessions root is unavailable")?;
+        let directory = summary
+            .parent()
+            .context("Grok summary has no parent directory")?;
+        let mut files = vec![summary.to_path_buf(), directory.to_path_buf()];
+        for name in std::iter::once("updates.jsonl").chain(STATE_FILES.iter().map(|state| state.0))
+        {
+            if let Some(file) = provider_file(root, &directory.join(name)) {
+                files.push(file);
+            }
+        }
+        // Removing goal/state.json changes its parent directory.
+        let goal = directory.join("goal");
+        if goal
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            files.push(goal);
+        }
+        Ok(files)
+    }
+
+    fn search_time(&self, metadata: &GrokMetadata, summary: &Path) -> Result<DateTime<Utc>> {
+        if let Some(time) = metadata.updated_at {
+            return Ok(time);
+        }
+        self.source_files(summary)?
+            .into_iter()
+            .try_fold(DateTime::<Utc>::MIN_UTC, |latest, path| {
+                Ok(latest.max(SnapshotFileStamp::read(&path)?.changed_at()))
+            })
     }
 
     fn direct_summary(&self, id: &str) -> Option<PathBuf> {
@@ -541,30 +581,32 @@ fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
     );
 }
 
+const STATE_FILES: [(&str, EventKind, &str, &str); 3] = [
+    (
+        "plan.json",
+        EventKind::PlanUpdated,
+        "grok.plan_state",
+        "plan",
+    ),
+    (
+        "goal/state.json",
+        EventKind::ProviderEvent,
+        "grok.goal_state",
+        "goal",
+    ),
+    (
+        "usage.json",
+        EventKind::ProviderEvent,
+        "grok.usage_state",
+        "usage",
+    ),
+];
+
 fn push_grok_state(builder: &mut EventBuilder, root: &Path, summary_path: &Path) {
     let Some(directory) = summary_path.parent() else {
         return;
     };
-    for (filename, kind, record_type, field) in [
-        (
-            "plan.json",
-            EventKind::PlanUpdated,
-            "grok.plan_state",
-            "plan",
-        ),
-        (
-            "goal/state.json",
-            EventKind::ProviderEvent,
-            "grok.goal_state",
-            "goal",
-        ),
-        (
-            "usage.json",
-            EventKind::ProviderEvent,
-            "grok.usage_state",
-            "usage",
-        ),
-    ] {
+    for (filename, kind, record_type, field) in STATE_FILES {
         let Some(path) = provider_file(root, &directory.join(filename)) else {
             continue;
         };
@@ -659,14 +701,15 @@ impl ProviderAdapter for GrokAdapter {
                 continue;
             }
             let index = positions.get(&id).copied();
+            let updated_at = self.search_time(&metadata, &path).ok();
             let session = NativeSession {
                 session: SessionRef::new(Provider::Grok, id),
                 title: metadata.title,
                 project_path: metadata.project_path,
                 git_branch: metadata.git_branch,
                 created_at: metadata.created_at,
-                updated_at: metadata.updated_at,
-                updated_at_approximate: false,
+                updated_at,
+                updated_at_approximate: metadata.updated_at.is_none(),
                 event_count: 0,
                 source_path: Some(path),
             };
@@ -728,8 +771,16 @@ impl ProviderAdapter for GrokAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.read_session_at(session, None)
+    }
+
+    fn read_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Grok)?;
-        let (summary, path) = self.find_summary(&session.id)?;
+        let (summary, path) = self.find_summary(&session.id, source_path)?;
         let metadata = metadata(&summary);
         let updates_path = path
             .parent()
@@ -739,7 +790,11 @@ impl ProviderAdapter for GrokAdapter {
         push_grok_session_metadata(&mut builder, &summary);
         let mut updates = GrokUpdateProcessor::default();
         let mut has_readable_update = false;
-        let oversized_records = if updates_path.is_file() {
+        let updates_path = self
+            .sessions_root
+            .as_deref()
+            .and_then(|root| provider_file(root, &updates_path));
+        let oversized_records = if let Some(updates_path) = updates_path {
             visit_json_lines(
                 &updates_path,
                 MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
@@ -774,15 +829,27 @@ impl ProviderAdapter for GrokAdapter {
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.preview_session_at(session, None)
+    }
+
+    fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
         const SAMPLE_RECORDS: usize = 1_024;
         validate_provider(session, Provider::Grok)?;
-        let (summary, path) = self.find_summary(&session.id)?;
+        let (summary, path) = self.find_summary(&session.id, source_path)?;
         let metadata = metadata(&summary);
         let updates_path = path
             .parent()
             .context("Grok summary has no parent directory")?
             .join("updates.jsonl");
-        let updates = if updates_path.is_file() {
+        let updates_path = self
+            .sessions_root
+            .as_deref()
+            .and_then(|root| provider_file(root, &updates_path));
+        let updates = if let Some(updates_path) = updates_path {
             json_lines_preview(&updates_path, SAMPLE_RECORDS)?
         } else {
             Vec::new()
@@ -807,6 +874,24 @@ impl ProviderAdapter for GrokAdapter {
             metadata.git_branch,
             captured_at,
         ))
+    }
+
+    fn search_source_files(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        let (_, path) = self.find_summary(&session.id, source_path)?;
+        self.source_files(&path)
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        let (summary, path) = self.find_summary(&snapshot.session.id, source_path)?;
+        self.search_time(&metadata(&summary), &path)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -856,6 +941,47 @@ mod tests {
         )
         .expect("synthetic updates");
         directory
+    }
+
+    #[test]
+    fn missing_update_time_uses_the_same_session_clock_for_each_search_read() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id":SESSION_ID, "updated_at":"unknown"}),
+            &[],
+        );
+        let adapter = GrokAdapter::with_root(root.path());
+        let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+        let expected = listed.updated_at.unwrap();
+        let path = listed.source_path.as_deref();
+        assert!(listed.updated_at_approximate);
+        for full in [true, false] {
+            let (_, observed) = adapter
+                .read_for_search(&listed.session, path, full)
+                .unwrap();
+            assert_eq!(observed, expected);
+        }
+        for budget in [0, u64::MAX] {
+            let (_, observed) = adapter
+                .index_for_search(&listed.session, path, budget)
+                .unwrap();
+            assert_eq!(observed, expected);
+        }
+
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"new update").unwrap();
+        let mut registry = crate::AdapterRegistry::new();
+        registry.register(adapter);
+        let (_, clock) = registry
+            .observe_search_read(&listed.session, path, |adapter, path| {
+                let read = adapter.read_for_search(&listed.session, path, true)?;
+                fs::rename(&replacement, directory.join("updates.jsonl"))?;
+                Ok(read)
+            })
+            .unwrap();
+        assert_eq!(clock, None);
     }
 
     #[test]

@@ -260,7 +260,9 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
       AND (
           (excluded.source_complete, excluded.provider_limited) >=
               (session_trajectories.source_complete, session_trajectories.provider_limited)
-          OR (excluded.provider_limited AND (?15 OR excluded.source_updated_at >= session_trajectories.source_updated_at))
+          OR (excluded.provider_limited AND (?15
+              OR (excluded.source_updated_at, excluded.source_updated_submillis) >=
+                 (session_trajectories.source_updated_at, coalesce(session_trajectories.source_updated_submillis, 0))))
           OR (excluded.document_version = session_trajectories.document_version
               AND (NOT ?15 OR session_trajectories.source_updated_submillis IS NOT NULL))
       ) AND (
@@ -512,6 +514,8 @@ pub enum TrajectorySourceGuard {
     Observed(Option<DateTime<Utc>>),
     /// A previous indexer recorded only the millisecond that contained the modification time.
     ObservedLegacy(DateTime<Utc>),
+    /// The provider's event time can repeat or move backwards after a restore.
+    ObservedDocument(Option<[u8; 32]>),
 }
 
 impl TrajectorySourceGuard {
@@ -532,6 +536,13 @@ impl TrajectorySourceGuard {
     ) -> Result<()> {
         let prior = match self {
             Self::NewerSource => return Ok(()),
+            Self::ObservedDocument(prior) => {
+                return if document_receipt(transaction, session)? == prior {
+                    Ok(())
+                } else {
+                    Err(StoreError::TrajectorySourceChanged)
+                };
+            }
             Self::Observed(prior) => prior.map(|time| {
                 (
                     time.timestamp_millis(),
@@ -562,6 +573,24 @@ impl TrajectorySourceGuard {
             Err(StoreError::TrajectorySourceChanged)
         }
     }
+}
+
+/// Hash the indexed row before a native read. Older clients can also update these fields.
+fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
+    connection
+        .prepare_cached(
+            "SELECT json_array(id, indexed_at, hex(content_hash), source_updated_at,
+                       source_updated_submillis, source_complete, provider_limited, complete,
+                       document_version, source_byte_count, indexed_byte_count,
+                       truncation_strategy, origin, derived_title)
+             FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+        )
+        .map_err(database_error)?
+        .query_row(params![session.provider.to_string(), session.id], |row| {
+            Ok(Sha256::digest(row.get::<_, String>(0)?).into())
+        })
+        .optional()
+        .map_err(database_error)
 }
 
 /// Indexing state of one cached search document, used to skip unchanged sessions.
@@ -1939,7 +1968,7 @@ impl Store {
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
-                    TrajectorySourceGuard::uses_file_time(session.provider),
+                    session.provider != Provider::Imported,
                     source_submillis(session.provider, source_updated_at),
                 ],
                 |row| row.get::<_, bool>(0),
@@ -1973,7 +2002,7 @@ impl Store {
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
-                    TrajectorySourceGuard::uses_file_time(session.provider),
+                    session.provider != Provider::Imported,
                     source_submillis(session.provider, source_updated_at),
                 ],
                 |row| row.get::<_, bool>(0),
@@ -2013,6 +2042,20 @@ impl Store {
             },
         )
         .transpose()
+    }
+
+    /// Observes the selected search document before a native read whose event time can regress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference is invalid or the document cannot be read.
+    pub fn observe_trajectory_document(
+        &self,
+        session: &SessionRef,
+    ) -> Result<TrajectorySourceGuard> {
+        validate_session_ref(session)?;
+        document_receipt(&self.connection.borrow(), session)
+            .map(TrajectorySourceGuard::ObservedDocument)
     }
 
     /// Returns the indexing state of every cached search document.
@@ -3063,7 +3106,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
             )
             .map_err(database_error)?;
     }
-    protect_bundle_trajectories(transaction)
+    ensure_bundle_protection(transaction)
 }
 
 fn ensure_trajectory_version_columns(
@@ -3094,12 +3137,7 @@ const BUNDLE_SOURCE_PROVIDER_SQL: &str = "json_extract(
 const BUNDLE_SOURCE_SESSION_ID_SQL: &str = "json_extract(
     CASE WHEN json_valid(bundle_json) THEN bundle_json END, '$.snapshot.session.id')";
 
-/// Indexes the source session of each bundle.
-///
-/// `protect_bundle_trajectories` runs every time a store opens. Without this index it parsed the
-/// JSON of every bundle once for each trajectory, so one large bundle made every command slow.
-/// The index holds both values, and `SQLite` fills it when any version of this program saves a
-/// bundle.
+/// Indexes the source session so a new trajectory can check for a bundle without reading its JSON.
 fn initialize_bundle_source_index(transaction: &Transaction<'_>) -> Result<()> {
     transaction
         .execute_batch(&format!(
@@ -3110,13 +3148,56 @@ fn initialize_bundle_source_index(transaction: &Transaction<'_>) -> Result<()> {
         .map_err(database_error)
 }
 
-// The expressions in the subquery must stay identical to the indexed ones, so that `SQLite` reads
-// them from `bundle_source_session` instead of parsing bundle JSON. Rows that are already
-// protected are skipped, so an unchanged store is not written.
-fn protect_bundle_trajectories(transaction: &Transaction<'_>) -> Result<()> {
+/// Protects existing rows on upgrade and maintains protection when any compatible writer saves
+/// a bundle or a trajectory. Check every trigger so reinstalling a missing one also repairs rows.
+fn ensure_bundle_protection(transaction: &Transaction<'_>) -> Result<()> {
+    let installed = transaction
+        .query_row(
+            "SELECT count(*) = 4 FROM sqlite_schema WHERE type = 'trigger' AND name IN (
+                 'protect_trajectory_after_insert', 'protect_trajectory_after_update',
+                 'protect_bundle_source_after_insert', 'protect_bundle_source_after_update'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?;
+    if installed {
+        return Ok(());
+    }
+
+    // Unary plus removes the column affinity so SQLite can look up both JSON expressions by index.
+    let trajectory = format!(
+        "WHEN new.protected_by_bundle = 0 AND (
+             new.origin = 'imported_bundle' OR EXISTS (
+                 SELECT 1 FROM bundles WHERE {BUNDLE_SOURCE_PROVIDER_SQL} = +new.provider
+                   AND {BUNDLE_SOURCE_SESSION_ID_SQL} = +new.session_id
+             )
+         ) BEGIN
+             UPDATE session_trajectories SET protected_by_bundle = 1 WHERE id = new.id;
+         END;"
+    );
+    let bundle = format!(
+        "BEGIN
+             UPDATE session_trajectories SET protected_by_bundle = 1
+             WHERE protected_by_bundle = 0 AND (provider, session_id) = (
+                 SELECT {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
+                 FROM (SELECT new.bundle_json AS bundle_json)
+             );
+         END;"
+    );
     transaction
         .execute_batch(&format!(
-            "UPDATE session_trajectories SET protected_by_bundle = 1
+            "CREATE TRIGGER IF NOT EXISTS protect_trajectory_after_insert
+             AFTER INSERT ON session_trajectories {trajectory}
+             CREATE TRIGGER IF NOT EXISTS protect_trajectory_after_update
+             AFTER UPDATE OF origin, provider, session_id, protected_by_bundle ON session_trajectories
+             {trajectory}
+             CREATE TRIGGER IF NOT EXISTS protect_bundle_source_after_insert
+             AFTER INSERT ON bundles {bundle}
+             CREATE TRIGGER IF NOT EXISTS protect_bundle_source_after_update
+             AFTER UPDATE OF bundle_json ON bundles {bundle}
+
+             UPDATE session_trajectories SET protected_by_bundle = 1
              WHERE protected_by_bundle = 0 AND (
                  origin = 'imported_bundle' OR (provider, session_id) IN (
                      SELECT {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
@@ -3131,7 +3212,7 @@ fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef
     transaction
         .execute(
             "UPDATE session_trajectories SET protected_by_bundle = 1
-             WHERE provider = ?1 AND session_id = ?2",
+             WHERE provider = ?1 AND session_id = ?2 AND protected_by_bundle = 0",
             params![session.provider.to_string(), session.id],
         )
         .map_err(database_error)?;
@@ -3179,6 +3260,9 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
              DROP TRIGGER IF EXISTS session_trajectories_after_delete;
              DROP TRIGGER IF EXISTS session_trajectories_after_update;
              DROP TABLE IF EXISTS session_trajectories_fts;
+
+             CREATE INDEX IF NOT EXISTS session_trajectory_legacy_text
+                 ON session_trajectories(id) WHERE redacted_text <> '';
 
              CREATE TABLE IF NOT EXISTS session_trajectory_chunk_rows (
                  id INTEGER PRIMARY KEY,
@@ -3260,12 +3344,12 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
     chunk_text_kept_with_trajectories(transaction)
 }
 
-/// Moves text that the oldest stores kept in `session_trajectories` into chunks.
+/// Moves legacy parent text into chunks. The partial index contains only parents still holding text.
 fn chunk_text_kept_with_trajectories(transaction: &Transaction<'_>) -> Result<()> {
     let existing = {
         let mut statement = transaction
             .prepare(
-                "SELECT id, redacted_text FROM session_trajectories
+                "SELECT id, redacted_text FROM session_trajectories INDEXED BY session_trajectory_legacy_text
                  WHERE redacted_text <> ''
                    AND NOT EXISTS (
                        SELECT 1 FROM session_trajectory_chunk_rows
@@ -3293,7 +3377,8 @@ fn chunk_text_kept_with_trajectories(transaction: &Transaction<'_>) -> Result<()
     }
     transaction
         .execute(
-            "UPDATE session_trajectories SET redacted_text = '' WHERE redacted_text <> ''",
+            "UPDATE session_trajectories INDEXED BY session_trajectory_legacy_text
+             SET redacted_text = '' WHERE redacted_text <> ''",
             [],
         )
         .map_err(database_error)?;
@@ -3816,10 +3901,10 @@ fn timestamp_from_db(timestamp: i64) -> Result<DateTime<Utc>> {
 }
 
 fn source_submillis(provider: Provider, time: DateTime<Utc>) -> u32 {
-    if TrajectorySourceGuard::uses_file_time(provider) {
-        time.timestamp_subsec_nanos() % 1_000_000
-    } else {
+    if provider == Provider::Imported {
         0
+    } else {
+        time.timestamp_subsec_nanos() % 1_000_000
     }
 }
 
@@ -4606,6 +4691,68 @@ mod tests {
         assert_eq!(state.document_version, 6);
         assert!(state.provider_limited);
         assert!(!state.source_complete);
+    }
+
+    #[test]
+    fn database_restores_require_the_document_observed_before_reading() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("store.sqlite3");
+        let first = Store::open(&database).unwrap();
+        let second = Store::open(&database).unwrap();
+        let session = SessionRef::new(Provider::Hermes, "restored");
+        let sibling = SessionRef::new(Provider::Hermes, "unrelated");
+        let now = Utc::now();
+        let make = |text: &'static str, seconds, version, full| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at: now + chrono::Duration::seconds(seconds),
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: full,
+            provider_limited: !full,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: version,
+            derived_title: None,
+        };
+        first
+            .upsert_trajectory_document(&session, &make("before", 0, 4, true))
+            .unwrap();
+        let original = first.observe_trajectory_document(&session).unwrap();
+        let restored = make("restored", -60, 6, false);
+        assert_eq!(
+            second
+                .upsert_observed_trajectory_documents_counted(&[(&session, restored, original)])
+                .unwrap(),
+            1
+        );
+        let current = first.observe_trajectory_document(&session).unwrap();
+        assert_eq!(
+            second
+                .upsert_observed_trajectory_documents_counted(&[(&session, restored, current)])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            first.observe_trajectory_document(&session).unwrap(),
+            current
+        );
+        let delayed = make("superseded", -60, 6, true);
+        assert!(matches!(
+            first.upsert_observed_trajectory_documents_counted(&[
+                (
+                    &sibling,
+                    delayed,
+                    first.observe_trajectory_document(&sibling).unwrap()
+                ),
+                (&session, delayed, original),
+            ]),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert!(first.trajectory_index_state(&sibling).unwrap().is_none());
+        assert_eq!(
+            first.search_session_trajectories("restored", 1).unwrap(),
+            [session]
+        );
     }
 
     #[test]
@@ -5997,6 +6144,63 @@ mod tests {
                 .search_session_trajectories("migration searchable", 10)
                 .expect("bundle-protected migrated trajectory"),
             vec![SessionRef::new(Provider::Codex, "legacy")]
+        );
+    }
+
+    #[test]
+    fn legacy_writer_after_upgrade_keeps_its_text_and_bundle_protection() {
+        let directory = tempdir().expect("temporary directory");
+        let database = directory.path().join("store.sqlite3");
+        let store = Store::open(&database).expect("store");
+        let write_native = |id| {
+            store
+                .upsert_session_trajectory(
+                    &SessionRef::new(Provider::Codex, id),
+                    "retained",
+                    Utc::now(),
+                    true,
+                )
+                .expect("write native trajectory");
+        };
+        write_native("before-insert");
+        write_native("before-update");
+
+        // Older writers save the bundle without setting protection on the source trajectory.
+        for id in ["before-insert", "before-update", "after-bundle"] {
+            store.connection.borrow().execute(
+                "INSERT INTO bundles (bundle_id, bundle_json, saved_at) VALUES ('fixture', ?1, 1)
+                 ON CONFLICT (bundle_id) DO UPDATE SET bundle_json = excluded.bundle_json",
+                [json!({"snapshot": {"session": {"provider": "codex", "id": id}}}).to_string()],
+            ).expect("save bundle with older writer");
+        }
+        write_native("after-bundle");
+        store
+            .replace_indexed_sessions(Provider::Codex, &[])
+            .expect("prune unobserved sessions");
+        assert_eq!(
+            store
+                .search_session_trajectories("retained", 10)
+                .expect("protected sources")
+                .len(),
+            3
+        );
+
+        store.connection.borrow().execute(
+            "INSERT INTO session_trajectories (
+                 provider, session_id, redacted_text, content_hash, source_updated_at, source_complete,
+                 complete, indexed_at, source_byte_count, indexed_byte_count, truncation_strategy,
+                 origin, protected_by_bundle
+             ) VALUES ('codex', 'legacy-parent', 'legacyparentmarker', X'', 1, 0, 0, 1, 18, 18,
+                       'legacy_unknown', 'native', 0)",
+            [],
+        ).expect("write legacy parent text");
+        drop(store);
+        let reopened = Store::open(database).expect("read legacy writer data");
+        assert_eq!(
+            reopened
+                .search_session_trajectories("legacyparentmarker", 10)
+                .expect("chunked text"),
+            [SessionRef::new(Provider::Codex, "legacy-parent")]
         );
     }
 

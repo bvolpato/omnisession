@@ -2782,6 +2782,34 @@ mod tests {
     }
 
     #[test]
+    fn imported_indexing_reads_from_the_supplied_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle = picker_bundle(omnis_core::capture_workspace(temporary.path()).unwrap());
+        let store = Store::open(temporary.path().join("index.sqlite")).unwrap();
+        store.save_bundle(&bundle).unwrap();
+        let imported = crate::imported_session_ref(bundle.manifest.bundle_id);
+        let candidate = crate::search_index::IndexCandidate {
+            session: imported.clone(),
+            updated_at: Some(bundle.snapshot.captured_at),
+            source_path: None,
+        };
+        let summary = crate::search_index::index_candidates(
+            &AdapterRegistry::new(),
+            &store,
+            vec![candidate],
+            false,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!((summary.indexed, summary.failed), (1, 0));
+        assert_eq!(
+            store.trajectory_title(&imported).unwrap(),
+            bundle.snapshot.title
+        );
+    }
+
+    #[test]
     fn relocated_imported_bundle_is_visible_without_a_workspace_prompt() {
         let temporary = tempfile::tempdir().expect("temporary workspace");
         let mut workspace = picker_workspace(temporary.path());

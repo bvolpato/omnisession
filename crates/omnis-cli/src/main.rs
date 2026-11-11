@@ -130,33 +130,47 @@ impl IndexedSessionReader for AdapterRegistry {
             }
             return Ok(bundle.snapshot);
         }
-        let cache = Store::open_default().and_then(|store| {
-            let prior = store.trajectory_index_state(session)?;
-            Ok((store, prior))
-        });
-        let (snapshot, source_updated_at) = read_search_snapshot(self, session, true)?;
-        let Some(source_updated_at) = source_updated_at else {
-            return Ok(snapshot);
+        let store = match Store::open_default() {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("warning: local trajectory index unavailable: {error}");
+                return self.read_session(session);
+            }
         };
-        match cache {
-            Ok((store, prior)) => {
-                if !full_document_current(session, source_updated_at, prior.as_ref())
-                    && let Err(error) = store_search_document(
-                        &store,
-                        session,
-                        &snapshot,
-                        true,
-                        source_updated_at,
-                        search_index::source_guard(session.provider, prior.as_ref()),
-                        None,
-                    )
+        let mut retry = true;
+        loop {
+            let observed = store.trajectory_index_state(session).and_then(|prior| {
+                let guard = search_index::source_guard(&store, session, prior.as_ref())?;
+                Ok((prior, guard))
+            });
+            let (snapshot, source_time) = read_native_search_snapshot(self, session, true)?;
+            let (prior, guard) = match observed {
+                Ok(state) => state,
+                Err(error) => {
+                    eprintln!("warning: local trajectory index unavailable: {error}");
+                    return Ok(snapshot);
+                }
+            };
+            if let Some(time) = source_time {
+                let current = full_document_current(session, time, prior.as_ref());
+                // A database can change while its event time stays the same.
+                let compare_document = matches!(guard, TrajectorySourceGuard::ObservedDocument(_))
+                    && prior.is_some_and(|state| {
+                        state.document_version <= omnis_core::SEARCH_DOCUMENT_VERSION
+                    });
+                if (compare_document || !current)
+                    && let Err(error) =
+                        store_search_document(&store, session, &snapshot, true, time, guard, None)
                 {
+                    if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
+                        retry = false;
+                        continue;
+                    }
                     eprintln!("warning: local trajectory index write: {error}");
                 }
             }
-            Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
+            return Ok(snapshot);
         }
-        Ok(snapshot)
     }
 }
 
@@ -221,7 +235,7 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store));
+    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store), true);
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
     let summary = index_with_interrupt(
@@ -300,7 +314,8 @@ fn discover_sessions(
     registry: &AdapterRegistry,
     provider: Option<Provider>,
     project: Option<&Path>,
-    cache: Option<&Store>,
+    store: Option<&Store>,
+    persist_metadata: bool,
 ) -> (Vec<NativeSession>, Vec<String>) {
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
@@ -339,7 +354,7 @@ fn discover_sessions(
     for (provider, result) in discovered {
         match result {
             Ok((found, notes)) => {
-                if let Some(store) = cache {
+                if let Some(store) = store.filter(|_| persist_metadata) {
                     let indexed = found
                         .iter()
                         .map(indexed_session_metadata)
@@ -366,7 +381,7 @@ fn discover_sessions(
         }
     }
     if include_imported {
-        match indexed_imported_sessions(project) {
+        match indexed_imported_sessions(store, project) {
             Ok((imported, imported_warnings)) => {
                 sessions.extend(imported);
                 warnings.extend(imported_warnings);
@@ -438,7 +453,8 @@ fn cached_search_sessions(
         .provider
         .is_none_or(|provider| provider == Provider::Imported)
     {
-        let (imported, notes) = indexed_imported_sessions((!args.all_projects).then_some(project))?;
+        let (imported, notes) =
+            indexed_imported_sessions(Some(store), (!args.all_projects).then_some(project))?;
         sessions.extend(imported);
         warnings.extend(notes);
     }
@@ -473,7 +489,8 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             registry,
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
-            None,
+            Some(&store),
+            false,
         )
     };
     sessions.sort_by_key(|session| Reverse(session.updated_at));
@@ -907,33 +924,13 @@ fn imported_bundle_id(session: &SessionRef) -> Result<Uuid> {
     Ok(bundle_id)
 }
 
-fn read_session(registry: &AdapterRegistry, session: &SessionRef) -> Result<CanonicalSnapshot> {
-    if session.provider != Provider::Imported {
-        return registry.read_session(session);
-    }
-    let bundle_id = imported_bundle_id(session)?;
-    let store = Store::open_default().context("opening OmniSession state")?;
-    load_imported_bundle(&store, bundle_id).map(|bundle| bundle.snapshot)
-}
-
-fn read_search_snapshot(
+fn read_native_search_snapshot(
     registry: &AdapterRegistry,
     session: &SessionRef,
     full_read: bool,
 ) -> Result<(CanonicalSnapshot, Option<chrono::DateTime<Utc>>)> {
-    if session.provider == Provider::Imported {
-        let snapshot = read_session(registry, session)?;
-        let updated_at = snapshot.captured_at;
-        return Ok((snapshot, Some(updated_at)));
-    }
     registry.observe_search_read(session, None, |adapter, path| {
-        let snapshot = if full_read {
-            adapter.read_session_at(session, path)?
-        } else {
-            adapter.preview_session_at(session, path)?
-        };
-        let updated_at = snapshot.captured_at;
-        Ok((snapshot, updated_at))
+        adapter.read_for_search(session, path, full_read)
     })
 }
 
@@ -1653,7 +1650,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         )
     };
     let (mut sessions, warnings) =
-        discover_sessions(registry, args.provider, project.as_deref(), None);
+        discover_sessions(registry, args.provider, project.as_deref(), None, false);
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 
@@ -1681,8 +1678,17 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     Ok(())
 }
 
-fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSession>, Vec<String>)> {
-    let store = Store::open_default()?;
+fn indexed_imported_sessions(
+    store: Option<&Store>,
+    project: Option<&Path>,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let default_store;
+    let store = if let Some(store) = store {
+        store
+    } else {
+        default_store = Store::open_default()?;
+        &default_store
+    };
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
     let current_remote = OnceCell::new();
@@ -1695,7 +1701,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
             if !path_matches {
                 let matches = (|| -> Result<bool> {
                     let bundle =
-                        load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
+                        load_imported_bundle(store, imported_bundle_id(&session.session)?)?;
                     source_workspace_matches_with_cache(
                         &session.session,
                         &bundle.snapshot,

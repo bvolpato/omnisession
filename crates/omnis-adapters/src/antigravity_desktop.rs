@@ -14,15 +14,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     antigravity::{
-        ProtoTimestamp, nonempty, proto_timestamp, push_database_steps, validate_id,
-        workspace_uri_path,
+        ProtoTimestamp, history_file_time, nonempty, proto_timestamp, push_database_steps,
+        validate_id, workspace_uri_path,
     },
     support::{
         EventBuilder, nested_files_matching, paths_match, provider_file, provider_root,
@@ -120,6 +120,16 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         Ok(sessions)
     }
 
+    fn search_source_files(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        validate_provider(session, Provider::AntigravityDesktop)?;
+        validate_id(&session.id)?;
+        search_files(self.root()?, &session.id, source_path)
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::AntigravityDesktop)?;
         validate_id(&session.id)?;
@@ -169,6 +179,14 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             "Antigravity Desktop sessions have no supported native launcher"
         ))
     }
+}
+
+pub(super) fn search_files(root: &Path, id: &str, listed: Option<&Path>) -> Result<Vec<PathBuf>> {
+    crate::antigravity::selected_search_files(
+        conversation_database(root, id),
+        provider_file(root, &root.join(SUMMARIES)),
+        listed,
+    )
 }
 
 fn conversation_database(root: &Path, id: &str) -> Option<PathBuf> {
@@ -239,12 +257,7 @@ fn native_session(
         .and_then(|summary| summary.last_modified_time.as_ref())
         .and_then(proto_timestamp);
     // Databases without a summary entry fall back to file time, which non-step writes also move.
-    let updated_at = recorded_update.or_else(|| {
-        fs::metadata(&database)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .map(DateTime::<Utc>::from)
-    });
+    let updated_at = recorded_update.or_else(|| history_file_time(&database));
     let project_path = summary.and_then(ProtoTrajectorySummary::project_path);
     let git_branch = project_path
         .as_ref()

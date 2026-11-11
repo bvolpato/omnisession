@@ -1,9 +1,11 @@
 use std::{
     borrow::Cow,
+    fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
@@ -14,9 +16,10 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
+        estimated_event_bytes, json_lines_preview, parse_timestamp, paths_match,
+        provider_executable, provider_file, provider_root, sort_sessions, sqlite_snapshot,
+        store_is_missing, validate_provider, visit_json_lines,
     },
 };
 
@@ -26,6 +29,7 @@ const PREVIEW_RECORDS: usize = 1_024;
 #[derive(Clone, Debug)]
 pub struct AntigravityAdapter {
     root: Option<PathBuf>,
+    summaries: Arc<SqliteSnapshotCache>,
 }
 
 impl AntigravityAdapter {
@@ -33,6 +37,7 @@ impl AntigravityAdapter {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
+            summaries: Arc::default(),
         }
     }
 
@@ -46,18 +51,17 @@ impl AntigravityAdapter {
         validate_id(id)?;
         let root = self.root()?;
         let database = root.join(SUMMARY_DATABASE);
-        let snapshot = sqlite_snapshot(root, &database)
-            .context("failed to snapshot Antigravity summary database")?;
-        snapshot
-            .connection
-            .query_row(
-                "SELECT conversation_id, title, step_count, last_modified_time, \
+        self.summaries.read(root, &database, |connection| {
+            connection
+                .query_row(
+                    "SELECT conversation_id, title, step_count, last_modified_time, \
                  workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
-                [id],
-                summary_from_row,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
+                    [id],
+                    summary_from_row,
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
+        })
     }
 
     fn transcript(&self, id: &str) -> Option<PathBuf> {
@@ -77,6 +81,11 @@ impl AntigravityAdapter {
         let root = self.root.as_deref()?;
         validate_id(id).ok()?;
         provider_file(root, &root.join("conversations").join(format!("{id}.db")))
+    }
+
+    fn history_source(&self, id: &str) -> Option<PathBuf> {
+        self.transcript(id)
+            .or_else(|| self.conversation_database(id))
     }
 
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
@@ -121,6 +130,7 @@ impl Default for AntigravityAdapter {
     fn default() -> Self {
         Self {
             root: provider_root("ANTIGRAVITY_CLI_HOME", &[".gemini", "antigravity-cli"]),
+            summaries: Arc::default(),
         }
     }
 }
@@ -169,16 +179,20 @@ impl ProviderAdapter for AntigravityAdapter {
             {
                 continue;
             }
+            let source_path = self.history_source(&summary.id);
+            let updated_at = summary
+                .updated_at
+                .or_else(|| source_path.as_deref().and_then(history_file_time));
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Antigravity, summary.id.clone()),
                 title: nonempty(summary.title),
                 project_path: summary.project_path,
                 git_branch: None,
                 created_at: None,
-                updated_at: summary.updated_at,
-                updated_at_approximate: false,
+                updated_at,
+                updated_at_approximate: summary.updated_at.is_none() && updated_at.is_some(),
                 event_count: summary.step_count,
-                source_path: self.conversation_database(&summary.id),
+                source_path,
             });
         }
         sort_sessions(&mut sessions);
@@ -187,6 +201,46 @@ impl ProviderAdapter for AntigravityAdapter {
 
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read(session, false)
+    }
+
+    fn search_source_files(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        validate_provider(session, Provider::Antigravity)?;
+        validate_id(&session.id)?;
+        let root = self.root()?;
+        selected_search_files(
+            self.history_source(&session.id),
+            provider_file(root, &root.join(SUMMARY_DATABASE)),
+            source_path,
+        )
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        validate_provider(&snapshot.session, Provider::Antigravity)?;
+        let summary = self.summary(&snapshot.session.id)?;
+        if let Some(updated) = summary.updated_at {
+            ensure!(
+                updated == snapshot.captured_at,
+                "Antigravity summary changed during search read"
+            );
+            return Ok(updated);
+        }
+        let current_source = self.history_source(&summary.id);
+        ensure!(
+            source_path.is_none() || source_path == current_source.as_deref(),
+            "Antigravity history source changed during search read"
+        );
+        Ok(current_source
+            .as_deref()
+            .and_then(history_file_time)
+            .unwrap_or(DateTime::UNIX_EPOCH))
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -236,6 +290,49 @@ struct Summary {
     step_count: usize,
     updated_at: Option<DateTime<Utc>>,
     project_path: Option<PathBuf>,
+}
+
+pub(super) fn selected_search_files(
+    source: Option<PathBuf>,
+    metadata: Option<PathBuf>,
+    listed: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    ensure!(
+        listed.is_none() || listed == source.as_deref(),
+        "Antigravity history source changed during search read"
+    );
+    let mut files = Vec::new();
+    for path in source.into_iter().chain(metadata) {
+        let wal = wal_path(&path);
+        files.push(path);
+        files.extend(wal);
+    }
+    Ok(files)
+}
+
+fn wal_path(path: &Path) -> Option<PathBuf> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "db" || ext == "vscdb")
+    {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        provider_file(path.parent()?, &PathBuf::from(wal))
+    } else {
+        None
+    }
+}
+
+pub(super) fn history_file_time(path: &Path) -> Option<DateTime<Utc>> {
+    // A SQLite WAL with frames can contain updates that the database file has not received.
+    if let Some(wal) = wal_path(path)
+        && let Ok(metadata) = fs::metadata(wal)
+        && metadata.len() > 32
+        && let Ok(time) = metadata.modified()
+    {
+        return Some(DateTime::from(time));
+    }
+    fs::metadata(path).ok()?.modified().ok().map(DateTime::from)
 }
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
@@ -724,6 +821,66 @@ mod tests {
         antigravity_user_request, proto_step, push_database_steps, synthetic_step, user_input_text,
         workspace_path, write_steps_database,
     };
+
+    #[test]
+    fn missing_summary_time_uses_the_selected_transcript_for_search() {
+        use crate::ProviderAdapter;
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let source = root
+            .path()
+            .join("brain")
+            .join(id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&source).unwrap();
+        let path = source.join("transcript.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"PLANNER_RESPONSE","content":"Synthetic response"}"#,
+        )
+        .unwrap();
+        let database =
+            rusqlite::Connection::open(root.path().join(super::SUMMARY_DATABASE)).unwrap();
+        database.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT)").unwrap();
+        database
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1,'Fixture',1,NULL,'[]')",
+                [id],
+            )
+            .unwrap();
+        let adapter = super::AntigravityAdapter::with_root(root.path());
+        let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+        let snapshot = adapter.read_session(&listed.session).unwrap();
+        let path = path.canonicalize().unwrap();
+        let expected = super::history_file_time(&path).unwrap();
+        assert_eq!(listed.source_path.as_deref(), Some(path.as_path()));
+        assert_eq!(listed.updated_at, Some(expected));
+        assert!(listed.updated_at_approximate);
+        assert_eq!(
+            adapter.search_source_time(&snapshot, Some(&path)).unwrap(),
+            expected
+        );
+
+        let mut registry = crate::AdapterRegistry::new();
+        registry.register(adapter);
+        let (_, clock) = registry
+            .observe_search_read(&listed.session, None, |adapter, path| {
+                let snapshot = adapter.read_session(&listed.session)?;
+                fs::write(
+                    source.join("transcript_full.jsonl"),
+                    r#"{"type":"PLANNER_RESPONSE","content":"Replacement"}"#,
+                )?;
+                let time = adapter.search_source_time(&snapshot, path)?;
+                Ok((snapshot, time))
+            })
+            .unwrap();
+        assert!(
+            clock.is_none(),
+            "the selected transcript changed during the read"
+        );
+    }
 
     #[test]
     fn decodes_local_workspace_uri() {

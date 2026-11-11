@@ -386,6 +386,64 @@ fn exact_reads_find_sessions_created_after_discovery_cache() {
 }
 
 #[test]
+fn cursor_search_clocks_follow_recorded_update_or_creation() {
+    let temporary = TempDir::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let cli_root = temporary.path().join("chats");
+    let cli_session = cli_root.join("bucket").join("sample");
+    fs::create_dir_all(&cli_session).unwrap();
+    let cli = CursorCliAdapter::with_root(cli_root);
+    let ide = CursorIdeAdapter::with_root(temporary.path());
+    let connection = rusqlite::Connection::open(database).unwrap();
+
+    for (updated, created) in [
+        (Some(1_700_000_001), Some(1_700_000_000)),
+        (None, Some(1_700_000_000)),
+        (None, None),
+    ] {
+        fs::write(
+            cli_session.join("meta.json"),
+            serde_json::json!({
+                "id": "sample",
+                "updatedAt": "unknown", "updatedAtMs": updated.map(|seconds| seconds * 1000),
+                "createdAt": null, "createdAtMs": created.map(|seconds| seconds * 1000),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE composerHeaders SET lastUpdatedAt = ?1, createdAt = ?2, value = ?3",
+                rusqlite::params![
+                    updated,
+                    created,
+                    r#"{"updatedAt":"unknown","lastUpdatedAt":null,"createdAt":null}"#
+                ],
+            )
+            .unwrap();
+        let expected = updated
+            .or(created)
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        for adapter in [&cli as &dyn ProviderAdapter, &ide] {
+            let session = adapter.list_sessions(None).unwrap().remove(0);
+            assert_eq!(session.updated_at, expected);
+            assert_eq!(
+                session.updated_at_approximate,
+                updated.is_none() && created.is_some()
+            );
+            let (snapshot, search_time) = adapter
+                .read_for_search(&session.session, None, true)
+                .unwrap();
+            assert_eq!(search_time, expected.unwrap_or(DateTime::<Utc>::UNIX_EPOCH));
+            if updated.is_none() {
+                assert_ne!(snapshot.captured_at, search_time);
+            }
+        }
+    }
+}
+
+#[test]
 fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace");

@@ -16,7 +16,7 @@ use std::sync::{
 use omnis_adapters::{IndexRead, ProviderAdapter};
 
 use crate::{
-    read_search_snapshot,
+    read_native_search_snapshot,
     search_index::{self, IndexCandidate, IndexProgress},
 };
 
@@ -419,10 +419,16 @@ pub(super) fn spawn_provider_update(
 
 fn read_picker_preview(
     registry: &AdapterRegistry,
+    store: Option<&Store>,
     key: &PreviewKey,
 ) -> anyhow::Result<(IndexRead, Option<DateTime<Utc>>)> {
     let session = &key.session;
-    let full_read = key.continuation_after.is_some() || session.provider == Provider::Imported;
+    if session.provider == Provider::Imported {
+        let read = search_index::read_imported(store, session)?;
+        let captured = read.snapshot.captured_at;
+        return Ok((read, Some(captured)));
+    }
+    let full_read = key.continuation_after.is_some();
     if !full_read && session.provider == Provider::Codex {
         let path = registry
             .find_native_session(session.provider, &session.id)?
@@ -433,7 +439,7 @@ fn read_picker_preview(
         let source_time = read.snapshot.captured_at;
         return Ok((read, Some(source_time)));
     }
-    let (snapshot, source_time) = read_search_snapshot(registry, session, full_read)?;
+    let (snapshot, source_time) = read_native_search_snapshot(registry, session, full_read)?;
     Ok((
         IndexRead {
             snapshot,
@@ -489,7 +495,7 @@ pub(super) fn spawn_preview_updates(
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
-                    let read = read_picker_preview(&registry, &key);
+                    let read = read_picker_preview(&registry, store.as_ref(), &key);
                     read.map_or(PreviewValue::Unavailable, |(read, source_time)| {
                         let IndexRead {
                             snapshot,

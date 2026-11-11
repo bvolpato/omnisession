@@ -176,6 +176,56 @@ pub trait ProviderAdapter: Send + Sync {
         self.read_session(session)
     }
 
+    /// Returns the source time used by discovery for the data that produced this snapshot.
+    /// An adapter with no recorded time can use the Unix epoch as a stable search placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected source can no longer be verified.
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        _source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        Ok(snapshot.captured_at)
+    }
+
+    /// Reads a snapshot and the provider's update time for that read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot read the session or verify its update time.
+    fn read_for_search(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read: bool,
+    ) -> Result<(CanonicalSnapshot, DateTime<Utc>)> {
+        let snapshot = if full_read {
+            self.read_session_at(session, source_path)?
+        } else {
+            self.preview_session_at(session, source_path)?
+        };
+        let time = self.search_source_time(&snapshot, source_path)?;
+        Ok((snapshot, time))
+    }
+
+    /// Reads the search projection within its budget and records the update time of that source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot read the source or verify its update time.
+    fn index_for_search(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<(IndexRead, DateTime<Utc>)> {
+        let read = self.index_session(session, source_path, full_read_bytes)?;
+        let time = self.search_source_time(&read.snapshot, source_path)?;
+        Ok((read, time))
+    }
+
     /// Reads enough provider-native history for bounded interactive previews.
     ///
     /// Adapters may sample large active sessions without weakening full-import limits.
@@ -211,6 +261,20 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
         Ok(None)
+    }
+
+    /// Returns the selected source files and directories when a search read uses several paths.
+    /// The registry checks their identities before and after reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected source cannot be resolved.
+    fn search_source_files(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
     }
 
     /// Reads history for indexing within a full-read byte budget.
@@ -432,8 +496,26 @@ impl AdapterRegistry {
     ) -> Result<(T, Option<DateTime<Utc>>)> {
         let adapter = self.adapter(session.provider)?;
         let Some(path) = adapter.search_timestamp_file(session, source_path)? else {
+            let stamps = || -> Result<Vec<_>> {
+                adapter
+                    .search_source_files(session, source_path)?
+                    .into_iter()
+                    .map(|path| {
+                        let stamp = match support::SnapshotFileStamp::read(&path) {
+                            Ok(stamp) => Some(stamp),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => return Err(error.into()),
+                        };
+                        Ok((path, stamp))
+                    })
+                    .collect()
+            };
+            let before = stamps()?;
             let (value, time) = read(adapter, source_path)?;
-            return Ok((value, Some(time)));
+            return Ok((
+                value,
+                stamps().is_ok_and(|after| after == before).then_some(time),
+            ));
         };
         let before = support::SnapshotFileStamp::read(&path).ok();
         let (value, _) = read(adapter, Some(&path))?;

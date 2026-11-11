@@ -476,6 +476,16 @@ pub(super) struct SnapshotFileStamp {
 }
 
 impl SnapshotFileStamp {
+    pub(super) fn changed_at(&self) -> DateTime<Utc> {
+        #[cfg(unix)]
+        if let Ok(nanos) = u32::try_from(self.identity.3)
+            && let Some(time) = DateTime::from_timestamp(self.identity.2, nanos)
+        {
+            return time;
+        }
+        self.modified.into()
+    }
+
     pub(super) fn read(path: &Path) -> io::Result<Self> {
         let metadata = path.metadata()?;
         Ok(Self {

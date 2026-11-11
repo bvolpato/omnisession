@@ -507,7 +507,7 @@ fn synthetic_bundle(index: usize) -> PortableBundle {
     }
 }
 
-// Every command opens the store, and opening checks bundle protection for all trajectories.
+// Every command opens the store. Include bundles and trajectories to measure startup cost.
 fn bench_store_open(criterion: &mut Criterion) {
     let dataset = Dataset::create(OPEN_TRAJECTORY_COUNT);
     let store = dataset.open();
