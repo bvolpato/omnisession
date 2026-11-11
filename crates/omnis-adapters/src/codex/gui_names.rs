@@ -57,12 +57,39 @@ fn configured_home(home: &Path) -> Result<Option<PathBuf>> {
         sqlite_home: Option<PathBuf>,
     }
     let path = home.join("config.toml");
-    if path
-        .symlink_metadata()
-        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Ok(None);
-    }
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let path = if metadata.is_symlink() {
+        let target = path.canonicalize()?;
+        let root = home.canonicalize()?;
+        let relative = target
+            .strip_prefix(&root)
+            .context("Codex config link leaves its home")?;
+        anyhow::ensure!(
+            !relative.components().any(|part| {
+                let name = part.as_os_str().to_string_lossy();
+                [
+                    "auth.json",
+                    "oauth_creds.json",
+                    ".credentials.json",
+                    "credentials.json",
+                    ".credentials",
+                    ".creds",
+                    ".ssh",
+                    ".gnupg",
+                ]
+                .iter()
+                .any(|protected| name.eq_ignore_ascii_case(protected))
+            }),
+            "Codex config link points to a credential location"
+        );
+        target
+    } else {
+        path
+    };
     let path = provider_file(home, &path).context("invalid Codex config file")?;
     let file = std::fs::File::open(path)?;
     let mut text = String::new();
@@ -111,7 +138,6 @@ impl StateName {
         &self,
         home: &Path,
         id: &str,
-
         revision: Option<SourceRevision>,
     ) -> bool {
         if path_uuid(&self.path).as_deref() != Some(id) {

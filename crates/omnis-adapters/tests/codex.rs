@@ -616,6 +616,9 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
     let db = rusqlite::Connection::open(home.path().join("alternate/state_5.sqlite"))?;
     db.execute("UPDATE threads SET title='Configured name'", [])?;
     check(Some("Configured name"))?;
+    #[cfg(unix)]
+    check_linked_gui_config(home.path(), &path)?;
+    check_archived_gui_name(home.path(), &path, &db)?;
     Ok(())
 }
 
@@ -652,5 +655,41 @@ fn check_gui_title(home: &Path, path: &Path, expected: Option<&str>) -> anyhow::
         adapter.preview_session(&session)?.title.as_deref(),
         expected
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_linked_gui_config(home: &Path, path: &Path) -> anyhow::Result<()> {
+    let config = home.join("config.toml");
+    fs::rename(&config, home.join("profile.toml"))?;
+    std::os::unix::fs::symlink("profile.toml", &config)?;
+    check_gui_title(home, path, Some("Configured name"))?;
+    fs::remove_file(&config)?;
+    fs::rename(home.join("profile.toml"), home.join("auth.json"))?;
+    std::os::unix::fs::symlink("auth.json", &config)?;
+    assert_eq!(
+        CodexAdapter::with_root(home).list_sessions(None)?[0].title,
+        None
+    );
+    fs::remove_file(&config)?;
+    fs::rename(home.join("auth.json"), config)?;
+    Ok(())
+}
+
+fn check_archived_gui_name(
+    home: &Path,
+    path: &Path,
+    db: &rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let mut rows = CodexAdapter::with_root(home).list_sessions(None)?;
+    rows[0].source_path = None;
+    let archive = home.join("archived_sessions");
+    fs::create_dir(&archive)?;
+    let archived = archive.join(path.file_name().unwrap());
+    fs::rename(path, &archived)?;
+    db.execute("UPDATE threads SET rollout_path = ?1", [archived.to_str()])?;
+    CodexAdapter::with_root(home).refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), Some("Configured name"));
+    assert_eq!(rows[0].source_path.as_deref(), Some(archived.as_path()));
     Ok(())
 }

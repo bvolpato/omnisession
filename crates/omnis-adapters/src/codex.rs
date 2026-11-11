@@ -217,6 +217,12 @@ impl CodexAdapter {
                     |path| row.matches_path(path),
                 ) {
                     session.title = row.title(index.titles.get(id));
+                } else if let Some(local) = observed.get(id.as_str())
+                    && session.project_path == local.project_path
+                    && row.matches_path(&local.path)
+                {
+                    // An archive move changes the path-based file identity.
+                    *session = local.native_session();
                 } else {
                     session.title = None;
                 }
