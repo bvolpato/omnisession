@@ -34,6 +34,9 @@ uuid.workspace = true
 tempfile.workspace = true
 wait-timeout.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix-openpty.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

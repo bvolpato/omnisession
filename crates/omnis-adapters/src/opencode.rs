@@ -2,7 +2,7 @@ use std::{
     io::{self, ErrorKind, Read, Seek},
     path::Path,
     path::PathBuf,
-    process::Stdio,
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -205,25 +205,13 @@ pub fn opencode_command_args(binary: &Path, arguments: &[&str]) -> Result<Vec<St
     ensure_provider_executable(binary)?;
     if is_opencode_v2(binary) {
         let mut args = Vec::with_capacity(arguments.len() + 2);
-        if !arguments.contains(&"--standalone") {
-            args.push("--standalone".to_owned());
+        if matches!(arguments.first(), Some(&("export" | "import"))) {
+            args.push("session".to_owned());
         }
-        if let Some((first, rest)) = arguments.split_first() {
-            match *first {
-                "export" => {
-                    args.push("session".to_owned());
-                    args.push("export".to_owned());
-                    args.extend(rest.iter().map(|s| (*s).to_owned()));
-                }
-                "import" => {
-                    args.push("session".to_owned());
-                    args.push("import".to_owned());
-                    args.extend(rest.iter().map(|s| (*s).to_owned()));
-                }
-                _ => {
-                    args.extend(arguments.iter().map(|s| (*s).to_owned()));
-                }
-            }
+        args.extend(arguments.iter().map(|s| (*s).to_owned()));
+        if !arguments.contains(&"--standalone") {
+            // OpenCode 2.0 accepts this flag on the leaf command.
+            args.push("--standalone".to_owned());
         }
         Ok(args)
     } else {
@@ -245,17 +233,7 @@ pub fn fork_opencode_session_with_binary(
     cwd: Option<&Path>,
 ) -> Result<String> {
     ensure_provider_executable(binary)?;
-    let encoded_session_id: String = session_id
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                char::from(byte).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect();
-    let endpoint = format!("/api/session/{encoded_session_id}/fork");
+    let endpoint = format!("{}/fork", session_endpoint(session_id)?);
     let output = command_json(
         binary,
         &["api", "--standalone", "POST", &endpoint, "-d", "{}"],
@@ -280,6 +258,66 @@ struct OpenCodeMetadata {
     git_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+}
+
+fn session_endpoint(id: &str) -> Result<String> {
+    if matches!(id, "" | "." | "..") {
+        bail!("invalid OpenCode session ID path segment");
+    }
+    let encoded: String = id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    Ok(format!("/api/session/{encoded}"))
+}
+
+/// Captures JSON from a prepared `OpenCode` command without interactive input.
+/// Legacy Unix releases flush large writes reliably when stdout is a raw terminal.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot start, stdout exceeds the limit, an output
+/// stream cannot be read, or the command or its output exceeds the deadline.
+pub fn bounded_opencode_json_output(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: Option<usize>,
+) -> Result<Output> {
+    opencode_json_output(command, timeout, stdout_limit, stderr_limit, None)
+}
+
+fn opencode_json_output(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: Option<usize>,
+    large_output_timeout: Option<Duration>,
+) -> Result<Output> {
+    command.stdin(Stdio::null());
+    #[cfg(not(unix))]
+    let _ = large_output_timeout;
+    #[cfg(unix)]
+    if command.get_args().next().is_some_and(|arg| arg == "--pure") {
+        command
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .env("TERM", "dumb");
+        return crate::provider_process::bounded_terminal_output(
+            command,
+            timeout,
+            stdout_limit,
+            stderr_limit,
+            large_output_timeout,
+        );
+    }
+    bounded_provider_output(command, timeout, Some(stdout_limit), stderr_limit)
 }
 
 fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
@@ -313,15 +351,16 @@ fn run_json(
     let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
     let args = opencode_command_args(binary, arguments)?;
     let mut command = provider_process(binary)?;
-    command.args(&args).stdin(Stdio::null());
+    command.args(&args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = match bounded_provider_output(
+    let output = match opencode_json_output(
         &mut command,
         Duration::from_secs(30),
-        Some(MAX_OUTPUT_SIZE),
+        MAX_OUTPUT_SIZE,
         exact_api.then_some(DIAGNOSTIC_LIMIT),
+        Some(Duration::from_secs(60)),
     ) {
         Ok(output) => output,
         // A missing working directory also reports NotFound, and that is a real failure.
@@ -455,13 +494,7 @@ fn lookup_metadata(
     let value = if v2 {
         run_json(
             binary,
-            &[
-                "api",
-                "--standalone",
-                "session.get",
-                "--param",
-                &format!("sessionID={id}"),
-            ],
+            &["api", "--standalone", "GET", &session_endpoint(id)?],
             cwd,
             Some(id),
         )?
@@ -1036,15 +1069,16 @@ esac"#,
             (
                 "2.2.0",
                 r#"
-case "$3:$5" in
+case "$3:$4" in
     session.list:*) echo '{"data":[]}' ;;
-    session.get:sessionID=ses_hidden) echo '{"data":{"id":"ses_hidden","location":{"directory":"/project"}}}' ;;
-    session.get:sessionID=ses_verbose) printf '%09000d' 0 >&2; echo '{"data":{"id":"ses_verbose"}}' ;;
-    session.get:sessionID=ses_missing) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_missing"}'; exit 1 ;;
-    session.get:sessionID=ses_wrong) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_other"}'; exit 1 ;;
-    session.get:sessionID=ses_server) echo 'HTTP 500 Internal Server Error' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_server"}'; exit 1 ;;
-    session.get:sessionID=ses_mismatch) echo '{"data":{"id":"ses_other"}}' ;;
-    session.get:sessionID=ses_malformed) echo '{"sessionID":"ses_malformed"}' ;;
+    GET:/api/session/ses_hidden) echo '{"data":{"id":"ses_hidden","location":{"directory":"/project"}}}' ;;
+    GET:/api/session/ses_verbose) printf '%09000d' 0 >&2; echo '{"data":{"id":"ses_verbose"}}' ;;
+    GET:/api/session/ses_path%2F%3F%23%25%20%C3%A9) echo '{"id":"ses_path/?#% é"}' ;;
+    GET:/api/session/ses_missing) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_missing"}'; exit 1 ;;
+    GET:/api/session/ses_wrong) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_other"}'; exit 1 ;;
+    GET:/api/session/ses_server) echo 'HTTP 500 Internal Server Error' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_server"}'; exit 1 ;;
+    GET:/api/session/ses_mismatch) echo '{"data":{"id":"ses_other"}}' ;;
+    GET:/api/session/ses_malformed) echo '{"sessionID":"ses_malformed"}' ;;
     *) exit 1 ;;
 esac"#,
             ),
@@ -1089,12 +1123,9 @@ esac"#,
                     super::find_opencode_session_with_binary(&binary, "ses_hidden", None).is_err()
                 );
             } else {
-                assert!(
-                    adapter
-                        .find_native_session("ses_verbose")
-                        .unwrap()
-                        .is_some()
-                );
+                for id in ["ses_path/?#% é", "ses_verbose"] {
+                    assert!(adapter.find_native_session(id).unwrap().is_some(), "{id}");
+                }
                 assert!(
                     adapter
                         .find_native_session("ses_missing")

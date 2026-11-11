@@ -1,10 +1,13 @@
 use std::{
     io::{self, Read},
     process::{Command, Output, Stdio},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
@@ -37,7 +40,129 @@ pub fn bounded_provider_output(
         .stdout(destination(stdout_limit))
         .stderr(destination(stderr_limit));
     let mut child = command.group_spawn()?;
-    let result = collect(&mut child, stdout_limit, stderr_limit, timeout);
+    let stdout = child.inner().stdout.take();
+    collect_or_stop(child, stdout, stdout_limit, stderr_limit, timeout, None)
+}
+
+#[cfg(unix)]
+pub(crate) fn bounded_terminal_output(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: Option<usize>,
+    large_output_timeout: Option<Duration>,
+) -> Result<Output> {
+    use rustix_openpty::rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+
+    let terminal = rustix_openpty::openpty(None, None).context("opening provider stdout PTY")?;
+    let mut attributes = tcgetattr(&terminal.user)?;
+    attributes.make_raw();
+    tcsetattr(&terminal.user, OptionalActions::Now, &attributes)?;
+    command
+        .stdout(terminal.user)
+        .stderr(if stderr_limit.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let child = command.group_spawn();
+    // Close the parent's copy of the writer so the reader sees the provider exit.
+    command.stdout(Stdio::null());
+    let progress = large_output_timeout.map(|maximum| {
+        Arc::new(LargeOutputWait {
+            last_read: Mutex::new(None),
+            maximum,
+        })
+    });
+    collect_or_stop(
+        child?,
+        Some(TerminalOutput {
+            file: terminal.controller.into(),
+            bytes: 0,
+            progress: progress.clone(),
+        }),
+        Some(stdout_limit),
+        stderr_limit,
+        timeout,
+        progress.as_deref(),
+    )
+}
+
+#[cfg(unix)]
+struct TerminalOutput {
+    file: std::fs::File,
+    bytes: usize,
+    progress: Option<Arc<LargeOutputWait>>,
+}
+
+#[cfg(unix)]
+impl Read for TerminalOutput {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        const MIB: usize = 1024 * 1024;
+        match self.file.read(buffer) {
+            Ok(read) => {
+                let previous = self.bytes;
+                self.bytes += read;
+                if self.bytes >= 8 * MIB
+                    && previous / MIB != self.bytes / MIB
+                    && let Some(progress) = &self.progress
+                {
+                    *progress
+                        .last_read
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+                }
+                Ok(read)
+            }
+            // Linux PTY controllers return EIO after the last writer closes.
+            Err(error)
+                if error.raw_os_error()
+                    == Some(rustix_openpty::rustix::io::Errno::IO.raw_os_error()) =>
+            {
+                Ok(0)
+            }
+            result => result,
+        }
+    }
+}
+
+struct LargeOutputWait {
+    last_read: Mutex<Option<Instant>>,
+    maximum: Duration,
+}
+
+impl LargeOutputWait {
+    fn allowed(&self, started: Instant, initial: Duration) -> Duration {
+        let last = *self
+            .last_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(last) = last else {
+            return initial;
+        };
+        let extended = last
+            .saturating_duration_since(started)
+            .saturating_add(Duration::from_secs(5));
+        initial.max(extended.min(self.maximum))
+    }
+}
+
+fn collect_or_stop(
+    mut child: GroupChild,
+    stdout: Option<impl Read + Send + 'static>,
+    stdout_limit: Option<usize>,
+    stderr_limit: Option<usize>,
+    timeout: Duration,
+    progress: Option<&LargeOutputWait>,
+) -> Result<Output> {
+    let result = collect(
+        &mut child,
+        stdout,
+        stdout_limit,
+        stderr_limit,
+        timeout,
+        progress,
+    );
     if result.is_err() {
         // The launcher can delegate to another executable that still holds the pipe.
         if child.kill().is_err() {
@@ -55,20 +180,22 @@ enum Stream {
 
 fn collect(
     child: &mut GroupChild,
+    stdout: Option<impl Read + Send + 'static>,
     stdout_limit: Option<usize>,
     stderr_limit: Option<usize>,
     timeout: Duration,
+    progress: Option<&LargeOutputWait>,
 ) -> Result<Output> {
     let started = Instant::now();
-    let remaining = || timeout.saturating_sub(started.elapsed());
+    let remaining = || {
+        progress
+            .map_or(timeout, |p| p.allowed(started, timeout))
+            .saturating_sub(started.elapsed())
+    };
     let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "provider command timed out");
     let (send, receive) = mpsc::channel();
     if let Some(limit) = stdout_limit {
-        let mut stdout = child
-            .inner()
-            .stdout
-            .take()
-            .context("missing provider stdout")?;
+        let mut stdout = stdout.context("missing provider stdout")?;
         let stdout_send = send.clone();
         thread::Builder::new().spawn(move || {
             let result = read_limited(&mut stdout, limit).and_then(|bytes| {
@@ -105,14 +232,22 @@ fn collect(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     for _ in 0..readers {
-        let stream = receive
-            .recv_timeout(remaining())
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => timed_out(),
-                mpsc::RecvTimeoutError::Disconnected => {
-                    io::Error::other("provider output reader stopped")
+        let stream = loop {
+            match receive.recv_timeout(remaining()) {
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if progress.is_some() && !remaining().is_zero() =>
+                {
+                    // A large read advanced the deadline while the receiver was waiting.
                 }
-            })??;
+                result => break result,
+            }
+        }
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => timed_out(),
+            mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::other("provider output reader stopped")
+            }
+        })??;
         match stream {
             Stream::Stdout(bytes) => stdout = bytes,
             Stream::Stderr(bytes) => stderr = bytes,
@@ -144,6 +279,25 @@ fn read_limited(reader: &mut impl Read, limit: usize) -> Result<Option<Vec<u8>>>
 mod tests {
     use super::read_limited;
     use std::io::Cursor;
+
+    #[test]
+    fn only_recent_large_reads_extend_the_initial_wait_up_to_the_maximum() {
+        use std::{
+            sync::Mutex,
+            time::{Duration, Instant},
+        };
+        let started = Instant::now();
+        let initial = Duration::from_secs(30);
+        for (last_read, allowed) in [(None, 30), (Some(10), 30), (Some(28), 33), (Some(58), 60)] {
+            let wait = super::LargeOutputWait {
+                last_read: Mutex::new(
+                    last_read.map(|seconds| started + Duration::from_secs(seconds)),
+                ),
+                maximum: Duration::from_secs(60),
+            };
+            assert_eq!(wait.allowed(started, initial), Duration::from_secs(allowed));
+        }
+    }
 
     #[test]
     fn accepts_the_exact_limit_and_stops_at_the_first_extra_byte() {
