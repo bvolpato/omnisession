@@ -3406,6 +3406,7 @@ fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
             ..plan.clone()
         })?;
         let mut command = prepare_launch_command(&probe)?;
+        let _home = version_gate::isolate_first_codex_probe(target.provider, &mut command)?;
         match omnis_adapters::bounded_provider_output(
             command.stdin(Stdio::null()),
             version_gate::PROBE_TIMEOUT,
