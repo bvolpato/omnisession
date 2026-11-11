@@ -349,7 +349,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
            OR session_trajectories.origin <> 'native'
            OR excluded.document_version = session_trajectories.document_version
            OR NOT (session_trajectories.source_complete OR session_trajectories.provider_limited)
-           OR excluded.source_complete OR excluded.provider_limited)
+           OR excluded.source_complete OR excluded.provider_limited OR ?30)
       AND CASE
           WHEN ?30 AND excluded.document_version > session_trajectories.document_version THEN 1
           WHEN excluded.provider = 'codex' THEN 1
@@ -922,6 +922,7 @@ pub struct TrajectoryDocument<'a> {
     pub redacted_text: &'a str,
     pub desktop_step_proof: Option<&'a [Uuid]>,
     pub desktop_projection: Option<&'a omnis_core::DesktopProjection>,
+    pub legacy_utf8_text: Option<&'a omnis_core::LegacyUtf8Projection>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     pub source_byte_count: usize,
@@ -3025,6 +3026,7 @@ impl Store {
                 local_opener: LocalOpenerEvidence::Unknown,
                 desktop_step_proof: None,
                 desktop_projection: None,
+                legacy_utf8_text: None,
                 withdrawn_title: None,
                 title_authoritative: false,
             },
@@ -9115,6 +9117,7 @@ mod tests {
                         local_opener: LocalOpenerEvidence::Unknown,
                         desktop_step_proof: None,
                         desktop_projection: None,
+                        legacy_utf8_text: None,
                         withdrawn_title: None,
                         source_revision: SourceRevision::default(),
                         redacted_text: text,
@@ -9163,6 +9166,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9267,6 +9271,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9381,6 +9386,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: text,
@@ -9446,6 +9452,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "removed",
@@ -9723,6 +9730,7 @@ mod tests {
                 local_opener: LocalOpenerEvidence::Unknown,
                 desktop_step_proof: None,
                 desktop_projection: None,
+                legacy_utf8_text: None,
                 withdrawn_title: None,
                 source_revision: SourceRevision::default(),
                 redacted_text: text,
@@ -9796,6 +9804,7 @@ mod tests {
                     local_opener: LocalOpenerEvidence::Unknown,
                     desktop_step_proof: None,
                     desktop_projection: None,
+                    legacy_utf8_text: None,
                     withdrawn_title: None,
                 };
                 store
@@ -9867,6 +9876,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: false,
         }
@@ -10855,6 +10865,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Withdrawn,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: Some(name),
             derived_title: None,
             title_is_verified: false,
@@ -10952,6 +10963,7 @@ mod tests {
                 local_opener: LocalOpenerEvidence::Withdrawn,
                 desktop_step_proof: None,
                 desktop_projection: None,
+                legacy_utf8_text: None,
                 withdrawn_title: Some(name),
                 truncation_strategy: if full { "none" } else { "source_incomplete" },
                 ..rollout_document("updated searchable content", time, revision, full, 6)
@@ -12875,6 +12887,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: true,
             ..rollout_document("original", older, first, true, 2)
@@ -13208,6 +13221,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13257,6 +13271,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13310,6 +13325,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13329,6 +13345,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13406,6 +13423,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13454,6 +13472,7 @@ mod tests {
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
             desktop_projection: None,
+            legacy_utf8_text: None,
             withdrawn_title: None,
             title_authoritative: false,
         };

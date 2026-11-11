@@ -5,7 +5,7 @@ use std::ops::Range;
 use omnis_ir::OmniEvent;
 use uuid::Uuid;
 
-use super::{truncation_notice, utf8_prefix_boundary, utf8_suffix_boundary};
+use super::truncation_notice;
 
 /// The range each verified Desktop row occupies after per-event truncation and before document truncation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,54 +35,6 @@ impl DesktopProjection {
         };
         self.rows.push((id, bytes));
         true
-    }
-
-    /// Checks an uncapped legacy projection that split a UTF-8 character at the old head boundary.
-    /// The old projector could move bytes from later chunks into the head and trim the tail early.
-    #[must_use]
-    pub fn matches_legacy_utf8_text(&self, previous_text: &str, incoming_text: &str) -> bool {
-        let size = incoming_text.len();
-        if size <= self.edge_limit
-            || size > self.edge_limit.saturating_mul(2)
-            || self.rows.last().is_none_or(|(_, row)| row.end != size)
-            || incoming_text.is_char_boundary(self.edge_limit)
-            || previous_text == incoming_text
-        {
-            return false;
-        }
-
-        let mut head_bytes = 0;
-        let mut tail = String::with_capacity(size - self.edge_limit);
-        let mut matches_chunk = |chunk: &str| {
-            let split = utf8_prefix_boundary(chunk, self.edge_limit - head_bytes);
-            let end = head_bytes + split;
-            if previous_text.get(head_bytes..end) != Some(&chunk[..split]) {
-                return false;
-            }
-            head_bytes = end;
-            tail.push_str(&chunk[split..]);
-            true
-        };
-
-        let mut end = 0;
-        for (_, row) in &self.rows {
-            if row.is_empty() {
-                continue;
-            }
-            let separator = if end == 0 { "" } else { "\n\n" };
-            if incoming_text.get(end..row.start) != Some(separator) || !matches_chunk(separator) {
-                return false;
-            }
-            let Some(chunk) = incoming_text.get(row.clone()) else {
-                return false;
-            };
-            if !matches_chunk(chunk) {
-                return false;
-            }
-            end = row.end;
-        }
-        let tail_start = utf8_suffix_boundary(&tail, self.edge_limit);
-        end == size && previous_text.get(head_bytes..) == Some(&tail[tail_start..])
     }
 
     /// Checks whether the new indexed text retains each previously searchable row fragment.
@@ -200,39 +152,5 @@ impl Edges {
                 indexed_start: tail_index,
             },
         ]))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DesktopProjection, Uuid};
-
-    #[test]
-    fn legacy_utf8_repair_requires_the_exact_historical_bytes() {
-        let rows = [
-            "abcdefghijklmnopqrstuvwxyz0123456789",
-            "🦀goldfinch",
-            "bluebird",
-        ];
-        let current = rows.join("\n\n");
-        let mut projection = DesktopProjection::new(40);
-        let mut offset = 0;
-        for row in rows {
-            projection
-                .rows
-                .push((Uuid::nil(), offset..offset + row.len()));
-            offset += row.len() + 2;
-        }
-        let legacy = "abcdefghijklmnopqrstuvwxyz0123456789\n\n\n\n🦀goldfinchbluebird";
-        assert!(projection.matches_legacy_utf8_text(legacy, &current));
-        assert!(!projection.matches_legacy_utf8_text("goldfinchbluebird", &current));
-        assert!(!projection.matches_legacy_utf8_text(&legacy.replace("gold", "cold"), &current));
-        assert!(!projection.matches_legacy_utf8_text(&current, &current));
-
-        let exact = "abcde🦀1234567";
-        let mut at_cap = DesktopProjection::new(8);
-        at_cap.rows.push((Uuid::nil(), 0..exact.len()));
-        assert!(at_cap.matches_legacy_utf8_text("abcde1234567", exact));
-        assert!(!at_cap.matches_legacy_utf8_text("abcde234567", exact));
     }
 }

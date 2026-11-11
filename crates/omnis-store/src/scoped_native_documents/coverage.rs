@@ -22,7 +22,7 @@ impl Primary {
     ) -> Result<Option<Self>> {
         let mut statement = tx.prepare_cached(
             "SELECT doc.id, origin.source_home, doc.source_file_id, doc.source_contents_id,
-                    doc.source_complete OR doc.provider_limited, doc.truncation_strategy, doc.indexed_byte_count, doc.content_hash
+                    doc.source_complete OR doc.provider_limited, doc.truncation_strategy, doc.source_byte_count, doc.indexed_byte_count, doc.content_hash
              FROM session_trajectories doc LEFT JOIN native_search_document_homes origin
                ON doc.id=origin.trajectory_id AND doc.source_file_id=origin.source_file AND origin.verification=1
              WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native'",
@@ -36,8 +36,8 @@ impl Primary {
                         verified_home: row.get(1)?,
                         file: optional_uuid(row, 2)?,
                         coverage: PriorCoverage::from_row(row, 3)?,
-                        bytes: row.get(6)?,
-                        hash: row.get(7)?,
+                        bytes: row.get(7)?,
+                        hash: row.get(8)?,
                     })
                 },
             )
@@ -86,7 +86,7 @@ pub(super) fn scoped_accepts_partial(
     has_gap: bool,
 ) -> Result<bool> {
     let mut statement = tx.prepare_cached(
-        "SELECT source_contents, source_complete OR provider_limited, truncation_strategy, stored_text
+        "SELECT source_contents, source_complete OR provider_limited, truncation_strategy, source_byte_count, stored_text
          FROM scoped_native_documents
          WHERE provider=?1 AND session_id=?2 AND source_home=?3 AND source_file=?4",
     ).map_err(database_error)?;
@@ -103,7 +103,7 @@ pub(super) fn scoped_accepts_partial(
     };
     let prior = PriorCoverage::from_row(row, 0).map_err(database_error)?;
     let text = row
-        .get_ref(3)
+        .get_ref(4)
         .map_err(database_error)?
         .as_str()
         .map_err(|_| StoreError::CorruptStore)?;
@@ -121,12 +121,16 @@ struct PriorCoverage {
     contents: Option<Uuid>,
     full_or_limited: bool,
     document_truncated: bool,
+    source_bytes: usize,
 }
 
 impl PriorCoverage {
     fn from_row(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Self> {
+        let bytes: i64 = row.get(column + 3)?;
         Ok(Self {
             contents: optional_uuid(row, column)?,
+            source_bytes: usize::try_from(bytes)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column + 3, bytes))?,
             full_or_limited: row.get(column + 1)?,
             document_truncated: row
                 .get_ref(column + 2)?
@@ -147,17 +151,10 @@ impl PriorCoverage {
         if !has_gap && self.contents != write.document.source_revision.contents {
             return Ok(true);
         }
-        if write.session.provider != crate::Provider::AntigravityDesktop {
-            if self.full_or_limited {
-                return Ok(false);
-            }
-            return Ok(hash == write.content_hash
-                || prior_text()?.is_some_and(|previous| {
-                    retains_legacy_preview(&previous, write.document.redacted_text)
-                }));
-        }
         let prior_steps = match (home, self.contents, write.document.source_revision.file) {
-            (Some(home), Some(contents), Some(file)) if has_gap => {
+            (Some(home), Some(contents), Some(file))
+                if has_gap && write.session.provider == crate::Provider::AntigravityDesktop =>
+            {
                 super::desktop_receipts::read(tx, &write.session.id, home, file, contents, hash)?
             }
             _ => None,
@@ -166,15 +163,28 @@ impl PriorCoverage {
         if has_gap
             && home.is_some()
             && hash != write.content_hash
+            && let Some(projection) = write.document.legacy_utf8_text
             && prior_steps
                 .as_deref()
-                .is_none_or(|previous| Some(previous) == incoming)
-            && let Some(projection) = write.document.desktop_projection
+                .is_none_or(|previous| incoming.is_some_and(|rows| rows.starts_with(previous)))
             && prior_text()?.is_some_and(|previous| {
-                projection.matches_legacy_utf8_text(&previous, write.document.redacted_text)
+                projection.retains_legacy_utf8_prefix(
+                    self.source_bytes,
+                    &previous,
+                    write.document.redacted_text,
+                )
             })
         {
             return Ok(true);
+        }
+        if write.session.provider != crate::Provider::AntigravityDesktop {
+            if self.full_or_limited {
+                return Ok(false);
+            }
+            return Ok(hash == write.content_hash
+                || prior_text()?.is_some_and(|previous| {
+                    retains_legacy_preview(&previous, write.document.redacted_text)
+                }));
         }
         if let (Some(previous), Some(incoming)) = (prior_steps, incoming) {
             if !retains_steps(&previous, incoming, self.full_or_limited) {

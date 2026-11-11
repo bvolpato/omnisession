@@ -206,6 +206,7 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         local_opener: omnis_store::LocalOpenerEvidence::Unknown,
         desktop_step_proof: None,
         desktop_projection: None,
+        legacy_utf8_text: None,
         withdrawn_title: None,
         title_authoritative: false,
     }

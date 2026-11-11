@@ -1689,6 +1689,62 @@ fn compressed_previews_confirm_absence_when_no_records_are_missing() -> anyhow::
 }
 
 #[test]
+fn legacy_codex_verification_matches_the_released_utf8_digest() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir()?;
+    let folder = temporary.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let mut rollout = fs::File::create(&path)?;
+    writeln!(
+        rollout,
+        "{}",
+        json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":"/synthetic"}})
+    )?;
+    let ignored = json!({"type":"progress", "data":"x".repeat(64 * 1024)});
+    for _ in 0..32 {
+        writeln!(rollout, "{ignored}")?;
+    }
+    let mut messages = vec!["a ".repeat(32_767) + "a"; 16];
+    // Leave two bytes in the old head window before the four-byte character.
+    messages[0].truncate(65_517);
+    messages.push("🦅goldfinch".to_owned());
+    messages.push("bluebird".to_owned());
+    for text in &messages {
+        writeln!(rollout, "{}", message("assistant", text))?;
+    }
+    for _ in 0..32 {
+        writeln!(rollout, "{ignored}")?;
+    }
+    drop(rollout);
+    let corrected = messages.join("\n\n");
+    assert_eq!(corrected.find('🦅'), Some(1024 * 1024 - 2));
+    let historical = corrected.replace("🦅goldfinch\n\nbluebird", "\n\n🦅goldfinchbluebird");
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let sampled =
+        CodexAdapter::with_root(temporary.path()).index_session(&session, Some(&path), 1)?;
+    assert!(!sampled.source_complete);
+    let verify = |bytes: &[u8]| {
+        CodexAdapter::verify_legacy_search_projection(
+            &session,
+            &path,
+            &sampled,
+            &Sha256::digest(bytes),
+        )
+    };
+    let verified = verify(historical.as_bytes())?.expect("the released search digest matches");
+    assert!(verified.source_complete);
+    assert_eq!(
+        omnis_core::trajectory_search_document(&verified.snapshot).text,
+        corrected
+    );
+    assert!(verify(corrected.as_bytes())?.is_none());
+    Ok(())
+}
+
+#[test]
 fn codex_index_budgets_the_decoded_size_of_compressed_rollouts() {
     let temporary = tempfile::tempdir().unwrap();
     let folder = temporary.path().join("archived_sessions");

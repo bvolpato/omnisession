@@ -103,7 +103,10 @@ pub(super) fn write(
     }
     if same_source || legacy_file || (primary.verified_home.is_none() && !has_gap) {
         return Ok(WriteResult::Primary(
-            same_source && has_gap && write.session.provider == crate::Provider::AntigravityDesktop,
+            same_source
+                && has_gap
+                && (write.session.provider == crate::Provider::AntigravityDesktop
+                    || write.document.legacy_utf8_text.is_some()),
         ));
     }
     if (!has_gap || write.source_complete)

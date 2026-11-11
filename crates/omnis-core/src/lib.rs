@@ -2,6 +2,7 @@
 
 mod cursor_workspace;
 mod desktop_projection;
+mod legacy_utf8_projection;
 mod recovery;
 
 pub use cursor_workspace::{
@@ -9,6 +10,7 @@ pub use cursor_workspace::{
     local_cursor_workspace_path, resolve_local_path, session_workspace_matches,
 };
 pub use desktop_projection::DesktopProjection;
+pub use legacy_utf8_projection::LegacyUtf8Projection;
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
 use std::{
@@ -1152,6 +1154,7 @@ pub fn first_user_message_after(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchDocument {
     pub desktop_projection: Option<DesktopProjection>,
+    pub legacy_utf8_text: Option<LegacyUtf8Projection>,
     pub text: String,
     pub truncated: bool,
     pub source_complete: bool,
@@ -1221,6 +1224,7 @@ fn trajectory_search_document_with_limits(
         ..
     } = visible_history(snapshot);
 
+    let mut legacy = None;
     let mut desktop_projection = (snapshot.session.provider == Provider::AntigravityDesktop)
         .then(|| DesktopProjection::new(document_edge_limit));
     for event in events {
@@ -1228,6 +1232,13 @@ fn trajectory_search_document_with_limits(
         if let Some(event_text) = search_event_text(event, event_edge_limit)
             && !event_text.text.trim().is_empty()
         {
+            legacy_utf8_projection::observe(
+                &mut legacy,
+                &retained,
+                included_events != 0,
+                source_byte_count,
+                &event_text,
+            );
             if included_events != 0 {
                 source_byte_count = source_byte_count.saturating_add(2);
                 retained.push("\n\n");
@@ -1251,6 +1262,7 @@ fn trajectory_search_document_with_limits(
         search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
     SearchDocument {
         desktop_projection,
+        legacy_utf8_text: legacy.and_then(|old| old.finish(&text, source_byte_count)),
         indexed_byte_count: text.len(),
         text,
         truncated: truncation_strategy != SearchTruncationStrategy::None,
@@ -1376,6 +1388,7 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
     boundary
 }
 
+#[derive(Clone)]
 struct HeadTailText {
     head: String,
     tail: VecDeque<String>,
@@ -1396,7 +1409,18 @@ impl HeadTailText {
     }
 
     fn push(&mut self, value: &str) {
-        let head_remaining = self.edge_limit.saturating_sub(self.total_byte_count);
+        self.push_with_head_budget(
+            value,
+            self.edge_limit.saturating_sub(self.total_byte_count),
+            false,
+        );
+    }
+
+    fn push_legacy(&mut self, value: &str) {
+        self.push_with_head_budget(value, self.edge_limit - self.head.len(), true);
+    }
+
+    fn push_with_head_budget(&mut self, value: &str, head_remaining: usize, legacy: bool) {
         self.total_byte_count = self.total_byte_count.saturating_add(value.len());
         let head_bytes = utf8_prefix_boundary(value, head_remaining);
         if head_bytes != 0 {
@@ -1409,7 +1433,13 @@ impl HeadTailText {
         let remainder_byte_count = remainder.len();
         self.tail.push_back(remainder);
         self.tail_byte_count += remainder_byte_count;
-        self.trim_tail();
+        // Corrected projections let the tail use bytes left over by a split UTF-8 character.
+        let tail_limit = if legacy {
+            self.edge_limit
+        } else {
+            self.edge_limit.saturating_mul(2) - self.head.len()
+        };
+        self.trim_tail(tail_limit);
     }
 
     fn truncated(&self) -> bool {
@@ -1444,9 +1474,7 @@ impl HeadTailText {
         text
     }
 
-    fn trim_tail(&mut self) {
-        // If the head ends before a multibyte character, its unused bytes belong to the tail.
-        let tail_limit = self.edge_limit.saturating_mul(2) - self.head.len();
+    fn trim_tail(&mut self, tail_limit: usize) {
         while self.tail_byte_count > tail_limit {
             let excess = self.tail_byte_count - tail_limit;
             let Some(front) = self.tail.pop_front() else {
@@ -5800,6 +5828,71 @@ mod tests {
             &with_middle.text,
             &after_restore.text
         ));
+    }
+
+    #[test]
+    fn historical_search_projection_matches_the_old_utf8_split_before_and_after_the_cap() {
+        let project = |texts: &[&str], edge| {
+            let events = texts
+                .iter()
+                .enumerate()
+                .map(|(sequence, text)| {
+                    event(
+                        u64::try_from(sequence).unwrap(),
+                        EventKind::MessageAssistant,
+                        json!({"text":text}),
+                    )
+                })
+                .collect();
+            trajectory_search_document_with_limits(&snapshot_with_events(events), 4096, edge)
+        };
+        let head = "p".repeat(56);
+        let crossing = format!("🦀{} goldfinch", "a".repeat(24));
+        let prior = project(&[&head, &crossing, "bluebird"], 60);
+        let expected_prior = format!("{head}\n\n\n\n{crossing}bluebird");
+        assert_eq!(
+            prior.legacy_utf8_text.as_deref(),
+            Some(expected_prior.as_str())
+        );
+        let appended = project(&[&head, &crossing, "bluebird", "new"], 60);
+        let legacy = appended.legacy_utf8_text.as_ref().unwrap();
+        assert!(legacy.retains_legacy_utf8_prefix(
+            prior.source_byte_count,
+            &expected_prior,
+            &appended.text
+        ));
+        assert!(!legacy.retains_legacy_utf8_prefix(
+            prior.source_byte_count - 1,
+            &expected_prior,
+            &appended.text
+        ));
+        assert!(!legacy.retains_legacy_utf8_prefix(
+            prior.source_byte_count,
+            "goldfinchbluebird",
+            &appended.text
+        ));
+        for bytes in [120, 121, 125] {
+            let last = "t".repeat(bytes - prior.source_byte_count - 2);
+            let doc = project(&[&head, &crossing, "bluebird", &last], 60);
+            assert_eq!(doc.source_byte_count, bytes);
+            let expected = super::head_tail_text(&format!("{expected_prior}\n\n{last}"), 60).0;
+            let rendered = doc.legacy_utf8_text.as_ref().unwrap();
+            assert_eq!(**rendered, expected);
+            assert!(rendered.retains_legacy_utf8_prefix(bytes, &expected, &doc.text));
+            assert_eq!(
+                rendered.retains_legacy_utf8_prefix(
+                    prior.source_byte_count,
+                    &expected_prior,
+                    &doc.text
+                ),
+                bytes == 120
+            );
+        }
+
+        let exact = project(&["abcde🦀1234567"], 8);
+        assert_eq!(exact.legacy_utf8_text.as_deref(), Some("abcde1234567"));
+        let ascii = project(&["abcdeABCD1234567"], 8);
+        assert!(ascii.legacy_utf8_text.is_none());
     }
 
     #[test]

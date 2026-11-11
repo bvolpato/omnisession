@@ -389,6 +389,7 @@ fn trajectory_document<'a>(
     omnis_store::TrajectoryDocument {
         desktop_step_proof: None,
         desktop_projection: document.desktop_projection.as_ref(),
+        legacy_utf8_text: document.legacy_utf8_text.as_ref(),
         redacted_text: &document.text,
         source_updated_at,
         source_byte_count: document.source_byte_count,

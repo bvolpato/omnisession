@@ -366,7 +366,11 @@ impl CodexAdapter {
                 read.snapshot.captured_at,
             );
             let document = omnis_core::trajectory_search_document(&snapshot);
-            if Sha256::digest(document.text.as_bytes())[..] != *expected_hash {
+            let historical_text = document
+                .legacy_utf8_text
+                .as_deref()
+                .unwrap_or(&document.text);
+            if Sha256::digest(historical_text.as_bytes())[..] != *expected_hash {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
