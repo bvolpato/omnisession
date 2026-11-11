@@ -737,6 +737,48 @@ fn a_retained_root_directory_only_supplies_its_position_to_children_written_afte
 }
 
 #[test]
+fn a_request_returning_to_an_omitted_directory_keeps_the_whole_retained_list() {
+    for kept_directory in [true, false] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Original task")),
+            directory_attachment(30, 1),
+            message(2, 1, "assistant", json!("Retained reply")),
+        ];
+        rows.extend(compaction(
+            3,
+            2,
+            if kept_directory { &[1, 30, 2] } else { &[1, 2] },
+        ));
+        rows.push(message(11, 30, "user", json!("New request")));
+        let expected: &[&str] = if kept_directory {
+            &["Summary 3", "Original task", "New request"]
+        } else {
+            &[
+                "Summary 3",
+                "Original task",
+                "Retained reply",
+                "New request",
+            ]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                expected,
+                "kept={kept_directory}, preview={preview}"
+            );
+            assert!(!active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert_eq!(text.contains("Retained reply"), !kept_directory);
+            }
+        }
+    }
+}
+
+#[test]
 fn descendants_of_an_omitted_directory_keep_its_cutoff_when_the_request_was_retained() {
     let mut base = vec![
         message(1, 0, "user", json!("Original task")),
@@ -746,9 +788,20 @@ fn descendants_of_an_omitted_directory_keep_its_cutoff_when_the_request_was_reta
     ];
     base.extend(compaction(3, 2, &[1, 30, 2]));
     let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
-    for (delay, links) in [(13, 1), (13, 2), (1, 1), (1, 2)] {
+    for (delay, links, progress_rows) in [
+        (13, 1, 0),
+        (13, 2, 0),
+        (1, 1, 0),
+        (1, 2, 0),
+        (13, 1, 1),
+        (13, 1, 2),
+    ] {
         let mut rows = base.clone();
         let mut parent = 31;
+        if progress_rows > 0 {
+            rows.push(opaque(50, parent, "progress"));
+            parent = 50;
+        }
         for id in 32..32 + links {
             rows.push(directory_attachment(id, parent));
             parent = id;
@@ -759,13 +812,17 @@ fn descendants_of_an_omitted_directory_keep_its_cutoff_when_the_request_was_reta
             row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
             row["isSidechain"] = json!(false);
         }
+        if progress_rows == 2 {
+            let index = base.len();
+            rows.insert(index + 1, rows[index].clone());
+        }
         let expected: &[&str] = if delay == 1 {
             &["Summary 3", "New request"]
         } else {
             &["New request"]
         };
         for preview in [false, true] {
-            let case = (delay, links, preview);
+            let case = (delay, links, progress_rows, preview);
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
             assert_eq!(handoff_messages(&active), expected, "{case:?}");

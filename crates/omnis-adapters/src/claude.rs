@@ -393,7 +393,7 @@ impl RecordDigest {
 
 impl RecordCopies {
     fn compares_link(role: Option<&str>, record: &Value) -> bool {
-        role == Some("attachment") || is_turn_duration(record)
+        matches!(role, Some("attachment" | "progress")) || is_turn_duration(record)
     }
 
     fn signature(

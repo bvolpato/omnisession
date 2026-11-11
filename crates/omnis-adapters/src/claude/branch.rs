@@ -1523,12 +1523,29 @@ impl Branch {
             // An explicit entry establishes its own position even when its old parent is missing.
             occurrence.uuid
         } else {
-            let query = compactions
-                .marker_paths
-                .query(records.get(&id)?.order)
-                .ok()?;
-            let ancestor = compactions.nearest_marker(summary, &query).ok()??;
             let checkpoint = &compactions.by_summary[&summary];
+            let marker = if matches!(checkpoint.markers, super::markers::Markers::None) {
+                None
+            } else {
+                let query = compactions
+                    .marker_paths
+                    .query(records.get(&id)?.order)
+                    .ok()?;
+                compactions.nearest_marker(summary, &query).ok()?
+            };
+            let source = parent
+                .source
+                .filter(|_| id == occurrence.uuid)
+                .and_then(|node| {
+                    self.nodes[node].uuid.filter(|uuid| {
+                        !duplicates.contains(uuid)
+                            && records
+                                .get(uuid)
+                                .is_some_and(|r| r.branch.source == Some(node))
+                            && compactions.contains(summary, *uuid, records)
+                    })
+                });
+            let ancestor = marker.or(source)?;
             if occurrence.header_count <= checkpoint.header {
                 // The provider removed this child. Returning to it continues after the retained list.
                 checkpoint.retained_tail?
