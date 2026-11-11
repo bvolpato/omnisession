@@ -14,10 +14,11 @@ use std::sync::{
 };
 
 use omnis_adapters::{IndexRead, ProviderAdapter};
+use omnis_store::SessionTrajectoryOrigin;
 
 use crate::{
     read_native_search_snapshot,
-    search_index::{self, IndexCandidate, IndexProgress},
+    search_index::{self, IndexCandidate, IndexProgress, SearchSource},
 };
 
 pub(super) struct DiscoveryUpdate {
@@ -421,12 +422,12 @@ fn read_picker_preview(
     registry: &AdapterRegistry,
     store: Option<&Store>,
     key: &PreviewKey,
-) -> anyhow::Result<(IndexRead, Option<DateTime<Utc>>)> {
+) -> anyhow::Result<(IndexRead, Option<SearchSource>)> {
     let session = &key.session;
     if session.provider == Provider::Imported {
         let read = search_index::read_imported(store, session)?;
-        let captured = read.snapshot.captured_at;
-        return Ok((read, Some(captured)));
+        let source = SearchSource::imported(read.snapshot.captured_at);
+        return Ok((read, Some(source)));
     }
     let full_read = key.continuation_after.is_some();
     if !full_read && session.provider == Provider::Codex {
@@ -436,17 +437,22 @@ fn read_picker_preview(
             .ok_or_else(|| anyhow::anyhow!("Codex rollout was not found"))?;
         let read =
             registry.index_session(session, Some(&path), search_index::FULL_READ_SOURCE_BYTES)?;
-        let source_time = read.snapshot.captured_at;
-        return Ok((read, Some(source_time)));
+        let source = SearchSource {
+            updated_at: read.snapshot.captured_at,
+            origin: SessionTrajectoryOrigin::Native,
+        };
+        return Ok((read, Some(source)));
     }
-    let (snapshot, source_time) = read_native_search_snapshot(registry, session, full_read)?;
+    let (snapshot, source) = read_native_search_snapshot(registry, session, full_read)?;
     Ok((
         IndexRead {
             snapshot,
-            source_complete: full_read,
+            source_complete: full_read
+                || source
+                    .is_some_and(|source| source.origin == SessionTrajectoryOrigin::NativeSummary),
             provider_limited: false,
         },
-        source_time,
+        source,
     ))
 }
 
@@ -496,19 +502,19 @@ pub(super) fn spawn_preview_updates(
                     PreviewValue::Unavailable
                 } else {
                     let read = read_picker_preview(&registry, store.as_ref(), &key);
-                    read.map_or(PreviewValue::Unavailable, |(read, source_time)| {
+                    read.map_or(PreviewValue::Unavailable, |(read, source)| {
                         let IndexRead {
                             snapshot,
                             source_complete: complete,
                             ..
                         } = read;
-                        if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
+                        if let (Some((store, guard)), Some(source)) = (writer, source) {
                             match crate::store_search_document(
                                 store,
                                 &key.session,
                                 &snapshot,
                                 complete,
-                                source_time,
+                                source,
                                 guard,
                                 None,
                             )
@@ -613,6 +619,13 @@ pub(super) fn receive_updates(
                 value,
                 indexed_title,
             } => {
+                if key.session.provider == Provider::Antigravity
+                    && let Some(i) = state.entry_positions.get(&key.session.to_string())
+                    && state.preview_key(&state.entries[*i].session).native_summary
+                        != key.native_summary
+                {
+                    continue;
+                }
                 state.remember_preview_title(&key, &value, indexed_title);
                 state.previews.insert(key, value, &state.preview_window);
                 state.trajectory_index_changed();

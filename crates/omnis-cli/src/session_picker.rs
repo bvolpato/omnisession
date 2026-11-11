@@ -442,6 +442,22 @@ impl PickerState {
     fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
+        if provider == Provider::Antigravity {
+            for new in &entries {
+                if let Some(i) = self.entry_positions.get(&new.key)
+                    && IndexCandidate::summary_path(
+                        provider,
+                        self.entries[*i].session.source_path.as_deref(),
+                    ) != IndexCandidate::summary_path(
+                        provider,
+                        new.session.source_path.as_deref(),
+                    )
+                {
+                    self.previews.remove_session(&new.session.session);
+                    self.preview_titles.remove(&new.key);
+                }
+            }
+        }
         self.entries
             .retain(|entry| entry.session.session.provider != provider);
         self.entries.extend(entries);
@@ -851,9 +867,16 @@ impl PickerState {
     }
 
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
+        let native_summary =
+            IndexCandidate::summary_path(session.session.provider, session.source_path.as_deref());
         PreviewKey {
             session: session.session.clone(),
-            updated_at: session.updated_at,
+            updated_at: if native_summary && session.updated_at_approximate {
+                None
+            } else {
+                session.updated_at
+            },
+            native_summary,
             continuation_after: self.lineage.continuation_after(&session.session),
         }
     }
@@ -931,6 +954,7 @@ impl PickerState {
 struct PreviewKey {
     session: SessionRef,
     updated_at: Option<DateTime<Utc>>,
+    native_summary: bool,
     continuation_after: Option<DateTime<Utc>>,
 }
 
@@ -3402,6 +3426,7 @@ mod tests {
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
             updated_at: state.entries[0].session.updated_at,
+            native_summary: false,
             continuation_after: None,
         };
         state.previews.insert(
@@ -3456,6 +3481,7 @@ mod tests {
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
             updated_at: state.entries[0].session.updated_at,
+            native_summary: false,
             continuation_after: None,
         };
         let value = PreviewValue::Ready {
@@ -4021,6 +4047,7 @@ mod tests {
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
             updated_at: state.entries[0].session.updated_at,
+            native_summary: false,
             continuation_after: None,
         };
         state.previews.insert(
@@ -4231,11 +4258,33 @@ mod tests {
     }
 
     #[test]
+    fn changing_antigravity_history_at_the_same_time_requests_a_fresh_preview() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Antigravity, "session", project, None);
+        native.source_path = Some(project.join("transcript.jsonl"));
+        let mut state = PickerState::new(vec![native.clone()], project, None, false);
+        for next_source in ["conversation_summaries.db", "transcript.jsonl"] {
+            state.refresh_preview_window(1);
+            let key = state.preview_key(&native);
+            state.previews.insert(key, PreviewValue::Unavailable, &[]);
+            native.source_path = Some(project.join(next_source));
+            state.replace_provider(Provider::Antigravity, vec![native.clone()], project, false);
+            state.refresh_preview_window(1);
+            state.preview_deadline = Some(Instant::now());
+            assert_eq!(
+                state.due_preview_request(),
+                Some(vec![state.preview_key(&native)])
+            );
+        }
+    }
+
+    #[test]
     fn preview_cache_keeps_every_active_viewport_entry() {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
                 updated_at: None,
+                native_summary: false,
                 continuation_after: None,
             })
             .collect::<Vec<_>>();
@@ -4248,6 +4297,7 @@ mod tests {
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
                 updated_at: None,
+                native_summary: false,
                 continuation_after: None,
             },
             PreviewValue::Unavailable,

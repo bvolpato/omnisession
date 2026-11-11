@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,7 +19,7 @@ use crate::{
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
         estimated_event_bytes, json_lines_preview, parse_timestamp, paths_match,
-        provider_executable, provider_file, provider_root, sort_sessions, sqlite_snapshot,
+        provider_executable, provider_file, provider_root, sidecar, sort_sessions, sqlite_snapshot,
         store_is_missing, validate_provider, visit_json_lines,
     },
 };
@@ -64,28 +65,32 @@ impl AntigravityAdapter {
         })
     }
 
-    fn transcript(&self, id: &str) -> Option<PathBuf> {
-        let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        let logs = root
-            .join("brain")
-            .join(id)
-            .join(".system_generated")
-            .join("logs");
-        ["transcript_full.jsonl", "transcript.jsonl"]
-            .into_iter()
-            .find_map(|name| provider_file(root, &logs.join(name)))
+    /// Returns whether a discovered Antigravity path names the shared summary catalog.
+    #[must_use]
+    pub fn is_summary_catalog(path: &Path) -> bool {
+        path.file_name()
+            .is_some_and(|name| name == SUMMARY_DATABASE)
     }
 
-    fn conversation_database(&self, id: &str) -> Option<PathBuf> {
-        let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        provider_file(root, &root.join("conversations").join(format!("{id}.db")))
-    }
-
-    fn history_source(&self, id: &str) -> Option<PathBuf> {
-        self.transcript(id)
-            .or_else(|| self.conversation_database(id))
+    fn source(&self, summary: &Summary) -> Result<PathBuf> {
+        let root = self.root()?;
+        let paths = history_paths(root, &summary.id);
+        if let Some(path) = paths.iter().find_map(|path| provider_file(root, path)) {
+            return Ok(path);
+        }
+        ensure!(
+            summary.step_count == Some(0),
+            "Antigravity session `{}` has no readable transcript or verified zero-step count",
+            summary.id
+        );
+        let canonical_root = fs::canonicalize(root)?;
+        for path in paths {
+            verify_missing_history(&path, &canonical_root)?;
+        }
+        let catalog = provider_file(root, &root.join(SUMMARY_DATABASE))
+            .context("Antigravity summary database is unavailable")?;
+        verify_snapshot_sidecars(&catalog, &canonical_root)?;
+        Ok(catalog)
     }
 
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
@@ -94,7 +99,9 @@ impl AntigravityAdapter {
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
-        if let Some(path) = self.transcript(&session.id) {
+        let path = self.source(&summary)?;
+        let transcript = path.extension().is_some_and(|ext| ext == "jsonl");
+        if transcript {
             if preview {
                 for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
                     push_transcript_record(&mut builder, &record);
@@ -107,22 +114,38 @@ impl AntigravityAdapter {
                     })?;
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
-        } else if let Some(path) = self.conversation_database(&session.id) {
+        } else if !Self::is_summary_catalog(&path) {
             push_database_steps(self.root()?, &path, &mut builder)?;
-        } else if summary.step_count > 0 {
-            return Err(anyhow!(
-                "Antigravity session `{}` declares history but has no readable transcript",
-                session.id
-            ));
         }
 
-        Ok(builder.snapshot(
+        let snapshot = builder.snapshot(
             session.clone(),
             nonempty(summary.title),
             summary.project_path,
             None,
             captured_at,
-        ))
+        );
+        if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
+            ensure!(
+                summary.step_count == Some(0) && (!transcript || fs::metadata(&path)?.len() == 0),
+                "Antigravity session `{}` has no readable steps in its history",
+                session.id
+            );
+            let root = self.root()?;
+            let canonical_root = fs::canonicalize(root)?;
+            verify_snapshot_sidecars(&root.join(SUMMARY_DATABASE), &canonical_root)?;
+            if !transcript {
+                verify_snapshot_sidecars(&path, &canonical_root)?;
+            }
+            for other in history_paths(root, &session.id) {
+                if provider_file(root, &other).as_ref() != Some(&path) {
+                    verify_missing_history(&other, &canonical_root).context(
+                        "cannot confirm empty Antigravity history with another possible source",
+                    )?;
+                }
+            }
+        }
+        Ok(snapshot)
     }
 }
 
@@ -179,10 +202,13 @@ impl ProviderAdapter for AntigravityAdapter {
             {
                 continue;
             }
-            let source_path = self.history_source(&summary.id);
-            let updated_at = summary
-                .updated_at
-                .or_else(|| source_path.as_deref().and_then(history_file_time));
+            let source_path = self.source(&summary).ok();
+            let updated_at = summary.updated_at.or_else(|| {
+                source_path
+                    .as_deref()
+                    .filter(|p| !Self::is_summary_catalog(p))
+                    .and_then(history_file_time)
+            });
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Antigravity, summary.id.clone()),
                 title: nonempty(summary.title),
@@ -191,7 +217,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 created_at: None,
                 updated_at,
                 updated_at_approximate: summary.updated_at.is_none() && updated_at.is_some(),
-                event_count: summary.step_count,
+                event_count: summary.step_count.unwrap_or(0),
                 source_path,
             });
         }
@@ -209,13 +235,46 @@ impl ProviderAdapter for AntigravityAdapter {
         source_path: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         validate_provider(session, Provider::Antigravity)?;
-        validate_id(&session.id)?;
-        let root = self.root()?;
-        selected_search_files(
-            self.history_source(&session.id),
-            provider_file(root, &root.join(SUMMARY_DATABASE)),
-            source_path,
-        )
+        let summary = self.summary(&session.id)?;
+        let source = self.source(&summary)?;
+        let catalog = if Self::is_summary_catalog(&source) {
+            None
+        } else {
+            let root = self.root()?;
+            Some(
+                provider_file(root, &root.join(SUMMARY_DATABASE))
+                    .context("Antigravity summary database is unavailable")?,
+            )
+        };
+        let mut files = selected_search_files(Some(source.clone()), catalog, source_path)?;
+        if summary.step_count == Some(0) && !Self::is_summary_catalog(&source) {
+            let root = self.root()?;
+            for other in history_paths(root, &session.id) {
+                if let Some(other) = provider_file(root, &other)
+                    && other != source
+                {
+                    files.extend(selected_search_files(Some(other), None, None)?);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn search_source_is_summary(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<bool> {
+        validate_provider(session, Provider::Antigravity)?;
+        if source_path.is_some_and(|path| !Self::is_summary_catalog(path)) {
+            return Ok(false);
+        }
+        let source = self.source(&self.summary(&session.id)?)?;
+        ensure!(
+            source_path.is_none_or(|listed| listed == source),
+            "Antigravity history source changed during search read"
+        );
+        Ok(Self::is_summary_catalog(&source))
     }
 
     fn search_source_time(
@@ -232,15 +291,17 @@ impl ProviderAdapter for AntigravityAdapter {
             );
             return Ok(updated);
         }
-        let current_source = self.history_source(&summary.id);
+        let current_source = self.source(&summary)?;
         ensure!(
-            source_path.is_none() || source_path == current_source.as_deref(),
+            source_path.is_none_or(|listed| listed == current_source),
             "Antigravity history source changed during search read"
         );
-        Ok(current_source
-            .as_deref()
-            .and_then(history_file_time)
-            .unwrap_or(DateTime::UNIX_EPOCH))
+        Ok(if Self::is_summary_catalog(&current_source) {
+            DateTime::UNIX_EPOCH
+        } else {
+            history_file_time(&current_source)
+                .context("Antigravity history file time is unavailable")?
+        })
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -287,9 +348,98 @@ impl ProviderAdapter for AntigravityAdapter {
 struct Summary {
     id: String,
     title: String,
-    step_count: usize,
+    step_count: Option<usize>,
     updated_at: Option<DateTime<Utc>>,
     project_path: Option<PathBuf>,
+}
+
+fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
+    let logs = root.join("brain").join(id).join(".system_generated/logs");
+    [
+        logs.join("transcript_full.jsonl"),
+        logs.join("transcript.jsonl"),
+        root.join("conversations").join(format!("{id}.db")),
+    ]
+}
+
+fn verify_missing_history(path: &Path, root: &Path) -> Result<()> {
+    verify_missing(path, root)?;
+    if path.extension().is_some_and(|ext| ext == "db") {
+        for suffix in ["-wal", "-journal"] {
+            verify_missing(&sidecar(path, suffix), root)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_snapshot_sidecars(database: &Path, root: &Path) -> Result<()> {
+    let wal = sidecar(database, "-wal");
+    if let Some(wal) = provider_file(root, &wal) {
+        let mut file = fs::File::open(wal)?;
+        if file.metadata()?.len() != 0 {
+            let mut header = [0; 32];
+            file.read_exact(&mut header)
+                .context("Antigravity SQLite WAL header is incomplete")?;
+            ensure!(
+                valid_wal_header(&header),
+                "Antigravity SQLite WAL header is invalid"
+            );
+        }
+    } else {
+        verify_missing(&wal, root)?;
+    }
+    // The private SQLite snapshot copies the database and its WAL.
+    verify_missing(&sidecar(database, "-journal"), root)
+}
+
+// SQLite ignores a damaged WAL header and can expose an older, empty checkpoint.
+// The header checksum is defined at https://www.sqlite.org/fileformat2.html#wal_file_format.
+fn valid_wal_header(header: &[u8; 32]) -> bool {
+    let (words, _) = header.as_chunks::<4>();
+    let magic = u32::from_be_bytes(words[0]);
+    let page_size = u32::from_be_bytes(words[2]);
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+        || u32::from_be_bytes(words[1]) != 3_007_000
+        || !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return false;
+    }
+    let read = if magic == 0x377f_0682 {
+        u32::from_le_bytes
+    } else {
+        u32::from_be_bytes
+    };
+    let (mut first, mut second) = (0_u32, 0_u32);
+    for &[a, b] in words[..6].as_chunks::<2>().0 {
+        first = first.wrapping_add(read(a)).wrapping_add(second);
+        second = second.wrapping_add(read(b)).wrapping_add(first);
+    }
+    first.to_be_bytes() == words[6] && second.to_be_bytes() == words[7]
+}
+
+/// A missing file can inherit its error from a dangling or inaccessible parent directory.
+fn verify_missing(path: &Path, canonical_root: &Path) -> Result<()> {
+    let mut ancestor = path;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                ensure!(
+                    ancestor != path
+                        && ancestor.is_dir()
+                        && fs::canonicalize(ancestor)?.starts_with(canonical_root),
+                    "Antigravity history path is present or outside the provider root"
+                );
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .context("Antigravity history root is unavailable")?;
+            }
+            Err(error) => return Err(error).context("cannot verify missing Antigravity history"),
+        }
+    }
 }
 
 pub(super) fn selected_search_files(
@@ -315,9 +465,7 @@ fn wal_path(path: &Path) -> Option<PathBuf> {
         .extension()
         .is_some_and(|ext| ext == "db" || ext == "vscdb")
     {
-        let mut wal = path.as_os_str().to_owned();
-        wal.push("-wal");
-        provider_file(path.parent()?, &PathBuf::from(wal))
+        provider_file(path.parent()?, &sidecar(path, "-wal"))
     } else {
         None
     }
@@ -337,11 +485,14 @@ pub(super) fn history_file_time(path: &Path) -> Option<DateTime<Utc>> {
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
     let workspace_uris: String = row.get(4)?;
-    let step_count = row.get::<_, i64>(2)?;
+    let step_count = row
+        .get::<_, i64>(2)
+        .ok()
+        .and_then(|n| usize::try_from(n).ok());
     Ok(Summary {
         id: row.get(0)?,
         title: row.get(1)?,
-        step_count: usize::try_from(step_count.max(0)).unwrap_or(usize::MAX),
+        step_count,
         updated_at: row
             .get::<_, String>(3)
             .ok()

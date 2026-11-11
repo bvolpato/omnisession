@@ -85,6 +85,83 @@ fn transcript(root: &Path) -> Vec<u8> {
 }
 
 #[test]
+fn only_a_verified_zero_can_stand_in_for_missing_history() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let path = root
+        .path()
+        .join("conversation_summaries.db")
+        .canonicalize()
+        .unwrap();
+    let catalog = Connection::open(&path).unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    let set_count = |count| {
+        catalog
+            .execute("UPDATE conversation_summaries SET step_count = ?1", [count])
+            .unwrap();
+    };
+    for count in [1, -1] {
+        set_count(count);
+        assert!(
+            adapter.list_sessions(None).unwrap()[0]
+                .source_path
+                .is_none()
+        );
+        assert!(adapter.read_session(&session).is_err());
+    }
+    set_count(0);
+    assert_eq!(
+        adapter.list_sessions(None).unwrap()[0]
+            .source_path
+            .as_deref(),
+        Some(path.as_path())
+    );
+    let empty = adapter
+        .index_for_search(&session, Some(&path), 1)
+        .unwrap()
+        .0;
+    assert!(empty.source_complete && empty.snapshot.events.is_empty());
+    assert!(
+        adapter
+            .search_source_is_summary(&session, Some(&path))
+            .unwrap()
+    );
+
+    transcript(root.path());
+    assert!(!adapter.search_source_is_summary(&session, None).unwrap());
+    assert!(adapter.search_source_files(&session, Some(&path)).is_err());
+    assert!(!adapter.read_session(&session).unwrap().events.is_empty());
+}
+
+#[test]
+fn empty_or_malformed_preferred_logs_cannot_hide_another_history_file() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let bytes = transcript(root.path());
+    let logs = root
+        .path()
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    let preferred = logs.join("transcript_full.jsonl");
+    fs::write(logs.join("transcript.jsonl"), bytes).unwrap();
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count = 0", [])
+        .unwrap();
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    let adapter = AntigravityAdapter::with_root(root.path());
+    for unverified in ["", "broken JSON"] {
+        fs::write(&preferred, unverified).unwrap();
+        assert!(adapter.read_session(&session).is_err());
+        assert!(adapter.preview_session(&session).is_err());
+    }
+    fs::remove_file(preferred).unwrap();
+    assert!(!adapter.read_session(&session).unwrap().events.is_empty());
+}
+
+#[test]
 fn lists_and_reads_synthetic_antigravity_session_without_mutation() {
     let temporary = tempdir().expect("temporary directory");
     let project = temporary.path().join("project space");

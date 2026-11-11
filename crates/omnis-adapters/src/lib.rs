@@ -277,6 +277,19 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Returns whether this read covers an empty session recorded only in the native catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog entry or its selected source changed.
+    fn search_source_is_summary(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Reads history for indexing within a full-read byte budget.
     ///
     /// Shared-database adapters measure the selected session's content instead of the database.
@@ -292,7 +305,8 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<IndexRead> {
         let over_budget = source_path
             .and_then(|path| path.metadata().ok())
-            .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes)
+            && !self.search_source_is_summary(session, source_path)?;
         if !over_budget {
             match self.read_session_at(session, source_path) {
                 Ok(snapshot) => {

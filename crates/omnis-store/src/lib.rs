@@ -228,14 +228,15 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
-        source_updated_submillis, provider_limited
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17)
+        source_updated_submillis, provider_limited, native_summary
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?19)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
         source_updated_submillis = excluded.source_updated_submillis,
         source_complete = excluded.source_complete,
         provider_limited = excluded.provider_limited,
+        native_summary = excluded.native_summary,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
         source_byte_count = excluded.source_byte_count,
@@ -248,6 +249,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
+            WHEN ?18 AND excluded.native_summary <> session_trajectories.native_summary
+                THEN excluded.derived_title
             WHEN excluded.source_complete AND excluded.truncation_strategy IN (
                 'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
             ) AND (
@@ -257,7 +260,10 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
-      AND (
+      AND (session_trajectories.native_summary = 0 OR ?18)
+      AND CASE
+      WHEN ?18 AND excluded.native_summary <> session_trajectories.native_summary THEN 1
+      ELSE (
           (excluded.source_complete, excluded.provider_limited) >=
               (session_trajectories.source_complete, session_trajectories.provider_limited)
           OR (excluded.provider_limited AND (?15
@@ -285,7 +291,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                    AND (
                        excluded.complete > session_trajectories.complete
                        OR (
-                           (excluded.complete = session_trajectories.complete OR ?18)
+                           (excluded.complete = session_trajectories.complete OR (?18 AND excluded.source_complete))
                            AND (
                                excluded.content_hash <> session_trajectories.content_hash
                                OR excluded.source_byte_count <>
@@ -300,7 +306,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                    )
            )
        )
-    ))
+    )) END
     RETURNING id
 ";
 #[derive(Debug, Error)]
@@ -475,13 +481,15 @@ pub struct SessionTrajectorySearchPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionTrajectoryOrigin {
     Native,
+    /// A verified native catalog summary for a session with zero steps and no history file.
+    NativeSummary,
     ImportedBundle,
 }
 
 impl SessionTrajectoryOrigin {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Native => "native",
+            Self::Native | Self::NativeSummary => "native",
             Self::ImportedBundle => "imported_bundle",
         }
     }
@@ -582,7 +590,7 @@ fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Opt
             "SELECT json_array(id, indexed_at, hex(content_hash), source_updated_at,
                        source_updated_submillis, source_complete, provider_limited, complete,
                        document_version, source_byte_count, indexed_byte_count,
-                       truncation_strategy, origin, derived_title)
+                       truncation_strategy, origin, derived_title, native_summary)
              FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
         )
         .map_err(database_error)?
@@ -595,6 +603,10 @@ fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Opt
 
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These fields record independent properties of the indexed source."
+)]
 pub struct TrajectoryIndexState {
     pub source_updated_at: DateTime<Utc>,
     /// False for historical rows written before the index recorded file time below a millisecond.
@@ -602,6 +614,8 @@ pub struct TrajectoryIndexState {
     pub source_complete: bool,
     /// The adapter exhausted its full-read budget and returned its best available preview.
     pub provider_limited: bool,
+    /// The native catalog was the only source of this document.
+    pub native_summary: bool,
     pub document_version: u32,
 }
 
@@ -613,6 +627,8 @@ pub struct TrajectoryIndexFailure {
     pub source_updated_at: Option<DateTime<Utc>>,
     /// Whether the indexer retained the full precision of the source time.
     pub source_time_precise: bool,
+    /// The failed candidate identified a native catalog summary without a history file.
+    pub native_summary: bool,
     /// Search document version of the indexer whose read failed.
     pub document_version: u32,
 }
@@ -1845,18 +1861,7 @@ impl Store {
         let mut total_indexed_bytes = 0_usize;
         let mut prepared = Vec::with_capacity(documents.len());
         for (session, document, guard) in documents {
-            validate_session_ref(session)?;
-            if (document.source_complete && document.provider_limited)
-                || document.indexed_byte_count != document.redacted_text.len()
-                || !valid_truncation_strategy(document.truncation_strategy)
-                || !valid_trajectory_coverage(
-                    document.source_byte_count,
-                    document.indexed_byte_count,
-                    document.truncation_strategy,
-                )
-            {
-                return Err(StoreError::InvalidSessionReference);
-            }
+            validate_trajectory_document(session, &document, guard)?;
             total_indexed_bytes = total_indexed_bytes
                 .checked_add(document.indexed_byte_count)
                 .filter(|total| *total <= max_indexed_bytes)
@@ -1921,10 +1926,9 @@ impl Store {
                         write.guard != TrajectorySourceGuard::NewerSource,
                         source_submillis(write.session.provider, write.document.source_updated_at),
                         write.document.provider_limited,
-                        // A full native read may now need more truncation than its predecessor.
-                        write.source_complete
-                            && write.document.origin == SessionTrajectoryOrigin::Native
+                        write.document.origin != SessionTrajectoryOrigin::ImportedBundle
                             && matches!(write.guard, TrajectorySourceGuard::ObservedDocument(_)),
+                        write.document.origin == SessionTrajectoryOrigin::NativeSummary,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1937,6 +1941,7 @@ impl Store {
             } else if write.document.origin == SessionTrajectoryOrigin::ImportedBundle {
                 protect_bundle_trajectory(&transaction, write.session)?;
             }
+            clear_observed_antigravity_failure(&transaction, &write)?;
         }
         drop(upsert_parent);
         replace_trajectory_chunks(&transaction, &rewritten)?;
@@ -2027,20 +2032,28 @@ impl Store {
         let connection = self.connection.borrow();
         let row = connection
             .query_row(
-                "SELECT source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited FROM session_trajectories
+                "SELECT source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited, native_summary FROM session_trajectories
                  WHERE provider = ?1 AND session_id = ?2",
                 params![session.provider.to_string(), session.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .optional()
             .map_err(database_error)?;
         row.map(
-            |(updated_at, source_complete, document_version, remainder, provider_limited)| {
+            |(
+                updated_at,
+                source_complete,
+                document_version,
+                remainder,
+                provider_limited,
+                native_summary,
+            )| {
                 Ok(TrajectoryIndexState {
                     source_updated_at: source_time_from_db(updated_at, remainder)?,
                     source_time_precise: remainder.is_some(),
                     source_complete,
                     provider_limited,
+                    native_summary,
                     document_version,
                 })
             },
@@ -2073,7 +2086,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited
+                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_updated_submillis, provider_limited, native_summary
                  FROM session_trajectories",
             )
             .map_err(database_error)?;
@@ -2087,6 +2100,7 @@ impl Store {
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<u32>>(5)?,
                     row.get::<_, bool>(6)?,
+                    row.get::<_, bool>(7)?,
                 ))
             })
             .map_err(database_error)?;
@@ -2100,6 +2114,7 @@ impl Store {
                 document_version,
                 remainder,
                 provider_limited,
+                native_summary,
             ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
@@ -2111,6 +2126,7 @@ impl Store {
                     source_time_precise: remainder.is_some(),
                     source_complete,
                     provider_limited,
+                    native_summary,
                     document_version: u32::try_from(document_version)
                         .map_err(|_| StoreError::CorruptStore)?,
                 },
@@ -2130,7 +2146,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, document_version, source_updated_submillis
+                "SELECT provider, session_id, source_updated_at, document_version, source_updated_submillis, native_summary
                  FROM trajectory_index_failures",
             )
             .map_err(database_error)?;
@@ -2142,13 +2158,20 @@ impl Store {
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<u32>>(4)?,
+                    row.get::<_, bool>(5)?,
                 ))
             })
             .map_err(database_error)?;
         let mut failures = std::collections::HashMap::new();
         for row in rows {
-            let (provider, session_id, source_updated_at, document_version, remainder) =
-                row.map_err(|_| StoreError::CorruptStore)?;
+            let (
+                provider,
+                session_id,
+                source_updated_at,
+                document_version,
+                remainder,
+                native_summary,
+            ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
                 .map_err(|_| StoreError::CorruptStore)?;
@@ -2159,6 +2182,7 @@ impl Store {
                         .map(|time| source_time_from_db(time, remainder))
                         .transpose()?,
                     source_time_precise: remainder.is_some(),
+                    native_summary,
                     document_version: u32::try_from(document_version)
                         .map_err(|_| StoreError::CorruptStore)?,
                 },
@@ -2178,15 +2202,19 @@ impl Store {
         failure: &TrajectoryIndexFailure,
     ) -> Result<()> {
         validate_session_ref(session)?;
+        if failure.native_summary && session.provider != Provider::Antigravity {
+            return Err(StoreError::InvalidSessionReference);
+        }
         let connection = self.connection.borrow_mut();
         connection
             .execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at, source_updated_submillis
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     provider, session_id, source_updated_at, document_version, failed_at, source_updated_submillis, native_summary
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (provider, session_id) DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
                      source_updated_submillis = excluded.source_updated_submillis,
+                     native_summary = excluded.native_summary,
                      document_version = excluded.document_version,
                      failed_at = excluded.failed_at",
                 params![
@@ -2199,6 +2227,7 @@ impl Store {
                     i64::from(failure.document_version),
                     now_timestamp(),
                     failure.source_updated_at.filter(|_| failure.source_time_precise).map(|time| source_submillis(session.provider, time)),
+                    failure.native_summary,
                 ],
             )
             .map_err(database_error)?;
@@ -2538,7 +2567,7 @@ impl Store {
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
-        ensure_source_time_columns(&transaction)?;
+        ensure_trajectory_source_columns(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -2968,19 +2997,31 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
         .map_err(database_error)
 }
 
-fn ensure_source_time_columns(transaction: &Transaction<'_>) -> Result<()> {
+fn ensure_trajectory_source_columns(transaction: &Transaction<'_>) -> Result<()> {
     // Existing rows keep a NULL remainder until their file is next read.
     for table in ["session_trajectories", "trajectory_index_failures"] {
-        let present = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'source_updated_submillis')",
-            [table],
-            |row| row.get::<_, bool>(0),
-        ).map_err(database_error)?;
-        if !present {
+        let (has_remainder, has_summary) = transaction
+            .query_row(
+                "SELECT count(*) FILTER (WHERE name = 'source_updated_submillis') > 0,
+                        count(*) FILTER (WHERE name = 'native_summary') > 0
+                 FROM pragma_table_info(?1)",
+                [table],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .map_err(database_error)?;
+        if !has_remainder {
             transaction
                 .execute_batch(&format!(
                     "ALTER TABLE {table} ADD COLUMN source_updated_submillis INTEGER
                  CHECK (source_updated_submillis BETWEEN 0 AND 999999)"
+                ))
+                .map_err(database_error)?;
+        }
+        if !has_summary {
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN native_summary INTEGER NOT NULL DEFAULT 0
+                     CHECK (native_summary IN (0, 1))"
                 ))
                 .map_err(database_error)?;
         }
@@ -3210,6 +3251,36 @@ fn ensure_bundle_protection(transaction: &Transaction<'_>) -> Result<()> {
              );"
         ))
         .map_err(database_error)
+}
+
+fn clear_observed_antigravity_failure(
+    transaction: &Transaction<'_>,
+    write: &PreparedTrajectoryWrite<'_, '_>,
+) -> Result<()> {
+    if write.session.provider == Provider::Antigravity
+        && write.document.origin != SessionTrajectoryOrigin::ImportedBundle
+        && matches!(write.guard, TrajectorySourceGuard::ObservedDocument(_))
+    {
+        transaction
+            .prepare_cached(
+                "DELETE FROM trajectory_index_failures
+                 WHERE provider = 'antigravity' AND session_id = ?1 AND document_version <= ?2
+                 AND EXISTS (
+                     SELECT 1 FROM session_trajectories
+                     WHERE provider = 'antigravity' AND session_id = ?1
+                       AND document_version <= ?2 AND native_summary = ?3
+                 )",
+            )
+            .and_then(|mut statement| {
+                statement.execute(params![
+                    write.session.id,
+                    write.document.document_version,
+                    write.document.origin == SessionTrajectoryOrigin::NativeSummary,
+                ])
+            })
+            .map_err(database_error)?;
+    }
+    Ok(())
 }
 
 fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef) -> Result<()> {
@@ -3709,6 +3780,33 @@ fn valid_truncation_strategy(strategy: &str) -> bool {
             | "legacy_bounded"
             | "legacy_unknown"
     )
+}
+
+fn validate_trajectory_document(
+    session: &SessionRef,
+    document: &TrajectoryDocument<'_>,
+    guard: TrajectorySourceGuard,
+) -> Result<()> {
+    validate_session_ref(session)?;
+    if (document.origin == SessionTrajectoryOrigin::NativeSummary
+        && (session.provider != Provider::Antigravity
+            || !matches!(guard, TrajectorySourceGuard::ObservedDocument(_))
+            || !document.source_complete
+            || !document.redacted_text.is_empty()
+            || document.source_byte_count != 0
+            || document.truncation_strategy != "none"))
+        || (document.source_complete && document.provider_limited)
+        || document.indexed_byte_count != document.redacted_text.len()
+        || !valid_truncation_strategy(document.truncation_strategy)
+        || !valid_trajectory_coverage(
+            document.source_byte_count,
+            document.indexed_byte_count,
+            document.truncation_strategy,
+        )
+    {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    Ok(())
 }
 
 fn valid_trajectory_coverage(
@@ -4695,6 +4793,204 @@ mod tests {
         assert_eq!(state.document_version, 6);
         assert!(state.provider_limited);
         assert!(!state.source_complete);
+    }
+
+    #[test]
+    fn a_native_catalog_summary_preserves_its_source_kind_across_same_time_reads() {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Antigravity, "summary");
+        let native = TrajectoryDocument {
+            redacted_text: "",
+            source_updated_at: Utc::now(),
+            source_byte_count: 0,
+            indexed_byte_count: 0,
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 6,
+            derived_title: None,
+        };
+        let summary = TrajectoryDocument {
+            origin: SessionTrajectoryOrigin::NativeSummary,
+            ..native
+        };
+        let write = |doc, guard| {
+            store.upsert_observed_trajectory_documents_counted(&[(&session, doc, guard)])
+        };
+        let observe = || store.observe_trajectory_document(&session).unwrap();
+        // Make the receipt comparison independent of the time taken by the test.
+        let fix_indexed_at = || {
+            store
+                .connection
+                .borrow()
+                .execute("UPDATE session_trajectories SET indexed_at = 1", [])
+                .unwrap()
+        };
+        assert_eq!(write(native, observe()).unwrap(), 1);
+        fix_indexed_at();
+        let before = observe();
+        assert!(matches!(
+            store.upsert_trajectory_document(&session, &summary),
+            Err(StoreError::InvalidSessionReference)
+        ));
+        assert_eq!(write(summary, before).unwrap(), 1);
+        fix_indexed_at();
+        let after = observe();
+        assert_ne!(before, after);
+        assert!(matches!(
+            write(native, before),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(write(summary, after).unwrap(), 0);
+        let later = TrajectoryDocument {
+            source_updated_at: native.source_updated_at + chrono::Duration::seconds(1),
+            ..native
+        };
+        assert_eq!(
+            write(later, super::TrajectorySourceGuard::NewerSource).unwrap(),
+            0
+        );
+        assert_eq!(observe(), after);
+        assert!(store.trajectory_index_states().unwrap()[&session].native_summary);
+        let (origin, hash): (String, Vec<u8>) = store
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT origin, content_hash FROM session_trajectories",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(origin, "native");
+        assert_eq!(hash, Sha256::digest(b"").to_vec());
+
+        let preview = TrajectoryDocument {
+            redacted_text: "history",
+            source_byte_count: 7,
+            indexed_byte_count: 7,
+            source_complete: false,
+            ..native
+        };
+        assert_eq!(write(preview, after).unwrap(), 1);
+        let state = store.trajectory_index_state(&session).unwrap().unwrap();
+        assert!(!state.native_summary);
+        let history = || store.search_session_trajectories("history", 1).unwrap();
+        assert_eq!(history(), std::slice::from_ref(&session));
+        assert_eq!(write(summary, observe()).unwrap(), 1);
+        assert!(history().is_empty());
+        assert!(matches!(
+            write(
+                TrajectoryDocument {
+                    origin: SessionTrajectoryOrigin::NativeSummary,
+                    ..preview
+                },
+                observe()
+            ),
+            Err(StoreError::InvalidSessionReference)
+        ));
+    }
+
+    #[test]
+    fn an_observed_antigravity_read_retires_only_eligible_index_failures() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Antigravity, "summary");
+        let summary = TrajectoryDocument {
+            redacted_text: "",
+            source_updated_at: Utc::now(),
+            source_byte_count: 0,
+            indexed_byte_count: 0,
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::NativeSummary,
+            document_version: 6,
+            derived_title: None,
+        };
+        let observe = || store.observe_trajectory_document(&session).unwrap();
+        let write = |guard| {
+            store.upsert_observed_trajectory_documents_counted(&[(&session, summary, guard)])
+        };
+        let before = observe();
+        assert_eq!(write(before).unwrap(), 1);
+        let current = observe();
+        for (native_summary, document_version) in [(false, 6), (true, 5), (false, 7)] {
+            let failure = super::TrajectoryIndexFailure {
+                source_updated_at: Some(summary.source_updated_at),
+                source_time_precise: true,
+                native_summary,
+                document_version,
+            };
+            store
+                .record_trajectory_index_failure(&session, &failure)
+                .unwrap();
+            assert!(matches!(
+                write(before),
+                Err(StoreError::TrajectorySourceChanged)
+            ));
+            assert_eq!(
+                store.trajectory_index_failures().unwrap()[&session],
+                failure
+            );
+            assert_eq!(write(current).unwrap(), 0);
+            assert_eq!(
+                store.trajectory_index_failures().unwrap().get(&session),
+                (document_version > summary.document_version).then_some(&failure)
+            );
+            assert_eq!(observe(), current);
+        }
+    }
+
+    #[test]
+    fn native_summary_provenance_defaults_to_false_for_legacy_documents_and_failures() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let session = SessionRef::new(Provider::Antigravity, "summary");
+        let time = Utc::now();
+        let failure = super::TrajectoryIndexFailure {
+            source_updated_at: Some(time),
+            source_time_precise: true,
+            native_summary: false,
+            document_version: 6,
+        };
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_session_trajectory(&session, "original", time, true)
+            .unwrap();
+        store
+            .record_trajectory_index_failure(&session, &failure)
+            .unwrap();
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "
+            ALTER TABLE session_trajectories DROP COLUMN native_summary;
+            ALTER TABLE trajectory_index_failures DROP COLUMN native_summary;
+        ",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(path).unwrap();
+        let state = store.trajectory_index_state(&session).unwrap().unwrap();
+        let recorded = || store.trajectory_index_failures().unwrap()[&session];
+        assert!(!state.native_summary);
+        assert_eq!(recorded(), failure);
+        for native_summary in [true, false] {
+            let changed = super::TrajectoryIndexFailure {
+                native_summary,
+                ..failure
+            };
+            store
+                .record_trajectory_index_failure(&session, &changed)
+                .unwrap();
+            assert_eq!(recorded(), changed);
+        }
     }
 
     #[test]
