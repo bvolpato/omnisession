@@ -1154,19 +1154,18 @@ fn codex_run(fixture: &Fixture, args: &[&str]) -> Output {
 fn codex_fork_links_the_child_in_the_profile_working_directory() {
     const CHILD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    for (args, moved) in [("[]", false), ("['--cd', '../fork-directory']", true)] {
+    for (args, destination, moved) in [
+        ("[]", "workspace", false),
+        ("['-C', 'nested']", "workspace/nested", false),
+        ("['--cd', '../fork-directory']", "fork-directory", true),
+    ] {
         let profile = format!("[profiles.local]\nagent = 'codex'\nargs = {args}\n");
         let fixture = fixture_with_codex_session(&profile, "openai");
-        let directory = fixture.root.join("fork-directory");
-        fs::create_dir(&directory).unwrap();
-        let child_directory = if moved {
-            &directory
-        } else {
-            &fixture.workspace
-        };
+        let directory = fixture.root.join(destination);
+        fs::create_dir_all(&directory).unwrap();
         let created = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
         for (id, cwd, parent) in [
-            (CHILD, child_directory, Some(CODEX_SESSION_ID)),
+            (CHILD, &directory, Some(CODEX_SESSION_ID)),
             (OTHER, &fixture.workspace, None),
         ] {
             let header = json!({"timestamp":created, "type":"session_meta", "payload":{
@@ -1188,15 +1187,36 @@ case " $* " in
 esac
 "#,
         );
-        let output = codex_run(
-            &fixture,
-            &[
-                "fork",
-                &format!("codex:{CODEX_SESSION_ID}"),
-                "--in",
-                "local",
-            ],
-        );
+        let source = format!("codex:{CODEX_SESSION_ID}");
+        for id in [&source, &Fixture::source()] {
+            let inspected = codex_plan(&fixture, &["inspect", id, "--target", "local"]);
+            assert_eq!(inspected["repository_matches"], !moved);
+            let mut dry_run = vec!["fork", id.as_str(), "--in", "local", "--dry-run"];
+            if moved {
+                let rejected = codex_run(&fixture, &dry_run);
+                assert!(!rejected.status.success());
+                assert!(
+                    String::from_utf8_lossy(&rejected.stderr)
+                        .contains("--allow-workspace-mismatch")
+                );
+                dry_run.push("--allow-workspace-mismatch");
+            }
+            let planned = codex_plan(&fixture, &dry_run);
+            assert_eq!(planned["fidelity"]["repository_matches"], !moved);
+        }
+        let mut args = vec!["fork", &source, "--in", "local"];
+        if moved {
+            let rejected = codex_run(&fixture, &args);
+            assert!(!rejected.status.success());
+            assert!(
+                fixture
+                    .capture
+                    .join(format!("rollout-{CHILD}.jsonl"))
+                    .is_file()
+            );
+            args.push("--allow-workspace-mismatch");
+        }
+        let output = codex_run(&fixture, &args);
         assert!(
             output.status.success(),
             "{}",
@@ -1300,7 +1320,7 @@ fn remote_codex_profiles_cannot_plan_a_native_resume_or_fork_of_a_local_thread()
         "native_resume"
     );
     let args = ["fork", &source, "--in", "routed", "--dry-run"];
-    set_args("['--', '--remote', 'ws://127.0.0.1:9']");
+    fixture.write_profiles("[profiles.routed]\nagent='codex'\nprogram='codex'\nargs=['--', '--remote', 'ws://127.0.0.1:9']\n");
     let invalid = codex_run(&fixture, &args);
     assert!(!invalid.status.success());
     let error = String::from_utf8_lossy(&invalid.stderr);
@@ -1470,6 +1490,48 @@ fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config()
             );
         } else {
             check_declined(&fork);
+        }
+    }
+}
+
+#[test]
+fn codex_workspace_flags_follow_the_selected_executable() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let native = fixture.root.join("bin/codex");
+    let alias = fixture.root.join("bin/alias");
+    std::os::unix::fs::symlink(&native, &alias).unwrap();
+    let foreign = fixture.root.join("foreign");
+    fs::create_dir(&foreign).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+
+    for (program, is_native) in [
+        (std::path::Path::new("codex"), true),
+        (native.as_path(), true),
+        (alias.as_path(), true),
+        (fixture.root.join("bin/wrapper").as_path(), false),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.selected]\nagent = 'codex'\nprogram = {}\nargs = ['--cd', {}]\n",
+            json!(program),
+            json!(foreign)
+        ));
+        let args = ["fork", &source, "--in", "selected", "--dry-run"];
+        let report = codex_plan(&fixture, &["inspect", &source, "--target", "selected"]);
+        assert_eq!(
+            report["repository_matches"],
+            !is_native,
+            "{}",
+            program.display()
+        );
+        let fork = codex_run(&fixture, &args);
+        assert_eq!(fork.status.success(), !is_native, "{}", program.display());
+        if is_native {
+            assert!(String::from_utf8_lossy(&fork.stderr).contains("--allow-workspace-mismatch"));
+            let allowed = codex_plan(
+                &fixture,
+                &[args.as_slice(), &["--allow-workspace-mismatch"]].concat(),
+            );
+            assert_eq!(allowed["fidelity"]["repository_matches"], false);
         }
     }
 }

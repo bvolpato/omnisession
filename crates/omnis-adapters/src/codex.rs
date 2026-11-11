@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    CodexWorkspaceProjection, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
+    CodexWorkspaceProjection, EnvChange, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
     NativeSession, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
         EventBuilder, JsonLineSkips, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
@@ -204,6 +204,7 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    relative_home: bool,
     current: Arc<CurrentRollouts>,
     use_workspace_index: bool,
     /// Rollout header cache file. Explicit roots leave it unset.
@@ -214,6 +215,50 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller's directory or an existing relative path cannot be resolved.
+    pub fn absolute_home(home: &Path) -> Result<PathBuf> {
+        if home.is_absolute() {
+            return Ok(home.to_owned());
+        }
+        match omnis_core::canonicalize_path(home) {
+            Err(error) if error.kind() == ErrorKind::NotFound => std::path::absolute(home),
+            result => result,
+        }
+        .context("resolving the selected Codex home")
+    }
+
+    fn selected_home(home: PathBuf) -> (Option<PathBuf>, bool) {
+        let relative = home.is_relative();
+        (Some(Self::absolute_home(&home).unwrap_or(home)), relative)
+    }
+
+    fn native_launch(&self, target: &LaunchTarget, args: Vec<String>) -> Result<LaunchPlan> {
+        let mut env = Vec::new();
+        if let Some(home) = self.codex_home.as_deref().filter(|_| self.relative_home) {
+            anyhow::ensure!(
+                home.is_absolute(),
+                "could not resolve the selected Codex home"
+            );
+            let value = home
+                .to_str()
+                .context("Codex requires a Unicode path in CODEX_HOME")?;
+            env.push(EnvChange::Set {
+                name: "CODEX_HOME".to_owned(),
+                value: value.to_owned(),
+            });
+        }
+        Ok(LaunchPlan {
+            program: "codex".to_owned(),
+            args,
+            cwd: target.cwd.clone(),
+            env,
+        })
+    }
+
     /// Returns the directory Codex uses when `CODEX_HOME` is unset. It can be absent before the first launch.
     #[must_use]
     pub fn default_home() -> Option<PathBuf> {
@@ -385,8 +430,10 @@ impl CodexAdapter {
 
     #[must_use]
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
+        let (codex_home, relative_home) = Self::selected_home(codex_home.into());
         Self {
-            codex_home: Some(codex_home.into()),
+            codex_home,
+            relative_home,
             current: Arc::default(),
             use_workspace_index: false,
             rollout_cache: None,
@@ -599,7 +646,7 @@ impl CodexAdapter {
             {
                 invalid.without_metadata -= 1;
             }
-            if row.is_some_and(current_rollout::CurrentRollout::required) {
+            if row.is_some_and(|row| row.requires_selection(home)) {
                 requires_scan |= selected.shadowed;
                 if !selected.shadowed
                     && let Some(revision) = session.observed_revision
@@ -719,7 +766,7 @@ impl CodexAdapter {
         let mut invalid = InvalidHeaders::default();
         let (mut scan, cached) = self.scan_for_lookup(id, source_path, home, &canonical_home);
         if let Some(row) = row {
-            if cached && row.required() {
+            if cached && row.requires_selection(home) {
                 // A restored copy can appear outside the recorded directory between lookups.
                 scan = self.session_scan(Some(&scan)).0;
             }
@@ -906,14 +953,15 @@ impl NativeSession {
 
 impl Default for CodexAdapter {
     fn default() -> Self {
-        let codex_home = std::env::var_os("CODEX_HOME")
+        let (codex_home, relative_home) = std::env::var_os("CODEX_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .or_else(Self::default_home);
+            .map_or_else(|| (Self::default_home(), false), Self::selected_home);
         Self {
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             current: Arc::new(CurrentRollouts::from_env()),
             codex_home,
+            relative_home,
             use_workspace_index: true,
             session_scan: Arc::default(),
             listing: Arc::default(),
@@ -2571,13 +2619,13 @@ impl ProviderAdapter for CodexAdapter {
         let (scan, _) = self.session_scan(None);
         for (id, revision) in prior {
             match rows.get(id) {
-                Some(row) if row.required() => {
+                Some(row) if row.requires_selection(home) => {
                     match row.resolve(home, id, scan.paths(id), scan.notes.is_empty()) {
                         Err(error) if error.is::<CurrentRolloutUnavailable>() => {
                             unavailable.insert(id.clone());
                         }
                         Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
-                            if row.has_legacy_name() {
+                            if row.has_legacy_name() || row.outside_home(home) {
                                 unavailable.insert(id.clone());
                             } else if let Some(selected) = row.generation(id)
                                 && let Some(file) = revision.and_then(|revision| revision.file)
@@ -2718,12 +2766,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
-        Ok(LaunchPlan {
-            program: "codex".to_owned(),
-            args: target.prompt.iter().cloned().collect(),
-            cwd: target.cwd.clone(),
-            env: Vec::new(),
-        })
+        self.native_launch(target, target.prompt.iter().cloned().collect())
     }
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -2736,12 +2779,7 @@ impl ProviderAdapter for CodexAdapter {
         if let Some(prompt) = &target.prompt {
             args.push(prompt.clone());
         }
-        Ok(LaunchPlan {
-            program: "codex".to_owned(),
-            args,
-            cwd: target.cwd.clone(),
-            env: Vec::new(),
-        })
+        self.native_launch(target, args)
     }
 
     fn codex_continuation_sqlite_home(
@@ -2749,15 +2787,24 @@ impl ProviderAdapter for CodexAdapter {
         session: Option<&SessionRef>,
         cwd: &Path,
         overrides: &crate::CodexLaunchOverrides,
+        expand_env_tilde: &dyn Fn() -> Result<bool>,
     ) -> Result<Option<PathBuf>> {
         if let Some(session) = session {
-            return current_launch::verified_sqlite_home(self, session, cwd, overrides);
+            return current_launch::verified_sqlite_home(
+                self,
+                session,
+                cwd,
+                overrides,
+                expand_env_tilde,
+            );
         }
         let home = self
             .codex_home
             .as_deref()
             .context("Codex home was not found")?;
-        self.current.root_for_launch(home, cwd, overrides).map(Some)
+        self.current
+            .root_for_launch(home, cwd, overrides, expand_env_tilde)
+            .map(Some)
     }
 }
 

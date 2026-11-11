@@ -104,6 +104,16 @@ impl SqliteHome {
         cwd: &Path,
         overrides: &CodexLaunchOverrides,
     ) -> Result<PathBuf> {
+        self.resolve_for_launch(home, cwd, overrides, &|| Ok(true))
+    }
+
+    pub(super) fn resolve_for_launch(
+        &self,
+        home: &Path,
+        cwd: &Path,
+        overrides: &CodexLaunchOverrides,
+        expand_env_tilde: &dyn Fn() -> Result<bool>,
+    ) -> Result<PathBuf> {
         let managed = self.legacy_managed_config()?;
         let managed = merge_settings(managed, self.mac_config(home, policy::Preference::Config)?);
         let settings = merge_settings(
@@ -141,6 +151,20 @@ impl SqliteHome {
             None => self.environment.as_deref(),
         };
         if let Some(path) = environment {
+            if path.starts_with("~") {
+                let literal = std::path::absolute(cwd)?.join(path);
+                match expand_env_tilde() {
+                    Ok(false) => return Ok(literal),
+                    Ok(true) => {}
+                    Err(error) => {
+                        let expanded = absolute_in(path, cwd)?;
+                        if same_existing_directory(&literal, &expanded) {
+                            return Ok(expanded);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             return absolute_in(path, cwd);
         }
         Ok(home.to_owned())
@@ -311,6 +335,11 @@ fn system_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+fn same_existing_directory(left: &Path, right: &Path) -> bool {
+    fs::canonicalize(left)
+        .is_ok_and(|left| left.is_dir() && fs::canonicalize(right).is_ok_and(|right| right == left))
+}
+
 fn environment_path(value: &str) -> Option<&Path> {
     let value = value.trim();
     (!value.is_empty()).then(|| Path::new(value))
@@ -368,6 +397,30 @@ mod tests {
             resolver.resolve_in(&home, &cwd, &launch)?,
             cwd.join("alternate")
         );
+        launch.environment = Some(EnvChange::Set {
+            name: "CODEX_SQLITE_HOME".into(),
+            value: "~/state".into(),
+        });
+        assert_eq!(
+            resolver.resolve_for_launch(&home, &cwd, &launch, &|| Ok(false))?,
+            cwd.join("~").join("state")
+        );
+        assert_eq!(
+            resolver.resolve_for_launch(&home, &cwd, &launch, &|| Ok(true))?,
+            absolute_in(Path::new("~/state"), &cwd)?
+        );
+        let unknown = || Err(anyhow!("unknown Codex version"));
+        assert!(
+            resolver
+                .resolve_for_launch(&home, &cwd, &launch, &unknown)
+                .is_err()
+        );
+        launch.sqlite_home = Some(home.join("explicit"));
+        assert_eq!(
+            resolver.resolve_for_launch(&home, &cwd, &launch, &unknown)?,
+            home.join("explicit")
+        );
+        launch.sqlite_home = None;
         launch.environment = Some(EnvChange::Remove("CODEX_SQLITE_HOME".into()));
         assert_eq!(resolver.resolve_in(&home, &cwd, &launch)?, home);
         fs::write(
