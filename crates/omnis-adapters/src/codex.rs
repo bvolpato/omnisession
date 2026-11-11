@@ -852,6 +852,7 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
+    deferred_output: Option<[u8; 32]>,
     receipt: Option<tool_occurrences::Receipt>,
     ambiguous: bool,
     model: Option<u64>,

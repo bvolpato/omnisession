@@ -863,29 +863,82 @@ fn completed_lookup(status: &str) -> Value {
     )
 }
 
+fn physical_call(name: &str, arguments: &Value) -> Value {
+    json!({"type":"response_item","payload":{
+        "type":"function_call","name":name,"arguments":arguments.to_string(),"call_id":"shared"}} )
+}
+
+fn physical_result(text: &str) -> Value {
+    json!({"type":"response_item","payload":{
+        "type":"function_call_output","call_id":"shared","output":text}})
+}
+
+fn command_display(name: &str, status: &str, text: &str) -> Value {
+    turn_item(
+        "turn",
+        &json!({
+            "type":"CommandExecution","id":"shared","command":[name],"cwd":"file:///workspace",
+            "source":"agent","parsed_cmd":[],"status":status,"aggregated_output":text
+        }),
+    )
+}
+
+fn assert_receipt_outcomes(scenario: &str, records: Vec<Value>, first_failed: bool) {
+    let expected = [
+        ("first receipt", first_failed),
+        ("second receipt", !first_failed),
+    ];
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "objective"),
+    ];
+    rows.extend(records);
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let trajectory = omnis_core::import_trajectory(&snapshot);
+        let native = omnis_core::native_trajectory_items(&trajectory);
+        let outputs: Vec<_> = native
+            .iter()
+            .filter_map(|item| match item {
+                omnis_core::NativeTrajectoryItem::Tool {
+                    output, is_error, ..
+                } => Some((output.as_str(), *is_error)),
+                omnis_core::NativeTrajectoryItem::Message { .. } => None,
+            })
+            .collect();
+        assert_eq!(outputs, expected, "{scenario}, preview={preview}");
+        let handoff = omnis_core::render_semantic_handoff(&snapshot);
+        for text in ["first receipt", "second receipt"] {
+            assert_eq!(handoff.matches(text).count(), 1, "{handoff}");
+        }
+        assert!(!handoff.contains("partial message"));
+        let plan = omnis_core::plan_semantic_handoff(&snapshot);
+        assert_eq!(plan.tool_outcomes.len(), 2, "{scenario}");
+        for (text, failed) in expected {
+            let outcome = plan
+                .tool_outcomes
+                .iter()
+                .find(|outcome| outcome.summary.contains(text))
+                .unwrap();
+            assert_eq!(
+                outcome.status,
+                if failed {
+                    omnis_core::ToolOutcomeStatus::Failed
+                } else {
+                    omnis_core::ToolOutcomeStatus::Completed
+                },
+                "{scenario}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_revised_tool_display_keeps_the_outcome_of_its_original_call() {
-    let call = |name: &str, arguments: Value| {
-        json!({"type":"response_item","payload":{
-        "type":"function_call","name":name,"arguments":arguments.to_string(),"call_id":"shared"}} )
-    };
-    let result = |text: &str| {
-        json!({"type":"response_item","payload":{
-        "type":"function_call_output","call_id":"shared","output":text}})
-    };
-    let command = |name: &str, status: &str, text: &str| {
-        turn_item(
-            "turn",
-            &json!({
-                "type":"CommandExecution","id":"shared","command":[name],"cwd":"file:///workspace",
-                "source":"agent","parsed_cmd":[],"status":status,"aggregated_output":text
-            }),
-        )
-    };
-    let first = call("exec_command", json!({"cmd":"first"}));
-    let second = call("exec_command", json!({"cmd":"second"}));
-    let finished = command("first", "completed", "first receipt");
-    let corrected = command("first", "failed", "first receipt");
+    let first = physical_call("exec_command", &json!({"cmd":"first"}));
+    let second = physical_call("exec_command", &json!({"cmd":"second"}));
+    let finished = command_display("first", "completed", "first receipt");
+    let corrected = command_display("first", "failed", "first receipt");
     for (scenario, records) in [
         "late correction",
         "both displayed",
@@ -896,67 +949,127 @@ fn a_revised_tool_display_keeps_the_outcome_of_its_original_call() {
     .zip([
         vec![
             first.clone(),
-            result("first receipt"),
+            physical_result("first receipt"),
             finished.clone(),
             second.clone(),
-            result("second receipt"),
+            physical_result("second receipt"),
             corrected.clone(),
         ],
         vec![
             first.clone(),
-            result("first receipt"),
+            physical_result("first receipt"),
             finished,
             second.clone(),
-            result("second receipt"),
-            command("second", "completed", "second receipt"),
+            physical_result("second receipt"),
+            command_display("second", "completed", "second receipt"),
             corrected.clone(),
         ],
         vec![
             first,
-            result("first receipt"),
-            command("first", "in_progress", "partial message"),
+            physical_result("first receipt"),
+            command_display("first", "in_progress", "partial message"),
             second,
             corrected,
-            result("second receipt"),
+            physical_result("second receipt"),
         ],
         vec![
-            call("lookup", json!({})),
-            result("first receipt"),
+            physical_call("lookup", &json!({})),
+            physical_result("first receipt"),
             completed_lookup("completed"),
-            call("other", json!({})),
+            physical_call("other", &json!({})),
             completed_lookup("failed"),
-            result("second receipt"),
+            physical_result("second receipt"),
         ],
     ]) {
-        let mut rows = vec![
-            event("task_started", json!({"turn_id":"turn"})),
-            page_user("turn", "request", "objective"),
-        ];
-        rows.extend(records);
+        assert_receipt_outcomes(scenario, records, true);
+    }
+}
+
+#[test]
+fn a_delayed_command_display_uses_the_published_command_and_output() {
+    for same_command in [false, true] {
+        for result_first in [false, true] {
+            let mut records = vec![
+                physical_call("exec_command", &json!({"cmd":"first"})),
+                physical_result("first receipt"),
+            ];
+            let (arguments, failed_output) = if same_command {
+                records.push(command_display("first", "completed", "first receipt"));
+                (json!({"cmd":"first","yield_time_ms":50}), "second receipt")
+            } else {
+                (json!({"cmd":"second"}), "first receipt")
+            };
+            records.push(physical_call("exec_command", &arguments));
+            let failed = command_display("first", "failed", failed_output);
+            let second = physical_result("second receipt");
+            records.extend(if result_first {
+                [second, failed]
+            } else {
+                [failed, second]
+            });
+            assert_receipt_outcomes(
+                &format!("same command={same_command}, result first={result_first}"),
+                records,
+                !same_command,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_deferred_failure_requires_the_eventual_result_to_match_its_output() {
+    let records = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "objective"),
+        physical_call("exec_command", &json!({"cmd":"same"})),
+        physical_result("first receipt"),
+        command_display("same", "completed", "first receipt"),
+        physical_call("exec_command", &json!({"cmd":"same","yield_time_ms":50})),
+        command_display("same", "failed", "unattributed display"),
+        physical_result("second receipt"),
+    ];
+    for mode in ["legacy", "paginated"] {
         for preview in [false, true] {
-            let snapshot =
-                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let snapshot = read_with_history_mode(records.clone(), preview, Some(mode)).unwrap();
+            assert!(
+                !omnis_core::trajectory_search_document(&snapshot).source_complete,
+                "{mode}"
+            );
+            let plan = omnis_core::plan_semantic_handoff(&snapshot);
+            for (text, status) in [
+                ("first receipt", omnis_core::ToolOutcomeStatus::Completed),
+                ("second receipt", omnis_core::ToolOutcomeStatus::Completed),
+                (
+                    "unattributed display",
+                    omnis_core::ToolOutcomeStatus::Failed,
+                ),
+            ] {
+                assert_eq!(
+                    plan.tool_outcomes
+                        .iter()
+                        .filter(|item| item.summary.contains(text) && item.status == status)
+                        .count(),
+                    1,
+                    "{mode} {text}"
+                );
+            }
             let trajectory = omnis_core::import_trajectory(&snapshot);
             let native = omnis_core::native_trajectory_items(&trajectory);
-            let outputs: Vec<_> = native
-                .iter()
-                .filter_map(|item| match item {
-                    omnis_core::NativeTrajectoryItem::Tool {
-                        output, is_error, ..
-                    } => Some((output.as_str(), *is_error)),
-                    omnis_core::NativeTrajectoryItem::Message { .. } => None,
-                })
-                .collect();
-            assert_eq!(
-                outputs,
-                [("first receipt", true), ("second receipt", false)],
-                "{scenario}, preview={preview}"
-            );
-            let handoff = omnis_core::render_semantic_handoff(&snapshot);
-            for text in ["first receipt", "second receipt"] {
-                assert_eq!(handoff.matches(text).count(), 1, "{handoff}");
+            for receipt in ["first receipt", "second receipt"] {
+                let count = native
+                    .iter()
+                    .filter(|item| match item {
+                        omnis_core::NativeTrajectoryItem::Tool {
+                            output, is_error, ..
+                        } => output == receipt && !is_error,
+                        omnis_core::NativeTrajectoryItem::Message { text, .. } => {
+                            text.starts_with("[Historical tool result.") && text.contains(receipt)
+                        }
+                    })
+                    .count();
+                assert_eq!(count, 1, "{mode}: {receipt}");
             }
-            assert!(!handoff.contains("partial message"));
+            assert!(native.iter().any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Message{text,..} if text.starts_with("[Historical tool failure.") && text.contains("unattributed display"))));
         }
     }
 }

@@ -95,9 +95,20 @@ pub(super) struct ScopedRecord {
     pub(super) owner: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum PendingCall {
     Unique(u64),
+    Overlapping(u64),
     Multiple,
+}
+
+impl PendingCall {
+    pub(super) fn sequence(self) -> Option<u64> {
+        match self {
+            Self::Unique(seq) | Self::Overlapping(seq) => Some(seq),
+            Self::Multiple => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -118,13 +129,23 @@ impl NativeCalls {
         owner: Option<u64>,
         payload: &serde_json::Value,
     ) {
+        let arguments = (payload["name"] == "exec_command")
+            .then(|| payload["arguments"].as_str())
+            .flatten()
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
+            })
+            .map(|mut fields| {
+                fields.remove("yield_time_ms");
+                serde_json::Value::Object(fields)
+            });
         self.source_keys.insert(
             sequence,
             super::paginated_rollback::json_digest(&[
                 &payload["type"],
                 &payload["name"],
                 &payload["namespace"],
-                &payload["arguments"],
+                arguments.as_ref().unwrap_or(&payload["arguments"]),
                 &payload["input"],
                 &payload["action"],
             ]),
@@ -153,9 +174,13 @@ impl NativeCalls {
         if matching.next().is_some() {
             return Some(PendingCall::Multiple);
         }
-        result
-            .filter(|result| first > *result)
-            .map(|_| PendingCall::Unique(first))
+        let result = result?;
+        if first > result {
+            return Some(PendingCall::Unique(first));
+        }
+        self.result_calls
+            .contains_key(&result)
+            .then_some(PendingCall::Overlapping(first))
     }
 
     pub(super) fn confirm_turn(&mut self, id: &str, sequence: u64, turn: &str, owner: Option<u64>) {

@@ -1,5 +1,6 @@
 //! Keep published turn slots separate from the physical model results they can mirror.
 
+use super::tool_history::PendingCall;
 use super::tool_occurrences::{Match, Receipt};
 use super::{CodexHistory, CompletedKind, CompletionScope, EventBuilder, model_result_kind};
 use omnis_ir::{EventKind, OmniEvent, ReplayPolicy};
@@ -73,6 +74,7 @@ pub(super) struct Projection {
     pub(super) peer: Option<u64>,
     receipt: Option<Receipt>,
     pending: Option<u64>,
+    deferred_output: Option<[u8; 32]>,
     pub(super) wait_for_call: bool,
     pub(super) ambiguous: bool,
     detach: Option<u64>,
@@ -98,38 +100,88 @@ impl CodexHistory {
             .and_then(|seq| self.calls.source_keys.get(seq))
     }
 
-    fn matching_occurrence(
+    fn match_display(
         &self,
         builder: &mut EventBuilder,
-        scope: (&str, &str),
+        (turn, id): (&str, &str),
         item: &Value,
         receipt: Option<Receipt>,
-        latest: Option<u64>,
+        candidate: Option<PendingCall>,
+        last_result: Option<u64>,
     ) -> Match {
-        let (turn, id) = scope;
-        let known = self.occurrences.find(turn, id, receipt);
-        let (Match::One(earlier), Some(latest)) = (&known, latest) else {
-            return known;
-        };
-        if *earlier == latest || self.occurrences.has_result(turn, id, latest) {
-            return known;
-        }
-        let earlier_call = self.call_identity_for_result(*earlier);
-        if earlier_call.is_some() && earlier_call != self.call_identity_for_result(latest) {
-            return known;
-        }
-        // Identical model calls can produce different results. Only the full original output
-        // distinguishes the newer, unpublished occurrence from a revision of the earlier one.
-        let mut matches = |seq| {
+        let matches = super::completed_item::model_output_matcher(item);
+        let mut output_matches = |seq| {
             builder
                 .event_at_mut(seq)
-                .is_some_and(|e| super::completed_item::display_matches_model(item, &e.payload))
+                .is_some_and(|event| matches(&event.payload))
         };
-        match (matches(*earlier), matches(latest)) {
-            (true, false) => known,
-            (false, true) => Match::One(latest),
-            _ => Match::Multiple,
+        let known = self
+            .occurrences
+            .find(turn, id, receipt, &mut output_matches);
+        let Some(candidate) = candidate else {
+            return known;
+        };
+        let Some(next) = candidate.sequence() else {
+            return Match::Multiple;
+        };
+        match known {
+            Match::One(old) => {
+                let earlier = self.call_identity_for_result(old);
+                if earlier.is_some() && earlier != self.calls.source_keys.get(&next) {
+                    return known;
+                }
+                if matches!(candidate, PendingCall::Unique(_))
+                    && item["type"] == "CommandExecution"
+                    && let Some(expected) =
+                        super::completed_item::model_body(&item["aggregated_output"])
+                    && !output_matches(old)
+                {
+                    return Match::AwaitOutput(expected);
+                }
+                Match::Multiple
+            }
+            Match::Missing
+                if matches!(candidate, PendingCall::Overlapping(_))
+                    || (receipt.is_some() && last_result.is_some_and(output_matches)) =>
+            {
+                Match::Multiple
+            }
+            other => other,
         }
+    }
+
+    fn reject_deferred_output(
+        &mut self,
+        builder: &mut EventBuilder,
+        turn: &str,
+        id: &str,
+        scope: CompletionScope,
+        output: &Value,
+    ) -> bool {
+        let Some(slot) = self
+            .completed
+            .get_mut(turn)
+            .and_then(|slots| slots.get_mut(&(scope, id.to_owned())))
+        else {
+            return false;
+        };
+        let Some(expected) = slot.deferred_output.take() else {
+            return false;
+        };
+        if super::completed_item::model_body(output) == Some(expected) {
+            return false;
+        }
+        slot.ambiguous = true;
+        if let Some(event) = builder.event_at_mut(slot.sequence)
+            && let Some(fields) = event.payload.as_object_mut()
+            && let Some(display_id) = fields.remove("id")
+        {
+            fields.insert("item_id".into(), display_id);
+        }
+        self.items
+            .outcomes
+            .take(id, false, Some(slot.sequence), Some(turn), None);
+        true
     }
 
     pub(super) fn completion_position(
@@ -158,46 +210,49 @@ impl CodexHistory {
         let candidate = self
             .calls
             .pending_occurrence(id, turn, last_result, generated);
-        let multiple = matches!(candidate, Some(super::tool_history::PendingCall::Multiple));
-        let pending = match candidate {
-            Some(super::tool_history::PendingCall::Unique(seq)) => Some(seq),
-            _ => None,
-        };
-        let known =
-            self.matching_occurrence(builder, (turn, id), &payload["item"], receipt, last_result);
+        let pending = candidate.and_then(PendingCall::sequence);
+        let known = self.match_display(
+            builder,
+            (turn, id),
+            &payload["item"],
+            receipt,
+            candidate,
+            last_result,
+        );
         let prior = match known {
             Match::One(seq) => Some(seq),
             _ => None,
         };
-        let multiple_receipts = matches!(known, Match::Multiple);
-        let unconfirmed_output = receipt.is_some()
-            && prior.is_none()
-            && pending.is_some()
-            && last_result
-                .and_then(|seq| builder.event_at_mut(seq))
-                .is_some_and(|event| {
-                    super::completed_item::display_matches_model(&payload["item"], &event.payload)
-                });
-        let ambiguous = display
-            && kind == CompletedKind::Tool
-            && (multiple
-                || multiple_receipts
-                || unconfirmed_output
-                || (prior.is_some()
-                    && pending.is_some_and(|next| {
-                        let past = prior.and_then(|r| self.call_identity_for_result(r));
-                        past.is_none() || past == self.calls.source_keys.get(&next)
-                    })));
+        let rejected = !display
+            && previous.is_some_and(|p| p.deferred_output.is_some())
+            && self.reject_deferred_output(
+                builder,
+                turn,
+                id,
+                if self.paginated {
+                    CompletionScope::Published
+                } else {
+                    historical
+                },
+                &payload["output"],
+            );
+        let ambiguous = rejected
+            || (display && kind == CompletedKind::Tool && matches!(known, Match::Multiple));
         let wait_for_call = if display {
             ambiguous || (pending.is_some() && kind == CompletedKind::Tool && prior.is_none())
         } else {
-            previous.is_some_and(|p| p.ambiguous)
+            rejected || previous.is_some_and(|p| p.ambiguous)
         };
         let mut projection = Projection {
             scope: historical,
             original: None,
             peer: None,
             detach: None,
+            deferred_output: if let Match::AwaitOutput(expected) = known {
+                Some(expected)
+            } else {
+                None
+            },
             wait_for_call,
             pending,
             receipt,
@@ -273,7 +328,7 @@ impl CodexHistory {
                 position.sequence = model;
                 if let Some(receipt) = position.receipt {
                     self.occurrences
-                        .observe(self.aliases.resolve(&turn), id, model, receipt);
+                        .observe(self.aliases.resolve(&turn), id, model, Some(receipt));
                 }
             }
             return;
@@ -287,7 +342,7 @@ impl CodexHistory {
             position.model = Some(model);
             if let Some(receipt) = position.receipt {
                 self.occurrences
-                    .observe(self.aliases.resolve(&turn), id, model, receipt);
+                    .observe(self.aliases.resolve(&turn), id, model, Some(receipt));
             }
             self.paginated_answers.move_tool_display(slot, model);
             self.completed
@@ -301,6 +356,7 @@ impl CodexHistory {
                     super::CompletedPosition {
                         kind: CompletedKind::Tool,
                         receipt: None,
+                        deferred_output: None,
                         ambiguous: false,
                         sequence: model,
                         model: None,
@@ -346,9 +402,7 @@ impl CodexHistory {
         let physical = builder
             .event_at_mut(sequence)
             .is_some_and(|e| model_output(e));
-        if let (Some(receipt), Some(model)) =
-            (receipt, if physical { Some(sequence) } else { peer })
-        {
+        if let Some(model) = if physical { Some(sequence) } else { peer } {
             self.occurrences
                 .observe(self.aliases.resolve(turn), id, model, receipt);
         }
@@ -375,6 +429,7 @@ impl CodexHistory {
                 kind,
                 receipt,
                 ambiguous: projected.ambiguous,
+                deferred_output: projected.deferred_output,
                 sequence,
                 model: peer,
             },

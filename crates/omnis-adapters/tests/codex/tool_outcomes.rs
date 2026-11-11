@@ -1493,3 +1493,105 @@ fn repeated_commands_with_the_same_inputs_can_be_distinguished_by_their_original
         assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
     }
 }
+
+#[test]
+fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
+    let header = "Wall time: 0.0420 seconds\nOutput:";
+    let near_header = "Wall time: 0.042 seconds\nOutput:";
+    let diagnostic = "No such file";
+    let cancel = "dynamic tool call was cancelled before receiving a response";
+    let image = "data:image/png;base64,AA==";
+    let text_part = |text| json!({"type":"input_text","text":text});
+    let image_part = |detail| json!({"type":"input_image","image_url":image,"detail":detail});
+    let mcp = json!({"type":"McpToolCall","id":"cmd","server":"fixture","tool":"lookup","arguments":{},"status":"failed","result":{"content":[{"type":"text","text":diagnostic}],"isError":true}});
+    let mut structured = mcp.clone();
+    structured["result"]["structuredContent"] = json!({"code":"missing_file"});
+    let dynamic = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":diagnostic},{"type":"inputImage","imageUrl":image}]});
+    let cancelled = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[],"error":cancel});
+    for (item, body, other) in [
+        (
+            mcp,
+            json!([text_part(header), text_part(diagnostic)]),
+            json!([text_part(near_header), text_part(diagnostic)]),
+        ),
+        (
+            structured,
+            json!(format!("{header}\n{{\"code\":\"missing_file\"}}")),
+            json!(format!("{near_header}\n{{\"code\":\"missing_file\"}}")),
+        ),
+        (
+            dynamic,
+            json!([text_part(diagnostic), image_part("high")]),
+            json!([text_part(diagnostic), image_part("low")]),
+        ),
+        (
+            cancelled,
+            json!(cancel),
+            json!("different cancellation reason"),
+        ),
+    ] {
+        for (output, matched) in [(body, true), (other, false)] {
+            for mode in [None, Some("paginated")] {
+                for display_first in [false, true] {
+                    let mut records = vec![
+                        event("task_started", json!({"turn_id":"turn"})),
+                        call(Some("turn")),
+                    ];
+                    let mut raw = model_result("");
+                    raw["payload"]["output"] = output.clone();
+                    let display = turn_item("turn", &item);
+                    records.extend(if display_first {
+                        [display, raw]
+                    } else {
+                        [raw, display]
+                    });
+                    for preview in [false, true] {
+                        let snapshot =
+                            read_with_history_mode(records.clone(), preview, mode).unwrap();
+                        let result = snapshot
+                            .events
+                            .iter()
+                            .find(|event| {
+                                event.source.raw_record_type.as_deref()
+                                    == Some("response_item.function_call_output")
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            result.kind == EventKind::ToolFailed,
+                            matched,
+                            "{item} {output} {mode:?} {display_first}"
+                        );
+                        let search = omnis_core::trajectory_search_document(&snapshot);
+                        assert!(search.source_complete);
+                        let outcomes = omnis_core::plan_semantic_handoff(&snapshot).tool_outcomes;
+                        assert_eq!(outcomes.len(), if matched { 1 } else { 2 });
+                        let media = item["content_items"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "inputImage")
+                        });
+                        if matched && media {
+                            assert!(
+                                omnis_core::import_trajectory(&snapshot)
+                                    .items
+                                    .iter()
+                                    .any(|item| item.text.contains("Historical tool failure")
+                                        && item.text.contains(diagnostic))
+                            );
+                        }
+                        if matched && !media {
+                            assert!(
+                                omnis_core::native_trajectory_items(
+                                    &omnis_core::import_trajectory(&snapshot)
+                                )
+                                .iter()
+                                .any(|item| matches!(
+                                    item,
+                                    omnis_core::NativeTrajectoryItem::Tool { is_error: true, .. }
+                                ))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

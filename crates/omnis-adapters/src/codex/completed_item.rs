@@ -13,8 +13,8 @@ mod private;
 mod receipts;
 
 pub(super) use receipts::{
-    annotate_model_receipt, clear_source_receipt, display_matches_model, equivalent_model_receipt,
-    with_source_receipt,
+    annotate_model_receipt, clear_source_receipt, equivalent_model_receipt, model_body,
+    model_output_matcher, with_source_receipt,
 };
 mod status;
 

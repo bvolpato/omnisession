@@ -1712,7 +1712,7 @@ fn a_failed_second_command_keeps_its_status_when_the_call_id_is_reused() {
 }
 
 #[test]
-fn overlapping_calls_before_the_first_result_keep_the_unattributed_failure_separate() {
+fn overlapping_calls_keep_an_unattributed_failure_separate_before_or_between_results() {
     for mode in ["legacy", "paginated"] {
         for turn in ["turn", "rollout-2"] {
             let [call, first, mut display] = command_rows(turn, "reused", "first output");
@@ -1722,32 +1722,80 @@ fn overlapping_calls_before_the_first_result_keep_the_unattributed_failure_separ
             item.remove("aggregated_output");
             item.insert("status".into(), "failed".into());
             item.insert("exit_code".into(), 1.into());
-            let rows = vec![
-                event("task_started", json!({"turn_id":turn})),
-                page_user(turn, "u", "request"),
-                call.clone(),
-                call,
-                display,
-                first,
-                second,
-            ];
-            for preview in [false, true] {
-                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
-                let failed: Vec<_> = snapshot
-                    .events
-                    .iter()
-                    .filter(|event| event.kind == omnis_ir::EventKind::ToolFailed)
-                    .collect();
-                assert_eq!(failed.len(), 1, "{mode} {turn}");
-                assert!(failed[0].payload["output"].is_null(), "{mode} {turn}");
-                let search = omnis_core::trajectory_search_document(&snapshot);
-                assert!(!search.source_complete, "{mode} {turn}");
-                for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
-                    for output in ["first output", "second output"] {
-                        assert_eq!(text.matches(output).count(), 1, "{mode} {turn}");
+            for after_first in [false, true] {
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":turn})),
+                    page_user(turn, "u", "request"),
+                    call.clone(),
+                    call.clone(),
+                ];
+                rows.extend(if after_first {
+                    [first.clone(), display.clone(), second.clone()]
+                } else {
+                    [display.clone(), first.clone(), second.clone()]
+                });
+                for preview in [false, true] {
+                    let snapshot =
+                        read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                    let failed: Vec<_> = snapshot
+                        .events
+                        .iter()
+                        .filter(|event| event.kind == omnis_ir::EventKind::ToolFailed)
+                        .collect();
+                    assert_eq!(failed.len(), 1, "{mode} {turn}");
+                    assert!(failed[0].payload["output"].is_null(), "{mode} {turn}");
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    assert!(!search.source_complete, "{mode} {turn}");
+                    for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                        for output in ["first output", "second output"] {
+                            assert_eq!(text.matches(output).count(), 1, "{mode} {turn}");
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn the_display_between_overlapping_results_identifies_a_distinct_finished_command() {
+    for mode in ["legacy", "paginated"] {
+        let [mut first_call, first_result, mut display] =
+            command_rows("turn", "reused", "first output");
+        let [mut second_call, second_result, _] = command_rows("turn", "reused", "second output");
+        first_call["payload"]["arguments"] = json!({"cmd":"pwd"}).to_string().into();
+        second_call["payload"]["arguments"] = json!({"cmd":"ls"}).to_string().into();
+        let item = &mut display["payload"]["item"];
+        item["status"] = "failed".into();
+        item["exit_code"] = 1.into();
+        let rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "u", "request"),
+            first_call,
+            second_call,
+            first_result,
+            display,
+            second_result,
+        ];
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            let outcomes: Vec<_> = snapshot
+                .events
+                .iter()
+                .filter_map(|e| e.payload["output"].as_str().map(|text| (text, &e.kind)))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [
+                    ("first output", &omnis_ir::EventKind::ToolFailed),
+                    ("second output", &omnis_ir::EventKind::ToolCompleted)
+                ],
+                "{mode}"
+            );
+            assert!(
+                omnis_core::trajectory_search_document(&snapshot).source_complete,
+                "{mode}"
+            );
         }
     }
 }
