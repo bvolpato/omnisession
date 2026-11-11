@@ -7,7 +7,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Child, ExitCode, ExitStatus, Stdio},
+    process::{Child, Command, ExitCode, ExitStatus, Stdio},
     thread,
     time::Duration,
 };
@@ -16,9 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
-    AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
-    ProviderInstallation, installed_opencode_model_with_binary,
-    read_opencode_session_with_binary_at,
+    AdapterRegistry, CodexWorkspaceProjection, EnvChange, LaunchPlan, LaunchTarget, NativeSession,
+    ProviderAdapter, ProviderInstallation, installed_opencode_model_with_binary,
 };
 use omnis_core::{
     build_fidelity_report, build_native_fork_report,
@@ -118,19 +117,42 @@ const DELETE_PROVIDERS: [Provider; 4] = [
 ];
 
 trait IndexedSessionReader {
-    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
+    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        self.read_selected_session_indexed(session, None)
+            .map(|read| read.snapshot)
+    }
+
+    fn read_selected_session_indexed(
+        &self,
+        session: &SessionRef,
+        expected: Option<SourceRevision>,
+    ) -> Result<omnis_adapters::IndexRead>;
 }
 
 fn full_index_read(
     registry: &AdapterRegistry,
     session: &SessionRef,
+    expected: Option<SourceRevision>,
 ) -> Result<omnis_adapters::IndexRead> {
     if matches!(session.provider, Provider::Codex | Provider::Grok) {
-        registry.index_session(session, None, u64::MAX)
+        let read = registry.index_session(session, None, u64::MAX)?;
+        if let Some(expected) = expected
+            && !expected.matches_file_contents(read.source_revision)
+        {
+            let source = if session.provider == Provider::Codex {
+                "Codex rollout"
+            } else {
+                "Grok source"
+            };
+            bail!("selected {source} changed before the continuation could read it");
+        }
+        Ok(read)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
             native_session: None,
             snapshot,
+            rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
             source_complete: true,
             source_revision: SourceRevision::default(),
         })
@@ -138,7 +160,11 @@ fn full_index_read(
 }
 
 impl IndexedSessionReader for AdapterRegistry {
-    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+    fn read_selected_session_indexed(
+        &self,
+        session: &SessionRef,
+        expected: Option<SourceRevision>,
+    ) -> Result<omnis_adapters::IndexRead> {
         let cache = Store::open_default().and_then(|store| {
             let (prior, observation) =
                 if matches!(session.provider, Provider::Codex | Provider::Grok) {
@@ -149,13 +175,21 @@ impl IndexedSessionReader for AdapterRegistry {
                 };
             Ok((store, prior, observation))
         });
-        let read = full_index_read(self, session).inspect_err(|cause| {
+        let read = full_index_read(self, session, expected).inspect_err(|cause| {
+            let Ok((store, _, Some(observed))) = &cache else {
+                return;
+            };
             if session.provider == Provider::Grok
-                && let Ok((store, _, Some(observed))) = &cache
                 && let Err(error) =
                     search_index::record_grok_rejection(self, store, session, observed, cause)
             {
                 eprintln!("warning: local trajectory index refresh: {error}");
+            } else if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(cause)
+                && let Some(metadata) = &observed.metadata
+                && let Err(error) =
+                    remove_confirmed_unavailable(self, store, vec![metadata.clone()])
+            {
+                eprintln!("warning: local trajectory index write: {error}");
             }
         })?;
         if session.provider == Provider::Grok
@@ -167,7 +201,7 @@ impl IndexedSessionReader for AdapterRegistry {
         {
             bail!("the selected Grok source requires a complete read after its rejection");
         }
-        let snapshot = read.snapshot;
+        let snapshot = &read.snapshot;
         match cache {
             Ok((store, prior, observation)) => {
                 let current = prior.is_some_and(|state| {
@@ -180,8 +214,8 @@ impl IndexedSessionReader for AdapterRegistry {
                             state.source_updated_at,
                         )
                 });
-                let selected = read.native_session.map(|native| {
-                    let mut selected = indexed_session_metadata(&native);
+                let selected = read.native_session.as_ref().map(|native| {
+                    let mut selected = indexed_session_metadata(native);
                     selected.project_path =
                         (!snapshot.workspace.current_dir.as_os_str().is_empty())
                             .then(|| snapshot.workspace.current_dir.clone());
@@ -215,9 +249,7 @@ impl IndexedSessionReader for AdapterRegistry {
                                 SearchDocumentTarget::Selected(selected, observed)
                             },
                         ),
-                        &snapshot,
-                        read.source_complete,
-                        read.source_revision,
+                        SearchDocumentInput::Read(&read),
                         (session.provider != Provider::Imported).then_some(self),
                         search_index::source_guard(session.provider, prior.as_ref()),
                     )
@@ -227,7 +259,7 @@ impl IndexedSessionReader for AdapterRegistry {
             }
             Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
         }
-        Ok(snapshot)
+        Ok(read)
     }
 }
 
@@ -235,42 +267,75 @@ fn codex_workspace_update(
     snapshot: &CanonicalSnapshot,
     revision: SourceRevision,
     source_complete: bool,
+    workspace_projection: &CodexWorkspaceProjection,
 ) -> Option<omnis_store::CodexWorkspaceUpdate> {
-    if !source_complete
-        || snapshot.session.provider != Provider::Codex
+    if snapshot.session.provider != Provider::Codex
         || revision.file.is_none()
         || revision.contents.is_none()
     {
         return None;
     }
-    if snapshot.events.iter().any(|event| {
-        matches!(
-            event.source.raw_record_type.as_deref(),
-            Some("omnisession.codex_malformed_records" | "omnisession.record_size_limit")
-        ) && event.payload["omitted_events"]
-            .as_u64()
-            .is_some_and(|count| count > 0)
-    }) {
-        return Some(omnis_store::CodexWorkspaceUpdate::Withdrawn(revision));
-    }
+    let directory = &snapshot.workspace.current_dir;
+    let directory = match workspace_projection {
+        CodexWorkspaceProjection::Observed(directory) => directory.as_deref(),
+        CodexWorkspaceProjection::Unchecked if !source_complete => return None,
+        CodexWorkspaceProjection::Unchecked => {
+            if snapshot.events.iter().any(|event| {
+                matches!(
+                    event.source.raw_record_type.as_deref(),
+                    Some(
+                        "omnisession.codex_malformed_records"
+                            | "omnisession.record_size_limit"
+                            | "omnisession.codex_workspace_unknown"
+                    )
+                ) && event.payload["workspace_unknown"] == true
+            }) {
+                return Some(omnis_store::CodexWorkspaceUpdate::Withdrawn(revision));
+            }
+            (!directory.as_os_str().is_empty()).then_some(directory.as_path())
+        }
+    };
+    let directory = directory.filter(|path| path.is_absolute());
+    let git_branch = directory
+        .filter(|path| path.as_os_str() == snapshot.workspace.current_dir.as_os_str())
+        .and(snapshot.workspace.git.branch.clone());
     Some(omnis_store::CodexWorkspaceUpdate::Verified(
         omnis_store::CodexWorkspace {
             source_revision: revision,
-            project_path: (!snapshot.workspace.current_dir.as_os_str().is_empty())
-                .then(|| snapshot.workspace.current_dir.clone()),
-            git_branch: snapshot.workspace.git.branch.clone(),
+            git_branch,
+            project_path: directory.map(Path::to_path_buf),
         },
     ))
 }
 
-fn verified_codex_workspace(
-    snapshot: &CanonicalSnapshot,
-    revision: SourceRevision,
-    source_complete: bool,
-) -> Option<omnis_store::CodexWorkspace> {
-    match codex_workspace_update(snapshot, revision, source_complete)? {
-        omnis_store::CodexWorkspaceUpdate::Verified(workspace) => Some(workspace),
+fn verified_codex_directory(read: &omnis_adapters::IndexRead) -> Option<PathBuf> {
+    match codex_workspace_update(
+        &read.snapshot,
+        read.source_revision,
+        read.source_complete,
+        &read.workspace_projection,
+    )? {
+        omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace
+            .project_path
+            .filter(|dir| !omnis_core::may_reach_network(dir)),
         omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => None,
+    }
+}
+
+fn codex_repository_matches(
+    snapshot: &CanonicalSnapshot,
+    directory: Option<&Path>,
+    project: &Path,
+) -> Result<bool> {
+    let Some(directory) =
+        directory.filter(|dir| dir.is_absolute() && !omnis_core::may_reach_network(dir))
+    else {
+        return Ok(false);
+    };
+    if directory.as_os_str() == snapshot.workspace.current_dir.as_os_str() {
+        Ok(workspace_state_matches(&snapshot.workspace, project)?)
+    } else {
+        Ok(workspace_paths_match(directory, project))
     }
 }
 
@@ -289,18 +354,35 @@ impl<'a> From<&'a SessionRef> for SearchDocumentTarget<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SearchDocumentInput<'a> {
+    Read(&'a omnis_adapters::IndexRead),
+    Bundle(&'a CanonicalSnapshot),
+}
+
 /// Stores a search document with the source revision and coverage observed by the reader.
 fn store_search_document<'a>(
     store: &Store,
     target: impl Into<SearchDocumentTarget<'a>>,
-    snapshot: &CanonicalSnapshot,
-    source_complete: bool,
-    source_revision: SourceRevision,
+    input: SearchDocumentInput<'_>,
     native_registry: Option<&AdapterRegistry>,
     guard: TrajectorySourceGuard,
 ) -> Result<Option<String>> {
+    let (snapshot, read) = match input {
+        SearchDocumentInput::Read(read) => (&read.snapshot, Some(read)),
+        SearchDocumentInput::Bundle(snapshot) => (snapshot, None),
+    };
+    let source_complete = read.is_none_or(|read| read.source_complete);
+    let source_revision = read.map(|read| read.source_revision).unwrap_or_default();
+    let workspace_projection = read.map_or(&CodexWorkspaceProjection::Unchecked, |read| {
+        &read.workspace_projection
+    });
+    let rollback_title = read.map_or(&omnis_adapters::RollbackTitle::Unknown, |read| {
+        &read.rollback_title
+    });
     let document = trajectory_search_document(snapshot);
-    let mut title = search_index::IndexedTitle::from_read(snapshot, source_complete, &document);
+    let mut title =
+        search_index::IndexedTitle::from_read(snapshot, source_complete, &document, rollback_title);
     let origin = if let Some(registry) = native_registry {
         title.check_withdrawal(registry, store, &snapshot.session, source_revision)?;
         SessionTrajectoryOrigin::Native
@@ -320,6 +402,7 @@ fn store_search_document<'a>(
         derived_title: title.current.as_deref(),
         withdrawn_title: title.withdrawn.as_deref(),
         title_is_verified: title.verified,
+        local_opener: title.local_opener,
     };
     let session = match target.into() {
         SearchDocumentTarget::Session(session) => {
@@ -327,7 +410,12 @@ fn store_search_document<'a>(
             session
         }
         SearchDocumentTarget::VisibleNative(native) => {
-            let workspace = codex_workspace_update(snapshot, source_revision, source_complete);
+            let workspace = codex_workspace_update(
+                snapshot,
+                source_revision,
+                source_complete,
+                workspace_projection,
+            );
             store.upsert_observed_trajectory_documents_with_workspaces(&[(
                 &native.session,
                 document,
@@ -337,7 +425,12 @@ fn store_search_document<'a>(
             &native.session
         }
         SearchDocumentTarget::Selected(selected, observed) => {
-            let workspace = codex_workspace_update(snapshot, source_revision, source_complete);
+            let workspace = codex_workspace_update(
+                snapshot,
+                source_revision,
+                source_complete,
+                workspace_projection,
+            );
             store.upsert_selected_session_document_with_workspace(
                 selected,
                 observed,
@@ -457,7 +550,7 @@ fn discover_sessions(
             .map(|provider| {
                 (
                     provider,
-                    scope.spawn(move || {
+                    scope.spawn(omnis_adapters::inherit_provider_probes(move || {
                         if let Some(project) = project.filter(|_| project_search) {
                             registry
                                 .adapter(provider)?
@@ -465,7 +558,7 @@ fn discover_sessions(
                         } else {
                             registry.list_sessions_with_notes(provider, project)
                         }
-                    }),
+                    })),
                 )
             })
             .collect::<Vec<_>>();
@@ -495,11 +588,14 @@ fn discover_sessions(
                         && registry
                             .adapter(provider)
                             .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if complete {
-                        store.replace_indexed_sessions(provider, &indexed)
-                    } else {
-                        store.merge_indexed_sessions(provider, &indexed)
-                    };
+                    let refreshed = cache_discovered_sessions(
+                        registry,
+                        store,
+                        provider,
+                        &indexed,
+                        complete,
+                        project.is_none(),
+                    );
                     if let Err(error) = refreshed {
                         warnings.push(format!("{provider} session cache: {error}"));
                     }
@@ -520,6 +616,69 @@ fn discover_sessions(
         }
     }
     (sessions, warnings)
+}
+
+fn cache_discovered_sessions(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Provider,
+    indexed: &[IndexedSession],
+    complete: bool,
+    all_projects: bool,
+) -> Result<()> {
+    if complete {
+        return Ok(store.replace_indexed_sessions(provider, indexed)?);
+    }
+    store.merge_indexed_sessions(provider, indexed)?;
+    if provider == Provider::Codex && all_projects {
+        remove_unavailable_search_sessions(
+            registry,
+            store,
+            indexed.iter().map(|row| (row.session.id.as_str(), None)),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_unavailable_search_sessions<'a>(
+    registry: &AdapterRegistry,
+    store: &Store,
+    found: impl Iterator<Item = (&'a str, Option<Uuid>)>,
+    project: Option<&Path>,
+) -> Result<()> {
+    let mut absent = store.indexed_sessions_for_provider(Provider::Codex)?;
+    if absent.is_empty() {
+        return Ok(());
+    }
+    let found: HashMap<_, _> = found.collect();
+    let mut matches = HashMap::new();
+    absent.retain(|row| {
+        found.get(row.session.id.as_str()).is_none_or(|file| {
+            file.zip(row.source_revision.and_then(|source| source.file))
+                .is_some_and(|(selected, prior)| selected != prior)
+        }) && cached_project_matches(row.project_path.as_deref(), project, &mut matches)
+    });
+    remove_confirmed_unavailable(registry, store, absent)
+}
+
+fn remove_confirmed_unavailable(
+    registry: &AdapterRegistry,
+    store: &Store,
+    mut absent: Vec<IndexedSession>,
+) -> Result<()> {
+    if !absent.is_empty() {
+        let sources = absent
+            .iter()
+            .map(|row| (row.session.id.clone(), row.source_revision))
+            .collect::<Vec<_>>();
+        let unavailable = registry
+            .adapter(Provider::Codex)?
+            .unavailable_codex_rollouts(&sources)?;
+        absent.retain(|row| unavailable.contains(&row.session.id));
+        store.remove_unavailable_codex_sessions(&absent)?;
+    }
+    Ok(())
 }
 
 const SEARCH_TEXT_WIDTH: usize = 80;
@@ -559,21 +718,16 @@ fn cached_search_sessions(
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
         .collect::<HashMap<_, _>>();
-    // Keep network path spellings distinct, as workspace_paths_match does.
-    let mut workspace_matches = HashMap::<OsString, bool>::new();
+    let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
         .filter(|session| session.session.provider != Provider::Imported)
         .filter(|session| {
             args.all_projects
-                || session.project_path.as_deref().is_some_and(|path| {
-                    if let Some(&matches) = workspace_matches.get(path.as_os_str()) {
-                        return matches;
-                    }
-                    let matches = workspace_paths_match(path, project);
-                    workspace_matches.insert(path.as_os_str().to_owned(), matches);
-                    matches
-                })
+                || session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(session.session.provider, path))
         })
         .map(|session| NativeSession {
             source_revision: session.source_revision.or_else(|| {
@@ -608,6 +762,55 @@ fn cached_search_sessions(
     Ok((sessions, warnings, titles))
 }
 
+fn cached_project_matches(
+    path: Option<&Path>,
+    project: Option<&Path>,
+    matches: &mut HashMap<OsString, bool>,
+) -> bool {
+    project.is_none_or(|project| {
+        path.is_some_and(|path| {
+            if let Some(&found) = matches.get(path.as_os_str()) {
+                return found;
+            }
+            let found = workspace_paths_match(path, project);
+            matches.insert(path.as_os_str().to_owned(), found);
+            found
+        })
+    })
+}
+
+fn live_search_sessions(
+    registry: &AdapterRegistry,
+    store: &Store,
+    args: &SearchArgs,
+    project: &Path,
+) -> (Vec<NativeSession>, Vec<String>) {
+    let project = (!args.all_projects).then_some(project);
+    let (sessions, mut warnings) =
+        discover_sessions(registry, args.provider, project, None, !args.no_index);
+    if args
+        .provider
+        .is_none_or(|provider| provider == Provider::Codex)
+    {
+        let found = sessions
+            .iter()
+            .filter(|row| row.session.provider == Provider::Codex)
+            .map(|row| {
+                // Ordinary indexing publishes the replacement. A metadata-only search must
+                // retire a superseded file without reading its replacement's conversation.
+                let file = row
+                    .source_revision
+                    .filter(|_| args.no_index)
+                    .and_then(|source| source.file);
+                (row.session.id.as_str(), file)
+            });
+        if let Err(error) = remove_unavailable_search_sessions(registry, store, found, project) {
+            warnings.push(format!("codex session cache: {error}"));
+        }
+    }
+    (sessions, warnings)
+}
+
 /// One ranked result. Conversation-only matches carry their full-text match.
 struct SearchHit<'a> {
     session: &'a NativeSession,
@@ -633,13 +836,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         let (sessions, warnings, titles) = cached_search_sessions(&store, args, &project)?;
         (sessions, warnings, Some(titles))
     } else {
-        let (sessions, warnings) = discover_sessions(
-            registry,
-            args.provider,
-            (!args.all_projects).then_some(project.as_path()),
-            None,
-            !args.no_index,
-        );
+        let (sessions, warnings) = live_search_sessions(registry, &store, args, &project);
         (sessions, warnings, None)
     };
     if args.cached {
@@ -724,19 +921,13 @@ fn refresh_search_workspaces(
     {
         return Ok(());
     }
-    let workspaces = omnis_store::CodexWorkspace::read_index(None)?;
+    let workspaces = omnis_store::CodexWorkspace::discovery_index(None)?;
     let mut matches = HashMap::<OsString, bool>::new();
     sessions.retain_mut(|session| {
         if session.session.provider != Provider::Codex {
             return true;
         }
-        if let Some(workspace) = session
-            .source_revision
-            .and_then(|revision| revision.file)
-            .and_then(|file| workspaces.get(&file))
-        {
-            session.apply_codex_workspace(workspace);
-        }
+        session.apply_codex_workspace_index(&workspaces, false);
         project.is_none_or(|project| {
             session.project_path.as_deref().is_some_and(|path| {
                 if let Some(&found) = matches.get(path.as_os_str()) {
@@ -1337,8 +1528,15 @@ struct InspectArgs {
         help = "Provider-qualified reference or exact session ID"
     )]
     session: String,
-    #[arg(long, value_name = "PROVIDER")]
-    target: Option<Provider>,
+    #[arg(long, value_name = "AGENT", help = "Target agent or launch profile")]
+    target: Option<AgentTarget>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help = "Check the permission mode used to launch the target (default: OMNI_MODE or the agent default)"
+    )]
+    mode: Option<launch_mode::ModeKind>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -1509,13 +1707,13 @@ struct ImportArgs {
 }
 
 fn main() -> ExitCode {
-    let result = run(Cli::parse());
+    let result = interrupt::with_provider_probes(|| run(Cli::parse()));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The command already reported the interrupted work.
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            let _ = writeln!(io::stderr().lock(), "error: {error:#}");
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
                 Some(ProviderExit(status)) => {
@@ -1540,7 +1738,10 @@ fn run(cli: Cli) -> Result<()> {
             show(&registry, &session, cli.json)
         }
         Commands::Markdown(args) => markdown(&registry, &args, cli.json),
-        Commands::Handoff(args) => handoff::run(&registry, &args.session, cli.json),
+        Commands::Handoff(args) => {
+            let source = resolve_session_ref(&registry, &args.session)?;
+            handoff::run(&registry, &source, None, cli.json)
+        }
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
         Commands::Fork(args) => fork(&registry, &args, cli.json),
@@ -1891,31 +2092,17 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
     let store = Store::open_default()?;
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    let current_remote = OnceCell::new();
+    let mut matcher = project
+        .map(|project| ImportedWorkspaceMatcher::new(&store, project))
+        .transpose()?;
     for session in store.indexed_sessions_for_provider(Provider::Imported)? {
-        if let Some(project) = project {
-            let path_matches = session
-                .project_path
-                .as_deref()
-                .is_some_and(|path| workspace_paths_match(path, project));
-            if !path_matches {
-                let matches = (|| -> Result<bool> {
-                    let bundle =
-                        load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
-                    source_workspace_matches_with_cache(
-                        &session.session,
-                        &bundle.snapshot,
-                        project,
-                        &current_remote,
-                    )
-                })();
-                match matches {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        warnings.push(format!("{}: {error:#}", session.session));
-                        continue;
-                    }
+        if let Some(matcher) = &mut matcher {
+            match matcher.matches(&session.session, session.project_path.as_deref()) {
+                Ok(ImportedWorkspaceMatch::Other) => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    warnings.push(format!("{}: {error:#}", session.session));
+                    continue;
                 }
             }
         }
@@ -1933,6 +2120,70 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
         });
     }
     Ok((sessions, warnings))
+}
+
+enum ImportedWorkspaceMatch {
+    Recorded,
+    Relocated,
+    Other,
+}
+
+struct ImportedWorkspaceMatcher<'a> {
+    store: &'a Store,
+    project: &'a Path,
+    paths: omnis_core::SessionWorkspaceMatcher<'a>,
+    relocatable_paths: HashMap<Provider, HashMap<OsString, bool>>,
+    providers: HashMap<String, Provider>,
+    current_remote: OnceCell<Option<String>>,
+}
+
+impl<'a> ImportedWorkspaceMatcher<'a> {
+    fn new(store: &'a Store, project: &'a Path) -> Result<Self> {
+        Ok(Self {
+            store,
+            project,
+            paths: omnis_core::SessionWorkspaceMatcher::new(project),
+            relocatable_paths: HashMap::new(),
+            providers: store.bundle_source_providers()?,
+            current_remote: OnceCell::new(),
+        })
+    }
+
+    fn can_relocate(&mut self, provider: Provider, path: &Path) -> Result<bool> {
+        let paths = self.relocatable_paths.entry(provider).or_default();
+        if let Some(&result) = paths.get(path.as_os_str()) {
+            return Ok(result);
+        }
+        let result = can_relocate_workspace(provider, path)?;
+        paths.insert(path.as_os_str().to_owned(), result);
+        Ok(result)
+    }
+
+    fn matches(
+        &mut self,
+        locator: &SessionRef,
+        path: Option<&Path>,
+    ) -> Result<ImportedWorkspaceMatch> {
+        if let (Some(&provider), Some(path)) = (self.providers.get(&locator.id), path) {
+            if self.paths.matches(provider, path) {
+                return Ok(ImportedWorkspaceMatch::Recorded);
+            }
+            if !self.can_relocate(provider, path)? {
+                return Ok(ImportedWorkspaceMatch::Other);
+            }
+        }
+        let bundle = load_imported_bundle(self.store, imported_bundle_id(locator)?)?;
+        if source_workspace_matches_with_cache(
+            locator,
+            &bundle.snapshot,
+            self.project,
+            &self.current_remote,
+        )? {
+            Ok(ImportedWorkspaceMatch::Relocated)
+        } else {
+            Ok(ImportedWorkspaceMatch::Other)
+        }
+    }
 }
 
 fn session_json(session: &NativeSession) -> Value {
@@ -1970,7 +2221,9 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         let handles = PROVIDERS.map(|provider| {
             (
                 provider,
-                scope.spawn(move || registry.find_native_session(provider, selector)),
+                scope.spawn(omnis_adapters::inherit_provider_probes(move || {
+                    registry.find_native_session(provider, selector)
+                })),
             )
         });
         handles.map(|(provider, handle)| {
@@ -1984,10 +2237,29 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
     });
     let mut matches = Vec::new();
     let mut failures = Vec::new();
+    let mut codex_unavailable = false;
     for (provider, result) in discovered {
         match result {
             Ok(session) => matches.extend(session.map(|session| session.session)),
-            Err(error) => failures.push(format!("{provider}: {error}")),
+            Err(error) => {
+                codex_unavailable |= provider == Provider::Codex
+                    && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(&error);
+                failures.push(format!("{provider}: {error}"));
+            }
+        }
+    }
+    if matches.is_empty() && codex_unavailable {
+        let session = SessionRef::new(Provider::Codex, selector);
+        let cleanup = Store::open_default()
+            .map_err(anyhow::Error::from)
+            .and_then(|store| {
+                if let Some(prior) = store.indexed_session(&session)? {
+                    remove_confirmed_unavailable(registry, &store, vec![prior])?;
+                }
+                Ok(())
+            });
+        if let Err(error) = cleanup {
+            eprintln!("warning: local trajectory index write: {error}");
         }
     }
     let selected = select_discovered_session(selector, matches, &failures)?;
@@ -2099,15 +2371,7 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
 }
 
 fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) -> Result<()> {
-    let source = resolve_session_ref(registry, &args.session)?;
-    let snapshot = registry
-        .read_session_indexed(&source)
-        .with_context(|| format!("reading `{source}`"))?;
-    let target = args.target.unwrap_or(snapshot.session.provider);
-    let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
-    let restore_source =
-        transfer::requires_import_for_native_resume(registry, &source, target.into())?;
-    let report = inspect_report(&snapshot, target, matches, restore_source)?;
+    let report = inspected_fidelity(registry, args)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2116,71 +2380,153 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     Ok(())
 }
 
-fn inspect_report(
-    snapshot: &CanonicalSnapshot,
-    target: Provider,
-    repository_matches: bool,
-    restore_source: bool,
-) -> Result<FidelityReport> {
-    if snapshot.session.provider == target && !restore_source {
+fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<FidelityReport> {
+    let source = resolve_session_ref(registry, &args.session)?;
+    let read = registry
+        .read_selected_session_indexed(&source, None)
+        .with_context(|| format!("reading `{source}`"))?;
+    let snapshot = &read.snapshot;
+    let target = match args.target {
+        Some(target) => target,
+        None => transfer::target_for_recorded_provider(
+            &source,
+            snapshot.session.provider.into(),
+            "--target",
+        )?,
+    };
+    transfer::reject_unsupported_target(target.provider)?;
+    transfer::check_launch_profile(target)?;
+    codex_import::check_continuation_target(target, &source)?;
+    let current = current_project()?;
+    let (project, matches) = if source.provider == Provider::Codex {
+        let directory = verified_codex_directory(&read);
+        let matches = codex_repository_matches(snapshot, directory.as_deref(), &current)?;
+        (directory.filter(|_| matches).unwrap_or(current), matches)
+    } else if source.provider == target.provider
+        && matches!(target.provider, Provider::CursorCli | Provider::CursorIde)
+    {
+        transfer::cursor_session_workspace(
+            target.provider,
+            Some(&snapshot.workspace.root),
+            &current,
+            false,
+            None,
+        )?
+    } else {
+        let matches = transfer::transfer_workspace_matches(snapshot, &current)?;
+        (current, matches)
+    };
+    let mode_args = transfer::launch_mode_args(
+        target,
+        args.mode,
+        &transfer::cursor_working_directory(target.provider, &project)?,
+        true,
+    )?;
+    if source.provider == target.provider
+        && !transfer::requires_import_for_native_resume(registry, &source, target)?
+    {
+        if target.provider == Provider::CursorIde {
+            let (_, report) = transfer::cursor_ide_continuation(snapshot, &project, matches)?;
+            return Ok(report);
+        }
+        let plan = registry.launch_plan(
+            &source,
+            &LaunchTarget {
+                cwd: Some(project),
+                fork: false,
+                prompt: None,
+            },
+        )?;
+        check_launcher_starts(target, &plan)?;
+        if target.provider == Provider::Codex {
+            let mut plan = target.launch_with_mode(plan, &mode_args)?;
+            transfer::verify_codex_launch(registry, &source, &source, &mut plan)?;
+        }
         return Ok(fidelity_report_for_snapshot(
             snapshot,
-            target,
-            repository_matches,
+            target.provider,
+            matches,
         ));
     }
-    if !may_attempt_native_import(target) {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
+    inspect_transfer_report(registry, snapshot, target, matches, &project)
+}
+
+fn inspect_transfer_report(
+    registry: &AdapterRegistry,
+    snapshot: &CanonicalSnapshot,
+    agent: AgentTarget,
+    repository_matches: bool,
+    project: &Path,
+) -> Result<FidelityReport> {
+    let target = agent.provider;
+    let check_new_launcher = || -> Result<()> {
+        let plan = registry.new_session_plan(
             target,
-            repository_matches,
-        ));
-    }
-    let project = current_project()?;
-    let Some(stats) = inspect_import_stats(snapshot, target, &project) else {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
-            target,
-            repository_matches,
-        ));
+            &LaunchTarget {
+                cwd: Some(project.to_path_buf()),
+                fork: true,
+                prompt: Some(transfer::HANDOFF_PREVIEW_PROMPT.to_owned()),
+            },
+        )?;
+        check_launcher_starts(agent, &plan)
     };
-    Ok(match stats {
-        Err(error) => {
-            let mut report =
-                build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
-            report.warnings.push(format!(
-                "native import unavailable: {}",
-                safe_terminal_line(&format!("{error:#}"))
-            ));
-            report
+    let stats = if may_attempt_native_import(target) {
+        inspect_import_stats(snapshot, agent, project)
+    } else {
+        None
+    };
+    let warning = match stats {
+        Some(Ok((truncated, tool_events, native_tool_records, official))) => {
+            if agent.profile.is_some() {
+                // The native import uses the installed provider. Its new session starts through the profile.
+                check_new_launcher()?;
+            }
+            return Ok(if official {
+                build_official_import_report_for_snapshot(
+                    snapshot,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                    native_tool_records,
+                )
+            } else {
+                build_native_materialization_report_for_snapshot(
+                    snapshot,
+                    target,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                    native_tool_records,
+                )
+            });
         }
-        Ok((truncated, tool_events, native_tool_records, true)) => {
-            build_official_import_report_for_snapshot(
-                snapshot,
-                repository_matches,
-                truncated,
-                tool_events,
-                native_tool_records,
-            )
+        Some(Err(error)) => Some(format!(
+            "native import unavailable: {}",
+            safe_terminal_line(&format!("{error:#}"))
+        )),
+        None => None,
+    };
+    check_new_launcher().with_context(|| {
+        let context = format!("checking the {agent} launcher for a semantic handoff");
+        match &warning {
+            Some(reason) => format!("{context} ({reason})"),
+            None => context,
         }
-        Ok((truncated, tool_events, native_tool_records, false)) => {
-            build_native_materialization_report_for_snapshot(
-                snapshot,
-                target,
-                repository_matches,
-                truncated,
-                tool_events,
-                native_tool_records,
-            )
-        }
-    })
+    })?;
+    let mut report =
+        build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
+    if let Some(warning) = warning {
+        report.warnings.push(warning);
+    }
+    Ok(report)
 }
 
 fn inspect_import_stats(
     snapshot: &CanonicalSnapshot,
-    target: Provider,
+    agent: AgentTarget,
     project: &Path,
 ) -> Option<Result<(bool, usize, usize, bool)>> {
+    let target = agent.provider;
     let stats = match target {
         Provider::Claude => resolved_provider_binary(target)
             .and_then(|binary| claude_import::ensure_supported(&binary))
@@ -2196,6 +2542,7 @@ fn inspect_import_stats(
         Provider::Codex => resolved_provider_binary(target)
             .and_then(|binary| codex_import::ensure_supported(&binary))
             .and_then(|_| codex_import::build(snapshot))
+            .and_then(|import| import.for_launch_profile(agent.profile))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, project))
@@ -2293,8 +2640,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         picked_target: false,
         mode: args.mode,
     };
-    let task_binding = (task.id, args.branch.clone());
-    resume(registry, &resume_args, json_output, Some(&task_binding))
+    resume(registry, &resume_args, json_output, Some(&binding))
 }
 
 fn task(registry: &AdapterRegistry, args: TaskArgs, json_output: bool) -> Result<()> {
@@ -2378,44 +2724,9 @@ fn bind_task_session(
         .selected_task(project)
         .context("reading selected task")?
         .ok_or_else(|| anyhow!("no selected task; run `omni task start NAME`"))?;
-    let prior = store
-        .current_binding(selected.id, branch)
-        .context("reading prior branch head")?;
-    let lineage = prior
-        .as_ref()
-        .filter(|prior| prior.session != *session)
-        .and_then(|prior| match registry.read_session_indexed(&prior.session) {
-            Ok(source) => Some((prior, source)),
-            Err(error) => {
-                eprintln!(
-                    "warning: prior `{}` could not be read ({}); binding without handoff lineage.",
-                    prior.session,
-                    safe_terminal_line(&format!("{error:#}"))
-                );
-                None
-            }
-        });
-    if let Some((prior, source)) = lineage {
-        let report = fidelity_report_for_snapshot(
-            &source,
-            session.provider,
-            workspace_state_matches(&source.workspace, project)?,
-        );
-        store
-            .record_handoff_and_bind(
-                selected.id,
-                branch,
-                &prior.session,
-                session,
-                report.mode,
-                &serde_json::to_value(&report)?,
-            )
-            .context("recording handoff and binding session")?;
-    } else {
-        store
-            .bind_session(selected.id, branch, session)
-            .context("binding session")?;
-    }
+    store
+        .bind_session(selected.id, branch, session)
+        .context("binding session")?;
     if json_output {
         println!(
             "{}",
@@ -2447,15 +2758,25 @@ fn validate_session_workspace(
     session: &SessionRef,
     project: &Path,
 ) -> Result<()> {
-    let snapshot = registry
-        .read_session_indexed(session)
+    let read = registry
+        .read_selected_session_indexed(session, None)
         .with_context(|| format!("validating `{session}`"))?;
-    if source_workspace_matches_for_session(session, &snapshot, project)? {
+    let directory = if session.provider == Provider::Codex {
+        let directory = verified_codex_directory(&read).with_context(|| {
+            format!("session `{session}` has no verified workspace for this task")
+        })?;
+        if workspace_paths_match(&directory, project) {
+            return Ok(());
+        }
+        directory
+    } else if source_workspace_matches_for_session(session, &read.snapshot, project)? {
         return Ok(());
-    }
+    } else {
+        read.snapshot.workspace.root
+    };
     bail!(
         "session `{session}` belongs to `{}`, not `{}`",
-        snapshot.workspace.root.display(),
+        directory.display(),
         project.display()
     )
 }
@@ -2474,16 +2795,15 @@ fn source_workspace_matches_with_cache(
     project: &Path,
     current_remote: &OnceCell<Option<String>>,
 ) -> Result<bool> {
-    if source_workspace_matches(snapshot, project) {
+    if omnis_core::session_workspace_matches(
+        snapshot.session.provider,
+        &snapshot.workspace.root,
+        project,
+    ) {
         return Ok(true);
     }
     if session.provider != Provider::Imported
-        || snapshot.workspace.root.as_os_str().is_empty()
-        || snapshot
-            .workspace
-            .root
-            .try_exists()
-            .context("checking source workspace")?
+        || !can_relocate_workspace(snapshot.session.provider, &snapshot.workspace.root)?
         || snapshot
             .workspace
             .git
@@ -2500,6 +2820,28 @@ fn source_workspace_matches_with_cache(
         current_remote.get_or_init(|| remote)
     };
     Ok(snapshot.workspace.git.remote_fingerprint.as_ref() == current.as_ref())
+}
+
+fn has_cursor_workspace_extension(provider: Provider, path: &Path) -> bool {
+    provider == Provider::CursorIde && path.extension().is_some_and(|ext| ext == "code-workspace")
+}
+
+fn cursor_workspace_file_path(provider: Provider, path: &Path) -> bool {
+    has_cursor_workspace_extension(provider, path)
+        && !omnis_core::local_cursor_workspace_path(path)
+            .is_ok_and(|resolved| resolved.is_some_and(|physical| physical.is_dir()))
+}
+
+fn can_relocate_workspace(provider: Provider, path: &Path) -> Result<bool> {
+    if path.as_os_str().is_empty()
+        || omnis_core::may_reach_network(path)
+        // A missing saved workspace cannot identify one repository. An existing folder with
+        // the same extension also stays in place, so neither case needs a configuration read.
+        || has_cursor_workspace_extension(provider, path)
+    {
+        return Ok(false);
+    }
+    Ok(!path.try_exists().context("checking source workspace")?)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -2524,7 +2866,10 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
     let mut snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
-    if snapshot.workspace.git.remote_fingerprint.is_none() {
+    // A saved workspace can contain several repositories. Its file path does not identify one.
+    if snapshot.workspace.git.remote_fingerprint.is_none()
+        && !cursor_workspace_file_path(snapshot.session.provider, &snapshot.workspace.root)
+    {
         match current_project() {
             Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
                 match workspace_remote_fingerprint(&current) {
@@ -2698,9 +3043,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store_search_document(
         store,
         &imported,
-        &bundle.snapshot,
-        true,
-        SourceRevision::default(),
+        SearchDocumentInput::Bundle(&bundle.snapshot),
         None,
         TrajectorySourceGuard::NewerSource,
     )
@@ -2954,27 +3297,25 @@ fn current_project() -> Result<PathBuf> {
     workspace_root(std::env::current_dir()?).context("resolving current workspace")
 }
 
-fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
-    workspace_paths_match(&source.workspace.root, project)
-}
-
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
-    println!("Transfer: {} -> {}", report.source, report.target);
-    println!("Mode: {}", report.mode);
-    println!("Repository match: {}", report.repository_matches);
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Transfer: {} -> {}", report.source, report.target)?;
+    writeln!(stdout, "Mode: {}", report.mode)?;
+    writeln!(stdout, "Repository match: {}", report.repository_matches)?;
     for entry in &report.entries {
         if let Some(detail) = &entry.detail {
-            println!(
+            writeln!(
+                stdout,
                 "  {:<24} {:?} ({})",
                 entry.feature,
                 entry.status,
                 safe_terminal_line(detail)
-            );
+            )?;
         } else {
-            println!("  {:<24} {:?}", entry.feature, entry.status);
+            writeln!(stdout, "  {:<24} {:?}", entry.feature, entry.status)?;
         }
     }
-    flush_stdout()?;
+    stdout.flush()?;
     for warning in &report.warnings {
         progress_line(&format!("warning: {warning}"))?;
     }
@@ -3060,7 +3401,7 @@ struct LaunchedProvider {
     _interrupts: Option<windows_console::InterruptScope>,
 }
 
-fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
+fn prepare_launch_command(plan: &LaunchPlan) -> Result<Command> {
     let provider = match plan.program.as_str() {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
@@ -3089,6 +3430,38 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
+    Ok(command)
+}
+
+/// Checks the CLI executable and environment without opening a session.
+fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
+    let mut failures = Vec::new();
+    for flag in ["--help", "--version"] {
+        let probe = target.launch(LaunchPlan {
+            args: vec![flag.to_owned()],
+            ..plan.clone()
+        })?;
+        let mut command = prepare_launch_command(&probe)?;
+        match omnis_adapters::bounded_provider_output(
+            command.stdin(Stdio::null()),
+            version_gate::PROBE_TIMEOUT,
+            None,
+            None,
+        ) {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => failures.push(format!("{flag} returned {}", output.status)),
+            Err(error) => failures.push(format!("{flag} failed: {error:#}")),
+        }
+    }
+    bail!(
+        "could not verify the {} launcher: {}",
+        target,
+        failures.join(", ")
+    )
+}
+
+fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
+    let mut command = prepare_launch_command(plan)?;
     #[cfg(windows)]
     let interrupts = windows_console::InterruptScope::ignore();
     let child = command
@@ -3133,11 +3506,6 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
                 session.id.clone(),
                 "--force".to_owned(),
             ]
-        }
-        Provider::OpenCode => {
-            let binary = resolved_provider_binary(session.provider)
-                .unwrap_or_else(|_| PathBuf::from("opencode"));
-            omnis_adapters::opencode_command_args(&binary, &["session", "delete", &session.id])?
         }
         Provider::Grok => {
             validate_grok_session_id(&session.id)?;
@@ -3219,7 +3587,16 @@ fn delete_native_session(
             let binary = cursor_ide_binary()?;
             Some(cursor_ide_import::delete_session(session, &binary)?)
         }
-        Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
+        Provider::OpenCode => {
+            let binary = resolved_provider_binary(Provider::OpenCode)?;
+            let cwd = workspace
+                .into_iter()
+                .chain(native.project_path.as_deref())
+                .find(|path| path.is_dir());
+            transfer::delete_opencode_session(&binary, session, cwd)?;
+            None
+        }
+        Provider::Codex | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
             None
         }
@@ -3228,13 +3605,15 @@ fn delete_native_session(
             provider_name(provider)
         ),
     };
+    // The provider has applied the deletion. Finish read-back under the same interrupt policy.
+    let _verification = interrupt::ProtectedCommand::enter();
     let sessions = registry
         .list_sessions(session.provider, None)
         .with_context(|| format!("verifying {} session deletion", session.provider))?;
     if sessions
         .iter()
         .any(|candidate| candidate.session == *session)
-        || registry.read_session(session).is_ok()
+        || (session.provider != Provider::OpenCode && registry.read_session(session).is_ok())
         || (session.provider == Provider::Grok
             && grok_session_directory_exists(
                 registry
@@ -3425,7 +3804,7 @@ fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
     Ok(file)
 }
 
-fn write_private_json(document: &Value) -> Result<NamedTempFile> {
+fn create_private_import_file() -> Result<NamedTempFile> {
     let _store = Store::open_default().context("validating OmniSession state root")?;
     let directory = state_root()
         .context("resolving OmniSession state")?
@@ -3447,19 +3826,11 @@ fn write_private_json(document: &Value) -> Result<NamedTempFile> {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .context("securing import directory")?;
     }
-    let mut file = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix("opencode-")
         .suffix(".json")
         .tempfile_in(&directory)
-        .context("creating private import")?;
-    serde_json::to_writer(file.as_file_mut(), document).context("writing private import")?;
-    file.as_file()
-        .sync_all()
-        .context("syncing private import")?;
-    if file.as_file().metadata()?.len() > MAX_BUNDLE_SIZE {
-        bail!("OpenCode import exceeds {MAX_BUNDLE_SIZE} byte safety limit");
-    }
-    Ok(file)
+        .context("creating private import")
 }
 
 fn sanitize_snapshot(mut snapshot: CanonicalSnapshot) -> CanonicalSnapshot {
@@ -4126,6 +4497,43 @@ mod tests {
     }
 
     #[test]
+    fn workspace_projection_keeps_git_metadata_only_for_the_recorded_directory() {
+        use omnis_adapters::{CodexWorkspaceProjection, ProviderAdapter};
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let id = "019fae41-ace0-7000-8000-123456789abc";
+        let path = sessions.join(format!("rollout-{id}.jsonl"));
+        let created = root.path().join("creation");
+        let moved = root.path().join("continuation");
+        let header = json!({"type":"session_meta","payload":{"id":id,"cwd":created,"git":{"branch":"creation-branch"}}});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let read = CodexAdapter::with_root(root.path())
+            .index_session(&SessionRef::new(Provider::Codex, id), Some(&path), u64::MAX)
+            .unwrap();
+        for (directory, expected_branch) in [
+            (Some(created), Some("creation-branch")),
+            (Some(moved), None),
+            (None, None),
+        ] {
+            let projection = CodexWorkspaceProjection::Observed(directory.clone());
+            let update = super::codex_workspace_update(
+                &read.snapshot,
+                read.source_revision,
+                false,
+                &projection,
+            )
+            .unwrap();
+            let omnis_store::CodexWorkspaceUpdate::Verified(workspace) = update else {
+                panic!("a stamped workspace projection must be accepted");
+            };
+            assert_eq!(workspace.project_path, directory);
+            assert_eq!(workspace.git_branch.as_deref(), expected_branch);
+        }
+    }
+
+    #[test]
     fn bundle_validation_rejects_network_workspace_roots() {
         let bundle = |root: &str| {
             let root = PathBuf::from(root);
@@ -4332,6 +4740,16 @@ mod tests {
         let current = tempfile::tempdir().expect("current workspace");
         let current_path = omnis_core::canonicalize_path(current.path()).expect("current path");
         let chosen_path = omnis_core::canonicalize_path(chosen.path()).expect("chosen path");
+        let service = chosen_path.join("service");
+        std::fs::create_dir(&service).expect("destination directory");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&chosen_path)
+                .status()
+                .expect("initialize destination repository")
+                .success()
+        );
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),
@@ -4359,7 +4777,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(chosen_path.clone()),
+            workspace_override: Some(service.clone()),
         };
 
         assert_eq!(
@@ -4382,7 +4800,22 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            omnis_core::canonicalize_path(chosen.path()).expect("chosen path")
+            chosen_path
+        );
+        let cursor = PickerSelection {
+            target: Provider::CursorIde.into(),
+            ..selection
+        };
+        assert_eq!(
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                false,
+                Some(&cursor)
+            )
+            .expect("selected Cursor IDE folder"),
+            service
         );
     }
 

@@ -14,15 +14,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
-    ProviderInstallation,
+    CodexWorkspaceProjection, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
+    NativeSession, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
         EventBuilder, JsonLineSkips, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, MAX_PREVIEW_TAIL_SIZE,
         MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, SnapshotFileStamp,
-        SqliteSnapshotCache, encode_uri_component, json_lines_preview_bounded, nested_files,
-        parse_timestamp, paths_match, percent_decode, provider_executable, provider_file,
-        provider_root, read_json, sort_sessions, string_at, validate_provider, value_at,
-        visit_json_lines_with_omissions,
+        SqliteSnapshotCache, WorkspaceGap, encode_uri_component, json_lines_preview_with_omissions,
+        nested_files, parse_timestamp, paths_match, percent_decode, provider_executable,
+        provider_file, provider_root, read_json, sort_sessions, string_at, validate_provider,
+        value_at, visit_json_lines_with_omissions,
     },
 };
 
@@ -369,8 +369,13 @@ impl GrokAdapter {
                     push,
                 )?;
             } else {
-                let preview =
-                    json_lines_preview_bounded(&file, SAMPLE_RECORDS, MAX_PREVIEW_TAIL_SIZE)?;
+                let preview = json_lines_preview_with_omissions(
+                    &file,
+                    SAMPLE_RECORDS,
+                    MAX_PREVIEW_TAIL_SIZE,
+                    MAX_TRANSCRIPT_LINE_SIZE,
+                    |_, _| WorkspaceGap::Other,
+                )?;
                 sampled = preview.sampled;
                 omissions = preview.omissions;
                 for record in preview.records {
@@ -1307,6 +1312,8 @@ impl ProviderAdapter for GrokAdapter {
         })?;
         Ok(IndexRead {
             snapshot,
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
+            rollback_title: RollbackTitle::Unknown,
             source_complete,
             source_revision,
             native_session: Some(native),

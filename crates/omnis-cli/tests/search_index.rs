@@ -718,14 +718,11 @@ fn assert_read_commands(
         .output()
         .expect("inspect imported source in reopened process");
     assert!(
-        inspected.status.success(),
-        "inspect imported source failed: {}",
-        String::from_utf8_lossy(&inspected.stderr)
+        !inspected.status.success(),
+        "the bundle needs an installed Codex to receive a handoff"
     );
-    let inspected: serde_json::Value =
-        serde_json::from_slice(&inspected.stdout).expect("inspect JSON");
-    assert_eq!(inspected["source"], "codex");
-    assert_eq!(inspected["target"], "codex");
+    assert!(String::from_utf8_lossy(&inspected.stderr).contains("OMNI_CODEX_BIN"));
+    assert!(inspected.stdout.is_empty());
 
     let exported_path = output_root.join("re-exported.json");
     let exported = environment

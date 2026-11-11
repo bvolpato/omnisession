@@ -21,9 +21,10 @@ use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 4] = [
+const PARSER_SOURCES: [&[u8]; 5] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
+    include_bytes!("current_rollout.rs"),
     include_bytes!("rollout_cache.rs"),
     include_bytes!("rollout_file.rs"),
 ];
@@ -73,7 +74,7 @@ pub(super) struct ObservedRollout {
 
 impl ObservedRollout {
     pub(super) fn read(path: &Path) -> Option<Self> {
-        super::path_uuid(path)?;
+        super::rollout_file::jsonl_file_name(path)?;
         let canonical = fs::canonicalize(path).ok()?;
         let path_id = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -179,9 +180,11 @@ impl RolloutStamp {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RolloutHeader {
     pub(super) id: String,
+    pub(super) forked_from_id: Option<Uuid>,
     pub(super) project_path: Option<PathBuf>,
     pub(super) git_branch: Option<String>,
     pub(super) cli_version: Option<String>,
+    pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }

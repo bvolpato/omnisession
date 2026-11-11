@@ -6,6 +6,7 @@ mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
+mod cursor_identity;
 mod grok;
 mod hermes;
 mod omp;
@@ -17,7 +18,7 @@ mod support;
 mod test_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -31,17 +32,27 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
+pub use cursor_identity::{
+    cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
+};
 pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, bounded_opencode_json_output, canonicalize_opencode_export,
-    find_opencode_session_with_binary, fork_opencode_session_with_binary, installed_opencode_model,
+    OpenCodeAdapter, OpenCodeGeneration, bounded_opencode_json_output,
+    canonicalize_opencode_export, find_opencode_session_with_binary,
+    fork_opencode_session_with_binary, installed_opencode_model,
     installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
-    read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
-pub use provider_process::{bounded_provider_output, provider_process};
+#[cfg(windows)]
+pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
+pub use provider_process::{
+    ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
+    bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
+    inherit_provider_probes, provider_process, with_provider_probes,
+};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,11 +79,101 @@ pub struct NativeSession {
     pub source_revision: Option<SourceRevision>,
 }
 
+/// The opener confirmed by a full ordinary Codex read or by reconstructing an applied rollback.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RollbackTitle {
+    #[default]
+    Unknown,
+    /// An empty title means the surviving transcript has no eligible user opener.
+    Known(Option<String>),
+    /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
+    UnknownAfterWithdrawal(WithdrawnOpeners),
+}
+
+/// Bounded evidence about local opening titles removed before the first unreadable row.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WithdrawnOpeners {
+    hashes: Vec<[u8; 32]>,
+    overflowed: bool,
+}
+
+impl WithdrawnOpeners {
+    fn record(&mut self, hash: [u8; 32]) {
+        if !self.hashes.contains(&hash) {
+            if self.hashes.len() < 8 {
+                self.hashes.push(hash);
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+
+    fn reissued(&mut self, title: &str) {
+        if !self.hashes.is_empty() {
+            let hash = RollbackTitle::fingerprint(title);
+            self.hashes.retain(|previous| *previous != hash);
+        }
+    }
+
+    fn after_gap(&self) -> RollbackTitle {
+        if self.hashes.is_empty() && !self.overflowed {
+            RollbackTitle::Unknown
+        } else {
+            RollbackTitle::UnknownAfterWithdrawal(self.clone())
+        }
+    }
+}
+
+impl RollbackTitle {
+    fn fingerprint(title: &str) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(title.as_bytes()).into()
+    }
+
+    /// Whether this reconstruction witnessed the saved opener being removed before a gap.
+    #[must_use]
+    pub fn withdraws(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.hashes.contains(&Self::fingerprint(title)))
+    }
+
+    /// Whether a single-title check can resolve an overflow in the bounded withdrawal history.
+    #[must_use]
+    pub fn needs_withdrawal_check(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.overflowed && !self.withdraws(title))
+    }
+}
+
+/// The effective workspace established independently of the amount of indexed conversation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CodexWorkspaceProjection {
+    #[default]
+    Unchecked,
+    /// No directory means the selected rollout establishes that its workspace is unknown.
+    Observed(Option<PathBuf>),
+}
+
+impl CodexWorkspaceProjection {
+    fn from_reconstruction(verified: bool, directory: Option<&Path>) -> Self {
+        if verified {
+            Self::Observed(
+                directory
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            )
+        } else {
+            Self::Unchecked
+        }
+    }
+}
+
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
+    pub rollback_title: RollbackTitle,
+    /// The workspace projection belongs to this read's source revision.
+    pub workspace_projection: CodexWorkspaceProjection,
     pub source_complete: bool,
     pub source_revision: SourceRevision,
 }
@@ -100,6 +201,15 @@ impl Default for LaunchTarget {
 pub enum EnvChange {
     Set { name: String, value: String },
     Remove(String),
+}
+
+/// State database settings that a Codex launch profile supplies.
+#[derive(Debug, Default)]
+pub struct CodexLaunchOverrides {
+    pub project_root_markers: Option<Vec<String>>,
+    pub profile: Option<String>,
+    pub sqlite_home: Option<PathBuf>,
+    pub environment: Option<EnvChange>,
 }
 
 /// Command description. Callers decide whether and how to execute it.
@@ -174,6 +284,20 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot resolve the launch configuration.
+    fn codex_continuation_sqlite_home(
+        &self,
+        _session: Option<&SessionRef>,
+        _cwd: &Path,
+        _overrides: &CodexLaunchOverrides,
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Non-fatal discovery observations from this adapter.
     ///
     /// Notes may be computed during the first `list_sessions` call and reused.
@@ -188,6 +312,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// session can be treated as deleted only after complete discovery. The default preserves it.
     fn discovery_is_complete(&self) -> bool {
         false
+    }
+
+    /// Returns the cached Codex sessions that their recorded rollout selections rule out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider's current selections cannot be checked.
+    fn unavailable_codex_rollouts(
+        &self,
+        _prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
     }
 
     /// Reads one provider-native session into canonical events.
@@ -259,6 +395,8 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
+            rollback_title: RollbackTitle::Unknown,
             native_session: None,
             snapshot,
             source_complete,

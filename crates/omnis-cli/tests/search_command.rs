@@ -15,6 +15,104 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn a_missing_current_rollout_revokes_only_its_cached_session_after_incomplete_discovery() {
+    let source = format!("codex:{CODEX_ID}");
+    for command in [
+        &["index", "--provider", "codex"][..],
+        &["show", &source],
+        &["show", CODEX_ID],
+        &["search", "Pagination", "--provider", "codex"],
+        &["search", "Pagination", "--no-index", "--provider", "codex"],
+    ] {
+        check_missing_current_rollout(command);
+    }
+}
+
+fn check_missing_current_rollout(command: &[&str]) {
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let day = codex.join("sessions/2026/01/02");
+    let original = day.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"));
+    let peer = day.join(format!(
+        "rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+    ));
+    let generation = "019f0000-0000-7000-8000-000000000093";
+    let current = day.join(format!(
+        "rollout-2026-01-02T00-00-00-{CODEX_ID}_{generation}.jsonl"
+    ));
+    let db = rusqlite::Connection::open(codex.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        rusqlite::params![CODEX_ID, original.to_str().unwrap()],
+    )
+    .unwrap();
+    fixture.index_codex();
+    let results = |query, mode| {
+        result_sessions(&fixture.search_json(&[
+            query,
+            mode,
+            "--all-projects",
+            "--provider",
+            "codex",
+        ]))
+    };
+    assert_eq!(
+        results("Pagination", "--cached"),
+        [format!("codex:{CODEX_ID}")]
+    );
+
+    fs::remove_file(&original).unwrap();
+    fs::remove_file(peer).unwrap();
+    let malformed =
+        day.join("rollout-2026-01-02T00-00-00-019f0000-0000-7000-8000-000000000094.jsonl");
+    fs::write(malformed, "{incomplete unrelated header").unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1, history_mode='paginated' WHERE id=?2",
+        rusqlite::params![current.to_str().unwrap(), CODEX_ID],
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .arg("--json")
+        .args(command)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.success(), command[0] != "show", "{command:?}");
+    if command[0] == "search" {
+        assert!(result_sessions(&serde_json::from_slice(&output.stdout).unwrap()).is_empty());
+    }
+    assert!(results("Pagination", "--cached").is_empty());
+    assert_eq!(
+        results("zebracorn", "--cached"),
+        [format!("codex:{OTHER_CODEX_ID}")]
+    );
+
+    write_jsonl(
+        &current,
+        &[
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
+              "history_mode":"paginated","cwd":fixture.workspace}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"item_completed","thread_id":CODEX_ID,
+              "turn_id":"restored","item":{"type":"AgentMessage","id":"answer","content":[
+                  {"type":"Text","text":"Restored cinnabar response"}]}}}),
+            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant",
+              "content":[{"type":"output_text","text":"Restored cinnabar response"}]}}),
+        ],
+    );
+    assert_eq!(fixture.index_codex()["indexed"], 1);
+    assert_eq!(
+        results("cinnabar", "--cached"),
+        [format!("codex:{CODEX_ID}")]
+    );
+    assert!(results("Pagination", "--cached").is_empty());
+    assert_eq!(fixture.index_codex()["stale"], 0);
+}
+
+#[test]
 fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
     for (direct_read, seconds_older) in [(false, 0), (true, 0), (true, 60)] {
         let fixture = Fixture::new();
@@ -98,14 +196,87 @@ fn a_preferred_rollout_replaces_warm_search_even_with_the_same_mtime() {
 }
 
 #[test]
+fn index_saves_the_workspace_from_a_large_rollback_while_search_text_stays_sampled() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let moved = fixture.root.join("other-workspace");
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    fs::remove_file(&path).unwrap();
+    let mut writer = GzEncoder::new(
+        fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
+        Compression::fast(),
+    );
+    let user =
+        |text: &str| json!({"type":"event_msg","payload":{"type":"user_message","message":text}});
+    let context = |cwd: &Path| json!({"type":"turn_context","payload":{"cwd":cwd}});
+    for record in [
+        json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace}}),
+        context(&fixture.workspace),
+        user("opening request"),
+        context(&moved),
+        user("second turn"),
+        json!({"type":"event_msg","payload":{"type":"agent_message","message":"Amethystlarch surviving reply"}}),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    let padding = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"fixture","output":"a".repeat(64_000)}}).to_string();
+    for _ in 0..268 {
+        writeln!(writer, "{padding}").unwrap();
+    }
+    for record in [
+        context(&fixture.workspace),
+        user("temporary third turn"),
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    writer.finish().unwrap();
+    fixture.index_codex();
+    for cached in [false, true] {
+        for (project, expected) in [(&fixture.workspace, false), (&moved, true)] {
+            let mut args = vec![
+                "Amethystlarch",
+                "--show-text",
+                "--provider",
+                "codex",
+                "--project",
+                project.to_str().unwrap(),
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            let results = fixture.search_json(&args);
+            assert_eq!(
+                result_sessions(&results).contains(&format!("codex:{CODEX_ID}")),
+                expected,
+                "{results}"
+            );
+            if expected {
+                assert_eq!(results["results"][0]["coverage"], "preview");
+                assert_eq!(
+                    results["results"][0]["project_path"],
+                    moved.to_str().unwrap()
+                );
+            }
+        }
+    }
+    assert_eq!(fixture.index_codex()["indexed"], 0);
+}
+
+#[test]
 fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
-    for (from_creation, query) in [
-        (true, "plumworkspacereply"),
-        (false, "plumworkspacereply"),
-        (true, "saffroncreationbranch"),
+    for (from_creation, query, damaged) in [
+        (true, "plumworkspacereply", false),
+        (false, "plumworkspacereply", false),
+        (false, "plumworkspacereply", true),
+        (true, "saffroncreationbranch", false),
     ] {
         let fixture = Fixture::new();
         let moved = fixture.root.join("other-workspace");
@@ -117,12 +288,28 @@ fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
             fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
             Compression::fast(),
         );
+        let header = json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}});
+        writeln!(writer, "{header}").unwrap();
+        if damaged {
+            writer
+                .write_all(b"{\"type\":\"turn_context\",\"payload\":\n")
+                .unwrap();
+        }
         for record in [
-            json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}}),
             json!({"type":"turn_context","payload":{"cwd":moved}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find my active request"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"plumworkspacereply"}]}}),
         ] {
             writeln!(writer, "{record}").unwrap();
+        }
+        if damaged {
+            for discarded in [
+                json!({"type":"turn_context","payload":{"cwd":fixture.workspace}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Discard this turn"}]}}),
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+            ] {
+                writeln!(writer, "{discarded}").unwrap();
+            }
         }
         writer.finish().unwrap();
         let project = if from_creation {
@@ -463,11 +650,12 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
                 derived_title: None,
                 withdrawn_title: None,
                 title_is_verified: false,
+                local_opener: omnis_store::LocalOpenerEvidence::Unknown,
             },
         )
         .unwrap();
     assert_eq!(
-        result_sessions(&fixture.search_json(&["Superseded", "--cached"])),
+        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"])),
         [session.to_string()]
     );
     assert!(
@@ -479,9 +667,12 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
             .status
             .success()
     );
-    assert!(result_sessions(&fixture.search_json(&["Superseded", "--cached"])).is_empty());
+    assert!(
+        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"]))
+            .is_empty()
+    );
     assert_eq!(
-        result_sessions(&fixture.search_json(&["unchanged", "--cached"])),
+        result_sessions(&fixture.search_json(&["unchanged", "--cached", "--all-projects"])),
         [session.to_string()]
     );
 }
@@ -495,7 +686,7 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
         fixture.add_missing_ancestor();
         fixture.index_codex();
         let search = |word, cached| {
-            let mut args = vec!["--provider", "codex", "--show-text", word];
+            let mut args = vec!["--provider", "codex", "--show-text", "--all-projects", word];
             if cached {
                 args.push("--cached");
             }
@@ -578,7 +769,14 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
         };
         append(&source);
         let search = |query: &str| {
-            fixture.search_json(&["--provider", "codex", "--show-text", "--cached", query])
+            fixture.search_json(&[
+                "--provider",
+                "codex",
+                "--show-text",
+                "--cached",
+                "--all-projects",
+                query,
+            ])
         };
         fixture.index_codex();
         assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
@@ -593,7 +791,13 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
             }
         }
         let original = fs::read(&path).unwrap();
-        let live = fixture.search_json(&["--provider", "codex", "--show-text", "backoff"]);
+        let live = fixture.search_json(&[
+            "--provider",
+            "codex",
+            "--show-text",
+            "--all-projects",
+            "backoff",
+        ]);
         for results in [live, search("backoff")] {
             if repeated_later {
                 assert_eq!(results["results"][0]["match"], "conversation");
@@ -606,6 +810,114 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
         assert_eq!(fixture.index_codex()["indexed"], 0);
         assert_eq!(fs::read(path).unwrap(), original);
     }
+}
+
+#[test]
+fn sampled_ordinary_rollback_replaces_a_previously_verified_title() {
+    assert_sampled_rollback_title(false);
+}
+
+#[test]
+fn sampled_legacy_rollback_repairs_a_title_cached_before_its_mode_was_recognized() {
+    assert_sampled_rollback_title(true);
+}
+
+fn assert_sampled_rollback_title(old_legacy_cache: bool) {
+    use std::io::{BufWriter, Write};
+
+    let fixture = Fixture::new();
+    let path = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    if old_legacy_cache {
+        let mut rows: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["payload"]["history_mode"] = json!("legacy");
+        write_jsonl(&path, &rows);
+    }
+    let cached = |query: &str| {
+        fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
+    };
+    fixture.index_codex();
+    assert_eq!(
+        cached(CODEX_ID)["results"][0]["title"],
+        "Tune the rate limiter backoff"
+    );
+    let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
+    let pad = format!(
+        "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}",
+        " ".repeat(1024 * 1024)
+    );
+    for _ in 0..16 {
+        writeln!(file, "{pad}").unwrap();
+    }
+    for row in [
+        json!({"type":"dynamic_tools_updated","payload":{"thread_id":CODEX_ID,"tools":[]}}),
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"Investigate latency instead"}]}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"Queue delay explains the slowdown"}]}}),
+    ] {
+        writeln!(file, "{row}").unwrap();
+    }
+    drop(file.into_inner().unwrap());
+    let original = fs::read(&path).unwrap();
+    if old_legacy_cache {
+        fixture.index_codex();
+        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        db.execute_batch(
+            "DROP TABLE codex_workspace_rechecks;
+             CREATE TABLE codex_workspace_rechecks(
+                 trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+                 source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
+        ).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE session_trajectories SET derived_title='Tune the rate limiter backoff',
+                 derived_title_is_verified=1,derived_title_is_local_opener=0
+                 WHERE provider='codex' AND session_id=?1 AND source_complete=0",
+                [CODEX_ID],
+            )
+            .unwrap(),
+            1,
+        );
+    }
+
+    if old_legacy_cache {
+        let pending = fixture.search_json(&["slowdown", "--provider", "codex"]);
+        assert!(result_sessions(&pending).is_empty());
+        assert!(
+            pending["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .unwrap()
+                        .contains("omni index --provider codex")
+                }),
+            "{pending}"
+        );
+        fixture.index_codex();
+    }
+    let live = fixture.search_json(&["backoff", "--provider", "codex", "--show-text"]);
+    assert!(result_sessions(&live).is_empty());
+    assert!(result_sessions(&cached("backoff")).is_empty());
+    let retained = cached("slowdown");
+    let scoped = fixture.search_json(&["slowdown", "--provider", "codex", "--show-text"]);
+    assert_eq!(scoped["results"][0]["title"], "Investigate latency instead");
+    assert_eq!(
+        retained["results"][0]["title"],
+        "Investigate latency instead"
+    );
+    assert_eq!(retained["results"][0]["coverage"], "preview");
+    assert_eq!(fixture.index_codex()["stale"], 0);
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -887,7 +1199,16 @@ fn a_fully_read_fork_with_missing_history_stays_partial_without_reindexing() {
         let first = fixture.index_codex();
         assert_eq!(first["indexed"], if direct_read { 1 } else { 2 });
         assert_eq!(fixture.index_codex()["indexed"], 0);
-        let cached = fixture.search_json(&["unchanged", "--provider", "codex", "--cached"]);
+        let project = fixture.search_json(&["unchanged", "--provider", "codex", "--cached"]);
+        assert!(result_sessions(&project).is_empty());
+        let cached = fixture.search_json(&[
+            "unchanged",
+            "--provider",
+            "codex",
+            "--cached",
+            "--all-projects",
+        ]);
+        assert_eq!(cached["results"][0].get("project_path"), Some(&Value::Null));
         assert_eq!(cached["results"][0]["coverage"], "preview");
     }
 }
@@ -1287,6 +1608,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env("CODEX_SQLITE_HOME", self.root.join("codex"))
             .env("GROK_HOME", self.root.join("grok"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
