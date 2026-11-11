@@ -685,3 +685,45 @@ fn paginated_revisions_share_the_item_id_across_display_kinds() {
         }
     }
 }
+
+#[test]
+fn a_context_compaction_revises_the_display_without_retaining_an_old_objective() {
+    for item in [
+        json!({"type":"ContextCompaction","id":"shared"}),
+        json!([18, "shared"]),
+    ] {
+        let mut rows = vec![
+            page_user("turn", "older", "still active objective"),
+            page_user("turn", "shared", "superseded objective"),
+            turn_item("turn", &item),
+            page_user("turn", "later", "later request"),
+        ];
+        for restored in [false, true] {
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(
+                    search.source_complete && !search.text.contains("superseded objective"),
+                    "{item}"
+                );
+                assert!(
+                    !omnis_core::render_semantic_handoff(&snapshot)
+                        .contains("superseded objective")
+                );
+                let expected = if restored {
+                    vec![
+                        "still active objective",
+                        "restored position",
+                        "later request",
+                    ]
+                } else {
+                    vec!["still active objective", "later request"]
+                };
+                assert_eq!(visible_text(&snapshot), expected);
+                assert_eq!(omnis_core::import_trajectory(&snapshot).tool_events, 0);
+            }
+            rows.push(page_user("turn", "shared", "restored position"));
+        }
+    }
+}

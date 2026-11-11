@@ -27,6 +27,7 @@ use crate::{
 mod attachments;
 mod checkpoint_wire;
 mod completed_item;
+mod completion_positions;
 mod display_text;
 mod message_mirrors;
 mod model_cut;
@@ -826,6 +827,7 @@ enum CompletedKind {
     User,
     Assistant,
     AsyncAssistant,
+    Compaction,
     Plan,
     Tool,
 }
@@ -841,6 +843,7 @@ impl CompletedKind {
             }
             Some("AgentMessage") => Self::Assistant,
             Some("Plan") => Self::Plan,
+            Some("ContextCompaction") => Self::Compaction,
             _ => Self::Tool,
         }
     }
@@ -1951,34 +1954,6 @@ impl CodexHistory {
         }
     }
 
-    fn completion_position(
-        &self,
-        turn: &str,
-        id: &str,
-        kind: CompletedKind,
-        display: bool,
-    ) -> (CompletionScope, Option<u64>) {
-        let positions = self.completed.get(turn);
-        let published = (CompletionScope::Published, id.to_owned());
-        let separate = (CompletionScope::Historical(kind), id.to_owned());
-        // The paginated display revises one item per ID. A model-only receipt can also
-        // share its call ID with a separately published asynchronous question.
-        let use_published = self.paginated
-            && (display
-                || positions
-                    .and_then(|p| p.get(&published))
-                    .is_some_and(|p| p.kind == kind));
-        let key = if use_published {
-            published
-        } else {
-            separate.clone()
-        };
-        let original = positions
-            .and_then(|p| p.get(&key).or_else(|| p.get(&separate)))
-            .map(|p| p.sequence);
-        (key.0, original)
-    }
-
     fn push_identified_item(
         &mut self,
         builder: &mut EventBuilder,
@@ -1993,7 +1968,7 @@ impl CodexHistory {
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
         let kind = CompletedKind::for_item(payload);
-        let (scope, original) = self.completion_position(&native_turn, id, kind, display);
+        let (scope, original) = self.completion_position(builder, &native_turn, id, kind, display);
         let owner = self
             .named_turns
             .get(&native_turn)
@@ -2503,11 +2478,7 @@ impl CodexItems {
         if let Some(sequence) = original
             && let Some(previous) = builder.event_at_mut(sequence)
         {
-            let has_model = previous
-                .source
-                .raw_record_type
-                .as_deref()
-                .is_some_and(|raw| raw.starts_with("response_item.") && raw.ends_with("_output"));
+            let has_model = completion_positions::model_output(previous);
             let failed_display = previous.kind == EventKind::ToolFailed
                 && (!has_model || model_result_kind(&previous.payload) != EventKind::ToolFailed);
             if display && has_model {
@@ -2541,7 +2512,7 @@ impl CodexItems {
             );
         }
         self.projected = Some(sequence);
-        if kind != EventKind::PlanUpdated {
+        if !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent) {
             self.tool_events += 1;
         }
         builder.push(
@@ -2566,7 +2537,7 @@ fn push_completed_item(
         Some("AgentMessage") => EventKind::MessageAssistant,
         _ => {
             if let Some((kind, payload)) = completed_item::historical_item(item) {
-                let id = (kind != EventKind::PlanUpdated)
+                let id = (!matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent))
                     .then(|| item["id"].as_str())
                     .flatten();
                 items.push_historical(
@@ -2686,6 +2657,11 @@ fn push_message_text<'a>(
             .mirrors
             .observe(&kind, text, matching, raw_type, builder.checkpoint())
     };
+    let matched = matched.filter(|seq| {
+        builder
+            .event_at_mut(*seq)
+            .is_some_and(|event| !completion_positions::model_output(event))
+    });
     let sequence = matched.unwrap_or_else(|| builder.checkpoint());
     items.message = Some(VisibleMessage {
         kind: kind.clone(),
@@ -2961,10 +2937,6 @@ fn scoped_model_call_id(payload: &Value, scoped: bool) -> Option<&str> {
         | "local_shell_call" => tool_wire_id(payload, scoped),
         _ => None,
     }
-}
-
-fn model_result_id(payload: &Value) -> Option<&str> {
-    scoped_model_result_id(payload, false)
 }
 
 fn scoped_model_result_id(payload: &Value, scoped: bool) -> Option<&str> {

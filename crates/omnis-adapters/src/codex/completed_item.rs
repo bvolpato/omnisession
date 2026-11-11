@@ -130,6 +130,7 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     let item_type = item["type"].as_str()?;
     let fields: &[&str] = match item_type {
         "Plan" => &["text"],
+        "ContextCompaction" => &[],
         "CommandExecution" => &["command", "cwd", "exit_code"],
         "FileChange" => &["changes", "stdout", "stderr"],
         "FunctionCallOutput" => &["name", "namespace"],
@@ -184,6 +185,7 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     }
     let kind = match (item_type, item["status"].as_str()) {
         ("Plan", _) => EventKind::PlanUpdated,
+        ("ContextCompaction", _) => EventKind::ProviderEvent,
         (_, Some("failed" | "declined" | "interrupted")) => EventKind::ToolFailed,
         (_, Some("in_progress" | "inProgress")) => EventKind::ToolCalled,
         ("CommandExecution", _) => EventKind::CommandExecuted,

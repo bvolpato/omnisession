@@ -1506,3 +1506,70 @@ fn an_empty_result_without_one_same_turn_call_keeps_separate_evidence() {
         }
     }
 }
+
+#[test]
+fn successive_empty_call_ids_preserve_the_order_of_both_raw_results() {
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "u", "request"),
+    ];
+    for (name, body) in [("call_one", "result one"), ("call_two", "result two")] {
+        let [mut call, result, _] = command_rows("turn", "", body);
+        call["payload"]["name"] = name.into();
+        rows.extend([call, result]);
+    }
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let evidence: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter_map(|e| {
+                e.payload
+                    .get("output")
+                    .or_else(|| e.payload.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            ["call_one", "result one", "call_two", "result two"]
+        );
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            omnis_core::render_semantic_handoff(&snapshot),
+        ] {
+            for marker in ["result one", "result two"] {
+                assert_eq!(text.matches(marker).count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_checkpoint_retains_an_empty_id_output_only_with_its_original_call() {
+    let [call, result, _] = command_rows("turn", "", "public outcome");
+    let display = turn_item(
+        "turn",
+        &json!({"type":"FunctionCallOutput","id":"","name":"exec_command","output":"public outcome"}),
+    );
+    let mut wrong_call = call["payload"].clone();
+    wrong_call["name"] = "some_other_call".into();
+    for (copy, kept) in [(call["payload"].clone(), true), (wrong_call, false)] {
+        let rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "u", "request"),
+            call.clone(),
+            result.clone(),
+            display.clone(),
+            json!({"type":"compacted","payload":{"window_number":1,"message":"","replacement_history":[copy,result["payload"]]}}),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                omnis_core::render_semantic_handoff(&snapshot).contains("public outcome"),
+                kept
+            );
+        }
+    }
+}

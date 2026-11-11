@@ -1057,3 +1057,38 @@ fn malformed_image_and_extension_revisions_leave_the_previous_display() {
         );
     }
 }
+
+#[test]
+fn replacing_a_published_slot_preserves_one_physical_model_result() {
+    for command_first in [true, false] {
+        let message = page_user("turn", "cmd", "shared slot request");
+        let display = command("turn", "completed");
+        let mut records = vec![event("task_started", json!({"turn_id":"turn"}))];
+        if !command_first {
+            records.push(message.clone());
+        }
+        records.extend([call(Some("turn")), model_result("recorded result"), display]);
+        if command_first {
+            records.push(message);
+        }
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                results(&snapshot),
+                [(&EventKind::ToolCompleted, "recorded result")]
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert_eq!(text.matches("recorded result").count(), 1, "{text}");
+                assert_eq!(
+                    text.contains("shared slot request"),
+                    command_first,
+                    "{text}"
+                );
+                assert!(!text.contains("display result"), "{text}");
+            }
+        }
+    }
+}
