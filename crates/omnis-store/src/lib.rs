@@ -227,11 +227,13 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         provider, session_id, redacted_text, content_hash,
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
-        truncation_strategy, origin, protected_by_bundle, document_version, derived_title
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
+        source_updated_submillis
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
+        source_updated_submillis = excluded.source_updated_submillis,
         source_complete = excluded.source_complete,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
@@ -253,12 +255,22 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ) THEN excluded.derived_title
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
-    WHERE excluded.document_version >= session_trajectories.document_version AND (
+    WHERE excluded.document_version >= session_trajectories.document_version
+      AND (
+          excluded.source_complete >= session_trajectories.source_complete
+          OR (excluded.document_version = session_trajectories.document_version
+              AND (NOT ?15 OR session_trajectories.source_updated_submillis IS NOT NULL))
+      ) AND (
        excluded.document_version > session_trajectories.document_version
-       OR excluded.source_updated_at > session_trajectories.source_updated_at
-       OR (?15 AND excluded.source_updated_at < session_trajectories.source_updated_at)
+       OR (excluded.source_updated_at, excluded.source_updated_submillis)
+           > (session_trajectories.source_updated_at, coalesce(session_trajectories.source_updated_submillis, 0))
+       OR (?15 AND (
+           excluded.source_updated_at IS NOT session_trajectories.source_updated_at
+           OR excluded.source_updated_submillis IS NOT session_trajectories.source_updated_submillis
+       ))
        OR (
-           excluded.source_updated_at = session_trajectories.source_updated_at
+           (excluded.source_updated_at, excluded.source_updated_submillis)
+           = (session_trajectories.source_updated_at, coalesce(session_trajectories.source_updated_submillis, 0))
            AND (
                excluded.source_complete > session_trajectories.source_complete
                OR (
@@ -491,6 +503,8 @@ pub enum TrajectorySourceGuard {
     NewerSource,
     /// A restored file may have any modification time. Only replace the source the reader saw.
     Observed(Option<DateTime<Utc>>),
+    /// A previous indexer recorded only the millisecond that contained the modification time.
+    ObservedLegacy(DateTime<Utc>),
 }
 
 impl TrajectorySourceGuard {
@@ -509,21 +523,32 @@ impl TrajectorySourceGuard {
         session: &SessionRef,
         source: DateTime<Utc>,
     ) -> Result<()> {
-        let Self::Observed(prior) = self else {
-            return Ok(());
+        let prior = match self {
+            Self::NewerSource => return Ok(()),
+            Self::Observed(prior) => prior.map(|time| {
+                (
+                    time.timestamp_millis(),
+                    Some(source_submillis(session.provider, time)),
+                )
+            }),
+            Self::ObservedLegacy(time) => Some((time.timestamp_millis(), None)),
         };
         let mut statement = transaction
-            .prepare_cached("SELECT source_updated_at FROM session_trajectories WHERE provider = ?1 AND session_id = ?2")
+            .prepare_cached("SELECT source_updated_at, source_updated_submillis FROM session_trajectories WHERE provider = ?1 AND session_id = ?2")
             .map_err(database_error)?;
         let current = statement
             .query_row(params![session.provider.to_string(), session.id], |row| {
-                row.get::<_, i64>(0)
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<u32>>(1)?))
             })
             .optional()
             .map_err(database_error)?;
         // A concurrent reader may still improve coverage of the same rollout.
-        if current == prior.map(|time| time.timestamp_millis())
-            || current == Some(source.timestamp_millis())
+        if current == prior
+            || current
+                == Some((
+                    source.timestamp_millis(),
+                    Some(source_submillis(session.provider, source)),
+                ))
         {
             Ok(())
         } else {
@@ -536,6 +561,8 @@ impl TrajectorySourceGuard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
     pub source_updated_at: DateTime<Utc>,
+    /// False for historical rows written before the index recorded file time below a millisecond.
+    pub source_time_precise: bool,
     pub source_complete: bool,
     pub document_version: u32,
 }
@@ -546,6 +573,8 @@ pub struct TrajectoryIndexState {
 pub struct TrajectoryIndexFailure {
     /// Source update time discovered when the read failed, when the provider reports one.
     pub source_updated_at: Option<DateTime<Utc>>,
+    /// Whether the indexer retained the full precision of the source time.
+    pub source_time_precise: bool,
     /// Search document version of the indexer whose read failed.
     pub document_version: u32,
 }
@@ -1751,7 +1780,8 @@ impl Store {
                         i64::from(write.document.origin == SessionTrajectoryOrigin::ImportedBundle),
                         i64::from(write.document.document_version),
                         write.document.derived_title,
-                        matches!(write.guard, TrajectorySourceGuard::Observed(_)),
+                        write.guard != TrajectorySourceGuard::NewerSource,
+                        source_submillis(write.session.provider, write.document.source_updated_at),
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1797,7 +1827,7 @@ impl Store {
                     WHERE provider = ?1
                       AND session_id = ?2
                       AND complete = 1
-                      AND source_updated_at >= ?3 AND (NOT ?4 OR source_updated_at = ?3)
+                      AND source_updated_at >= ?3 AND (NOT ?4 OR (source_updated_at = ?3 AND source_updated_submillis = ?5))
                 )
                 ",
                 params![
@@ -1805,6 +1835,7 @@ impl Store {
                     session.id,
                     source_updated_at.timestamp_millis(),
                     TrajectorySourceGuard::uses_file_time(session.provider),
+                    source_submillis(session.provider, source_updated_at),
                 ],
                 |row| row.get::<_, bool>(0),
             )
@@ -1831,13 +1862,14 @@ impl Store {
                 "SELECT EXISTS (
                     SELECT 1 FROM session_trajectories
                     WHERE provider = ?1 AND session_id = ?2
-                      AND source_complete = 1 AND source_updated_at >= ?3 AND (NOT ?4 OR source_updated_at = ?3)
+                      AND source_complete = 1 AND source_updated_at >= ?3 AND (NOT ?4 OR (source_updated_at = ?3 AND source_updated_submillis = ?5))
                 )",
                 params![
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
                     TrajectorySourceGuard::uses_file_time(session.provider),
+                    source_submillis(session.provider, source_updated_at),
                 ],
                 |row| row.get::<_, bool>(0),
             )
@@ -1857,20 +1889,23 @@ impl Store {
         let connection = self.connection.borrow();
         let row = connection
             .query_row(
-                "SELECT source_updated_at, source_complete, document_version FROM session_trajectories
+                "SELECT source_updated_at, source_complete, document_version, source_updated_submillis FROM session_trajectories
                  WHERE provider = ?1 AND session_id = ?2",
                 params![session.provider.to_string(), session.id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get::<_, u32>(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(database_error)?;
-        row.map(|(updated_at, source_complete, document_version)| {
-            Ok(TrajectoryIndexState {
-                source_updated_at: timestamp_from_db(updated_at)?,
-                source_complete,
-                document_version,
-            })
-        })
+        row.map(
+            |(updated_at, source_complete, document_version, remainder)| {
+                Ok(TrajectoryIndexState {
+                    source_updated_at: source_time_from_db(updated_at, remainder)?,
+                    source_time_precise: remainder.is_some(),
+                    source_complete,
+                    document_version,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -1885,7 +1920,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version
+                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_updated_submillis
                  FROM session_trajectories",
             )
             .map_err(database_error)?;
@@ -1897,20 +1932,28 @@ impl Store {
                     row.get::<_, i64>(2)?,
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<u32>>(5)?,
                 ))
             })
             .map_err(database_error)?;
         let mut states = std::collections::HashMap::new();
         for row in rows {
-            let (provider, session_id, source_updated_at, source_complete, document_version) =
-                row.map_err(|_| StoreError::CorruptStore)?;
+            let (
+                provider,
+                session_id,
+                source_updated_at,
+                source_complete,
+                document_version,
+                remainder,
+            ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
                 .map_err(|_| StoreError::CorruptStore)?;
             states.insert(
                 SessionRef::new(provider, session_id),
                 TrajectoryIndexState {
-                    source_updated_at: timestamp_from_db(source_updated_at)?,
+                    source_updated_at: source_time_from_db(source_updated_at, remainder)?,
+                    source_time_precise: remainder.is_some(),
                     source_complete,
                     document_version: u32::try_from(document_version)
                         .map_err(|_| StoreError::CorruptStore)?,
@@ -1931,7 +1974,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, document_version
+                "SELECT provider, session_id, source_updated_at, document_version, source_updated_submillis
                  FROM trajectory_index_failures",
             )
             .map_err(database_error)?;
@@ -1942,12 +1985,13 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<u32>>(4)?,
                 ))
             })
             .map_err(database_error)?;
         let mut failures = std::collections::HashMap::new();
         for row in rows {
-            let (provider, session_id, source_updated_at, document_version) =
+            let (provider, session_id, source_updated_at, document_version, remainder) =
                 row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
@@ -1955,7 +1999,10 @@ impl Store {
             failures.insert(
                 SessionRef::new(provider, session_id),
                 TrajectoryIndexFailure {
-                    source_updated_at: source_updated_at.map(timestamp_from_db).transpose()?,
+                    source_updated_at: source_updated_at
+                        .map(|time| source_time_from_db(time, remainder))
+                        .transpose()?,
+                    source_time_precise: remainder.is_some(),
                     document_version: u32::try_from(document_version)
                         .map_err(|_| StoreError::CorruptStore)?,
                 },
@@ -1979,10 +2026,11 @@ impl Store {
         connection
             .execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     provider, session_id, source_updated_at, document_version, failed_at, source_updated_submillis
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (provider, session_id) DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
+                     source_updated_submillis = excluded.source_updated_submillis,
                      document_version = excluded.document_version,
                      failed_at = excluded.failed_at",
                 params![
@@ -1994,6 +2042,7 @@ impl Store {
                         .map(DateTime::timestamp_millis),
                     i64::from(failure.document_version),
                     now_timestamp(),
+                    failure.source_updated_at.filter(|_| failure.source_time_precise).map(|time| source_submillis(session.provider, time)),
                 ],
             )
             .map_err(database_error)?;
@@ -2333,6 +2382,7 @@ impl Store {
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
+        ensure_source_time_columns(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -2760,6 +2810,26 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
              CHECK (updated_at_approximate IN (0, 1));",
         )
         .map_err(database_error)
+}
+
+fn ensure_source_time_columns(transaction: &Transaction<'_>) -> Result<()> {
+    // Existing rows keep a NULL remainder until their file is next read.
+    for table in ["session_trajectories", "trajectory_index_failures"] {
+        let present = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'source_updated_submillis')",
+            [table],
+            |row| row.get::<_, bool>(0),
+        ).map_err(database_error)?;
+        if !present {
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN source_updated_submillis INTEGER
+                 CHECK (source_updated_submillis BETWEEN 0 AND 999999)"
+                ))
+                .map_err(database_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
@@ -3631,6 +3701,24 @@ pub fn state_root() -> Result<PathBuf> {
 
 fn timestamp_from_db(timestamp: i64) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp_millis(timestamp).ok_or(StoreError::CorruptStore)
+}
+
+fn source_submillis(provider: Provider, time: DateTime<Utc>) -> u32 {
+    if TrajectorySourceGuard::uses_file_time(provider) {
+        time.timestamp_subsec_nanos() % 1_000_000
+    } else {
+        0
+    }
+}
+
+fn source_time_from_db(milliseconds: i64, remainder: Option<u32>) -> Result<DateTime<Utc>> {
+    let remainder = remainder.unwrap_or_default();
+    if remainder >= 1_000_000 {
+        return Err(StoreError::CorruptStore);
+    }
+    timestamp_from_db(milliseconds)?
+        .checked_add_signed(chrono::Duration::nanoseconds(i64::from(remainder)))
+        .ok_or(StoreError::CorruptStore)
 }
 
 fn now_timestamp() -> i64 {

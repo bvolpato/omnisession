@@ -297,15 +297,6 @@ fn process_startup_migrates_legacy_bundle_without_exposing_mismatched_identity()
 
     let store_path = environment.state_root.join("store.sqlite3");
     let reopened = Store::open(&store_path).expect("reopen migrated store");
-    let page = reopened
-        .search_session_trajectory_page_for_sessions(
-            VISIBLE_MARKER,
-            10,
-            std::slice::from_ref(&imported),
-        )
-        .expect("search migrated imported source");
-    assert_eq!(page.matches.len(), 1);
-    assert_eq!(page.matches[0].session, imported);
     let imported_metadata = reopened
         .indexed_sessions_for_provider(Provider::Imported)
         .expect("read migrated metadata");
@@ -316,7 +307,34 @@ fn process_startup_migrates_legacy_bundle_without_exposing_mismatched_identity()
             .unwrap_or_default()
             .contains(SECRET_VALUE)
     );
+    assert!(
+        !reopened
+            .trajectory_index_states()
+            .unwrap()
+            .contains_key(&imported)
+    );
     drop(reopened);
+
+    let searched = environment
+        .command()
+        .current_dir(&environment.workspace)
+        .args([
+            "--json",
+            "search",
+            VISIBLE_MARKER,
+            "--cached",
+            "--provider",
+            "imported",
+        ])
+        .output()
+        .expect("search legacy imported session");
+    assert!(
+        searched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    let results: serde_json::Value = serde_json::from_slice(&searched.stdout).expect("search JSON");
+    assert_eq!(results["results"][0]["session"], imported.to_string());
 
     let mismatched = environment
         .command()

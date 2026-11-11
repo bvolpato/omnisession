@@ -113,6 +113,13 @@ fn upgraded_search_documents_refresh_on_direct_reads_and_for_imported_bundles() 
             .unwrap();
     }
     drop(store);
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "DELETE FROM session_index WHERE provider = 'imported' AND session_id = ?1",
+            [receipt["bundle_id"].as_str().unwrap()],
+        )
+        .unwrap();
 
     fixture.run_json(&["index", "--provider", "codex"]);
     fixture.run_json(&["list", "--provider", "codex"]);

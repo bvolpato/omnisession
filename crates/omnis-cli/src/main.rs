@@ -133,13 +133,14 @@ impl IndexedSessionReader for AdapterRegistry {
         match cache {
             Ok((store, prior)) => {
                 let current = prior.is_some_and(|state| {
-                    state.source_complete
-                        && state.document_version >= omnis_core::SEARCH_DOCUMENT_VERSION
-                        && !search_index::source_time_changed(
-                            session.provider,
-                            source_updated_at,
-                            state.source_updated_at,
-                        )
+                    state.document_version > omnis_core::SEARCH_DOCUMENT_VERSION
+                        || (state.source_complete
+                            && state.document_version == omnis_core::SEARCH_DOCUMENT_VERSION
+                            && !search_index::source_time_changed(
+                                session.provider,
+                                source_updated_at,
+                                &state,
+                            ))
                 });
                 if !current
                     && let Err(error) = store_search_document(
@@ -2456,10 +2457,14 @@ fn imported_session_ref(bundle_id: Uuid) -> SessionRef {
 }
 
 fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
-    let imported = imported_session_ref(bundle.manifest.bundle_id);
+    index_bundle_metadata(store, bundle)?;
+    index_bundle_document(store, bundle)
+}
+
+fn index_bundle_metadata(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store
         .upsert_indexed_session(&IndexedSession {
-            session: imported.clone(),
+            session: imported_session_ref(bundle.manifest.bundle_id),
             title: bundle.snapshot.title.as_deref().map(redact_secrets),
             project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
             git_branch: bundle
@@ -2474,10 +2479,13 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
             updated_at_approximate: false,
             event_count: bundle.manifest.event_count,
         })
-        .context("indexing imported bundle metadata")?;
+        .context("indexing imported bundle metadata")
+}
+
+fn index_bundle_document(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store_search_document(
         store,
-        &imported,
+        &imported_session_ref(bundle.manifest.bundle_id),
         &bundle.snapshot,
         true,
         bundle.snapshot.captured_at,
@@ -2492,7 +2500,7 @@ fn backfill_missing_imported_sources() -> Result<()> {
     let missing = store
         .bundle_ids_needing_imported_source(None)
         .context("finding missing imported sources")?;
-    index_stored_bundles(&store, missing)
+    index_stored_bundles(&store, missing, index_bundle_metadata)
 }
 
 fn refresh_cached_imported_sources(store: &Store, sessions: &[NativeSession]) -> Result<()> {
@@ -2510,16 +2518,21 @@ fn refresh_cached_imported_sources(store: &Store, sessions: &[NativeSession]) ->
     index_stored_bundles(
         store,
         outdated.into_iter().filter(|id| eligible.contains(id)),
+        index_bundle_document,
     )
 }
 
-fn index_stored_bundles(store: &Store, ids: impl IntoIterator<Item = Uuid>) -> Result<()> {
+fn index_stored_bundles(
+    store: &Store,
+    ids: impl IntoIterator<Item = Uuid>,
+    index: fn(&Store, &PortableBundle) -> Result<()>,
+) -> Result<()> {
     for bundle_id in ids {
         let Ok(bundle) = load_imported_bundle(store, bundle_id) else {
             eprintln!("warning: ignored malformed stored bundle `{bundle_id}`");
             continue;
         };
-        index_bundle_source(store, &bundle)
+        index(store, &bundle)
             .with_context(|| format!("migrating imported bundle `{bundle_id}`"))?;
     }
     Ok(())
