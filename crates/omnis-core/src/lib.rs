@@ -48,6 +48,8 @@ const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+/// The Claude transcript records a compaction here but contains no summary text.
+pub const CLAUDE_MISSING_COMPACTION_SUMMARY: &str = "omnisession.missing_compaction_summary";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -2698,9 +2700,14 @@ fn visible_import_events(
         ..
     } = visible_history(snapshot);
     if use_latest_compaction
-        && let Some(start) = events
-            .iter()
-            .rposition(|event| source_compaction_text(event).is_some())
+        && let Some(start) = events.iter().rposition(|event| {
+            source_compaction_text(event).is_some()
+                || (event.source.provider == Provider::Claude
+                    && event.kind == EventKind::ProviderEvent
+                    && event.source.raw_record_type.as_deref()
+                        == Some(CLAUDE_MISSING_COMPACTION_SUMMARY)
+                    && reports_omitted_events(event))
+        })
     {
         events.drain(..start);
     }

@@ -73,7 +73,12 @@ impl Node {
 #[derive(Default)]
 pub(super) struct Ambiguity {
     pub(super) results: bool,
+    pub(super) missing_source: bool,
     pub(super) assistants: bool,
+}
+
+fn is_tool_outcome(event: &ClaudeEvent) -> bool {
+    matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
 }
 
 #[derive(Default)]
@@ -82,6 +87,7 @@ pub(super) struct Rewind {
     pub(super) excluded: HashSet<usize>,
     excluded_paths: HashMap<usize, usize>,
     retained_results: HashMap<usize, usize>,
+    archival_results: HashSet<usize>,
     call_scopes: HashMap<usize, Vec<usize>>,
 }
 
@@ -143,6 +149,24 @@ impl Rewind {
             .is_ok()
     }
 
+    fn results_only(&self, node: usize) -> bool {
+        self.excluded.contains(&node)
+            && (self.archival_results.contains(&node) || self.retained_results.contains_key(&node))
+    }
+
+    pub(super) fn conflicts_with(
+        &self,
+        node: usize,
+        branch: &Branch,
+        events: &[ClaudeEvent],
+    ) -> bool {
+        self.excluded.contains(&node)
+            && (!self.results_only(node)
+                || events[branch.nodes[node].events.clone()]
+                    .iter()
+                    .any(|event| !is_tool_outcome(event)))
+    }
+
     pub(super) fn apply_to_path(
         &self,
         path: Vec<usize>,
@@ -153,13 +177,17 @@ impl Rewind {
         }
         let mut after_summary = HashMap::<usize, Vec<(usize, usize)>>::new();
         for (&node, &(summary, rank)) in moved {
-            if !self.excluded.contains(&node) {
+            if !self.excluded.contains(&node) || self.results_only(node) {
                 after_summary.entry(summary).or_default().push((rank, node));
             }
         }
         let mut selected = Vec::new();
         for node in path {
-            if self.excluded.contains(&node) || moved.contains_key(&node) {
+            // An unlisted result stays at its original position in recovery. Listed
+            // results beyond a cutoff compete for calls in the retaining summary.
+            let archival =
+                self.archival_results.contains(&node) && !self.retained_results.contains_key(&node);
+            if (self.excluded.contains(&node) && !archival) || moved.contains_key(&node) {
                 continue;
             }
             selected.push(node);
@@ -214,7 +242,12 @@ impl RetainedBranch<'_> {
             if self.branch.nodes[node].user {
                 // Validate each result block against the retained calls. The rest of the
                 // user record and its descendants stay behind the cutoff.
-                rewind.retained_results.entry(node).or_insert(summary);
+                if self.events[self.branch.nodes[node].events.clone()]
+                    .iter()
+                    .any(is_tool_outcome)
+                {
+                    rewind.retained_results.entry(node).or_insert(summary);
+                }
             } else if selected_response {
                 kept.push(node);
                 continue;
@@ -263,6 +296,14 @@ impl RetainedBranch<'_> {
             return false;
         }
         true
+    }
+
+    fn keeps_ancestors(&self, index: usize) -> bool {
+        let node = &self.branch.nodes[index];
+        !node.user
+            || self.events[node.events.clone()]
+                .iter()
+                .any(|event| !is_tool_outcome(event))
     }
 
     /// A native retained list can end before the physical conversation did.
@@ -323,27 +364,39 @@ impl RetainedBranch<'_> {
             sibling
         };
         let issuing = self.response_node(cutoff).map(|i| &self.branch.nodes[i]);
-        let mut protected = kept.to_vec();
+        let mut protected: Vec<_> = kept
+            .iter()
+            .copied()
+            .filter(|&i| self.keeps_ancestors(i))
+            .collect();
         let mut discarded = Vec::new();
+        let mut outcomes = Vec::new();
         let mut ambiguous = false;
         let mut index = tail;
         while index != start {
-            if known.contains(&index) || selected_response(index, &mut ambiguous) {
-                // Its ancestors also belong to the surviving logical history.
+            let node = &self.branch.nodes[index];
+            let belongs = known.contains(&index) || selected_response(index, &mut ambiguous);
+            if belongs && self.keeps_ancestors(index) {
                 protected.push(index);
                 break;
             }
-            let node = &self.branch.nodes[index];
-            if !node.user
-                && issuing.is_some_and(|source| {
-                    source.turn == node.turn
-                        && source.writer == node.writer
-                        && (source.response.is_none() || node.response.is_none())
-                })
-            {
-                ambiguous = true;
+            if node.user && self.events[node.events.clone()].iter().any(is_tool_outcome) {
+                // An outcome can follow another user turn while answering the original
+                // call. Its position does not establish ownership of its ancestors.
+                outcomes.push(index);
             }
-            discarded.push(index);
+            if !belongs {
+                if !node.user
+                    && issuing.is_some_and(|source| {
+                        source.turn == node.turn
+                            && source.writer == node.writer
+                            && (source.response.is_none() || node.response.is_none())
+                    })
+                {
+                    ambiguous = true;
+                }
+                discarded.push(index);
+            }
             index = node
                 .parent
                 .expect("strict descendant of the retained cutoff");
@@ -363,6 +416,7 @@ impl RetainedBranch<'_> {
             return;
         }
         rewind.ambiguous_response |= ambiguous;
+        rewind.archival_results.extend(outcomes);
         self.exclude_before(summary, &discarded, &protected, Some(start), rewind);
     }
 
@@ -377,7 +431,9 @@ impl RetainedBranch<'_> {
         let source = match explicit {
             ToolSource::Record(source) => source,
             ToolSource::Absent => parent?,
-            ToolSource::Unresolved | ToolSource::Duplicate { .. } => return None,
+            ToolSource::Missing | ToolSource::Unresolved | ToolSource::Duplicate { .. } => {
+                return None;
+            }
         };
         let unit = self.branch.response_unit(source)?;
         if self.branch.nodes[source].writer != node.writer || node.events.is_empty() {
@@ -502,6 +558,14 @@ pub(super) struct Branch {
     ever_retained: HashSet<Uuid>,
     earlier_owners: HashMap<Uuid, Option<usize>>,
     transparent_owners: HashMap<Uuid, Option<(usize, Uuid)>>,
+    latest_marker_summary: HashMap<usize, Option<usize>>,
+    replaced_retained_uuid: bool,
+    #[cfg(test)]
+    pub(super) transparent_links_read: usize,
+    // Only lookups requested by an input record get a cross-summary entry.
+    queried_owners: HashMap<(usize, Uuid), Option<(usize, Uuid)>>,
+    // Unretained links have the same next possible cutoff in every summary.
+    next_markers: HashMap<Uuid, Option<Uuid>>,
     unverified_nodes: HashMap<usize, usize>,
     active_rejection: Option<usize>,
     // Each observed parent can ask about one source and one user turn.
@@ -510,6 +574,7 @@ pub(super) struct Branch {
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
+    sampled_copy_paths: Option<super::membership::Paths>,
     external_parents: Option<HashMap<Uuid, usize>>,
 }
 
@@ -517,21 +582,38 @@ impl Branch {
     pub(super) fn start_sampled_tail(&mut self, connected: bool) {
         self.external_parents = Some(HashMap::new());
         if !connected {
+            self.sampled_copy_paths = Some(super::membership::Paths::default());
             self.tip = None;
             self.forked = true;
             self.active_rejection = None;
-            self.transparent_owners.clear();
+            self.clear_transparent_paths();
         }
     }
 
     pub(super) fn observe_existing(&mut self, parent: Parent) {
-        // If the gap hid the active leaf, the first repeated tail record still has a
-        // known parent chain. Once a tail leaf exists, copies leave it in place.
-        if self.tip.is_none() && self.external_parents.is_some() {
-            self.tip = parent.node;
-            self.active_rejection = self.unverified_retention();
-            self.select_retention();
+        // When the gap hid the leaf, a run of copied records can recover a known branch.
+        let (Some(paths), Some(node)) = (&mut self.sampled_copy_paths, parent.node) else {
+            return;
+        };
+        if let Some(tip) = self.tip
+            && node <= tip
+        {
+            if node == tip {
+                return;
+            }
+            // An older copy may be an ancestor of a leaf we already recovered.
+            if !paths.active() {
+                for original in &self.nodes {
+                    paths.push(original.parent);
+                }
+            }
+            if paths.distance(node, tip).is_some() {
+                return;
+            }
         }
+        self.tip = Some(node);
+        self.active_rejection = self.unverified_retention();
+        self.select_retention();
     }
 
     fn unresolved_parent(&mut self, value: &Value) -> Parent {
@@ -637,6 +719,7 @@ impl Branch {
                 ..parent
             };
         }
+        self.sampled_copy_paths = None;
         self.forked |= parent.node != previous.node;
         let index = self.nodes.len();
         if let Some(summary) = parent.unverified {
@@ -767,14 +850,17 @@ impl Branch {
                             same_parent: super::record_uuid(record, "parentUuid") == Some(id),
                         };
                     }
-                    records
-                        .get(&id)
-                        .filter(|record| !record.branch.transparent)
-                        .and_then(|record| {
-                            record.branch.source.filter(|&source| {
-                                let assistant = &self.nodes[source];
-                                !assistant.user && assistant.events == record.events
-                            })
+                    let Some(record) = records.get(&id) else {
+                        return ToolSource::Missing;
+                    };
+                    record
+                        .branch
+                        .source
+                        .filter(|&source| {
+                            let assistant = &self.nodes[source];
+                            !record.branch.transparent
+                                && !assistant.user
+                                && assistant.events == record.events
                         })
                         .map_or(ToolSource::Unresolved, ToolSource::Record)
                 });
@@ -823,7 +909,7 @@ impl Branch {
         if parent.node == Some(summary) || parent.source >= Some(summary) {
             return None;
         }
-        if let Some(&owner) = self.transparent_owners.get(&id) {
+        if let Some(&owner) = self.queried_owners.get(&(summary, id)) {
             return owner;
         }
 
@@ -840,10 +926,24 @@ impl Branch {
                 self.retained_summary(uuid, Some(source), records, compactions)
                     .map(|owner| (owner, uuid))
             });
+        // A visible parent already retained by a newer summary takes precedence
+        // over every transparent record retained by an earlier one.
+        let latest_marker = if self.replaced_retained_uuid {
+            // A replacement can change whether a retained UUID is transparent.
+            Some(summary)
+        } else {
+            self.latest_marker_summary.get(&summary).copied().flatten()
+        };
+        if latest_marker.is_none() || latest_marker < owner.map(|(s, _)| s) {
+            return owner;
+        }
         let mut path = Vec::new();
         let mut cursor = Some(id);
-        while let Some(uuid) = cursor {
+        let mut complete = true;
+        while let Some(uuid) = self.next_marker(cursor, source, records, duplicates) {
             let Some(record) = records.get(&uuid) else {
+                // A sampled tail can supply an unresolved UUID later.
+                complete = false;
                 break;
             };
             // A repeated UUID can now point at a different conversation.
@@ -862,7 +962,8 @@ impl Branch {
                 .retained_summary(uuid, record.branch.node, records, compactions)
                 .map(|s| (s, uuid));
             path.push((uuid, retained));
-            if retained.is_some_and(|(s, _)| s == summary) || duplicates.contains(&uuid) {
+            if retained.is_some_and(|(s, _)| Some(s) == latest_marker) || duplicates.contains(&uuid)
+            {
                 break;
             }
             cursor = record.parent;
@@ -873,9 +974,54 @@ impl Branch {
             if retained.map(|(s, _)| s) >= owner.map(|(s, _)| s) {
                 owner = retained;
             }
-            self.transparent_owners.insert(uuid, owner);
+            if complete {
+                self.transparent_owners.insert(uuid, owner);
+            } else {
+                self.transparent_owners.remove(&uuid);
+            }
+        }
+        if complete {
+            self.queried_owners.insert((summary, id), owner);
         }
         owner
+    }
+
+    fn next_marker(
+        &mut self,
+        mut cursor: Option<Uuid>,
+        source: usize,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+    ) -> Option<Uuid> {
+        let mut skipped = Vec::new();
+        while let Some(id) = cursor {
+            let Some(record) = records.get(&id) else {
+                break;
+            };
+            if !record.branch.transparent || record.branch.source != Some(source) {
+                cursor = None;
+                break;
+            }
+            if self.ever_retained.contains(&id) || duplicates.contains(&id) {
+                break;
+            }
+            if let Some(&next) = self.next_markers.get(&id) {
+                cursor = next;
+                break;
+            }
+            // The provisional entry bounds cyclic records during the first walk.
+            #[cfg(test)]
+            {
+                self.transparent_links_read += 1;
+            }
+            self.next_markers.insert(id, None);
+            skipped.push(id);
+            cursor = record.parent;
+        }
+        for id in skipped {
+            self.next_markers.insert(id, cursor);
+        }
+        cursor
     }
 
     fn retained_summary(
@@ -915,16 +1061,47 @@ impl Branch {
     }
 
     pub(super) fn record_replaced(&mut self, id: Uuid) {
-        if self.transparent_owners.contains_key(&id) || self.ever_retained.contains(&id) {
-            self.transparent_owners.clear();
+        let retained = self.ever_retained.contains(&id);
+        self.replaced_retained_uuid |= retained;
+        if retained || self.next_markers.contains_key(&id) {
+            self.clear_transparent_paths();
         }
     }
 
-    pub(super) fn remember_retention(&mut self, ids: &[Uuid]) {
-        self.ever_retained.extend(ids);
+    fn clear_transparent_paths(&mut self) {
+        self.next_markers.clear();
+        self.queried_owners.clear();
+        self.transparent_owners.clear();
+    }
+
+    pub(super) fn remember_retention(
+        &mut self,
+        ids: &[Uuid],
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) {
+        let mut new_marker = false;
+        let mut has_marker = false;
+        for &id in ids {
+            new_marker |= self.ever_retained.insert(id) && self.next_markers.contains_key(&id);
+            has_marker |= records[&id].branch.transparent;
+        }
+        if has_marker && let Some(summary) = self.selected_summary() {
+            self.latest_marker_summary.insert(summary, Some(summary));
+        }
+        if new_marker {
+            self.clear_transparent_paths();
+        }
     }
 
     pub(super) fn select_retention(&mut self) {
+        if let Some(summary) = self.selected_summary()
+            && !self.latest_marker_summary.contains_key(&summary)
+        {
+            let previous = self
+                .previous_summary(summary)
+                .and_then(|p| self.latest_marker_summary.get(&p).copied().flatten());
+            self.latest_marker_summary.insert(summary, previous);
+        }
         self.transparent_owners.clear();
         self.earlier_owners.clear();
     }
@@ -1289,6 +1466,7 @@ impl Branch {
             self.merge_selected_events(events, path, &anchors, &results),
             Ambiguity {
                 results: results.ambiguous_selected,
+                missing_source: results.missing_source,
                 assistants,
             },
         )
@@ -1509,7 +1687,8 @@ impl Branch {
     ) -> ToolResults {
         let mut calls = ToolCalls::default();
         let mut results = ToolResults::default();
-        let mut outcomes = HashMap::new();
+        let mut outcomes = HashMap::<_, Outcome>::new();
+        let mut transports = HashMap::new();
         let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             if !node.user {
@@ -1518,33 +1697,49 @@ impl Branch {
                 }
                 continue;
             }
+            let partial = active[index] && rewind.results_only(index);
+            let selected = active[index] && !partial;
             let parent = self.issuing_parent(index);
             let source = self.tool_source(index);
+            let issuer = parent.map(|p| *transports.get(&p).unwrap_or(&p));
+            let origin = issuer.and_then(|p| self.response_unit(p));
+            // A verified outcome can link the next parallel result to its original response.
+            // An ordinary user message supplies no such evidence.
+            let mut transport = issuer.filter(|_| origin.is_some());
             for position in node.events.clone() {
                 let event = &events[position];
-                if !matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed) {
+                // A withdrawn row contributes only individually verified outcomes.
+                if partial {
+                    results.withhold(position);
+                }
+                if !is_tool_outcome(event) {
                     continue;
                 }
                 let id = event.payload["tool_use_id"].as_str();
-                if active[index] {
+                if selected {
                     results.observe_selected(position, source, &calls, node.writer.as_deref(), id);
                 }
-                let Some(id) = id else { continue };
+                let Some(id) = id else {
+                    transport = None;
+                    continue;
+                };
                 let ambiguous = |key| {
-                    if active[index] {
+                    if selected {
                         unresolved.insert((key, epoch[index]), index);
                     }
                 };
                 let Some((call, mut priority)) =
                     calls.resolve(self, parent, source, node, id, ambiguous)
                 else {
+                    transport = None;
                     continue;
                 };
                 let available = anchors[call.node].is_some_and(|owner| eligible(index, owner));
                 let paired = available && !call.repeated;
-                let original_parent = parent
-                    .and_then(|p| self.response_unit(p))
-                    .is_some_and(|unit| Some(unit) == self.response_unit(call.node));
+                let original_parent = origin.is_some() && origin == self.response_unit(call.node);
+                if !original_parent {
+                    transport = None;
+                }
                 let separated = epoch[index] != node.summary
                     || (active[call.node] && epoch[call.node] != epoch[index]);
                 let retained = active[index]
@@ -1553,58 +1748,38 @@ impl Branch {
                         .summary
                         .is_some_and(|summary| rewind.kept_call(call.position, summary))
                         || (self.nodes[call.node].summary == node.summary
-                            && (anchors[call.node].is_some() || original_parent)));
-                let repeated = available && call.repeated && active[index] && active[call.node];
+                            && (anchors[call.node].is_some() || (!partial && original_parent))));
+                let repeated = available && call.repeated && selected && active[call.node];
                 if !paired && !retained && !repeated {
                     if active[index] && priority == ResultSource::Linked {
                         results.withhold(position);
                     }
                     continue;
                 }
-                if active[index] {
+                if selected {
                     results.withhold(position);
                     priority = ResultSource::Selected;
                 }
                 // A result retained without its call stays in that summary's documentary history.
                 let documentary = !paired;
+                let scope = if documentary { epoch[index] } else { None };
                 outcomes
-                    .entry((
-                        call,
-                        documentary,
-                        if documentary { epoch[index] } else { None },
-                    ))
-                    .and_modify(|(best, kept)| match priority.cmp(best) {
-                        std::cmp::Ordering::Greater => {
-                            *best = priority;
-                            *kept = Some(position);
-                        }
-                        std::cmp::Ordering::Equal => {
-                            if kept.is_some_and(|prior: usize| {
-                                events[prior].kind != event.kind
-                                    || events[prior].payload != event.payload
-                            }) {
-                                *kept = None;
-                            }
-                        }
-                        std::cmp::Ordering::Less => {}
-                    })
-                    .or_insert((priority, Some(position)));
+                    .entry((call, documentary, scope))
+                    .and_modify(|outcome| outcome.consider(priority, position, events))
+                    .or_insert(Outcome {
+                        priority,
+                        position: Some(position),
+                    });
+            }
+            if let Some(issuer) = transport
+                && events[node.events.clone()].iter().any(is_tool_outcome)
+            {
+                transports.insert(index, issuer);
             }
         }
         results.ambiguous_selected =
             self.has_ambiguous_selected_result(&unresolved, events, anchors, epoch, rewind);
-        for ((call, documentary, _), (source, position)) in outcomes {
-            if let Some(position) = position {
-                results.filtered.remove(&position);
-                if documentary {
-                    results.documentary.insert(position);
-                } else {
-                    results.pairs.push((call.position, position));
-                }
-            } else if source == ResultSource::Selected {
-                results.ambiguous_selected = true;
-            }
-        }
+        results.accept_outcomes(outcomes);
         results
     }
 }
@@ -1615,9 +1790,25 @@ struct ToolResults {
     documentary: HashSet<usize>,
     pairs: Vec<(usize, usize)>,
     ambiguous_selected: bool,
+    missing_source: bool,
 }
 
 impl ToolResults {
+    fn accept_outcomes(&mut self, outcomes: HashMap<(ToolCall, bool, Option<usize>), Outcome>) {
+        for ((call, documentary, _), outcome) in outcomes {
+            if let Some(position) = outcome.position {
+                self.filtered.remove(&position);
+                if documentary {
+                    self.documentary.insert(position);
+                } else {
+                    self.pairs.push((call.position, position));
+                }
+            } else if outcome.priority == ResultSource::Selected {
+                self.ambiguous_selected = true;
+            }
+        }
+    }
+
     fn observe_selected(
         &mut self,
         position: usize,
@@ -1626,6 +1817,11 @@ impl ToolResults {
         writer: Option<&str>,
         id: Option<&str>,
     ) {
+        if source == ToolSource::Missing {
+            self.documentary.insert(position);
+            self.missing_source = true;
+            return;
+        }
         let selected_id = id.is_some_and(|id| calls.selected_ids.contains(&(writer, id)));
         // Preserve a selected orphan unless its own links identify a stale call.
         if source == ToolSource::Absent && !selected_id {
@@ -1673,6 +1869,7 @@ impl ToolResults {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolSource {
     Absent,
+    Missing,
     Unresolved,
     Duplicate { uuid: Uuid, same_parent: bool },
     Record(usize),
@@ -1825,7 +2022,7 @@ impl<'a> ToolCalls<'a> {
                 };
                 call
             }
-            ToolSource::Unresolved => return None,
+            ToolSource::Missing | ToolSource::Unresolved => return None,
             ToolSource::Absent => {
                 if let Some(call) = parent_record.or(parent_response) {
                     call.last()
@@ -1858,4 +2055,25 @@ enum ResultSource {
     CallId,
     Linked,
     Selected,
+}
+
+struct Outcome {
+    priority: ResultSource,
+    position: Option<usize>,
+}
+
+impl Outcome {
+    fn consider(&mut self, priority: ResultSource, position: usize, events: &[ClaudeEvent]) {
+        if priority > self.priority {
+            self.priority = priority;
+            self.position = Some(position);
+        } else if priority == self.priority
+            && self.position.is_some_and(|prior| {
+                events[prior].kind != events[position].kind
+                    || events[prior].payload != events[position].payload
+            })
+        {
+            self.position = None;
+        }
+    }
 }

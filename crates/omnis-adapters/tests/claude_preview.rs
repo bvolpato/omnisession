@@ -76,17 +76,15 @@ fn a_disconnected_preview_keeps_the_known_assistant_record_repeated_in_its_tail(
     let source = root.path().join(format!("{}.jsonl", session.id));
     let mut file = BufWriter::new(File::create(source).unwrap());
     let assistant = json!({"type":"assistant", "uuid":id(2), "parentUuid":id(1), "message":{"content":"Repeated in the tail"}});
-    writeln!(
-        file,
-        "{}",
-        json!({"type":"user", "uuid":id(1), "parentUuid":null, "message":{"content":"Inspect"}})
-    )
-    .unwrap();
+    let request =
+        json!({"type":"user", "uuid":id(1), "parentUuid":null, "message":{"content":"Inspect"}});
+    writeln!(file, "{request}").unwrap();
     writeln!(file, "{assistant}").unwrap();
     let padding = json!({"type":"progress", "padding":"x".repeat(64 * 1024)}).to_string();
     for _ in 0..208 {
         writeln!(file, "{padding}").unwrap();
     }
+    writeln!(file, "{request}").unwrap();
     writeln!(file, "{assistant}").unwrap();
     file.flush().unwrap();
 

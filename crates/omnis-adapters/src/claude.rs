@@ -304,7 +304,7 @@ struct ClaudeRecord {
 }
 
 #[derive(Default)]
-struct AssistantCopies {
+struct RecordCopies {
     current: HashMap<Uuid, [u8; 32]>,
     displaced: HashMap<(Uuid, [u8; 32]), ClaudeRecord>,
 }
@@ -322,25 +322,42 @@ impl io::Write for RecordDigest {
     }
 }
 
-impl AssistantCopies {
+impl RecordCopies {
+    fn signature(
+        record: &Value,
+        compactions: &Compactions,
+        duplicates: &HashSet<Uuid>,
+    ) -> Option<[u8; 32]> {
+        // With an implicit parent, identical records can start different turns.
+        let role = string_at(record, &[&["type"], &["message", "role"], &["role"]]);
+        let fixed_parent = match role {
+            Some("system") if record["subtype"] == "compact_boundary" => {
+                record_uuid(record, "logicalParentUuid").is_some()
+            }
+            Some("user" | "assistant") if record["isCompactSummary"] == true => {
+                // The same summary text can describe a different boundary after a UUID collision.
+                record_uuid(record, "parentUuid").is_some_and(|id| {
+                    compactions.by_id.contains_key(&id) && !duplicates.contains(&id)
+                })
+            }
+            Some("user" | "assistant") => record.get("parentUuid").is_some(),
+            _ => false,
+        };
+        if !fixed_parent || record["isMeta"] == true {
+            return None;
+        }
+        let mut digest = RecordDigest(Sha256::new());
+        serde_json::to_writer(&mut digest, record).expect("writing JSON to a digest cannot fail");
+        Some(digest.0.finalize().into())
+    }
+
     fn observe(
         &mut self,
         id: Uuid,
-        record: &Value,
+        signature: Option<[u8; 32]>,
         records: &mut HashMap<Uuid, ClaudeRecord>,
         branch: &mut branch::Branch,
     ) -> bool {
-        // Older records with an implicit parent can start a different turn at each position.
-        let signature = (record["type"] == "assistant"
-            && record.get("parentUuid").is_some()
-            && record["isMeta"] != true
-            && record["isCompactSummary"] != true)
-            .then(|| {
-                let mut digest = RecordDigest(Sha256::new());
-                serde_json::to_writer(&mut digest, record)
-                    .expect("writing JSON to a digest cannot fail");
-                <[u8; 32]>::from(digest.0.finalize())
-            });
         let previous = match signature {
             Some(digest) => self.current.insert(id, digest),
             None => self.current.remove(&id),
@@ -497,7 +514,7 @@ impl Compactions {
         Ok(context)
     }
 
-    fn validate(
+    fn validate_members(
         &self,
         summary: usize,
         records: &HashMap<Uuid, ClaudeRecord>,
@@ -1052,6 +1069,30 @@ fn push_events(events: &mut Vec<ClaudeEvent>, record: &Value) {
     }
 }
 
+fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
+    if record["isCompactSummary"] != true || record["isMeta"] == true {
+        return;
+    }
+    if events[start..].iter().any(|event| {
+        event.kind == EventKind::CompactionCreated
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+    }) {
+        return;
+    }
+    // Preserve the boundary so earlier requests stay in recovery when the summary is missing.
+    events.truncate(start);
+    events.push(ClaudeEvent {
+        kind: EventKind::ProviderEvent,
+        payload: json!({"native_history_unverified":true,"reason":"Claude compacted the conversation, but the summary record has no text"}),
+        timestamp: parse_timestamp(record.get("timestamp")),
+        replay_policy: ReplayPolicy::HistoricalOnly,
+        raw_type: Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY.into()),
+        source: record_uuid(record, "uuid").map(ClaudeEventSource::Record),
+    });
+}
+
 /// Historical record of one `tool_use` or `tool_result` content block.
 fn tool_event(
     part: &Value,
@@ -1177,7 +1218,7 @@ struct ClaudeTranscript {
     events: Vec<ClaudeEvent>,
     records: HashMap<Uuid, ClaudeRecord>,
     duplicate_records: HashSet<Uuid>,
-    assistant_copies: AssistantCopies,
+    record_copies: RecordCopies,
     compactions: Compactions,
     has_records: bool,
     has_conversation: bool,
@@ -1188,14 +1229,18 @@ impl ClaudeTranscript {
     fn observe(&mut self, record: &Value) {
         let main_record = is_main_record(record);
         let id = record_uuid(record, "uuid");
-        if main_record
-            && let Some(id) = id
-            && self
-                .assistant_copies
-                .observe(id, record, &mut self.records, &mut self.branch)
-        {
-            self.branch.observe_existing(self.records[&id].branch);
-            return;
+        if main_record && let Some(id) = id {
+            let signature =
+                RecordCopies::signature(record, &self.compactions, &self.duplicate_records);
+            if self
+                .record_copies
+                .observe(id, signature, &mut self.records, &mut self.branch)
+            {
+                if record["type"] != "system" {
+                    self.branch.observe_existing(self.records[&id].branch);
+                }
+                return;
+            }
         }
         self.has_records = true;
         self.metadata.observe_timestamp(record);
@@ -1215,6 +1260,7 @@ impl ClaudeTranscript {
         let start = self.events.len();
         if record["type"] != "progress" {
             push_events(&mut self.events, record);
+            check_summary(&mut self.events, start, record);
         }
         let previous_summary = self.branch.selected_summary();
         let branch = self.branch.observe(
@@ -1273,11 +1319,12 @@ impl ClaudeTranscript {
             self.compactions.link_summary(record, index);
             match self
                 .compactions
-                .validate(index, &self.records, &self.duplicate_records)
+                .validate_members(index, &self.records, &self.duplicate_records)
             {
                 Ok(Some(context)) => {
                     self.compactions.accept(index, &context, &self.records);
-                    self.branch.remember_retention(&context.records);
+                    self.branch
+                        .remember_retention(&context.records, &self.records);
                 }
                 Err(error) => {
                     self.compactions
@@ -1432,7 +1479,10 @@ impl ClaudeTranscript {
                 anyhow!("Claude's rewound assistant records lack a verifiable response identity")
             });
         }
-        if moved.keys().any(|node| rewind.excluded.contains(node)) {
+        if moved
+            .keys()
+            .any(|&node| rewind.conflicts_with(node, &self.branch, &self.events))
+        {
             error.get_or_insert_with(|| {
                 anyhow!("retained compaction context references a discarded turn")
             });
@@ -1506,6 +1556,12 @@ impl ClaudeTranscript {
             report_unverified(
                 "omnisession.ambiguous_assistant_record",
                 "Different versions of one Claude assistant record could supply the same response block",
+            );
+        }
+        if ambiguity.missing_source {
+            report_unverified(
+                "omnisession.missing_tool_source",
+                "A selected Claude tool result refers to an issuing assistant record missing from the transcript",
             );
         }
         if ambiguity.results {
@@ -2222,6 +2278,43 @@ mod tests {
     }
 
     #[test]
+    fn returns_through_distinct_progress_links_walk_the_shared_chain_once() {
+        let id = uuid::Uuid::from_u128;
+        let mut transcript = transcript_from_records(&[
+            json!({"type":"user","uuid":id(1),"parentUuid":null,"message":{"content":"Task"}}),
+            json!({"type":"assistant","uuid":id(2),"parentUuid":id(1),"message":{"content":"Answer"}}),
+            json!({"type":"attachment","uuid":id(98),"parentUuid":id(2)}),
+        ]);
+        for i in 0..128 {
+            transcript.observe(&json!({"type":"progress","uuid":id(100+i),"parentUuid":id(if i == 0 {2} else {99+i})}));
+        }
+        for (boundary, parent, retained) in [(3, 2, vec![id(2), id(98)]), (5, 4, vec![])] {
+            transcript.observe(&json!({"type":"system","subtype":"compact_boundary","uuid":id(boundary),"logicalParentUuid":id(parent),
+                "compactMetadata":{"preservedMessages":{"uuids":retained,"anchorUuid":id(boundary+1)}}}));
+            transcript.observe(&json!({"type":"user","uuid":id(boundary+1),"parentUuid":id(boundary),"isCompactSummary":true,"message":{"content":"Summary"}}));
+        }
+        for i in 0..40 {
+            transcript.observe(&json!({"type":"user","uuid":id(500+2*i),"parentUuid":id(6),"message":{"content":"Later branch"}}));
+            transcript.observe(&json!({"type":"user","uuid":id(501+2*i),"parentUuid":id(227-i),"message":{"content":"Earlier branch"}}));
+        }
+        assert!(transcript.branch.transparent_links_read <= 128);
+        let snapshot = transcript
+            .snapshot(
+                &SessionRef::new(Provider::Claude, "test"),
+                InputCoverage::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|e| e.payload["text"].as_str())
+                .collect::<Vec<_>>(),
+            ["Task", "Summary", "Answer", "Earlier branch"]
+        );
+    }
+
+    #[test]
     fn returning_to_a_validated_segment_reuses_its_membership() {
         let id = uuid::Uuid::from_u128;
         let mut transcript = transcript_with_an_earlier_retained_segment();
@@ -2406,7 +2499,11 @@ mod tests {
                 json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Summary"}}),
             ];
             if let Some(index) = ambiguous_record {
-                records.insert(index, records[index].clone());
+                let mut collision = records[index].clone();
+                if index == 2 {
+                    collision["message"]["content"] = json!("Different summary with the same UUID");
+                }
+                records.insert(index, collision);
             } else {
                 records[2]["parentUuid"] = serde_json::Value::Null;
             }
