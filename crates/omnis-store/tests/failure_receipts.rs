@@ -214,6 +214,11 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         .upsert_trajectory_document(&f.session, &legacy)
         .unwrap();
     let raw = rusqlite::Connection::open(&path).unwrap();
+    // This historical schema predates physical source IDs and native document ownership.
+    raw.execute_batch(
+        "DROP TRIGGER remember_rebound_document_home; DROP TABLE native_search_document_homes;",
+    )
+    .unwrap();
     for column in [
         "source_file_id",
         "missing_ancestor_id",
@@ -554,4 +559,71 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
             .unwrap(),
         vec![locator]
     );
+}
+
+#[test]
+fn live_search_reads_the_source_title_and_body_from_the_same_home() {
+    let f = Fixture::new();
+    let writer = Store::open(f.root.path().join("synthetic.sqlite3")).unwrap();
+    let a = f.root.path().join("a");
+    let b = f.root.path().join("b");
+    let locator = IndexedSession {
+        session: f.session.clone(),
+        title: None,
+        project_path: None,
+        git_branch: None,
+        created_at: None,
+        updated_at: None,
+        updated_at_approximate: false,
+        event_count: 1,
+    };
+    let write = |home: &std::path::Path, file, text| {
+        let doc = TrajectoryDocument {
+            derived_title: Some(text),
+            ..full(text, revision(file, file))
+        };
+        writer
+            .upsert_verified_session_document_in_home(
+                &locator,
+                Some(home),
+                doc,
+                writer.observe_trajectory_document(&f.session).unwrap(),
+                |_, _| true,
+            )
+            .unwrap();
+    };
+    write(&a, 1, "redwood");
+    let candidates = [(f.session.id.as_str(), revision(1, 1).file)];
+    f.index
+        .read_trajectory_search(|read| -> omnis_store::Result<()> {
+            assert!(
+                read.conflicting_native_documents(f.session.provider, &a, &candidates)?
+                    .is_empty()
+            );
+            write(&b, 2, "birch");
+            assert_eq!(read.trajectory_titles()?[&f.session], "redwood");
+            let page = read.search_session_trajectory_page_for_sessions(
+                "redwood",
+                1,
+                std::slice::from_ref(&f.session),
+            )?;
+            assert_eq!(page.matches[0].session, f.session);
+            Ok(())
+        })
+        .unwrap();
+    f.index
+        .read_trajectory_search(|read| -> omnis_store::Result<()> {
+            assert!(
+                read.conflicting_native_documents(f.session.provider, &a, &candidates)?
+                    .contains(&f.session)
+            );
+            assert_eq!(read.trajectory_titles()?[&f.session], "birch");
+            // A restore in the same home can use its verified text while the incoming copy is incomplete.
+            assert!(
+                read.conflicting_native_documents(f.session.provider, &b, &candidates)?
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
 }

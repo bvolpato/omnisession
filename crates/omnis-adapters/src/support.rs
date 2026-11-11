@@ -35,8 +35,8 @@ const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
-const MAX_DISCOVERED_FILES: usize = 10_000;
-const MAX_DISCOVERY_ENTRIES: usize = 200_000;
+pub(super) const MAX_DISCOVERED_FILES: usize = 10_000;
+pub(super) const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 // Snapshots copy the database and WAL to private temporary storage, so this bounds disk use, not
 // memory. It matches the streamed transcript budget. `OMNI_SNAPSHOT_MAX_BYTES` overrides it.

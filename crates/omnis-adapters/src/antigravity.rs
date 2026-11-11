@@ -465,16 +465,50 @@ impl Summary {
         } else {
             None
         };
-        let contents = Uuid::new_v5(
-            &file,
-            &serde_json::to_vec(&(history, wal, declared_steps, empty_sources_verified))?,
-        );
+        let contents =
+            history_contents(file, history, wal, declared_steps, empty_sources_verified)?;
         Ok(SourceRevision {
             file: Some(file),
             contents: Some(contents),
             missing_ancestor: None,
         })
     }
+}
+
+fn history_contents(
+    file: Uuid,
+    history: Option<Uuid>,
+    wal: Option<WalRevision>,
+    declared_steps: Option<usize>,
+    empty_sources_verified: Option<bool>,
+) -> Result<Uuid> {
+    Ok(Uuid::new_v5(
+        &file,
+        &serde_json::to_vec(&(history, wal, declared_steps, empty_sources_verified))?,
+    ))
+}
+
+pub(super) fn database_history_revision(
+    database: &Path,
+    declared_steps: usize,
+) -> Option<SourceRevision> {
+    let revision = source_file_revision(database)?;
+    let wal = WalRevision::read(database);
+    if matches!(wal, WalRevision::Unavailable) {
+        return None;
+    }
+    let contents = history_contents(
+        revision.file?,
+        Some(revision.contents?),
+        Some(wal),
+        Some(declared_steps),
+        None,
+    )
+    .ok()?;
+    Some(SourceRevision {
+        contents: Some(contents),
+        ..revision
+    })
 }
 
 #[derive(serde::Serialize)]

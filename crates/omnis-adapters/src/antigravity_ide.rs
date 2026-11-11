@@ -281,6 +281,7 @@ impl ProviderAdapter for AntigravityIdeAdapter {
             let mut sessions = desktop.list_sessions(project)?;
             for session in &mut sessions {
                 session.session.provider = Provider::AntigravityIde;
+                session.source_revision = None;
             }
             return Ok(sessions);
         }
@@ -983,6 +984,18 @@ mod tests {
             )],
         );
         let before = fs::read(&database).unwrap();
+        let alias = AntigravityIdeAdapter {
+            legacy_desktop: true,
+            ..AntigravityIdeAdapter::with_root(&desktop)
+        };
+        let listed = alias.list_sessions(None).unwrap().pop().unwrap();
+        let observation = alias
+            .observe_search_source(&listed.session, listed.source_path.as_deref())
+            .unwrap();
+        assert_eq!(
+            listed.source_revision,
+            observation.map(|source| source.revision)
+        );
         let legacy = AntigravityIdeAdapter {
             root: Some(ide.clone()),
             legacy_desktop: false,

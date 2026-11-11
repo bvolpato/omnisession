@@ -4,9 +4,12 @@ use super::{
     PreviewIndexTitle, PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL,
     Sender, SessionRef, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
     TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
-    first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
-    session_preview, thread,
+    first_user_message_after, has_scoped_home, mpsc, normalized_picker_entries,
+    populate_approximate_updated_at, session_preview, thread,
 };
+
+use std::collections::HashMap;
+use uuid::Uuid;
 
 use std::sync::{
     Arc,
@@ -32,7 +35,7 @@ pub(super) enum SessionCacheUpdate {
     Listed {
         provider: Provider,
         sessions: Vec<IndexedSession>,
-        complete: bool,
+        scope: DiscoveryScope,
         attempt: Option<SessionDiscoveryAttempt>,
         publication: Option<Sender<Option<bool>>>,
     },
@@ -45,24 +48,19 @@ impl SessionCacheUpdate {
             Self::Listed {
                 provider,
                 sessions,
-                complete,
+                scope,
                 attempt,
                 publication,
             } => {
-                let scope = if *complete {
-                    DiscoveryScope::CompleteProvider
-                } else {
-                    DiscoveryScope::PartialProvider
-                };
                 if let Some(attempt) = attempt {
                     let result =
-                        store.publish_session_discovery(attempt, sessions, scope, Utc::now());
+                        store.publish_session_discovery(attempt, sessions, *scope, Utc::now());
                     if let Some(publication) = publication {
                         let _ = publication.send(result.as_ref().ok().copied());
                     }
                     result?;
                 } else {
-                    store.cache_discovered_sessions(*provider, sessions, scope, None)?;
+                    store.cache_discovered_sessions(*provider, sessions, *scope, None)?;
                 }
             }
             Self::Failed(attempt) => {
@@ -75,9 +73,11 @@ impl SessionCacheUpdate {
 
 pub(super) enum PickerUpdate {
     Cached(Result<Vec<PickerEntry>, String>),
+    NativeHomes(HashMap<Provider, PathBuf>),
+    NativeTitles(Vec<(SessionRef, Option<Uuid>, Option<String>)>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
-        key: PreviewKey,
+        key: Box<PreviewKey>,
         value: PreviewValue,
         indexed_title: PreviewIndexTitle,
     },
@@ -95,11 +95,17 @@ pub(super) enum PickerUpdate {
     IndexFailures(usize),
 }
 
+pub(super) struct PickerIndexRequest {
+    pub(super) candidates: Vec<IndexCandidate>,
+    pub(super) homes: HashMap<Provider, PathBuf>,
+    pub(super) pending_titles: HashMap<SessionRef, Uuid>,
+}
+
 pub(super) struct PickerWorkers {
     pub(super) receiver: Receiver<PickerUpdate>,
     pub(super) preview_sender: Sender<Vec<PreviewKey>>,
     pub(super) trajectory_search_sender: SyncSender<TrajectorySearchRequest>,
-    pub(super) search_index_sender: Sender<Vec<IndexCandidate>>,
+    pub(super) search_index_sender: Sender<PickerIndexRequest>,
     search_index_stop: Arc<AtomicBool>,
 }
 
@@ -116,7 +122,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (trajectory_search_sender, trajectory_search_receiver) =
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<SessionCacheUpdate>();
-    let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
+    let (search_index_sender, search_index_receiver) = mpsc::channel::<PickerIndexRequest>();
     let search_index_stop = Arc::new(AtomicBool::new(false));
 
     spawn_index_writer(sender.clone(), index_receiver);
@@ -142,7 +148,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
 // Newer candidate lists replace the running pass; stopping the picker ends it.
 pub(super) fn spawn_search_index(
     sender: Sender<PickerUpdate>,
-    receiver: Receiver<Vec<IndexCandidate>>,
+    receiver: Receiver<PickerIndexRequest>,
     stop: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -150,7 +156,7 @@ pub(super) fn spawn_search_index(
         let Ok(store) = Store::open_default() else {
             return;
         };
-        let pending = std::cell::RefCell::new(None::<Vec<IndexCandidate>>);
+        let pending = std::cell::RefCell::new(None::<PickerIndexRequest>);
         // Failed reads are recorded and later passes skip them, so warn about the whole unreadable
         // set only after this picker run found new failures.
         let mut found_failures = false;
@@ -163,7 +169,25 @@ pub(super) fn spawn_search_index(
                     Err(_) => return,
                 },
             };
-            let candidates = receiver.try_iter().last().unwrap_or(candidates);
+            let PickerIndexRequest {
+                candidates,
+                homes,
+                pending_titles,
+            } = receiver.try_iter().last().unwrap_or(candidates);
+            let selected: HashMap<_, _> = candidates
+                .iter()
+                .filter(|candidate| has_scoped_home(candidate.session.provider))
+                .map(|candidate| (candidate.session.clone(), candidate.source_revision.file))
+                .collect();
+            send_native_titles(
+                &store,
+                &sender,
+                &homes,
+                pending_titles
+                    .iter()
+                    .filter(|(session, file)| selected.get(*session) == Some(&Some(**file)))
+                    .map(|(session, file)| (session, Some(*file))),
+            );
             let should_stop = || {
                 if stop.load(Ordering::Relaxed) {
                     return true;
@@ -180,7 +204,19 @@ pub(super) fn spawn_search_index(
                 candidates,
                 false,
                 &should_stop,
-                &mut |progress| {
+                &mut |mut progress| {
+                    send_native_titles(
+                        &store,
+                        &sender,
+                        &homes,
+                        progress
+                            .titles
+                            .iter()
+                            .filter_map(|(session, _)| Some((session, *selected.get(session)?))),
+                    );
+                    progress
+                        .titles
+                        .retain(|(session, _)| !has_scoped_home(session.provider));
                     let _ = sender.send(PickerUpdate::Indexing(progress));
                 },
             ) {
@@ -201,6 +237,34 @@ pub(super) fn spawn_search_index(
             }
         }
     });
+}
+
+fn send_native_titles<'a>(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    homes: &HashMap<Provider, PathBuf>,
+    selected: impl Iterator<Item = (&'a SessionRef, Option<Uuid>)> + Clone,
+) {
+    if selected.clone().next().is_none() {
+        return;
+    }
+    let titles = store.read_trajectory_search(|snapshot| -> omnis_store::Result<_> {
+        let conflicts = crate::conflicting_search_documents(snapshot, homes, selected.clone())?;
+        selected
+            .filter(|(session, _)| {
+                homes.contains_key(&session.provider) && !conflicts.contains(*session)
+            })
+            .map(|(session, file)| Ok((session.clone(), file, snapshot.trajectory_title(session)?)))
+            .collect()
+    });
+    match titles {
+        Ok(titles) => {
+            let _ = sender.send(PickerUpdate::NativeTitles(titles));
+        }
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!("session titles: {error}")));
+        }
+    }
 }
 
 pub(super) fn spawn_update_check(sender: Sender<PickerUpdate>) {
@@ -271,14 +335,11 @@ pub(super) fn spawn_cache_updates(
     current_project: PathBuf,
 ) {
     thread::spawn(move || {
+        let registry = AdapterRegistry::with_local_adapters();
         let Ok(store) = Store::open_default() else {
-            let _ = sender.send(PickerUpdate::Cached(Err(
-                "session index is unavailable".to_owned()
-            )));
-            spawn_all_provider_updates(&sender, &index_sender, &current_project);
+            discover_without_cache(&registry, &sender, &index_sender, &current_project);
             return;
         };
-        let registry = AdapterRegistry::with_local_adapters();
         // Observe the reader before loading the catalog so a concurrent publication cannot be missed.
         let mut selections: std::collections::HashMap<_, _> =
             [Provider::Antigravity, Provider::AntigravityDesktop]
@@ -290,11 +351,17 @@ pub(super) fn spawn_cache_updates(
                 })
                 .into_iter()
                 .collect();
-        let home = |provider| {
-            selections
-                .get(&provider)
-                .and_then(|selection: &HomeDiscovery| selection.home.as_deref())
-        };
+        let homes: HashMap<_, _> = selections
+            .iter()
+            .filter_map(|(&provider, selection)| Some((provider, selection.home.clone()?)))
+            .collect();
+        if sender
+            .send(PickerUpdate::NativeHomes(homes.clone()))
+            .is_err()
+        {
+            return;
+        }
+        let home = |provider| homes.get(&provider).map(PathBuf::as_path);
         let Some(cache_loaded) = send_cached_picker_entries(
             &store,
             &sender,
@@ -304,11 +371,7 @@ pub(super) fn spawn_cache_updates(
         ) else {
             return;
         };
-        if let Ok(titles) = store.trajectory_titles()
-            && sender
-                .send(PickerUpdate::Titles(titles.into_iter().collect()))
-                .is_err()
-        {
+        if !send_cached_titles(&store, &sender, &homes) {
             return;
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
@@ -350,17 +413,77 @@ pub(super) fn spawn_cache_updates(
                         &current_project,
                         provider,
                         attempt,
+                        homes.get(&provider),
                     );
                 }
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!(
                         "{provider} session index: {error}"
                     )));
-                    start_provider_update(&sender, &index_sender, &current_project, provider, None);
+                    start_provider_update(
+                        &sender,
+                        &index_sender,
+                        &current_project,
+                        provider,
+                        None,
+                        homes.get(&provider),
+                    );
                 }
             }
         }
     });
+}
+
+fn discover_without_cache(
+    registry: &AdapterRegistry,
+    sender: &Sender<PickerUpdate>,
+    index_sender: &Sender<SessionCacheUpdate>,
+    project: &Path,
+) {
+    let homes: HashMap<_, _> = [Provider::Antigravity, Provider::AntigravityDesktop]
+        .into_iter()
+        .filter_map(|provider| Some((provider, registry.discovery_cache_home(provider).ok()??)))
+        .collect();
+    let _ = sender.send(PickerUpdate::NativeHomes(homes.clone()));
+    let _ = sender.send(PickerUpdate::Cached(Err(
+        "session index is unavailable".to_owned()
+    )));
+    for provider in PROVIDERS {
+        start_provider_update(
+            sender,
+            index_sender,
+            project,
+            provider,
+            None,
+            homes.get(&provider),
+        );
+    }
+}
+
+fn send_cached_titles(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    homes: &HashMap<Provider, PathBuf>,
+) -> bool {
+    let titles = store.read_trajectory_search(|snapshot| -> omnis_store::Result<_> {
+        let mut titles = snapshot.trajectory_titles()?;
+        let conflicts = crate::conflicting_search_documents(
+            snapshot,
+            homes,
+            titles.keys().map(|session| (session, None)),
+        )?;
+        titles.retain(|session, _| {
+            (!has_scoped_home(session.provider) || homes.contains_key(&session.provider))
+                && !conflicts.contains(session)
+        });
+        Ok(titles.into_iter().collect())
+    });
+    match titles {
+        Ok(titles) => sender.send(PickerUpdate::Titles(titles)).is_ok(),
+        Err(error) => sender
+            .send(PickerUpdate::Warning(format!("session titles: {error}")))
+            .is_ok(),
+    }
 }
 
 fn send_cached_picker_entries(
@@ -453,30 +576,22 @@ fn begin_picker_discovery(
     Ok(PickerDiscovery::Due(None))
 }
 
-pub(super) fn spawn_all_provider_updates(
-    sender: &Sender<PickerUpdate>,
-    index_sender: &Sender<SessionCacheUpdate>,
-    current_project: &Path,
-) {
-    for provider in PROVIDERS {
-        start_provider_update(sender, index_sender, current_project, provider, None);
-    }
-}
-
-pub(super) fn start_provider_update(
+fn start_provider_update(
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
     attempt: Option<SessionDiscoveryAttempt>,
+    home: Option<&PathBuf>,
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
-        spawn_provider_update(
+        spawn_provider_update_in_home(
             sender.clone(),
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
             attempt,
+            home.cloned(),
         );
     }
 }
@@ -514,24 +629,34 @@ pub(super) fn spawn_provider_update(
     provider: Provider,
     attempt: Option<SessionDiscoveryAttempt>,
 ) {
+    let home = attempt.as_ref().map(|attempt| attempt.home().to_path_buf());
+    spawn_provider_update_in_home(
+        sender,
+        index_sender,
+        current_project,
+        provider,
+        attempt,
+        home,
+    );
+}
+
+fn spawn_provider_update_in_home(
+    sender: Sender<PickerUpdate>,
+    index_sender: Sender<SessionCacheUpdate>,
+    current_project: PathBuf,
+    provider: Provider,
+    attempt: Option<SessionDiscoveryAttempt>,
+    home: Option<PathBuf>,
+) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        let home = match registry.discovery_cache_home(provider) {
-            Ok(home) => home,
-            Err(error) => {
-                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
-                    provider,
-                    result: Err(error),
-                }));
-                return;
-            }
-        };
-        let selected = attempt
-            .as_ref()
-            .map_or(home.as_deref(), |attempt| Some(attempt.home()));
-        let result = registry.list_sessions_in_home(provider, None, selected);
+        let result = registry.list_sessions_in_home(provider, None, home.as_deref());
         match result {
-            Ok((mut sessions, notes)) => {
+            Ok(omnis_adapters::NativeListing {
+                mut sessions,
+                notes,
+                desktop_summaries_unavailable: unavailable,
+            }) => {
                 let complete = notes.is_empty()
                     && registry
                         .adapter(provider)
@@ -543,13 +668,18 @@ pub(super) fn spawn_provider_update(
                 }
                 populate_approximate_updated_at(&mut sessions);
                 let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
-                let entries = normalized_picker_entries(sessions, &current_project, false);
                 if attempt.is_some() || home.is_none() {
                     let (reply, waiting) = attempt.as_ref().map(|_| mpsc::channel()).unzip();
                     let update = SessionCacheUpdate::Listed {
                         provider,
                         sessions: indexed,
-                        complete,
+                        scope: if unavailable {
+                            DiscoveryScope::DesktopDatabasesWithoutSummaries
+                        } else if complete {
+                            DiscoveryScope::CompleteProvider
+                        } else {
+                            DiscoveryScope::PartialProvider
+                        },
                         attempt: attempt.clone(),
                         publication: reply,
                     };
@@ -573,6 +703,17 @@ pub(super) fn spawn_provider_update(
                         return;
                     }
                 }
+                if unavailable
+                    && let Some(home) = home.as_deref()
+                    && let Err(error) = Store::open_default().and_then(|store| {
+                        crate::fill_cached_desktop_summaries(&store, home, &mut sessions)
+                    })
+                {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "{provider} cached summaries: {error}"
+                    )));
+                }
+                let entries = normalized_picker_entries(sessions, &current_project, false);
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
                     result: Ok((entries, complete)),
@@ -621,7 +762,34 @@ fn read_picker_preview(
         };
         return Ok((read, Some(source)));
     }
-    let (snapshot, source) = read_native_search_snapshot(registry, session, full_read)?;
+    let (snapshot, source) = if has_scoped_home(session.provider) {
+        let home = key
+            .native_home
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("native preview home is unavailable"))?;
+        anyhow::ensure!(
+            registry.discovery_cache_home(session.provider)?.as_deref() == Some(home),
+            "native preview home changed"
+        );
+        let result = search_index::observe_native_read(
+            registry,
+            session,
+            None,
+            key.source_revision,
+            |adapter, path| adapter.read_for_search(session, path, full_read),
+        )?;
+        let observation = result
+            .1
+            .as_ref()
+            .and_then(|source| source.observation.as_ref());
+        anyhow::ensure!(
+            observation.is_some_and(|source| source.home == home),
+            "native preview source changed"
+        );
+        result
+    } else {
+        read_native_search_snapshot(registry, session, full_read)?
+    };
     Ok((
         IndexRead {
             snapshot,
@@ -697,8 +865,16 @@ pub(super) fn spawn_preview_updates(
                                 guard,
                                 None,
                             )
-                            .and_then(|_| store.trajectory_title(&key.session))
-                            {
+                            .and_then(|_| {
+                                match key.native_home.as_deref() {
+                                    Some(home) => store.trajectory_title_for_native_source(
+                                        &key.session,
+                                        home,
+                                        key.source_revision.and_then(|revision| revision.file),
+                                    ),
+                                    None => store.trajectory_title(&key.session),
+                                }
+                            }) {
                                 Ok(title) => indexed_title = PreviewIndexTitle::Written(title),
                                 Err(error) => {
                                     let _ = sender.send(PickerUpdate::Warning(format!(
@@ -718,7 +894,7 @@ pub(super) fn spawn_preview_updates(
                 };
                 if sender
                     .send(PickerUpdate::Preview {
-                        key,
+                        key: Box::new(key),
                         value,
                         indexed_title,
                     })
@@ -748,11 +924,31 @@ pub(super) fn spawn_trajectory_search_updates(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
                     store
-                        .search_session_trajectory_page_for_sessions(
-                            &request.query,
-                            TRAJECTORY_SEARCH_LIMIT,
-                            &request.eligible_sessions,
-                        )
+                        .read_trajectory_search(|snapshot| {
+                            let conflicts = crate::conflicting_search_documents(
+                                snapshot,
+                                &request.homes,
+                                request
+                                    .eligible_sessions
+                                    .iter()
+                                    .map(|(session, file)| (session, *file)),
+                            )?;
+                            let eligible = request
+                                .eligible_sessions
+                                .into_iter()
+                                .filter_map(|(session, _)| {
+                                    ((!has_scoped_home(session.provider)
+                                        || request.homes.contains_key(&session.provider))
+                                        && !conflicts.contains(&session))
+                                    .then_some(session)
+                                })
+                                .collect::<Vec<_>>();
+                            snapshot.search_session_trajectory_page_for_sessions(
+                                &request.query,
+                                TRAJECTORY_SEARCH_LIMIT,
+                                &eligible,
+                            )
+                        })
                         .map_err(|error| error.to_string())
                 },
             );
@@ -780,6 +976,23 @@ pub(super) fn receive_updates(
     while let Ok(update) = receiver.try_recv() {
         changed = true;
         match update {
+            PickerUpdate::NativeHomes(homes) => state.native_homes = homes,
+            PickerUpdate::NativeTitles(titles) => {
+                let titles = titles
+                    .into_iter()
+                    .filter_map(|(session, file, title)| {
+                        let index = *state.entry_positions.get(&session.to_string())?;
+                        let selected_file = state.entries[index].source_file();
+                        if selected_file == file {
+                            state.pending_native_titles.remove(&session);
+                            Some((session, title))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                state.remember_indexed_titles(titles);
+            }
             PickerUpdate::Cached(Ok(entries)) => {
                 state.cache_loaded = true;
                 state.replace_all_entries(entries);
@@ -798,7 +1011,8 @@ pub(super) fn receive_updates(
                 value,
                 indexed_title,
             } => {
-                if key.session.provider == Provider::Antigravity
+                let key = *key;
+                if has_scoped_home(key.session.provider)
                     && let Some(i) = state.entry_positions.get(&key.session.to_string())
                     && state.preview_key(&state.entries[*i]) != key
                 {

@@ -1,8 +1,12 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use omnis_ir::Provider;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -36,7 +40,9 @@ pub enum SessionDiscoveryState {
     Superseded,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Observation {
+    selected_home: bool,
     id: Uuid,
     checked_at: i64,
     succeeded: Option<bool>,
@@ -63,10 +69,10 @@ fn current_attempt(
 ) -> Result<Option<Observation>> {
     let mut statement = connection
         .prepare_cached(
-            "SELECT lease.attempt_id, lease.checked_at, result.succeeded
+            "SELECT lease.attempt_id, lease.checked_at, result.succeeded, lease.source_home = ?3
              FROM session_index_reader_checks AS lease
              LEFT JOIN session_index_discovery_results AS result USING (provider,reader_version,attempt_id)
-             WHERE lease.provider = ?1 AND lease.reader_version = ?2 AND lease.source_home = ?3",
+             WHERE lease.provider = ?1 AND lease.reader_version = ?2",
         )
         .map_err(database_error)?;
     statement
@@ -81,6 +87,7 @@ fn current_attempt(
                     id: Uuid::from_bytes(row.get(0)?),
                     checked_at: row.get(1)?,
                     succeeded: row.get(2)?,
+                    selected_home: row.get(3)?,
                 })
             },
         )
@@ -98,7 +105,7 @@ fn recent_claim(
     let Some(check) = current_attempt(connection, provider, version, home)? else {
         return Ok(None);
     };
-    if check.checked_at < fresh_since.timestamp_millis() {
+    if !check.selected_home || check.checked_at < fresh_since.timestamp_millis() {
         return Ok(None);
     }
     if check.succeeded.is_some() {
@@ -114,7 +121,247 @@ fn recent_claim(
     )))
 }
 
+/// Identifies the provider-wide check in effect when a command starts a live catalog read.
+#[derive(Debug)]
+pub struct SessionDiscoveryCheckpoint {
+    provider: Provider,
+    version: u32,
+    home: PathBuf,
+    observation: Option<Observation>,
+    workspace: Option<PathBuf>,
+    workspace_publication: Option<(i64, bool)>,
+}
+
+impl SessionDiscoveryCheckpoint {
+    /// Whether the recorded provider-wide check selected this command's native home.
+    #[must_use]
+    pub fn is_for_selected_home(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|check| check.selected_home)
+    }
+
+    /// Whether this attempt still owns provider-wide publication at this checkpoint.
+    #[must_use]
+    pub fn owns(&self, attempt: &SessionDiscoveryAttempt) -> bool {
+        self.observation.as_ref().is_some_and(|check| {
+            check.selected_home && check.id == attempt.id && check.succeeded.is_none()
+        })
+    }
+
+    /// Whether the intervening publications selected this command's home.
+    #[must_use]
+    pub fn can_follow(&self, prior: &Self) -> bool {
+        let wide_changed = self.observation != prior.observation;
+        let workspace_changed = self.workspace_publication != prior.workspace_publication;
+        let workspace_local = self.workspace_publication.is_some_and(|(_, local)| local);
+        let wide_local = self.is_for_selected_home()
+            || (self.observation.is_none() && workspace_changed && workspace_local);
+        (wide_changed || workspace_changed)
+            && (!wide_changed || wide_local)
+            && (!workspace_changed || workspace_local)
+    }
+
+    fn is_current(&self, connection: &Connection) -> Result<bool> {
+        Ok(
+            current_attempt(connection, self.provider, self.version, &self.home)?
+                == self.observation
+                && workspace_publication(
+                    connection,
+                    self.provider,
+                    &self.home,
+                    self.workspace.as_deref(),
+                )? == self.workspace_publication,
+        )
+    }
+
+    fn record_workspace(&self, tx: &Transaction<'_>, sessions: &[IndexedSession]) -> Result<()> {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return Ok(());
+        };
+        let mut sorted: Vec<_> = sessions.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.session.id.cmp(&b.session.id));
+        let mut hash = Sha256::new();
+        for row in sorted {
+            let fields = (
+                &row.session.id,
+                &row.title,
+                &row.project_path,
+                &row.git_branch,
+                row.created_at.map(|time| time.timestamp_millis()),
+                row.updated_at.map(|time| time.timestamp_millis()),
+                row.updated_at_approximate,
+                row.event_count,
+            );
+            hash.update(
+                serde_json::to_vec(&fields).map_err(|_| StoreError::InvalidSessionReference)?,
+            );
+        }
+        let fingerprint: [u8; 32] = hash.finalize().into();
+        tx.execute(
+            "INSERT INTO session_workspace_catalogs(provider,workspace,source_home,fingerprint,generation)
+             SELECT ?1,?2,?3,?4,coalesce(max(generation),0)+1 FROM session_workspace_catalogs WHERE provider=?1
+             ON CONFLICT(provider,workspace) DO UPDATE SET source_home=excluded.source_home,
+                 fingerprint=excluded.fingerprint, generation=excluded.generation
+             WHERE source_home IS NOT excluded.source_home OR fingerprint IS NOT excluded.fingerprint",
+            params![self.provider.to_string(), workspace.as_os_str().as_encoded_bytes(), self.home.as_os_str().as_encoded_bytes(), fingerprint],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+}
+
+fn workspace_publication(
+    connection: &Connection,
+    provider: Provider,
+    home: &Path,
+    workspace: Option<&Path>,
+) -> Result<Option<(i64, bool)>> {
+    if provider != Provider::Antigravity {
+        return Ok(None);
+    }
+    let local = home.as_os_str().as_encoded_bytes();
+    let provider = provider.to_string();
+    let read = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?));
+    let result = if let Some(workspace) = workspace {
+        connection.query_row(
+            "SELECT generation, source_home = ?2 FROM session_workspace_catalogs WHERE provider = ?1 AND workspace = ?3",
+            params![provider, local, workspace.as_os_str().as_encoded_bytes()], read,
+        )
+    } else {
+        connection.query_row(
+            "SELECT generation, source_home = ?2 FROM session_workspace_catalogs WHERE provider = ?1 ORDER BY generation DESC LIMIT 1",
+            params![provider, local], read,
+        )
+    };
+    result.optional().map_err(database_error)
+}
+
+pub(super) enum CatalogWrite<'a> {
+    Unchecked,
+    Publish(
+        &'a SessionDiscoveryAttempt,
+        DateTime<Utc>,
+        Option<&'a SessionDiscoveryCheckpoint>,
+    ),
+    Merge(&'a SessionDiscoveryCheckpoint),
+}
+
+impl CatalogWrite<'_> {
+    pub(super) fn permits(
+        self,
+        transaction: &Transaction<'_>,
+        sessions: &[IndexedSession],
+    ) -> Result<bool> {
+        match self {
+            Self::Unchecked => Ok(true),
+            Self::Publish(attempt, finished_at, checkpoint) => {
+                if let Some(checkpoint) = checkpoint
+                    && !checkpoint.is_current(transaction)?
+                {
+                    return Ok(false);
+                }
+                publish_attempt(transaction, attempt, finished_at, sessions)
+            }
+            Self::Merge(checkpoint) => {
+                if !checkpoint.is_current(transaction)? {
+                    return Ok(false);
+                }
+                checkpoint.record_workspace(transaction, sessions)?;
+                Ok(true)
+            }
+        }
+    }
+}
+
 impl Store {
+    /// Observes the reader and home without claiming discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the discovery state.
+    pub fn session_discovery_checkpoint(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        project: Option<&Path>,
+    ) -> Result<SessionDiscoveryCheckpoint> {
+        let workspace = project.filter(|_| provider == Provider::Antigravity);
+        let connection = self.connection.borrow();
+        let tx = connection.unchecked_transaction().map_err(database_error)?;
+        let checkpoint = SessionDiscoveryCheckpoint {
+            provider,
+            version,
+            home: home.to_owned(),
+            observation: current_attempt(&tx, provider, version, home)?,
+            workspace: workspace.map(Path::to_owned),
+            workspace_publication: workspace_publication(&tx, provider, home, workspace)?,
+        };
+        tx.commit().map_err(database_error)?;
+        Ok(checkpoint)
+    }
+
+    /// Checks a live read without publishing any catalog data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read its discovery state.
+    pub fn discovery_checkpoint_is_current(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+    ) -> Result<bool> {
+        let connection = self.connection.borrow();
+        let tx = connection.unchecked_transaction().map_err(database_error)?;
+        let current = checkpoint.is_current(&tx)?;
+        tx.commit().map_err(database_error)?;
+        Ok(current)
+    }
+
+    /// Merges a workspace listing while its discovery checkpoint is current, including a successful empty listing.
+    /// This operation preserves provider-wide discovery ownership and completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the checkpoint or save the rows.
+    pub fn merge_sessions_at_discovery_checkpoint(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+    ) -> Result<bool> {
+        if sessions.is_empty() && checkpoint.workspace.is_none() {
+            return self.discovery_checkpoint_is_current(checkpoint);
+        }
+        self.write_discovered_sessions(
+            checkpoint.provider,
+            sessions,
+            DiscoveryScope::Workspace,
+            Some(&checkpoint.home),
+            CatalogWrite::Merge(checkpoint),
+        )
+    }
+
+    /// Merges a Desktop database listing while keeping summary metadata from the same native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog or checkpoint cannot be read or written.
+    pub fn merge_desktop_databases_at_checkpoint(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+    ) -> Result<bool> {
+        if sessions.is_empty() {
+            return checkpoint.is_current(&self.connection.borrow());
+        }
+        self.write_discovered_sessions(
+            checkpoint.provider,
+            sessions,
+            DiscoveryScope::DesktopDatabasesWithoutSummaries,
+            Some(&checkpoint.home),
+            CatalogWrite::Merge(checkpoint),
+        )
+    }
+
     /// Claims a provider-wide discovery if this reader has no recent check for the selected home.
     ///
     /// # Errors
@@ -213,7 +460,9 @@ impl Store {
             &attempt.home,
         )?;
         Ok(match observation {
-            Some(check) if check.id == attempt.id => check.state(fresh_since),
+            Some(check) if check.selected_home && check.id == attempt.id => {
+                check.state(fresh_since)
+            }
             _ => SessionDiscoveryState::Superseded,
         })
     }
@@ -237,7 +486,32 @@ impl Store {
             sessions,
             scope,
             Some(&attempt.home),
-            Some((attempt, finished_at)),
+            CatalogWrite::Publish(attempt, finished_at, None),
+        )
+    }
+
+    /// Publishes a provider-wide catalog only while its scoped discovery checkpoint is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing or write fails.
+    pub fn publish_at_discovery_checkpoint(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+        scope: DiscoveryScope,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        if !checkpoint.owns(attempt) {
+            return Ok(false);
+        }
+        self.write_discovered_sessions(
+            attempt.provider,
+            sessions,
+            scope,
+            Some(&attempt.home),
+            CatalogWrite::Publish(attempt, finished_at, Some(checkpoint)),
         )
     }
 

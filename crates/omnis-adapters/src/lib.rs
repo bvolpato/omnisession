@@ -71,11 +71,21 @@ pub struct NativeSession {
     pub source_revision: Option<SourceRevision>,
 }
 
+/// Native catalog rows and the metadata quality observed during the same read.
+#[derive(Default)]
+pub struct NativeListing {
+    pub sessions: Vec<NativeSession>,
+    pub notes: Vec<String>,
+    pub desktop_summaries_unavailable: bool,
+}
+
 /// A durable source revision and the native path metadata that verified this read.
 #[derive(Debug)]
 pub struct SearchSourceObservation {
     pub revision: SourceRevision,
     pub session: NativeSession,
+    /// The desktop database was readable, but its optional summary metadata was unavailable.
+    pub desktop_summaries_unavailable: bool,
     /// Canonical native home verified together with this session.
     pub home: PathBuf,
     selected_home: PathBuf,
@@ -103,6 +113,7 @@ impl SearchSourceObservation {
         let observed = Self {
             revision,
             session,
+            desktop_summaries_unavailable: false,
             home,
             selected_home: root.to_path_buf(),
             paths,
@@ -205,6 +216,19 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
+
+    /// Returns the session listing with its non-fatal observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
+        Ok(NativeListing {
+            sessions: self.list_sessions(project)?,
+            notes: self.discovery_notes(),
+            ..NativeListing::default()
+        })
+    }
 
     /// Finds session metadata by exact native ID.
     ///
@@ -529,9 +553,8 @@ impl AdapterRegistry {
         provider: Provider,
         project: Option<&Path>,
     ) -> Result<(Vec<NativeSession>, Vec<String>)> {
-        let adapter = self.adapter(provider)?;
-        let sessions = adapter.list_sessions(project)?;
-        Ok((sessions, adapter.discovery_notes()))
+        let listing = self.adapter(provider)?.list_catalog(project)?;
+        Ok((listing.sessions, listing.notes))
     }
 
     /// Returns the selected native home for providers with home-specific catalog caches.
@@ -553,13 +576,13 @@ impl AdapterRegistry {
         provider: Provider,
         project: Option<&Path>,
         home: Option<&Path>,
-    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    ) -> Result<NativeListing> {
         let adapter = self.adapter(provider)?;
         anyhow::ensure!(
             adapter.discovery_cache_home()?.as_deref() == home,
             "provider home changed during discovery"
         );
-        let listing = self.list_sessions_with_notes(provider, project)?;
+        let listing = adapter.list_catalog(project)?;
         anyhow::ensure!(
             adapter.discovery_cache_home()?.as_deref() == home,
             "provider home changed during discovery"

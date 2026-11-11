@@ -59,7 +59,8 @@ impl IndexCandidate {
         let readable = provider == Provider::Imported
             || (provider != Provider::OpenCode
                 && session.source_path.is_some()
-                && (provider != Provider::Antigravity || session.source_revision.is_some()));
+                && (!TrajectorySourceGuard::uses_catalog_home(provider)
+                    || session.source_revision.is_some()));
         readable.then(|| Self {
             session: session.session.clone(),
             // The picker may display a shared database's age for an undated session.
@@ -147,7 +148,7 @@ pub(crate) fn source_time_changed(
     current: DateTime<Utc>,
     cached: &TrajectoryIndexState,
 ) -> bool {
-    if provider == Provider::Antigravity && cached.source_revision.file.is_some() {
+    if TrajectorySourceGuard::uses_catalog_home(provider) && cached.source_revision.file.is_some() {
         // The verified physical revision covers the history. The catalog has its own clock.
         false
     } else if provider == Provider::Imported {
@@ -181,7 +182,7 @@ fn background_source_guard(
     session: &SessionRef,
     prior: Option<&TrajectoryIndexState>,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
-    if session.provider == Provider::Antigravity {
+    if TrajectorySourceGuard::uses_catalog_home(session.provider) {
         store.observe_discovered_trajectory_document(session)
     } else {
         source_guard(store, session, prior)
@@ -192,11 +193,9 @@ fn guard_observed_home(
     guard: TrajectorySourceGuard,
     observation: Option<&SearchSourceObservation>,
 ) -> TrajectorySourceGuard {
-    observation
-        .filter(|source| source.session.session.provider == Provider::Antigravity)
-        .map_or(guard, |source| {
-            guard.for_published_catalog_home(&source.home)
-        })
+    observation.map_or(guard, |source| {
+        guard.for_published_catalog_home(&source.home)
+    })
 }
 
 pub(crate) fn observe_source(
@@ -250,7 +249,9 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
     {
         return false;
     }
-    if candidate.session.provider == Provider::Antigravity && failure.source_file.is_some() {
+    if TrajectorySourceGuard::uses_catalog_home(candidate.session.provider)
+        && failure.source_file.is_some()
+    {
         return true;
     }
     (failure.source_time_precise
@@ -322,7 +323,8 @@ fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
             && (state.document_version < search_document_version(provider)
-                || (provider == Provider::Antigravity && state.source_revision.file.is_none())
+                || (TrajectorySourceGuard::uses_catalog_home(provider)
+                    && state.source_revision.file.is_none())
                 || (provider != Provider::Imported && !state.source_time_precise))
     }) {
         u64::MAX
@@ -355,16 +357,17 @@ fn pending(
         let prior = states.get(&candidate.session);
         let failure = failures.get(&candidate.session);
         // A verified return to the cached source retires a failure for the other source.
-        let failed_other_source = candidate.session.provider == Provider::Antigravity
-            && prior.is_some_and(|state| {
-                state.document_version == search_document_version(candidate.session.provider)
-            })
-            && failure.is_some_and(|failure| {
-                failure.document_version <= search_document_version(candidate.session.provider)
-                    && (failure.native_summary != candidate.native_summary()
-                        || failure.source_file != candidate.source_revision.file
-                        || failure.source_contents != candidate.source_revision.contents)
-            });
+        let failed_other_source =
+            TrajectorySourceGuard::uses_catalog_home(candidate.session.provider)
+                && prior.is_some_and(|state| {
+                    state.document_version == search_document_version(candidate.session.provider)
+                })
+                && failure.is_some_and(|failure| {
+                    failure.document_version <= search_document_version(candidate.session.provider)
+                        && (failure.native_summary != candidate.native_summary()
+                            || failure.source_file != candidate.source_revision.file
+                            || failure.source_contents != candidate.source_revision.contents)
+                });
         if !needs_index(&candidate, prior) && !failed_other_source {
             continue;
         }
@@ -452,7 +455,7 @@ pub(crate) fn index_candidates(
                 prepare_session(registry, Some(store), candidate, *guard, *budget)
             });
             // Antigravity clears its failure inside the guarded history or summary write.
-            if candidate.session.provider != Provider::Antigravity
+            if !TrajectorySourceGuard::uses_catalog_home(candidate.session.provider)
                 && result.is_ok()
                 && failures.contains_key(&candidate.session)
             {
@@ -680,7 +683,9 @@ fn flush_batch(
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
+                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate)
+                    && prepared.source.native_home() == fresh.source.native_home()
+                {
                     prepared = fresh;
                     stored = prepared.store(store);
                 }
@@ -747,7 +752,15 @@ struct PreparedIndex {
 impl PreparedIndex {
     fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
         let session = self.candidate.session;
-        if let Ok(title) = store.trajectory_title(&session) {
+        let title = match self.source.observation.as_ref() {
+            Some(source) => store.trajectory_title_for_native_source(
+                &session,
+                &source.home,
+                source.revision.file,
+            ),
+            None => store.trajectory_title(&session),
+        };
+        if let Ok(title) = title {
             titles.push((session, title));
         }
     }
@@ -780,7 +793,7 @@ pub(crate) fn indexed_title(
     session: &SessionRef,
     snapshot: &omnis_ir::CanonicalSnapshot,
 ) -> Option<String> {
-    if session.provider == Provider::Antigravity {
+    if TrajectorySourceGuard::uses_catalog_home(session.provider) {
         session_history_title(snapshot)
     } else {
         session_search_title(snapshot)
@@ -817,6 +830,12 @@ fn verified_source(
 }
 
 impl SearchSource {
+    fn native_home(&self) -> Option<&std::ffi::OsStr> {
+        self.observation
+            .as_ref()
+            .map(|source| source.home.as_os_str())
+    }
+
     pub(crate) fn revision(&self) -> SourceRevision {
         self.observation
             .as_ref()
@@ -872,7 +891,10 @@ pub(crate) fn observe_native_read<T>(
     Ok((
         value,
         updated_at
-            .filter(|_| current)
+            .filter(|_| {
+                current
+                    && (session.provider != Provider::AntigravityDesktop || observation.is_some())
+            })
             .map(|updated_at| SearchSource {
                 updated_at,
                 origin,

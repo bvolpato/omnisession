@@ -38,6 +38,7 @@ use omnis_store::{
     HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use uuid::Uuid;
 
 use crate::{
     DELETE_PROVIDERS, PROVIDERS,
@@ -146,6 +147,14 @@ struct PickerEntry {
     cached: bool,
 }
 
+impl PickerEntry {
+    fn source_file(&self) -> Option<Uuid> {
+        self.session
+            .source_revision
+            .and_then(|revision| revision.file)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum NewSessionRow {
     Hidden,
@@ -172,6 +181,8 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
+    native_homes: HashMap<Provider, PathBuf>,
+    pending_native_titles: HashMap<SessionRef, Uuid>,
     indexed_titles: HashMap<String, String>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
     index_progress: Option<(usize, usize)>,
@@ -252,6 +263,8 @@ impl PickerState {
             selected: 0,
             selection_touched: false,
             visible_cache: RefCell::new(None),
+            native_homes: HashMap::new(),
+            pending_native_titles: HashMap::new(),
             indexed_titles: HashMap::new(),
             preview_titles: HashMap::new(),
             index_progress: None,
@@ -452,11 +465,20 @@ impl PickerState {
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
-        if provider == Provider::Antigravity {
+        if has_scoped_home(provider) {
             for new in &entries {
-                if let Some(&i) = self.entry_positions.get(&new.key)
-                    && self.preview_key(&self.entries[i]) != self.preview_key(new)
+                let previous = self
+                    .entry_positions
+                    .get(&new.key)
+                    .map(|&i| &self.entries[i]);
+                if let Some(file) = new.source_file()
+                    && previous.and_then(PickerEntry::source_file) != Some(file)
                 {
+                    self.indexed_titles.remove(&new.key);
+                    self.pending_native_titles
+                        .insert(new.session.session.clone(), file);
+                }
+                if previous.is_some_and(|old| self.preview_key(old) != self.preview_key(new)) {
                     self.previews.remove_session(&new.session.session);
                     self.preview_titles.remove(&new.key);
                 }
@@ -816,12 +838,13 @@ impl PickerState {
         Some(TrajectorySearchRequest {
             generation: self.trajectory_search_generation,
             query: self.query.clone(),
+            homes: self.native_homes.clone(),
             eligible_sessions: self
                 .entries
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| entry.session.session.clone())
+                .map(|(_, entry)| (entry.session.session.clone(), entry.source_file()))
                 .collect(),
         })
     }
@@ -892,6 +915,7 @@ impl PickerState {
             IndexCandidate::summary_path(session.session.provider, session.source_path.as_deref());
         PreviewKey {
             session: session.session.clone(),
+            native_home: self.native_homes.get(&session.session.provider).cloned(),
             source_revision: session.source_revision,
             catalog: (session.session.provider == Provider::Antigravity).then(|| CatalogPreview {
                 title: if entry.has_provider_title {
@@ -989,6 +1013,7 @@ struct CatalogPreview {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    native_home: Option<PathBuf>,
     source_revision: Option<omnis_ir::SourceRevision>,
     catalog: Option<CatalogPreview>,
     updated_at: Option<DateTime<Utc>>,
@@ -1385,10 +1410,18 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
     (!head.is_empty()).then(|| format!("detached @ {}", short_id(head)))
 }
 
+const fn has_scoped_home(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    )
+}
+
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
-    eligible_sessions: Vec<SessionRef>,
+    homes: HashMap<Provider, PathBuf>,
+    eligible_sessions: Vec<(SessionRef, Option<Uuid>)>,
 }
 
 #[derive(Default)]
@@ -1674,7 +1707,13 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
         changed = true;
     }
     if let Some(candidates) = state.due_index_request() {
-        let _ = workers.search_index_sender.send(candidates);
+        let _ = workers
+            .search_index_sender
+            .send(workers::PickerIndexRequest {
+                candidates,
+                homes: state.native_homes.clone(),
+                pending_titles: state.pending_native_titles.clone(),
+            });
     }
     if let Some(request) = state.due_trajectory_search_request() {
         changed = true;
@@ -2831,7 +2870,11 @@ mod tests {
             workers::SessionCacheUpdate::Listed {
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
-                complete,
+                scope: if complete {
+                    omnis_store::DiscoveryScope::CompleteProvider
+                } else {
+                    omnis_store::DiscoveryScope::PartialProvider
+                },
                 attempt: None,
                 publication: None,
             }
@@ -4391,6 +4434,7 @@ mod tests {
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
                 source_revision: None,
+                native_home: None,
                 catalog: None,
                 updated_at: None,
                 native_summary: false,
@@ -4406,6 +4450,7 @@ mod tests {
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
                 source_revision: None,
+                native_home: None,
                 catalog: None,
                 updated_at: None,
                 native_summary: false,
@@ -5000,6 +5045,66 @@ mod tests {
     }
 
     #[test]
+    fn native_search_and_queued_titles_follow_the_selected_source() {
+        let project = Path::new("/workspace");
+        let provider = Provider::Antigravity;
+        let mut native = session(provider, "shared", project, None);
+        let file = Uuid::new_v4();
+        native.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(file),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native.clone()], project, Some(provider), false);
+        let (sender, receiver) = mpsc::channel();
+        let homes = HashMap::from([(provider, PathBuf::from("/home-a"))]);
+        sender
+            .send(PickerUpdate::NativeHomes(homes.clone()))
+            .unwrap();
+        sender
+            .send(PickerUpdate::NativeTitles(vec![
+                (
+                    native.session.clone(),
+                    Some(file),
+                    Some("Local title".to_owned()),
+                ),
+                (
+                    native.session.clone(),
+                    Some(Uuid::new_v4()),
+                    Some("Foreign title".to_owned()),
+                ),
+            ]))
+            .unwrap();
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            project,
+        );
+        assert_eq!(
+            state.selected_entry().unwrap().session.title.as_deref(),
+            Some("Local title")
+        );
+        let preview = state.preview_key(&state.entries[0]);
+        assert_eq!(preview.native_home.as_deref(), Some(Path::new("/home-a")));
+        state.query = "foreign".to_owned();
+        state.query_changed();
+        assert!(state.visible_indices().is_empty());
+        state.trajectory_search_deadline = Some(Instant::now());
+        let request = state.due_trajectory_search_request().unwrap();
+        assert_eq!(request.homes, homes);
+        assert_eq!(
+            request.eligible_sessions,
+            [(native.session.clone(), Some(file))]
+        );
+        state.update_provider_entries(provider, Vec::new(), false);
+        state.trajectory_search_deadline = Some(Instant::now());
+        let offline = state.due_trajectory_search_request().unwrap();
+        assert_eq!(offline.homes, homes);
+        assert_eq!(offline.eligible_sessions, [(native.session, None)]);
+    }
+
+    #[test]
     fn trajectory_search_request_snapshots_workspace_and_provider_eligibility() {
         let current = Path::new("/workspace/current");
         let mut state = PickerState::new(
@@ -5026,7 +5131,7 @@ mod tests {
             .expect("current workspace request");
         assert_eq!(
             current_request.eligible_sessions,
-            vec![SessionRef::new(Provider::Codex, "current-codex")]
+            vec![(SessionRef::new(Provider::Codex, "current-codex"), None)]
         );
 
         handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -5038,8 +5143,8 @@ mod tests {
         assert_eq!(
             all_projects_request.eligible_sessions,
             vec![
-                SessionRef::new(Provider::Codex, "current-codex"),
-                SessionRef::new(Provider::Codex, "other-codex"),
+                (SessionRef::new(Provider::Codex, "current-codex"), None),
+                (SessionRef::new(Provider::Codex, "other-codex"), None),
             ]
         );
 

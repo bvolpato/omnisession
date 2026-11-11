@@ -5,6 +5,8 @@
 //! can keep entries for conversations that no longer have a local database. Archived
 //! conversations, whose databases the app empties, are not listed.
 
+mod source;
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -13,20 +15,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    LaunchPlan, LaunchTarget, NativeListing, NativeSession, ProviderAdapter, ProviderInstallation,
     antigravity::{
         ProtoTimestamp, history_file_time, nonempty, proto_timestamp, push_database_steps,
         validate_id, workspace_uri_path,
     },
     support::{
-        EventBuilder, nested_files_matching, paths_match, provider_file, provider_root,
-        sort_sessions, store_is_missing, validate_provider,
+        EventBuilder, MAX_DISCOVERED_FILES, MAX_DISCOVERY_ENTRIES, paths_match, provider_file,
+        provider_root, sort_sessions, store_is_missing, validate_provider,
     },
 };
 
@@ -41,6 +43,9 @@ pub struct AntigravityDesktopAdapter {
 }
 
 impl AntigravityDesktopAdapter {
+    /// Discovery can list the databases when their optional title and workspace metadata is unreadable.
+    pub const UNREADABLE_SUMMARIES: &str = "Antigravity Desktop summary metadata is unreadable. Conversation databases remain available in all-projects discovery.";
+
     #[must_use]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -86,30 +91,86 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        self.list_catalog(project).map(|listing| listing.sessions)
+    }
+
+    fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
         let Some(root) = self.root.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(NativeListing::default());
         };
-        let conversations = root.join(CONVERSATIONS);
-        if store_is_missing(&conversations) {
-            return Ok(Vec::new());
+        if store_is_missing(root) {
+            return Ok(NativeListing::default());
         }
-        let summaries = read_summaries(root).unwrap_or_default();
+        let root = root
+            .canonicalize()
+            .context("resolving Antigravity Desktop home")?;
+        let Some(conversations) = native_directory(&root, CONVERSATIONS)? else {
+            return Ok(NativeListing::default());
+        };
+        let mut annotations = None;
+        let mut notes = Vec::new();
+        let summaries = read_summaries(&root).unwrap_or_else(|_| {
+            notes.push(Self::UNREADABLE_SUMMARIES.to_owned());
+            None
+        });
+        let entries =
+            fs::read_dir(&conversations).context("listing Antigravity Desktop conversations")?;
         let mut sessions = Vec::new();
-        for candidate in nested_files_matching(&conversations, 0, &|path, is_dir| {
-            !is_dir && path.extension().is_some_and(|extension| extension == "db")
-        }) {
-            let Some(id) = candidate.file_stem().and_then(OsStr::to_str) else {
-                continue;
-            };
-            let Some(database) = conversation_database(root, id) else {
-                continue;
-            };
-            // The app hides archived conversations and empties their databases while keeping the
-            // summary, so listing them would only show sessions that cannot be read.
-            if archived(root, id) {
+        let mut databases = 0;
+        for (count, entry) in entries.enumerate() {
+            ensure!(
+                count < MAX_DISCOVERY_ENTRIES,
+                "Antigravity Desktop conversation directory exceeds discovery limit"
+            );
+            let entry = entry.context("reading Antigravity Desktop directory entry")?;
+            let candidate = entry.path();
+            if candidate
+                .extension()
+                .is_none_or(|extension| extension != "db")
+            {
                 continue;
             }
-            let session = native_session(id, database, summaries.get(id));
+            let Some(id) = candidate
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .filter(|id| validate_id(id).is_ok())
+            else {
+                continue;
+            };
+            if !entry
+                .file_type()
+                .context("checking Antigravity Desktop directory entry")?
+                .is_file()
+            {
+                continue;
+            }
+            if databases == 0 {
+                annotations = native_directory(&root, ANNOTATIONS)?;
+            }
+            databases += 1;
+            ensure!(
+                databases <= MAX_DISCOVERED_FILES,
+                "Antigravity Desktop conversation count exceeds discovery limit"
+            );
+            let database = candidate
+                .canonicalize()
+                .context("resolving listed Antigravity Desktop database")?;
+            ensure!(
+                database == candidate,
+                "Antigravity Desktop database moved during discovery"
+            );
+            // The app hides archived conversations and empties their databases while keeping the
+            // summary, so listing them would only show sessions that cannot be read.
+            if let Some(directory) = &annotations
+                && archived(directory, id)?
+            {
+                continue;
+            }
+            let session = native_session(
+                id,
+                database,
+                summaries.as_ref().and_then(|rows| rows.get(id)),
+            );
             if project.is_some_and(|requested| {
                 session
                     .project_path
@@ -121,7 +182,11 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             sessions.push(session);
         }
         sort_sessions(&mut sessions);
-        Ok(sessions)
+        Ok(NativeListing {
+            sessions,
+            notes,
+            desktop_summaries_unavailable: summaries.is_none() && databases != 0,
+        })
     }
 
     fn search_source_files(
@@ -134,14 +199,26 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         search_files(self.root()?, &session.id, source_path)
     }
 
+    fn observe_search_source(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+    ) -> Result<Option<crate::SearchSourceObservation>> {
+        source::observe(self, session, path)
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::AntigravityDesktop)?;
         validate_id(&session.id)?;
         let root = self.root()?;
         let database = conversation_database(root, &session.id)
             .ok_or_else(|| anyhow!("Antigravity Desktop session `{}` was not found", session.id))?;
-        let summaries = read_summaries(root).unwrap_or_default();
-        let listed = native_session(&session.id, database.clone(), summaries.get(&session.id));
+        let summaries = read_summaries(root).ok().flatten();
+        let listed = native_session(
+            &session.id,
+            database.clone(),
+            summaries.as_ref().and_then(|rows| rows.get(&session.id)),
+        );
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
         let decoded = push_database_steps(root, &database, &mut builder)?;
         if decoded == 0 && listed.event_count > 0 && builder.checkpoint() == 0 {
@@ -171,7 +248,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             .as_ref()
             .is_some_and(|root| root.join(CONVERSATIONS).is_dir() && read_summaries(root).is_err())
         {
-            vec!["Antigravity Desktop summary metadata is unreadable; conversation databases remain available in all-projects discovery with unknown titles and workspaces.".to_owned()]
+            vec![Self::UNREADABLE_SUMMARIES.to_owned()]
         } else {
             Vec::new()
         }
@@ -198,27 +275,51 @@ fn conversation_database(root: &Path, id: &str) -> Option<PathBuf> {
     provider_file(root, &root.join(CONVERSATIONS).join(format!("{id}.db")))
 }
 
+fn native_directory(root: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let directory = root.join(name);
+    if store_is_missing(&directory) {
+        return Ok(None);
+    }
+    let directory = directory
+        .canonicalize()
+        .with_context(|| format!("resolving Antigravity Desktop {name} directory"))?;
+    ensure!(
+        directory.starts_with(root) && fs::metadata(&directory)?.is_dir(),
+        "invalid Antigravity Desktop {name} directory"
+    );
+    Ok(Some(directory))
+}
+
 /// Whether the conversation's text-format annotation marks it archived.
-fn archived(root: &Path, id: &str) -> bool {
+fn archived(directory: &Path, id: &str) -> Result<bool> {
     const MAX_ANNOTATION_SIZE: u64 = 64 * 1024;
-    let Some(path) = provider_file(root, &root.join(ANNOTATIONS).join(format!("{id}.pbtxt")))
-    else {
-        return false;
-    };
-    let mut text = String::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_ANNOTATION_SIZE).read_to_string(&mut text))
-        .is_ok_and(|_| annotation_archived(&text))
+    let path = directory.join(format!("{id}.pbtxt"));
+    if store_is_missing(&path) {
+        return Ok(false);
+    }
+    ensure!(
+        path.symlink_metadata()?.is_file() && path.canonicalize()? == path,
+        "invalid Antigravity Desktop archive annotation"
+    );
+    let bytes = read_stable(&path, MAX_ANNOTATION_SIZE)
+        .context("reading Antigravity Desktop archive annotation")?;
+    annotation_archived(std::str::from_utf8(&bytes)?)
 }
 
 /// Finds a top-level `archived: true` field in a protobuf text-format message, ignoring nested
 /// messages and quoted strings.
-fn annotation_archived(text: &str) -> bool {
+fn annotation_archived(text: &str) -> Result<bool> {
     let mut spaced = String::with_capacity(text.len());
     let mut quote = None;
     let mut escaped = false;
+    let mut comment = false;
     for character in text.chars() {
-        if let Some(delimiter) = quote {
+        if comment {
+            if character == '\n' {
+                comment = false;
+                spaced.push(' ');
+            }
+        } else if let Some(delimiter) = quote {
             if escaped {
                 escaped = false;
             } else if character == '\\' {
@@ -229,27 +330,58 @@ fn annotation_archived(text: &str) -> bool {
             }
         } else if matches!(character, '"' | '\'') {
             quote = Some(character);
-        } else if matches!(character, ':' | '{' | '}' | '<' | '>' | ',' | ';') {
+        } else if character == '#' {
+            comment = true;
+        } else if matches!(
+            character,
+            ':' | '{' | '}' | '<' | '>' | '[' | ']' | ',' | ';'
+        ) {
             spaced.extend([' ', character, ' ']);
         } else {
             spaced.push(character);
         }
     }
-    let tokens = spaced.split_whitespace().collect::<Vec<_>>();
-    let mut depth = 0_usize;
-    for (index, token) in tokens.iter().enumerate() {
-        match *token {
-            "{" | "<" => depth += 1,
-            "}" | ">" => depth = depth.saturating_sub(1),
-            "archived" if depth == 0 && tokens.get(index + 1) == Some(&":") => {
-                return tokens
-                    .get(index + 2)
-                    .is_some_and(|value| matches!(*value, "true" | "True" | "t" | "1"));
+    ensure!(
+        quote.is_none(),
+        "unterminated string in Antigravity Desktop archive annotation"
+    );
+    let mut closing = Vec::new();
+    let mut archived = None;
+    let mut previous = None;
+    let mut tokens = spaced.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "{" => closing.push("}"),
+            "<" => closing.push(">"),
+            "[" => closing.push("]"),
+            "}" | ">" | "]" => ensure!(
+                closing.pop() == Some(token),
+                "invalid Antigravity Desktop archive annotation"
+            ),
+            "archived" if closing.is_empty() && previous != Some(":") => {
+                ensure!(
+                    tokens.next() == Some(":"),
+                    "invalid Antigravity Desktop archive flag"
+                );
+                ensure!(
+                    archived.is_none(),
+                    "duplicate Antigravity Desktop archive flag"
+                );
+                archived = Some(match tokens.next() {
+                    Some("true" | "True" | "t" | "1") => true,
+                    Some("false" | "False" | "f" | "0") => false,
+                    _ => return Err(anyhow!("invalid Antigravity Desktop archive flag")),
+                });
             }
             _ => {}
         }
+        previous = Some(token);
     }
-    false
+    ensure!(
+        closing.is_empty(),
+        "unfinished Antigravity Desktop archive annotation"
+    );
+    Ok(archived.unwrap_or(false))
 }
 
 fn native_session(
@@ -266,8 +398,11 @@ fn native_session(
     let git_branch = project_path
         .as_ref()
         .and_then(|_| summary.and_then(ProtoTrajectorySummary::git_branch));
+    let event_count = summary.map_or(0, |summary| {
+        usize::try_from(summary.step_count).unwrap_or(usize::MAX)
+    });
     NativeSession {
-        source_revision: None,
+        source_revision: crate::antigravity::database_history_revision(&database, event_count),
         session: SessionRef::new(Provider::AntigravityDesktop, id),
         title: summary.and_then(|summary| nonempty(summary.summary.clone())),
         project_path,
@@ -277,39 +412,35 @@ fn native_session(
             .and_then(proto_timestamp),
         updated_at,
         updated_at_approximate: recorded_update.is_none(),
-        event_count: summary.map_or(0, |summary| {
-            usize::try_from(summary.step_count).unwrap_or(usize::MAX)
-        }),
+        event_count,
         source_path: Some(database),
     }
 }
 
-fn read_summaries(root: &Path) -> Result<HashMap<String, ProtoTrajectorySummary>> {
+fn read_summaries(root: &Path) -> Result<Option<HashMap<String, ProtoTrajectorySummary>>> {
     let path = root.join(SUMMARIES);
     if store_is_missing(&path) {
-        return Ok(HashMap::new());
+        return Ok(None);
     }
     let path = provider_file(root, &path)
         .ok_or_else(|| anyhow!("Antigravity Desktop summaries are outside the data root"))?;
-    let bytes = read_stable(&path).context("failed to read Antigravity Desktop summaries")?;
+    let bytes = read_stable(&path, MAX_SUMMARIES_SIZE)
+        .context("failed to read Antigravity Desktop summaries")?;
     ProtoSummariesState::decode(bytes.as_slice())
-        .map(|state| state.summaries)
+        .map(|state| Some(state.summaries))
         .context("failed to decode Antigravity Desktop summaries")
 }
 
 /// Reads a bounded provider file and retries when a concurrent writer replaces it mid-read.
-fn read_stable(path: &Path) -> Result<Vec<u8>> {
+fn read_stable(path: &Path, limit: u64) -> Result<Vec<u8>> {
     for _ in 0..3 {
         let before = fs::metadata(path)?;
-        if before.len() > MAX_SUMMARIES_SIZE {
-            return Err(anyhow!(
-                "Antigravity Desktop summaries exceed safe read limit"
-            ));
-        }
+        ensure!(
+            before.len() <= limit,
+            "Antigravity Desktop metadata exceeds its read limit"
+        );
         let mut bytes = Vec::new();
-        File::open(path)?
-            .take(MAX_SUMMARIES_SIZE + 1)
-            .read_to_end(&mut bytes)?;
+        File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
         let after = fs::metadata(path)?;
         if before.len() == after.len()
             && before.modified().ok() == after.modified().ok()
@@ -318,7 +449,7 @@ fn read_stable(path: &Path) -> Result<Vec<u8>> {
             return Ok(bytes);
         }
     }
-    Err(anyhow!("Antigravity Desktop summaries changed during read"))
+    Err(anyhow!("Antigravity Desktop metadata changed during read"))
 }
 
 /// `jetbox_summaries_pb.SummariesState`.
@@ -632,6 +763,142 @@ mod tests {
                 .any(|note| note.contains("unreadable"))
         );
         assert_eq!(fs::read(root.join(SUMMARIES)).unwrap(), before);
+    }
+
+    #[test]
+    fn a_missing_optional_summary_lists_databases_without_claiming_a_metadata_clear() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_conversation(root, SESSION_ID);
+        let adapter = AntigravityDesktopAdapter::with_root(root);
+        let absent = adapter.list_catalog(None).unwrap();
+        assert_eq!(absent.sessions.len(), 1);
+        assert!(absent.notes.is_empty() && absent.desktop_summaries_unavailable);
+
+        write_summaries(root, Vec::new());
+        let empty = adapter.list_catalog(None).unwrap();
+        assert_eq!(empty.sessions.len(), 1);
+        assert!(empty.notes.is_empty() && !empty.desktop_summaries_unavailable);
+    }
+
+    #[test]
+    fn invalid_archive_annotation_fails_listing_and_preserves_direct_reads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_conversation(root, SESSION_ID);
+        let annotations = root.join("annotations");
+        fs::create_dir(&annotations).unwrap();
+        let path = annotations.join(format!("{SESSION_ID}.pbtxt"));
+        let adapter = AntigravityDesktopAdapter::with_root(root);
+        fs::write(&path, "# archived:true\n").unwrap();
+        assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+        for invalid in [
+            "archived:true archival_status_timestamp:{",
+            "archived:true archived:false",
+            "archived perhaps",
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(adapter.list_sessions(None).is_err());
+        }
+        let source = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
+        assert!(!adapter.read_session(&source).unwrap().events.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_read_failure_is_distinct_from_an_empty_desktop_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let adapter = AntigravityDesktopAdapter::with_root(root);
+        assert!(adapter.list_sessions(None).unwrap().is_empty());
+        write_conversation(root, SESSION_ID);
+        let directory = root.join("conversations");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o100)).unwrap();
+        let cannot_list = fs::read_dir(&directory).is_err();
+        let listing = adapter.list_sessions(None);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        if cannot_list {
+            assert!(listing.is_err());
+        }
+        assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_observes_the_selected_database_wal_count_and_archive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_conversation(root, SESSION_ID);
+        let adapter = AntigravityDesktopAdapter::with_root(root);
+        let session = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
+        let path = root
+            .join(format!("conversations/{SESSION_ID}.db"))
+            .canonicalize()
+            .unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+            .unwrap();
+        let observe = || {
+            adapter
+                .observe_search_source(&session, Some(&path))
+                .unwrap()
+                .unwrap()
+        };
+        let missing = observe();
+        assert!(missing.desktop_summaries_unavailable);
+        fs::write(root.join(SUMMARIES), [0xff]).unwrap();
+        assert!(observe().desktop_summaries_unavailable);
+        write_summaries(root, vec![]);
+        let healthy = observe();
+        assert!(!healthy.desktop_summaries_unavailable);
+        assert_eq!(healthy.revision, missing.revision);
+        writer
+            .execute(
+                "INSERT INTO steps SELECT idx + 10, step_type, step_payload FROM steps",
+                [],
+            )
+            .unwrap();
+        assert!(!healthy.is_current());
+        let with_wal = observe();
+        assert_ne!(with_wal.revision.contents, healthy.revision.contents);
+        write_summaries(
+            root,
+            vec![(
+                SESSION_ID,
+                ProtoTrajectorySummary {
+                    step_count: 6,
+                    ..Default::default()
+                },
+            )],
+        );
+        let with_count = observe();
+        assert_eq!(
+            adapter.list_sessions(None).unwrap()[0].source_revision,
+            Some(with_count.revision)
+        );
+        assert_ne!(with_count.revision.contents, with_wal.revision.contents);
+        let annotations = root.join("annotations");
+        fs::create_dir(&annotations).unwrap();
+        fs::write(
+            annotations.join(format!("{SESSION_ID}.pbtxt")),
+            "archived: true",
+        )
+        .unwrap();
+        assert!(!with_count.is_current());
+        assert!(
+            adapter
+                .observe_search_source(&session, Some(&path))
+                .is_err()
+        );
+        assert!(
+            adapter
+                .observe_search_source(&session, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!adapter.read_session(&session).unwrap().events.is_empty());
     }
 
     #[test]

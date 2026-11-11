@@ -16,8 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
-    AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
-    ProviderInstallation, installed_opencode_model_with_binary,
+    AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeListing, NativeSession,
+    ProviderAdapter, ProviderInstallation, installed_opencode_model_with_binary,
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
@@ -33,8 +33,8 @@ use omnis_ir::{
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
 use omnis_store::{
-    DiscoveryScope, IndexedSession, SessionDiscoveryAttempt, SessionTrajectoryMatch,
-    SessionTrajectoryOrigin, Store, StoreError, TrajectorySourceGuard,
+    DiscoveryScope, IndexedSession, SessionDiscoveryAttempt, SessionDiscoveryCheckpoint,
+    SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError, TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -227,9 +227,10 @@ fn store_search_document(
     if let Some(observation) = &source.observation {
         let metadata = indexed_session_metadata(&observation.session);
         return store
-            .upsert_verified_session_document_in_home(
+            .upsert_verified_session_document_with_catalog(
                 &metadata,
                 Some(&observation.home),
+                observation.desktop_summaries_unavailable,
                 document,
                 guard,
                 |_, revision| source.verifies(revision),
@@ -251,7 +252,7 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) =
+    let (sessions, notes, _) =
         discover_sessions(registry, args.provider, None, Some(&store), |_| true);
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
@@ -326,65 +327,206 @@ fn index_with_interrupt(
     )
 }
 
-/// Records a provider-wide native discovery before it starts, including attempts that fail.
-fn begin_native_discovery(
-    provider: Provider,
-    home: Option<&Path>,
-    store: Option<&Store>,
-    warnings: &mut Vec<String>,
-) -> Option<SessionDiscoveryAttempt> {
-    let home = home?;
-    match store?.mark_session_discovery_attempted(
-        provider,
-        omnis_core::search_document_version(provider),
-        home,
-    ) {
-        Ok(attempt) => Some(attempt),
-        Err(error) => {
-            warnings.push(format!("{provider} session cache: {error}"));
-            None
-        }
-    }
+enum DiscoveryOwnership {
+    Wide(SessionDiscoveryAttempt, Option<SessionDiscoveryCheckpoint>),
+    Checked(SessionDiscoveryCheckpoint),
+    Untracked,
 }
 
 struct CatalogCheck<'a> {
     provider: Provider,
     home: Option<PathBuf>,
     store: Option<&'a Store>,
-    attempt: Option<SessionDiscoveryAttempt>,
+    persist: bool,
+    ownership: DiscoveryOwnership,
 }
 
-impl CatalogCheck<'_> {
-    fn publish(
+impl<'a> CatalogCheck<'a> {
+    fn begin(
+        registry: &AdapterRegistry,
+        provider: Provider,
+        project: Option<&Path>,
+        store: Option<&'a Store>,
+        persist: bool,
+    ) -> Result<Self> {
+        let home = registry.discovery_cache_home(provider)?;
+        let ownership = match (store, home.as_deref()) {
+            (Some(store), Some(home)) => {
+                let version = omnis_core::search_document_version(provider);
+                if persist && project.is_none() {
+                    let attempt =
+                        store.mark_session_discovery_attempted(provider, version, home)?;
+                    let checkpoint = if provider == Provider::Antigravity {
+                        Some(store.session_discovery_checkpoint(provider, version, home, None)?)
+                    } else {
+                        None
+                    };
+                    DiscoveryOwnership::Wide(attempt, checkpoint)
+                } else {
+                    DiscoveryOwnership::Checked(
+                        store.session_discovery_checkpoint(provider, version, home, project)?,
+                    )
+                }
+            }
+            _ => DiscoveryOwnership::Untracked,
+        };
+        Ok(Self {
+            provider,
+            home,
+            store,
+            persist,
+            ownership,
+        })
+    }
+
+    fn native_project<'p>(&self, project: Option<&'p Path>) -> Option<&'p Path> {
+        if self.provider == Provider::AntigravityDesktop && self.store.is_some() {
+            None
+        } else {
+            project
+        }
+    }
+
+    fn restore_desktop_summaries(&self, store: &Store, listing: &mut NativeListing) {
+        if listing.desktop_summaries_unavailable
+            && let Some(home) = &self.home
+            && let Err(error) = fill_cached_desktop_summaries(store, home, &mut listing.sessions)
+        {
+            listing
+                .notes
+                .push(format!("{} cached summaries: {error}", self.provider));
+        }
+    }
+
+    fn accept(
         &self,
+        store: &Store,
         registry: &AdapterRegistry,
         project: Option<&Path>,
-        found: &[NativeSession],
-        notes: &[String],
+        listing: &mut NativeListing,
         finished_at: chrono::DateTime<Utc>,
     ) -> Result<bool> {
-        let Some(store) = self.store else {
-            return Ok(true);
+        let NativeListing {
+            sessions: rows,
+            notes,
+            desktop_summaries_unavailable: unavailable,
+        } = listing;
+        let indexed = if self.persist {
+            rows.iter().map(indexed_session_metadata).collect()
+        } else {
+            Vec::new()
         };
-        if registry.discovery_cache_home(self.provider)? != self.home {
-            return Ok(false);
+        if let DiscoveryOwnership::Checked(checkpoint) = &self.ownership {
+            if !self.persist {
+                return Ok(store.discovery_checkpoint_is_current(checkpoint)?);
+            }
+            if *unavailable {
+                return Ok(store.merge_desktop_databases_at_checkpoint(checkpoint, &indexed)?);
+            }
+            return Ok(store.merge_sessions_at_discovery_checkpoint(checkpoint, &indexed)?);
+        }
+        if !self.persist {
+            return Ok(true);
         }
         let scope = if project.is_some() {
             DiscoveryScope::Workspace
+        } else if *unavailable {
+            DiscoveryScope::DesktopDatabasesWithoutSummaries
         } else if notes.is_empty() && registry.adapter(self.provider)?.discovery_is_complete() {
             DiscoveryScope::CompleteProvider
         } else {
             DiscoveryScope::PartialProvider
         };
-        let indexed = found
-            .iter()
-            .map(indexed_session_metadata)
-            .collect::<Vec<_>>();
-        if let Some(attempt) = &self.attempt {
-            return Ok(store.publish_session_discovery(attempt, &indexed, scope, finished_at)?);
+        if let DiscoveryOwnership::Wide(attempt, checkpoint) = &self.ownership {
+            return Ok(if let Some(checkpoint) = checkpoint {
+                store.publish_at_discovery_checkpoint(
+                    attempt,
+                    checkpoint,
+                    &indexed,
+                    scope,
+                    finished_at,
+                )?
+            } else {
+                store.publish_session_discovery(attempt, &indexed, scope, finished_at)?
+            });
         }
-        store.cache_discovered_sessions(self.provider, &indexed, scope, self.home.as_deref())?;
+        if let Err(error) =
+            store.cache_discovered_sessions(self.provider, &indexed, scope, self.home.as_deref())
+        {
+            notes.push(format!("{} session cache: {error}", self.provider));
+        }
         Ok(true)
+    }
+
+    fn finish(
+        mut self,
+        registry: &AdapterRegistry,
+        project: Option<&Path>,
+        mut listing: NativeListing,
+        mut finished_at: chrono::DateTime<Utc>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let Some(store) = self.store else {
+            return Ok((listing.sessions, listing.notes));
+        };
+        // A fresh native listing retains source paths and revisions. The winner can finish during the first retry.
+        for retry in 0..=2 {
+            let current_home = registry.discovery_cache_home(self.provider)?;
+            if current_home.as_deref().map(Path::as_os_str)
+                != self.home.as_deref().map(Path::as_os_str)
+            {
+                break;
+            }
+            if self.provider == Provider::AntigravityDesktop
+                && let Some(project) = project
+            {
+                self.restore_desktop_summaries(store, &mut listing);
+                listing.sessions.retain(|session| {
+                    session
+                        .project_path
+                        .as_deref()
+                        .is_some_and(|path| workspace_paths_match(path, project))
+                });
+            }
+            if self.accept(store, registry, project, &mut listing, finished_at)? {
+                if project.is_none() {
+                    self.restore_desktop_summaries(store, &mut listing);
+                }
+                return Ok((listing.sessions, listing.notes));
+            }
+            let Some(home) = self.home.as_deref() else {
+                break;
+            };
+            let checkpoint = store.session_discovery_checkpoint(
+                self.provider,
+                omnis_core::search_document_version(self.provider),
+                home,
+                project,
+            )?;
+            let same_home = match &self.ownership {
+                DiscoveryOwnership::Checked(prior) => checkpoint.can_follow(prior),
+                DiscoveryOwnership::Wide(attempt, Some(prior)) if prior.owns(attempt) => {
+                    checkpoint.can_follow(prior)
+                }
+                _ => checkpoint.is_for_selected_home(),
+            };
+            if retry == 2 || !same_home {
+                break;
+            }
+            self.ownership = match &self.ownership {
+                DiscoveryOwnership::Wide(attempt, _) if checkpoint.owns(attempt) => {
+                    DiscoveryOwnership::Wide(attempt.clone(), Some(checkpoint))
+                }
+                _ => DiscoveryOwnership::Checked(checkpoint),
+            };
+            listing = registry.list_sessions_in_home(
+                self.provider,
+                self.native_project(project),
+                Some(home),
+            )?;
+            finished_at = Utc::now();
+        }
+        self.record_failure(registry, Utc::now())?;
+        anyhow::bail!("catalog changed during discovery. Retry to read its current sessions.")
     }
 
     fn record_failure(
@@ -392,8 +534,12 @@ impl CatalogCheck<'_> {
         registry: &AdapterRegistry,
         finished_at: chrono::DateTime<Utc>,
     ) -> Result<()> {
-        if let (Some(store), Some(attempt)) = (self.store, &self.attempt)
-            && registry.discovery_cache_home(self.provider)?.as_deref() == Some(attempt.home())
+        if let (Some(store), DiscoveryOwnership::Wide(attempt, _)) = (self.store, &self.ownership)
+            && registry
+                .discovery_cache_home(self.provider)?
+                .as_deref()
+                .map(Path::as_os_str)
+                == Some(attempt.home().as_os_str())
         {
             store.finish_session_discovery(attempt, finished_at)?;
         }
@@ -408,7 +554,7 @@ fn discover_sessions(
     project: Option<&Path>,
     store: Option<&Store>,
     persist_metadata: impl Fn(Provider) -> bool,
-) -> (Vec<NativeSession>, Vec<String>) {
+) -> (Vec<NativeSession>, Vec<String>, HashMap<Provider, PathBuf>) {
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
         || PROVIDERS.to_vec(),
@@ -420,40 +566,36 @@ fn discover_sessions(
         },
     );
     let mut sessions = Vec::new();
+    let mut homes = HashMap::new();
     let mut warnings = Vec::new();
     let discovered = thread::scope(|scope| {
         let handles = providers
             .into_iter()
             .filter_map(|provider| {
-                let home = match registry.discovery_cache_home(provider) {
-                    Ok(home) => home,
+                let check = match CatalogCheck::begin(
+                    registry,
+                    provider,
+                    project,
+                    store,
+                    persist_metadata(provider),
+                ) {
+                    Ok(check) => check,
                     Err(error) => {
-                        warnings.push(format!("{provider} session home: {error}"));
+                        warnings.push(format!("{provider} session discovery: {error}"));
                         return None;
                     }
                 };
-                let store = store.filter(|_| persist_metadata(provider));
-                let attempt = begin_native_discovery(
-                    provider,
-                    home.as_deref(),
-                    store.filter(|_| project.is_none()),
-                    &mut warnings,
-                );
-                let selected = home.clone();
+                let selected = check.home.clone();
+                let native_project = check.native_project(project);
                 let handle = scope.spawn(move || {
-                    let rows =
-                        registry.list_sessions_in_home(provider, project, selected.as_deref());
+                    let rows = registry.list_sessions_in_home(
+                        provider,
+                        native_project,
+                        selected.as_deref(),
+                    );
                     (rows, Utc::now())
                 });
-                Some((
-                    CatalogCheck {
-                        provider,
-                        home,
-                        store,
-                        attempt,
-                    },
-                    handle,
-                ))
+                Some((check, handle))
             })
             .collect::<Vec<_>>();
         handles
@@ -470,24 +612,24 @@ fn discover_sessions(
     });
     for (check, (result, finished_at)) in discovered {
         let provider = check.provider;
-        let cached = match result {
-            Ok((found, notes)) => {
-                let current = check.publish(registry, project, &found, &notes, finished_at);
-                warnings.extend(notes);
-                if matches!(current, Ok(false)) {
-                    warnings.push(format!("{provider} catalog changed during discovery. Retry to read its current sessions."));
-                } else {
+        let home = check.home.clone();
+        match result {
+            Ok(listing) => match check.finish(registry, project, listing, finished_at) {
+                Ok((found, notes)) => {
+                    if let Some(home) = home {
+                        homes.insert(provider, home);
+                    }
                     sessions.extend(found);
+                    warnings.extend(notes);
                 }
-                current.map(|_| ())
-            }
+                Err(error) => warnings.push(format!("{provider}: {error}")),
+            },
             Err(error) => {
                 warnings.push(format!("{provider}: {error}"));
-                check.record_failure(registry, finished_at)
+                if let Err(error) = check.record_failure(registry, finished_at) {
+                    warnings.push(format!("{provider} session cache: {error}"));
+                }
             }
-        };
-        if let Err(error) = cached {
-            warnings.push(format!("{provider} session cache: {error}"));
         }
     }
     if include_imported {
@@ -499,13 +641,35 @@ fn discover_sessions(
             Err(error) => warnings.push(format!("imported: {error}")),
         }
     }
-    (sessions, warnings)
+    (sessions, warnings, homes)
 }
 
 const SEARCH_TEXT_WIDTH: usize = 80;
 const SEARCH_TITLE_MIN_WIDTH: usize = 16;
 const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
 const SEARCH_SNIPPET_CHARACTERS: usize = 320;
+
+fn fill_cached_desktop_summaries(
+    store: &Store,
+    home: &Path,
+    sessions: &mut [NativeSession],
+) -> omnis_store::Result<()> {
+    let listed = sessions
+        .iter()
+        .map(indexed_session_metadata)
+        .collect::<Vec<_>>();
+    let cached = store.desktop_sessions_with_cached_summaries(home, &listed)?;
+    for (session, row) in sessions.iter_mut().zip(cached) {
+        session.title = row.title;
+        session.project_path = row.project_path;
+        session.git_branch = row.git_branch;
+        session.created_at = row.created_at;
+        session.updated_at = row.updated_at;
+        session.updated_at_approximate = row.updated_at_approximate;
+        session.event_count = row.event_count;
+    }
+    Ok(())
+}
 
 fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     IndexedSession {
@@ -593,15 +757,16 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let store = Store::open_default().context("opening OmniSession state")?;
-    let (mut sessions, mut warnings) = if args.cached {
-        cached_search_sessions(&store, args, &project)?
+    let (mut sessions, mut warnings, homes) = if args.cached {
+        let (sessions, warnings) = cached_search_sessions(&store, args, &project)?;
+        (sessions, warnings, HashMap::new())
     } else {
         discover_sessions(
             registry,
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
             Some(&store),
-            |provider| !args.no_index && provider == Provider::Antigravity,
+            |provider| !args.no_index && TrajectorySourceGuard::uses_catalog_home(provider),
         )
     };
     sessions.sort_by_key(|session| Reverse(session.updated_at));
@@ -622,10 +787,23 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         };
         (index, true)
     };
-    let titles = store
-        .trajectory_titles()
-        .context("reading derived session titles")?;
-    let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
+    let (hits, has_more) = store.read_trajectory_search(|snapshot| {
+        let mut titles = snapshot
+            .trajectory_titles()
+            .context("reading derived session titles")?;
+        let conflicts = conflicting_search_documents(
+            snapshot,
+            &homes,
+            sessions.iter().map(|session| {
+                (
+                    &session.session,
+                    session.source_revision.and_then(|revision| revision.file),
+                )
+            }),
+        )?;
+        titles.retain(|session, _| !conflicts.contains(session));
+        rank_search_hits(snapshot, &query, &sessions, &titles, &conflicts, args.limit)
+    })?;
     if json_output {
         let mut value = search_json(
             &query,
@@ -667,12 +845,41 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     Ok(())
 }
 
+fn conflicting_search_documents<'a>(
+    snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
+    homes: &HashMap<Provider, PathBuf>,
+    candidates: impl Iterator<Item = (&'a SessionRef, Option<Uuid>)>,
+) -> omnis_store::Result<HashSet<SessionRef>> {
+    let mut conflicts = HashSet::new();
+    if homes.is_empty() {
+        return Ok(conflicts);
+    }
+    let mut selected = HashMap::<Provider, Vec<_>>::new();
+    for (session, file) in candidates {
+        if homes.contains_key(&session.provider) {
+            selected
+                .entry(session.provider)
+                .or_default()
+                .push((session.id.as_str(), file));
+        }
+    }
+    for (provider, sources) in selected {
+        conflicts.extend(snapshot.conflicting_native_documents(
+            provider,
+            &homes[&provider],
+            &sources,
+        )?);
+    }
+    Ok(conflicts)
+}
+
 /// Ranks metadata matches by fuzzy score, then conversation-only matches in full-text rank order.
 fn rank_search_hits<'a>(
-    store: &Store,
+    snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
     query: &str,
     sessions: &'a [NativeSession],
     titles: &HashMap<SessionRef, String>,
+    conflicts: &HashSet<SessionRef>,
     limit: usize,
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let terms = fuzzy::query_terms(query);
@@ -726,10 +933,11 @@ fn rank_search_hits<'a>(
         .collect::<HashSet<_>>();
     let eligible = sessions
         .iter()
+        .filter(|session| !conflicts.contains(&session.session))
         .map(|session| session.session.clone())
         .collect::<Vec<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
-    let page = store
+    let page = snapshot
         .search_session_trajectory_page_for_sessions(
             query,
             limit.saturating_add(metadata.len()),
@@ -1760,7 +1968,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let (mut sessions, warnings) =
+    let (mut sessions, warnings, _) =
         discover_sessions(registry, args.provider, project.as_deref(), None, |_| false);
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
@@ -3622,9 +3830,18 @@ mod tests {
         }
         let expected = ["newer", "first", "second", "weak", "conversation"];
         for limit in 0..=6 {
-            let (hits, has_more) =
-                super::rank_search_hits(&store, "needle", &sessions, &super::HashMap::new(), limit)
-                    .expect("rank matches");
+            let (hits, has_more) = store
+                .read_trajectory_search(|snapshot| {
+                    super::rank_search_hits(
+                        snapshot,
+                        "needle",
+                        &sessions,
+                        &super::HashMap::new(),
+                        &super::HashSet::new(),
+                        limit,
+                    )
+                })
+                .expect("rank matches");
             assert_eq!(
                 hits.iter()
                     .map(|hit| hit.session.session.id.as_str())
