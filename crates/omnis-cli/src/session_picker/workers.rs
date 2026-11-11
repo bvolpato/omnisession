@@ -506,7 +506,12 @@ pub(super) fn read_picker_preview(
 fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySourceGuard>) -> u64 {
     let revision = key.source.as_ref().and_then(PreviewSource::revision);
     guard.map_or(search_index::FULL_READ_SOURCE_BYTES, |guard| {
-        search_index::projection_read_budget(guard, key.updated_at, revision.unwrap_or_default())
+        search_index::projection_read_budget(
+            key.session.provider,
+            guard,
+            key.updated_at,
+            revision.unwrap_or_default(),
+        )
     })
 }
 

@@ -152,7 +152,12 @@ impl IndexCandidate {
         if self.require_full_read {
             u64::MAX
         } else {
-            projection_read_budget(guard, self.updated_at, self.source_revision)
+            projection_read_budget(
+                self.session.provider,
+                guard,
+                self.updated_at,
+                self.source_revision,
+            )
         }
     }
 
@@ -234,6 +239,7 @@ pub(crate) fn source_guard(
 }
 
 pub(crate) fn projection_read_budget(
+    provider: Provider,
     guard: TrajectorySourceGuard,
     updated_at: Option<DateTime<Utc>>,
     revision: SourceRevision,
@@ -241,6 +247,18 @@ pub(crate) fn projection_read_budget(
     let TrajectorySourceGuard::Observed(Some(prior)) = guard else {
         return FULL_READ_SOURCE_BYTES;
     };
+    if provider == Provider::Grok
+        && prior.source_complete
+        && revision.file.is_some()
+        && revision.file == prior.source_revision.file
+        && revision.contents.is_some()
+        && (revision.contents != prior.source_revision.contents
+            || prior.document_version < SEARCH_DOCUMENT_VERSION
+            || updated_at
+                .is_some_and(|time| source_time_changed(provider, time, prior.source_updated_at)))
+    {
+        return omnis_adapters::GrokAdapter::MAX_INDEX_REFRESH_BYTES;
+    }
     if prior.source_complete
         && prior.document_version < SEARCH_DOCUMENT_VERSION
         && updated_at.is_some_and(|timestamp| {
@@ -1618,6 +1636,7 @@ mod tests {
         };
         let budget = |stored, selected, updated_at| {
             projection_read_budget(
+                Provider::Codex,
                 TrajectorySourceGuard::Observed(Some(TrajectoryIndexState {
                     provider_limited: false,
                     source_updated_at: time,

@@ -786,6 +786,105 @@ fn grok_search_refreshes_when_only_its_plan_changes() {
 }
 
 #[test]
+fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"amberquince"}}}});
+    let half = format!("{padding}\n").repeat(132);
+    fs::write(dir.join("updates.jsonl"), format!("{half}{marker}\n{half}")).unwrap();
+    let reference = format!("grok:{id}");
+    assert!(
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let search = |term| result_sessions(&fixture.search_json(&[term, "--provider", "grok"]));
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::write(dir.join("usage.json"), r#"{"total_tokens":17}"#).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":"2099-01-01T00:00:00Z"})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    let plan = dir.join("plan.json");
+    fs::write(
+        &plan,
+        json!([{"content":"juniperviolet","status":"pending"}]).to_string(),
+    )
+    .unwrap();
+    assert_eq!(search("juniperviolet"), [reference.as_str()]);
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::remove_file(plan).unwrap();
+    assert!(search("juniperviolet").is_empty());
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+}
+
+#[test]
+fn grok_ownership_scan_continues_after_an_oversized_record() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":3}).to_string(),
+    )
+    .unwrap();
+    let update = |owner: &str, kind: &str, text: &str| json!({"params":{"sessionId":owner,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}});
+    let foreign = update(
+        "22222222-2222-4222-8222-222222222222",
+        "agent_message_chunk",
+        "foreignlemon",
+    );
+    let path = dir.join("updates.jsonl");
+    let reference = format!("grok:{id}");
+    let show = || {
+        fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap()
+    };
+    fs::write(&path, foreign.to_string()).unwrap();
+    assert!(!show().status.success());
+    let question = update(id, "user_message_chunk", "ownedmint");
+    let reply = update(id, "agent_message_chunk", "ownedpear");
+    let oversized = "x".repeat(16 * 1024 * 1024 + 1);
+    fs::write(&path, format!("{question}\n{oversized}\n{reply}")).unwrap();
+    let result = show();
+    assert!(result.status.success());
+    let snapshot: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    for turn in ["ownedmint", "ownedpear"] {
+        assert!(events.iter().any(|row| row["payload"]["text"] == turn));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|row| row["payload"]["omitted_events"] == 1)
+    );
+    fs::write(&path, format!("{question}\n{oversized}\n{foreign}")).unwrap();
+    let result = show();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("different session ID"));
+}
+
+#[test]
 fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
     let fixture = Fixture::new();
     let id = "11111111-2222-4333-8444-555555555555";

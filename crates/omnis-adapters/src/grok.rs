@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
@@ -17,11 +17,12 @@ use crate::{
     CodexWorkspaceProjection, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
     NativeSession, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
-        EventBuilder, JsonLineSkips, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, MAX_PREVIEW_TAIL_SIZE,
-        MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, SnapshotFileStamp,
-        SqliteSnapshotCache, WorkspaceGap, encode_uri_component, json_lines_preview_with_omissions,
-        nested_files, parse_timestamp, paths_match, percent_decode, provider_executable,
-        provider_file, provider_root, read_json, sort_sessions, string_at, validate_provider,
+        BoundedLine, EventBuilder, JsonLineSkips, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
+        MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE,
+        SnapshotFileStamp, SqliteSnapshotCache, WorkspaceGap, encode_uri_component,
+        json_lines_preview_with_omissions, nested_files, parse_timestamp, paths_match,
+        percent_decode, provider_executable, provider_file, provider_root,
+        read_bounded_line_with_budget, read_json, sort_sessions, string_at, validate_provider,
         value_at, visit_json_lines_with_omissions,
     },
 };
@@ -107,6 +108,11 @@ struct CheckedUpdates {
 }
 
 #[derive(Deserialize)]
+struct OwnerHeader {
+    params: Option<UpdateParams>,
+}
+
+#[derive(Deserialize)]
 struct UpdateHeader {
     params: Option<UpdateParams>,
     #[serde(rename = "sessionUpdate", alias = "type", alias = "event")]
@@ -127,6 +133,9 @@ fn present_owner<'de, D: serde::Deserializer<'de>>(
 }
 
 impl GrokAdapter {
+    /// Maximum log size for refreshing a previously complete search document.
+    pub const MAX_INDEX_REFRESH_BYTES: u64 = MAX_COLLECTED_TRANSCRIPT_FILE_SIZE;
+
     #[must_use]
     pub fn with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -179,10 +188,9 @@ impl GrokAdapter {
         let directory = summary.parent().context(stale)?;
         let path = provider_file(directory, &directory.join("updates.jsonl")).context(stale)?;
         let ownership = scan_update_headers(&path, |line| {
-            #[derive(Deserialize)]
-            struct OwnerHeader {
-                params: Option<UpdateParams>,
-            }
+            let Some(line) = line else {
+                return Ok(true);
+            };
             let Ok(header) = serde_json::from_slice::<OwnerHeader>(line) else {
                 // The transcript reader omits malformed JSON. A readable record still needs an owner.
                 return Ok(serde_json::from_slice::<Value>(line).is_err());
@@ -612,6 +620,9 @@ fn native_update_headers(
     expected_updates: u64,
 ) -> Result<NativeResumeSupport> {
     let Some(observed) = scan_update_headers(path, |line| {
+        let Some(line) = line else {
+            return Ok(false);
+        };
         let Ok(header) = serde_json::from_slice::<UpdateHeader>(line) else {
             return Ok(false);
         };
@@ -645,29 +656,25 @@ fn native_update_headers(
 
 fn scan_update_headers(
     path: &Path,
-    mut accepts: impl FnMut(&[u8]) -> Result<bool>,
+    mut accepts: impl FnMut(Option<&[u8]>) -> Result<bool>,
 ) -> Result<Option<u64>> {
     let file = fs::File::open(path)?;
     let bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file.take(bytes));
     let mut line = Vec::new();
     let mut observed = 0_u64;
-    loop {
-        line.clear();
-        let size = reader
-            .by_ref()
-            .take(MAX_STREAMED_TRANSCRIPT_LINE_SIZE + 1)
-            .read_until(b'\n', &mut line)?;
-        if size == 0 {
-            break;
-        }
-        if size as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
-            return Ok(None);
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        if !accepts(&line)? {
+    while let Some((kind, _)) = read_bounded_line_with_budget(
+        &mut reader,
+        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        u64::MAX,
+        &mut line,
+    )? {
+        let record = match kind {
+            BoundedLine::Complete if line.iter().all(u8::is_ascii_whitespace) => continue,
+            BoundedLine::Complete => Some(line.as_slice()),
+            BoundedLine::Oversized => None,
+        };
+        if !accepts(record)? {
             return Ok(None);
         }
         observed += 1;
@@ -785,10 +792,8 @@ impl GrokMetadata {
             if let Some(updates) = stamp("updates.jsonl") {
                 contents = updates.revision(contents);
             }
-            for (name, _, _, _) in GROK_STATE_FILES {
-                if let Some(state) = stamp(name) {
-                    contents = state.revision(Uuid::new_v5(&contents, name.as_bytes()));
-                }
+            if let Some(plan) = stamp("plan.json") {
+                contents = plan.revision(Uuid::new_v5(&contents, b"plan.json"));
             }
         }
         SourceRevision {
