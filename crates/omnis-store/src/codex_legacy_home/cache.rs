@@ -56,15 +56,9 @@ fn identifies_live_file(stamp: &Stamp, path: &Path) -> bool {
     if !stat.is_file() || stamp.inode == 0 || stat.ino() != stamp.inode {
         return false;
     }
-    if let Some(file) = stamp.file_id {
-        let name = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
-        let object = [stat.dev().to_le_bytes(), stat.ino().to_le_bytes()];
-        return file == Uuid::new_v5(&name, object.as_flattened());
-    }
-    stat.len() == stamp.len
-        && (stat.mtime(), stat.mtime_nsec()) == (stamp.modified.0, i64::from(stamp.modified.1))
-        && (stat.ctime(), stat.ctime_nsec()) == (stamp.changed.0, i64::from(stamp.changed.1))
-        && stat.nlink() == 1
+    let name = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
+    let object = [stat.dev().to_le_bytes(), stat.ino().to_le_bytes()];
+    stamp.file_id == Some(Uuid::new_v5(&name, object.as_flattened()))
 }
 
 #[cfg(not(unix))]
@@ -86,7 +80,7 @@ impl Stamp {
         };
         let same_time = modified.timestamp_millis() == updated.timestamp_millis();
         let Some(source) = row.source_revision else {
-            return same_time;
+            return false;
         };
         let (Some(file), Some(contents)) = (self.file_id, source.contents) else {
             return false;
@@ -211,17 +205,12 @@ fn session_path(home: &Path, path: &Path) -> bool {
         && !omnis_core::may_reach_network(path)
 }
 
-struct HomeEvidence {
-    unique_home: Option<String>,
-    matches_catalog: bool,
-}
-
 impl Cache {
     fn collect(
         &self,
         key: &str,
         rows: &HashMap<&str, &IndexedSession>,
-        homes: &mut HashMap<String, HomeEvidence>,
+        homes: &mut HashMap<String, Option<String>>,
     ) -> Option<()> {
         if !schema_v1(&self.format)
             || !self.codex_home.is_absolute()
@@ -243,13 +232,13 @@ impl Cache {
             }
             // The workspace migration clears unverified folders. A matching source can
             // still identify its home without restoring that folder.
-            let workspace_matches = header.project_path == row.project_path
-                || (row.project_path.is_none() && row.source_revision.is_some());
+            let workspace_matches =
+                header.project_path == row.project_path || row.project_path.is_none();
             let matches_catalog = workspace_matches
                 && header.created_at.map(|t| t.timestamp_millis())
                     == row.created_at.map(|t| t.timestamp_millis())
                 && rollout.stamp.matches(row);
-            if !matches_catalog && row.source_revision.is_some() {
+            if !matches_catalog {
                 continue;
             }
             let candidate = home
@@ -269,18 +258,12 @@ impl Cache {
                         && identifies_live_file(&rollout.stamp, &rollout_path)
                 })
                 .and_then(Path::to_str);
-            // An unstamped catalog row may belong to a rollout that has changed since
-            // indexing. A matching copy in another home cannot establish ownership.
             let evidence = homes
                 .entry(header.id.clone())
-                .or_insert_with(|| HomeEvidence {
-                    unique_home: candidate.map(str::to_owned),
-                    matches_catalog: false,
-                });
-            if evidence.unique_home.as_deref() != candidate {
-                evidence.unique_home = None;
+                .or_insert_with(|| candidate.map(str::to_owned));
+            if evidence.as_deref() != candidate {
+                *evidence = None;
             }
-            evidence.matches_catalog |= matches_catalog;
         }
         Some(())
     }
@@ -323,8 +306,7 @@ pub(super) fn homes<'a>(
     }
     homes
         .into_iter()
-        .filter(|(_, evidence)| evidence.matches_catalog)
-        .filter_map(|(id, evidence)| Some((id, evidence.unique_home?)))
+        .filter_map(|(id, home)| Some((id, home?)))
         .collect()
 }
 
@@ -412,109 +394,71 @@ mod tests {
     }
 
     #[test]
-    fn foreign_cache_ambiguity_and_incomplete_inventory_withhold_the_home() {
-        use std::os::unix::fs::MetadataExt;
-        use std::time::{Duration, UNIX_EPOCH};
-
-        let temporary = tempfile::tempdir().unwrap();
-        let state = temporary.path().canonicalize().unwrap();
-        let cache = state.join("cache");
-        fs::create_dir(&cache).unwrap();
-        let row = unstamped_row(&state);
-        let write_cache = |home: &Path, modified: u64| {
-            let name = cache.join(format!("codex-rollouts-{}.json", home_digest(home)));
-            let make_entry = |path: &Path, timestamp| {
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                let file = File::create(path).unwrap();
-                file.set_modified(UNIX_EPOCH + Duration::from_secs(timestamp))
-                    .unwrap();
-                let stat = file.metadata().unwrap();
-                json!({"header":{"id": row.session.id, "project_path": row.project_path, "is_subagent": false},
-                    "stamp":{"len":stat.len(), "inode":stat.ino(), "modified":[stat.mtime(),stat.mtime_nsec()],
-                    "changed":[stat.ctime(),stat.ctime_nsec()]}})
-            };
-            let rollout = home.join("sessions/restored.jsonl");
-            let archive = home.join("archived_sessions/prior.jsonl");
-            let data = json!({"format":"1-0.8.52-0123456789abcdef", "codex_home":home,
-                "rollouts":{rollout.to_str().unwrap():make_entry(&rollout, modified),
-                    archive.to_str().unwrap():make_entry(&archive, 90)}});
-            fs::write(&name, data.to_string()).unwrap();
-            name
-        };
-        let first = state.join("A");
-        write_cache(&first, 100);
-        assert_eq!(
-            homes(&state, [&row]).get(&row.session.id),
-            first.to_str().map(str::to_owned).as_ref()
-        );
-        write_cache(&first, 101);
-        assert!(homes(&state, [&row]).is_empty());
-        let second = write_cache(&state.join("B"), 100);
-        assert!(homes(&state, [&row]).is_empty());
-        write_cache(&first, 100);
-        assert!(homes(&state, [&row]).is_empty());
-        fs::write(second, "{").unwrap();
-        assert!(homes(&state, [&row]).is_empty());
-    }
-
-    #[test]
-    fn a_retargeted_home_link_cannot_lend_its_old_header_to_a_copy() {
+    fn only_the_recorded_file_can_claim_a_renamed_rollout() {
         use std::os::unix::fs::{MetadataExt, symlink};
         use std::time::{Duration, UNIX_EPOCH};
 
-        let tmp = tempfile::tempdir().unwrap();
-        let state = tmp.path().canonicalize().unwrap();
-        let row = unstamped_row(&state);
-        let a = state.join("A");
-        let b = state.join("B");
-        let links = state.join("links");
-        fs::create_dir(&links).unwrap();
-        let alias = links.join("alias");
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().canonicalize().unwrap();
         let cache = state.join("cache");
         fs::create_dir(&cache).unwrap();
-        let relative = Path::new("sessions").join(format!("rollout-{}.jsonl", row.session.id));
+        let alias = state.join("selected");
+        let a = state.join("A");
+        let b = state.join("B");
         for home in [&a, &b] {
             fs::create_dir_all(home.join("sessions")).unwrap();
-            let file = File::create(home.join(&relative)).unwrap();
-            file.set_modified(UNIX_EPOCH + Duration::from_secs(100))
+            File::create(home.join("sessions/restored.jsonl"))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(100))
                 .unwrap();
         }
-        symlink("../A", &alias).unwrap();
-        let save = |home: &Path| {
-            let path = home.join(&relative);
+        symlink(&a, &alias).unwrap();
+        let mut row = unstamped_row(&state);
+        let save = |row: &IndexedSession| {
+            let path = alias.join("sessions/restored.jsonl");
             let stat = path.metadata().unwrap();
-            let stamp = json!({"len":stat.len(),"inode":stat.ino(),"changed":[stat.ctime(),stat.ctime_nsec()],
+            let canonical = path.canonicalize().unwrap();
+            let name = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                canonical.as_os_str().as_encoded_bytes(),
+            );
+            let file = Uuid::new_v5(
+                &name,
+                [stat.dev().to_le_bytes(), stat.ino().to_le_bytes()].as_flattened(),
+            );
+            let fields = [
+                stat.len().to_le_bytes(),
+                stat.mtime().to_le_bytes(),
+                stat.mtime_nsec().to_le_bytes(),
+                stat.ctime().to_le_bytes(),
+                stat.ctime_nsec().to_le_bytes(),
+            ];
+            let contents = Uuid::new_v5(&file, fields.as_flattened());
+            let stamp = json!({"len":stat.len(),"inode":stat.ino(),"file_id":file,"changed":[stat.ctime(),stat.ctime_nsec()],
                 "modified":[stat.mtime(),stat.mtime_nsec()]});
             let header =
                 json!({"id":row.session.id,"project_path":row.project_path,"is_subagent":false});
-            let data = json!({"format":"1-0.10.1-0123456789abcdef","codex_home":home,
+            let data = json!({"format":"1-0.10.1-0123456789abcdef","codex_home":alias,
                 "rollouts":{path.to_str().unwrap():{"stamp":stamp,"header":header}}});
-            let name = cache.join(format!("codex-rollouts-{}.json", home_digest(home)));
-            fs::write(&name, data.to_string()).unwrap();
-            name
+            let name = cache.join(format!("codex-rollouts-{}.json", home_digest(&alias)));
+            fs::write(name, data.to_string()).unwrap();
+            omnis_ir::SourceRevision {
+                file: Some(file),
+                contents: Some(contents),
+                missing_ancestor: None,
+            }
         };
-        save(&alias);
+        let source = save(&row);
+        assert!(homes(&state, [&row]).is_empty());
+        row.source_revision = Some(source);
         assert_eq!(homes(&state, [&row])[&row.session.id], a.to_str().unwrap());
         fs::remove_file(&alias).unwrap();
         fs::create_dir(&alias).unwrap();
         assert!(homes(&state, [&row]).is_empty());
         fs::remove_dir(&alias).unwrap();
-        symlink("../A", &alias).unwrap();
-        let physical = save(&a);
-        assert_eq!(homes(&state, [&row])[&row.session.id], a.to_str().unwrap());
-        fs::remove_file(physical).unwrap();
-        File::open(a.join(&relative))
-            .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_secs(101))
-            .unwrap();
-        save(&alias);
-        save(&b);
-        assert!(homes(&state, [&row]).is_empty());
-        fs::remove_file(&alias).unwrap();
         symlink(&b, &alias).unwrap();
         assert!(homes(&state, [&row]).is_empty());
-        fs::remove_file(&alias).unwrap();
-        symlink(state.join("gone"), &alias).unwrap();
+        save(&row);
         assert!(homes(&state, [&row]).is_empty());
     }
 }
