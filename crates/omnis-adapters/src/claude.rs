@@ -770,12 +770,42 @@ fn claude_session_metadata(record: &Value) -> Option<Value> {
     })
 }
 
+struct AmbiguousResponse {
+    key: (String, String),
+    position: usize,
+    event: ClaudeEvent,
+}
+
+impl AmbiguousResponse {
+    fn changes_history(&self, transcript: &ClaudeTranscript) -> bool {
+        let Some(&index) = transcript.responses.get(&self.key) else {
+            return true;
+        };
+        let confirmed = &transcript.events[index];
+        let payload = if self.position <= index {
+            if self.position != index || self.event.timestamp != confirmed.timestamp {
+                return true;
+            }
+            let mut merged = self.event.payload.clone();
+            merge_response_metadata(&mut merged, &confirmed.payload);
+            merged
+        } else {
+            let mut merged = confirmed.payload.clone();
+            merge_response_metadata(&mut merged, &self.event.payload);
+            merged
+        };
+        payload != confirmed.payload
+    }
+}
+
 #[derive(Default)]
 struct ClaudeTranscript {
     metadata: ClaudeMetadata,
     titles: TitleCandidates,
     events: Vec<ClaudeEvent>,
     responses: ResponseMetadata,
+    ambiguous_responses: Vec<AmbiguousResponse>,
+    ambiguous_retention: bool,
     records: HashMap<Uuid, ClaudeRecord>,
     duplicate_records: HashSet<Uuid>,
     preserved_context: Option<Result<PreservedContext>>,
@@ -797,6 +827,7 @@ impl ClaudeTranscript {
         let boundary = record["type"] == "system" && record["subtype"] == "compact_boundary";
         if ownership == ThreadOwnership::Main {
             if boundary {
+                self.ambiguous_retention = false;
                 self.preserved_context =
                     compaction_preserved_context(record, &self.records).transpose();
             }
@@ -806,21 +837,20 @@ impl ClaudeTranscript {
             let mut possible = Vec::new();
             let mut response = ResponseMetadata::default();
             push_events(&mut possible, &mut response, record);
-            let unchanged_metadata = response.iter().any(|(key, index)| {
-                self.responses.get(key).is_some_and(|existing| {
-                    let payload = &self.events[*existing].payload;
-                    let mut merged = payload.clone();
-                    merge_response_metadata(&mut merged, &possible[*index].payload);
-                    merged == *payload
-                })
-            });
-            let changes_retention = boundary
-                && (self.preserved_context.is_some()
+            if let Some((key, index)) = response.into_iter().next() {
+                self.ambiguous_responses.push(AmbiguousResponse {
+                    key,
+                    position: start,
+                    event: possible.swap_remove(index),
+                });
+            }
+            self.omitted_events += possible.len();
+            if boundary {
+                self.ambiguous_retention |= self.preserved_context.is_some()
                     || compaction_preserved_context(record, &self.records)
                         .transpose()
-                        .is_some());
-            self.omitted_events +=
-                possible.len() - usize::from(unchanged_metadata) + usize::from(changes_retention);
+                        .is_some();
+            }
         }
         // An explicitly retained record with unknown ownership has an ID but no visible events.
         if let Some(id) = record
@@ -927,6 +957,12 @@ impl ClaudeTranscript {
             ));
         }
         self.coverage.validate(session)?;
+        self.omitted_events += self
+            .ambiguous_responses
+            .iter()
+            .filter(|response| response.changes_history(&self))
+            .count()
+            + usize::from(self.ambiguous_retention);
         let preservation_error = self.restore_preserved_context().err();
         // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
         drop(self.responses);

@@ -5,7 +5,7 @@ use super::{
     SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
     TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
     first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
-    session_preview, thread, trajectory_search_document,
+    preview_continuation_title, session_preview, thread, trajectory_search_document,
 };
 
 use std::sync::{
@@ -41,12 +41,18 @@ impl SessionCacheUpdate {
     }
 }
 
+pub(super) enum PreviewTitle {
+    FromPreview,
+    Indexed(Option<String>),
+}
+
 pub(super) enum PickerUpdate {
     Cached(Result<Vec<PickerEntry>, String>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
         key: PreviewKey,
         value: PreviewValue,
+        indexed_title: PreviewTitle,
     },
     TrajectorySearch {
         generation: u64,
@@ -479,6 +485,7 @@ pub(super) fn spawn_preview_updates(
                     queue = VecDeque::from(newer);
                 }
                 let full_read = key.continuation_after.is_some();
+                let mut indexed_title = PreviewTitle::FromPreview;
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
@@ -509,6 +516,10 @@ pub(super) fn spawn_preview_updates(
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"
                                 )));
+                            } else if key.session.provider == Provider::Claude
+                                && let Ok(title) = store.trajectory_title(&key.session)
+                            {
+                                indexed_title = PreviewTitle::Indexed(title);
                             }
                         }
                         PreviewValue::Ready {
@@ -520,7 +531,14 @@ pub(super) fn spawn_preview_updates(
                         }
                     })
                 };
-                if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                if sender
+                    .send(PickerUpdate::Preview {
+                        key,
+                        value,
+                        indexed_title,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -590,10 +608,19 @@ pub(super) fn receive_updates(
             PickerUpdate::Lineage(Err(error)) => {
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
-            PickerUpdate::Preview { key, value } => {
+            PickerUpdate::Preview {
+                key,
+                value,
+                indexed_title,
+            } => {
                 if key.revision == state.previews.revision(&key.session) {
                     state.remember_preview_workspace(&key, &value);
-                    state.remember_preview_title(&key, &value);
+                    if let PreviewTitle::Indexed(title) = indexed_title {
+                        let title = preview_continuation_title(&value).or(title);
+                        state.remember_derived_titles(vec![(key.session.clone(), title)]);
+                    } else {
+                        state.remember_preview_title(&key, &value);
+                    }
                     state.previews.insert(key, value, &state.preview_window);
                 }
                 state.trajectory_index_changed();

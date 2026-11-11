@@ -5417,6 +5417,7 @@ mod tests {
             let (sender, receiver) = mpsc::channel();
             sender
                 .send(PickerUpdate::Preview {
+                    indexed_title: workers::PreviewTitle::FromPreview,
                     key,
                     value: PreviewValue::Ready {
                         preview: Box::new(SessionPreview {

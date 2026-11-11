@@ -119,8 +119,10 @@ fn unknown_ownership_on_an_invisible_metadata_row_keeps_complete_search_coverage
     rows.push(json!({"type":"user","isMeta":true,"isSidechain":"broken","message":{"role":"user","content":"invisiblemarker"}}));
     rows.push(json!({"type":"progress","isSidechain":"broken","data":{"type":"hook_progress"}}));
     let mut chunk = json!({"type":"assistant","message":{"id":"response","role":"assistant","model":"synthetic","usage":{"output_tokens":15}}});
-    rows.push(chunk.clone());
+    let confirmed = chunk.clone();
     chunk["teamName"] = json!(42);
+    rows.push(chunk.clone());
+    rows.push(confirmed);
     rows.push(chunk);
     rows.push(json!({"type":"system","subtype":"compact_boundary","isSidechain":"unknown"}));
     write_jsonl(&path, &rows);

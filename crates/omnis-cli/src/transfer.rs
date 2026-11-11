@@ -136,8 +136,7 @@ fn resume_from_snapshot(
         .as_ref()
         .is_some_and(|selection| selection.workspace.replacement().is_some())
     {
-        if source.provider == Provider::Imported && snapshot.session.provider == Provider::CursorIde
-        {
+        if source.provider == Provider::Imported && snapshot.workspace.root.is_absolute() {
             transfer_repository_matches(source, &snapshot, &project)?
         } else {
             is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root)
