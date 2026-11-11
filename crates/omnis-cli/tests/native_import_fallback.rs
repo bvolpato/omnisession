@@ -67,8 +67,26 @@ fi
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+notify_sessions() {
+    printf '{"method":"externalAgentConfig/import/%s","params":{"importId":"%s","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2" "$3" "$4"
+}
+accept_import() {
+    printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+    notify_sessions progress synthetic-import '' ''
+}
 complete_sessions() {
-    printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2"
+    notify_sessions progress "${FAKE_CODEX_PROGRESS_ID:-synthetic-import}" "$1" "$2"
+    case "$FAKE_CODEX_COMPLETION" in
+    timeout) return ;;
+    disconnect) exit 1 ;;
+    conflict-progress|conflict-completed)
+        conflicting='{"itemType":"SESSIONS","source":"'"$source"'","target":"44444444-4444-4444-8444-444444444444"}'
+        notify_sessions "${FAKE_CODEX_COMPLETION#conflict-}" synthetic-import "$conflicting" ''
+        if [ "$FAKE_CODEX_COMPLETION" = conflict-progress ]; then exit 1; fi
+        return
+        ;;
+    esac
+    notify_sessions completed synthetic-import "$1" "$2"
 }
 send_progress() {
     : > "$capture/progress-started"
@@ -102,8 +120,12 @@ while IFS= read -r line; do
         case "$FAKE_CODEX_IMPORT" in
         prepare|prepare-wrong-source)
             if [ "$FAKE_CODEX_IMPORT" = prepare-wrong-source ]; then source=$source.other; fi
-            printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
-            complete_sessions '' '{"itemType":"SESSIONS","source":"'"$source"'","failureStage":"session_prepare","subErrorType":"failed_to_prepare_session","message":"synthetic preparation failure"}'
+            stage=${FAKE_CODEX_FAILURE_STAGE:-session_prepare}
+            subtype=${FAKE_CODEX_FAILURE_SUBTYPE:-failed_to_prepare_session}
+            failure_source='"'"$source"'"'
+            if [ "$stage" = session_permit ]; then failure_source=null; fi
+            accept_import
+            complete_sessions '' '{"itemType":"SESSIONS","source":'"$failure_source"',"failureStage":"'"$stage"'","subErrorType":"'"$subtype"'","message":"synthetic preparation failure"}'
             continue
             ;;
         esac
@@ -134,7 +156,7 @@ while IFS= read -r line; do
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
         if [ "$FAKE_CODEX_IMPORT" = late-reply ]; then send_progress; fi
-        printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+        accept_import
         if [ "$FAKE_CODEX_IMPORT" = late-completion ]; then send_progress; fi
         if [ "$FAKE_CODEX_IMPORT" = lost-completion ]; then exit 1; fi
         if [ "$FAKE_CODEX_IMPORT" = hold ]; then
@@ -148,7 +170,7 @@ while IFS= read -r line; do
         case "$FAKE_CODEX_IMPORT" in ledger-wrong-source|success-wrong-source) source=$source.other ;; esac
         success='{"itemType":"SESSIONS","source":"'"$source"'","target":"'"$FAKE_CODEX_THREAD"'"}'
         case "$FAKE_CODEX_IMPORT" in
-        failed-completion) complete_sessions '' '{"message":"failed to shutdown imported session"}' ;;
+        failed-completion) complete_sessions '' '{"itemType":"SESSIONS","source":"'"$source"'","failureStage":"session_persist","subErrorType":"failed_to_shutdown_thread","message":"failed to shutdown imported session"}' ;;
         ledger|ledger-wrong-source)
             complete_sessions "$success" '{"itemType":"SESSIONS","source":null,"failureStage":"session_ledger_update","subErrorType":"failed_to_update_session_ledger","message":"synthetic ledger failure"}'
             ;;
@@ -228,10 +250,27 @@ for (const signal of ["SIGINT", "SIGBREAK"]) {
 const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
-const completeSessions = (successes, failures) => send({
-  method: "externalAgentConfig/import/completed",
-  params: { importId: "synthetic-import", itemTypeResults: [{ itemType: "SESSIONS", successes, failures }] },
+const notifySessions = (event, importId, successes, failures) => send({
+  method: `externalAgentConfig/import/${event}`,
+  params: { importId, itemTypeResults: [{ itemType: "SESSIONS", successes, failures }] },
 });
+function acceptImport(id) {
+  send({ id, result: { importId: "synthetic-import" } });
+  notifySessions("progress", "synthetic-import", [], []);
+}
+function completeSessions(successes, failures) {
+  notifySessions("progress", env.FAKE_CODEX_PROGRESS_ID || "synthetic-import", successes, failures);
+  const ending = env.FAKE_CODEX_COMPLETION;
+  if (ending === "timeout") return;
+  if (ending === "disconnect") process.exit(1);
+  if (ending === "conflict-progress" || ending === "conflict-completed") {
+    notifySessions(ending.split("-")[1], "synthetic-import",
+      [{ ...successes[0], target: "44444444-4444-4444-8444-444444444444" }], []);
+    if (ending === "conflict-progress") process.exit(1);
+    return;
+  }
+  notifySessions("completed", "synthetic-import", successes, failures);
+}
 let pendingRead;
 async function sendProgress() {
   fs.writeFileSync(path.join(capture, "progress-started"), "");
@@ -268,9 +307,12 @@ async function sendProgress() {
         const history = [];
         const source = params.migrationItems[0].details.sessions[0].path;
         if (mode === "prepare" || mode === "prepare-wrong-source") {
-          send({ id: request.id, result: { importId: "synthetic-import" } });
-          completeSessions([], [{ itemType: "SESSIONS", source: mode === "prepare" ? source : source + ".other",
-            failureStage: "session_prepare", subErrorType: "failed_to_prepare_session", message: "synthetic preparation failure" }]);
+          acceptImport(request.id);
+          const stage = env.FAKE_CODEX_FAILURE_STAGE || "session_prepare";
+          const failureSource = mode === "prepare" ? source : source + ".other";
+          completeSessions([], [{ itemType: "SESSIONS", source: stage === "session_permit" ? null : failureSource,
+            failureStage: stage, subErrorType: env.FAKE_CODEX_FAILURE_SUBTYPE || "failed_to_prepare_session",
+            message: "synthetic preparation failure" }]);
           break;
         }
         for (const record of fs.readFileSync(source, "utf8").split("\n").filter(Boolean)) {
@@ -299,7 +341,7 @@ async function sendProgress() {
           ...records,
         ].map((record) => `${JSON.stringify(record)}\n`).join(""));
         if (mode === "late-reply") await sendProgress();
-        send({ id: request.id, result: { importId: "synthetic-import" } });
+        acceptImport(request.id);
         if (mode === "late-completion") await sendProgress();
         if (mode === "lost-completion") process.exit(1);
         if (mode === "hold") {
@@ -312,7 +354,8 @@ async function sendProgress() {
         const reportedSource = ["ledger-wrong-source", "success-wrong-source"].includes(mode) ? source + ".other" : source;
         const success = { itemType: "SESSIONS", source: reportedSource, target: env.FAKE_CODEX_THREAD };
         if (mode === "failed-completion") {
-          completeSessions([], [{ message: "failed to shutdown imported session" }]);
+          completeSessions([], [{ itemType: "SESSIONS", source, failureStage: "session_persist",
+            subErrorType: "failed_to_shutdown_thread", message: "failed to shutdown imported session" }]);
         } else if (mode === "ledger" || mode === "ledger-wrong-source") {
           completeSessions([success], [{ itemType: "SESSIONS", source: null, failureStage: "session_ledger_update",
             subErrorType: "failed_to_update_session_ledger", message: "synthetic ledger failure" }]);
@@ -1009,28 +1052,68 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
 
 #[test]
 fn codex_ledger_failure_rolls_back_the_reported_thread_before_fallback() {
-    assert_codex_completion_fallback("ledger", &[&format!("thread/delete {THREAD_ID}"), "launch"]);
+    assert_codex_completion_fallback(
+        "ledger",
+        &[],
+        &[&format!("thread/delete {THREAD_ID}"), "launch"],
+    );
 }
 
 #[test]
 fn codex_preparation_failure_falls_back_without_deleting_a_thread() {
-    assert_codex_completion_fallback("prepare", &["launch"]);
+    assert_codex_completion_fallback("prepare", &[], &["launch"]);
 }
 
-fn assert_codex_completion_fallback(mode: &str, expected_actions: &[&str]) {
+#[test]
+fn codex_progress_rolls_back_the_exact_target_when_completion_is_lost() {
+    for mode in ["success", "ledger"] {
+        for ending in ["disconnect", "timeout"] {
+            assert_codex_completion_fallback(
+                mode,
+                &[
+                    ("FAKE_CODEX_COMPLETION", ending),
+                    ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
+                ],
+                &[&format!("thread/delete {THREAD_ID}"), "launch"],
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_preallocation_failures_fall_back_without_deleting_a_thread() {
+    for (stage, subtype) in [
+        ("session_persist", "failed_to_load_session_config"),
+        (
+            "session_persist",
+            "failed_to_load_session_config_invalid_data",
+        ),
+        ("session_permit", "failed_to_acquire_import_permit"),
+    ] {
+        assert_codex_completion_fallback(
+            "prepare",
+            &[
+                ("FAKE_CODEX_FAILURE_STAGE", stage),
+                ("FAKE_CODEX_FAILURE_SUBTYPE", subtype),
+            ],
+            &["launch"],
+        );
+    }
+}
+
+fn assert_codex_completion_fallback(mode: &str, extra: &[(&str, &str)], expected_actions: &[&str]) {
     if !tools_available() {
         return;
     }
     let fixture = Fixture::new();
-    let run = fixture.run(
-        &Route::Resume.args(),
-        &[
-            ("FAKE_CODEX_IMPORT", mode),
-            ("FAKE_CODEX_ROLLOUT", "faithful"),
-            ("FAKE_CODEX_LOG_LAUNCH", "1"),
-        ],
-    );
-    assert!(run.status.success(), "{mode}: {}", run.stderr);
+    let mut environment = vec![
+        ("FAKE_CODEX_IMPORT", mode),
+        ("FAKE_CODEX_ROLLOUT", "faithful"),
+        ("FAKE_CODEX_LOG_LAUNCH", "1"),
+    ];
+    environment.extend_from_slice(extra);
+    let run = fixture.run(&Route::Resume.args(), &environment);
+    assert!(run.status.success(), "{mode} {extra:?}: {}", run.stderr);
     let actions: Vec<_> = fixture
         .rpc_log()
         .into_iter()
@@ -1044,14 +1127,19 @@ fn assert_codex_completion_fallback(mode: &str, expected_actions: &[&str]) {
 }
 
 #[test]
-fn codex_wrong_source_completion_never_deletes_or_launches() {
+fn codex_ambiguous_receipts_never_delete_or_launch() {
     if !tools_available() {
         return;
     }
-    for mode in [
-        "ledger-wrong-source",
-        "prepare-wrong-source",
-        "success-wrong-source",
+    for (mode, ending, progress_id) in [
+        ("ledger-wrong-source", "", "synthetic-import"),
+        ("prepare-wrong-source", "", "synthetic-import"),
+        ("success-wrong-source", "", "synthetic-import"),
+        ("failed-completion", "", "synthetic-import"),
+        ("success-wrong-source", "disconnect", "synthetic-import"),
+        ("success", "disconnect", "other-import"),
+        ("success", "conflict-progress", "synthetic-import"),
+        ("success", "conflict-completed", "synthetic-import"),
     ] {
         let fixture = Fixture::new();
         let run = fixture.run(
@@ -1059,9 +1147,15 @@ fn codex_wrong_source_completion_never_deletes_or_launches() {
             &[
                 ("FAKE_CODEX_IMPORT", mode),
                 ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_COMPLETION", ending),
+                ("FAKE_CODEX_PROGRESS_ID", progress_id),
             ],
         );
-        assert!(!run.status.success(), "{mode}: {}", run.stderr);
+        assert!(
+            !run.status.success(),
+            "{mode} {ending} {progress_id}: {}",
+            run.stderr
+        );
         let calls = fixture.rpc_log();
         assert!(
             !calls.iter().any(|call| call.starts_with("thread/delete")),

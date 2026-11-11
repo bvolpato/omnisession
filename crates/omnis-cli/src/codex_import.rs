@@ -190,32 +190,66 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
             )
         }
     })?;
-    let id = receipt.thread_id;
+    let (id, failure) = match receipt {
+        ImportReceipt::Rejected(reason) => bail!("{reason}"),
+        ImportReceipt::Created { thread_id, failure } => (thread_id, failure),
+    };
     let target = SessionRef::new(Provider::Codex, &id);
-    let verified = match receipt.failure {
+    let verified = match failure {
         Some(error) => Err(error),
         None => verify_visible_turns(&mut server, &id, import)
-            .context("verifying visible Codex turns and model provider"),
+            .context("verifying visible Codex turns and model provider")
+            .and_then(|()| server.shutdown().context("flushing imported Codex thread")),
     };
     if let Err(error) = verified {
-        let rollback = server
-            .request("thread/delete", &json!({ "threadId": id }))
-            .and_then(|_| server.shutdown());
-        return Err(combine_rollback_error(error, rollback));
-    }
-    if let Err(error) = server.shutdown() {
+        // A lost connection can still have reported the generated thread before it closed.
         drop(server);
         return Err(combine_rollback_error(
-            error.context("flushing imported Codex thread"),
+            error,
             rollback(binary, cwd, &target, import),
         ));
     }
     Ok(target)
 }
 
-struct ImportReceipt {
-    thread_id: String,
-    failure: Option<anyhow::Error>,
+enum ImportReceipt {
+    Created {
+        thread_id: String,
+        failure: Option<anyhow::Error>,
+    },
+    Rejected(String),
+}
+
+impl ImportReceipt {
+    fn merge(self, next: Self) -> Result<Self> {
+        match (self, next) {
+            (
+                Self::Created { thread_id, failure },
+                Self::Created {
+                    thread_id: other,
+                    failure: later,
+                },
+            ) if thread_id == other => Ok(Self::Created {
+                thread_id,
+                failure: failure.or(later),
+            }),
+            (rejected @ Self::Rejected(_), Self::Rejected(_)) => Ok(rejected),
+            _ => bail!("Codex reported conflicting outcomes for the submitted session"),
+        }
+    }
+
+    fn interrupted(self, error: anyhow::Error) -> Self {
+        match self {
+            Self::Created { thread_id, failure } => Self::Created {
+                thread_id,
+                failure: Some(match failure {
+                    Some(failure) => failure.context(error),
+                    None => error,
+                }),
+            },
+            rejected @ Self::Rejected(_) => rejected,
+        }
+    }
 }
 
 fn submit_import(
@@ -244,16 +278,11 @@ fn submit_import(
             "providerId": "omnisession",
         }),
     )?;
-    let import_id = result
-        .get("importId")
-        .and_then(Value::as_str)
+    let import_id = result["importId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
         .context("Codex import response omitted import ID")?;
-    let completed = server.wait_for_notification(
-        "externalAgentConfig/import/completed",
-        Some(("importId", import_id)),
-        deadline,
-    )?;
-    import_receipt(&completed, source_path)
+    server.wait_for_import(import_id, source_path, deadline)
 }
 
 fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Result<PathBuf> {
@@ -312,17 +341,17 @@ impl std::fmt::Display for ImportRejected {
 
 impl std::error::Error for ImportRejected {}
 
-fn import_receipt(completed: &Value, source_path: &Path) -> Result<ImportReceipt> {
-    let results = completed
+fn import_receipt(notification: &Value, source_path: &Path) -> Result<Option<ImportReceipt>> {
+    let results = notification
         .get("itemTypeResults")
         .and_then(Value::as_array)
         .context("Codex completion omitted import results")?;
     let mut session_results = results
         .iter()
         .filter(|result| result.get("itemType").and_then(Value::as_str) == Some("SESSIONS"));
-    let sessions = session_results
-        .next()
-        .context("Codex completion omitted session import result")?;
+    let Some(sessions) = session_results.next() else {
+        return Ok(None);
+    };
     if session_results.next().is_some() {
         bail!("Codex completion reported multiple session import results");
     }
@@ -332,24 +361,17 @@ fn import_receipt(completed: &Value, source_path: &Path) -> Result<ImportReceipt
     let failures = sessions["failures"]
         .as_array()
         .context("Codex session import result omitted failures")?;
-    let matches_source = |item: &Value| {
-        item["itemType"] == "SESSIONS"
-            && item["source"].as_str().map(Path::new) == Some(source_path)
-    };
+    if successes.is_empty() && failures.is_empty() {
+        return Ok(None);
+    }
     let failure = if let Some(first) = failures.first() {
         let message = first["message"]
             .as_str()
             .map_or_else(|| "unknown session import error".to_owned(), redact_secrets);
         let detail = format!("Codex session import failed: {message}");
         if successes.is_empty() {
-            if failures.len() == 1
-                && matches_source(first)
-                && matches!(
-                    first["failureStage"].as_str(),
-                    Some("session_missing" | "session_source_path" | "session_prepare")
-                )
-            {
-                return Err(ImportRejected(detail).into());
+            if failures.len() == 1 && rejected_before_creation(first, source_path) {
+                return Ok(Some(ImportReceipt::Rejected(detail)));
             }
             bail!("{detail}");
         }
@@ -363,17 +385,62 @@ fn import_receipt(completed: &Value, source_path: &Path) -> Result<ImportReceipt
             successes.len()
         );
     };
-    if !matches_source(success) {
+    if !matches_import_source(success, source_path) {
         bail!("Codex session import success did not identify the submitted source");
     }
     let id = success["target"]
         .as_str()
         .context("Codex session import omitted target thread ID")?;
-    Uuid::parse_str(id).context("Codex imported an invalid thread ID")?;
-    Ok(ImportReceipt {
-        thread_id: id.to_owned(),
+    let id = Uuid::parse_str(id).context("Codex imported an invalid thread ID")?;
+    Ok(Some(ImportReceipt::Created {
+        thread_id: id.to_string(),
         failure,
-    })
+    }))
+}
+
+fn matches_import_source(item: &Value, source_path: &Path) -> bool {
+    item["itemType"] == "SESSIONS" && item["source"].as_str().map(Path::new) == Some(source_path)
+}
+
+fn rejected_before_creation(failure: &Value, source_path: &Path) -> bool {
+    let stage = failure["failureStage"].as_str();
+    let subtype = failure["subErrorType"].as_str();
+    // Codex acquires one permit for the whole sessions batch before it considers its sole source.
+    if stage == Some("session_permit") {
+        return failure["itemType"] == "SESSIONS"
+            && failure.get("source") == Some(&Value::Null)
+            && subtype == Some("failed_to_acquire_import_permit");
+    }
+    matches_import_source(failure, source_path)
+        && match stage {
+            Some("session_missing" | "session_source_path" | "session_prepare") => true,
+            Some("session_persist") => subtype.is_some_and(|code| {
+                code == "failed_to_load_session_config"
+                    || code
+                        .strip_prefix("failed_to_load_session_config_")
+                        .is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                "not_found"
+                                    | "permission_denied"
+                                    | "already_exists"
+                                    | "invalid_input"
+                                    | "invalid_data"
+                                    | "is_a_directory"
+                                    | "not_a_directory"
+                                    | "timed_out"
+                                    | "write_zero"
+                                    | "unexpected_eof"
+                                    | "storage_full"
+                                    | "quota_exceeded"
+                                    | "file_too_large"
+                                    | "read_only_filesystem"
+                                    | "other"
+                            )
+                        })
+            }),
+            _ => false,
+        }
 }
 
 fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) -> Result<()> {
@@ -655,25 +722,44 @@ impl AppServer {
         }
     }
 
-    fn wait_for_notification(
-        &mut self,
-        method: &str,
-        match_field: Option<(&str, &str)>,
+    fn wait_for_import(
+        &self,
+        import_id: &str,
+        source_path: &Path,
         deadline: Instant,
-    ) -> Result<Value> {
+    ) -> Result<ImportReceipt> {
+        let mut progress: Option<ImportReceipt> = None;
         loop {
-            let message = self.receive_before(deadline)?;
-            if message.get("method").and_then(Value::as_str) != Some(method) {
+            let message = match self.receive_before(deadline) {
+                Ok(message) => message,
+                Err(error) => {
+                    return match progress {
+                        Some(receipt) => Ok(receipt
+                            .interrupted(error.context("waiting for Codex import completion"))),
+                        None => Err(error),
+                    };
+                }
+            };
+            let completed = match message["method"].as_str() {
+                Some("externalAgentConfig/import/progress") => false,
+                Some("externalAgentConfig/import/completed") => true,
+                _ => continue,
+            };
+            let params = &message["params"];
+            if params["importId"].as_str() != Some(import_id) {
                 continue;
             }
-            let params = message
-                .get("params")
-                .cloned()
-                .context("Codex app-server notification omitted params")?;
-            if match_field.is_none_or(|(field, expected)| {
-                params.get(field).and_then(Value::as_str) == Some(expected)
-            }) {
-                return Ok(params);
+            if let Some(receipt) = import_receipt(params, source_path)? {
+                let receipt = match progress {
+                    Some(previous) => previous.merge(receipt)?,
+                    None => receipt,
+                };
+                if completed {
+                    return Ok(receipt);
+                }
+                progress = Some(receipt);
+            } else if completed {
+                bail!("Codex completion omitted the session import outcome");
             }
         }
     }
