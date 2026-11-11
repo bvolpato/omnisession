@@ -2,6 +2,11 @@
 
 use std::{path::Path, process::Command};
 
+mod bounded_output;
+pub use bounded_output::bounded_provider_output;
+#[cfg(unix)]
+pub(crate) use bounded_output::bounded_terminal_output;
+
 #[cfg(any(test, windows))]
 use std::path::PathBuf;
 #[cfg(windows)]
