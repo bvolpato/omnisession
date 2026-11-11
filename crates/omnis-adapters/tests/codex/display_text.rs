@@ -239,3 +239,135 @@ fn a_plan_display_confirms_only_the_matching_proposal_in_its_turn() {
         );
     }
 }
+
+fn plan_model(turn: &str, id: &str, role: &str, text: &str, order: u64) -> Value {
+    let kind = if role == "user" {
+        "input_text"
+    } else {
+        "output_text"
+    };
+    json!({"type":"response_item","metadata":{"user_input_order":order},"payload":{
+        "type":"message","id":id,"role":role,"internal_chat_message_metadata_passthrough":{"turn_id":turn},
+        "content":[{"type":kind,"text":text}]}})
+}
+
+#[test]
+fn a_displayed_plan_follows_its_model_proposal_through_rollback() {
+    let turn = "planning";
+    let shown = turn_item(
+        turn,
+        &json!({"type":"Plan","id":"planning-plan","text":"Visible proposal\n"}),
+    );
+    let source = "Comment.\n<proposed_plan>\nVisible proposal\n</proposed_plan>";
+    for order in [None, Some(1), Some(2)] {
+        let mut rows = vec![
+            event(
+                "task_started",
+                json!({"turn_id":turn,"collaboration_mode_kind":"plan"}),
+            ),
+            plan_model(turn, "u1", "user", "keep", 1),
+            super::page_user(turn, "u1", "keep"),
+        ];
+        if let Some(order) = order {
+            rows.push(plan_model(turn, "msg", "assistant", source, order));
+            rows.push(shown_assistant(turn, "msg", "Comment.\n"));
+        }
+        rows.extend([
+            shown.clone(),
+            plan_model(turn, "u2", "user", "steer", 2),
+            super::page_user(turn, "u2", "steer"),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ]);
+        for preview in [false, true] {
+            let snapshot =
+                super::read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let plan = snapshot
+                .events
+                .iter()
+                .find(|e| e.payload["type"] == "Plan")
+                .unwrap();
+            assert_eq!(plan.payload["text"], "Visible proposal\n");
+            let active = omnis_core::import_conversation(&snapshot)
+                .messages
+                .into_iter()
+                .map(|m| m.text)
+                .collect::<Vec<_>>();
+            let expected = match order {
+                None => vec!["keep", "Visible proposal\n"],
+                Some(1) => vec!["keep", "Comment.\n", "Visible proposal\n"],
+                _ => vec!["keep"],
+            };
+            assert_eq!(active, expected);
+            assert_eq!(
+                plan.payload["omnisession_codex_rollback"].as_str(),
+                if order == Some(2) {
+                    Some("withdrawn")
+                } else {
+                    None
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn a_mixed_checkpoint_keeps_both_public_items_and_restores_the_prior_plan() {
+    let t = "planning";
+    let user = plan_model(t, "u1", "user", "keep", 1);
+    let raw = plan_model(
+        t,
+        "first",
+        "assistant",
+        "Comment.\n<proposed_plan>\noriginal\n</proposed_plan>",
+        1,
+    );
+    let plan = |text| turn_item(t, &json!({"type":"Plan","id":"planning-plan","text":text}));
+    let mut rows = vec![
+        event(
+            "task_started",
+            json!({"turn_id":t,"collaboration_mode_kind":"plan"}),
+        ),
+        user.clone(),
+        super::page_user(t, "u1", "keep"),
+        raw.clone(),
+        shown_assistant(t, "first", "Comment.\n"),
+        plan("original\n"),
+        json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[user["payload"],raw["payload"]]}}),
+    ];
+    for revised in [false, true] {
+        if revised {
+            rows.extend([
+                plan_model(t, "u2", "user", "later", 2),
+                super::page_user(t, "u2", "later"),
+                plan_model(
+                    t,
+                    "new",
+                    "assistant",
+                    "<proposed_plan>\nremoved\n</proposed_plan>",
+                    2,
+                ),
+                plan("removed\n"),
+                event("thread_rolled_back", json!({"num_turns":1})),
+            ]);
+        }
+        for preview in [false, true] {
+            let snapshot =
+                super::read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let active = omnis_core::import_conversation(&snapshot)
+                .messages
+                .into_iter()
+                .map(|m| m.text)
+                .collect::<Vec<_>>();
+            assert_eq!(active, ["keep", "Comment.\n", "original\n"]);
+            let displayed = snapshot
+                .events
+                .iter()
+                .find(|e| e.payload["type"] == "Plan")
+                .unwrap();
+            assert_eq!(
+                displayed.payload["text"],
+                if revised { "removed\n" } else { "original\n" }
+            );
+        }
+    }
+}

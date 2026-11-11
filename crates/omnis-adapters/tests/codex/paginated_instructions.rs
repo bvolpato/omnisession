@@ -196,3 +196,163 @@ fn a_literal_and_an_attachment_cannot_both_confirm_the_same_raw_input() {
         );
     }
 }
+
+#[test]
+fn a_second_rollback_counts_only_instructions_retained_by_the_first() {
+    let make_user = |id: &str, text: &str, order| {
+        let mut user = message("user", text);
+        user["payload"]["id"] = id.into();
+        user["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":"a"});
+        user["metadata"] = json!({"user_input_order":order});
+        user
+    };
+    let body = json!({"author":"/root","recipient":"/root/reader","content":"private-marker","trigger_turn":false});
+    let mut assistant = message("assistant", &body.to_string());
+    assistant["payload"]["content"][0]["type"] = "output_text".into();
+    let typed = raw(
+        json!({"type":"agent_message","author":"/root","recipient":"/root/reader","content":[{"type":"input_text","text":"private-marker"}]}),
+    );
+    for (mut instruction, order, inherited, first_survives) in [
+        (assistant.clone(), 2, false, false),
+        (assistant.clone(), 1, false, true),
+        (assistant, 2, true, true),
+        (typed, 2, false, true),
+    ] {
+        instruction["metadata"] =
+            json!({"user_input_order":order,"inherited_user_message":inherited});
+        let rows = [
+            event("task_started", json!({"turn_id":"a"})),
+            make_user("u1", "first request", 1),
+            page_user("a", "u1", "first request"),
+            instruction,
+            make_user("u2", "queued request", 2),
+            page_user("a", "u2", "queued request"),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ];
+        let display = ["first request", "queued request"];
+        active_after(
+            &rows,
+            &display,
+            if first_survives { &display[..1] } else { &[] },
+        );
+    }
+}
+
+#[test]
+fn a_legacy_display_needs_a_matching_model_input_across_a_rollback() {
+    let exchange = |turn: &str, text: &str, model: bool, raw_first: bool| {
+        let mut rows = vec![event("task_started", json!({"turn_id":turn}))];
+        let display = event("user_message", json!({"message":text}));
+        let input = message("user", text);
+        if model && raw_first {
+            rows.push(input.clone());
+        }
+        rows.push(display);
+        if model && !raw_first {
+            rows.push(input);
+        }
+        rows.push(event("task_complete", json!({"turn_id":turn})));
+        rows
+    };
+    for (model, raw_first, extra) in [
+        (false, true, false),
+        (true, true, false),
+        (true, false, false),
+        (false, true, true),
+    ] {
+        let mut rows = exchange("a", "first request", true, raw_first);
+        rows.extend(exchange("b", "second request", model, raw_first));
+        if extra {
+            rows.extend(exchange("c", "third request", true, raw_first));
+        }
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, None).unwrap();
+            let published = ["first request", "second request"];
+            assert_eq!(
+                visible_text(&snapshot),
+                if extra {
+                    &published[..]
+                } else {
+                    &published[..1]
+                }
+            );
+            assert_eq!(
+                snapshot
+                    .events
+                    .iter()
+                    .any(|event| event.payload["native_history_unverified"] == true),
+                !model
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_private_model_inputs_stay_out_of_exports_and_have_their_own_rollback_position() {
+    let body = json!({"author":"/root","recipient":"/root/reader","content":"private-marker","trigger_turn":false}).to_string();
+    let mut private = message("assistant", &body);
+    private["payload"]["content"][0]["type"] = "output_text".into();
+    let mut queued = message("user", "queued request");
+    queued["metadata"] = json!({"user_input_order":2});
+    let rollback = event("thread_rolled_back", json!({"num_turns":1}));
+    for (order, uncertain) in [(1, true), (2, false)] {
+        private["metadata"] = json!({"user_input_order":order});
+        let rows = [
+            message("user", "first request"),
+            private.clone(),
+            queued.clone(),
+            rollback.clone(),
+            rollback.clone(),
+        ];
+        for preview in [false, true] {
+            let public = read_with_history_mode(rows[..3].to_vec(), preview, None).unwrap();
+            assert_eq!(visible_text(&public), ["first request", "queued request"]);
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&public, &mut recovery).unwrap();
+            assert!(
+                !String::from_utf8(recovery)
+                    .unwrap()
+                    .contains("private-marker")
+            );
+            assert!(!omnis_core::render_markdown_export(&public).contains("private-marker"));
+            let snapshot = read_with_history_mode(rows.to_vec(), preview, None).unwrap();
+            assert!(visible_text(&snapshot).is_empty());
+            assert_eq!(
+                snapshot
+                    .events
+                    .iter()
+                    .any(|e| e.payload["native_history_unverified"] == true),
+                uncertain
+            );
+        }
+    }
+    for (count, uncertain) in [(2, true), (3, false), (20, false)] {
+        let reset = read_with_history_mode(
+            vec![
+                message("user", "first"),
+                queued.clone(),
+                private.clone(),
+                event("thread_rolled_back", json!({"num_turns":count})),
+            ],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(visible_text(&reset).is_empty());
+        assert_eq!(
+            reset
+                .events
+                .iter()
+                .any(|e| e.payload["native_history_unverified"] == true),
+            uncertain
+        );
+    }
+    let independently_published = turn_item(
+        "a",
+        &json!({"type":"AgentMessage","id":"public","content":[{"type":"Text","text":body}]}),
+    );
+    let public =
+        read_with_history_mode(vec![private, independently_published], false, None).unwrap();
+    assert_eq!(visible_text(&public), [body.as_str()]);
+}

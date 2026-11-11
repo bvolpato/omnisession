@@ -1018,7 +1018,7 @@ fn trajectory_search_document_with_limits(
     } = visible_history(snapshot);
 
     for event in events {
-        let Some(event_text) = search_event_text(event, event_edge_limit) else {
+        let Some(event_text) = search_event_text(snapshot, event, event_edge_limit) else {
             continue;
         };
         if event_text.text.trim().is_empty() {
@@ -1054,7 +1054,11 @@ struct SearchEventText {
     truncated: bool,
 }
 
-fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEventText> {
+fn search_event_text(
+    snapshot: &CanonicalSnapshot,
+    event: &OmniEvent,
+    edge_limit: usize,
+) -> Option<SearchEventText> {
     if !matches!(
         event.kind,
         EventKind::MessageUser
@@ -1095,7 +1099,15 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
         }
     };
     let safe_text = safe_terminal_text(&raw_text);
-    let redacted = redact_secrets(&safe_text);
+    let mut redacted = redact_secrets(&safe_text);
+    if let Some(previous) = restored_codex_answer(snapshot, event)
+        && previous != raw_text
+    {
+        let previous = redact_secrets(&safe_terminal_text(previous));
+        if !previous.trim().is_empty() && previous != redacted {
+            redacted = format!("{previous}\n\n{redacted}");
+        }
+    }
     let source_byte_count = redacted.len();
     let edge_limit = if matches!(
         event.kind,
@@ -6757,6 +6769,38 @@ mod tests {
                         .is_some_and(|detail| detail.contains("model rollback"))
             }));
         }
+    }
+
+    #[test]
+    fn search_indexes_both_published_reply_versions_within_one_event_budget() {
+        let mut snapshot = codex_display_after_rollback();
+        snapshot.events.retain(|event| event.sequence == 6);
+        let previous = format!("originalword --password fixture-old {}", "x".repeat(120));
+        let latest = format!("{} --password fixture-new revisedword", "y".repeat(120));
+        snapshot.events[0].payload["text"] = json!(latest);
+        snapshot.events[0].payload["omnisession_codex_prior_display"] = json!(previous);
+
+        let whole = trajectory_search_document(&snapshot);
+        assert!(whole.text.starts_with("originalword"));
+        assert!(whole.text.ends_with("revisedword"));
+        assert!(!whole.text.contains("fixture-old"));
+        assert!(!whole.text.contains("fixture-new"));
+        let bounded = trajectory_search_document_with_limits(&snapshot, 48, 1_000);
+        assert!(bounded.text.starts_with("originalword"));
+        assert!(bounded.text.ends_with("revisedword"));
+        assert!(bounded.indexed_byte_count <= 96);
+        assert_eq!(bounded.source_byte_count, whole.indexed_byte_count);
+        assert_eq!(
+            bounded.truncation_strategy,
+            SearchTruncationStrategy::EventHeadTail
+        );
+
+        snapshot.events[0].source.raw_record_type = Some("response_item.message".into());
+        assert!(
+            !trajectory_search_document(&snapshot)
+                .text
+                .contains("originalword")
+        );
     }
 
     #[test]

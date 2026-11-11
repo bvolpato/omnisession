@@ -6,8 +6,13 @@ use omnis_ir::EventKind;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod history;
+mod turns;
+use super::model_cut::{acceptance_order, input_order, removes_accepted};
 use super::paginated_rollback::model_instruction;
 use super::{CodexHistory, EventBuilder, MAX_CANONICAL_EVENTS, PaginatedRollback, Withdrawal};
+pub(super) use history::CheckpointHistory;
+pub(super) use turns::{CheckpointSelection, CheckpointTurns};
 
 type DigestKey = [u8; 32];
 type CompletedPositions = HashMap<(DigestKey, DigestKey), Option<u64>>;
@@ -36,8 +41,9 @@ struct Copy {
 pub(super) struct PaginatedCheckpoint {
     ordinal: u64,
     display_end: u64,
-    numbered: bool,
     discarded: bool,
+    uncertain_selection: bool,
+    linked_calls: HashMap<usize, usize>,
     retained: usize,
     prefix_inputs: usize,
     users: Vec<(usize, Option<u64>)>,
@@ -77,8 +83,9 @@ impl PaginatedCheckpoint {
         let mut checkpoint = Self {
             ordinal: history.source_ordinal,
             display_end: builder.checkpoint(),
-            numbered: payload["window_number"].is_u64() || payload["window_id"].is_u64(),
             discarded: false,
+            uncertain_selection: false,
+            linked_calls: HashMap::new(),
             retained: items.len(),
             prefix_inputs: items[..start]
                 .iter()
@@ -94,50 +101,38 @@ impl PaginatedCheckpoint {
         let input_copies = history
             .paginated_inputs
             .confirmed_input_copies(&aliases, items);
-        let answer_copies = history.paginated_answers.confirmed_answer_copies(&aliases);
+        let answer_copies =
+            history
+                .paginated_answers
+                .confirmed_answer_copies(&aliases, &items[start..], |item| {
+                    history.model_plan_mode(item)
+                });
         let original = input_copies.original_display_users();
         let turn_key = |turn: &str| {
             let turn = Sha256::digest(history.aliases.resolve(turn).as_bytes()).into();
             aliases.get(&turn).copied().unwrap_or(turn)
         };
         let completed = completed_positions(history, turn_key);
-        if !checkpoint.numbered
-            && let Some(prior) = &history.paginated_checkpoint
-        {
-            // Without a full reverse turn scan, an earlier replacement may still own these displayed inputs.
-            checkpoint.unverified_on_fallback.extend(
-                original
-                    .iter()
-                    .copied()
-                    .filter(|seq| *seq < prior.display_end),
-            );
-            checkpoint
-                .unverified_on_fallback
-                .extend(prior.positions.keys().copied());
-            checkpoint
-                .unverified_on_fallback
-                .extend(prior.unverified_on_fallback.iter().copied());
-            checkpoint
-                .unverified_on_fallback
-                .retain(|seq| *seq >= builder.first_sequence());
-        }
         // Only retained replacement rows can prove which public display item they contain.
         for (index, item) in items.iter().enumerate().skip(start) {
-            let order = metadata.and_then(|entries| {
-                let entry = &entries[index];
-                (entry["inherited_user_message"] != true)
-                    .then(|| entry["user_input_order"].as_u64())
-                    .flatten()
-            });
+            let metadata = metadata
+                .and_then(|entries| entries.get(index))
+                .unwrap_or(&Value::Null);
             let instruction = model_instruction(item);
             if instruction {
-                checkpoint.users.push((index, order));
+                checkpoint.users.push((index, input_order(metadata)));
             }
-            if let Some(order) = order
-                && (item["type"] == "function_call"
-                    || (item["type"] == "message" && item["role"] == "assistant"))
-            {
+            if let Some(order) = acceptance_order(item, metadata) {
                 checkpoint.ordered_outputs.insert(index, order);
+            }
+            if instruction && item["role"] == "assistant" {
+                continue;
+            }
+            if let Some((seq, spelling)) = answer_copies.get_plan(item) {
+                checkpoint.positions.entry(seq).or_default().push(Copy {
+                    index,
+                    answer: Some(spelling),
+                });
             }
             let witnessed = match item["role"].as_str() {
                 Some("user") => input_copies.get(item).map(|seq| (seq, None)),
@@ -166,6 +161,18 @@ impl PaginatedCheckpoint {
                 checkpoint.unverified_on_fallback.insert(seq);
             }
         }
+        for (index, seq, call) in history
+            .paginated_answers
+            .checkpoint_tool_copies(&aliases, items, start)
+        {
+            checkpoint.positions.entry(seq).or_default().push(Copy {
+                index,
+                answer: None,
+            });
+            if let Some(call) = call {
+                checkpoint.linked_calls.insert(index, call);
+            }
+        }
         Some(checkpoint)
     }
 
@@ -173,17 +180,19 @@ impl PaginatedCheckpoint {
         &mut self,
         count: usize,
         inputs: &PaginatedRollback,
+        selection: CheckpointSelection,
     ) -> EffectiveRollback {
-        if self.discarded || count == 0 {
+        if count == 0 {
             return EffectiveRollback::from_inputs(count, inputs);
         }
+        if selection != CheckpointSelection::Selected(self.ordinal) {
+            self.discarded = true;
+            self.uncertain_selection = selection == CheckpointSelection::Unverified;
+            return EffectiveRollback::from_inputs(count, inputs);
+        }
+        self.discarded = false;
         let suffix = inputs.count_after(self.ordinal);
         let remaining = count.saturating_sub(suffix);
-        if remaining > 0 && !self.numbered {
-            // Reverse replay skips an unnumbered checkpoint in the removed turn.
-            self.discarded = true;
-            return EffectiveRollback::from_inputs(count, inputs);
-        }
         let mut effect = EffectiveRollback::from_inputs(count.min(suffix), inputs);
         if remaining > 0 && (!self.users.is_empty() || self.prefix_inputs > 0) {
             let keep = self.users.len().saturating_sub(remaining);
@@ -221,12 +230,16 @@ impl PaginatedCheckpoint {
     }
 
     pub(super) fn item_withdrawn(&self, index: usize) -> bool {
+        let removed = |slot| {
+            slot >= self.retained
+                || removes_accepted(self.ordered_outputs.get(&slot).copied(), self.cutoff)
+        };
         self.discarded
-            || index >= self.retained
+            || removed(index)
             || self
-                .cutoff
-                .zip(self.ordered_outputs.get(&index))
-                .is_some_and(|(cut, accepted)| *accepted >= cut)
+                .linked_calls
+                .get(&index)
+                .is_some_and(|&call| removed(call))
     }
 
     pub(super) fn retained_answer(&self, seq: u64) -> Option<DigestKey> {
@@ -247,7 +260,8 @@ impl PaginatedCheckpoint {
             return baseline;
         }
         if self.discarded {
-            if self.unverified_on_fallback.contains(&seq)
+            if self.uncertain_selection
+                || self.unverified_on_fallback.contains(&seq)
                 || owner.is_some_and(|seq| self.unverified_on_fallback.contains(&seq))
             {
                 return Some(Withdrawal::Unverified);

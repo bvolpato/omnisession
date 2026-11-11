@@ -9,7 +9,9 @@ use super::{MAX_CANONICAL_EVENTS, Position, TurnAliases, Withdrawal};
 
 type Hash = [u8; 32];
 type Scoped = (Hash, Hash);
-type Version = (Scoped, Hash);
+type NativeId = (Option<Hash>, Hash);
+type ModelVersion = (Option<Hash>, Option<Hash>, Hash);
+type DisplayCopy = (u64, Hash);
 
 fn hash(text: &str) -> Hash {
     Sha256::digest(text.as_bytes()).into()
@@ -17,6 +19,12 @@ fn hash(text: &str) -> Hash {
 
 fn scope(key: Scoped, aliases: &TurnAliases) -> Scoped {
     (aliases.get(&key.0).copied().unwrap_or(key.0), key.1)
+}
+
+fn is_reply(item: &Value) -> bool {
+    item["type"] == "message"
+        && item["role"] == "assistant"
+        && !super::super::paginated_rollback::model_instruction(item)
 }
 
 fn raw_text(item: &Value) -> Option<Hash> {
@@ -40,25 +48,30 @@ fn raw_text(item: &Value) -> Option<Hash> {
 
 #[derive(Clone, Copy)]
 struct Raw {
-    key: Option<Scoped>,
     turn: Option<Hash>,
+    id: Option<Hash>,
+    wire: Option<Hash>,
     text: Option<Hash>,
+    plan: Option<Hash>,
     ordinal: u64,
     window: u64,
     removed: bool,
 }
 
 impl Raw {
-    fn new(item: &Value, ordinal: u64) -> Self {
-        let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(hash);
-        let key = turn.zip(item["id"].as_str().filter(|s| !s.is_empty()).map(hash));
+    fn new(item: &Value, ordinal: u64, plan_mode: bool) -> Self {
+        let digest = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(hash);
+        let wire = raw_text(item);
+        let (text, plan) = plan_mode
+            .then(|| super::super::display_text::model_plan(item))
+            .flatten()
+            .map_or((wire, None), |(outer, plan)| (outer, Some(plan)));
         Self {
-            key,
-            turn,
-            text: raw_text(item),
+            id: digest(&item["id"]),
+            turn: digest(&item["internal_chat_message_metadata_passthrough"]["turn_id"]),
+            wire,
+            text,
+            plan,
             ordinal,
             window: 0,
             removed: false,
@@ -66,29 +79,44 @@ impl Raw {
     }
 
     fn normalized(mut self, aliases: &TurnAliases) -> Self {
-        self.key = self.key.map(|key| scope(key, aliases));
         self.turn = self
             .turn
             .map(|turn| aliases.get(&turn).copied().unwrap_or(turn));
         self
+    }
+
+    fn key(self) -> Option<NativeId> {
+        self.id.map(|id| (self.turn, id))
+    }
+
+    fn version(self) -> Option<ModelVersion> {
+        Some((self.turn, self.id, self.wire?))
     }
 }
 
 #[derive(Clone, Copy)]
 struct Shown {
     seq: u64,
+    ordinal: u64,
     key: Scoped,
     text: Hash,
     generated: bool,
     revised: bool,
+    plan: Option<Hash>,
     window: u64,
+}
+
+impl Shown {
+    fn text_key(self, turn: Hash) -> Key {
+        Key::Text(self.plan.is_some(), turn, self.plan.unwrap_or(self.text))
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 enum Key {
-    Id(Scoped),
-    Version(Version),
-    Text(Option<Hash>, Hash),
+    Id(NativeId),
+    Version(NativeId, Hash),
+    Text(bool, Hash, Hash),
 }
 
 #[derive(Default)]
@@ -117,19 +145,34 @@ impl Evidence {
 
 struct Matches<'a> {
     history: &'a AnswerOccurrences,
+    rows: &'a VecDeque<(Raw, Position)>,
     aliases: &'a TurnAliases,
+    replacement: bool,
     groups: HashMap<Key, Group>,
 }
 
 impl<'a> Matches<'a> {
-    fn build(history: &'a AnswerOccurrences, aliases: &'a TurnAliases) -> Self {
+    fn build(
+        history: &'a AnswerOccurrences,
+        rows: &'a VecDeque<(Raw, Position)>,
+        aliases: &'a TurnAliases,
+        replacement: bool,
+    ) -> Self {
         let mut groups = HashMap::<Key, Group>::new();
-        for (index, &(raw, ref position)) in history.model.iter().enumerate() {
+        for (index, &(raw, ref position)) in rows.iter().enumerate() {
             let raw = raw.normalized(aliases);
+            let id = raw
+                .key()
+                .filter(|_| raw.plan.is_none() || raw.text.is_some());
             for key in [
-                raw.key.map(Key::Id),
-                raw.key.zip(raw.text).map(Key::Version),
-                raw.text.map(|text| Key::Text(raw.turn, text)),
+                id.map(Key::Id),
+                id.zip(raw.text).map(|(id, text)| Key::Version(id, text)),
+                raw.turn
+                    .zip(raw.text)
+                    .map(|(turn, text)| Key::Text(false, turn, text)),
+                raw.turn
+                    .zip(raw.plan)
+                    .map(|(turn, text)| Key::Text(true, turn, text)),
             ]
             .into_iter()
             .flatten()
@@ -143,73 +186,162 @@ impl<'a> Matches<'a> {
             }
         }
         for shown in history.versions() {
-            let key = scope(shown.key, aliases);
-            groups.entry(Key::Id(key)).or_default().displays += 1;
-            groups
-                .entry(Key::Text(Some(key.0), shown.text))
-                .or_default()
-                .displays += 1;
+            let (turn, id) = scope(shown.key, aliases);
+            if shown.plan.is_none() {
+                groups
+                    .entry(Key::Id((Some(turn), id)))
+                    .or_default()
+                    .displays += 1;
+                groups
+                    .entry(Key::Version((None, id), shown.text))
+                    .or_default()
+                    .displays += 1;
+            }
+            groups.entry(shown.text_key(turn)).or_default().displays += 1;
         }
         Self {
             history,
+            rows,
             aliases,
+            replacement,
             groups,
         }
     }
 
     fn witness(&self, group: &Group) -> Option<Raw> {
-        let &(mut raw, ref position) = self.history.model.get(group.kept.or(group.last)?)?;
+        let &(mut raw, ref position) = self.rows.get(group.kept.or(group.last)?)?;
         raw.removed = position.removed;
         Some(raw.normalized(self.aliases))
     }
 
-    fn find(&self, shown: Shown) -> Option<Evidence> {
-        let key = scope(shown.key, self.aliases);
+    fn identified(&self, shown: Shown, id: NativeId) -> Option<Evidence> {
         if let Some(raw) = self
             .groups
-            .get(&Key::Version((key, shown.text)))
+            .get(&Key::Version(id, shown.text))
             .and_then(|g| self.witness(g))
         {
             return Some(Evidence::Witness(raw));
         }
-        if let Some(group) = self.groups.get(&Key::Id(key)).filter(|g| g.last.is_some()) {
-            // A single native ID can match different public formatting until the display changes.
-            if !group.several && !self.history.shown.get(&shown.seq)?.revised {
+        // A missing turn can identify an item only through a unique ID and exact public text.
+        let unstamped = (None, id.1);
+        if let Some(group) = self
+            .groups
+            .get(&Key::Version(unstamped, shown.text))
+            .filter(|g| g.last.is_some())
+        {
+            if !group.several && group.displays == 1 {
+                return self.witness(group).map(Evidence::Witness);
+            }
+            return group.removed.then_some(Evidence::Unverified);
+        }
+        if let Some(group) = self.groups.get(&Key::Id(id)).filter(|g| g.last.is_some()) {
+            // Source copies can differ in formatting. A replacement alone must match the public spelling.
+            if !self.replacement && !group.several && !self.history.shown.get(&shown.seq)?.revised {
                 return self.witness(group).map(Evidence::Witness);
             }
             return (shown.revised || group.removed).then_some(Evidence::Unverified);
         }
-        if !shown.generated {
-            return None;
+        self.groups
+            .get(&Key::Id(unstamped))
+            .is_some_and(|g| g.removed)
+            .then_some(Evidence::Unverified)
+    }
+
+    fn unidentified_neighbor(&self, shown: Shown, turn: Hash) -> bool {
+        // Without native IDs, adjacent identical records can establish uncertainty only.
+        if self.replacement || !self.history.rolled {
+            return false;
         }
-        let group = self.groups.get(&Key::Text(Some(key.0), shown.text))?;
+        [shown.ordinal.checked_sub(1), shown.ordinal.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|n| {
+                self.rows
+                    .binary_search_by_key(&n, |(raw, _)| raw.ordinal)
+                    .ok()
+            })
+            .any(|index| {
+                let (raw, position) = &self.rows[index];
+                let raw = raw.normalized(self.aliases);
+                let spelling = if shown.plan.is_some() {
+                    raw.plan
+                } else {
+                    raw.text
+                };
+                position.removed
+                    && raw.window == shown.window
+                    && raw.turn.is_none_or(|t| t == turn)
+                    && (raw.id.is_none()
+                        || ((shown.generated || shown.plan.is_some()) && raw.turn.is_none()))
+                    && spelling == Some(shown.plan.unwrap_or(shown.text))
+            })
+    }
+
+    fn find(&self, shown: Shown) -> Option<Evidence> {
+        let (turn, id) = scope(shown.key, self.aliases);
+        if shown.plan.is_none() {
+            if let Some(evidence) = self.identified(shown, (Some(turn), id)) {
+                return Some(evidence);
+            }
+            if !shown.generated {
+                return self
+                    .unidentified_neighbor(shown, turn)
+                    .then_some(Evidence::Unverified);
+            }
+        }
+        let group = self.groups.get(&shown.text_key(turn))?;
         if !group.several
             && group.displays == 1
             && let Some(raw) = self.witness(group)
-            && raw.window == shown.window
-            && raw
-                .key
-                .is_none_or(|k| self.groups[&Key::Id(k)].displays == 0)
+            && (self.replacement || raw.window == shown.window)
+            && (shown.plan.is_some()
+                || raw
+                    .key()
+                    .is_none_or(|k| self.groups[&Key::Id(k)].displays == 0))
         {
             return Some(Evidence::Witness(raw));
         }
-        let unscoped = self.groups.get(&Key::Text(None, shown.text));
-        (group.removed || unscoped.is_some_and(|g| g.removed)).then_some(Evidence::Unverified)
+        (group.removed || self.unidentified_neighbor(shown, turn)).then_some(Evidence::Unverified)
     }
 }
 
 pub(in super::super) struct ConfirmedAnswers {
     aliases: TurnAliases,
-    copies: HashMap<Version, Option<(u64, Hash)>>,
+    copies: [HashMap<ModelVersion, Option<DisplayCopy>>; 2],
 }
 
 impl ConfirmedAnswers {
-    pub(in super::super) fn get(&self, item: &Value) -> Option<(u64, Hash)> {
-        if item["type"] != "message" || item["role"] != "assistant" {
+    pub(in super::super) fn get(&self, item: &Value) -> Option<DisplayCopy> {
+        self.projection(item, false)
+    }
+
+    pub(in super::super) fn get_plan(&self, item: &Value) -> Option<DisplayCopy> {
+        self.projection(item, true)
+    }
+
+    fn projection(&self, item: &Value, plan: bool) -> Option<DisplayCopy> {
+        let copies = &self.copies[usize::from(plan)];
+        if copies.is_empty() || !is_reply(item) {
             return None;
         }
-        let raw = Raw::new(item, 0).normalized(&self.aliases);
-        self.copies.get(&(raw.key?, raw.text?)).copied().flatten()
+        let key = Raw::new(item, 0, false)
+            .normalized(&self.aliases)
+            .version()?;
+        copies.get(&key).copied().flatten()
+    }
+
+    fn insert(&mut self, raw: Raw, shown: Shown) {
+        if let Some(key) = raw.version() {
+            let entry = Some((shown.seq, shown.text));
+            self.copies[usize::from(shown.plan.is_some())]
+                .entry(key)
+                .and_modify(|prior| {
+                    if *prior != entry {
+                        *prior = None;
+                    }
+                })
+                .or_insert(entry);
+        }
     }
 }
 
@@ -232,14 +364,13 @@ pub(super) struct AnswerOccurrences {
 }
 
 impl AnswerOccurrences {
-    pub(super) fn model(&mut self, record: &Value, ordinal: u64) {
+    pub(super) fn model(&mut self, record: &Value, ordinal: u64, plan_mode: bool) {
         if self.model.len() == MAX_CANONICAL_EVENTS {
             self.model.pop_front();
         }
-        let mut raw = Raw::new(&record["payload"], ordinal);
+        let mut raw = Raw::new(&record["payload"], ordinal, plan_mode);
         raw.window = self.window;
-        self.model
-            .push_back((raw, Position::new(record, ordinal, true)));
+        self.model.push_back((raw, Position::new(record, ordinal)));
     }
 
     pub(super) fn archive(&mut self, seq: u64, text: &str) {
@@ -261,7 +392,16 @@ impl AnswerOccurrences {
         self.prior.push_back((old, text.to_owned()));
     }
 
-    pub(super) fn display(&mut self, seq: u64, turn: &str, id: &str, text: &str) {
+    pub(super) fn display(
+        &mut self,
+        seq: u64,
+        turn: &str,
+        id: &str,
+        text: &str,
+        ordinal: u64,
+        plan: bool,
+    ) {
+        let plan = plan.then(|| super::super::display_text::display_digest(text));
         let digest = hash(text);
         let old = self.shown.get(&seq);
         if old.is_some_and(|old| old.text == digest) {
@@ -271,12 +411,14 @@ impl AnswerOccurrences {
             seq,
             Shown {
                 seq,
+                ordinal,
                 key: (hash(turn), hash(id)),
                 text: digest,
                 generated: id
                     .strip_prefix("item-")
                     .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())),
                 revised: old.is_some(),
+                plan,
                 window: self.window,
             },
         );
@@ -292,28 +434,65 @@ impl AnswerOccurrences {
             .chain(self.shown.values().copied())
     }
 
-    pub(super) fn confirmed(&self, aliases: &TurnAliases) -> ConfirmedAnswers {
-        let matches = Matches::build(self, aliases);
-        let mut copies = HashMap::new();
+    pub(super) fn confirmed(
+        &self,
+        aliases: &TurnAliases,
+        items: &[Value],
+        plan_mode: impl Fn(&Value) -> bool,
+    ) -> ConfirmedAnswers {
+        let source = Matches::build(self, &self.model, aliases, false);
+        let mut confirmed = ConfirmedAnswers {
+            aliases: aliases.clone(),
+            copies: Default::default(),
+        };
+        let incomplete_ids = items.iter().any(|item| {
+            is_reply(item)
+                && (!item["id"].is_string()
+                    || !item["internal_chat_message_metadata_passthrough"]["turn_id"].is_string())
+        });
+        let mut pending = Vec::new();
         for shown in self.versions() {
-            if let Some(Evidence::Witness(raw)) = matches.find(shown)
-                && let Some(key) = raw.key.zip(raw.text)
-            {
-                let value = Some((shown.seq, shown.text));
-                copies
-                    .entry(key)
-                    .and_modify(|existing| {
-                        if *existing != value {
-                            *existing = None;
-                        }
-                    })
-                    .or_insert(value);
+            match source.find(shown) {
+                Some(Evidence::Witness(raw)) => {
+                    confirmed.insert(raw, shown);
+                    if incomplete_ids || raw.turn.is_none() || raw.id.is_none() {
+                        pending.push((shown, Some(raw)));
+                    }
+                }
+                Some(Evidence::Unverified) if shown.generated || shown.plan.is_some() => {}
+                None | Some(Evidence::Unverified) => pending.push((shown, None)),
             }
         }
-        ConfirmedAnswers {
-            copies,
-            aliases: aliases.clone(),
+        drop(source);
+        if !pending.is_empty() {
+            let rows = items
+                .iter()
+                .filter(|item| is_reply(item))
+                .map(|item| {
+                    (
+                        Raw::new(item, 0, plan_mode(item)),
+                        Position {
+                            ordinal: 0,
+                            order: None,
+                            removed: false,
+                        },
+                    )
+                })
+                .collect();
+            let replacement = Matches::build(self, &rows, aliases, true);
+            for (shown, source) in pending {
+                if let Some(Evidence::Witness(raw)) = replacement.find(shown)
+                    && source.is_none_or(|s| {
+                        s.wire == raw.wire
+                            && s.id.zip(raw.id).is_none_or(|(a, b)| a == b)
+                            && s.turn.zip(raw.turn).is_none_or(|(a, b)| a == b)
+                    })
+                {
+                    confirmed.insert(raw, shown);
+                }
+            }
         }
+        confirmed
     }
 
     pub(super) fn rollback(&mut self, ordinal: u64, order: Option<u64>) {
@@ -334,7 +513,7 @@ impl AnswerOccurrences {
         if !self.rolled && !self.shown.values().any(|s| s.revised) {
             return HashMap::new();
         }
-        let matches = Matches::build(self, aliases);
+        let matches = Matches::build(self, &self.model, aliases, false);
         let mut rulings = HashMap::<u64, Ruling>::new();
         for (shown, _) in &self.prior {
             if let Some(Evidence::Witness(raw)) = matches.find(*shown)

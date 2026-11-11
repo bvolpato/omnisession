@@ -681,3 +681,71 @@ fn a_withdrawn_checkpoint_owner_keeps_its_later_display_reply_out_of_the_handoff
         );
     }
 }
+
+#[test]
+fn unnumbered_compaction_follows_its_native_turn_when_a_steer_rolls_back() {
+    let request = |turn: &str, text: &str| {
+        let mut item = message("user", text);
+        item["payload"]["id"] = format!("input-{text}").into();
+        item["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+        let shown = page_user(turn, &format!("input-{text}"), text);
+        [item, shown]
+    };
+    let checkpoint = |item: &serde_json::Value, numbered| {
+        let mut body = json!({"message":"", "replacement_history":[item["payload"]]});
+        if numbered {
+            body["window_number"] = 1.into();
+        }
+        json!({"type":"compacted", "payload":body})
+    };
+    let first = request("first", "first request");
+    let second = request("second", "second request");
+    let old = request("older", "earlier request");
+    let start = |turn| event("task_started", json!({"turn_id":turn}));
+    let end = |turn| event("task_complete", json!({"turn_id":turn}));
+    for (prior, numbered, next_turn, expected) in [
+        (
+            false,
+            false,
+            false,
+            vec!["earlier request", "first request", "second request"],
+        ),
+        (true, false, false, vec!["first request", "second request"]),
+        (false, true, false, vec!["second request"]),
+        (false, false, true, vec!["second request"]),
+    ] {
+        let mut rows = vec![start("older")];
+        rows.extend(old.clone());
+        rows.extend([end("older"), start("first")]);
+        rows.extend(first.clone());
+        if prior {
+            rows.push(checkpoint(&first[0], true));
+        }
+        rows.extend([end("first"), start("second")]);
+        rows.extend(second.clone());
+        rows.push(checkpoint(&second[0], numbered));
+        if next_turn {
+            rows.extend([end("second"), start("third")]);
+        }
+        let steer_turn = if next_turn { "third" } else { "second" };
+        rows.extend(request(steer_turn, "queued request"));
+        rows.extend([
+            end(steer_turn),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ]);
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let active = omnis_core::import_conversation(&snapshot);
+            assert_eq!(
+                active
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "prior={prior} numbered={numbered} next_turn={next_turn} preview={preview}"
+            );
+        }
+    }
+}

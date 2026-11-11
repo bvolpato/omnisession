@@ -1253,7 +1253,7 @@ fn main() -> ExitCode {
         // The command already reported the interrupted work.
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            let _ = writeln!(io::stderr().lock(), "error: {error:#}");
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
                 Some(ProviderExit(status)) => {
@@ -2693,22 +2693,24 @@ fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool 
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
-    println!("Transfer: {} -> {}", report.source, report.target);
-    println!("Mode: {}", report.mode);
-    println!("Repository match: {}", report.repository_matches);
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Transfer: {} -> {}", report.source, report.target)?;
+    writeln!(stdout, "Mode: {}", report.mode)?;
+    writeln!(stdout, "Repository match: {}", report.repository_matches)?;
     for entry in &report.entries {
         if let Some(detail) = &entry.detail {
-            println!(
+            writeln!(
+                stdout,
                 "  {:<24} {:?} ({})",
                 entry.feature,
                 entry.status,
                 safe_terminal_line(detail)
-            );
+            )?;
         } else {
-            println!("  {:<24} {:?}", entry.feature, entry.status);
+            writeln!(stdout, "  {:<24} {:?}", entry.feature, entry.status)?;
         }
     }
-    flush_stdout()?;
+    stdout.flush()?;
     for warning in &report.warnings {
         progress_line(&format!("warning: {warning}"))?;
     }
@@ -2868,11 +2870,6 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
                 "--force".to_owned(),
             ]
         }
-        Provider::OpenCode => {
-            let binary = resolved_provider_binary(session.provider)
-                .unwrap_or_else(|_| PathBuf::from("opencode"));
-            omnis_adapters::opencode_command_args(&binary, &["session", "delete", &session.id])?
-        }
         Provider::Grok => {
             validate_grok_session_id(&session.id)?;
             vec![
@@ -2953,7 +2950,16 @@ fn delete_native_session(
             let binary = cursor_ide_binary()?;
             Some(cursor_ide_import::delete_session(session, &binary)?)
         }
-        Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
+        Provider::OpenCode => {
+            let binary = resolved_provider_binary(Provider::OpenCode)?;
+            let cwd = workspace
+                .into_iter()
+                .chain(native.project_path.as_deref())
+                .find(|path| path.is_dir());
+            transfer::delete_opencode_session(&binary, session, cwd)?;
+            None
+        }
+        Provider::Codex | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
             None
         }
@@ -2968,7 +2974,7 @@ fn delete_native_session(
     if sessions
         .iter()
         .any(|candidate| candidate.session == *session)
-        || registry.read_session(session).is_ok()
+        || (session.provider != Provider::OpenCode && registry.read_session(session).is_ok())
         || (session.provider == Provider::Grok
             && grok_session_directory_exists(
                 registry
@@ -3159,7 +3165,7 @@ fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
     Ok(file)
 }
 
-fn write_private_json(document: &Value) -> Result<NamedTempFile> {
+fn create_private_import_file() -> Result<NamedTempFile> {
     let _store = Store::open_default().context("validating OmniSession state root")?;
     let directory = state_root()
         .context("resolving OmniSession state")?
@@ -3181,19 +3187,11 @@ fn write_private_json(document: &Value) -> Result<NamedTempFile> {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .context("securing import directory")?;
     }
-    let mut file = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix("opencode-")
         .suffix(".json")
         .tempfile_in(&directory)
-        .context("creating private import")?;
-    serde_json::to_writer(file.as_file_mut(), document).context("writing private import")?;
-    file.as_file()
-        .sync_all()
-        .context("syncing private import")?;
-    if file.as_file().metadata()?.len() > MAX_BUNDLE_SIZE {
-        bail!("OpenCode import exceeds {MAX_BUNDLE_SIZE} byte safety limit");
-    }
-    Ok(file)
+        .context("creating private import")
 }
 
 fn sanitize_snapshot(mut snapshot: CanonicalSnapshot) -> CanonicalSnapshot {

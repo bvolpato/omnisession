@@ -69,7 +69,7 @@ pub(super) fn is_private_instruction(payload: &Value) -> bool {
     communication(&message)
 }
 
-fn communication(message: &Value) -> bool {
+pub(super) fn communication(message: &Value) -> bool {
     let path = |value: &Value| value.as_str().is_some_and(agent_path);
     path(&message["author"])
         && path(&message["recipient"])
@@ -265,8 +265,11 @@ fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
 }
 
 fn content_digest(payload: &Value) -> Key {
-    // A checkpoint can reuse an ID after editing the prompt or replacing an attachment.
-    // Hash the original structured content without retaining a second copy of media data.
+    json_digest(&payload["content"])
+}
+
+// A checkpoint can reuse an ID after editing a message, an attachment, or a tool result.
+pub(super) fn json_digest(value: &impl serde::Serialize) -> Key {
     struct Writer(Sha256);
     impl std::io::Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -279,7 +282,7 @@ fn content_digest(payload: &Value) -> Key {
         }
     }
     let mut writer = Writer(Sha256::new());
-    serde_json::to_writer(&mut writer, &payload["content"]).expect("serializing JSON to a digest");
+    serde_json::to_writer(&mut writer, value).expect("serializing JSON to a digest");
     writer.0.finalize().into()
 }
 
@@ -345,6 +348,7 @@ struct Input {
     // A migrated request can have a generated turn opening immediately before its display.
     display_start: u64,
     order: Option<u64>,
+    accepted_output: Option<u64>,
     inherited: bool,
 }
 
@@ -398,6 +402,7 @@ impl Input {
             ordinal,
             display_start: ordinal,
             order: None,
+            accepted_output: None,
             inherited: false,
         }
     }
@@ -413,6 +418,72 @@ impl Input {
     fn adjacent(self, shown: Self) -> bool {
         self.ordinal.abs_diff(shown.ordinal) == 1
             || self.ordinal.checked_add(1) == Some(shown.display_start)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InputPosition {
+    ordinal: u64,
+    order: Option<u64>,
+}
+
+impl InputPosition {
+    pub(super) fn user(record: &Value, ordinal: u64) -> Option<Self> {
+        let payload = &record["payload"];
+        (record["type"] == "response_item"
+            && payload["role"] == "user"
+            && model_instruction(payload))
+        .then(|| Self {
+            ordinal,
+            order: super::model_cut::input_order(&record["metadata"]),
+        })
+    }
+}
+
+// The legacy public turn list excludes inter-agent inputs that count toward a model rollback.
+#[derive(Default)]
+pub(super) struct LegacyPrivateInputs {
+    entries: VecDeque<InputPosition>,
+    evicted_through: u64,
+}
+
+impl LegacyPrivateInputs {
+    pub(super) fn observe(&mut self, record: &Value, ordinal: u64) -> bool {
+        let payload = &record["payload"];
+        let private = match record["type"].as_str() {
+            Some("inter_agent_communication") => communication(payload),
+            Some("response_item") => is_private_instruction(payload),
+            _ => false,
+        };
+        if private {
+            if self.entries.len() == MAX_CANONICAL_EVENTS
+                && let Some(old) = self.entries.pop_front()
+            {
+                self.evicted_through = old.ordinal;
+            }
+            self.entries.push_back(InputPosition {
+                ordinal,
+                order: super::model_cut::acceptance_order(payload, &record["metadata"]),
+            });
+        }
+        private
+    }
+
+    pub(super) fn crosses(&mut self, cut: InputPosition, excess: u64) -> bool {
+        let keep = self
+            .entries
+            .partition_point(|entry| entry.ordinal < cut.ordinal);
+        let hidden = (self.entries.len() - keep) as u64;
+        let evicted = self
+            .evicted_through
+            .checked_sub(cut.ordinal)
+            .map_or(0, |span| span.saturating_add(1));
+        self.entries.truncate(keep);
+        if cut.order.is_some() {
+            self.entries
+                .retain(|entry| !super::model_cut::removes_accepted(entry.order, cut.order));
+        }
+        hidden.saturating_add(evicted) > excess
     }
 }
 
@@ -478,11 +549,13 @@ impl PaginatedRollback {
         let mut input = Input::new(turn, spelling, false, ordinal, self.segment);
         if !user {
             input.kind = IdKind::InterAgent;
+            input.accepted_output =
+                super::model_cut::acceptance_order(payload, &record["metadata"]);
         }
         input.window = self.window;
         input.inherited = !standalone && record["metadata"]["inherited_user_message"] == true;
-        if !input.inherited && !standalone {
-            input.order = record["metadata"]["user_input_order"].as_u64();
+        if !standalone {
+            input.order = super::model_cut::input_order(&record["metadata"]);
         }
         if self.model.len() == MAX_CANONICAL_EVENTS
             && let Some(old) = self.model.pop_front()
@@ -556,6 +629,8 @@ impl PaginatedRollback {
         &mut self,
         count: usize,
         aliases: &HashMap<Key, Key>,
+        boundary: Option<(u64, Option<u64>)>,
+        checkpoint_floor: u64,
     ) -> HashMap<u64, Withdrawal> {
         let mut marked = HashMap::new();
         if count == 0 {
@@ -583,7 +658,20 @@ impl PaginatedRollback {
             self.evicted = self.evicted.saturating_sub(extra);
         }
         self.match_model_inputs(cut, aliases, &mut marked, |_, _, _| {});
+        let cutoff = boundary
+            .filter(|(ordinal, _)| {
+                self.model
+                    .get(cut)
+                    .is_some_and(|input| input.ordinal == *ordinal)
+            })
+            .and_then(|(_, order)| order);
         self.model.truncate(cut);
+        if cutoff.is_some() {
+            self.model.retain(|input| {
+                input.ordinal <= checkpoint_floor
+                    || !super::model_cut::removes_accepted(input.accepted_output, cutoff)
+            });
+        }
         for (seq, &status) in &marked {
             if let Some(shown) = self.displayed.get_mut(seq) {
                 shown.withdrawal = Some(status);

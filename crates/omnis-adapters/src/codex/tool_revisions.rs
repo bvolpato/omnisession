@@ -29,15 +29,26 @@ impl PreviousDisplay {
         if priority(Some(raw_type)) < priority(event.source.raw_record_type.as_deref()) {
             return None;
         }
+        Some(Self::replace_payload(
+            event,
+            kind,
+            json!({ "text": text }),
+            raw_type,
+        ))
+    }
+
+    pub(super) fn replace_payload(
+        event: &mut OmniEvent,
+        kind: EventKind,
+        payload: Value,
+        raw_type: &str,
+    ) -> Self {
         event.replay_policy = ReplayPolicy::Contextual;
-        Some(Self {
+        Self {
             kind: std::mem::replace(&mut event.kind, kind),
-            payload: Some(std::mem::replace(
-                &mut event.payload,
-                json!({ "text": text }),
-            )),
+            payload: Some(std::mem::replace(&mut event.payload, payload)),
             message_source: event.source.raw_record_type.replace(raw_type.to_owned()),
-        })
+        }
     }
 
     pub(super) fn was_displayed_message(&self) -> bool {

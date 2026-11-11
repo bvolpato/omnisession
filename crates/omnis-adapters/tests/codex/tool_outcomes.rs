@@ -560,3 +560,104 @@ fn legacy_display_revisions_keep_the_earlier_payload_or_a_later_model_receipt() 
         assert_eq!(results(&snapshot), [(&EventKind::ToolFailed, expected)]);
     }
 }
+
+#[test]
+fn checkpoint_tools_require_the_same_call_and_result_and_follow_the_call_cutoff() {
+    let turn = "original";
+    let mut user = message("user", "first request");
+    user["payload"]["id"] = "first".into();
+    user["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id": turn});
+    let call = json!({"type":"function_call", "call_id":"call-a", "name":"lookup", "arguments":"{\"count\":1}"});
+    let result =
+        json!({"type":"function_call_output", "call_id":"call-a", "output":"published result"});
+    let mut other_call = call.clone();
+    other_call["arguments"] = "{\"count\":2}".into();
+    let mut other_result = result.clone();
+    other_result["output"] = "replacement-only result".into();
+    let published = [
+        event("task_started", json!({"turn_id":turn})),
+        user.clone(),
+        page_user(turn, "first", "first request"),
+        json!({"type":"response_item", "payload":call}),
+        json!({"type":"response_item", "payload":result}),
+        turn_item(
+            turn,
+            &json!({"type":"FunctionCallOutput", "id":"call-a", "name":"lookup", "output":"published result"}),
+        ),
+    ];
+    // The result precedes the steer on disk. With matching acceptance orders its call still withdraws it.
+    for (items, rollback, expected_calls, expected_results) in [
+        (vec![call.clone(), result.clone()], false, 1, 1),
+        (vec![call.clone(), other_result], false, 1, 0),
+        (vec![other_call, result.clone()], false, 0, 0),
+        (vec![result.clone()], false, 0, 0),
+        (vec![call.clone(), result], true, 0, 0),
+    ] {
+        let mut retained = vec![user["payload"].clone()];
+        retained.extend(items);
+        let mut metadata = vec![json!({}); retained.len()];
+        if rollback {
+            metadata[1] = json!({"user_input_order":2});
+            retained.push(message("user", "queued request")["payload"].clone());
+            metadata.push(json!({"user_input_order":2}));
+        }
+        let mut rows = published.to_vec();
+        rows.push(
+            json!({"type":"compacted", "payload":{"message":"", "window_number":2,
+            "replacement_history":retained, "replacement_history_metadata":metadata}}),
+        );
+        if rollback {
+            rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let markdown = omnis_core::render_markdown_export(&snapshot);
+            let active = markdown.split("## Previous Codex display").next().unwrap();
+            assert_eq!(active.matches("### Tool call").count(), expected_calls);
+            assert_eq!(active.matches("### Tool result").count(), expected_results);
+            assert!(!markdown.contains("replacement-only result"));
+            let import = omnis_core::import_trajectory(&snapshot);
+            let structured = import
+                .items
+                .iter()
+                .filter(|item| item.tool.is_some())
+                .count();
+            assert_eq!(structured, if expected_results == 1 { 2 } else { 0 });
+        }
+    }
+}
+
+#[test]
+fn checkpoint_tool_results_with_a_reused_call_id_follow_the_scoped_call() {
+    let call = |turn: &str| json!({"type":"function_call", "call_id":"reuse", "name":"lookup", "arguments":"{}", "internal_chat_message_metadata_passthrough":{"turn_id":turn}});
+    let result = json!({"type":"function_call_output", "call_id":"reuse", "output":"same result"});
+    let mut records = Vec::new();
+    for turn in ["first", "second"] {
+        records.extend([
+            event("task_started", json!({"turn_id":turn})),
+            json!({"type":"response_item","payload":call(turn)}),
+            json!({"type":"response_item","payload":result}),
+            event("task_complete", json!({"turn_id":turn})),
+        ]);
+    }
+    for (stamp, expected) in [(true, [true, true, false, false]), (false, [false; 4])] {
+        let mut retained = call("first");
+        if !stamp {
+            retained
+                .as_object_mut()
+                .unwrap()
+                .remove("internal_chat_message_metadata_passthrough");
+        }
+        let mut rows = records.clone();
+        rows.push(json!({"type":"compacted","payload":{"message":"", "window_number":1, "replacement_history":[retained,result]}}));
+        let snapshot = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+        let active: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ToolCalled | EventKind::ToolCompleted))
+            .map(|e| e.payload.get("omnisession_codex_checkpoint").is_none())
+            .collect();
+        assert_eq!(active, expected, "checkpoint has turn stamp: {stamp}");
+    }
+}

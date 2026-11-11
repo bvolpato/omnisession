@@ -1,9 +1,9 @@
 //! Codex's visible assistant text in Plan mode.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use omnis_ir::{EventKind, ReplayPolicy};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{EventBuilder, MAX_CANONICAL_EVENTS};
@@ -15,29 +15,47 @@ pub(super) fn without_plan(text: &str) -> Option<String> {
     if !text.contains("<proposed_plan>") && !text.contains("<oai-mem-citation>") {
         return None;
     }
-    let mut uncited = String::new();
-    let text = if visit_uncited(text, |chunk| uncited.push_str(chunk)) {
-        uncited.as_str()
-    } else {
-        text
-    };
     let mut visible = String::new();
-    last_plan(text, |line| visible.push_str(line))?;
+    last_plan(&uncited(text), |line| visible.push_str(line))?;
     Some(visible)
+}
+
+/// One model response can produce both a public assistant message and a separate Plan.
+pub(super) fn model_plan(item: &Value) -> Option<(Option<Key>, Key)> {
+    if item["type"] != "message" || item["role"] != "assistant" {
+        return None;
+    }
+    let mut parts = item["content"]
+        .as_array()?
+        .iter()
+        .filter(|part| part["type"] == "output_text");
+    let mut text = Cow::Borrowed(parts.next()?["text"].as_str()?);
+    for part in parts {
+        text.to_mut().push_str(part["text"].as_str()?);
+    }
+    let plan = proposal_digest(&text)?;
+    let mut outer = String::new();
+    last_plan(&uncited(&text), |line| outer.push_str(line));
+    let assistant = (!outer.trim().is_empty()).then(|| Sha256::digest(outer.as_bytes()).into());
+    Some((assistant, plan))
 }
 
 /// The native Plan item contains the last block in a response, with its citations removed.
 pub(super) fn proposal_digest(text: &str) -> Option<Key> {
     let body = last_plan(text, |_| {})?;
-    let mut uncited = String::new();
-    Some(if visit_uncited(body, |chunk| uncited.push_str(chunk)) {
-        display_digest(&uncited)
-    } else {
-        display_digest(body)
-    })
+    Some(display_digest(&uncited(body)))
 }
 
-fn display_digest(text: &str) -> Key {
+fn uncited(text: &str) -> Cow<'_, str> {
+    let mut result = String::new();
+    if visit_uncited(text, |part| result.push_str(part)) {
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub(super) fn display_digest(text: &str) -> Key {
     // Some restored Plan items omit the line ending before the closing tag.
     let text = text
         .strip_suffix("\r\n")

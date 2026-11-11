@@ -11,6 +11,7 @@ use super::paginated_rollback::Withdrawal;
 
 type TurnAliases = HashMap<[u8; 32], [u8; 32]>;
 
+mod checkpoint_tools;
 mod occurrences;
 use occurrences::{AnswerOccurrences, ConfirmedAnswers};
 
@@ -73,11 +74,8 @@ struct Position {
 }
 
 impl Position {
-    fn new(record: &Value, ordinal: u64, ordered: bool) -> Self {
-        let metadata = &record["metadata"];
-        let order = metadata["user_input_order"]
-            .as_u64()
-            .filter(|_| ordered && metadata["inherited_user_message"] != true);
+    fn new(record: &Value, ordinal: u64) -> Self {
+        let order = super::model_cut::acceptance_order(&record["payload"], &record["metadata"]);
         Self {
             ordinal,
             order,
@@ -86,14 +84,13 @@ impl Position {
     }
 
     fn rollback(&mut self, ordinal: u64, order: Option<u64>) {
-        self.removed |= self.ordinal >= ordinal
-            || order
-                .zip(self.order)
-                .is_some_and(|(cut, accepted)| accepted >= cut);
+        self.removed |=
+            self.ordinal >= ordinal || super::model_cut::removes_accepted(self.order, order);
     }
 }
 
 struct ModelTool {
+    digest: Option<[u8; 32]>,
     position: Position,
     // Outputs refer to the matched call's canonical sequence, even when the call was unstamped.
     call: Option<u64>,
@@ -125,8 +122,8 @@ impl PaginatedAnswers {
         self.aliases = aliases;
     }
 
-    pub(super) fn model(&mut self, record: &Value, ordinal: u64) {
-        self.answers.model(record, ordinal);
+    pub(super) fn model(&mut self, record: &Value, ordinal: u64, plan_mode: bool) {
+        self.answers.model(record, ordinal, plan_mode);
     }
 
     pub(super) fn archive_changed_reply(
@@ -145,8 +142,13 @@ impl PaginatedAnswers {
         }
     }
 
-    pub(super) fn confirmed_answer_copies(&self, aliases: &TurnAliases) -> ConfirmedAnswers {
-        self.answers.confirmed(aliases)
+    pub(super) fn confirmed_answer_copies(
+        &self,
+        aliases: &TurnAliases,
+        items: &[Value],
+        plan_mode: impl Fn(&Value) -> bool,
+    ) -> ConfirmedAnswers {
+        self.answers.confirmed(aliases, items, plan_mode)
     }
 
     pub(super) fn finish_answers(&mut self) -> HashMap<u64, Option<Withdrawal>> {
@@ -191,10 +193,9 @@ impl PaginatedAnswers {
                     .add(false);
             }
         }
-        // Among tool items, Codex's acceptance cutoff applies only to function calls.
-        let ordered = record["payload"]["type"] == "function_call";
         let tool = ModelTool {
-            position: Position::new(record, ordinal, ordered),
+            digest: checkpoint_tools::payload_digest(&record["payload"]),
+            position: Position::new(record, ordinal),
             call: call.or_else(|| stored?.call),
             key,
             output,
@@ -254,8 +255,17 @@ impl PaginatedAnswers {
     }
 
     /// A completed item can arrive after Codex has already rolled back its model copy.
-    pub(super) fn display(&mut self, sequence: u64, turn: &str, id: &str, text: &str) {
-        self.answers.display(sequence, turn, id, text);
+    pub(super) fn display(
+        &mut self,
+        sequence: u64,
+        turn: &str,
+        id: &str,
+        text: &str,
+        ordinal: u64,
+        plan: bool,
+    ) {
+        self.answers
+            .display(sequence, turn, id, text, ordinal, plan);
     }
 
     pub(super) fn rollback(

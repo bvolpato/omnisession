@@ -201,17 +201,131 @@ fn indistinguishable_generated_replies_stay_in_recovery_after_a_partial_rollback
 }
 
 #[test]
+fn unstamped_reply_needs_a_unique_public_id_and_spelling() {
+    for (order, ambiguous) in [(1, false), (2, false), (2, true)] {
+        let mut raw = model("a", "shared", "assistant", "public reply");
+        raw["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("internal_chat_message_metadata_passthrough");
+        raw["metadata"] = json!({"user_input_order":order});
+        let mut queued = model("a", "later", "user", "later");
+        queued["metadata"] = json!({"user_input_order":2});
+        let mut rows = vec![
+            start("a"),
+            model("a", "keep", "user", "keep"),
+            page_user("a", "keep", "keep"),
+            raw,
+            shown("a", "shared", "public reply"),
+        ];
+        if ambiguous {
+            rows.push(shown("b", "shared", "public reply"));
+        }
+        rows.extend([queued, page_user("a", "later", "later"), rollback()]);
+        let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+        let statuses = snap
+            .events
+            .iter()
+            .filter(|event| event.payload["text"] == "public reply")
+            .map(|event| event.payload["omnisession_codex_rollback"].as_str())
+            .collect::<Vec<_>>();
+        if ambiguous {
+            assert_eq!(statuses, [Some("unverified"), Some("unverified")]);
+        } else {
+            assert_eq!(statuses, [(order == 2).then_some("withdrawn")]);
+        }
+    }
+}
+
+#[test]
+fn an_unidentified_withdrawn_raw_only_marks_its_neighbor_uncertain() {
+    let mut rows = vec![
+        start("a"),
+        model("a", "u", "user", "keep"),
+        page_user("a", "u", "keep"),
+    ];
+    let mut raw = model("a", "unused", "assistant", "same answer");
+    let payload = raw["payload"].as_object_mut().unwrap();
+    payload.remove("id");
+    payload.remove("internal_chat_message_metadata_passthrough");
+    raw["metadata"] = json!({"user_input_order":2});
+    let mut later = model("a", "q", "user", "queued");
+    later["metadata"] = json!({"user_input_order":2});
+    rows.extend([
+        raw,
+        shown("a", "typed", "same answer"),
+        later,
+        page_user("a", "q", "queued"),
+        rollback(),
+        start("fresh"),
+        model("fresh", "new", "user", "new"),
+        page_user("fresh", "new", "new"),
+        shown("fresh", "fresh-reply", "same answer"),
+    ]);
+    let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+    let flags = snap
+        .events
+        .iter()
+        .filter(|e| e.payload["text"] == "same answer")
+        .map(|e| e.payload["omnisession_codex_rollback"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(flags, [Some("unverified"), None]);
+}
+
+#[test]
+fn a_checkpoint_can_witness_a_generated_reply_without_a_previous_model_copy() {
+    let first = model("a", "u", "user", "keep");
+    let reply = model("a", "native", "assistant", "public reply");
+    for (raw_copy, second_display, checkpoint_turn, checkpoint_text, active) in [
+        (true, false, "a", "public reply", true),
+        (false, false, "a", "public reply", true),
+        (false, true, "a", "public reply", false),
+        (false, false, "b", "public reply", false),
+        (false, false, "a", "model-only reply", false),
+    ] {
+        let mut rows = vec![start("a"), first.clone(), page_user("a", "u", "keep")];
+        if raw_copy {
+            rows.push(reply.clone());
+        }
+        rows.push(shown("a", "item-2", "public reply"));
+        if second_display {
+            rows.push(shown("a", "item-3", "public reply"));
+        }
+        let replacement = model(checkpoint_turn, "native", "assistant", checkpoint_text);
+        rows.push(json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[first["payload"],replacement["payload"]]}}));
+        let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+        let active_text = omnis_core::import_conversation(&snap)
+            .messages
+            .into_iter()
+            .map(|m| m.text)
+            .collect::<Vec<_>>();
+        if active {
+            assert_eq!(active_text, ["keep", "public reply"]);
+        } else {
+            assert_eq!(active_text, ["keep"]);
+        }
+        assert!(
+            !serde_json::to_string(&snap)
+                .unwrap()
+                .contains("model-only reply")
+        );
+    }
+}
+
+#[test]
 fn rollback_transfers_only_the_previously_displayed_surviving_reply_version() {
-    for with_checkpoint in [false, true] {
+    for (with_checkpoint, original_model_copy) in [(false, true), (true, true), (true, false)] {
         let first = model("turn", "first", "user", "keep");
         let old = model("turn", "reply", "assistant", "original public reply");
         let mut rows = vec![
             start("turn"),
             first.clone(),
             page_user("turn", "first", "keep"),
-            old.clone(),
-            shown("turn", "reply", "original public reply"),
         ];
+        if original_model_copy {
+            rows.push(old.clone());
+        }
+        rows.push(shown("turn", "reply", "original public reply"));
         if with_checkpoint {
             rows.push(json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[first["payload"],old["payload"]]}}));
         }
