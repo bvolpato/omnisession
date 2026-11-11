@@ -229,13 +229,18 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         provider, session_id, redacted_text, content_hash,
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
-        truncation_strategy, origin, protected_by_bundle, document_version, derived_title, codex_home, source_revision, provider_limited
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18)
+        truncation_strategy, origin, protected_by_bundle, document_version, derived_title, codex_home, source_revision, provider_limited, source_file_bytes
+    ) SELECT ?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19
+    WHERE ?20 = 0
+      OR (?17 IS NOT NULL AND EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2 AND source_revision = ?17))
+      OR (?20 = 1 AND NOT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2))
+      OR (?20 = 2 AND EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2 AND source_revision IS ?21))
     ON CONFLICT DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
         source_complete = excluded.source_complete,
         source_revision = excluded.source_revision,
+        source_file_bytes = excluded.source_file_bytes,
         provider_limited = excluded.provider_limited,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
@@ -481,9 +486,30 @@ impl SessionTrajectoryOrigin {
     }
 }
 
+/// Index state observed before reading the provider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrajectoryWriteGuard {
+    #[default]
+    Unchecked,
+    Missing,
+    Existing(Option<i64>),
+}
+
+impl TrajectoryWriteGuard {
+    const fn sql(self) -> (i64, Option<i64>) {
+        match self {
+            Self::Unchecked => (0, None),
+            Self::Missing => (1, None),
+            Self::Existing(revision) => (2, revision),
+        }
+    }
+}
+
 /// Physical source evidence collected during a trajectory read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TrajectorySource {
+    pub expected: TrajectoryWriteGuard,
+    pub file_bytes: Option<i64>,
     pub revision: Option<i64>,
     pub provider_limited: bool,
 }
@@ -1960,6 +1986,9 @@ impl Store {
                         passive_preview,
                         write.document.source.revision,
                         write.document.source.provider_limited,
+                        write.document.source.file_bytes,
+                        write.document.source.expected.sql().0,
+                        write.document.source.expected.sql().1,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2086,6 +2115,18 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Reads the current revision for a conditional trajectory write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be read.
+    pub fn trajectory_write_guard(&self, session: &SessionRef) -> Result<TrajectoryWriteGuard> {
+        self.connection.borrow().query_row(
+            "SELECT source_revision FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2",
+            params![session.provider.to_string(), session.id], |row| row.get(0)
+        ).optional().map(|row| row.map_or(TrajectoryWriteGuard::Missing, TrajectoryWriteGuard::Existing)).map_err(database_error)
+    }
+
     /// Checks whether a complete search document still covers the observed source time
     /// and needs an upgrade to the requested version.
     ///
@@ -2096,15 +2137,17 @@ impl Store {
         &self,
         session: &SessionRef,
         revision: Option<i64>,
+        bytes: Option<i64>,
         updated_at: Option<DateTime<Utc>>,
         version: u32,
     ) -> Result<bool> {
         self.connection.borrow().query_row(
-            "SELECT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2
-                AND source_complete AND ((source_revision IS NULL AND ?5 IS NOT NULL)
+            "SELECT EXISTS (SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+                AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))
+                AND source_complete AND ((?5 IS NOT NULL AND source_revision IS NOT ?5 AND (source_file_bytes IS NULL OR source_file_bytes >= ?6))
                 OR (document_version < ?3 AND (CASE WHEN ?5 IS NOT NULL THEN source_revision = ?5
                     ELSE ?4 IS NULL OR source_updated_at >= ?4 END))))",
-            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis()), revision],
+            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis()), revision, bytes],
             |row| row.get(0),
         ).map_err(database_error)
     }
@@ -2120,7 +2163,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection
             .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_revision, provider_limited
+                "SELECT provider, session_id, source_updated_at, source_complete, document_version, source_revision, provider_limited, source_file_bytes
                  FROM visible_trajectories",
             )
             .map_err(database_error)?;
@@ -2133,6 +2176,8 @@ impl Store {
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
                     TrajectorySource {
+                        expected: TrajectoryWriteGuard::Existing(row.get(5)?),
+                        file_bytes: row.get(7)?,
                         revision: row.get(5)?,
                         provider_limited: row.get(6)?,
                     },
@@ -3185,26 +3230,24 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
         .map_err(database_error)?;
     drop(statement);
     let has_column = |name: &str| columns.iter().any(|column| column == name);
-    if !has_column("source_revision") {
-        transaction
-            .execute_batch("ALTER TABLE session_trajectories ADD COLUMN source_revision INTEGER")
-            .map_err(database_error)?;
-    }
-    if !has_column("provider_limited") {
-        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN provider_limited INTEGER NOT NULL DEFAULT 0").map_err(database_error)?;
+    for (name, definition) in [
+        ("content_hash", "BLOB NOT NULL DEFAULT X''"),
+        ("source_revision", "INTEGER"),
+        ("source_file_bytes", "INTEGER"),
+        ("provider_limited", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !has_column(name) {
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE session_trajectories ADD COLUMN {name} {definition}"
+                ))
+                .map_err(database_error)?;
+        }
     }
     let missing_coverage = !has_column("source_byte_count")
         || !has_column("indexed_byte_count")
         || !has_column("truncation_strategy")
         || !has_column("source_complete");
-    if !has_column("content_hash") {
-        transaction
-            .execute_batch(
-                "ALTER TABLE session_trajectories
-                 ADD COLUMN content_hash BLOB NOT NULL DEFAULT X'';",
-            )
-            .map_err(database_error)?;
-    }
     if !has_column("source_complete") {
         transaction
             .execute_batch(
@@ -5146,6 +5189,48 @@ mod tests {
             .expect("search full read");
         assert!(matches[0].source_complete);
         assert!(!matches[0].complete);
+    }
+
+    #[test]
+    fn stale_batch_cannot_overwrite_a_newer_source_revision() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Claude, "concurrent");
+        let now = Utc::now();
+        let document = |text: &'static str, revision, expected| TrajectoryDocument {
+            source: crate::TrajectorySource {
+                revision: Some(revision),
+                expected,
+                ..crate::TrajectorySource::default()
+            },
+            redacted_text: text,
+            source_updated_at: now,
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 1,
+            derived_title: None,
+        };
+        let missing = store.trajectory_write_guard(&session).unwrap();
+        store
+            .upsert_trajectory_document(&session, &document("initial", 1, missing))
+            .unwrap();
+        let initial = store.trajectory_write_guard(&session).unwrap();
+        store
+            .upsert_trajectory_document(&session, &document("newest", 3, initial))
+            .unwrap();
+        store
+            .upsert_trajectory_documents(&[
+                (&session, document("stale", 2, initial)),
+                (&session, document("absent", 4, missing)),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.search_session_trajectories("newest", 10).unwrap(),
+            [session]
+        );
     }
 
     #[test]

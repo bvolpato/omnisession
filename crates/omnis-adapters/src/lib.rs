@@ -283,6 +283,8 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
+        let selected_path = self.search_transcript_path(session, source_path)?;
+        let source_path = selected_path.as_deref();
         let source_complete = !source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
@@ -476,7 +478,10 @@ impl AdapterRegistry {
         session: &SessionRef,
         hint: Option<&Path>,
     ) -> Result<Option<TranscriptRevision>> {
-        if !matches!(session.provider, Provider::Claude | Provider::Codex) {
+        if !matches!(
+            session.provider,
+            Provider::Claude | Provider::Codex | Provider::Pi | Provider::OhMyPi
+        ) {
             return Ok(None);
         }
         self.adapter(session.provider)?

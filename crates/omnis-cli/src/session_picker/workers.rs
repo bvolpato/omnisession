@@ -448,14 +448,58 @@ pub(super) fn spawn_provider_update(
     });
 }
 
+struct PickerPreviewRead {
+    read: omnis_adapters::IndexRead,
+    revision: Option<omnis_adapters::TranscriptRevision>,
+    guard: omnis_store::TrajectoryWriteGuard,
+}
+
+impl PickerPreviewRead {
+    fn store(&self, store: &Store, key: &PreviewKey) -> omnis_store::Result<PreviewTitle> {
+        let snapshot = &self.read.snapshot;
+        let origin = if key.session.provider == Provider::Imported {
+            SessionTrajectoryOrigin::ImportedBundle
+        } else {
+            SessionTrajectoryOrigin::Native
+        };
+        let observed = self
+            .revision
+            .map(|r| r.modified)
+            .or(key.updated_at)
+            .unwrap_or(snapshot.captured_at);
+        let source = omnis_store::TrajectorySource {
+            expected: self.guard,
+            file_bytes: self.revision.map(|r| r.bytes),
+            revision: self.revision.map(|r| r.key),
+            provider_limited: self.read.provider_limited,
+        };
+        crate::store_search_document(
+            store,
+            &key.session,
+            snapshot,
+            &trajectory_search_document(snapshot),
+            self.read.source_complete,
+            origin,
+            (observed, source),
+        )?;
+        if key.session.provider == Provider::Claude {
+            store
+                .trajectory_title(&key.session)
+                .map(PreviewTitle::Indexed)
+        } else {
+            Ok(PreviewTitle::FromPreview)
+        }
+    }
+}
+
 fn read_picker_preview(
     registry: &AdapterRegistry,
     key: &PreviewKey,
     store: Option<&Store>,
-) -> Result<(
-    omnis_adapters::IndexRead,
-    Option<omnis_adapters::TranscriptRevision>,
-)> {
+) -> Result<PickerPreviewRead> {
+    let guard = store
+        .and_then(|store| store.trajectory_write_guard(&key.session).ok())
+        .unwrap_or_default();
     let revision = registry.search_revision(&key.session, None)?;
     let full = |snapshot| omnis_adapters::IndexRead {
         snapshot,
@@ -471,6 +515,7 @@ fn read_picker_preview(
             .needs_full_projection_upgrade(
                 &key.session,
                 revision.map(|r| r.key),
+                revision.map(|r| r.bytes),
                 key.updated_at,
                 omnis_core::SEARCH_DOCUMENT_VERSION,
             )
@@ -488,7 +533,11 @@ fn read_picker_preview(
         revision == registry.search_revision(&key.session, None)?,
         "selected transcript changed during indexing"
     );
-    Ok((read, revision))
+    Ok(PickerPreviewRead {
+        read,
+        revision,
+        guard,
+    })
 }
 
 pub(super) fn spawn_preview_updates(
@@ -533,44 +582,20 @@ pub(super) fn spawn_preview_updates(
                 {
                     PreviewValue::Unavailable
                 } else {
-                    let imported = key.session.provider == Provider::Imported;
                     let read = read_picker_preview(&registry, &key, store.as_ref());
-                    read.map_or(PreviewValue::Unavailable, |(read, revision)| {
-                        let snapshot = read.snapshot;
-                        let full_read = read.source_complete;
+                    read.map_or(PreviewValue::Unavailable, |preview| {
                         if let Some(store) = &store {
-                            let document = trajectory_search_document(&snapshot);
-                            if let Err(error) = crate::store_search_document(
-                                store,
-                                &key.session,
-                                &snapshot,
-                                &document,
-                                full_read,
-                                if imported {
-                                    SessionTrajectoryOrigin::ImportedBundle
-                                } else {
-                                    SessionTrajectoryOrigin::Native
-                                },
-                                (
-                                    revision
-                                        .map(|r| r.modified)
-                                        .or(key.updated_at)
-                                        .unwrap_or(snapshot.captured_at),
-                                    omnis_store::TrajectorySource {
-                                        revision: revision.map(|r| r.key),
-                                        provider_limited: read.provider_limited,
-                                    },
-                                ),
-                            ) {
-                                let _ = sender.send(PickerUpdate::Warning(format!(
-                                    "trajectory index write: {error}"
-                                )));
-                            } else if key.session.provider == Provider::Claude
-                                && let Ok(title) = store.trajectory_title(&key.session)
-                            {
-                                indexed_title = PreviewTitle::Indexed(title);
+                            match preview.store(store, &key) {
+                                Ok(title) => indexed_title = title,
+                                Err(error) => {
+                                    let _ = sender.send(PickerUpdate::Warning(format!(
+                                        "trajectory index write: {error}"
+                                    )));
+                                }
                             }
                         }
+                        let snapshot = preview.read.snapshot;
+                        let full_read = preview.read.source_complete;
                         PreviewValue::Ready {
                             continuation: key.continuation_after.and_then(|handoff_at| {
                                 first_user_message_after(&snapshot, handoff_at)

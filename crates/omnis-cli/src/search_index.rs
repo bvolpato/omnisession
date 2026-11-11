@@ -48,6 +48,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
     revision: Option<omnis_adapters::TranscriptRevision>,
+    expected: omnis_store::TrajectoryWriteGuard,
     upgrade_full_document: bool,
 }
 
@@ -62,7 +63,10 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
-            revision: if matches!(provider, Provider::Claude | Provider::Codex) {
+            revision: if matches!(
+                provider,
+                Provider::Claude | Provider::Codex | Provider::Pi | Provider::OhMyPi
+            ) {
                 session
                     .source_path
                     .as_deref()
@@ -70,6 +74,7 @@ impl IndexCandidate {
             } else {
                 None
             },
+            expected: omnis_store::TrajectoryWriteGuard::Unchecked,
             upgrade_full_document: false,
         })
     }
@@ -210,23 +215,20 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            candidate.upgrade_full_document = states.get(&candidate.session).is_some_and(|state| {
-                state.source_complete
-                    && match candidate.revision {
-                        Some(revision) => {
-                            state.source.revision.is_none()
-                                || (state.document_version < SEARCH_DOCUMENT_VERSION
-                                    && state.source.revision == Some(revision.key))
-                        }
-                        None => {
-                            state.document_version < SEARCH_DOCUMENT_VERSION
-                                && candidate.updated_at.is_none_or(|time| {
-                                    time.timestamp_millis()
-                                        <= state.source_updated_at.timestamp_millis()
-                                })
-                        }
-                    }
-            });
+            if candidate.revision.is_some() {
+                candidate.expected = states
+                    .get(&candidate.session)
+                    .map_or(omnis_store::TrajectoryWriteGuard::Missing, |state| {
+                        state.source.expected
+                    });
+            }
+            candidate.upgrade_full_document = store.needs_full_projection_upgrade(
+                &candidate.session,
+                candidate.revision.map(|revision| revision.key),
+                candidate.revision.map(|revision| revision.bytes),
+                candidate.updated_at,
+                SEARCH_DOCUMENT_VERSION,
+            )?;
             stale.push(candidate);
         }
     }
@@ -562,6 +564,7 @@ fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
 ) -> anyhow::Result<PreparedIndex> {
+    let before = registry.search_revision(&candidate.session, candidate.source_path.as_deref())?;
     let imported = candidate.session.provider == Provider::Imported;
     let IndexRead {
         snapshot,
@@ -588,7 +591,7 @@ fn prepare_session(
     let observed =
         registry.search_revision(&candidate.session, candidate.source_path.as_deref())?;
     anyhow::ensure!(
-        candidate.revision == observed,
+        before == observed,
         "selected transcript changed during indexing"
     );
     let source_updated_at = observed
@@ -602,6 +605,8 @@ fn prepare_session(
     };
     Ok(PreparedIndex {
         source: omnis_store::TrajectorySource {
+            expected: candidate.expected,
+            file_bytes: observed.map(|revision| revision.bytes),
             revision: observed.map(|revision| revision.key),
             provider_limited,
         },
@@ -691,6 +696,7 @@ mod tests {
             updated_at,
             source_path,
             revision: None,
+            expected: omnis_store::TrajectoryWriteGuard::Unchecked,
             upgrade_full_document: false,
         }
     }
@@ -830,6 +836,7 @@ mod tests {
             source: omnis_store::TrajectorySource {
                 revision: Some(revision.key),
                 provider_limited: true,
+                ..omnis_store::TrajectorySource::default()
             },
             source_updated_at: revision.modified,
             source_complete: false,
@@ -837,7 +844,9 @@ mod tests {
         };
         assert!(!needs_index(&selected, Some(&indexed)));
         fs::write(&path, "first row and second row").unwrap();
-        std::fs::File::open(&path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(revision.modified.into())
             .unwrap();
@@ -1366,6 +1375,7 @@ mod tests {
                         updated_at: Some(Utc::now()),
                         source_path: None,
                         revision: None,
+                        expected: omnis_store::TrajectoryWriteGuard::Unchecked,
                         upgrade_full_document: false,
                     })
                     .collect(),

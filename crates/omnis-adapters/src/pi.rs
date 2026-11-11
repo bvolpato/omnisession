@@ -1041,6 +1041,14 @@ impl ProviderAdapter for PiAdapter {
         Ok(sessions)
     }
 
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        self.session_path(&session.id, hint).map(Some)
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         self.read_session_at(session, None)
     }

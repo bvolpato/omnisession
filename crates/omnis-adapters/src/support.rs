@@ -500,6 +500,7 @@ impl SnapshotFileStamp {
 /// Physical identity of a selected transcript for search cache validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptRevision {
+    pub bytes: i64,
     pub modified: DateTime<Utc>,
     pub key: i64,
 }
@@ -536,6 +537,7 @@ impl TranscriptRevision {
         let mut prefix = [0; 8];
         prefix.copy_from_slice(&digest[..8]);
         Ok(Self {
+            bytes: i64::try_from(stamp.len).map_err(io::Error::other)?,
             modified,
             key: i64::from_le_bytes(prefix),
         })

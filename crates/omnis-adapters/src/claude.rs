@@ -114,19 +114,6 @@ impl ClaudeAdapter {
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
-    fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
-        Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
-        let hinted = source_path.and_then(|source_path| {
-            let root = self.projects_root.as_deref()?;
-            let expected_name = format!("{id}.jsonl");
-            if source_path.file_name()?.to_str()? != expected_name {
-                return None;
-            }
-            provider_file(root, source_path)
-        });
-        hinted.map_or_else(|| self.find_session(id), Ok)
-    }
-
     fn history_index(&self) -> ClaudeHistory {
         let Some(config_root) = self.projects_root.as_deref().and_then(Path::parent) else {
             return ClaudeHistory::default();
@@ -1062,12 +1049,35 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let history = self.history_index();
+        let mut history = self.history_index();
+        let mut seen = HashSet::new();
+        let duplicates = self
+            .session_files()
+            .iter()
+            .filter_map(|(id, _)| (!seen.insert(id)).then_some(id))
+            .collect::<HashSet<_>>();
+        let mut selected = HashMap::new();
+        for id in duplicates {
+            let path = match self.find_session(id) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    history.notes.push(error.to_string());
+                    None
+                }
+            };
+            selected.insert(id, path);
+        }
         let mut sessions = sample_files_concurrently(self.session_files(), |session_files| {
             let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
             let mut sessions = Vec::new();
             for (id, path) in session_files {
+                if selected
+                    .get(id)
+                    .is_some_and(|chosen| chosen.as_ref() != Some(path))
+                {
+                    continue;
+                }
                 let Some(path) = files.as_mut().and_then(|files| files.resolve(path)) else {
                     continue;
                 };
@@ -1179,9 +1189,9 @@ impl ProviderAdapter for ClaudeAdapter {
     fn search_transcript_path(
         &self,
         session: &SessionRef,
-        hint: Option<&Path>,
+        _hint: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        self.session_path(&session.id, hint).map(Some)
+        self.find_session(&session.id).map(Some)
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1191,10 +1201,10 @@ impl ProviderAdapter for ClaudeAdapter {
     fn read_session_at(
         &self,
         session: &SessionRef,
-        source_path: Option<&Path>,
+        _source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
-        let path = self.session_path(&session.id, source_path)?;
+        let path = self.find_session(&session.id)?;
         let mut transcript = ClaudeTranscript::default();
         let oversized_records =
             visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
@@ -1211,11 +1221,11 @@ impl ProviderAdapter for ClaudeAdapter {
     fn preview_session_at(
         &self,
         session: &SessionRef,
-        source_path: Option<&Path>,
+        _source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         const SAMPLE_RECORDS: usize = 1_024;
         validate_provider(session, Provider::Claude)?;
-        let path = self.session_path(&session.id, source_path)?;
+        let path = self.find_session(&session.id)?;
         let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
         let mut transcript = ClaudeTranscript::default();
         for record in records {

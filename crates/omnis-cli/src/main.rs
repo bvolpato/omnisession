@@ -121,6 +121,11 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        let store = Store::open_default();
+        let guard = store
+            .as_ref()
+            .ok()
+            .and_then(|store| store.trajectory_write_guard(session).ok());
         let revision = self.search_revision(session, None)?;
         let snapshot = read_session(self, session)?;
         anyhow::ensure!(
@@ -128,7 +133,7 @@ impl IndexedSessionReader for AdapterRegistry {
             "selected transcript changed during indexing"
         );
         let updated_at = revision.map_or(snapshot.captured_at, |source| source.modified);
-        match Store::open_default() {
+        match store {
             Ok(store) => {
                 let current = match store.session_trajectory_source_is_current_at_revision(
                     session,
@@ -158,6 +163,8 @@ impl IndexedSessionReader for AdapterRegistry {
                         (
                             updated_at,
                             omnis_store::TrajectorySource {
+                                expected: guard.unwrap_or_default(),
+                                file_bytes: revision.map(|r| r.bytes),
                                 revision: revision.map(|r| r.key),
                                 provider_limited: false,
                             },
