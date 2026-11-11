@@ -70,7 +70,7 @@ fn resume_request(
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
-    let restore_source =
+    let mut restore_source =
         requires_import_for_native_resume(registry, &request.source, request.agent_target())?;
     // `switch` sets no_fork to prefer the bound session. The picker lets the user explicitly
     // choose "Continue original session".
@@ -90,14 +90,38 @@ fn resume_request(
         launch_mode_args(request.agent_target(), request.mode, json_output)?
     };
     if can_resume_without_snapshot(request) && !restore_source {
-        return resume_native_without_snapshot(
-            registry,
-            args,
-            task_binding,
-            request,
-            &mode_args,
-            json_output,
+        let workspace = native_resume_workspace(registry, request, args)?;
+        let selects_source = codex_import::launch_selects_session(
+            registry.adapter(request.target)?,
+            &request.source,
+            request.profile,
+            &workspace.0,
         );
+        if matches!(selects_source, Ok(true)) {
+            return resume_native_without_snapshot(
+                registry,
+                args,
+                task_binding,
+                request,
+                &mode_args,
+                workspace,
+                json_output,
+            );
+        }
+        if request.resume_in_place && (task_binding.is_none() || require_original) {
+            let source = safe_terminal_line(&request.source.to_string());
+            let cwd = safe_terminal_line(&workspace.0.display().to_string());
+            let reason = selects_source.err().map_or_else(
+                || "the launch configuration selects a different or unverified rollout".to_owned(),
+                |error| safe_terminal_line(&error.to_string()),
+            );
+            bail!(
+                "{} cannot resume `{source}` in place from `{cwd}` because {reason}. To continue in a copy, run `omni fork {source} --in {}`.",
+                provider_name(request.target),
+                request.agent_target(),
+            );
+        }
+        restore_source = true;
     }
     loop {
         match resume_from_snapshot(
@@ -297,8 +321,10 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         (target, args.mode)
     } else {
         let targets = launch_profile::runnable_agent_targets();
-        let can_copy =
-            |source: &SessionRef, target| can_materialize_target(registry, source, target);
+        let project = current_project()?;
+        let can_copy = |source: &SessionRef, target| {
+            can_materialize_target(registry, source, target, &project)
+        };
         let Some(picked) = session_picker::pick_fork_target(
             &source,
             &targets,
@@ -460,10 +486,19 @@ pub(super) fn can_materialize_target(
     registry: &AdapterRegistry,
     source: &SessionRef,
     target: AgentTarget,
+    project: &Path,
 ) -> bool {
     source.provider != target.provider
         || materializes_native_forks(target.provider)
         || requires_import_for_native_resume(registry, source, target).unwrap_or(false)
+        || (source.provider == Provider::Codex
+            && !omnis_core::may_reach_network(project)
+            && workspace_root(project).is_ok_and(|cwd| {
+                registry.adapter(source.provider).is_ok_and(|adapter| {
+                    !codex_import::launch_selects_session(adapter, source, target.profile, &cwd)
+                        .unwrap_or(false)
+                })
+            }))
 }
 
 pub(super) fn resume_project(
@@ -490,25 +525,33 @@ pub(super) fn resume_project(
     )
 }
 
+fn native_resume_workspace(
+    registry: &AdapterRegistry,
+    request: &ResolvedResumeRequest,
+    args: &ResumeArgs,
+) -> Result<(PathBuf, bool)> {
+    let current = current_project()?;
+    if let Some(selection) = &request.picker_selection {
+        let project = selected_native_workspace(selection, &current)?;
+        let repository_matches = workspace_paths_match(&project, &current);
+        Ok((project, repository_matches))
+    } else {
+        explicit_native_workspace(registry, request, args, &current)
+    }
+}
+
 fn resume_native_without_snapshot(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
     task_binding: Option<&(i64, String)>,
     request: &ResolvedResumeRequest,
     mode_args: &[String],
+    (project, repository_matches): (PathBuf, bool),
     json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
         bail!("`--materialize-only` requires a supported native import");
     }
-    let current = current_project()?;
-    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
-        let project = selected_native_workspace(selection, &current)?;
-        let repository_matches = workspace_paths_match(&project, &current);
-        (project, repository_matches)
-    } else {
-        explicit_native_workspace(registry, request, args, &current)?
-    };
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
     } else {
@@ -2877,9 +2920,9 @@ fn resolve_resume_request(
                 })
                 .collect::<Vec<_>>()
         };
-        let can_copy = |source: &SessionRef, target: AgentTarget| {
+        let can_copy = |source: &SessionRef, target: AgentTarget, project: &Path| {
             (!args.no_fork || source.provider != target.provider)
-                && can_materialize_target(registry, source, target)
+                && can_materialize_target(registry, source, target, project)
         };
         session_picker::pick_session(
             &project,

@@ -2009,9 +2009,19 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(snapshot.session.provider);
-    let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
+    let project = current_project()?;
+    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     let restore_source =
-        transfer::requires_import_for_native_resume(registry, &source, target.into())?;
+        transfer::requires_import_for_native_resume(registry, &source, target.into())?
+            || (source.provider == Provider::Codex
+                && target == Provider::Codex
+                && !codex_import::launch_selects_session(
+                    registry.adapter(target)?,
+                    &source,
+                    None,
+                    &project,
+                )
+                .unwrap_or(false));
     let report = inspect_report(&snapshot, target, matches, restore_source)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);

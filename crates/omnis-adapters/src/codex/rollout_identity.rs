@@ -1,9 +1,11 @@
 //! Codex keeps the thread ID when a revert creates another physical rollout.
 
+mod sqlite_home;
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    env, fs,
+    fs,
     io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -75,7 +77,7 @@ fn native_filename(path: &Path) -> bool {
 
 #[derive(Debug, Default)]
 pub(super) struct RolloutSelector {
-    sqlite_home: Option<PathBuf>,
+    sqlite_home: sqlite_home::SqliteHome,
     snapshot: SqliteSnapshotCache,
     immutable_paths: Mutex<HashMap<String, PathBuf>>,
 }
@@ -83,12 +85,7 @@ pub(super) struct RolloutSelector {
 impl RolloutSelector {
     pub(super) fn from_env() -> Self {
         Self {
-            sqlite_home: env::var("CODEX_SQLITE_HOME")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            sqlite_home: sqlite_home::SqliteHome::from_env(),
             ..Self::default()
         }
     }
@@ -140,15 +137,15 @@ impl RolloutSelector {
         let Some(path) = path else {
             return Ok(None);
         };
-        let complete =
-            (fresh && scan.notes.is_empty() && !scan.indices(id).is_empty()).then_some(scan);
-        let native = Self::native_selects(home, complete, id, &path, current)?;
+        let fresh = fresh && scan.notes.is_empty() && !scan.indices(id).is_empty();
+        let native = Self::native_selects(home, scan, fresh, id, &path, current)?;
         Ok(Some((path, native)))
     }
 
     fn native_selects(
         home: &Path,
-        fresh_scan: Option<&CodexFileScan>,
+        scan: &CodexFileScan,
+        fresh: bool,
         id: &str,
         selected: &Path,
         current: Option<&SelectedRollout>,
@@ -184,7 +181,7 @@ impl RolloutSelector {
                 return Ok(false);
             }
         }
-        if !native_filename(selected) {
+        if !native_filename(selected) || scan.skipped_directories {
             return Ok(false);
         }
         // Codex keeps the first file at the newest (timestamp, rollout ID). Plain JSONL
@@ -201,16 +198,19 @@ impl RolloutSelector {
                 .is_some_and(|candidate| same_native_copy(&candidate, selected).unwrap_or(false))
         };
         let active = home.join("sessions");
-        if let Some(scan) = fresh_scan {
+        if fresh {
             return Ok(scan
                 .files
                 .iter()
                 .filter(|path| path.starts_with(&active))
                 .all(|path| agrees(path)));
         }
-        // Old or bounded discovery can miss a second copy. An unreadable directory
-        // also prevents us from confirming which file the provider will open.
-        Ok(active_files_agree(active, agrees).unwrap_or(false))
+        let mut agree = true;
+        let inventory = walk_roots([active], super::SCAN_LIMIT, |path| {
+            agree &= agrees(path);
+            Ok(())
+        })?;
+        Ok(agree && inventory.complete())
     }
 
     /// A filesystem fallback can locate a thread or immutable rollout after the listing fills up.
@@ -274,8 +274,12 @@ impl RolloutSelector {
 
     fn scan_exact(home: &Path, id: &str, kind: IdKind) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(home);
-        visit_rollouts(home, |path| candidates.observe(path, id, kind, None))?;
-        candidates.exact_choice(home, kind)
+        let inventory = visit_rollouts(home, |path| candidates.observe(path, id, kind, None))?;
+        let found = candidates.exact_choice(home, kind)?;
+        if found.is_none() {
+            inventory.require_access()?;
+        }
+        Ok(found)
     }
 
     pub(super) fn available_rollouts(
@@ -327,17 +331,20 @@ impl RolloutSelector {
         Ok(available)
     }
 
-    fn database<'a>(&'a self, home: &'a Path) -> Option<(&'a Path, PathBuf)> {
-        let root = self.sqlite_home.as_deref().unwrap_or(home);
-        provider_file(root, &root.join("state_5.sqlite")).map(|path| (root, path))
-    }
-
     fn current_rows<'a>(
         &self,
         home: &Path,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, SelectedRollout>> {
-        let Some((root, database)) = self.database(home) else {
+        self.rows_in(&self.sqlite_home.resolve(home)?, ids)
+    }
+
+    fn rows_in<'a>(
+        &self,
+        root: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, SelectedRollout>> {
+        let Some(database) = provider_file(root, &root.join("state_5.sqlite")) else {
             return Ok(HashMap::new());
         };
         self.snapshot
@@ -375,6 +382,39 @@ impl RolloutSelector {
     }
 }
 
+impl super::CodexAdapter {
+    /// A different launch directory can select another generation of the same logical thread.
+    pub(crate) fn selected_state_agrees_at(
+        &self,
+        cwd: &Path,
+        session: &omnis_ir::SessionRef,
+        overrides: &crate::CodexLaunchOverrides,
+    ) -> Result<bool> {
+        let home = self
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        let source = self.selector.sqlite_home.resolve(home)?;
+        let destination = self.selector.sqlite_home.resolve_in(home, cwd, overrides)?;
+        if source == destination || same_file::is_same_file(&source, &destination).unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        let path = self.find_session_path(&session.id)?;
+        let rows = self.selector.rows_in(&destination, [&*session.id])?;
+        let (scan, cached) = self.session_scan(None);
+        let fresh = !cached && scan.notes.is_empty() && !scan.indices(&session.id).is_empty();
+        RolloutSelector::native_selects(
+            home,
+            &scan,
+            fresh,
+            &session.id,
+            &path,
+            rows.get(&session.id),
+        )
+    }
+}
+
 struct SelectedRollout {
     path: PathBuf,
     paginated: bool,
@@ -394,18 +434,26 @@ impl RolloutCatalog<'_> {
     /// Check exact names once per indexing pass. A later batch can see restored rollouts.
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(self.home);
-        self.visit_physical(id, |path| {
+        let inventory = self.visit_physical(id, |path| {
             candidates.observe(path, id, IdKind::Rollout, None)
         })?;
-        candidates.exact_choice(self.home, IdKind::Rollout)
+        let found = candidates.exact_choice(self.home, IdKind::Rollout)?;
+        if found.is_none() {
+            inventory.require_access()?;
+        }
+        Ok(found)
     }
 
-    fn visit_physical(&self, id: &str, mut each: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    fn visit_physical(
+        &self,
+        id: &str,
+        mut each: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<Inventory> {
         if let Some(scan) = &self.fresh_scan {
             for path in scan.paths(self.home, id) {
                 each(path)?;
             }
-            return Ok(());
+            return Ok(Inventory::default());
         }
         let paths = self
             .ancestors
@@ -496,7 +544,7 @@ pub(super) fn discovery_path(home: &Path, path: &Path) -> bool {
     else {
         return false;
     };
-    tail.components().count() <= 6
+    tail.components().count() <= super::SCAN_DEPTH + 1
         && tail
             .components()
             .all(|part| matches!(part, std::path::Component::Normal(_)))
@@ -545,6 +593,20 @@ fn managed_recording(home: &Path, path: &Path) -> bool {
     true
 }
 
+// Restored state can contain an absolute path written by Codex on the other platform.
+fn recorded_file_name(path: &Path) -> Option<&Path> {
+    let text = path.to_str()?;
+    let windows = text.starts_with(r"\\")
+        || text.starts_with("//")
+        || matches!(text.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic());
+    let name = if windows {
+        text.rsplit(['/', '\\']).next()?
+    } else {
+        text.rsplit('/').next()?
+    };
+    (!name.contains('\\')).then(|| Path::new(name))
+}
+
 fn relocated_rollout(
     home: &Path,
     recorded: &Path,
@@ -552,6 +614,9 @@ fn relocated_rollout(
     paginated: bool,
     catalog: Option<&RolloutCatalog<'_>>,
 ) -> Result<Option<PathBuf>> {
+    let Some(recorded) = recorded_file_name(recorded) else {
+        return Ok(None);
+    };
     if !canonical_filename(recorded) || thread_id(recorded) != Some(id) {
         return Ok(None);
     }
@@ -609,11 +674,12 @@ pub(super) fn visit_immutable_copies(
         }
         Ok(())
     };
-    if let Some(catalog) = catalog {
+    let inventory = if let Some(catalog) = catalog {
         catalog.visit_physical(rollout, exact)
     } else {
         visit_rollouts(home, exact)
-    }
+    }?;
+    inventory.require_access()
 }
 
 fn copy_digest(path: &Path, remaining: &mut u64) -> Result<[u8; 32]> {
@@ -762,6 +828,9 @@ pub(super) fn provider_can_read_ancestors<'a>(
         }
         Ok(())
     };
+    if !selected.is_empty() && scan.skipped_directories {
+        return Ok(false);
+    }
     if scan.notes.is_empty() {
         for id in selected.keys() {
             for index in scan.indices(id) {
@@ -769,7 +838,10 @@ pub(super) fn provider_can_read_ancestors<'a>(
             }
         }
     } else if !selected.is_empty() {
-        visit_rollouts(home, check)?;
+        let inventory = walk_roots(rollout_roots(home), super::SCAN_LIMIT, check)?;
+        if !inventory.complete() {
+            return Ok(false);
+        }
     }
     Ok(readable)
 }
@@ -914,52 +986,115 @@ impl Candidates {
     }
 }
 
-fn active_files_agree(root: PathBuf, agrees: impl Fn(&Path) -> bool) -> io::Result<bool> {
-    let mut directories = vec![root];
-    while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                directories.push(entry.path());
-            } else if kind.is_file() && !agrees(&entry.path()) {
-                return Ok(false);
+#[derive(Clone, Copy, Default)]
+pub(super) struct Inventory {
+    inaccessible: bool,
+    limited: bool,
+}
+
+impl Inventory {
+    fn complete(self) -> bool {
+        !self.inaccessible && !self.limited
+    }
+
+    fn require_access(self) -> Result<()> {
+        if self.inaccessible {
+            return Err(InaccessibleInventory.into());
+        }
+        Ok(())
+    }
+
+    fn accessible<T>(&mut self, result: io::Result<T>) -> io::Result<Option<T>> {
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                self.inaccessible = true;
+                Ok(None)
             }
+            result => result.map(Some),
         }
     }
-    Ok(true)
+}
+
+#[derive(Debug)]
+pub(super) struct InaccessibleInventory;
+
+impl std::fmt::Display for InaccessibleInventory {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("Codex could not search all source rollout directories")
+    }
+}
+
+impl std::error::Error for InaccessibleInventory {}
+
+fn rollout_roots(home: &Path) -> [PathBuf; 2] {
+    [home.join("sessions"), home.join("archived_sessions")]
 }
 
 pub(super) fn visit_rollouts(
     home: &Path,
-    mut visit: impl FnMut(&Path) -> Result<()>,
-) -> Result<()> {
+    visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<Inventory> {
     #[cfg(test)]
     tests::FULL_WALKS.with(|walks| walks.set(walks.get() + 1));
-    for directory in ["sessions", "archived_sessions"] {
-        visit_files(&home.join(directory), 5, &mut visit)?;
+    walk_roots(rollout_roots(home), usize::MAX, visit)
+}
+
+fn walk_roots(
+    roots: impl IntoIterator<Item = PathBuf>,
+    mut remaining: usize,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<Inventory> {
+    let mut inventory = Inventory::default();
+    for directory in roots {
+        visit_files(
+            &directory,
+            super::SCAN_DEPTH,
+            &mut remaining,
+            &mut inventory,
+            &mut visit,
+        )?;
     }
-    Ok(())
+    Ok(inventory)
 }
 
 fn visit_files(
     root: &Path,
     depth: usize,
+    remaining: &mut usize,
+    inventory: &mut Inventory,
     visit: &mut impl FnMut(&Path) -> Result<()>,
 ) -> Result<()> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if !metadata.is_dir() => return Ok(()),
-        Ok(_) => {}
+    let metadata = match fs::symlink_metadata(root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+        metadata => inventory.accessible(metadata)?,
+    };
+    if !metadata.is_some_and(|metadata| metadata.is_dir()) {
+        inventory.limited = true;
+        return Ok(());
     }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
+    let Some(entries) = inventory.accessible(fs::read_dir(root))? else {
+        return Ok(());
+    };
+    for entry in entries {
+        if *remaining == 0 {
+            inventory.limited = true;
+            break;
+        }
+        *remaining -= 1;
+        let Some(entry) = inventory.accessible(entry)? else {
+            continue;
+        };
+        let Some(kind) = inventory.accessible(entry.file_type())? else {
+            continue;
+        };
         if kind.is_file() {
             visit(&entry.path())?;
-        } else if kind.is_dir() && depth > 0 {
-            visit_files(&entry.path(), depth - 1, visit)?;
+        } else if kind.is_dir() {
+            if depth == 0 {
+                inventory.limited = true;
+            } else {
+                visit_files(&entry.path(), depth - 1, remaining, inventory, visit)?;
+            }
         }
     }
     Ok(())

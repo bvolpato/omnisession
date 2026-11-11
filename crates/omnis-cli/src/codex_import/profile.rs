@@ -101,6 +101,55 @@ impl ImportProfile {
     }
 }
 
+pub(crate) fn launch_selects_session(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    session: &omnis_ir::SessionRef,
+    profile: Option<&crate::launch_profile::LaunchProfile>,
+    directory: &Path,
+) -> Result<bool> {
+    use omnis_adapters::{CodexLaunchOverrides, EnvChange, LaunchPlan};
+
+    let mut overrides = CodexLaunchOverrides::default();
+    let Some(profile) = profile.filter(|_| session.provider == omnis_ir::Provider::Codex) else {
+        return adapter.native_selects_session_at(session, directory, &overrides);
+    };
+    let plan = profile.apply(
+        LaunchPlan {
+            program: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        },
+        &crate::launch_profile::environment,
+    )?;
+    let mut launch_dir = directory.to_owned();
+    let mut args = plan.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(path) = option_value(arg, "--cd", "-C", &mut args)? {
+            launch_dir = directory.join(path);
+        } else if let Some(name) = option_value(arg, "--profile", "-p", &mut args)? {
+            if !plain_name(name) {
+                bail!("Codex --profile requires a plain profile name");
+            }
+            overrides.profile = Some(name.to_owned());
+        } else if let Some(assignment) = option_value(arg, "--config", "-c", &mut args)? {
+            let (key, value) = assignment
+                .split_once('=')
+                .context("Codex -c requires key=value")?;
+            if key.trim() == "sqlite_home" {
+                overrides.sqlite_home = Some(config_string(value)?.into());
+            }
+        }
+    }
+    overrides.environment = plan.env.into_iter().rev().find(|change| match change {
+        EnvChange::Set { name, .. } | EnvChange::Remove(name) => name == "CODEX_SQLITE_HOME",
+    });
+    adapter.native_selects_session_at(session, &launch_dir, &overrides)
+}
+
 /// Whether plain `codex`, with no launch profile, can open a session that uses `provider`.
 ///
 /// A configuration that cannot be read answers yes. Codex then reports the problem itself, and
@@ -134,7 +183,7 @@ fn config_string(value: &str) -> Result<String> {
     match value.parse::<toml::Value>() {
         Ok(toml::Value::String(s)) => Ok(s),
         Err(_) => Ok(value.to_owned()),
-        Ok(_) => bail!("Codex model provider override must be a string"),
+        Ok(_) => bail!("Codex configuration override must be a string"),
     }
 }
 

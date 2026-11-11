@@ -1531,7 +1531,7 @@ pub fn pick_session(
     new_session_targets: &[AgentTarget],
     initial_provider: Option<Provider>,
     all_projects: bool,
-    materialize: Option<CanMaterialize<'_>>,
+    materialize: Option<CanMaterializeAt<'_>>,
     requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
@@ -1651,7 +1651,7 @@ fn select_picker_row(
     target: Option<AgentTarget>,
     available_targets: &[AgentTarget],
     new_session_targets: &[AgentTarget],
-    materialize: Option<CanMaterialize<'_>>,
+    materialize: Option<CanMaterializeAt<'_>>,
     requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
@@ -1681,9 +1681,19 @@ fn select_picker_row(
     };
     let session = entry.session.session.clone();
     let project_path = entry.session.project_path.clone();
-    let intent = materialize.map_or(TargetIntent::Resume(&session), |can_copy| {
-        TargetIntent::Materialize(&session, can_copy)
-    });
+    let can_copy = |source: &SessionRef, target| {
+        let launch_project = if state.all_projects {
+            project_path.as_deref().unwrap_or(current_project)
+        } else {
+            current_project
+        };
+        materialize.is_some_and(|check| check(source, target, launch_project))
+    };
+    let intent = if materialize.is_some() {
+        TargetIntent::Materialize(&session, &can_copy)
+    } else {
+        TargetIntent::Resume(&session)
+    };
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(
         target,
@@ -1829,6 +1839,7 @@ struct TargetChoice {
 }
 
 pub(super) type CanMaterialize<'a> = &'a dyn Fn(&SessionRef, AgentTarget) -> bool;
+pub(super) type CanMaterializeAt<'a> = &'a dyn Fn(&SessionRef, AgentTarget, &Path) -> bool;
 
 #[derive(Clone, Copy)]
 enum TargetIntent<'a> {
@@ -5818,7 +5829,7 @@ mod tests {
         let mut registry = AdapterRegistry::new();
         registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
         let can_copy = |session: &SessionRef, target| {
-            crate::transfer::can_materialize_target(&registry, session, target)
+            crate::transfer::can_materialize_target(&registry, session, target, home.path())
         };
         let targets = [Provider::Codex, Provider::Claude];
         for (folder, expect_copy) in [("archived_sessions", true), ("sessions/2026/01/01", false)] {

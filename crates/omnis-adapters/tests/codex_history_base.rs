@@ -13,6 +13,9 @@ const PARENT: &str = "11111111-1111-4111-8111-111111111111";
 const CHILD: &str = "22222222-2222-4222-8222-222222222222";
 const REVERT: &str = "33333333-3333-4333-8333-333333333333";
 
+#[path = "codex_history_base/partial_inventory.rs"]
+mod partial_inventory;
+
 fn write(
     home: &Path,
     root: &str,
@@ -500,6 +503,10 @@ fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result
     fs::write(&damaged, &bytes)?;
     fs::remove_file(&original)?;
     check(true)?;
+    let conflicting_prefix = encoded(&parent).replace("parent one", "shadow one");
+    fs::write(&backup, conflicting_prefix)?;
+    check(false)?;
+    fs::write(&backup, encoded(&parent))?;
     assert_eq!(
         adapter.native_resume_support(&leaf)?,
         NativeResumeSupport::ImportOnly
@@ -516,6 +523,89 @@ fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result
     check(true)?;
     assert_eq!(fs::read(&damaged)?, bytes);
     assert_eq!(fs::read_to_string(&backup)?, encoded(&parent));
+    Ok(())
+}
+
+#[test]
+fn a_missing_parent_header_ordinal_requires_an_archive_matching_the_readable_rows()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (root, day) = (home.path(), "sessions/2026/01/01");
+    let stamp = "2026-01-01T00-00-00";
+    let grand = [header(REVERT, 0, None), turn(1, "user", "grandparent")];
+    let mut parent = [
+        header(PARENT, 2, Some(bookmark(REVERT, &grand))),
+        turn(3, "user", "parent one"),
+        turn(4, "assistant", "parent two"),
+    ];
+    parent[0]["writer_version"] = json!("0.167.1");
+    let child = [
+        header(CHILD, 5, Some(bookmark(PARENT, &parent))),
+        turn(6, "user", "child"),
+    ];
+    write(root, day, REVERT, REVERT, stamp, &grand);
+    let selected = write(root, day, PARENT, PARENT, stamp, &parent);
+    let leaf = write(root, day, CHILD, CHILD, stamp, &child);
+    let damaged = encoded(&parent).replacen("\"ordinal\"", "\"ordhnal\"", 1);
+    fs::write(&selected, &damaged)?;
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    let check = |expected: &[&str], partial: bool| -> anyhow::Result<()> {
+        let adapter = CodexAdapter::with_root(root);
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+            adapter.index_session(&session, Some(&leaf), 1)?.snapshot,
+        ] {
+            let history = omnis_core::import_conversation(&snapshot);
+            assert_eq!(history.truncated, partial);
+            assert_eq!(
+                history
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(
+            adapter.native_resume_support(&session)?,
+            NativeResumeSupport::ImportOnly
+        );
+        Ok(())
+    };
+    check(&["child"], true)?;
+    let archive = write(root, "archived_sessions", PARENT, PARENT, stamp, &parent);
+    check(&["grandparent", "parent one", "parent two", "child"], false)?;
+    fs::write(
+        &archive,
+        encoded(&parent).replace("parent two", "wrong text"),
+    )?;
+    check(&["child"], true)?;
+    let mut other_header = parent.clone();
+    other_header[0]["payload"]["cwd"] = json!(format!("/workspace/{REVERT}"));
+    fs::write(&archive, encoded(&other_header))?;
+    check(&["child"], true)?;
+    let mut other_header = parent.clone();
+    other_header[0]["writer_version"] = json!("0.166.0");
+    fs::write(&archive, encoded(&other_header))?;
+    check(&["child"], true)?;
+    assert_eq!(fs::read_to_string(&selected)?, damaged);
+    assert_eq!(fs::read_to_string(&leaf)?, encoded(&child));
+
+    fs::write(&archive, encoded(&parent))?;
+    fs::write(&selected, damaged.replace("\"ordinal\":4", "\"ordinal\":8"))?;
+    let err = read(root, false).unwrap_err();
+    assert!(err.to_string().contains("ordinal"), "{err:#}");
+
+    let mut wrong = parent.clone();
+    wrong[0]["ordinal"] = json!(9);
+    fs::write(&selected, encoded(&wrong))?;
+    let err = read(root, false).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cutoff precedes the source header"),
+        "{err:#}"
+    );
     Ok(())
 }
 
@@ -716,6 +806,20 @@ fn codex_rejects_cutoffs_that_disagree_with_the_referenced_rollout() {
         CHILD,
         "2026-01-02T00-00-00",
         &[header(CHILD, 2, Some(base))],
+    );
+    let error = read(home.path(), false).unwrap_err();
+    assert!(error.to_string().contains("cutoffs disagree"), "{error:#}");
+
+    // The saved byte offset includes the opening brace after the last expected ordinal.
+    let mut next_byte = bookmark(PARENT, &parent[..2]);
+    next_byte["end_byte_offset"] = json!(encoded(&parent[..2]).len() + 1);
+    write(
+        home.path(),
+        "sessions",
+        CHILD,
+        CHILD,
+        "2026-01-02T00-00-00",
+        &[header(CHILD, 2, Some(next_byte))],
     );
     let error = read(home.path(), false).unwrap_err();
     assert!(error.to_string().contains("cutoffs disagree"), "{error:#}");

@@ -323,6 +323,17 @@ fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<(
         assert_selected(&restored, &selected, &abandoned, "restored selection")?;
     }
 
+    let db = rusqlite::Connection::open(restored.join("state_5.sqlite"))?;
+    for pointer in [
+        format!(r"C:\Users\restored\.codex\sessions\{name}"),
+        format!(r"\\server\backups\.codex\archived_sessions\{name}"),
+        format!("/previous/home/.codex/sessions/{name}"),
+    ] {
+        db.execute("UPDATE threads SET rollout_path = ?1", [pointer])?;
+        assert_selected(&restored, &selected, &abandoned, "restored selection")?;
+    }
+    drop(db);
+
     let archived = restored
         .join("archived_sessions")
         .join(name)
@@ -375,5 +386,93 @@ fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<(
         fs::read_to_string(&saved)?,
         rollout("different original selection")
     );
+    Ok(())
+}
+
+#[test]
+fn switching_the_configured_state_database_selects_its_current_generation() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let day = home.join("sessions/2026/01/01");
+    fs::create_dir_all(&day)?;
+    for (directory, generation, date, text) in [
+        ("configured", SELECTED, "01", "configured history"),
+        (".", ABANDONED, "02", "default history"),
+    ] {
+        let name = format!("rollout-2026-01-{date}T00-00-00-{THREAD}_{generation}.jsonl");
+        let path = day.join(name);
+        fs::write(&path, rollout(text))?;
+        let db_dir = home.join(directory);
+        fs::create_dir_all(&db_dir)?;
+        let db = rusqlite::Connection::open(db_dir.join("state_5.sqlite"))?;
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )?;
+        db.execute(
+            "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+            [THREAD, path.to_str().unwrap()],
+        )?;
+    }
+    let adapter = CodexAdapter::with_root(home);
+    let config = home.join("config.toml");
+    for (setting, expected) in [
+        ("sqlite_home = 'absent/../configured'", "configured history"),
+        ("[unrelated]\nsqlite_home = 'configured'", "default history"),
+    ] {
+        fs::write(&config, setting)?;
+        let snapshot = adapter.read_session(&session)?;
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["text"] == expected)
+        );
+    }
+    let repo = home.join("project");
+    let project_settings = repo.join(".codex");
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested)?;
+    fs::create_dir_all(&project_settings)?;
+    fs::create_dir_all(repo.join(".git"))?;
+    fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main")?;
+    fs::write(
+        project_settings.join("config.toml"),
+        "sqlite_home = '../..'",
+    )?;
+    for (trust, agrees) in [("untrusted", true), ("trusted", false)] {
+        fs::write(
+            &config,
+            format!(
+                "sqlite_home = 'configured'\n[projects.{}]\ntrust_level = '{trust}'",
+                serde_json::to_string(&repo)?
+            ),
+        )?;
+        assert_eq!(
+            adapter.native_selects_session_at(
+                &session,
+                &nested,
+                &omnis_adapters::CodexLaunchOverrides::default()
+            )?,
+            agrees
+        );
+    }
+    let selected = day.join(format!(
+        "rollout-2026-01-01T00-00-00-{THREAD}_{SELECTED}.jsonl"
+    ));
+    let database = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    database.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [selected.to_str().unwrap()],
+    )?;
+    assert!(adapter.native_selects_session_at(
+        &session,
+        &nested,
+        &omnis_adapters::CodexLaunchOverrides::default()
+    )?);
+
+    fs::write(config, "sqlite_home = 1234")?;
+    let error = adapter.read_session(&session).unwrap_err();
+    assert!(format!("{error:#}").contains("sqlite_home"));
     Ok(())
 }

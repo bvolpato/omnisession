@@ -10,12 +10,13 @@ use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use tempfile::{NamedTempFile, TempPath};
 
-use super::rollout_identity::{rollout_id, visit_rollouts};
+use super::rollout_identity::{Inventory, rollout_id, visit_rollouts};
 
 #[derive(Default)]
 pub(super) struct AncestorPaths {
     paths: HashMap<String, Vec<PathBuf>>,
     overflow: Option<TempPath>,
+    inventory: Inventory,
 }
 
 impl AncestorPaths {
@@ -23,7 +24,7 @@ impl AncestorPaths {
         let mut result = Self::default();
         let mut writer = None;
         let mut retained = 0;
-        visit_rollouts(home, |path| {
+        result.inventory = visit_rollouts(home, |path| {
             let Some(id) = rollout_id(path) else {
                 return Ok(());
             };
@@ -65,7 +66,11 @@ impl AncestorPaths {
         Ok(result)
     }
 
-    pub(super) fn visit(&self, id: &str, mut each: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    pub(super) fn visit(
+        &self,
+        id: &str,
+        mut each: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<Inventory> {
         for path in self.paths.get(id).into_iter().flatten() {
             each(path)?;
         }
@@ -83,6 +88,6 @@ impl AncestorPaths {
                 }
             }
         }
-        Ok(())
+        Ok(self.inventory)
     }
 }

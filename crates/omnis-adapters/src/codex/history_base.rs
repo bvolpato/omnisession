@@ -1,6 +1,7 @@
 //! Reads the immutable prefixes that Codex records in paginated fork and revert rollouts.
 
 mod copies;
+mod observed;
 
 use std::{
     collections::HashSet,
@@ -34,15 +35,37 @@ pub(super) struct Position {
 }
 
 impl Position {
-    fn source_start(self, header: &Value) -> Result<u64> {
-        let start = header["ordinal"]
-            .as_u64()
-            .context("missing Codex source ordinal")?;
+    fn source_header(
+        self,
+        adapter: &CodexAdapter,
+        catalog: Option<&RolloutCatalog<'_>>,
+    ) -> Result<Option<(PathBuf, Value)>> {
+        let Some(path) = adapter.rollout_path_in(
+            &self.thread_id.to_string(),
+            rollout_identity::IdKind::Rollout,
+            catalog,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let header = rollout_file::header(&path)?
+            .into_iter()
+            .next()
+            .context("missing Codex source rollout header")?;
+        Ok(Some((path, header)))
+    }
+
+    fn source_start(self, header: &Value) -> Result<Option<u64>> {
+        let Some(ordinal) = header.get("ordinal") else {
+            return Ok(None);
+        };
+        let start = ordinal.as_u64().context("invalid Codex source ordinal")?;
         ensure!(
             start < self.end_ordinal_exclusive,
             "Codex history_base cutoff precedes the source header"
         );
-        Ok(start)
+        Ok(Some(start))
     }
 }
 
@@ -114,20 +137,35 @@ impl HistoryBase {
         !matches!(self, Self::None)
     }
 
+    pub(super) fn leaf_only(
+        self,
+        leaf: &Path,
+        scope: HistoryScope,
+        subagent_start: Option<u64>,
+    ) -> Result<Lineage> {
+        Ok(Lineage {
+            visible_leaf_start: self.visible_start(leaf, scope, subagent_start, None)?,
+            ..Lineage::default()
+        })
+    }
+
     pub(super) fn resolve(
         mut self,
         leaf: &Path,
         scope: HistoryScope,
         subagent_start: Option<u64>,
-        find: impl Fn(&str) -> Result<Option<PathBuf>>,
+        adapter: &CodexAdapter,
+        catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Lineage> {
-        let visible_leaf_start = self.visible_start(leaf, scope, subagent_start, None)?;
+        let leaf_only = self.leaf_only(leaf, scope, subagent_start)?;
         if !self.is_some() {
-            return Ok(Lineage {
-                visible_leaf_start,
-                ..Lineage::default()
-            });
+            return Ok(leaf_only);
         }
+        let home = adapter
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        let fallback = std::cell::OnceCell::new();
         let mut seen = HashSet::from([rollout_identity::rollout_id(leaf)
             .and_then(|id| Uuid::parse_str(id).ok())
             .context("invalid Codex rollout ID")?]);
@@ -149,15 +187,15 @@ impl HistoryBase {
                 break Some("Codex inherited history exceeds the read limit");
             }
             budget -= pos.end_byte_offset;
-            let source = find(&pos.thread_id.to_string()).and_then(|path| {
-                path.map(|path| rollout_file::header(&path).map(|header| (path, header)))
-                    .transpose()
-            });
-            let (path, records) = match source {
+            let (path, meta) = match pos.source_header(adapter, catalog) {
                 Ok(Some(source)) => source,
                 Ok(None) => {
                     missing_rollout = Some(pos.thread_id);
                     break Some("Codex referenced an unavailable source rollout");
+                }
+                Err(error) if error.is::<rollout_identity::InaccessibleInventory>() => {
+                    missing_rollout = Some(pos.thread_id);
+                    break Some("Codex could not search all directories for a referenced rollout");
                 }
                 Err(error) if error.is::<rollout_file::CompressedHeaderError>() => {
                     missing_rollout = Some(pos.thread_id);
@@ -165,9 +203,6 @@ impl HistoryBase {
                 }
                 Err(error) => return Err(error),
             };
-            let meta = records
-                .first()
-                .context("missing Codex source rollout header")?;
             ensure!(
                 meta["type"] == "session_meta"
                     && meta["payload"]["id"].as_str() == rollout_identity::thread_id(&path),
@@ -183,35 +218,35 @@ impl HistoryBase {
                     "Codex cannot load an inherited rollout without a string creation directory",
                 );
             }
-            self = Self::from_header(&path, meta);
-            let start = pos.source_start(meta)?;
-            let subagent = subagent_history_start(meta);
-            let visibility = self.visible_start(&path, scope, subagent, Some(pos.end_byte_offset));
-            let visible_start = match visibility {
-                Ok(start) => Some(start),
-                Err(error) if rollout_file::compressed(&path) && error.is::<std::io::Error>() => {
-                    None
-                }
-                Err(error) => return Err(error),
+            let mut segment = Segment::from_header(&path, &meta, pos, scope)?;
+            if segment.is_none() && scope == HistoryScope::Visible {
+                let catalog = catalog.unwrap_or_else(|| {
+                    fallback.get_or_init(|| adapter.selector.listing(home, std::iter::empty()))
+                });
+                segment =
+                    copies::verified_copy(home, catalog, &path, pos, &mut budget, |alternate| {
+                        let records = rollout_file::header(alternate)?;
+                        match records.first() {
+                            Some(header) => Segment::from_header(alternate, header, pos, scope),
+                            None => Ok(None),
+                        }
+                    })?;
+            }
+            let Some(segment) = segment else {
+                missing_rollout = Some(pos.thread_id);
+                break Some("Codex referenced a source header without a verifiable ordinal");
             };
-            segments.push(Segment {
-                visible_start,
-                subagent,
-                verified_revision: None,
-                path,
-                start,
-                position: pos,
-                base: self,
-            });
+            self = segment.base;
+            segments.push(segment);
         };
 
         segments.reverse();
         Ok(Lineage {
             segments,
             first_available: 0,
-            visible_leaf_start,
             missing_rollout,
             unavailable,
+            ..leaf_only
         })
     }
 
@@ -306,6 +341,34 @@ struct Segment {
 }
 
 impl Segment {
+    fn from_header(
+        path: &Path,
+        header: &Value,
+        position: Position,
+        scope: HistoryScope,
+    ) -> Result<Option<Self>> {
+        let Some(start) = position.source_start(header)? else {
+            return Ok(None);
+        };
+        let base = HistoryBase::from_header(path, header);
+        let subagent = subagent_history_start(header);
+        let visibility = base.visible_start(path, scope, subagent, Some(position.end_byte_offset));
+        let visible_start = match visibility {
+            Ok(start) => Some(start),
+            Err(error) if rollout_file::compressed(path) && error.is::<std::io::Error>() => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Some(Self {
+            visible_start,
+            subagent,
+            verified_revision: None,
+            path: path.to_owned(),
+            start,
+            position,
+            base,
+        }))
+    }
+
     fn record_ordinal(&self, record: &Value, expected: u64) -> Result<u64> {
         let ordinal = record["ordinal"]
             .as_u64()
@@ -387,7 +450,9 @@ impl Lineage {
         let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         // Only segments newer than an unrecoverable gap can contribute to the projection.
         for &(index, reason) in damage.0.iter().rev() {
-            if let Some(verified) = self.segments[index].verified_copy(home, catalog, &mut budget) {
+            if let Some(verified) =
+                self.segments[index].verified_copy(home, catalog, &mut budget)?
+            {
                 self.segments[index] = verified;
             } else {
                 self.first_available = index + 1;
@@ -565,6 +630,10 @@ fn read_prefix_from(
                 ));
             }
         };
+        ensure!(
+            malformed || next < position.end_ordinal_exclusive,
+            "Codex history_base byte and ordinal cutoffs disagree"
+        );
         match kind {
             BoundedLine::Oversized => {
                 ensure!(next > start, "Codex history_base source header changed");
@@ -572,10 +641,6 @@ fn read_prefix_from(
                     remaining -= length;
                     continue;
                 }
-                ensure!(
-                    next < position.end_ordinal_exclusive,
-                    "Codex history_base byte and ordinal cutoffs disagree"
-                );
                 skipped += 1;
             }
             BoundedLine::Complete => {
@@ -604,10 +669,6 @@ fn read_prefix_from(
                     );
                     next = ordinal;
                 } else {
-                    ensure!(
-                        next < position.end_ordinal_exclusive,
-                        "Codex history_base byte and ordinal cutoffs disagree"
-                    );
                     next = segment.record_ordinal(&record, next)?;
                 }
                 if !malformed

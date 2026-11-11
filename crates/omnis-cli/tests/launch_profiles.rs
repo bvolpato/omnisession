@@ -1133,6 +1133,79 @@ fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
 }
 
 #[test]
+fn codex_profile_forks_the_displayed_rollout_when_its_state_database_changes() {
+    let fixture = fixture_with_codex_session(
+        r#"[profiles.routed]
+agent = "codex"
+[profiles.routed.env]
+CODEX_SQLITE_HOME = "${ROOT}/alternate-state"
+"#,
+        "openai",
+    );
+    fixture.executable("bin/codex", "#!/bin/sh\necho 'codex-cli 0.167.1'\n");
+    let home = fixture.root.join("codex");
+    let alternate = fixture.root.join("alternate-state");
+    fs::create_dir(&alternate).unwrap();
+    let file = |day| {
+        home.join("sessions").join(format!(
+            "rollout-2026-01-{day:02}T00-00-00-{CODEX_SESSION_ID}.jsonl"
+        ))
+    };
+    let selected = file(1);
+    let other = file(2);
+    let header = fs::read_to_string(&selected).unwrap();
+    for (path, text) in [
+        (&selected, "Keep the visible draft"),
+        (&other, "Other branch"),
+    ] {
+        let row = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]}});
+        fs::write(path, format!("{header}\n{row}\n")).unwrap();
+    }
+    for directory in [&home, &alternate] {
+        let db = rusqlite::Connection::open(directory.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+            (CODEX_SESSION_ID, selected.to_str().unwrap()),
+        )
+        .unwrap();
+    }
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let fork = ["fork", &source, "--in", "routed", "--dry-run"];
+    let original = [
+        "resume",
+        &source,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--dry-run",
+    ];
+    assert_eq!(
+        codex_plan(&fixture, &fork)["fidelity"]["mode"],
+        "native_fork"
+    );
+    assert!(codex_run(&fixture, &original).status.success());
+
+    rusqlite::Connection::open(alternate.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [other.to_str().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        codex_plan(&fixture, &fork)["fidelity"]["mode"],
+        "native_materialization"
+    );
+    let rejected = codex_run(&fixture, &original);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains(&format!("omni fork {source}")));
+}
+
+#[test]
 fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
     let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");
     let source = format!("codex:{CODEX_SESSION_ID}");

@@ -106,6 +106,14 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// State database settings that a Codex launch profile supplies.
+#[derive(Debug, Default)]
+pub struct CodexLaunchOverrides {
+    pub profile: Option<String>,
+    pub sqlite_home: Option<PathBuf>,
+    pub environment: Option<EnvChange>,
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
@@ -159,6 +167,20 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error if the adapter cannot identify the source representation.
     fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
         Ok(NativeResumeSupport::Direct)
+    }
+
+    /// Checks whether a native launch in this directory selects the displayed session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot resolve the launch configuration.
+    fn native_selects_session_at(
+        &self,
+        _session: &SessionRef,
+        _cwd: &Path,
+        _overrides: &CodexLaunchOverrides,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
     /// Non-fatal discovery observations from this adapter.

@@ -36,6 +36,7 @@ use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 use rollout_identity::{IdKind, RolloutCatalog, RolloutSelector};
 
 const SCAN_LIMIT: usize = 10_000;
+const SCAN_DEPTH: usize = 5;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
@@ -49,6 +50,7 @@ struct CodexFileScan {
     files: Vec<PathBuf>,
     ids: OnceLock<HashMap<String, Vec<usize>>>,
     notes: Vec<String>,
+    skipped_directories: bool,
 }
 
 type SharedScan = Arc<Mutex<Option<Arc<CodexFileScan>>>>;
@@ -697,7 +699,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let collect_limit = limit.saturating_add(1);
     collect_jsonl(
         &home.join("sessions"),
-        5,
+        SCAN_DEPTH,
         &mut files,
         collect_limit,
         &mut unreadable_dirs,
@@ -706,7 +708,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     if files.len() <= limit {
         collect_jsonl(
             &home.join("archived_sessions"),
-            5,
+            SCAN_DEPTH,
             &mut files,
             collect_limit,
             &mut unreadable_dirs,
@@ -734,6 +736,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     CodexFileScan {
         files,
         notes,
+        skipped_directories: unreadable_dirs > 0 || depth_limited_dirs > 0,
         ..Default::default()
     }
 }
@@ -1066,18 +1069,20 @@ impl CodexSession {
         scope: HistoryScope,
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Lineage> {
-        self.history_base
-            .resolve(&self.path, scope, self.subagent_history_start, |id| {
-                adapter.rollout_path_in(id, IdKind::Rollout, catalog, None)
-            })
+        self.history_base.resolve(
+            &self.path,
+            scope,
+            self.subagent_history_start,
+            adapter,
+            catalog,
+        )
     }
 
     fn withdrew_search_title(&self, prior_title: &str) -> Result<bool> {
-        let lineage = self.history_base.resolve(
+        let lineage = self.history_base.leaf_only(
             &self.path,
             HistoryScope::Visible,
             self.subagent_history_start,
-            |_| Ok(None),
         )?;
         let mut supported = true;
         let mut first = true;
@@ -2182,6 +2187,15 @@ impl ProviderAdapter for CodexAdapter {
         Ok(Some(session.native_session()))
     }
 
+    fn native_selects_session_at(
+        &self,
+        session: &SessionRef,
+        cwd: &Path,
+        overrides: &crate::CodexLaunchOverrides,
+    ) -> Result<bool> {
+        self.selected_state_agrees_at(cwd, session, overrides)
+    }
+
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Codex)?;
         Uuid::parse_str(&session.id).context("Codex session ID must be a UUID")?;
@@ -2525,6 +2539,7 @@ mod tests {
     fn listing_notes_describe_empty_and_partial_scans() {
         let scan = CodexFileScan {
             ids: OnceLock::new(),
+            skipped_directories: false,
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
