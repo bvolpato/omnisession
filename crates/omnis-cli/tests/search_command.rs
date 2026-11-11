@@ -660,6 +660,70 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
 }
 
 #[test]
+fn grok_partial_export_recovers_explicitly_owned_turns_after_a_foreign_log() {
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let replacement = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&replacement).unwrap();
+    let update = |owner: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"user_message_chunk","content":{"type":"text","text":"violetcedar"}
+        }}})
+    };
+    let partial = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2});
+    fs::write(replacement.join("summary.json"), partial.to_string()).unwrap();
+    write_jsonl(
+        &replacement.join("updates.jsonl"),
+        &[update("22222222-2222-4222-8222-222222222222")],
+    );
+    let rejected = fixture
+        .command()
+        .args(["show", &reference])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("different session ID")
+    );
+    write_jsonl(
+        &replacement.join("updates.jsonl"),
+        &[update(id), json!({"params":{"sessionId":id}})],
+    );
+    let shown = fixture
+        .command()
+        .args(["--json", "show", &reference])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["payload"]["omitted_events"] == 1)
+    );
+    let markdown = fixture
+        .command()
+        .args(["markdown", &reference])
+        .output()
+        .unwrap();
+    assert!(markdown.status.success());
+    assert!(
+        String::from_utf8(markdown.stdout)
+            .unwrap()
+            .contains("violetcedar")
+    );
+    assert_eq!(
+        result_sessions(&fixture.search_json(&["violetcedar", "--cached", "--provider", "grok"])),
+        [reference.as_str()]
+    );
+}
+
+#[test]
 fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
     let fixture = Fixture::new();
     let id = "11111111-2222-4333-8444-555555555555";

@@ -178,12 +178,26 @@ impl GrokAdapter {
         );
         let directory = summary.parent().context(stale)?;
         let path = provider_file(directory, &directory.join("updates.jsonl")).context(stale)?;
-        let ownership = native_update_headers(&path, &session.id, 0, true);
+        let ownership = scan_update_headers(&path, |line| {
+            #[derive(Deserialize)]
+            struct OwnerHeader {
+                params: Option<UpdateParams>,
+            }
+            let owner = serde_json::from_slice::<OwnerHeader>(line)
+                .ok()
+                .and_then(|header| header.params?.session_id);
+            if let Some(owner) = owner {
+                anyhow::ensure!(owner == session.id, GrokHistoryError::ForeignOwner);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        });
         anyhow::ensure!(Self::updates_revision(summary) == Some(log), stale);
         let result = ownership
             .map_err(|cause| checked_history_error(cause, selection, Some(log), updated_at))?;
         anyhow::ensure!(
-            result == NativeResumeSupport::Direct,
+            result.is_some(),
             "cannot verify the owner of every Grok update"
         );
         Ok(())
@@ -314,7 +328,7 @@ impl GrokAdapter {
         {
             return Ok(checked.support);
         }
-        let support = native_update_headers(&updates, id, expected_updates, false);
+        let support = native_update_headers(&updates, id, expected_updates);
         anyhow::ensure!(
             SnapshotFileStamp::read(&updates)? == before,
             "selected Grok source changed during native ownership verification"
@@ -443,7 +457,8 @@ impl GrokAdapter {
         let mut observed = 0_u64;
         let mut sampled = false;
         let mut omissions = JsonLineSkips::default();
-        if let Some(file) = provider_file(root, &directory.join("updates.jsonl")) {
+        let log = provider_file(root, &directory.join("updates.jsonl"));
+        if let Some(file) = &log {
             let mut push = |record: Value| -> Result<()> {
                 // Grok rekeys inherited ACP updates when it creates a native fork.
                 anyhow::ensure!(
@@ -465,13 +480,13 @@ impl GrokAdapter {
             };
             if full {
                 omissions = visit_json_lines_with_omissions(
-                    &file,
+                    file,
                     MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
                     push,
                 )?;
             } else {
                 let preview = json_lines_preview_with_omissions(
-                    &file,
+                    file,
                     SAMPLE_RECORDS,
                     MAX_PREVIEW_TAIL_SIZE,
                     MAX_TRANSCRIPT_LINE_SIZE,
@@ -513,7 +528,16 @@ impl GrokAdapter {
             metadata.title.clone(),
             metadata.project_path.clone(),
             metadata.git_branch.clone(),
-            metadata.updated_at.unwrap_or_else(Utc::now),
+            metadata
+                .updated_at
+                .or_else(|| {
+                    fs::metadata(log.as_deref().unwrap_or(path))
+                        .ok()?
+                        .modified()
+                        .ok()
+                        .map(Into::into)
+                })
+                .unwrap_or_else(Utc::now),
         ))
     }
 }
@@ -584,8 +608,43 @@ fn native_update_headers(
     path: &Path,
     id: &str,
     expected_updates: u64,
-    require_explicit_owner: bool,
 ) -> Result<NativeResumeSupport> {
+    let Some(observed) = scan_update_headers(path, |line| {
+        let Ok(header) = serde_json::from_slice::<UpdateHeader>(line) else {
+            return Ok(false);
+        };
+        if let Some(owner) = header
+            .params
+            .as_ref()
+            .and_then(|params| params.session_id.as_deref())
+        {
+            anyhow::ensure!(owner == id, GrokHistoryError::ForeignOwner);
+        }
+        if header.legacy_kind.is_none()
+            && header.params.is_none_or(|params| params.update.is_none())
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    })?
+    else {
+        return Ok(NativeResumeSupport::ImportOnly);
+    };
+    anyhow::ensure!(
+        observed > 0 || expected_updates == 0,
+        "Grok session `{id}` declares history but has no readable updates"
+    );
+    Ok(if observed < expected_updates {
+        NativeResumeSupport::ImportOnly
+    } else {
+        NativeResumeSupport::Direct
+    })
+}
+
+fn scan_update_headers(
+    path: &Path,
+    mut accepts: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<Option<u64>> {
     let file = fs::File::open(path)?;
     let bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file.take(bytes));
@@ -601,39 +660,17 @@ fn native_update_headers(
             break;
         }
         if size as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
-            return Ok(NativeResumeSupport::ImportOnly);
+            return Ok(None);
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(header) = serde_json::from_slice::<UpdateHeader>(&line) else {
-            return Ok(NativeResumeSupport::ImportOnly);
-        };
-        if let Some(owner) = header
-            .params
-            .as_ref()
-            .and_then(|params| params.session_id.as_deref())
-        {
-            anyhow::ensure!(owner == id, GrokHistoryError::ForeignOwner);
-        } else if require_explicit_owner {
-            return Ok(NativeResumeSupport::ImportOnly);
-        }
-        if header.legacy_kind.is_none()
-            && header.params.is_none_or(|params| params.update.is_none())
-        {
-            return Ok(NativeResumeSupport::ImportOnly);
+        if !accepts(&line)? {
+            return Ok(None);
         }
         observed += 1;
     }
-    anyhow::ensure!(
-        observed > 0 || expected_updates == 0,
-        "Grok session `{id}` declares history but has no readable updates"
-    );
-    Ok(if observed < expected_updates {
-        NativeResumeSupport::ImportOnly
-    } else {
-        NativeResumeSupport::Direct
-    })
+    Ok(Some(observed))
 }
 
 fn path_id(path: &Path) -> Uuid {
@@ -1770,6 +1807,11 @@ mod tests {
         let log = directory.join("updates.jsonl");
         let adapter = GrokAdapter::with_root(root.path());
         let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        let captured_at = DateTime::<Utc>::from(log.metadata().unwrap().modified().unwrap());
+        assert_eq!(
+            adapter.preview_session(&session).unwrap().captured_at,
+            captured_at
+        );
         let snapshot = adapter.read_session(&session).unwrap();
         assert!(
             snapshot
