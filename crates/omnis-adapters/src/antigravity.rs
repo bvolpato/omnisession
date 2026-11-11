@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -125,6 +124,13 @@ impl AntigravityAdapter {
             None,
             captured_at,
         );
+        if snapshot.events.is_empty() {
+            let root = self.root()?;
+            self.summaries
+                .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
+                    catalog.verify_empty_wal()
+                })?;
+        }
         if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
             ensure!(
                 summary.step_count == Some(0) && (!transcript || fs::metadata(&path)?.len() == 0),
@@ -220,6 +226,18 @@ impl ProviderAdapter for AntigravityAdapter {
                 event_count: summary.step_count.unwrap_or(0),
                 source_path,
             });
+        }
+        drop(statement);
+        let catalog_only = |session: &NativeSession| {
+            session
+                .source_path
+                .as_deref()
+                .is_some_and(Self::is_summary_catalog)
+        };
+        if sessions.iter().any(catalog_only) && snapshot.verify_empty_wal().is_err() {
+            for session in sessions.iter_mut().filter(|session| catalog_only(session)) {
+                session.source_path = None;
+            }
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -374,48 +392,11 @@ fn verify_missing_history(path: &Path, root: &Path) -> Result<()> {
 
 fn verify_snapshot_sidecars(database: &Path, root: &Path) -> Result<()> {
     let wal = sidecar(database, "-wal");
-    if let Some(wal) = provider_file(root, &wal) {
-        let mut file = fs::File::open(wal)?;
-        if file.metadata()?.len() != 0 {
-            let mut header = [0; 32];
-            file.read_exact(&mut header)
-                .context("Antigravity SQLite WAL header is incomplete")?;
-            ensure!(
-                valid_wal_header(&header),
-                "Antigravity SQLite WAL header is invalid"
-            );
-        }
-    } else {
+    if provider_file(root, &wal).is_none() {
         verify_missing(&wal, root)?;
     }
     // The private SQLite snapshot copies the database and its WAL.
     verify_missing(&sidecar(database, "-journal"), root)
-}
-
-// SQLite ignores a damaged WAL header and can expose an older, empty checkpoint.
-// The header checksum is defined at https://www.sqlite.org/fileformat2.html#wal_file_format.
-fn valid_wal_header(header: &[u8; 32]) -> bool {
-    let (words, _) = header.as_chunks::<4>();
-    let magic = u32::from_be_bytes(words[0]);
-    let page_size = u32::from_be_bytes(words[2]);
-    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
-        || u32::from_be_bytes(words[1]) != 3_007_000
-        || !(512..=65_536).contains(&page_size)
-        || !page_size.is_power_of_two()
-    {
-        return false;
-    }
-    let read = if magic == 0x377f_0682 {
-        u32::from_le_bytes
-    } else {
-        u32::from_be_bytes
-    };
-    let (mut first, mut second) = (0_u32, 0_u32);
-    for &[a, b] in words[..6].as_chunks::<2>().0 {
-        first = first.wrapping_add(read(a)).wrapping_add(second);
-        second = second.wrapping_add(read(b)).wrapping_add(first);
-    }
-    first.to_be_bytes() == words[6] && second.to_be_bytes() == words[7]
 }
 
 /// A missing file can inherit its error from a dangling or inaccessible parent directory.
@@ -710,6 +691,9 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
+    if stored == 0 {
+        snapshot.verify_empty_wal()?;
+    }
     let mut statement = snapshot
         .connection
         .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;

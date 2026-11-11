@@ -135,6 +135,45 @@ fn only_a_verified_zero_can_stand_in_for_missing_history() {
 }
 
 #[test]
+fn a_damaged_wal_commit_cannot_restore_an_older_zero_step_summary() {
+    let source = tempdir().unwrap();
+    summary_database(source.path(), source.path());
+    let database = source.path().join("conversation_summaries.db");
+    let wal_path = source.path().join("conversation_summaries.db-wal");
+    let writer = Connection::open(&database).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             UPDATE conversation_summaries SET step_count=0;",
+        )
+        .unwrap();
+    let zero = fs::read(&wal_path).unwrap();
+    writer
+        .execute("UPDATE conversation_summaries SET step_count=1", [])
+        .unwrap();
+    let mut damaged = fs::read(&wal_path).unwrap();
+    assert!(damaged.len() > zero.len());
+    *damaged.last_mut().unwrap() ^= 1;
+    let short = &damaged[..damaged.len() - 1];
+
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    for (wal, verified) in [(zero.as_slice(), true), (short, false), (&damaged, false)] {
+        let root = tempdir().unwrap();
+        fs::copy(&database, root.path().join("conversation_summaries.db")).unwrap();
+        fs::write(root.path().join("conversation_summaries.db-wal"), wal).unwrap();
+        let adapter = AntigravityAdapter::with_root(root.path());
+        let listed = adapter.list_sessions(None).unwrap();
+        assert_eq!(listed[0].source_path.is_some(), verified);
+        let read = adapter.read_session(&session);
+        if verified {
+            assert!(read.unwrap().events.is_empty());
+        } else {
+            assert!(read.is_err());
+        }
+    }
+}
+
+#[test]
 fn empty_or_malformed_preferred_logs_cannot_hide_another_history_file() {
     let root = tempdir().unwrap();
     summary_database(root.path(), root.path());

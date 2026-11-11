@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
@@ -445,7 +446,25 @@ pub(crate) fn store_is_missing(path: &Path) -> bool {
 #[derive(Debug)]
 pub(crate) struct SqliteSnapshot {
     pub(crate) connection: Connection,
-    _directory: TempDir,
+    directory: TempDir,
+    verified_wal: OnceCell<Result<(), String>>,
+}
+
+impl SqliteSnapshot {
+    /// Call after the query finishes so SQLite can report its recovered commit boundary.
+    pub(crate) fn verify_empty_wal(&self) -> Result<()> {
+        let verified = self.verified_wal.get_or_init(|| {
+            crate::sqlite_wal::verify(
+                &self.connection,
+                &self.directory.path().join("snapshot.sqlite-wal"),
+            )
+            .map_err(|error| error.to_string())
+        });
+        verified
+            .as_ref()
+            .copied()
+            .map_err(|message| crate::UnverifiedSqliteWal(message.clone()).into())
+    }
 }
 
 /// Bounds for the private copy a `SQLite` snapshot makes.
@@ -551,12 +570,21 @@ impl SqliteSnapshotCache {
         database: &Path,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        self.read_snapshot(root, database, |snapshot| read(&snapshot.connection))
+    }
+
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        root: &Path,
+        database: &Path,
+        read: impl FnOnce(&SqliteSnapshot) -> Result<T>,
+    ) -> Result<T> {
         let database = provider_file(root, database)
             .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
         let limits = SnapshotLimits::from_environment()?;
         // Unix change time detects same-size rewrites that preserve modification time.
         if !cfg!(unix) {
-            return read(&sqlite_snapshot_with_limits(root, &database, limits)?.connection);
+            return read(&sqlite_snapshot_with_limits(root, &database, limits)?);
         }
         let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..3 {
@@ -565,14 +593,14 @@ impl SqliteSnapshotCache {
                 .as_ref()
                 .filter(|cached| cached.database == database && cached.stamp == stamp)
             {
-                return read(&snapshot.snapshot.connection);
+                return read(&snapshot.snapshot);
             }
             *cached = None;
             let snapshot = sqlite_snapshot_with_limits(root, &database, limits)?;
             if stamp != SnapshotStamp::read(root, &database, limits.max_bytes)? {
                 continue;
             }
-            let result = read(&snapshot.connection);
+            let result = read(&snapshot);
             *cached = Some(CachedSnapshot {
                 database,
                 stamp,
@@ -668,7 +696,8 @@ fn sqlite_snapshot_with_limits(
         connection.pragma_update(None, "query_only", "ON")?;
         return Ok(SqliteSnapshot {
             connection,
-            _directory: directory,
+            directory,
+            verified_wal: OnceCell::new(),
         });
     }
     Err(anyhow!("provider database changed during snapshot"))

@@ -210,11 +210,10 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
         })
 }
 
-/// Whether a read failed only because a database was busy or a source changed while it was read,
-/// so a later pass can succeed even when the source time does not move.
+/// Whether a later read can succeed even if the provider's session time stays the same.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
+        cause.is::<omnis_adapters::UnverifiedSqliteWal>() || cause
             .downcast_ref::<rusqlite::Error>()
             .and_then(rusqlite::Error::sqlite_error_code)
             .is_some_and(|code| {
