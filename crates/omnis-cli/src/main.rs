@@ -236,19 +236,12 @@ fn store_search_document(
                 .and_then(omnis_adapters::source_file_revision)
                 .is_some_and(|current| expected.matches_file_contents(current))
         };
-        if full_read {
-            store.upsert_verified_session_document_checked(
-                &indexed_session_metadata(native),
-                document,
-                guard,
-                verify,
-            )?
-        } else {
-            store.upsert_observed_trajectory_documents_checked(
-                &[(session, document, guard)],
-                verify,
-            )?
-        }
+        store.upsert_verified_session_document_checked(
+            &indexed_session_metadata(native),
+            document,
+            guard,
+            verify,
+        )?
     } else {
         store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
     };

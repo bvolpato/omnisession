@@ -1995,12 +1995,12 @@ impl Store {
             .map(TrajectorySourceGuard::Verified)
     }
 
-    /// Publishes metadata from a full native read in the same transaction as its search document.
+    /// Publishes the native catalog and search document from the same selected source.
     /// Returns the number of search documents rewritten.
     ///
     /// # Errors
     ///
-    /// Returns an error when the read was partial, the observed state changed, or a write failed.
+    /// Returns an error if a preview lacks a file revision, the observed state changed, or a write failed.
     pub fn upsert_verified_session_document(
         &self,
         metadata: &IndexedSession,
@@ -2026,7 +2026,8 @@ impl Store {
             || !matches!(guard, TrajectorySourceGuard::Verified(_))
             || document.origin != SessionTrajectoryOrigin::Native
             || !(document.source_complete
-                || (document.provider_limited && document.source_revision.contents.is_some()))
+                || (document.source_revision.file.is_some()
+                    && document.source_revision.contents.is_some()))
             || metadata.source_revision.unwrap_or_default().file != document.source_revision.file
             || metadata.source_revision.unwrap_or_default().contents
                 != document.source_revision.contents
@@ -2128,7 +2129,9 @@ impl Store {
                         source_submillis(write.session.provider, write.document.source_updated_at),
                         write.document.provider_limited,
                         write.document.can_clear_derived_title(),
-                        verified_metadata.is_some() || write.observed_full_source(),
+                        (verified_metadata.is_some()
+                            && (write.source_complete || write.document.provider_limited))
+                            || write.observed_full_source(),
                         revision.file.map(Uuid::into_bytes),
                         revision.missing_ancestor.map(Uuid::into_bytes),
                         revision.contents.map(Uuid::into_bytes),
@@ -2140,6 +2143,11 @@ impl Store {
                 .map_err(database_error)?;
             if let Some(metadata) = verified_metadata {
                 if trajectory_id.is_none() && !write.matches_stored(&transaction)? {
+                    if !write.source_complete && !write.document.provider_limited {
+                        // A sample can confirm the header while an earlier full read still covers more history.
+                        // Keep that document with its original catalog until a full read can update both.
+                        continue;
+                    }
                     return Err(StoreError::TrajectorySourceChanged);
                 }
                 if !matches_catalog_row(&transaction, metadata)? {
@@ -5490,18 +5498,21 @@ mod tests {
         };
         assert_eq!(write(sample), 0);
         assert_eq!(write(updated), 0);
+        let publish = |doc, guard| {
+            store
+                .upsert_verified_session_document_checked(&current, doc, guard, |_, selected| {
+                    selected == revision
+                })
+                .unwrap()
+        };
+        let paired = store.observe_verified_session(session).unwrap();
+        assert_eq!(publish(sample, paired), 0);
+        assert!(hit("archivedmiddle"));
         assert_eq!(
             store.indexed_sessions().unwrap(),
             std::slice::from_ref(&old)
         );
-        assert!(hit("archivedmiddle"));
-
-        let paired = store.observe_verified_session(session).unwrap();
-        store
-            .upsert_verified_session_document_checked(&current, updated, paired, |_, r| {
-                r == revision
-            })
-            .unwrap();
+        assert_eq!(publish(updated, paired), 1);
         assert_eq!(
             store.indexed_sessions().unwrap(),
             std::slice::from_ref(&current)
@@ -5536,14 +5547,7 @@ mod tests {
             .unwrap();
         store.upsert_indexed_session(&current).unwrap();
         assert!(!hit("freshsource"));
-        store
-            .upsert_verified_session_document_checked(
-                &current,
-                updated,
-                store.observe_verified_session(session).unwrap(),
-                |_, r| r == revision,
-            )
-            .unwrap();
+        publish(updated, store.observe_verified_session(session).unwrap());
         assert!(store.trajectory_index_failures().unwrap().is_empty());
         assert!(hit("freshsource"));
     }

@@ -811,14 +811,15 @@ impl ResumeContext<'_> {
     }
 
     fn save_handoff_after_failure(&self) {
-        if self.source.provider == self.target || self.args.dry_run || self.json_output {
+        if self.args.dry_run || self.json_output {
             return;
         }
         // If the submitted history has a handoff link, the surviving session needs that exact file.
-        let file = self
-            .recovery_file
-            .take()
-            .map_or_else(|| write_temp_handoff(self.snapshot, None), Ok);
+        let file = match self.recovery_file.take() {
+            Some(file) => Ok(file),
+            None if self.source.provider != self.target => write_temp_handoff(self.snapshot, None),
+            None => return,
+        };
         match file {
             Ok(file) => crate::recovery::keep_handoff(file),
             Err(error) => {

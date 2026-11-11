@@ -844,10 +844,7 @@ fn prepare_session(
         previous_failure: None,
         verified_metadata: native_session
             .as_ref()
-            .filter(|_| {
-                (source_complete || provider_limited)
-                    && matches!(guard, TrajectorySourceGuard::Verified(_))
-            })
+            .filter(|_| matches!(guard, TrajectorySourceGuard::Verified(_)))
             .map(crate::indexed_session_metadata),
         candidate: selected,
         document,
@@ -1334,6 +1331,46 @@ mod tests {
         let again = index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
             .expect("reindex synthetic sessions");
         assert_eq!(again.stale, 0);
+    }
+
+    #[test]
+    fn sampled_pi_read_publishes_the_catalog_revision_with_its_search_text() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        fs::create_dir(&root)?;
+        let header = json!({"type":"session","version":3,"id":"sampled","cwd":temporary.path()});
+        let message = json!({"type":"message","id":"ask","parentId":null,
+            "message":{"role":"user","content":"sampledneedle"}});
+        fs::write(root.join("session.jsonl"), format!("{header}\n{message}\n"))?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::PiAdapter::with_root(root));
+        let store = Store::open(temporary.path().join("store.sqlite3"))?;
+        let listed = registry
+            .find_native_session(Provider::Pi, "sampled")?
+            .unwrap();
+        let catalog = crate::indexed_session_metadata(&listed);
+        let session = &listed.session;
+        store.upsert_indexed_session(&omnis_store::IndexedSession {
+            project_path: Some(temporary.path().join("previous")),
+            source_revision: None,
+            ..catalog.clone()
+        })?;
+        let candidate = IndexCandidate::from_session(&listed).unwrap();
+        let guard = store.observe_verified_session(session)?;
+        prepare_session(&registry, &candidate, guard, 0)?.store(&store)?;
+
+        let document = store.trajectory_index_state(session)?.unwrap();
+        assert!(!document.source_complete && !document.provider_limited);
+        assert_eq!(Some(document.source_revision), catalog.source_revision);
+        assert_eq!(
+            store.indexed_sessions_for_provider(Provider::Pi)?,
+            [catalog]
+        );
+        assert_eq!(
+            store.search_session_trajectories("sampledneedle", 1)?,
+            std::slice::from_ref(session)
+        );
+        Ok(())
     }
 
     #[test]

@@ -485,7 +485,7 @@ fn read_picker_preview(
     let mut retry = true;
     loop {
         let writer = store.and_then(|store| {
-            let observed = if full_read && file_backed {
+            let observed = if file_backed {
                 store.observe_verified_session(&key.session)
             } else {
                 search_index::observe_source(store, &key.session)
