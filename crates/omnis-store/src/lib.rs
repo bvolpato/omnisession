@@ -501,16 +501,22 @@ pub struct TrajectoryDocument<'a> {
     pub origin: SessionTrajectoryOrigin,
     pub document_version: u32,
     pub derived_title: Option<&'a str>,
+    /// The provider reader established the current task title even when the transcript was sampled.
+    pub title_authoritative: bool,
 }
 
 impl TrajectoryDocument<'_> {
     /// A full read can establish that a title was removed even if the text index sampled long messages.
     fn can_clear_derived_title(&self) -> bool {
-        self.source_complete
-            && matches!(
-                self.truncation_strategy,
-                "none" | "event_head_tail" | "document_head_tail" | "event_and_document_head_tail"
-            )
+        self.title_authoritative
+            || (self.source_complete
+                && matches!(
+                    self.truncation_strategy,
+                    "none"
+                        | "event_head_tail"
+                        | "document_head_tail"
+                        | "event_and_document_head_tail"
+                ))
     }
 }
 
@@ -523,6 +529,8 @@ pub enum TrajectorySourceGuard {
     Observed(Option<DateTime<Utc>>),
     /// A previous indexer recorded only the millisecond that contained the modification time.
     ObservedLegacy(DateTime<Utc>),
+    /// The document and catalog observed before opening one native session.
+    Verified([u8; 32]),
 }
 
 impl TrajectorySourceGuard {
@@ -540,6 +548,13 @@ impl TrajectorySourceGuard {
     ) -> Result<()> {
         let prior = match self {
             Self::NewerSource => return Ok(()),
+            Self::Verified(expected) => {
+                return if expected == verified_session_state(transaction, session)? {
+                    Ok(())
+                } else {
+                    Err(StoreError::TrajectorySourceChanged)
+                };
+            }
             Self::Observed(prior) => prior.map(|time| {
                 (
                     time.timestamp_millis(),
@@ -605,6 +620,133 @@ struct PreparedTrajectoryWrite<'session, 'document> {
     complete: bool,
     source_byte_count: i64,
     indexed_byte_count: i64,
+}
+
+impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
+    fn new(
+        session: &'s SessionRef,
+        document: TrajectoryDocument<'d>,
+        guard: TrajectorySourceGuard,
+        remaining_bytes: usize,
+    ) -> Result<Self> {
+        validate_session_ref(session)?;
+        if (document.source_complete && document.provider_limited)
+            || document.indexed_byte_count != document.redacted_text.len()
+            || !valid_truncation_strategy(document.truncation_strategy)
+            || !valid_trajectory_coverage(
+                document.source_byte_count,
+                document.indexed_byte_count,
+                document.truncation_strategy,
+            )
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        if document.indexed_byte_count > remaining_bytes {
+            return Err(StoreError::TrajectoryBatchTooLarge);
+        }
+        // A full read can cover a source even when the provider omitted events.
+        let source_complete =
+            document.source_complete && document.truncation_strategy != "legacy_unknown";
+        let complete = source_complete
+            && document.truncation_strategy == "none"
+            && document.source_byte_count == document.indexed_byte_count;
+        Ok(Self {
+            session,
+            content_hash: Sha256::digest(document.redacted_text.as_bytes()).to_vec(),
+            guard,
+            document,
+            source_complete,
+            complete,
+            source_byte_count: i64::try_from(document.source_byte_count)
+                .map_err(|_| StoreError::InvalidSessionReference)?,
+            indexed_byte_count: i64::try_from(document.indexed_byte_count)
+                .map_err(|_| StoreError::InvalidSessionReference)?,
+        })
+    }
+
+    fn matches_stored(&self, connection: &Connection) -> Result<bool> {
+        let doc = self.document;
+        connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM session_trajectories
+                    WHERE provider = ?1 AND session_id = ?2 AND content_hash = ?3
+                      AND source_updated_at = ?4 AND source_updated_submillis = ?5
+                      AND source_complete = ?6 AND provider_limited = ?7 AND complete = ?8
+                      AND source_byte_count = ?9 AND indexed_byte_count = ?10
+                      AND truncation_strategy = ?11 AND origin = ?12 AND document_version = ?13
+                      AND (NOT ?14 OR derived_title IS ?15)
+                )",
+                params![
+                    self.session.provider.to_string(),
+                    self.session.id,
+                    self.content_hash,
+                    doc.source_updated_at.timestamp_millis(),
+                    source_submillis(self.session.provider, doc.source_updated_at),
+                    self.source_complete,
+                    doc.provider_limited,
+                    self.complete,
+                    self.source_byte_count,
+                    self.indexed_byte_count,
+                    doc.truncation_strategy,
+                    doc.origin.as_str(),
+                    doc.document_version,
+                    doc.can_clear_derived_title() || doc.derived_title.is_some(),
+                    doc.derived_title,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+}
+
+fn verified_session_state(connection: &Connection, session: &SessionRef) -> Result<[u8; 32]> {
+    // A restored file can reuse its modification time. Observe content, coverage and catalog
+    // together so another full reader cannot restore an obsolete title or workspace.
+    let state: String = connection
+        .query_row(
+            "SELECT json_array(?1, ?2,
+                (SELECT json_array(hex(content_hash), source_updated_at, source_updated_submillis,
+                     source_complete, provider_limited, complete, source_byte_count, indexed_byte_count,
+                     truncation_strategy, origin, document_version, derived_title)
+                 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2),
+                (SELECT json_array(title, project_path, git_branch, created_at, updated_at,
+                     updated_at_approximate, event_count)
+                 FROM session_index WHERE provider = ?1 AND session_id = ?2))",
+            params![session.provider.to_string(), session.id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    Ok(Sha256::digest(state.as_bytes()).into())
+}
+
+fn matches_catalog_row(connection: &Connection, metadata: &IndexedSession) -> Result<bool> {
+    let project = metadata
+        .project_path
+        .as_deref()
+        .map(|path| path.to_str().ok_or(StoreError::InvalidWorkspaceRoot))
+        .transpose()?;
+    let event_count =
+        i64::try_from(metadata.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
+    connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_index WHERE provider = ?1 AND session_id = ?2
+         AND title IS ?3 AND project_path IS ?4 AND git_branch IS ?5 AND created_at IS ?6
+         AND updated_at IS ?7 AND updated_at_approximate = ?8 AND event_count = ?9)",
+            params![
+                metadata.session.provider.to_string(),
+                metadata.session.id,
+                metadata.title,
+                project,
+                metadata.git_branch,
+                metadata.created_at.map(|time| time.timestamp_millis()),
+                metadata.updated_at.map(|time| time.timestamp_millis()),
+                metadata.updated_at_approximate,
+                event_count
+            ],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
 }
 
 /// `SQLite`-backed state for one local `OmniSession` installation.
@@ -1115,6 +1257,28 @@ impl Store {
             .transpose()
     }
 
+    /// Returns imported locator IDs for bundles from this provider, using the source index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source index cannot be read.
+    pub fn bundle_ids_for_source_provider(&self, provider: Provider) -> Result<Vec<String>> {
+        let names =
+            serde_json::to_string(provider.names()).map_err(|_| StoreError::BundleEncoding)?;
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare_cached(&format!(
+                "SELECT bundle_id FROM bundles
+                 WHERE {BUNDLE_SOURCE_PROVIDER_SQL} IN (SELECT value FROM json_each(?1))"
+            ))
+            .map_err(database_error)?;
+        statement
+            .query_map([names], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
     /// Returns bundle UUIDs whose durable imported locator lacks metadata or search content.
     ///
     /// # Errors
@@ -1214,6 +1378,10 @@ impl Store {
     ///
     /// Returns an error for invalid metadata or failed persistence.
     pub fn upsert_indexed_session(&self, session: &IndexedSession) -> Result<()> {
+        Self::write_indexed_session(&self.connection.borrow(), session)
+    }
+
+    fn write_indexed_session(connection: &Connection, session: &IndexedSession) -> Result<()> {
         validate_session_ref(&session.session)?;
         let project_path = session
             .project_path
@@ -1222,7 +1390,6 @@ impl Store {
             .transpose()?;
         let event_count =
             i64::try_from(session.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
-        let connection = self.connection.borrow();
         connection
             .execute(
                 "
@@ -1623,6 +1790,7 @@ impl Store {
                 origin,
                 document_version: 0,
                 derived_title: None,
+                title_authoritative: false,
             },
         )
     }
@@ -1644,6 +1812,7 @@ impl Store {
             std::iter::once((session, *document, TrajectorySourceGuard::NewerSource)),
             1,
             usize::MAX,
+            None,
         )
         .map(|_| ())
     }
@@ -1671,6 +1840,7 @@ impl Store {
             }),
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+            None,
         )
         .map(|_| ())
     }
@@ -1706,6 +1876,47 @@ impl Store {
             } else {
                 MAX_TRAJECTORY_WRITE_BATCH_BYTES
             },
+            None,
+        )
+    }
+
+    /// Captures the current search document and catalog before reading the selected session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session reference is invalid or the store cannot read its state.
+    pub fn observe_verified_session(&self, session: &SessionRef) -> Result<TrajectorySourceGuard> {
+        validate_session_ref(session)?;
+        verified_session_state(&self.connection.borrow(), session)
+            .map(TrajectorySourceGuard::Verified)
+    }
+
+    /// Publishes metadata from a full native read in the same transaction as its search document.
+    /// Returns the number of search documents rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read was partial, the observed state changed, or a write failed.
+    pub fn upsert_verified_session_document(
+        &self,
+        metadata: &IndexedSession,
+        document: TrajectoryDocument<'_>,
+        guard: TrajectorySourceGuard,
+    ) -> Result<usize> {
+        if !TrajectorySourceGuard::uses_file_time(metadata.session.provider)
+            || !matches!(guard, TrajectorySourceGuard::Verified(_))
+            || document.origin != SessionTrajectoryOrigin::Native
+            || !document.source_complete
+            || document.truncation_strategy == "legacy_unknown"
+            || metadata.updated_at != Some(document.source_updated_at)
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        self.upsert_trajectory_documents_with_limits(
+            std::iter::once((&metadata.session, document, guard)),
+            1,
+            usize::MAX,
+            Some(metadata),
         )
     }
 
@@ -1720,6 +1931,7 @@ impl Store {
         >,
         max_documents: usize,
         max_indexed_bytes: usize,
+        verified_metadata: Option<&IndexedSession>,
     ) -> Result<usize> {
         if documents.len() == 0 {
             return Ok(0);
@@ -1728,48 +1940,16 @@ impl Store {
             return Err(StoreError::TrajectoryBatchTooLarge);
         }
 
-        let mut total_indexed_bytes = 0_usize;
+        let mut remaining_bytes = max_indexed_bytes;
         let mut prepared = Vec::with_capacity(documents.len());
         for (session, document, guard) in documents {
-            validate_session_ref(session)?;
-            if (document.source_complete && document.provider_limited)
-                || document.indexed_byte_count != document.redacted_text.len()
-                || !valid_truncation_strategy(document.truncation_strategy)
-                || !valid_trajectory_coverage(
-                    document.source_byte_count,
-                    document.indexed_byte_count,
-                    document.truncation_strategy,
-                )
-            {
-                return Err(StoreError::InvalidSessionReference);
-            }
-            total_indexed_bytes = total_indexed_bytes
-                .checked_add(document.indexed_byte_count)
-                .filter(|total| *total <= max_indexed_bytes)
-                .ok_or(StoreError::TrajectoryBatchTooLarge)?;
-
-            // Provider-reported omissions keep `complete` false through the strategy, but a full
-            // read of such a source still covers it; clearing `source_complete` would re-index it
-            // forever.
-            let source_complete =
-                document.source_complete && document.truncation_strategy != "legacy_unknown";
-            let complete = source_complete
-                && document.truncation_strategy == "none"
-                && document.source_byte_count == document.indexed_byte_count;
-            let source_byte_count = i64::try_from(document.source_byte_count)
-                .map_err(|_| StoreError::InvalidSessionReference)?;
-            let indexed_byte_count = i64::try_from(document.indexed_byte_count)
-                .map_err(|_| StoreError::InvalidSessionReference)?;
-            prepared.push(PreparedTrajectoryWrite {
+            prepared.push(PreparedTrajectoryWrite::new(
                 session,
-                content_hash: Sha256::digest(document.redacted_text.as_bytes()).to_vec(),
-                guard,
                 document,
-                source_complete,
-                complete,
-                source_byte_count,
-                indexed_byte_count,
-            });
+                guard,
+                remaining_bytes,
+            )?);
+            remaining_bytes -= document.indexed_byte_count;
         }
 
         let mut connection = self.connection.borrow_mut();
@@ -1779,11 +1959,19 @@ impl Store {
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
-            write.guard.check(
+            let guard = write.guard.check(
                 &transaction,
                 write.session,
                 write.document.source_updated_at,
-            )?;
+            );
+            if let (Err(StoreError::TrajectorySourceChanged), Some(metadata)) =
+                (&guard, verified_metadata)
+                && write.matches_stored(&transaction)?
+                && matches_catalog_row(&transaction, metadata)?
+            {
+                continue;
+            }
+            guard?;
             let trajectory_id = upsert_parent
                 .query_row(
                     params![
@@ -1810,6 +1998,14 @@ impl Store {
                 )
                 .optional()
                 .map_err(database_error)?;
+            if let Some(metadata) = verified_metadata {
+                if trajectory_id.is_none() && !write.matches_stored(&transaction)? {
+                    return Err(StoreError::TrajectorySourceChanged);
+                }
+                if !matches_catalog_row(&transaction, metadata)? {
+                    Self::write_indexed_session(&transaction, metadata)?;
+                }
+            }
             if let Some(trajectory_id) = trajectory_id {
                 // A later write of the same session replaces an earlier one in this batch.
                 rewritten.retain(|(other, _)| *other != trajectory_id);
@@ -4378,6 +4574,7 @@ mod tests {
                         origin: SessionTrajectoryOrigin::Native,
                         document_version,
                         derived_title: None,
+                        title_authoritative: false,
                     },
                 )
                 .expect("write preview");
@@ -4435,6 +4632,7 @@ mod tests {
                 origin: SessionTrajectoryOrigin::Native,
                 document_version,
                 derived_title,
+                title_authoritative: false,
             };
         store
             .upsert_session_trajectory(&session, "legacy redaction marker", source_updated_at, true)
@@ -4533,6 +4731,7 @@ mod tests {
                         origin: SessionTrajectoryOrigin::Native,
                         document_version: version,
                         derived_title: None,
+                        title_authoritative: false,
                     },
                 )
                 .unwrap();
@@ -4557,6 +4756,92 @@ mod tests {
     }
 
     #[test]
+    fn verified_full_read_keeps_same_time_search_and_catalog_changes_together() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("index.sqlite3")).unwrap();
+        let time = DateTime::from_timestamp(1_000, 843).unwrap();
+        let mut catalog = indexed_session(Provider::OhMyPi, "restored-omp", "Initial title");
+        catalog.updated_at = Some(time);
+        let document = |text: &'static str| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at: time,
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 5,
+            derived_title: Some(text),
+            title_authoritative: false,
+        };
+        let old = document("oldmarker");
+        let new = document("newmarker");
+        let session = catalog.session.clone();
+        let observe = || store.observe_verified_session(&session).unwrap();
+        let publish = |meta: &IndexedSession, doc, guard| {
+            store.upsert_verified_session_document(meta, doc, guard)
+        };
+        assert_eq!(publish(&catalog, old, observe()).unwrap(), 1);
+        let before = observe();
+        catalog.title = Some("Replacement title".to_owned());
+        assert_eq!(publish(&catalog, new, before).unwrap(), 1);
+        assert_eq!(publish(&catalog, new, before).unwrap(), 0);
+        assert!(matches!(
+            publish(&catalog, old, before),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+
+        let before_move = observe();
+        let mut moved = catalog.clone();
+        moved.project_path = Some(PathBuf::from("/workspace/moved"));
+        assert_eq!(publish(&moved, new, before_move).unwrap(), 0);
+        assert!(matches!(
+            publish(&catalog, new, before_move),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        let previous_version = TrajectoryDocument {
+            document_version: 4,
+            ..new
+        };
+        assert!(matches!(
+            publish(&catalog, previous_version, observe()),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        let preview = TrajectoryDocument {
+            source_complete: false,
+            ..new
+        };
+        assert!(matches!(
+            publish(&catalog, preview, observe()),
+            Err(StoreError::InvalidSessionReference)
+        ));
+
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "CREATE TRIGGER fail_catalog BEFORE UPDATE ON session_index
+             BEGIN SELECT RAISE(ABORT, 'catalog write failed'); END;",
+            )
+            .unwrap();
+        assert!(publish(&catalog, old, observe()).is_err());
+        let stored = store.indexed_sessions().unwrap().pop().unwrap();
+        assert_eq!(stored.project_path, moved.project_path);
+        assert_eq!(stored.title, moved.title);
+        assert!(
+            store
+                .search_session_trajectories("oldmarker", 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.search_session_trajectories("newmarker", 1).unwrap(),
+            [session]
+        );
+    }
+
+    #[test]
     fn restored_file_wins_over_a_reader_that_started_before_the_restore() {
         use super::TrajectorySourceGuard::Observed;
 
@@ -4577,6 +4862,7 @@ mod tests {
                 origin: SessionTrajectoryOrigin::Native,
                 document_version: version,
                 derived_title: None,
+                title_authoritative: false,
             };
             store.upsert_observed_trajectory_documents_counted(&[(&session, document, guard)])
         };
@@ -4637,6 +4923,7 @@ mod tests {
                 origin: SessionTrajectoryOrigin::Native,
                 document_version: 4,
                 derived_title: title,
+                title_authoritative: false,
             };
             store
                 .upsert_observed_trajectory_documents(&[(
@@ -4699,6 +4986,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 2,
             derived_title: None,
+            title_authoritative: false,
         };
         // Earlier writers stored provider omissions as an incomplete read.
         store
@@ -4741,6 +5029,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
         // The last document spans more chunks than one insert statement holds.
         let mut last = "synthetic filler text. ".repeat(
@@ -4787,6 +5076,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 7,
             derived_title: Some("Synthetic native title"),
+            title_authoritative: false,
         };
         let imported_document = TrajectoryDocument {
             redacted_text: imported_text,
@@ -4799,6 +5089,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::ImportedBundle,
             document_version: 8,
             derived_title: Some("Synthetic imported title"),
+            title_authoritative: false,
         };
 
         store
@@ -4869,6 +5160,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
 
         assert!(
@@ -4910,6 +5202,7 @@ mod tests {
             origin: SessionTrajectoryOrigin::Native,
             document_version: 1,
             derived_title: None,
+            title_authoritative: false,
         };
 
         assert!(

@@ -123,16 +123,25 @@ trait IndexedSessionReader {
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let cache = Store::open_default().and_then(|store| {
-            let prior = store.trajectory_index_state(session)?;
-            Ok((store, prior))
+            let (prior, guard) = if matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
+                (None, store.observe_verified_session(session)?)
+            } else {
+                let prior = store.trajectory_index_state(session)?;
+                (
+                    prior,
+                    search_index::source_guard(session.provider, prior.as_ref()),
+                )
+            };
+            Ok((store, prior, guard))
         });
-        let (snapshot, source_updated_at) = read_search_snapshot(self, session, true)?;
+        let (read, source_updated_at) = read_search_snapshot(self, session, true)?;
+        let snapshot = read.snapshot;
         let Some(source_updated_at) = source_updated_at else {
             return Ok(snapshot);
         };
         match cache {
-            Ok((store, prior)) => {
-                let version = omnis_core::search_document_version(session.provider);
+            Ok((store, prior, guard)) => {
+                let version = omnis_core::search_document_version(snapshot.session.provider);
                 let current = prior.is_some_and(|state| {
                     state.document_version > version
                         || (state.source_complete
@@ -150,7 +159,11 @@ impl IndexedSessionReader for AdapterRegistry {
                         &snapshot,
                         true,
                         source_updated_at,
-                        search_index::source_guard(session.provider, prior.as_ref()),
+                        guard,
+                        read.native_session
+                            .as_ref()
+                            .map(indexed_session_metadata)
+                            .as_ref(),
                     )
                 {
                     eprintln!("warning: local trajectory index write: {error}");
@@ -174,6 +187,7 @@ fn store_search_document(
     full_read: bool,
     source_updated_at: chrono::DateTime<Utc>,
     guard: TrajectorySourceGuard,
+    metadata: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
@@ -182,22 +196,24 @@ fn store_search_document(
     };
     let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    let rewritten = store.upsert_observed_trajectory_documents_counted(&[(
-        session,
-        omnis_store::TrajectoryDocument {
-            redacted_text: &document.text,
-            source_updated_at,
-            source_byte_count: document.source_byte_count,
-            indexed_byte_count: document.indexed_byte_count,
-            truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read,
-            provider_limited: false,
-            origin,
-            document_version: omnis_core::search_document_version(session.provider),
-            derived_title: derived_title.as_deref(),
-        },
-        guard,
-    )])?;
+    let document = omnis_store::TrajectoryDocument {
+        redacted_text: &document.text,
+        source_updated_at,
+        source_byte_count: document.source_byte_count,
+        indexed_byte_count: document.indexed_byte_count,
+        truncation_strategy: document.truncation_strategy.as_str(),
+        source_complete: full_read,
+        provider_limited: false,
+        origin,
+        document_version: omnis_core::search_document_version(snapshot.session.provider),
+        derived_title: derived_title.as_deref(),
+        title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
+    };
+    let rewritten = if let Some(metadata) = metadata {
+        store.upsert_verified_session_document(metadata, document, guard)?
+    } else {
+        store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
+    };
     Ok(rewritten != 0)
 }
 
@@ -954,20 +970,33 @@ fn read_search_snapshot(
     registry: &AdapterRegistry,
     session: &SessionRef,
     full_read: bool,
-) -> Result<(CanonicalSnapshot, Option<chrono::DateTime<Utc>>)> {
+) -> Result<(omnis_adapters::IndexRead, Option<chrono::DateTime<Utc>>)> {
     if session.provider == Provider::Imported {
         let snapshot = read_session(registry, session)?;
         let updated_at = snapshot.captured_at;
-        return Ok((snapshot, Some(updated_at)));
+        return Ok((
+            omnis_adapters::IndexRead {
+                native_session: None,
+                snapshot,
+                source_complete: true,
+                provider_limited: false,
+            },
+            Some(updated_at),
+        ));
     }
     registry.observe_search_read(session, None, |adapter, path| {
-        let snapshot = if full_read {
-            adapter.read_session_at(session, path)?
+        let read = if full_read {
+            adapter.read_full_index_at(session, path)?
         } else {
-            adapter.preview_session_at(session, path)?
+            omnis_adapters::IndexRead {
+                native_session: None,
+                snapshot: adapter.preview_session_at(session, path)?,
+                source_complete: false,
+                provider_limited: false,
+            }
         };
-        let updated_at = snapshot.captured_at;
-        Ok((snapshot, updated_at))
+        let updated_at = read.snapshot.captured_at;
+        Ok((read, updated_at))
     })
 }
 
@@ -2510,6 +2539,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         true,
         bundle.snapshot.captured_at,
         TrajectorySourceGuard::NewerSource,
+        None,
     )
     .context("indexing imported bundle trajectory")?;
     Ok(())

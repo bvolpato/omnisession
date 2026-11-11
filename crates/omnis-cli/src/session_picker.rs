@@ -624,44 +624,43 @@ impl PickerState {
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
-            self.remember_derived_titles(vec![(key.session.clone(), title)]);
+            self.remember_derived_titles([(key.session.clone(), Some(title))]);
         } else if let PreviewValue::Ready { preview, .. } = value
             && preview.title == omnis_core::SessionPreviewTitle::AfterClear(None)
         {
-            let selected = self.selected_entry().map(|entry| entry.key.clone());
-            let key = key.session.to_string();
-            if let Some(previous) = self.derived_titles.remove(&key)
-                && let Some(entry) = self
-                    .entry_positions
-                    .get(&key)
-                    .and_then(|index| self.entries.get_mut(*index))
-            {
-                if entry.session.title.as_deref() == Some(previous.as_str()) {
-                    entry.session.title = None;
-                }
-                entry.fields = SearchFields::new(&entry.session, None);
-                self.entries_generation = self.entries_generation.wrapping_add(1);
-                self.restore_selection(selected);
-            }
+            self.remember_derived_titles([(key.session.clone(), None)]);
         }
     }
 
-    fn remember_derived_titles(&mut self, titles: Vec<(SessionRef, String)>) {
+    fn remember_derived_titles(
+        &mut self,
+        titles: impl IntoIterator<Item = (SessionRef, Option<String>)>,
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         let mut changed = false;
         for (session, title) in titles {
             let key = session.to_string();
-            let previous = self.derived_titles.insert(key.clone(), title.clone());
-            if previous.as_deref() == Some(title.as_str()) {
+            if self.derived_titles.get(&key) == title.as_ref() {
                 continue;
             }
+            let previous = match &title {
+                Some(title) => self.derived_titles.insert(key.clone(), title.clone()),
+                None => self.derived_titles.remove(&key),
+            };
             changed = true;
             if let Some(entry) = self
                 .entry_positions
                 .get(&key)
                 .and_then(|index| self.entries.get_mut(*index))
             {
-                apply_derived_title(entry, previous.as_deref(), &title);
+                if let Some(title) = title {
+                    apply_derived_title(entry, previous.as_deref(), &title);
+                } else {
+                    if entry.session.title == previous {
+                        entry.session.title = None;
+                    }
+                    entry.fields = SearchFields::new(&entry.session, None);
+                }
             }
         }
         if changed {
@@ -3413,11 +3412,11 @@ mod tests {
         state.remember_derived_titles(vec![
             (
                 SessionRef::new(Provider::Codex, "untitled"),
-                "Rate limiter retry".to_owned(),
+                Some("Rate limiter retry".to_owned()),
             ),
             (
                 SessionRef::new(Provider::Claude, "titled"),
-                "First prompt text".to_owned(),
+                Some("First prompt text".to_owned()),
             ),
         ]);
 
@@ -3447,7 +3446,7 @@ mod tests {
             updated_at: None,
             continuation_after: None,
         };
-        state.remember_derived_titles(vec![(key.session.clone(), "Archived request".into())]);
+        state.remember_derived_titles([(key.session.clone(), Some("Archived request".into()))]);
         for title in [Some("Current request"), None] {
             let mut preview = synthetic_preview("Assistant reply");
             preview.title = omnis_core::SessionPreviewTitle::AfterClear(title.map(str::to_owned));

@@ -1086,27 +1086,35 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
+    Ok(json_lines_preview_with_suffix(path, sample_records)?.0)
+}
+
+/// Returns sampled records and the number of consecutive decoded records at EOF.
+pub(crate) fn json_lines_preview_with_suffix(
+    path: &Path,
+    sample_records: usize,
+) -> Result<(Vec<Value>, usize)> {
     let metadata = File::open(path)?.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
     if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        let (records, consumed) = read_json_lines_with_end(path, MAX_PROVIDER_RECORDS)?;
+        let (records, consumed, suffix) = read_json_lines_with_end(path, MAX_PROVIDER_RECORDS)?;
         if consumed >= metadata.len() {
-            return Ok(records);
+            return Ok((records, suffix));
         }
     }
 
-    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records)?;
+    let (mut records, prefix_end, _) = read_json_lines_with_end(path, sample_records)?;
+    let (tail, suffix) = json_lines_tail_with_offsets(path, sample_records)?;
     records.extend(
-        json_lines_tail_with_offsets(path, sample_records)?
-            .into_iter()
+        tail.into_iter()
             .filter_map(|(offset, record)| (offset >= prefix_end).then_some(record)),
     );
-    Ok(records)
+    Ok((records, suffix))
 }
 
-fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
+fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<(Vec<(u64, Value)>, usize)> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1121,6 +1129,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
+    let mut suffix = 0;
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1132,6 +1141,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         offset += u64::try_from(read)?;
         // Previews skip oversized records the way streamed reads do.
         if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            suffix = 0;
             continue;
         }
         if let Ok(record) = serde_json::from_slice(&line)
@@ -1141,17 +1151,20 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
                 records.pop_front();
             }
             records.push_back((line_offset, record));
+            suffix = (suffix + 1).min(limit);
+        } else {
+            suffix = 0;
         }
     }
-    Ok(records.into_iter().collect())
+    Ok((records.into_iter().collect(), suffix))
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(read_json_lines_with_end(path, limit)?.0)
 }
 
-/// Reads up to `limit` leading lines and returns their records and consumed bytes.
-fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
+/// Reads leading lines and tracks the decoded suffix after the last skipped line.
+fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64, usize)> {
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1160,6 +1173,7 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
     let mut records = Vec::new();
     let mut line = Vec::new();
     let mut consumed = 0_u64;
+    let mut suffix = 0;
     for _ in 0..limit {
         let Some((line_kind, read)) =
             read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
@@ -1168,16 +1182,16 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
         };
         consumed += read;
         // Previews skip oversized records the way streamed reads do.
-        match line_kind {
-            BoundedLine::Oversized => {}
-            BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
-                    records.push(record);
-                }
-            }
+        if matches!(line_kind, BoundedLine::Complete)
+            && let Ok(record) = serde_json::from_slice(&line)
+        {
+            records.push(record);
+            suffix += 1;
+        } else {
+            suffix = 0;
         }
     }
-    Ok((records, consumed))
+    Ok((records, consumed, suffix))
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -2127,6 +2141,7 @@ mod tests {
 
         let records = json_lines_tail_with_offsets(&path, 2)
             .expect("tail records")
+            .0
             .into_iter()
             .map(|(_, record)| record)
             .collect::<Vec<_>>();

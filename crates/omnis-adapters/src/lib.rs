@@ -67,6 +67,8 @@ pub struct NativeSession {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Catalog metadata verified by the reader of the selected native transcript.
+    pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
     /// A provider limit made a full read impossible, even without an indexer byte budget.
@@ -176,6 +178,24 @@ pub trait ProviderAdapter: Send + Sync {
         self.read_session(session)
     }
 
+    /// Reads a full transcript together with any catalog metadata verified by the same read.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures, including limits that prevent a full read.
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        Ok(IndexRead {
+            native_session: None,
+            snapshot: self.read_session_at(session, source_path)?,
+            source_complete: true,
+            provider_limited: false,
+        })
+    }
+
     /// Reads enough provider-native history for bounded interactive previews.
     ///
     /// Adapters may sample large active sessions without weakening full-import limits.
@@ -230,19 +250,14 @@ pub trait ProviderAdapter: Send + Sync {
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
         if !over_budget {
-            match self.read_session_at(session, source_path) {
-                Ok(snapshot) => {
-                    return Ok(IndexRead {
-                        snapshot,
-                        source_complete: true,
-                        provider_limited: false,
-                    });
-                }
+            match self.read_full_index_at(session, source_path) {
+                Ok(read) => return Ok(read),
                 Err(error) if error.is::<support::TranscriptReadLimit>() => {}
                 Err(error) => return Err(error),
             }
         }
         Ok(IndexRead {
+            native_session: None,
             snapshot: self.preview_session_at(session, source_path)?,
             source_complete: false,
             provider_limited: !over_budget,

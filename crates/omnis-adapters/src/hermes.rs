@@ -115,6 +115,7 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                native_session: None,
                 snapshot: builder.snapshot(
                     session.clone(),
                     metadata.title,

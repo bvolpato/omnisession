@@ -453,7 +453,14 @@ pub(super) fn spawn_preview_updates(
                 }
                 let full_read = key.continuation_after.is_some();
                 let writer = store.as_ref().and_then(|store| {
-                    match crate::search_index::observe_source(store, &key.session) {
+                    let observed = if full_read
+                        && matches!(key.session.provider, Provider::Pi | Provider::OhMyPi)
+                    {
+                        store.observe_verified_session(&key.session)
+                    } else {
+                        crate::search_index::observe_source(store, &key.session)
+                    };
+                    match observed {
                         Ok(guard) => Some((store, guard)),
                         Err(error) => {
                             let _ = sender.send(PickerUpdate::Warning(format!(
@@ -468,7 +475,8 @@ pub(super) fn spawn_preview_updates(
                 } else {
                     let imported = key.session.provider == Provider::Imported;
                     let snapshot = read_search_snapshot(&registry, &key.session, full_read);
-                    snapshot.map_or(PreviewValue::Unavailable, |(snapshot, source_time)| {
+                    snapshot.map_or(PreviewValue::Unavailable, |(read, source_time)| {
+                        let snapshot = read.snapshot;
                         if let (Some((store, guard)), Some(source_time)) = (writer, source_time)
                             && let Err(error) = crate::store_search_document(
                                 store,
@@ -477,6 +485,10 @@ pub(super) fn spawn_preview_updates(
                                 full_read || imported,
                                 source_time,
                                 guard,
+                                read.native_session
+                                    .as_ref()
+                                    .map(crate::indexed_session_metadata)
+                                    .as_ref(),
                             )
                         {
                             let _ = sender.send(PickerUpdate::Warning(format!(
@@ -593,7 +605,11 @@ pub(super) fn receive_updates(
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
             }
-            PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
+            PickerUpdate::Titles(titles) => state.remember_derived_titles(
+                titles
+                    .into_iter()
+                    .map(|(session, title)| (session, Some(title))),
+            ),
             PickerUpdate::Indexing(progress) => {
                 state.index_progress = Some((progress.indexed, progress.total));
                 if !progress.titles.is_empty() {

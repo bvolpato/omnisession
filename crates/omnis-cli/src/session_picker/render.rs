@@ -1627,8 +1627,10 @@ pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
     let PreviewValue::Ready { preview, .. } = preview else {
         return None;
     };
-    if let omnis_core::SessionPreviewTitle::AfterClear(title) = &preview.title {
-        return title.clone();
+    match &preview.title {
+        omnis_core::SessionPreviewTitle::AfterClear(title) => return title.clone(),
+        omnis_core::SessionPreviewTitle::Unverified => return None,
+        omnis_core::SessionPreviewTitle::FirstMessage => {}
     }
     preview
         .first
@@ -2015,7 +2017,8 @@ pub(super) fn display_title(session: &NativeSession, preview: Option<&PreviewVal
                         .clone()
                         .unwrap_or_else(|| "Untitled session".to_owned()),
                 ),
-                omnis_core::SessionPreviewTitle::FirstMessage => None,
+                omnis_core::SessionPreviewTitle::FirstMessage
+                | omnis_core::SessionPreviewTitle::Unverified => None,
             }
         })
         .or_else(|| {

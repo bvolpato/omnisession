@@ -15,12 +15,12 @@ use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview,
-        nested_files, omitted_images_text, parse_timestamp, paths_match, provider_executable,
-        provider_file, provider_root, read_json_line_at, sort_sessions, string_at,
-        validate_provider, visit_json_lines_with_offsets,
+        EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
+        json_lines_preview_with_suffix, nested_files, omitted_images_text, parse_timestamp,
+        paths_match, provider_executable, provider_file, provider_root, read_json_line_at,
+        sort_sessions, string_at, validate_provider, visit_json_lines_with_offsets,
     },
 };
 
@@ -126,6 +126,27 @@ struct PiHeader {
     timestamp: Option<DateTime<Utc>>,
 }
 
+impl PiHeader {
+    fn into_native(
+        self,
+        provider: Provider,
+        path: PathBuf,
+        modified: Option<DateTime<Utc>>,
+    ) -> NativeSession {
+        NativeSession {
+            session: SessionRef::new(provider, self.id),
+            title: self.title,
+            project_path: Some(self.cwd),
+            git_branch: None,
+            created_at: self.timestamp,
+            updated_at: modified.or(self.timestamp),
+            updated_at_approximate: modified.is_some(),
+            event_count: 0,
+            source_path: Some(path),
+        }
+    }
+}
+
 fn header(records: &[Value], provider: Provider) -> Result<PiHeader> {
     let record = records
         .first()
@@ -218,7 +239,7 @@ fn read_header(path: &Path, provider: Provider) -> Result<PiHeader> {
 enum HeaderState {
     #[default]
     Empty,
-    OhMyPiTitle,
+    OhMyPiTitle(Option<String>),
     Parsed(Result<PiHeader>),
 }
 
@@ -267,12 +288,17 @@ impl PiTranscriptIndex {
         let header = match &self.header {
             HeaderState::Empty => Some(
                 if provider == Provider::OhMyPi && record["type"] == "title" {
-                    HeaderState::OhMyPiTitle
+                    HeaderState::OhMyPiTitle(string_at(record, &[&["title"]]).map(str::to_owned))
                 } else {
                     HeaderState::Parsed(header_record(record))
                 },
             ),
-            HeaderState::OhMyPiTitle => Some(HeaderState::Parsed(header_record(record))),
+            HeaderState::OhMyPiTitle(title) => Some(HeaderState::Parsed(
+                header_record(record).map(|mut header| {
+                    header.title.clone_from(title);
+                    header
+                }),
+            )),
             HeaderState::Parsed(_) => None,
         };
         if let Some(header) = header {
@@ -330,7 +356,9 @@ impl PiTranscriptIndex {
     fn take_header(&mut self) -> Result<PiHeader> {
         match std::mem::take(&mut self.header) {
             HeaderState::Empty => Err(anyhow!("Pi session contains no valid JSONL records")),
-            HeaderState::OhMyPiTitle => Err(anyhow!("Oh My Pi title slot has no session header")),
+            HeaderState::OhMyPiTitle(_) => {
+                Err(anyhow!("Oh My Pi title slot has no session header"))
+            }
             HeaderState::Parsed(header) => header,
         }
     }
@@ -340,6 +368,8 @@ impl PiTranscriptIndex {
 struct PiFileStamp {
     length: u64,
     modified: SystemTime,
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -352,10 +382,15 @@ struct PiFileStamp {
 
 impl PiFileStamp {
     fn read(file: &fs::File) -> Result<Self> {
-        let metadata = file.metadata()?;
+        Self::from_metadata(&file.metadata()?)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
         Ok(Self {
             length: metadata.len(),
             modified: metadata.modified()?,
+            #[cfg(not(unix))]
+            created: metadata.created().ok(),
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -977,10 +1012,7 @@ fn snapshot_from_records(
     ))
 }
 
-fn snapshot_from_open_file(
-    session: &SessionRef,
-    path: &Path,
-) -> Result<omnis_ir::CanonicalSnapshot> {
+fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRead> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
     let stamp = PiFileStamp::read(reader.get_ref())?;
@@ -1026,12 +1058,36 @@ fn snapshot_from_open_file(
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     stamp.ensure_unchanged(reader.get_ref())?;
-    Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
+    if !fs::metadata(path)
+        .ok()
+        .and_then(|metadata| PiFileStamp::from_metadata(&metadata).ok())
+        .is_some_and(|current| current == stamp)
+    {
+        bail!("Pi session changed during read");
+    }
+    let snapshot = builder.snapshot(
+        session.clone(),
+        title,
+        Some(header.cwd.clone()),
+        None,
+        captured_at,
+    );
+    Ok(IndexRead {
+        native_session: Some(header.into_native(
+            session.provider,
+            path.to_path_buf(),
+            Some(stamp.modified.into()),
+        )),
+        snapshot,
+        source_complete: true,
+        provider_limited: false,
+    })
 }
 
 fn snapshot_from_records_preview(
     session: &SessionRef,
     records: &[Value],
+    suffix_len: usize,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     let header = header(records, session.provider)?;
     if header.id != session.id {
@@ -1044,16 +1100,32 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for (entry, role) in session_path(records, session.provider, true)? {
+    let path = session_path(records, session.provider, true)?;
+    let suffix = &records[records.len().saturating_sub(suffix_len)..];
+    let verified_reset = session.provider == Provider::OhMyPi
+        && path
+            .iter()
+            .rfind(|(entry, _)| entry["type"] == "reset_boundary")
+            .is_some_and(|(reset, _)| suffix.iter().any(|record| std::ptr::eq(record, *reset)));
+    for (entry, role) in path {
         emit_entry(&mut builder, session.provider, entry, role);
     }
-    Ok(builder.snapshot(
+    let mut snapshot = builder.snapshot(
         session.clone(),
         session_title(records),
         Some(header.cwd),
         None,
         captured_at,
-    ))
+    );
+    if session.provider == Provider::OhMyPi
+        && let Some(reset) = snapshot
+            .events
+            .iter_mut()
+            .rfind(|event| event.source.raw_record_type.as_deref() == Some("reset_boundary"))
+    {
+        reset.payload["verified_through_leaf"] = verified_reset.into();
+    }
+    Ok(snapshot)
 }
 
 impl ProviderAdapter for PiAdapter {
@@ -1085,17 +1157,7 @@ impl ProviderAdapter for PiAdapter {
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from);
-            sessions.push(NativeSession {
-                session: SessionRef::new(self.provider, header.id),
-                title: header.title,
-                project_path: Some(header.cwd),
-                git_branch: None,
-                created_at: header.timestamp,
-                updated_at: file_updated_at.or(header.timestamp),
-                updated_at_approximate: file_updated_at.is_some(),
-                event_count: 0,
-                source_path: Some(path),
-            });
+            sessions.push(header.into_native(self.provider, path, file_updated_at));
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -1110,6 +1172,14 @@ impl ProviderAdapter for PiAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
+        Ok(self.read_full_index_at(session, source_path)?.snapshot)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
         validate_provider(session, self.provider)?;
         let path = self.session_path(&session.id, source_path)?;
         snapshot_from_open_file(session, &path)
@@ -1135,7 +1205,8 @@ impl ProviderAdapter for PiAdapter {
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, self.provider)?;
         let path = self.session_path(&session.id, source_path)?;
-        snapshot_from_records_preview(session, &json_lines_preview(&path, PREVIEW_RECORDS)?)
+        let (records, suffix_len) = json_lines_preview_with_suffix(&path, PREVIEW_RECORDS)?;
+        snapshot_from_records_preview(session, &records, suffix_len)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1444,11 +1515,52 @@ mod tests {
                 "message": {"role": "user", "content": "tail", "timestamp": 1}
             }),
         ];
-        let snapshot =
-            snapshot_from_records_preview(&SessionRef::new(Provider::Pi, "session"), &records)
-                .expect("partial Pi preview");
+        let snapshot = snapshot_from_records_preview(
+            &SessionRef::new(Provider::Pi, "session"),
+            &records,
+            records.len(),
+        )
+        .expect("partial Pi preview");
         assert_eq!(snapshot.events.len(), 1);
         assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+    }
+
+    #[test]
+    fn omp_preview_clears_a_title_only_when_the_tail_confirms_the_active_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = PiAdapter::oh_my_pi_with_root(root.path());
+        let session = SessionRef::new(Provider::OhMyPi, "current");
+        let records = [
+            json!({"type":"session","version":3,"id":"current","cwd":"/workspace"}),
+            json!({"type":"message","id":"old","message":{"role":"user","content":"Archived request"}}),
+            json!({"type":"reset_boundary","id":"clear","parentId":"old"}),
+            json!({"type":"message","id":"reply","parentId":"clear","message":{"role":"assistant","content":[{"type":"text","text":"Ready"}]}}),
+        ];
+        let mut source = serialized_records(&records);
+        let path = write_fixture(root.path(), "current.jsonl", &source);
+        let read = || adapter.preview_session_at(&session, Some(&path)).unwrap();
+        let snapshot = read();
+        assert!(omnis_core::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        assert_eq!(
+            omnis_core::session_preview(&snapshot).title,
+            omnis_core::SessionPreviewTitle::AfterClear(None)
+        );
+
+        let padding =
+            "x".repeat(usize::try_from(crate::support::MAX_TRANSCRIPT_LINE_SIZE).unwrap());
+        let sibling = json!({"type":"message","id":"other","parentId":"old","message":{"role":"user","content":padding}});
+        source.push_str(&sibling.to_string());
+        fs::write(&path, source).unwrap();
+        let sample = read();
+        assert!(!omnis_core::session_search_title_is_authoritative(
+            &sample, false
+        ));
+        assert_eq!(
+            omnis_core::session_preview(&sample).title,
+            omnis_core::SessionPreviewTitle::Unverified
+        );
     }
 
     #[test]

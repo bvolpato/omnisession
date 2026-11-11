@@ -2370,6 +2370,9 @@ pub(super) fn materialize_codex_import(
         let details = report.map_or_else(
             || "target session could not be read".to_owned(),
             |report| {
+                if report.history_incomplete {
+                    return "target session reported omitted records".to_owned();
+                }
                 format!(
                     "matched {} of {} expected messages across {} observed messages",
                     report.matched_messages, report.expected_messages, report.observed_messages

@@ -745,13 +745,32 @@ pub struct SessionPreview {
 pub enum SessionPreviewTitle {
     FirstMessage,
     AfterClear(Option<String>),
+    Unverified,
+}
+
+/// Reports whether this read can establish that the current task has no title.
+#[must_use]
+pub fn session_search_title_is_authoritative(
+    snapshot: &CanonicalSnapshot,
+    full_read: bool,
+) -> bool {
+    (full_read && !snapshot.events.iter().any(reports_omitted_events))
+        || latest_omp_reset(snapshot).is_some_and(|reset| {
+            reset.payload["verified_through_leaf"] == true
+                && reset.payload["type"] == "reset_boundary"
+                && !is_secret(reset)
+        })
 }
 
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    if let Some(context) = reset_preview_context(snapshot) {
-        return post_clear_search_title(snapshot, &context.events[context.start..]);
+    if let Some((context, verified)) = reset_preview_context(snapshot) {
+        return if verified {
+            post_clear_search_title(snapshot, &context.events[context.start..])
+        } else {
+            None
+        };
     }
     let title = snapshot
         .title
@@ -776,9 +795,12 @@ fn compact_search_title(title: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn reset_preview_context(snapshot: &CanonicalSnapshot) -> Option<ContextEvents<'_>> {
-    latest_omp_reset(snapshot)?;
-    Some(sorted_context_events(snapshot))
+fn reset_preview_context(snapshot: &CanonicalSnapshot) -> Option<(ContextEvents<'_>, bool)> {
+    let reset = latest_omp_reset(snapshot)?;
+    Some((
+        sorted_context_events(snapshot),
+        reset.payload["verified_through_leaf"] != false,
+    ))
 }
 
 fn post_clear_search_title(snapshot: &CanonicalSnapshot, active: &[&OmniEvent]) -> Option<String> {
@@ -806,13 +828,17 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut message_count = 0;
     let metadata = session_recorded_metadata(snapshot);
 
-    let (events, start, title) = if let Some(context) = reset_preview_context(snapshot) {
-        let title = post_clear_search_title(snapshot, &context.events[context.start..]);
-        (
-            context.events,
-            context.start,
-            SessionPreviewTitle::AfterClear(title),
-        )
+    let (events, start, title) = if let Some((context, verified)) = reset_preview_context(snapshot)
+    {
+        let title = if verified {
+            SessionPreviewTitle::AfterClear(post_clear_search_title(
+                snapshot,
+                &context.events[context.start..],
+            ))
+        } else {
+            SessionPreviewTitle::Unverified
+        };
+        (context.events, context.start, title)
     } else {
         (
             visible_events(snapshot),
@@ -981,7 +1007,7 @@ pub fn first_user_message_after(
 ) -> Option<HandoffMessage> {
     let (events, start) = reset_preview_context(snapshot).map_or_else(
         || (visible_events(snapshot), 0),
-        |context| (context.events, context.start),
+        |(context, _)| (context.events, context.start),
     );
     events.into_iter().skip(start).find_map(|event| {
         if event.kind != EventKind::MessageUser
@@ -1308,7 +1334,9 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+/// Returns whether the text is a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -2711,19 +2739,55 @@ fn compaction_position(events: &[&OmniEvent], last: usize) -> (usize, bool) {
     let later = events[last];
     // The v3 reader through OmniSession 0.10.1 began a compacted snapshot with its active summary.
     // If the native compaction omitted its retained ID, the reader kept chronological order.
-    // A later entry without that ID can also be an older retained summary. Its timestamp can
-    // distinguish the two cases. Newer readers mark the active summary explicitly.
-    if last > 0
-        && is_leading_pi_compaction(first)
-        && first.source.provider == later.source.provider
-        && is_unmarked_pi_compaction(later)
+    // A later entry without that ID can also be an older retained summary. Newer readers mark
+    // the active summary explicitly.
+    if last == 0
+        || !is_leading_pi_compaction(first)
+        || first.source.provider != later.source.provider
+        || first.source.native_session_id != later.source.native_session_id
+        || first.branch_id != later.branch_id
+        || !is_unmarked_pi_compaction(later)
     {
-        if later.payload["first_kept_entry_id"].is_string() || recorded_after(first, later) {
-            return (0, false);
-        }
-        return (last, !recorded_after(later, first));
+        return (last, false);
     }
-    (last, false)
+    if later.payload["first_kept_entry_id"].is_string() {
+        return (0, false);
+    }
+    let Some(first_time) = first.timestamp else {
+        return (last, true);
+    };
+    // Only the leading compaction could move. In chronological order every subsequent entry
+    // follows it. In reordered history every entry through the last retained compaction precedes it.
+    let mut chronological = true;
+    let mut reordered = true;
+    let mut previous = None;
+    for (index, event) in events.iter().enumerate().skip(1) {
+        if event.source.provider != first.source.provider
+            || event.source.native_session_id != first.source.native_session_id
+            || event.source.provider_version != first.source.provider_version
+            || event.branch_id != first.branch_id
+            || event
+                .source
+                .raw_record_type
+                .as_deref()
+                .is_none_or(|kind| kind.starts_with("omnisession."))
+        {
+            continue;
+        }
+        if let Some(time) = event.timestamp {
+            if previous.is_some_and(|earlier| time < earlier) {
+                return (last, true);
+            }
+            chronological &= time >= first_time;
+            reordered &= index > last || time <= first_time;
+            previous = Some(time);
+        }
+    }
+    if reordered && !chronological {
+        (0, false)
+    } else {
+        (last, reordered == chronological)
+    }
 }
 
 fn sorted_context_events(snapshot: &CanonicalSnapshot) -> ContextEvents<'_> {
@@ -2847,7 +2911,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
         && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
             || ["omitted_events", "unsupported_text_records"]
@@ -4420,6 +4486,68 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert!(!super::needs_recovery_handoff(&snapshot, false));
+        }
+    }
+
+    #[test]
+    fn dated_native_turns_resolve_legacy_compactions_with_missing_metadata() {
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let mut snapshot = snapshot_with_events(vec![
+                compaction(0, provider, "Leading summary"),
+                event(
+                    1,
+                    EventKind::MessageUser,
+                    json!({"text": "Retained request"}),
+                ),
+                compaction(2, provider, "Following summary"),
+                event(
+                    3,
+                    EventKind::MessageAssistant,
+                    json!({"text": "Final reply"}),
+                ),
+            ]);
+            snapshot.session.provider = provider;
+            for entry in &mut snapshot.events {
+                entry.source.provider = provider;
+                entry.source.provider_version = Some("3".into());
+                let kind = if entry.kind == EventKind::CompactionCreated {
+                    "compaction"
+                } else {
+                    "message"
+                };
+                entry.source.raw_record_type = Some(kind.into());
+            }
+            snapshot.events[0].payload["first_kept_entry_id"] = json!("kept");
+            let first_time = snapshot.captured_at;
+            snapshot.events[0].timestamp = Some(first_time);
+            let at = |millis| first_time + chrono::Duration::milliseconds(millis);
+            let leading = ("Leading summary", false, Some("Retained request"));
+            let chronological = ("Following summary", false, None);
+            let uncertain = (IMPORT_OMISSION_NOTICE, true, None);
+            for (request, following, reply, (expected, truncated, objective)) in [
+                (Some(-1500), None, 1000, leading),
+                (Some(500), None, 1000, chronological),
+                (Some(0), None, 1000, uncertain),
+                (None, None, 1000, uncertain),
+                (None, None, -500, leading),
+                (Some(500), None, -500, uncertain),
+                (Some(-1500), Some(500), 1000, uncertain),
+            ] {
+                snapshot.events[1].timestamp = request.map(at);
+                snapshot.events[2].timestamp = following.map(at);
+                snapshot.events[3].timestamp = Some(at(reply));
+                let trajectory = import_trajectory(&snapshot);
+                let first = &trajectory.items[0].text;
+                assert!(
+                    first.ends_with(expected),
+                    "{provider:?} {request:?} {following:?} {reply}"
+                );
+                assert_eq!(trajectory.truncated, truncated);
+                assert_eq!(
+                    super::plan_semantic_handoff(&snapshot).objective.as_deref(),
+                    objective,
+                );
+            }
         }
     }
 
