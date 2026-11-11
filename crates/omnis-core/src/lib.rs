@@ -1668,6 +1668,7 @@ impl ItemLimits {
 struct ImportCandidate {
     item: TrajectoryItem,
     is_compaction: bool,
+    unpaired_call: bool,
 }
 
 fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
@@ -1703,6 +1704,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     is_compaction: false,
+                    unpaired_call: false,
                 },
                 truncated,
             ))
@@ -1718,6 +1720,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     is_compaction: true,
+                    unpaired_call: false,
                 },
                 truncated,
             ))
@@ -1730,6 +1733,9 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
             if limits.redact {
                 redact_json_secrets(&mut payload);
             }
+            let unpaired_call = event.source.provider == Provider::Claude
+                && event.kind == EventKind::ToolCalled
+                && payload["omnisession_unpaired_call"] == true;
             let text = serde_json::to_string_pretty(&payload).ok()?;
             let truncated = text.chars().count() > limits.tool_event;
             let text = limits.bounded_tool_text(&text);
@@ -1743,9 +1749,14 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                             text
                         ),
                         timestamp: event.timestamp,
-                        tool: native_tool_part(&event.kind, &payload, limits),
+                        tool: if unpaired_call {
+                            None
+                        } else {
+                            native_tool_part(&event.kind, &payload, limits)
+                        },
                     },
                     is_compaction: false,
+                    unpaired_call,
                 },
                 truncated,
             ))
@@ -2110,17 +2121,13 @@ fn import_trajectory_with_limits(
         if candidate.item.kind == TrajectoryItemKind::Tool {
             tool_events += 1;
         }
-        recent.push(candidate.item.clone());
+        recent.push(candidate);
     }
     recent.reverse();
 
     let mut items =
         Vec::with_capacity(recent.len() + usize::from(anchor_retained) + usize::from(truncated));
-    if anchor_retained {
-        items.push(anchor.expect("retained compaction anchor exists"));
-    }
-    items.extend(recent);
-
+    let mut first = 0;
     if truncated {
         let notice = TrajectoryItem {
             kind: TrajectoryItemKind::Assistant,
@@ -2129,15 +2136,30 @@ fn import_trajectory_with_limits(
             tool: None,
         };
         let notice_length = notice.text.chars().count();
-        while notice_length > remaining && items.len() > usize::from(anchor_retained) {
-            let remove_at = usize::from(anchor_retained);
-            let removed = items.remove(remove_at);
-            remaining += removed.text.chars().count();
+        while notice_length > remaining && first < recent.len() {
+            remaining += recent[first].item.text.chars().count();
+            first += 1;
         }
         if notice_length <= remaining {
-            items.insert(0, notice);
+            items.push(notice);
         }
     }
+    if anchor_retained {
+        items.push(anchor.expect("retained compaction anchor exists"));
+    }
+    let retained = &mut recent[first..];
+    if retained.iter().any(|item| item.unpaired_call) {
+        let call = |item: &ImportCandidate| {
+            item.unpaired_call || matches!(item.item.tool, Some(TrajectoryTool::Call { .. }))
+        };
+        for group in retained.chunk_by_mut(|left, right| call(left) && call(right)) {
+            // Preserve all selected calls and keep the verified ones beside their results.
+            if group.len() > 1 && group.iter().any(|item| item.unpaired_call) {
+                group.sort_by_key(|item| !item.unpaired_call);
+            }
+        }
+    }
+    items.extend(retained.iter().map(|candidate| candidate.item.clone()));
 
     validate_native_tools(&mut items, snapshot.session.provider);
     tool_events = items

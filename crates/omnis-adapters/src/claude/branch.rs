@@ -40,6 +40,147 @@ struct EarlierRetention {
     incomplete: bool,
 }
 
+type ResponseKey<'a> = (&'a ResponseId, Option<&'a str>, Option<usize>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ResponseUnit<'a> {
+    Named(ResponseKey<'a>),
+    Record(usize),
+}
+
+impl Node {
+    fn response_key(&self, summary: Option<usize>) -> Option<ResponseKey<'_>> {
+        Some((self.response.as_ref()?, self.writer.as_deref(), summary))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Rewind {
+    pub(super) excluded: HashSet<usize>,
+    retained_results: HashMap<usize, usize>,
+}
+
+/// Index the logical response and child links only if a rewind discarded retained turns.
+pub(super) struct RetainedBranch<'a> {
+    branch: &'a Branch,
+    events: &'a [ClaudeEvent],
+    record_calls: HashSet<(usize, &'a str)>,
+    response_calls: HashSet<(ResponseUnit<'a>, &'a str)>,
+    children: Vec<Vec<usize>>,
+    siblings: HashMap<ResponseKey<'a>, Vec<usize>>,
+}
+
+impl RetainedBranch<'_> {
+    pub(super) fn kept_before<'a>(
+        &self,
+        summary: usize,
+        retained: &[usize],
+        end: usize,
+        parent: Option<usize>,
+        rewind: &mut Rewind,
+        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+    ) -> Vec<usize> {
+        let mut kept = retained[..end].to_vec();
+        let issuing = |node| self.response_node(node, &record_for);
+        let kept_responses: HashSet<_> = kept
+            .iter()
+            .copied()
+            .chain(parent)
+            .filter_map(issuing)
+            .filter_map(|node| self.branch.response_unit(node))
+            .collect();
+        let mut discarded = Vec::new();
+        for &node in &retained[end..] {
+            if self.branch.nodes[node].user {
+                // Validate each result block against the retained calls. The rest of the
+                // user record and its descendants stay behind the cutoff.
+                rewind.retained_results.entry(node).or_insert(summary);
+            } else if self
+                .branch
+                .response_unit(node)
+                .is_some_and(|unit| kept_responses.contains(&unit))
+            {
+                kept.push(node);
+                continue;
+            }
+            discarded.push(node);
+        }
+        self.exclude_before(summary, discarded, &kept, &mut rewind.excluded);
+        kept
+    }
+
+    // A tool result can link to any block in a response. Ordinary user text starts another turn.
+    fn response_node<'a>(
+        &self,
+        index: usize,
+        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+    ) -> Option<usize> {
+        let node = &self.branch.nodes[index];
+        if !node.user {
+            return self.branch.response_unit(index).map(|_| index);
+        }
+        let parent = self.branch.issuing_parent(index, record_for);
+        let explicit = self.branch.tool_source(index, record_for);
+        let source = match explicit {
+            ToolSource::Record(source) => source,
+            ToolSource::Absent => parent?,
+            ToolSource::Unresolved => return None,
+        };
+        let unit = self.branch.response_unit(source)?;
+        if self.branch.nodes[source].writer != node.writer || node.events.is_empty() {
+            return None;
+        }
+        let parent_unit = parent.and_then(|id| self.branch.response_unit(id));
+        self.events[node.events.clone()]
+            .iter()
+            .all(|event| {
+                matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
+                    && event.payload["tool_use_id"].as_str().is_some_and(|id| {
+                        if matches!(explicit, ToolSource::Record(_)) {
+                            self.record_calls.contains(&(source, id))
+                                && !parent_unit.is_some_and(|other| {
+                                    other != unit && self.response_calls.contains(&(other, id))
+                                })
+                        } else {
+                            self.response_calls.contains(&(unit, id))
+                        }
+                    })
+            })
+            .then_some(source)
+    }
+
+    /// Bound each cutoff at its summary. The recovery history follows the summary's
+    /// logical parent, but the replacement branch starts at the summary.
+    fn exclude_before(
+        &self,
+        summary: usize,
+        discarded: Vec<usize>,
+        kept: &[usize],
+        excluded: &mut HashSet<usize>,
+    ) {
+        let protected: HashSet<_> = kept.iter().copied().collect();
+        let mut pending = discarded;
+        let mut responses = HashSet::new();
+        while let Some(index) = pending.pop() {
+            let node = &self.branch.nodes[index];
+            if index >= summary
+                || node.summary == Some(index)
+                || protected.contains(&index)
+                || !excluded.insert(index)
+            {
+                continue;
+            }
+            pending.extend(self.children[index].iter().copied());
+            if let Some(key) = node.response_key(node.summary)
+                && responses.insert(key)
+                && let Some(group) = self.siblings.get(&key)
+            {
+                pending.extend(group.iter().copied());
+            }
+        }
+    }
+}
+
 /// A progress or attachment record points to its nearest conversation ancestor in the UUID map.
 #[derive(Default)]
 pub(super) struct Branch {
@@ -277,19 +418,114 @@ impl Branch {
             .collect()
     }
 
-    pub(super) fn forked(&self) -> bool {
-        self.forked
+    pub(super) fn index_retention<'a>(&'a self, events: &'a [ClaudeEvent]) -> RetainedBranch<'a> {
+        let mut children = vec![Vec::new(); self.nodes.len()];
+        let mut siblings = HashMap::<_, Vec<_>>::new();
+        let mut record_calls = HashSet::new();
+        let mut response_calls = HashSet::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                children[parent].push(index);
+            }
+            if let Some(key) = node.response_key(node.summary) {
+                siblings.entry(key).or_default().push(index);
+            }
+            if let Some(unit) = self.response_unit(index) {
+                for call in &events[node.events.clone()] {
+                    if call.kind == EventKind::ToolCalled
+                        && let Some(id) = call.payload["id"].as_str()
+                    {
+                        record_calls.insert((index, id));
+                        response_calls.insert((unit, id));
+                    }
+                }
+            }
+        }
+        RetainedBranch {
+            branch: self,
+            events,
+            children,
+            siblings,
+            record_calls,
+            response_calls,
+        }
+    }
+
+    fn response_unit(&self, index: usize) -> Option<ResponseUnit<'_>> {
+        let node = &self.nodes[index];
+        if node.user || node.summary == Some(index) || node.events.is_empty() {
+            return None;
+        }
+        Some(
+            node.response_key(node.summary)
+                .map_or(ResponseUnit::Record(index), ResponseUnit::Named),
+        )
+    }
+
+    pub(super) fn needs_event_order<'a>(
+        &self,
+        events: &[ClaudeEvent],
+        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+    ) -> bool {
+        if self.forked {
+            return true;
+        }
+        // In a linear transcript, complete groups with distinct IDs are already in native order.
+        let mut seen = HashSet::new();
+        let mut pending = HashMap::new();
+        let mut receiving = false;
+        for (index, node) in self.nodes.iter().enumerate() {
+            for event in &events[node.events.clone()] {
+                match event.kind {
+                    EventKind::ToolCalled => {
+                        let Some(id) = event.payload["id"].as_str() else {
+                            return true;
+                        };
+                        if !seen.insert(id) || (receiving && !pending.is_empty()) {
+                            return true;
+                        }
+                        pending.insert(id, index);
+                        receiving = false;
+                    }
+                    EventKind::ToolCompleted | EventKind::ToolFailed => {
+                        let Some(caller) = event.payload["tool_use_id"]
+                            .as_str()
+                            .and_then(|id| pending.remove(id))
+                        else {
+                            return true;
+                        };
+                        if node.parent != Some(caller) || self.nodes[caller].writer != node.writer {
+                            return true;
+                        }
+                        if let Some(source) = self.tool_sources.get(&index)
+                            && !source.as_ref().and_then(&record_for).is_some_and(|r| {
+                                r.branch.node == Some(caller)
+                                    && r.events == self.nodes[caller].events
+                            })
+                        {
+                            return true;
+                        }
+                        receiving = true;
+                    }
+                    EventKind::MessageUser | EventKind::MessageAssistant if !pending.is_empty() => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        !pending.is_empty()
     }
 
     pub(super) fn event_order<'a>(
         &self,
-        events: &[ClaudeEvent],
+        events: &mut [ClaudeEvent],
         path: &[usize],
-        excluded: &HashSet<usize>,
+        rewind: &Rewind,
         record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
     ) -> Vec<usize> {
         let mut active = vec![false; self.nodes.len()];
-        let mut epoch = vec![None; self.nodes.len()];
+        let mut epoch: Vec<_> = self.nodes.iter().map(|node| node.summary).collect();
         let mut summary = None;
         for &index in path {
             active[index] = true;
@@ -301,13 +537,17 @@ impl Branch {
         // A recovered sibling must belong to the same compacted conversation. Only a
         // provider-declared retained record can cross the summary from its physical past.
         let can_recover = |index: usize, owner: usize| {
-            !excluded.contains(&index) && self.nodes[index].summary == epoch[owner]
+            (!rewind.excluded.contains(&index) && self.nodes[index].summary == epoch[owner])
+                || rewind
+                    .retained_results
+                    .get(&index)
+                    .is_some_and(|&summary| epoch[owner] == Some(summary))
         };
         let mut responses = HashMap::new();
         for &index in path {
             let node = &self.nodes[index];
-            if let Some(response) = &node.response {
-                responses.insert((response, node.writer.as_deref(), epoch[index]), index);
+            if let Some(key) = node.response_key(epoch[index]) {
+                responses.insert(key, index);
             }
         }
         let anchors: Vec<_> = self
@@ -345,7 +585,27 @@ impl Branch {
                 blocks.entry(*slot).or_default().push(index);
             }
         }
-        let results = self.parallel_results(events, &active, &anchors, &can_recover, record_for);
+        let eligible = |index: usize, owner: usize| {
+            if active[index] {
+                epoch[index] == epoch[owner]
+            } else {
+                can_recover(index, owner)
+            }
+        };
+        let results =
+            self.parallel_results(events, &active, &anchors, &epoch, &eligible, record_for);
+        // An unmatched call is documentary. It cannot invalidate a later, complete tool group.
+        for (node, anchor) in self.nodes.iter().zip(&anchors) {
+            if anchor.is_some() {
+                for pos in node.events.clone() {
+                    if events[pos].kind == EventKind::ToolCalled
+                        && !results.paired_calls.contains(&pos)
+                    {
+                        events[pos].payload["omnisession_unpaired_call"] = Value::Bool(true);
+                    }
+                }
+            }
+        }
         let mut order = Vec::new();
         for &index in path {
             let node = &self.nodes[index];
@@ -354,60 +614,86 @@ impl Branch {
                     order.extend(self.nodes[block].events.clone());
                 }
             } else {
-                order.extend(node.events.clone());
+                order.extend(
+                    node.events
+                        .clone()
+                        .filter(|position| !results.filtered.contains(position)),
+                );
             }
-            if let Some(extra) = results.get(&index) {
+            if let Some(extra) = results.after.get(&index) {
                 order.extend(extra);
             }
         }
         order
     }
 
-    /// Recover individual result blocks. Other content in an abandoned user turn stays off the branch.
+    fn tool_source<'a>(
+        &self,
+        index: usize,
+        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+    ) -> ToolSource {
+        let Some(id) = self.tool_sources.get(&index) else {
+            return ToolSource::Absent;
+        };
+        id.as_ref()
+            .and_then(record_for)
+            .and_then(|record| {
+                let source = record.branch.node?;
+                // A progress record can point at the assistant but cannot identify its call.
+                (source < index
+                    && !self.nodes[source].user
+                    && self.nodes[source].events == record.events)
+                    .then_some(source)
+            })
+            .map_or(ToolSource::Unresolved, ToolSource::Record)
+    }
+
+    fn issuing_parent<'a>(
+        &self,
+        index: usize,
+        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+    ) -> Option<usize> {
+        match self.suffix_parents.get(&index) {
+            Some(id) => record_for(id)?.branch.node.filter(|&parent| parent < index),
+            None => self.nodes[index].parent,
+        }
+    }
+
+    /// Validate selected and recovered result blocks against the calls in the final conversation.
     fn parallel_results<'a>(
         &self,
         events: &[ClaudeEvent],
         active: &[bool],
         anchors: &[Option<usize>],
-        can_recover: &impl Fn(usize, usize) -> bool,
+        epoch: &[Option<usize>],
+        eligible: &impl Fn(usize, usize) -> bool,
         record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> HashMap<usize, Vec<usize>> {
-        let calls = ToolCalls::new(&self.nodes, events, anchors);
+    ) -> ToolResults {
+        let calls = ToolCalls::new(&self.nodes, events, anchors, epoch);
+        let mut results = ToolResults::default();
         let mut outcomes = HashMap::new();
-        let mut unplaced_selected = HashSet::new();
         for (index, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.user) {
-            let source = self
-                .tool_sources
-                .get(&index)
-                .map_or(ToolSource::Absent, |id| {
-                    let resolved = id.as_ref().and_then(&record_for).and_then(|record| {
-                        let source = record.branch.node?;
-                        // A progress record can point at the assistant but cannot identify its call.
-                        (source < index
-                            && !self.nodes[source].user
-                            && self.nodes[source].events == record.events)
-                            .then_some(source)
-                    });
-                    resolved.map_or(ToolSource::Unresolved, ToolSource::Record)
-                });
+            let parent = self.issuing_parent(index, &record_for);
+            let source = self.tool_source(index, &record_for);
             for position in node.events.clone() {
                 let event = &events[position];
                 if !matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed) {
                     continue;
                 }
-                let Some(id) = event.payload["tool_use_id"].as_str() else {
-                    continue;
-                };
-                let key = (node.writer.as_deref(), id);
+                let id = event.payload["tool_use_id"].as_str();
+                if active[index]
+                    && (!matches!(source, ToolSource::Absent)
+                        || id.is_some_and(|id| calls.known.contains(id)))
+                {
+                    results.filtered.insert(position);
+                }
+                let Some(id) = id else { continue };
                 let Some((owner, mut priority)) =
-                    calls.owner(index, node, id, source, &self.nodes, anchors)
+                    calls.owner(index, parent, id, source, &self.nodes, anchors)
                 else {
-                    if active[index] {
-                        unplaced_selected.insert(key);
-                    }
                     continue;
                 };
-                if !active[index] && !can_recover(index, owner) {
+                if !eligible(index, owner) {
                     continue;
                 }
                 if active[index] {
@@ -415,34 +701,52 @@ impl Branch {
                 }
                 outcomes
                     .entry((owner, id))
-                    .and_modify(|(best, kept)| {
-                        match priority.cmp(best) {
-                            std::cmp::Ordering::Greater => {
-                                *best = priority;
-                                *kept = Some(position);
-                            }
-                            // Two equally plausible orphaned outcomes cannot establish which one survived.
-                            std::cmp::Ordering::Equal => *kept = None,
-                            std::cmp::Ordering::Less => {}
+                    .and_modify(|(best, kept)| match priority.cmp(best) {
+                        std::cmp::Ordering::Greater => {
+                            *best = priority;
+                            *kept = Some(position);
                         }
+                        std::cmp::Ordering::Equal => {
+                            if kept.is_some_and(|prior: usize| {
+                                events[prior].kind != event.kind
+                                    || events[prior].payload != event.payload
+                            }) {
+                                *kept = None;
+                            }
+                        }
+                        std::cmp::Ordering::Less => {}
                     })
                     .or_insert((priority, Some(position)));
             }
         }
-        let mut extras = HashMap::<usize, Vec<usize>>::new();
-        for ((owner, id), (source, position)) in outcomes {
-            if source != ResultSource::Selected
-                && let Some(position) = position
-                && !unplaced_selected.contains(&(self.nodes[owner].writer.as_deref(), id))
-            {
-                extras.entry(owner).or_default().push(position);
+        let mut confirmed = HashMap::<usize, Vec<(bool, usize)>>::new();
+        for ((owner, id), (priority, position)) in outcomes {
+            if let Some(position) = position {
+                confirmed
+                    .entry(owner)
+                    .or_default()
+                    .push((priority == ResultSource::Selected, position));
+                if let Some(Some((_, pos))) = calls.first_in_response.get(&(owner, id)) {
+                    results.paired_calls.insert(*pos);
+                }
             }
         }
-        for positions in extras.values_mut() {
+        for (owner, mut positions) in confirmed {
+            // Recovered siblings precede the selected result, which originally followed the calls.
             positions.sort_unstable();
+            results
+                .after
+                .insert(owner, positions.into_iter().map(|(_, p)| p).collect());
         }
-        extras
+        results
     }
+}
+
+#[derive(Default)]
+struct ToolResults {
+    filtered: HashSet<usize>,
+    after: HashMap<usize, Vec<usize>>,
+    paired_calls: HashSet<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -452,38 +756,59 @@ enum ToolSource {
     Record(usize),
 }
 
+type ScopedCallId<'a> = (Option<&'a str>, Option<usize>, &'a str);
+
 struct ToolCalls<'a> {
     by_record: HashSet<(usize, &'a str)>,
-    first_in_response: HashMap<(usize, &'a str), usize>,
-    unique_owner: HashMap<(Option<&'a str>, &'a str), Option<usize>>,
+    first_in_response: HashMap<(usize, &'a str), Option<(usize, usize)>>,
+    unique_owner: HashMap<ScopedCallId<'a>, Option<usize>>,
+    known: HashSet<&'a str>,
+    epoch: &'a [Option<usize>],
 }
 
 impl<'a> ToolCalls<'a> {
-    fn new(nodes: &'a [Node], events: &'a [ClaudeEvent], anchors: &[Option<usize>]) -> Self {
+    fn new(
+        nodes: &'a [Node],
+        events: &'a [ClaudeEvent],
+        anchors: &[Option<usize>],
+        epoch: &'a [Option<usize>],
+    ) -> Self {
         let mut calls = Self {
             by_record: HashSet::new(),
             first_in_response: HashMap::new(),
             unique_owner: HashMap::new(),
+            known: HashSet::new(),
+            epoch,
         };
         for (index, node) in nodes.iter().enumerate() {
-            for event in &events[node.events.clone()] {
+            for position in node.events.clone() {
+                let event = &events[position];
                 if event.kind == EventKind::ToolCalled
                     && let Some(id) = event.payload["id"].as_str()
                 {
+                    calls.known.insert(id);
                     calls.by_record.insert((index, id));
                     let owner = anchors[index];
                     if let Some(owner) = owner {
-                        calls.first_in_response.entry((owner, id)).or_insert(index);
+                        calls
+                            .first_in_response
+                            .entry((owner, id))
+                            .and_modify(|call| *call = None)
+                            .or_insert(Some((index, position)));
                     }
-                    calls
-                        .unique_owner
-                        .entry((node.writer.as_deref(), id))
-                        .and_modify(|prior| {
-                            if *prior != owner {
-                                *prior = None;
-                            }
-                        })
-                        .or_insert(owner);
+                    // Results kept across a summary can have a user parent and no explicit
+                    // source. Require one issuer in their original conversation as well.
+                    for scope in [epoch[index], node.summary] {
+                        calls
+                            .unique_owner
+                            .entry((node.writer.as_deref(), scope, id))
+                            .and_modify(|prior| {
+                                if *prior != owner {
+                                    *prior = None;
+                                }
+                            })
+                            .or_insert(owner);
+                    }
                 }
             }
         }
@@ -493,19 +818,19 @@ impl<'a> ToolCalls<'a> {
     fn owner(
         &self,
         index: usize,
-        node: &Node,
+        parent_node: Option<usize>,
         id: &str,
         source: ToolSource,
         nodes: &[Node],
         anchors: &[Option<usize>],
     ) -> Option<(usize, ResultSource)> {
+        let node = &nodes[index];
         let precedes_result = |owner: &usize| {
             self.first_in_response
                 .get(&(*owner, id))
-                .is_some_and(|&caller| caller < index)
+                .is_some_and(|caller| caller.is_some_and(|(caller, _)| caller < index))
         };
-        let parent = node
-            .parent
+        let parent = parent_node
             .and_then(|p| anchors[p])
             .filter(|&owner| nodes[owner].writer == node.writer)
             .filter(precedes_result);
@@ -514,15 +839,16 @@ impl<'a> ToolCalls<'a> {
         }
         if let ToolSource::Record(source) = source {
             let owner = anchors[source]?;
-            if nodes[source].writer != node.writer || !self.by_record.contains(&(source, id)) {
+            if nodes[source].writer != node.writer
+                || !self.by_record.contains(&(source, id))
+                || !precedes_result(&owner)
+            {
                 return None;
             }
             // Two assistants that claim the same call ID cannot identify each other's result.
             if parent.is_some_and(|other| other != owner)
                 || (parent.is_none()
-                    && node
-                        .parent
-                        .is_some_and(|p| self.by_record.contains(&(p, id))))
+                    && parent_node.is_some_and(|p| self.by_record.contains(&(p, id))))
             {
                 return None;
             }
@@ -531,9 +857,12 @@ impl<'a> ToolCalls<'a> {
         if let Some(owner) = parent {
             return Some((owner, ResultSource::Linked));
         }
+        if parent_node.is_some_and(|p| self.by_record.contains(&(p, id))) {
+            return None;
+        }
         let owner = self
             .unique_owner
-            .get(&(node.writer.as_deref(), id))
+            .get(&(node.writer.as_deref(), self.epoch[index], id))
             .copied()
             .flatten()
             .filter(precedes_result)?;

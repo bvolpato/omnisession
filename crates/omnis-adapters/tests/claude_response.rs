@@ -334,3 +334,313 @@ fn a_repeated_source_uuid_cannot_disambiguate_a_reused_tool_id() {
             .all(|e| e.payload["content"] != "ambiguous")
     );
 }
+
+#[test]
+fn split_response_results_have_the_same_owners_after_compaction_in_either_order() {
+    for compacted in [false, true] {
+        for last in [2, 3] {
+            for sibling_parent in [1, 2] {
+                let mut rows = vec![
+                    message(1, 0, "user", json!("Inspect both")),
+                    block(2, 1, "request", json!([call("a")])),
+                    block(3, sibling_parent, "request", json!([call("b")])),
+                ];
+                if compacted {
+                    rows.extend(compaction(4, 3, &[2, 3]));
+                }
+                let first = 5 - last;
+                let outcome = |row, owner| {
+                    let id = if owner == 2 { "a" } else { "b" };
+                    linked_result(row, owner, owner, id, id)
+                };
+                rows.extend([
+                    outcome(6, first),
+                    outcome(7, last),
+                    message(8, 7, "assistant", json!("Finished")),
+                ]);
+                assert_eq!(
+                    tool_outcomes(&read(&rows)),
+                    [("a".into(), false), ("b".into(), false)],
+                    "compacted={compacted}, last owner={last}, second block parent={sibling_parent}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_rewind_removes_the_withdrawn_turn_and_its_response_blocks_from_history() {
+    for sibling_parent in [2, 3] {
+        for listed_block in [3, 4] {
+            let mut rows = vec![
+                message(1, 0, "user", json!("Initial task")),
+                message(2, 1, "user", json!("Shared question")),
+                block(3, 2, "abandoned", json!("Retired block one")),
+                block(4, sibling_parent, "abandoned", json!("Retired block two")),
+                message(5, 4, "user", json!("Retired follow-up")),
+                block(6, 5, "child", json!("Retired reply")),
+            ];
+            rows.extend(compaction(7, 6, &[2, listed_block]));
+            rows.push(block(9, 2, "new", json!("Replacement")));
+            for _ in 0..2 {
+                let snap = read(&rows);
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snap, &mut recovery).unwrap();
+                for text in [
+                    omnis_core::trajectory_search_document(&snap).text,
+                    String::from_utf8(recovery).unwrap(),
+                ] {
+                    assert!(text.contains("Shared question"));
+                    assert!(text.contains("Replacement"));
+                    assert!(
+                        !text.contains("Retired"),
+                        "listed={listed_block}, parent={sibling_parent}: {text}"
+                    );
+                }
+                rows.extend(compaction(10, 9, &[9]));
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_selected_result_cannot_hide_a_verified_retry() {
+    for (stale_last, stale_source, foreign) in [
+        (false, 2, false),
+        (true, 2, false),
+        (true, 3, true),
+        (true, 99, false),
+    ] {
+        let mut records = vec![
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "abandoned", json!([call("reused")])),
+            block(3, 1, "selected", json!([call("reused")])),
+        ];
+        let good = linked_result(4, 3, 3, "reused", "retry output");
+        let mut stale = linked_result(5, 3, stale_source, "reused", "abandoned output");
+        if foreign {
+            stale["agentId"] = json!("worker");
+        }
+        stale["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"text","text":"keep this note"}));
+        records.extend(if stale_last {
+            [good, stale]
+        } else {
+            [stale, good]
+        });
+        records.push(message(6, 5, "assistant", json!("Finished")));
+        let snapshot = read(&records);
+        assert_eq!(tool_outcomes(&snapshot), [("retry output".into(), false)]);
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("keep this note"));
+        assert!(!recovery.contains("abandoned output"));
+    }
+}
+
+#[test]
+fn linear_retries_keep_distinct_native_pairs_and_original_provider_ids() {
+    let mut first = block(2, 1, "first", json!([call("same")]));
+    first["message"]["content"][0]["input"] = json!({"file":"old"});
+    let mut latest = block(3, 2, "second", json!([call("same")]));
+    latest["message"]["content"][0]["input"] = json!({"file":"new"});
+    let snapshot = read(&[
+        message(1, 0, "user", json!("Inspect")),
+        first,
+        latest,
+        linked_result(4, 3, 2, "same", "wrong attempt"),
+        linked_result(5, 4, 3, "same", "correct"),
+    ]);
+    let pairs: Vec<_> = native_trajectory_items(&import_trajectory(&snapshot))
+        .into_iter()
+        .filter_map(|item| {
+            if let NativeTrajectoryItem::Tool { input, output, .. } = item {
+                Some((input, output))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(pairs, [(json!({"file":"new"}), "correct".into())]);
+    let provider_ids: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| {
+            event.payload["id"]
+                .as_str()
+                .or(event.payload["tool_use_id"].as_str())
+        })
+        .collect();
+    assert_eq!(provider_ids, ["same", "same", "same"]);
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["content"] == "wrong attempt")
+    );
+}
+
+#[test]
+fn selected_results_with_equal_provenance_and_conflicting_outputs_are_omitted() {
+    for linked in [true, false] {
+        let mut first = linked_result(3, 2, 2, "id", "first outcome");
+        let mut second = linked_result(4, 3, 2, "id", "other outcome");
+        if !linked {
+            for row in [&mut first, &mut second] {
+                row.as_object_mut()
+                    .unwrap()
+                    .remove("sourceToolAssistantUUID");
+            }
+        }
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "r", json!([call("id")])),
+            first,
+            second,
+        ]);
+        assert!(tool_outcomes(&snapshot).is_empty());
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolCompleted | EventKind::ToolFailed))
+        );
+    }
+}
+
+#[test]
+fn selected_result_cannot_answer_a_call_in_another_compaction_epoch() {
+    let mut records = vec![
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "old", json!([call("same")])),
+    ];
+    records.extend(compaction(3, 2, &[]));
+    records.extend([
+        block(5, 4, "new", json!([call("same")])),
+        linked_result(6, 5, 5, "same", "right epoch"),
+        linked_result(7, 6, 2, "same", "wrong epoch"),
+    ]);
+    let snapshot = read(&records);
+    assert_eq!(tool_outcomes(&snapshot), [("right epoch".into(), false)]);
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["content"] == "wrong epoch")
+    );
+}
+
+#[test]
+fn implicit_retained_parent_disambiguates_a_result_after_a_retry() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "retained", json!([call("same")])),
+        json!({"type":"progress","uuid":Uuid::from_u128(3),"parentUuid":Uuid::from_u128(2)}),
+    ];
+    rows.extend(compaction(4, 3, &[2, 3]));
+    rows.extend([
+        block(6, 5, "discarded", json!([call("same")])),
+        message(
+            7,
+            3,
+            "user",
+            json!([result("same", "retained output", false)]),
+        ),
+    ]);
+    assert_eq!(
+        tool_outcomes(&read(&rows)),
+        [("retained output".into(), false)]
+    );
+}
+
+#[test]
+fn a_retained_result_fills_only_a_call_that_the_new_branch_left_unanswered() {
+    for named in [false, true] {
+        for replace in [false, true] {
+            let calls = json!([call("a"), call("b")]);
+            let mut rows = vec![
+                message(1, 0, "user", json!("Inspect both")),
+                if named {
+                    block(2, 1, "request", calls)
+                } else {
+                    message(2, 1, "assistant", calls)
+                },
+                linked_result(3, 2, 2, "a", "original"),
+                message(
+                    4,
+                    3,
+                    "user",
+                    json!([
+                        result("b", "sibling", false), result("unknown", "Withdrawn result", true),
+                        {"type":"text", "text":"Withdrawn request"}
+                    ]),
+                ),
+                message(5, 4, "user", json!("Withdrawn follow-up")),
+            ];
+            rows.extend(compaction(6, 5, &[2, 3, 4, 5]));
+            let (parent, expected) = if replace {
+                rows.push(linked_result(8, 2, 2, "a", "replacement"));
+                (8, "replacement")
+            } else {
+                (3, "original")
+            };
+            rows.push(message(9, parent, "assistant", json!("Finished")));
+            let snapshot = read(&rows);
+            assert_eq!(
+                tool_outcomes(&snapshot),
+                [(expected.into(), false), ("sibling".into(), false)],
+                "named={named}, replace={replace}"
+            );
+            assert!(
+                !omnis_core::trajectory_search_document(&snapshot)
+                    .text
+                    .contains("Withdrawn")
+            );
+        }
+    }
+}
+
+#[test]
+fn a_mixed_result_keeps_its_verified_pair_when_another_call_is_unanswered() {
+    for reverse in [false, true] {
+        let first = block(
+            2,
+            1,
+            "request",
+            json!([call(if reverse { "b" } else { "a" })]),
+        );
+        let second = block(
+            3,
+            2,
+            "request",
+            json!([call(if reverse { "a" } else { "b" })]),
+        );
+        let mut mixed = linked_result(4, 3, if reverse { 3 } else { 2 }, "a", "verified");
+        mixed["message"]["content"].as_array_mut().unwrap().extend([
+            result("b", "unverified", true),
+            json!({"type":"text","text":"keep this note"}),
+        ]);
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Inspect")),
+            first,
+            second,
+            mixed,
+        ]);
+        assert_eq!(tool_outcomes(&snapshot), [("verified".into(), false)]);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|e| e.payload["text"] == "keep this note")
+        );
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|e| e.payload["content"] == "unverified")
+        );
+    }
+}

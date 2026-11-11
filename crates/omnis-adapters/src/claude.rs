@@ -984,14 +984,21 @@ impl ClaudeTranscript {
         Ok(Some((selected, end)))
     }
 
-    fn selected_events(&self) -> (Vec<usize>, Option<anyhow::Error>) {
+    fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>) {
         let mut path = self.branch.selected_path();
-        let mut excluded = HashSet::new();
+        let record_for = |id: &Uuid| {
+            self.records
+                .get(id)
+                .filter(|_| !self.duplicate_records.contains(id))
+        };
+        let mut rewind = branch::Rewind::default();
+        let mut retention = None;
         let mut moved = HashMap::new();
         let mut error = None;
         if !self.compactions.headers.is_empty() {
             let present: HashSet<_> = path.iter().copied().collect();
-            for (summary, tip) in self.branch.retained_segments(&path) {
+            // Later summaries own records retained more than once.
+            for (summary, tip) in self.branch.retained_segments(&path).into_iter().rev() {
                 let (retained, end) = match self.retained_nodes(summary, tip) {
                     Ok(Some(segment)) => segment,
                     Ok(None) => continue,
@@ -1000,34 +1007,42 @@ impl ClaudeTranscript {
                         continue;
                     }
                 };
-                let (kept, discarded) = retained.split_at(end);
-                excluded.extend(discarded);
+                let kept = if end < retained.len() {
+                    let parent = tip
+                        .as_ref()
+                        .and_then(record_for)
+                        .and_then(|record| record.branch.node);
+                    retention
+                        .get_or_insert_with(|| self.branch.index_retention(&self.events))
+                        .kept_before(summary, &retained, end, parent, &mut rewind, record_for)
+                } else {
+                    retained
+                };
                 if self.branch.selected_summary() == Some(summary)
                     || tip.is_some()
                     || kept.iter().any(|index| !present.contains(index))
                 {
-                    for (rank, &index) in kept.iter().enumerate() {
-                        if excluded.contains(&index) {
-                            error.get_or_insert_with(|| {
-                                anyhow!("retained compaction context references a discarded turn")
-                            });
-                        } else {
-                            moved.insert(index, (summary, rank));
-                        }
+                    for (rank, index) in kept.into_iter().enumerate() {
+                        moved.entry(index).or_insert((summary, rank));
                     }
                 }
             }
         }
-        if !moved.is_empty() || !excluded.is_empty() {
+        if moved.keys().any(|node| rewind.excluded.contains(node)) {
+            error.get_or_insert_with(|| {
+                anyhow!("retained compaction context references a discarded turn")
+            });
+        }
+        if !moved.is_empty() || !rewind.excluded.is_empty() {
             let mut after_summary = HashMap::<usize, Vec<(usize, usize)>>::new();
             for (&node, &(summary, rank)) in &moved {
-                if !excluded.contains(&node) {
+                if !rewind.excluded.contains(&node) {
                     after_summary.entry(summary).or_default().push((rank, node));
                 }
             }
             let mut selected = Vec::new();
             for node in path {
-                if excluded.contains(&node) || moved.contains_key(&node) {
+                if rewind.excluded.contains(&node) || moved.contains_key(&node) {
                     continue;
                 }
                 selected.push(node);
@@ -1040,11 +1055,7 @@ impl ClaudeTranscript {
         }
         (
             self.branch
-                .event_order(&self.events, &path, &excluded, |id| {
-                    self.records
-                        .get(id)
-                        .filter(|_| !self.duplicate_records.contains(id))
-                }),
+                .event_order(&mut self.events, &path, &rewind, record_for),
             error,
         )
     }
@@ -1066,7 +1077,12 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        let preservation_error = if self.branch.forked() || !self.compactions.headers.is_empty() {
+        let preservation_error = if !self.compactions.headers.is_empty()
+            || self.branch.needs_event_order(&self.events, |id| {
+                self.records
+                    .get(id)
+                    .filter(|_| !self.duplicate_records.contains(id))
+            }) {
             let (order, error) = self.selected_events();
             let mut slots = self.events.into_iter().map(Some).collect::<Vec<_>>();
             self.events = order
