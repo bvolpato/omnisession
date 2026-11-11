@@ -113,6 +113,8 @@ pub struct NativeListing {
     pub sessions: Vec<NativeSession>,
     pub notes: Vec<String>,
     pub desktop_summaries_unavailable: bool,
+    /// Listed Desktop databases with no entry in a readable summary file.
+    pub missing_desktop_summary_ids: Vec<String>,
     /// Desktop database IDs whose archive annotations could not be verified.
     pub unverified_desktop_ids: Vec<String>,
 }

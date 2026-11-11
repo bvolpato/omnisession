@@ -1,4 +1,4 @@
-//! Checks an empty result against the WAL in an already verified private database copy.
+//! Checks the recovered SQLite commit boundary against the WAL in the private database copy.
 
 use std::{
     fmt,
@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 
-/// The private SQLite snapshot cannot confirm that an empty result covers the native WAL.
+/// The private SQLite snapshot cannot verify the native WAL commit boundary.
 #[derive(Debug)]
 pub struct UnverifiedSqliteWal(pub(crate) String);
 
@@ -18,7 +18,7 @@ impl fmt::Display for UnverifiedSqliteWal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "SQLite WAL cannot confirm that the session is empty ({})",
+            "SQLite WAL commit boundary could not be verified ({})",
             self.0
         )
     }
@@ -28,7 +28,7 @@ impl std::error::Error for UnverifiedSqliteWal {}
 
 const HEADER_BYTES: u64 = 32;
 const FRAME_HEADER_BYTES: u64 = 24;
-// A large write still in progress can wait for its next commit before an empty result is published.
+// A large write still in progress can wait for its next commit before its results are published.
 const MAX_UNCOMMITTED_BYTES: u64 = 4 * 1024 * 1024;
 // Each older frame needs one header read and a seek over its page.
 const MAX_OLDER_HEADERS: u64 = 1_024;

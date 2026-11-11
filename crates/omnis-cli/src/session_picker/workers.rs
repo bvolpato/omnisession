@@ -707,6 +707,7 @@ fn spawn_provider_update_in_home(
                     mut sessions,
                     notes,
                     desktop_summaries_unavailable: unavailable,
+                    missing_desktop_summary_ids,
                     unverified_desktop_ids,
                 },
                 names,
@@ -731,6 +732,7 @@ fn spawn_provider_update_in_home(
                         scope: crate::discovery_scope(
                             complete,
                             unavailable,
+                            &missing_desktop_summary_ids,
                             &unverified_desktop_ids,
                         ),
                         attempt: attempt.clone(),
@@ -756,24 +758,19 @@ fn spawn_provider_update_in_home(
                         return;
                     }
                 }
-                let mut cached = Vec::new();
-                if (unavailable || !unverified_desktop_ids.is_empty())
-                    && let Some(home) = home.as_deref()
-                {
-                    match cached_desktop_observations(
-                        home,
-                        unavailable,
-                        &mut sessions,
-                        &unverified_desktop_ids,
-                    ) {
-                        Ok(rows) => cached = rows,
-                        Err(error) => {
-                            let _ = sender.send(PickerUpdate::Warning(format!(
-                                "{provider} cached catalog: {error}"
-                            )));
-                        }
-                    }
-                }
+                let cached = cached_desktop_observations(
+                    home.as_deref(),
+                    unavailable,
+                    &mut sessions,
+                    &missing_desktop_summary_ids,
+                    &unverified_desktop_ids,
+                )
+                .unwrap_or_else(|error| {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "{provider} cached catalog: {error}"
+                    )));
+                    Vec::new()
+                });
                 let mut entries = normalized_picker_entries(sessions, &current_project, false);
                 entries.extend(normalized_picker_entries(cached, &current_project, true));
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
@@ -859,14 +856,27 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
 }
 
 fn cached_desktop_observations(
-    home: &Path,
+    home: Option<&Path>,
     summaries_unavailable: bool,
     sessions: &mut [NativeSession],
+    missing_summary_ids: &[String],
     unverified_ids: &[String],
 ) -> omnis_store::Result<Vec<NativeSession>> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    if !summaries_unavailable && missing_summary_ids.is_empty() && unverified_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let store = Store::open_default()?;
-    if summaries_unavailable {
-        crate::fill_cached_desktop_summaries(&store, home, sessions)?;
+    if summaries_unavailable || !missing_summary_ids.is_empty() {
+        crate::fill_cached_desktop_summaries(
+            &store,
+            home,
+            sessions,
+            summaries_unavailable,
+            missing_summary_ids,
+        )?;
     }
     if unverified_ids.is_empty() {
         return Ok(Vec::new());

@@ -130,6 +130,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         let mut sessions = Vec::new();
         let mut databases = 0;
         let mut unverified_desktop_ids = Vec::new();
+        let mut missing_desktop_summary_ids = Vec::new();
         for (count, entry) in entries.enumerate() {
             ensure!(
                 count < MAX_DISCOVERY_ENTRIES,
@@ -177,11 +178,8 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
                     }
                 }
             }
-            let session = native_session(
-                id,
-                database,
-                summaries.as_ref().and_then(|rows| rows.get(id)),
-            );
+            let summary = summaries.as_ref().and_then(|rows| rows.get(id));
+            let session = native_session(id, database, summary);
             if project.is_some_and(|requested| {
                 session
                     .project_path
@@ -190,6 +188,9 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             }) {
                 continue;
             }
+            if summaries.is_some() && summary.is_none() {
+                missing_desktop_summary_ids.push(id.to_owned());
+            }
             sessions.push(session);
         }
         sort_sessions(&mut sessions);
@@ -197,6 +198,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             sessions,
             notes,
             desktop_summaries_unavailable: summaries.is_none() && databases != 0,
+            missing_desktop_summary_ids,
             unverified_desktop_ids,
         })
     }
@@ -226,13 +228,10 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         let database = conversation_database(root, &session.id)
             .ok_or_else(|| anyhow!("Antigravity Desktop session `{}` was not found", session.id))?;
         let summaries = read_summaries(root).ok().flatten();
-        let listed = native_session(
-            &session.id,
-            database.clone(),
-            summaries.as_ref().and_then(|rows| rows.get(&session.id)),
-        );
+        let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
+        let listed = native_session(&session.id, database.clone(), summary);
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let declared_steps = if summaries.is_none()
+        let declared_steps = if summary.is_none()
             && let Some((file, count)) = self.cached_step_count
             && listed.source_revision.and_then(|revision| revision.file) == Some(file)
         {
@@ -421,11 +420,9 @@ fn native_session(
     let git_branch = project_path
         .as_ref()
         .and_then(|_| summary.and_then(ProtoTrajectorySummary::git_branch));
-    let event_count = summary.map_or(0, |summary| {
-        usize::try_from(summary.step_count).unwrap_or(usize::MAX)
-    });
+    let declared_steps = summary.map(|row| usize::try_from(row.step_count).unwrap_or(usize::MAX));
     NativeSession {
-        source_revision: crate::antigravity::database_history_revision(&database, event_count),
+        source_revision: crate::antigravity::database_history_revision(&database, declared_steps),
         session: SessionRef::new(Provider::AntigravityDesktop, id),
         title: summary.and_then(|summary| nonempty(summary.summary.clone())),
         project_path,
@@ -435,7 +432,7 @@ fn native_session(
             .and_then(proto_timestamp),
         updated_at,
         updated_at_approximate: recorded_update.is_none(),
-        event_count,
+        event_count: declared_steps.unwrap_or_default(),
         source_path: Some(database),
     }
 }
@@ -806,11 +803,33 @@ mod tests {
         };
         assert!(has_gap());
 
-        write_summaries(root, Vec::new());
+        write_summaries(root, vec![(ORPHAN_ID, ProtoTrajectorySummary::default())]);
         let empty = adapter.list_catalog(None).unwrap();
         assert_eq!(empty.sessions.len(), 1);
         assert!(empty.notes.is_empty() && !empty.desktop_summaries_unavailable);
-        assert!(!has_gap());
+        assert_eq!(empty.missing_desktop_summary_ids, [SESSION_ID]);
+        assert!(has_gap());
+
+        for step_count in [3, 0] {
+            write_summaries(
+                root,
+                vec![(
+                    SESSION_ID,
+                    ProtoTrajectorySummary {
+                        step_count,
+                        ..Default::default()
+                    },
+                )],
+            );
+            assert!(
+                adapter
+                    .list_catalog(None)
+                    .unwrap()
+                    .missing_desktop_summary_ids
+                    .is_empty()
+            );
+            assert!(!has_gap());
+        }
 
         fs::remove_file(root.join(SUMMARIES)).unwrap();
         fs::rename(
@@ -906,10 +925,12 @@ mod tests {
         assert!(missing.desktop_summaries_unavailable);
         fs::write(root.join(SUMMARIES), [0xff]).unwrap();
         assert!(observe().desktop_summaries_unavailable);
-        write_summaries(root, vec![]);
+        write_summaries(root, vec![(ORPHAN_ID, ProtoTrajectorySummary::default())]);
+        assert!(observe().desktop_summaries_unavailable);
+        write_summaries(root, vec![(SESSION_ID, ProtoTrajectorySummary::default())]);
         let healthy = observe();
         assert!(!healthy.desktop_summaries_unavailable);
-        assert_eq!(healthy.revision, missing.revision);
+        assert_ne!(healthy.revision, missing.revision);
         writer
             .execute(
                 "INSERT INTO steps SELECT idx + 10, step_type, step_payload FROM steps",

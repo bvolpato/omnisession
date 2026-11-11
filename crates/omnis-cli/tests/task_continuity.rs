@@ -1085,6 +1085,86 @@ fn antigravity_ide_source_lists_and_continues_in_another_provider() {
 }
 
 #[test]
+fn desktop_search_keeps_readable_steps_until_the_missing_history_arrives() {
+    use prost::Message;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    let home = write_synthetic_antigravity_ide(root, &workspace);
+    let summary = home.join("agyhub_summaries_proto.pb");
+    let mut summaries = IdeSummaries::decode(fs::read(&summary).unwrap().as_slice()).unwrap();
+    summaries.summaries.get_mut(SESSION_ID).unwrap().step_count = 2;
+    fs::write(&summary, summaries.encode_to_vec()).unwrap();
+    let database = home.join("conversations").join(format!("{SESSION_ID}.db"));
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let step = |text: &str| {
+        IdeStep {
+            r#type: 14,
+            user_input: Some(IdeUserInput {
+                user_response: text.to_owned(),
+            }),
+        }
+        .encode_to_vec()
+    };
+    let opening = format!("{} readablebody", "opening ".repeat(64));
+    connection
+        .execute(
+            "UPDATE steps SET step_payload=?1 WHERE idx=0",
+            [step(&opening)],
+        )
+        .unwrap();
+    let run = |state, args: &[&str]| {
+        successful_json(
+            command(root, &workspace)
+                .env("OMNISESSION_HOME", root.join(state))
+                .env("ANTIGRAVITY_DESKTOP_HOME", &home)
+                .arg("--json")
+                .args(args),
+        )
+    };
+    let search = |query| {
+        run(
+            "state",
+            &["search", "--provider", "antigravity-desktop", query],
+        )
+    };
+    for _ in 0..2 {
+        let partial = search("readablebody");
+        assert_eq!(partial["results"][0]["coverage"], "preview", "{partial}");
+        assert_eq!(partial["index"]["failed"], 0);
+    }
+
+    run(
+        "opened",
+        &["show", &format!("antigravity-desktop:{SESSION_ID}")],
+    );
+    let cached = run(
+        "opened",
+        &[
+            "search",
+            "--cached",
+            "--provider",
+            "antigravity-desktop",
+            "readablebody",
+        ],
+    );
+    assert_eq!(cached["results"][0]["coverage"], "preview", "{cached}");
+
+    connection
+        .execute(
+            "INSERT INTO steps VALUES (1, ?1)",
+            [step("Recovered suffix")],
+        )
+        .unwrap();
+    assert_eq!(search("suffix")["results"].as_array().unwrap().len(), 1);
+    connection
+        .execute("DELETE FROM steps WHERE idx=1", [])
+        .unwrap();
+    assert_eq!(search("suffix")["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn antigravity_desktop_source_has_its_own_identity_and_continues_elsewhere() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

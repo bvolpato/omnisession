@@ -495,7 +495,7 @@ pub(crate) struct SqliteSnapshot {
 
 impl SqliteSnapshot {
     /// Call after the query finishes so SQLite can report its recovered commit boundary.
-    pub(crate) fn verify_empty_wal(&self) -> Result<()> {
+    pub(crate) fn verify_wal(&self) -> Result<()> {
         let verified = self.verified_wal.get_or_init(|| {
             crate::sqlite_wal::verify(
                 &self.connection,

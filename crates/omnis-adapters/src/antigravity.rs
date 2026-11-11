@@ -154,7 +154,7 @@ impl AntigravityAdapter {
             let root = self.root()?;
             self.summaries
                 .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
-                    catalog.verify_empty_wal()
+                    catalog.verify_wal()
                 })?;
         }
         if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
@@ -242,7 +242,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 .as_deref()
                 .is_some_and(Self::is_summary_catalog)
         };
-        if sessions.iter().any(catalog_only) && snapshot.verify_empty_wal().is_err() {
+        if sessions.iter().any(catalog_only) && snapshot.verify_wal().is_err() {
             for session in sessions.iter_mut().filter(|session| catalog_only(session)) {
                 session.source_path = None;
                 session.source_revision = None;
@@ -294,7 +294,7 @@ impl ProviderAdapter for AntigravityAdapter {
                     "Antigravity history source changed during search read"
                 );
                 if Self::is_summary_catalog(&source) {
-                    snapshot.verify_empty_wal()?;
+                    snapshot.verify_wal()?;
                 }
                 let revision = summary.search_revision(root, &source)?;
                 Ok(summary.native_session(Some(source), Some(revision)))
@@ -515,7 +515,7 @@ fn history_contents(
 
 pub(super) fn database_history_revision(
     database: &Path,
-    declared_steps: usize,
+    declared_steps: Option<usize>,
 ) -> Option<SourceRevision> {
     let revision = source_file_revision(database)?;
     let wal = WalRevision::read(database);
@@ -526,7 +526,7 @@ pub(super) fn database_history_revision(
         revision.file?,
         Some(revision.contents?),
         Some(wal),
-        Some(declared_steps),
+        declared_steps,
         None,
     )
     .ok()?;
@@ -928,13 +928,11 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
-    if stored == 0 {
-        snapshot.verify_empty_wal()?;
-        if declared_steps > 0 {
-            return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
-                "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
-            )));
-        }
+    snapshot.verify_wal()?;
+    if stored == 0 && declared_steps > 0 {
+        return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
+            "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+        )));
     }
     let mut statement = snapshot
         .connection
@@ -1332,6 +1330,32 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn a_nonempty_checkpoint_cannot_hide_a_torn_wal_commit() {
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("steps.db");
+        write_steps_database(&database, &[synthetic_step(21, None)]);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 INSERT INTO steps SELECT idx + 1, step_type, step_payload FROM steps;",
+            )
+            .unwrap();
+        let wal = std::fs::read(source.path().join("steps.db-wal")).unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        let copy = restored.path().join("steps.db");
+        std::fs::copy(&database, &copy).unwrap();
+        let read = |bytes: &[u8]| {
+            std::fs::write(restored.path().join("steps.db-wal"), bytes).unwrap();
+            let mut events = EventBuilder::new(Provider::AntigravityDesktop, "synthetic");
+            push_database_steps(restored.path(), &copy, &mut events, 0)
+        };
+        assert_eq!(read(&wal).unwrap(), 2);
+        let error = read(&wal[..wal.len() - 1]).unwrap_err();
+        assert!(error.is::<crate::UnverifiedSqliteWal>());
     }
 
     #[test]

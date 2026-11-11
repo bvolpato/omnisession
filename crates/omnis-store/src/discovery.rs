@@ -369,7 +369,9 @@ impl Store {
         let listing = listing.into();
         if !matches!(
             listing.scope,
-            DiscoveryScope::Workspace | DiscoveryScope::DesktopDatabasesWithoutSummaries
+            DiscoveryScope::Workspace
+                | DiscoveryScope::DesktopDatabasesWithoutSummaries
+                | DiscoveryScope::DesktopPartialSummaries { .. }
         ) {
             return Err(StoreError::InvalidSessionReference);
         }

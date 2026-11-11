@@ -1632,6 +1632,29 @@ pub(crate) fn observe_native_read<T>(
     ))
 }
 
+/// Returns the coverage to publish, or `None` when an incomplete read would replace better history.
+pub(super) fn index_source_complete(
+    store: Option<&Store>,
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    source_complete: bool,
+) -> omnis_store::Result<Option<bool>> {
+    if session.provider == Provider::Imported
+        || !AntigravityAdapter::has_missing_database_steps(snapshot)
+    {
+        return Ok(Some(source_complete));
+    }
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let prior = store.trajectory_index_state(session)?;
+    if prior.is_some_and(|prior| prior.source_complete || prior.provider_limited) {
+        Ok(None)
+    } else {
+        Ok(Some(false))
+    }
+}
+
 fn prepare_session(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -1693,11 +1716,8 @@ fn prepare_session(
     } else {
         read
     };
-    if session.provider != Provider::Imported
-        && omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot)
-    {
-        return Err(omnis_adapters::IncompleteTranscript.into());
-    }
+    let source_complete = index_source_complete(store, session, &snapshot, source_complete)?
+        .ok_or(omnis_adapters::IncompleteTranscript)?;
     let source_revision = source
         .observation
         .as_ref()

@@ -58,8 +58,8 @@ pub(super) fn observe(
             "Antigravity Desktop database changed during search read"
         );
         let summaries = read_summaries(root).ok().flatten();
-        summaries_unavailable = summaries.is_none();
         let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
+        summaries_unavailable = summary.is_none();
         Ok(native_session(&session.id, database, summary))
     })?;
     observation.desktop_summaries_unavailable = summaries_unavailable;

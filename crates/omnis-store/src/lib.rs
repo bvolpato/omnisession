@@ -603,8 +603,29 @@ pub enum DiscoveryScope {
         session_ids: Vec<String>,
         summaries_unavailable: bool,
     },
+    /// Desktop read its summary file, but some listed databases had no summary entry.
+    DesktopPartialSummaries {
+        missing_summary_ids: Vec<String>,
+        unverified_archive_ids: Vec<String>,
+    },
     /// The provider was asked for a single workspace.
     Workspace,
+}
+
+enum MissingDesktopSummaries {
+    None,
+    All,
+    Selected(std::collections::HashSet<String>),
+}
+
+impl MissingDesktopSummaries {
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Selected(ids) => ids.contains(id),
+        }
+    }
 }
 
 impl DiscoveryScope {
@@ -617,14 +638,31 @@ impl DiscoveryScope {
         }
     }
 
-    fn desktop_observations(self, provider: Provider) -> Result<(Vec<String>, bool)> {
+    fn desktop_observations(
+        self,
+        provider: Provider,
+    ) -> Result<(Vec<String>, MissingDesktopSummaries)> {
         let observed = match self {
             Self::DesktopUnverifiedArchives {
                 session_ids,
                 summaries_unavailable,
-            } => (session_ids, summaries_unavailable),
-            Self::DesktopDatabasesWithoutSummaries => (Vec::new(), true),
-            _ => return Ok((Vec::new(), false)),
+            } => (
+                session_ids,
+                if summaries_unavailable {
+                    MissingDesktopSummaries::All
+                } else {
+                    MissingDesktopSummaries::None
+                },
+            ),
+            Self::DesktopPartialSummaries {
+                missing_summary_ids,
+                unverified_archive_ids,
+            } => (
+                unverified_archive_ids,
+                MissingDesktopSummaries::Selected(missing_summary_ids.into_iter().collect()),
+            ),
+            Self::DesktopDatabasesWithoutSummaries => (Vec::new(), MissingDesktopSummaries::All),
+            _ => return Ok((Vec::new(), MissingDesktopSummaries::None)),
         };
         if provider != Provider::AntigravityDesktop {
             return Err(StoreError::InvalidSessionReference);
@@ -2727,7 +2765,12 @@ impl Store {
         sessions: &[IndexedSession],
     ) -> Result<Vec<IndexedSession>> {
         validate_discovered_sessions(Provider::AntigravityDesktop, sessions)?;
-        retain_desktop_summaries(&self.connection.borrow(), home, sessions)
+        retain_desktop_summaries(
+            &self.connection.borrow(),
+            home,
+            sessions,
+            &MissingDesktopSummaries::All,
+        )
     }
 
     /// Returns the last positive step count verified for this Desktop home and database file.
@@ -2827,11 +2870,12 @@ impl Store {
             missing = changes.missing;
             adjusted = changes.updated;
             adjusted.as_slice()
-        } else if summaries_unavailable {
+        } else if !matches!(summaries_unavailable, MissingDesktopSummaries::None) {
             adjusted = retain_desktop_summaries(
                 &transaction,
                 home.ok_or(StoreError::InvalidSessionReference)?,
                 sessions,
+                &summaries_unavailable,
             )?;
             adjusted.as_slice()
         } else {
@@ -2854,6 +2898,11 @@ impl Store {
                 write_indexed_session_row(&mut statement, &provider_name, session, indexed_at)?;
                 if let Some(home) = home {
                     record_discovery_home(&transaction, &session.session, home)?;
+                    if provider == Provider::AntigravityDesktop
+                        && !summaries_unavailable.contains(&session.session.id)
+                    {
+                        record_desktop_declared_steps(&transaction, session, home)?;
+                    }
                 }
             }
         }
@@ -4343,6 +4392,7 @@ impl TrajectoryWriteContext<'_> {
                 transaction,
                 home.ok_or(StoreError::InvalidSessionReference)?,
                 std::slice::from_ref(row),
+                &MissingDesktopSummaries::All,
             )?;
             write_indexed_session(transaction, &retained[0])?;
         } else {
@@ -5317,10 +5367,41 @@ fn record_verified_document_home(
     Ok(())
 }
 
+fn record_desktop_declared_steps(
+    transaction: &Transaction<'_>,
+    row: &IndexedSession,
+    home: &Path,
+) -> Result<()> {
+    let Some(file) = row.source_revision.and_then(|revision| revision.file) else {
+        return Ok(());
+    };
+    let count = i64::try_from(row.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
+    // Discovery can read a newer declaration even if the subsequent document read fails.
+    // Keep it with the verified database so another home's catalog cannot displace it.
+    transaction
+        .prepare_cached(
+            "UPDATE native_search_document_homes SET declared_steps=?1
+             WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='antigravity-desktop'
+                 AND session_id=?2 AND origin='native' AND source_file_id=?3)
+             AND verification=1 AND source_file=?3 AND source_home=?4 AND declared_steps IS NOT ?1",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![
+                count,
+                row.session.id,
+                file.as_bytes(),
+                home.as_os_str().as_encoded_bytes()
+            ])
+        })
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn retain_desktop_summaries(
     connection: &Connection,
     home: &Path,
     sessions: &[IndexedSession],
+    missing: &MissingDesktopSummaries,
 ) -> Result<Vec<IndexedSession>> {
     let mut statement = connection
         .prepare_cached(
@@ -5334,6 +5415,9 @@ fn retain_desktop_summaries(
     sessions
         .iter()
         .map(|session| {
+            if !missing.contains(&session.session.id) {
+                return Ok(session.clone());
+            }
             let previous = statement
                 .query_row(
                     params![session.session.id, home.as_os_str().as_encoded_bytes()],

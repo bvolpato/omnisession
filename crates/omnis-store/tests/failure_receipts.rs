@@ -768,6 +768,7 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
     );
     publish(&b);
     assert!(cached());
+
     let partial = TrajectoryDocument {
         derived_title: Some("Partial title"),
         ..preview(revision(4, 4))
@@ -787,6 +788,60 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
     );
     publish(&a);
     assert_eq!(title(&b, partial.source_revision.file), None);
+}
+
+#[test]
+fn a_new_desktop_declaration_survives_loss_of_the_catalog_locator() {
+    let fixture = Fixture::new();
+    let store = &fixture.index;
+    let provider = Provider::AntigravityDesktop;
+    let session = SessionRef::new(provider, "restored");
+    let home = fixture.root.path().join("home");
+    let other = fixture.root.path().join("other");
+    let file = Uuid::from_u128(2);
+    let known = IndexedSession {
+        event_count: 3,
+        source_revision: Some(revision(2, 2)),
+        ..locator(&session)
+    };
+    store
+        .upsert_verified_session_document_with_catalog(
+            &known,
+            Some(&home),
+            false,
+            full("verified history", revision(2, 2)),
+            store.observe_trajectory_document(&session).unwrap(),
+            |_, _| true,
+        )
+        .unwrap();
+    let count = || {
+        store
+            .verified_desktop_step_count(&session, &home, file)
+            .unwrap()
+    };
+    assert_eq!(count(), Some(3));
+
+    let empty = IndexedSession {
+        source_revision: Some(revision(2, 3)),
+        event_count: 0,
+        ..known
+    };
+    let discover = |home, scope| {
+        store
+            .cache_discovered_sessions(provider, std::slice::from_ref(&empty), scope, Some(home))
+            .unwrap();
+    };
+    discover(
+        &home,
+        omnis_store::DiscoveryScope::DesktopPartialSummaries {
+            missing_summary_ids: vec![session.id.clone()],
+            unverified_archive_ids: Vec::new(),
+        },
+    );
+    assert_eq!(count(), Some(3));
+    discover(&home, omnis_store::DiscoveryScope::Workspace);
+    discover(&other, omnis_store::DiscoveryScope::Workspace);
+    assert_eq!(count(), None);
 }
 
 #[test]

@@ -328,11 +328,11 @@ fn store_observed_search_document(
     guard: TrajectorySourceGuard,
     locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
-    if session.provider != Provider::Imported
-        && omnis_adapters::AntigravityAdapter::has_missing_database_steps(snapshot)
-    {
+    let Some(full_read) =
+        search_index::index_source_complete(Some(store), session, snapshot, full_read)?
+    else {
         return Ok(false);
-    }
+    };
     let document = trajectory_search_document(snapshot);
     let title = search_index::IndexedTitle::from_read(
         session.provider,
@@ -823,9 +823,16 @@ impl<'a> CatalogCheck<'a> {
     }
 
     fn restore_desktop_summaries(&self, store: &Store, listing: &mut NativeListing) {
-        if listing.desktop_summaries_unavailable
+        if (listing.desktop_summaries_unavailable
+            || !listing.missing_desktop_summary_ids.is_empty())
             && let Some(home) = &self.home
-            && let Err(error) = fill_cached_desktop_summaries(store, home, &mut listing.sessions)
+            && let Err(error) = fill_cached_desktop_summaries(
+                store,
+                home,
+                &mut listing.sessions,
+                listing.desktop_summaries_unavailable,
+                &listing.missing_desktop_summary_ids,
+            )
         {
             listing
                 .notes
@@ -845,6 +852,7 @@ impl<'a> CatalogCheck<'a> {
             sessions: rows,
             notes,
             desktop_summaries_unavailable: unavailable,
+            missing_desktop_summary_ids,
             unverified_desktop_ids,
         } = listing;
         let indexed = if self.persist {
@@ -861,8 +869,8 @@ impl<'a> CatalogCheck<'a> {
             if !self.persist {
                 return Ok(store.discovery_checkpoint_is_current(checkpoint)?);
             }
-            let scope = if *unavailable {
-                DiscoveryScope::DesktopDatabasesWithoutSummaries
+            let scope = if *unavailable || !missing_desktop_summary_ids.is_empty() {
+                discovery_scope(false, *unavailable, missing_desktop_summary_ids, &[])
             } else {
                 DiscoveryScope::Workspace
             };
@@ -881,6 +889,7 @@ impl<'a> CatalogCheck<'a> {
             discovery_scope(
                 notes.is_empty() && registry.adapter(self.provider)?.discovery_is_complete(),
                 *unavailable,
+                missing_desktop_summary_ids,
                 unverified_desktop_ids,
             )
         };
@@ -1286,9 +1295,15 @@ const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 fn discovery_scope(
     complete: bool,
     summaries_unavailable: bool,
+    missing_summary_ids: &[String],
     unverified_ids: &[String],
 ) -> DiscoveryScope {
-    if !unverified_ids.is_empty() {
+    if !missing_summary_ids.is_empty() {
+        DiscoveryScope::DesktopPartialSummaries {
+            missing_summary_ids: missing_summary_ids.to_vec(),
+            unverified_archive_ids: unverified_ids.to_vec(),
+        }
+    } else if !unverified_ids.is_empty() {
         DiscoveryScope::DesktopUnverifiedArchives {
             session_ids: unverified_ids.to_vec(),
             summaries_unavailable,
@@ -1306,13 +1321,20 @@ fn fill_cached_desktop_summaries(
     store: &Store,
     home: &Path,
     sessions: &mut [NativeSession],
+    all_missing: bool,
+    missing_ids: &[String],
 ) -> omnis_store::Result<()> {
-    let listed = sessions
+    let missing: HashSet<_> = missing_ids.iter().collect();
+    let selected: Vec<_> = sessions
+        .iter_mut()
+        .filter(|row| all_missing || missing.contains(&row.session.id))
+        .collect();
+    let listed = selected
         .iter()
-        .map(indexed_session_metadata)
+        .map(|row| indexed_session_metadata(row))
         .collect::<Vec<_>>();
     let cached = store.desktop_sessions_with_cached_summaries(home, &listed)?;
-    for (session, row) in sessions.iter_mut().zip(cached) {
+    for (session, row) in selected.into_iter().zip(cached) {
         session.title = row.title;
         session.project_path = row.project_path;
         session.git_branch = row.git_branch;
