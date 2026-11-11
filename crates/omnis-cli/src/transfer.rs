@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use omnis_adapters::OpenCodeGeneration;
+use omnis_adapters::{OpenCodeGeneration, ProviderAdapter};
 use omnis_core::{ImportTrajectory, TrajectoryItem, TrajectoryItemKind, needs_recovery_handoff};
 use omnis_ir::SourceRevision;
 use omnis_store::{BindingRecord, BranchHeadAdvance, BranchHeadRestore};
@@ -642,6 +642,7 @@ fn resume_native_without_snapshot(
     if let Some(started_at) = fork_started_at {
         link_native_fork(
             registry,
+            request.agent_target(),
             &request.source,
             &plan,
             started_at,
@@ -774,6 +775,7 @@ fn resume_opencode_v2_fork(
 
 fn link_native_fork(
     registry: &AdapterRegistry,
+    target: AgentTarget,
     source: &SessionRef,
     plan: &LaunchPlan,
     started_at: chrono::DateTime<Utc>,
@@ -782,7 +784,9 @@ fn link_native_fork(
 ) -> Result<()> {
     let provider = provider_name(source.provider);
     let project = if source.provider == Provider::Codex {
-        Some(codex_import::launch_directory(plan)?)
+        Some(codex_import::launch_directory(
+            target.codex_option_plan(plan)?.as_ref(),
+        )?)
     } else {
         plan.cwd.clone()
     };
@@ -1083,7 +1087,8 @@ fn codex_native_launch(
     let native_args = std::mem::take(&mut plan.args);
     let mut plan = target.launch_with_mode(plan, &mode_args)?;
     if (override_dir || !startup_matches)
-        && !plan
+        && !target
+            .codex_option_plan(&plan)?
             .args
             .iter()
             .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
@@ -1095,7 +1100,13 @@ fn codex_native_launch(
         !requires_import_for_native_resume(registry, source, target)?,
         "selected Codex rollout no longer supports a native launch"
     );
-    verify_codex_launch(registry, source, source, &mut plan)?;
+    verify_codex_launch(
+        registry.adapter(Provider::Codex)?,
+        target,
+        source,
+        source,
+        &mut plan,
+    )?;
     let selected = registry.find_native_session(Provider::Codex, &source.id)?;
     anyhow::ensure!(
         selected
@@ -1107,13 +1118,13 @@ fn codex_native_launch(
 }
 
 pub(super) fn verify_codex_launch(
-    registry: &AdapterRegistry,
+    adapter: &dyn ProviderAdapter,
+    target: AgentTarget,
     session: &SessionRef,
     source: &SessionRef,
     plan: &mut LaunchPlan,
 ) -> Result<()> {
-    let route =
-        codex_import::pin_local_server(registry.adapter(Provider::Codex)?, Some(session), plan);
+    let route = codex_import::pin_local_server(adapter, target, Some(session), plan);
     if matches!(route, Ok(true)) {
         return Ok(());
     }
@@ -1325,10 +1336,25 @@ impl ResumeContext<'_> {
     }
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
+        self.launch_plan_from(session, target, self.registry.adapter(session.provider)?)
+    }
+
+    fn launch_plan_from(
+        &self,
+        session: &SessionRef,
+        target: &LaunchTarget,
+        source_adapter: &dyn ProviderAdapter,
+    ) -> Result<LaunchPlan> {
         let plan = self.registry.launch_plan(session, target)?;
         let mut plan = self.agent_target().launch_with_mode(plan, self.mode_args)?;
         if session.provider == Provider::Codex && !self.args.materialize_only {
-            verify_codex_launch(self.registry, session, self.source, &mut plan)?;
+            verify_codex_launch(
+                source_adapter,
+                self.agent_target(),
+                session,
+                self.source,
+                &mut plan,
+            )?;
         }
         Ok(plan)
     }
@@ -1338,7 +1364,12 @@ impl ResumeContext<'_> {
         let mut plan = self.agent_target().launch_with_mode(plan, self.mode_args)?;
         if provider == Provider::Codex && target.prompt.is_some() {
             anyhow::ensure!(
-                codex_import::pin_local_server(self.registry.adapter(provider)?, None, &mut plan)?,
+                codex_import::pin_local_server(
+                    self.registry.adapter(provider)?,
+                    self.agent_target(),
+                    None,
+                    &mut plan
+                )?,
                 "cannot verify the local Codex configuration for the handoff file"
             );
         }
@@ -2193,14 +2224,17 @@ fn resume_via_codex_import(
     };
     let rollback = || codex_import::rollback(binary, context.project, &target, import);
     interrupt.check(ImportCheckpoint::Materialized, &target, rollback)?;
-    let launch = match context.launch_plan(
-        &target,
-        &LaunchTarget {
-            cwd: Some(context.process_directory.to_path_buf()),
-            fork: false,
-            prompt: None,
-        },
-    ) {
+    let launch = match import.target_adapter().and_then(|adapter| {
+        context.launch_plan_from(
+            &target,
+            &LaunchTarget {
+                cwd: Some(context.process_directory.to_path_buf()),
+                fork: false,
+                prompt: None,
+            },
+            &adapter,
+        )
+    }) {
         Ok(launch) => launch,
         Err(error) => {
             return Err(error_after_rollback(

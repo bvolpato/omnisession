@@ -2898,7 +2898,13 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
         check_launcher_starts(target, &plan)?;
         if target.provider == Provider::Codex {
             let mut plan = target.launch_with_mode(plan, &mode_args)?;
-            transfer::verify_codex_launch(registry, &source, &source, &mut plan)?;
+            transfer::verify_codex_launch(
+                registry.adapter(Provider::Codex)?,
+                target,
+                &source,
+                &source,
+                &mut plan,
+            )?;
         }
         return Ok(fidelity_report_for_snapshot(
             snapshot,

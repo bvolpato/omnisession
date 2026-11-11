@@ -454,19 +454,12 @@ impl CodexAdapter {
         }
     }
 
-    /// Reads an imported thread from the stores selected by its native import.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the thread cannot be read or its selected rollout changes during the read.
-    pub fn read_imported_session(
-        codex_home: &Path,
-        sqlite_home: &Path,
-        session: &SessionRef,
-    ) -> Result<omnis_ir::CanonicalSnapshot> {
+    /// Selects existing threads from the SQLite directory used for the native import.
+    #[must_use]
+    pub fn for_import(codex_home: &Path, sqlite_home: &Path) -> Self {
         let mut adapter = Self::with_root(codex_home);
         adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
-        adapter.read_session(session)
+        adapter
     }
 
     fn discover_session_scan(&self) -> CodexFileScan {

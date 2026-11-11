@@ -956,15 +956,10 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
     let foreign = fixture.root.join("home/foreign state");
     fs::create_dir_all(&foreign)?;
     fs::create_dir_all(&selected)?;
-    let db = rusqlite::Connection::open(selected.join("state_5.sqlite"))?;
-    db.execute_batch(
-        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    write_import_thread_database(
+        &selected.join("state_5.sqlite"),
+        &fixture.generated_rollout(),
     )?;
-    db.execute(
-        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
-        [THREAD_ID, fixture.generated_rollout().to_str().unwrap()],
-    )?;
-    drop(db);
     let foreign_db = foreign.join("state_5.sqlite");
     fs::write(&foreign_db, b"damaged caller database")?;
     let canary = foreign.join(THREAD_ID);
@@ -977,9 +972,13 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
         "routed",
         "--materialize-only",
     ]);
-    let run = |read, rollout| {
+    let run = |read, rollout, materialize_only| {
         fixture.run(
-            &args,
+            if materialize_only {
+                &args
+            } else {
+                &args[..args.len() - 1]
+            },
             &[
                 ("FAKE_CODEX_VERSION", "0.167.1"),
                 ("FAKE_CODEX_TRACK_DATABASE", "1"),
@@ -989,7 +988,7 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
             ],
         )
     };
-    let failed = run("empty", "faithful");
+    let failed = run("empty", "faithful", true);
     assert!(!failed.status.success(), "{}", failed.stderr);
     assert!(
         fixture
@@ -1015,9 +1014,13 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
         assert!(!selected.join(THREAD_ID).exists());
         assert!(!fixture.generated_rollout().exists());
     };
-    assert_readback_rollback(run("", "divergent"));
-    let succeeded = run("", "faithful");
+    assert_readback_rollback(run("", "divergent", true));
+    let succeeded = run("", "faithful", true);
     assert!(succeeded.status.success(), "{}", succeeded.stderr);
+    assert!(fixture.launch_arguments().is_none());
+    let launched = run("", "faithful", false);
+    assert!(launched.status.success(), "{}", launched.stderr);
+    assert_import_resume(&fixture, &selected)?;
     let generated = fs::read_to_string(fixture.generated_rollout())?;
     assert!(generated.contains(SOURCE_QUESTION));
     assert_eq!(fs::read_to_string(selected.join(THREAD_ID))?, generated);
@@ -1029,7 +1032,7 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
     fs::copy(selected.join("state_5.sqlite"), &foreign_db)?;
     let caller_before = fs::read(&foreign_db)?;
     fs::write(selected.join("state_5.sqlite"), b"damaged profile database")?;
-    assert_readback_rollback(run("", "faithful"));
+    assert_readback_rollback(run("", "faithful", true));
     assert_eq!(fs::read(&foreign_db)?, caller_before);
     assert_eq!(
         fs::read_to_string(&canary)?,
@@ -1037,11 +1040,35 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
     );
     let pins = fs::read_to_string(fixture.capture.join("sqlite-pins"))?;
     let pins: Vec<_> = pins.lines().collect();
-    assert_eq!(pins.len(), 7, "three rollbacks and a successful import");
+    assert_eq!(pins.len(), 8, "three rollbacks and two successful imports");
     for pin in pins {
         let config: toml::Table = toml::from_str(pin)?;
         assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), selected);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_import_resume(fixture: &Fixture, selected: &Path) -> anyhow::Result<()> {
+    let launched = fixture.launch_arguments().expect("native Codex launch");
+    let pin = format!("sqlite_home={}", serde_json::to_string(selected)?);
+    assert!(
+        launched.ends_with(&strings(&["-c", &pin, "resume", THREAD_ID])),
+        "{launched:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_import_thread_database(path: &Path, rollout: &Path) -> anyhow::Result<()> {
+    let db = rusqlite::Connection::open(path)?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        [THREAD_ID, rollout.to_str().unwrap()],
+    )?;
     Ok(())
 }
 

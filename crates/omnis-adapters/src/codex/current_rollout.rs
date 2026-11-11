@@ -46,7 +46,7 @@ impl CurrentRollouts {
     pub(super) fn pinned(sqlite_home: &Path) -> Self {
         Self {
             pinned: Some(sqlite_home.to_owned()),
-            ..Self::default()
+            ..Self::from_env()
         }
     }
 
@@ -71,8 +71,14 @@ impl CurrentRollouts {
         overrides: &crate::CodexLaunchOverrides,
         expand_env_tilde: &dyn Fn() -> Result<bool>,
     ) -> Result<PathBuf> {
-        self.sqlite_home
-            .resolve_for_launch(home, cwd, overrides, expand_env_tilde)
+        let destination =
+            self.sqlite_home
+                .resolve_for_launch(home, cwd, overrides, expand_env_tilde)?;
+        ensure!(
+            self.pinned.as_ref().is_none_or(|root| root == &destination),
+            "Codex launch selects a different SQLite home than the native import"
+        );
+        Ok(destination)
     }
 
     pub(super) fn stamp(&self, home: &Path) -> Option<CurrentRolloutStamp> {
@@ -616,7 +622,11 @@ fn copies_match(
         Some(hash) => hash,
         None => *reference_digest.insert(hash_copy(reference, remaining)?),
     };
-    Ok(hash_copy(copy, remaining)? == expected)
+    match hash_copy(copy, remaining) {
+        Ok(hash) => Ok(hash == expected),
+        Err(error) if error.is::<CurrentRolloutUnavailable>() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
@@ -630,16 +640,16 @@ fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
         .take(*remaining + 1);
     let mut buffer = [0; 16 * 1024];
     let mut decoded = 0;
-    loop {
-        let size = reader
-            .read(&mut buffer)
-            .map_err(|error| copy_read_error(&copy.path, error))?;
-        if size == 0 {
-            break;
+    let result = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(size) => {
+                decoded += size as u64;
+                hash.update(&buffer[..size]);
+            }
+            Err(error) => break Err(copy_read_error(&copy.path, error)),
         }
-        hash.update(&buffer[..size]);
-        decoded += size as u64;
-    }
+    };
     *remaining = remaining
         .checked_sub(encoded.max(decoded))
         .ok_or(CurrentRolloutUnconfirmed)?;
@@ -647,6 +657,7 @@ fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
         Some(copy.revision) == CodexAdapter::index_file_revision(&copy.path),
         CurrentRolloutUnconfirmed
     );
+    result?;
     Ok(hash.finalize().into())
 }
 
@@ -808,6 +819,59 @@ mod tests {
         assert!(read().unwrap_err().is::<CurrentRolloutUnavailable>());
         fs::remove_file(packed)?;
         assert_eq!(read()?.unwrap().path, copy);
+        Ok(())
+    }
+
+    #[test]
+    fn a_damaged_gzip_does_not_hide_a_copy_matching_the_readable_original() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().join("restored");
+        let selected = rollout(
+            &fixture.path().join("origin/sessions"),
+            None,
+            "final request",
+        )?;
+        let archive = rollout(&home.join("archived_sessions"), None, "final request")?;
+        let active = home.join("sessions");
+        fs::create_dir_all(&active)?;
+        let damaged = active
+            .join(selected.file_name().unwrap())
+            .with_extension("jsonl.gz");
+        let mut gzip =
+            flate2::write::GzEncoder::new(fs::File::create(&damaged)?, flate2::Compression::fast());
+        gzip.write_all(&fs::read(&selected)?)?;
+        let file = gzip.finish()?;
+        file.set_len(file.metadata()?.len() - 4)?;
+        drop(file);
+        let row = CurrentRollout {
+            path: selected,
+            paginated: Some(true),
+            archived: false,
+        };
+        let paths = [damaged.as_path(), archive.as_path()];
+        assert_eq!(
+            row.resolve(&home, THREAD, paths, true)?.unwrap().path,
+            archive
+        );
+        assert!(
+            row.resolve(&home, THREAD, [damaged.as_path()], true)
+                .unwrap_err()
+                .is::<CurrentRolloutUnavailable>()
+        );
+        fs::remove_file(&row.path)?;
+        assert!(
+            row.resolve(&home, THREAD, paths, true)
+                .unwrap_err()
+                .is::<CurrentRolloutUnavailable>()
+        );
+        let copy = row.check(&damaged, THREAD)?.unwrap();
+        let mut budget = 64 * 1024;
+        assert!(
+            hash_copy(&copy, &mut budget)
+                .unwrap_err()
+                .is::<CurrentRolloutUnavailable>()
+        );
+        assert!(budget <= 64 * 1024 - fs::metadata(&damaged)?.len());
         Ok(())
     }
 

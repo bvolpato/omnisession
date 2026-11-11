@@ -1519,6 +1519,32 @@ fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config()
 }
 
 #[test]
+fn codex_resume_keeps_wrapper_configuration_arguments_opaque() {
+    let fixture = fixture_with_codex_session(
+        "[profiles.selected]\nagent = 'codex'\nprogram = '${ROOT}/bin/wrapper'\nargs = ['-c', 'production']\n",
+        "openai",
+    );
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let output = codex_run(
+        &fixture,
+        &["resume", &source, "--in", "selected", "--no-fork"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = fixture.captured("args");
+    let args: Vec<_> = captured.split_terminator('\0').collect();
+    assert!(args.starts_with(&["-c", "production"]));
+    assert!(
+        args.windows(2)
+            .any(|a| a[0] == "-c" && a[1].starts_with("sqlite_home="))
+    );
+    assert!(args.ends_with(&["resume", CODEX_SESSION_ID]));
+}
+
+#[test]
 fn codex_workspace_flags_follow_the_selected_executable() {
     let fixture = fixture_with_codex_session("", "openai");
     let native = fixture.root.join("bin/codex");

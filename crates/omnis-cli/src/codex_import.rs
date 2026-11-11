@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use omnis_adapters::{AdapterRegistry, CodexAdapter, LaunchTarget};
+use omnis_adapters::{AdapterRegistry, CodexAdapter, LaunchTarget, ProviderAdapter};
 use omnis_core::{
     CODEX_IMPORT_MARKER, HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope,
     redact_secrets, reports_omitted_events,
@@ -120,8 +120,12 @@ impl CodexImport {
             .context("missing verified Codex import SQLite home")
     }
 
+    pub(super) fn target_adapter(&self) -> Result<CodexAdapter> {
+        Ok(CodexAdapter::for_import(&self.home, self.sqlite_home()?))
+    }
+
     pub(super) fn read_target(&self, target: &SessionRef) -> Result<CanonicalSnapshot> {
-        CodexAdapter::read_imported_session(&self.home, self.sqlite_home()?, target)
+        self.target_adapter()?.read_session(target)
     }
 
     pub(crate) fn for_launch_profile(
@@ -131,15 +135,12 @@ impl CodexImport {
         process_directory: &Path,
     ) -> Result<Self> {
         let adapter = registry.adapter(Provider::Codex)?;
-        let mut plan = target.launch(adapter.new_session_plan(&LaunchTarget {
+        let plan = target.launch(adapter.new_session_plan(&LaunchTarget {
             cwd: Some(process_directory.to_owned()),
             ..LaunchTarget::default()
         })?)?;
-        if !target.uses_provider_program()? {
-            // Native import uses the installed Codex. The replacement program runs only after the copy is verified.
-            plan.args.clear();
-            plan.program = "codex".into();
-        } else if target.profile.is_some() {
+        let mut plan = target.codex_option_plan(&plan)?.into_owned();
+        if target.profile.is_some() && target.uses_provider_program()? {
             self.profile = ImportProfile::resolve(&plan.args, &self.home)?;
         }
         let sqlite_home = if let Some(home) = profile::selected_sqlite_home(adapter, None, &plan)? {

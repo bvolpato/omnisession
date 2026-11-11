@@ -636,6 +636,26 @@ impl AgentTarget {
         self.profile.is_some_and(LaunchProfile::overrides_program)
     }
 
+    /// Returns the arguments that Codex receives after an opaque wrapper consumes its own prefix.
+    pub(crate) fn codex_option_plan(
+        self,
+        plan: &LaunchPlan,
+    ) -> Result<std::borrow::Cow<'_, LaunchPlan>> {
+        if self.uses_provider_program()? {
+            return Ok(std::borrow::Cow::Borrowed(plan));
+        }
+        let prefix = self.profile.map_or(0, |profile| profile.args.len());
+        let args = plan
+            .args
+            .get(prefix..)
+            .context("missing launch profile arguments")?;
+        Ok(std::borrow::Cow::Owned(LaunchPlan {
+            program: "codex".into(),
+            args: args.to_vec(),
+            ..plan.clone()
+        }))
+    }
+
     /// Whether the profile runs the installed provider executable, including through an alias.
     pub(crate) fn uses_provider_program(self) -> Result<bool> {
         let Some(program) = self.own_program()? else {
