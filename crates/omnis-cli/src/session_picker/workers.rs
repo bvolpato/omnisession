@@ -32,7 +32,8 @@ pub(super) struct DiscoveryUpdate {
 }
 
 pub(super) struct CatalogNames {
-    pub(super) observed: Vec<IndexedSession>,
+    pub(super) inventory: omnis_store::CodexCatalogInventory,
+    pub(super) prior_assignments: std::collections::HashMap<String, String>,
     pub(super) complete: bool,
 }
 
@@ -47,11 +48,12 @@ impl SessionCacheUpdate {
     pub(super) fn persist(&self, store: &Store) -> omnis_store::Result<()> {
         if self.provider == Provider::Codex {
             if let Some(names) = &self.names {
-                store.refresh_codex_catalog(
+                store.refresh_codex_catalog_with_name_history(
                     &self.sessions,
                     self.complete,
                     names.complete,
-                    &names.observed,
+                    &names.inventory,
+                    &names.prior_assignments,
                 )?;
             }
             Ok(())
@@ -403,7 +405,7 @@ pub(super) fn spawn_provider_update(
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
         let observed = if provider == Provider::Codex {
-            match Store::open_default().and_then(|store| store.observe_codex_catalog()) {
+            match Store::open_default().and_then(|store| store.observe_codex_catalog_inventory()) {
                 Ok(sessions) => Some(sessions),
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
@@ -419,13 +421,16 @@ pub(super) fn spawn_provider_update(
                 let complete = registry
                     .adapter(provider)
                     .is_ok_and(ProviderAdapter::discovery_is_complete);
-                let names = observed.map(|observed| {
-                    Arc::new(CatalogNames {
-                        observed,
-                        complete: registry
-                            .adapter(provider)
-                            .is_ok_and(ProviderAdapter::session_titles_are_complete),
-                    })
+                let names = observed.and_then(|inventory| {
+                    let adapter = registry.adapter(provider).ok()?;
+                    let complete = adapter.session_titles_are_complete();
+                    let prior_assignments =
+                        crate::prior_codex_assignments(adapter, &sessions, &inventory, complete);
+                    Some(Arc::new(CatalogNames {
+                        inventory,
+                        prior_assignments,
+                        complete,
+                    }))
                 });
                 for note in notes {
                     if sender.send(PickerUpdate::Warning(note)).is_err() {
@@ -610,6 +615,38 @@ impl<'a> PreviewWriter<'a> {
             selected,
         })
     }
+
+    fn matching_selection(
+        &self,
+        read: &omnis_adapters::IndexRead,
+    ) -> Option<(&IndexedSession, &SelectedSessionObservation)> {
+        let observation = self.selected.as_ref()?;
+        let row = observation.metadata.as_ref()?;
+        (read.source_revision.contents.is_some()
+            && row
+                .source_revision?
+                .matches_file_contents(read.source_revision)
+            && row.updated_at?.timestamp_millis() == read.snapshot.captured_at.timestamp_millis())
+        .then_some((row, observation))
+    }
+}
+
+fn record_bundle_preview(
+    session: &SessionRef,
+    writer: Option<&PreviewWriter<'_>>,
+    snapshot: &omnis_ir::CanonicalSnapshot,
+) -> anyhow::Result<PreviewMetadata> {
+    let mut metadata = PreviewMetadata::default();
+    if let Some(writer) = writer {
+        metadata.indexed_title = crate::store_search_document(
+            writer.store,
+            session,
+            crate::SearchDocumentInput::Bundle(snapshot),
+            None,
+            writer.guard,
+        )?;
+    }
+    Ok(metadata)
 }
 
 fn record_preview(
@@ -620,17 +657,7 @@ fn record_preview(
     read: &mut omnis_adapters::IndexRead,
 ) -> anyhow::Result<PreviewMetadata> {
     if session.provider == Provider::Imported {
-        let mut metadata = PreviewMetadata::default();
-        if let Some(writer) = writer {
-            metadata.indexed_title = crate::store_search_document(
-                writer.store,
-                session,
-                crate::SearchDocumentInput::Bundle(&read.snapshot),
-                None,
-                writer.guard,
-            )?;
-        }
-        return Ok(metadata);
+        return record_bundle_preview(session, writer, &read.snapshot);
     }
     let revision = read.source_revision;
     let native = read.native_session.as_ref();
@@ -658,16 +685,8 @@ fn record_preview(
         }),
         ..PreviewMetadata::default()
     };
-    let prior = writer
-        .and_then(|writer| writer.selected.as_ref())
-        .and_then(|observation| observation.metadata.as_ref().map(|row| (row, observation)))
-        .filter(|(row, _)| {
-            row.source_revision.is_some_and(|source| {
-                revision.contents.is_some() && source.matches_file_contents(revision)
-            }) && row.updated_at.is_some_and(|time| {
-                time.timestamp_millis() == read.snapshot.captured_at.timestamp_millis()
-            })
-        });
+    let observed = writer.and_then(|writer| writer.selected.as_ref());
+    let prior = writer.and_then(|writer| writer.matching_selection(read));
     let mut selection = None;
     if let Some(name) = known_name {
         let name = name.as_deref().map(omnis_core::redact_secrets);
@@ -680,26 +699,43 @@ fn record_preview(
             );
             let mut selected = row.clone();
             selected.title.clone_from(&name);
-            selection = Some((selected, observation));
+            selection = Some((selected, observation, None));
         }
         metadata.provider_name = Some(ProviderNameChange {
             previous: previous_name,
             current: name,
         });
-    } else if session.provider == Provider::Codex && native.is_some() {
-        read.snapshot.title = if let Some((row, observation)) = prior {
+    } else if session.provider == Provider::Codex {
+        if let Some((row, observation)) = prior {
             if row.title.is_some() {
-                selection = Some((row.clone(), observation));
+                selection = Some((row.clone(), observation, None));
             }
-            row.title.clone()
-        } else {
-            previous_name
-        };
+            read.snapshot.title.clone_from(&row.title);
+        } else if observed.is_none() {
+            read.snapshot.title = previous_name;
+        }
+    }
+    if prior.is_none()
+        && let Some((native, observation)) = native.zip(observed)
+    {
+        let (selected, history) = crate::selected_read_metadata(
+            registry,
+            native,
+            revision,
+            &mut read.snapshot,
+            name_observation.as_ref(),
+            Some(observation),
+        );
+        if (!name_observed && selected.title.is_some())
+            || observation.legacy_codex_name_candidate(&selected)
+        {
+            selection = Some((selected, observation, history));
+        }
     }
     if let Some(writer) = writer {
         let target = match selection.as_ref() {
-            Some((selected, observation)) => {
-                crate::SearchDocumentTarget::Selected(selected, observation)
+            Some((selected, observation, history)) => {
+                crate::SearchDocumentTarget::Selected(selected, observation, history.as_deref())
             }
             None => native.map_or(
                 crate::SearchDocumentTarget::Session(session),

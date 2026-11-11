@@ -849,6 +849,7 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
         writeln!(file, "{pad}").unwrap();
     }
     for row in [
+        json!({"type":"dynamic_tools_updated","payload":{"thread_id":CODEX_ID,"tools":[]}}),
         json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
         json!({"type":"response_item","payload":{"type":"message","role":"user",
             "content":[{"type":"input_text","text":"Investigate latency instead"}]}}),
@@ -1123,6 +1124,88 @@ fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
             .session_index_checked_at(Provider::Codex)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn an_unscoped_catalog_name_needs_its_prior_assignment_and_original_rollout() {
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let names = codex.join("session_index.jsonl");
+    let assignment = |id, name| json!({"id": id, "thread_name": name});
+    let prior = assignment(CODEX_ID, "Azure Quokka");
+    let other = assignment(OTHER_CODEX_ID, "Elm Cormorant");
+    fs::write(&names, format!("{prior}\n{other}\n")).unwrap();
+    fixture.index_codex();
+
+    // An interrupted older index saved the catalog before writing trajectories or recording the home.
+    let state = fixture.root.join("state");
+    let populated = fixture.root.join("populated");
+    fs::rename(&state, &populated).unwrap();
+    fixture.search(&["--cached", "Quokka"]);
+    let db = rusqlite::Connection::open(state.join("store.sqlite3")).unwrap();
+    db.execute(
+        "ATTACH DATABASE ?1 AS populated",
+        [populated.join("store.sqlite3").to_str().unwrap()],
+    )
+    .unwrap();
+    db.execute_batch(
+        "INSERT INTO session_index
+            (provider, session_id, title, project_path, git_branch, created_at, updated_at,
+             updated_at_approximate, event_count, indexed_at, source_file_id, source_contents_id)
+         SELECT provider, session_id, title, project_path, git_branch, created_at, updated_at,
+                updated_at_approximate, event_count, indexed_at, source_file_id, source_contents_id
+         FROM populated.session_index WHERE provider='codex'",
+    )
+    .unwrap();
+    drop(db);
+
+    fs::write(&names, format!("{prior}\n{other}\n{{")).unwrap();
+    let file = codex.join(format!(
+        "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+    ));
+    let replaced = file.with_extension("previous");
+    fs::rename(&file, &replaced).unwrap();
+    fs::copy(&replaced, &file).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(fs::metadata(replaced).unwrap().modified().unwrap())
+        .unwrap();
+
+    let cached = |term| fixture.search_json(&["--all-projects", "--cached", "--show-text", term]);
+    assert_eq!(
+        result_sessions(&cached("Quokka")),
+        [format!("codex:{CODEX_ID}")]
+    );
+    let shown = |id| {
+        let output = fixture
+            .command()
+            .args(["--json", "show", &format!("codex:{id}")])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(shown(CODEX_ID)["title"], "Azure Quokka");
+    assert_eq!(cached("unchanged")["results"][0]["title"], "Azure Quokka");
+    assert!(shown(OTHER_CODEX_ID)["title"].is_null());
+    assert!(result_sessions(&cached("Cormorant")).is_empty());
+    assert_eq!(
+        cached("zebracorn")["results"][0]["title"],
+        "Draft release notes"
+    );
+    fs::write(names, "").unwrap();
+    assert_eq!(fixture.index_codex()["failed"], 0);
+    assert!(result_sessions(&cached("Quokka")).is_empty());
+    assert_eq!(
+        cached("unchanged")["results"][0]["title"],
+        "Tune the rate limiter backoff"
     );
 }
 

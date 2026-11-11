@@ -1132,6 +1132,133 @@ fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON output")
 }
 
+fn add_rollout_databases(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    fixture.executable("bin/codex", "#!/bin/sh\necho 'codex-cli 0.167.1'\n");
+    let home = fixture.root.join("codex");
+    let alternate = fixture.root.join("alternate-state");
+    fs::create_dir(&alternate).unwrap();
+    let file = |day| {
+        home.join("sessions").join(format!(
+            "rollout-2026-01-{day:02}T00-00-00-{CODEX_SESSION_ID}.jsonl"
+        ))
+    };
+    let selected = file(1);
+    let other = file(2);
+    let header = fs::read_to_string(&selected).unwrap();
+    for (path, text) in [
+        (&selected, "Keep the visible draft"),
+        (&other, "Other branch"),
+    ] {
+        let row = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]}});
+        fs::write(path, format!("{header}\n{row}\n")).unwrap();
+    }
+    for directory in [&home, &alternate] {
+        let db = rusqlite::Connection::open(directory.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+            (CODEX_SESSION_ID, selected.to_str().unwrap()),
+        )
+        .unwrap();
+    }
+    (alternate, other)
+}
+
+fn select_alternate_rollout(alternate: &std::path::Path, other: &std::path::Path) {
+    rusqlite::Connection::open(alternate.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [other.to_str().unwrap()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let (alternate, other) = add_rollout_databases(&fixture);
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let fork = ["fork", &source, "--in", "routed", "--dry-run"];
+    let original = [
+        "resume",
+        &source,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--dry-run",
+    ];
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\n[profiles.routed.env]\nCODEX_SQLITE_HOME = {}\n",
+        json!(alternate)
+    ));
+
+    assert_eq!(
+        codex_plan(&fixture, &fork)["fidelity"]["mode"],
+        "native_fork"
+    );
+    select_alternate_rollout(&alternate, &other);
+    let check_declined = |args: &[&str]| {
+        let output = codex_run(&fixture, args);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("different or unverified rollout"), "{error}");
+        assert!(error.contains(&format!("omni handoff {source}")), "{error}");
+    };
+    check_declined(&fork);
+    check_declined(&original);
+
+    fs::write(
+        fixture.root.join("codex/work.config.toml"),
+        format!("sqlite_home = {}\n", json!(alternate)),
+    )
+    .unwrap();
+    fixture.write_profiles("[profiles.routed]\nagent = 'codex'\nargs = ['--profile', 'work']\n");
+    check_declined(&fork);
+
+    let nested = fixture.workspace.join("subdirectory");
+    fs::create_dir(&nested).unwrap();
+    fs::write(fixture.workspace.join("fixture-root"), "").unwrap();
+    fs::write(
+        fixture.root.join("codex/config.toml"),
+        format!(
+            "project_root_markers = ['fixture-root']\n[projects.{}]\ntrust_level = 'trusted'\n",
+            json!(fixture.workspace)
+        ),
+    )
+    .unwrap();
+    let config = fixture.workspace.join(".codex");
+    fs::create_dir(&config).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        format!("sqlite_home = {}\n", json!(alternate)),
+    )
+    .unwrap();
+    for (assignment, can_launch) in [
+        ("project_root_markers=[]", false),
+        (r#"project_root_markers=["fixture-root"]"#, true),
+        ("projects={}", false),
+        ("model=gpt-5", true),
+    ] {
+        let args = json!(["--cd", nested, "-c", assignment]);
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nargs = {args}\n"
+        ));
+        if can_launch {
+            assert_eq!(
+                codex_plan(&fixture, &fork)["fidelity"]["mode"],
+                "native_fork",
+                "{assignment}"
+            );
+        } else {
+            check_declined(&fork);
+        }
+    }
+}
+
 #[test]
 fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
     let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");

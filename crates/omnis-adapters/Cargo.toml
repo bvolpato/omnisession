@@ -34,11 +34,14 @@ serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 wait-timeout.workspace = true
 zstd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+known-folders.workspace = true
 winapi-util.workspace = true
+winreg.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix-openpty.workspace = true

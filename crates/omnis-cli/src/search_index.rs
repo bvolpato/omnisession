@@ -479,20 +479,22 @@ fn observe_replacements(
     {
         return Ok(observations);
     }
-    let catalog = store
-        .observe_codex_catalog()?
-        .into_iter()
-        .map(|row| (row.session.clone(), row))
+    let inventory = store.observe_codex_catalog_inventory()?;
+    let catalog = inventory
+        .observed
+        .iter()
+        .map(|row| (&row.session, row))
         .collect::<HashMap<_, _>>();
     for (candidate, guard) in stale {
         let Some(metadata) = &candidate.metadata else {
             continue;
         };
-        if failures.contains_key(&candidate.session)
+        if inventory.legacy_codex_source(&candidate.session).is_some()
+            || failures.contains_key(&candidate.session)
             || matches!(guard, TrajectorySourceGuard::Observed(Some(prior)) if prior.source_revision.file != candidate.source_revision.file)
             || catalog
                 .get(&candidate.session)
-                .is_some_and(|stored| stored != metadata)
+                .is_some_and(|stored| *stored != metadata)
         {
             observations.insert(
                 candidate.session.clone(),
@@ -692,6 +694,14 @@ fn publish_selected_read(
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
     let name_observed = verified_name_coverage(read.native_name.as_ref(), Some(&selected))?;
     let mut metadata = crate::indexed_session_metadata(&selected);
+    let history = corroborated_codex_name(
+        registry,
+        &selected,
+        revision,
+        &metadata,
+        observation,
+        read.native_name.as_ref(),
+    );
     let mut document = read.store_document();
     let retained;
     if let Some(current) = &observation.metadata
@@ -713,12 +723,13 @@ fn publish_selected_read(
         document.local_opener = LocalOpenerEvidence::Unknown;
         document.withdrawn_title = None;
     }
-    store.upsert_selected_session_document_with_name_coverage(
+    store.upsert_selected_session_document_with_name_history(
         &metadata,
         observation,
         document,
         read.workspace.as_ref(),
         name_observed,
+        history.as_ref().map(|prior| prior.assignment.as_str()),
     )?;
     Ok(store.indexed_trajectory_title(&read.candidate.session)?)
 }
@@ -957,6 +968,37 @@ pub(crate) fn native_codex_name(
         .transpose()
 }
 
+pub(crate) struct CorroboratedCodexName<'a> {
+    pub(crate) stored: &'a str,
+    pub(crate) assignment: String,
+}
+
+pub(crate) fn corroborated_codex_name<'a>(
+    registry: &AdapterRegistry,
+    native: &NativeSession,
+    revision: SourceRevision,
+    selected: &IndexedSession,
+    observation: &'a SelectedSessionObservation,
+    name: Option<&NativeSessionName>,
+) -> Option<CorroboratedCodexName<'a>> {
+    if name != Some(&NativeSessionName::Unknown)
+        || native.title.is_some()
+        || !native
+            .source_revision
+            .is_some_and(|source| source.matches_file_contents(revision))
+        || !observation.legacy_codex_name_candidate(selected)
+    {
+        return None;
+    }
+    let assignment = registry
+        .adapter(Provider::Codex)
+        .ok()?
+        .prior_session_names(&[native])
+        .remove(&native.session.id)?;
+    let stored = observation.corroborated_legacy_codex_name(selected, &assignment)?;
+    Some(CorroboratedCodexName { stored, assignment })
+}
+
 pub(crate) fn verified_name_coverage(
     name: Option<&NativeSessionName>,
     native: Option<&NativeSession>,
@@ -977,7 +1019,7 @@ fn legacy_opener_name(
     registry: &AdapterRegistry,
     session: &SessionRef,
     revision: SourceRevision,
-    prior: &str,
+    prior: &omnis_store::LegacyCodexOpenerCandidate,
     selected_path: impl Fn() -> Result<PathBuf>,
 ) -> Result<Option<NativeSessionName>> {
     let Some(name @ (NativeSessionName::Absent | NativeSessionName::Unknown)) =
@@ -989,7 +1031,8 @@ fn legacy_opener_name(
         &selected_path()?,
         session,
         revision,
-        prior,
+        &prior.title,
+        prior.requires_tool_catalog,
     )? {
         return Ok(None);
     }
@@ -1132,7 +1175,7 @@ impl IndexedTitle {
             && let Some(name) =
                 legacy_opener_name(registry, session, revision, &prior, || selected_path(true))?
         {
-            self.withdrawn = Some(prior);
+            self.withdrawn = Some(prior.title);
             self.local_opener = if name == NativeSessionName::Unknown {
                 self.current = None;
                 self.authoritative = false;

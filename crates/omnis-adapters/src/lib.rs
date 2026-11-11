@@ -218,6 +218,15 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// State database settings that a Codex launch profile supplies.
+#[derive(Debug, Default)]
+pub struct CodexLaunchOverrides {
+    pub project_root_markers: Option<Vec<String>>,
+    pub profile: Option<String>,
+    pub sqlite_home: Option<PathBuf>,
+    pub environment: Option<EnvChange>,
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
@@ -285,6 +294,20 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(NativeResumeSupport::Direct)
     }
 
+    /// Checks whether a native launch in this directory selects the displayed session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot resolve the launch configuration.
+    fn native_selects_session_at(
+        &self,
+        _session: &SessionRef,
+        _cwd: &Path,
+        _overrides: &CodexLaunchOverrides,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Non-fatal discovery observations from this adapter.
     ///
     /// Notes may be computed during the first `list_sessions` call and reused.
@@ -309,6 +332,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// Reads the latest name assignment for one session.
     fn native_session_name(&self, _id: &str) -> NativeSessionName {
         NativeSessionName::Unknown
+    }
+
+    /// Returns earlier readable assignments that can corroborate a saved name for the same rollout.
+    /// An unreadable later row prevents these assignments from establishing the current name.
+    fn prior_session_names(&self, _sessions: &[&NativeSession]) -> HashMap<String, String> {
+        HashMap::new()
     }
 
     /// Checks whether the name still matches the provider's index after a session read.

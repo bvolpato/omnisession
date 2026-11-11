@@ -1,6 +1,6 @@
 use super::{
-    LocalOpenerEvidence, PreparedTrajectoryWrite, Result, SelectedMetadata,
-    SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, database_error,
+    LegacyCodexOpenerCandidate, LocalOpenerEvidence, PreparedTrajectoryWrite, Result,
+    SelectedMetadata, SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, database_error,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -36,7 +36,7 @@ pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) 
     ).map_err(database_error)?;
     if has_origin {
         transaction.execute_batch(
-            "INSERT OR IGNORE INTO legacy_codex_title_proofs
+            "INSERT OR IGNORE INTO legacy_codex_title_proofs(trajectory_id,source_file_id,source_contents_id,previous_title)
              SELECT t.id,t.source_file_id,t.source_contents_id,t.derived_title
              FROM session_trajectories t JOIN session_index c ON c.provider=t.provider AND c.session_id=t.session_id
              WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle AND t.document_version=6
@@ -62,6 +62,45 @@ pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) 
         )).map_err(database_error)?;
     }
     Ok(())
+}
+
+/// The old index could stop following the opening message at a tool catalog update.
+pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>) -> Result<()> {
+    let seen: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('legacy_codex_title_proofs') WHERE name='requires_tool_catalog')",
+        [], |row| row.get(0),
+    ).map_err(database_error)?;
+    if seen {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "ALTER TABLE legacy_codex_title_proofs ADD COLUMN requires_tool_catalog INTEGER NOT NULL DEFAULT 0
+             CHECK(requires_tool_catalog IN (0,1));
+         CREATE TEMP TABLE tool_catalog_title_candidates(id INTEGER PRIMARY KEY);
+         INSERT INTO tool_catalog_title_candidates
+             SELECT t.id FROM session_trajectories t LEFT JOIN session_index c
+               ON c.provider=t.provider AND c.session_id=t.session_id
+             WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle AND t.document_version=6
+               AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL
+               AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown'
+               AND t.derived_title_is_verified AND length(t.derived_title)>0
+               AND ((t.derived_title_is_local_opener=1 AND (c.title IS NULL OR c.source_file_id IS NOT t.source_file_id))
+                    OR (t.derived_title_is_local_opener=0 AND c.source_file_id=t.source_file_id
+                        AND c.source_contents_id=t.source_contents_id AND c.title IS NULL));
+         INSERT OR IGNORE INTO legacy_codex_title_proofs(trajectory_id,source_file_id,source_contents_id,previous_title,requires_tool_catalog)
+             SELECT t.id,t.source_file_id,t.source_contents_id,t.derived_title,1
+             FROM tool_catalog_title_candidates n JOIN session_trajectories t ON n.id=t.id
+             WHERE t.derived_title_is_local_opener=0;
+         DELETE FROM tool_catalog_title_candidates WHERE id IN (
+             SELECT t.id FROM tool_catalog_title_candidates n JOIN session_trajectories t ON n.id=t.id
+             WHERE t.source_complete AND t.truncation_strategy NOT GLOB 'source_incomplete*');
+         UPDATE trajectory_index_failures AS f SET document_version=5 WHERE f.provider='codex' AND f.document_version=6
+           AND EXISTS (SELECT 1 FROM session_trajectories t JOIN tool_catalog_title_candidates n ON t.id=n.id
+               WHERE t.provider=f.provider AND t.session_id=f.session_id AND t.source_file_id=f.source_file_id
+                 AND t.source_contents_id=f.source_contents_id AND t.source_updated_at IS f.source_updated_at);
+         UPDATE session_trajectories SET document_version=5 WHERE id IN (SELECT id FROM tool_catalog_title_candidates);
+         DROP TABLE tool_catalog_title_candidates;"
+    ).map_err(database_error)
 }
 
 pub(super) fn name_retries(connection: &Connection) -> Result<HashMap<SessionRef, SourceRevision>> {
@@ -91,15 +130,20 @@ pub(super) fn candidate(
     connection: &Connection,
     session: &SessionRef,
     file: Uuid,
-) -> Result<Option<String>> {
+) -> Result<Option<LegacyCodexOpenerCandidate>> {
     if session.provider != Provider::Codex {
         return Ok(None);
     }
     connection
         .query_row(
-            &format!("SELECT p.previous_title {MATCHING_PROOF} AND t.session_id=?1 AND t.source_file_id=?2"),
+            &format!("SELECT p.previous_title,p.requires_tool_catalog {MATCHING_PROOF} AND t.session_id=?1 AND t.source_file_id=?2"),
             params![session.id, file.into_bytes()],
-            |row| row.get(0),
+            |row| {
+                Ok(LegacyCodexOpenerCandidate {
+                    title: row.get(0)?,
+                    requires_tool_catalog: row.get(1)?,
+                })
+            },
         )
         .optional()
         .map_err(database_error)

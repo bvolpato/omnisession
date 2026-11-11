@@ -140,6 +140,59 @@ fn gaps_in_the_name_index_warn_without_hiding_rollouts_or_later_names() {
 }
 
 #[test]
+#[cfg(any(unix, windows))]
+fn earlier_names_corroborate_only_rollouts_with_one_possible_home() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let flat = root.path().join("flat");
+    let outer = root.path().join("outer");
+    let inner = outer.join("sessions/team");
+    let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID}});
+    for home in [&flat, &inner] {
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions)?;
+        fs::write(
+            sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+            format!("{header}\n"),
+        )?;
+    }
+    let assignment = |name: &str| json!({"id":SESSION_ID, "thread_name":name});
+    let old = assignment("Old name");
+    let recent = assignment("  Last recorded name  ");
+    let damaged = format!("{old}\n{{torn\n{recent}\n{{torn again\n");
+    for home in [&flat, &outer, &inner] {
+        fs::write(home.join("session_index.jsonl"), &damaged)?;
+    }
+    for home in [&flat, &outer, &inner] {
+        let adapter = CodexAdapter::with_root(home);
+        let session = adapter
+            .find_native_session(SESSION_ID)?
+            .expect("selected rollout");
+        assert!(session.title.is_none());
+        assert_eq!(
+            adapter.native_session_name(SESSION_ID),
+            omnis_adapters::NativeSessionName::Unknown
+        );
+        let prior = adapter.prior_session_names(&[&session]);
+        assert_eq!(
+            prior.get(SESSION_ID).map(String::as_str),
+            (home == &flat).then_some("  Last recorded name  ")
+        );
+        let current = assignment("Confirmed name");
+        fs::write(
+            home.join("session_index.jsonl"),
+            format!("{damaged}{current}\n"),
+        )?;
+        assert!(
+            adapter
+                .native_session_name(SESSION_ID)
+                .confirms(Some("Confirmed name"))
+        );
+        assert!(adapter.prior_session_names(&[&session]).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn missing_codex_home_does_not_claim_complete_discovery() {
     let temporary = tempfile::tempdir().expect("temporary parent directory");
     let missing_home = temporary.path().join("missing-codex-home");
@@ -514,6 +567,47 @@ fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> a
     };
     assert_eq!(title.chars().count(), 240);
     assert!(title.starts_with("Investigate [REDACTED: API_KEY] details"));
+    Ok(())
+}
+
+#[test]
+fn dynamic_tool_catalog_preserves_an_ordinary_rollback_title() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::{Known, Unknown};
+
+    let mut header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    let function = json!({"type":"function","name":"weather","description":"Catalog documentation only","inputSchema":{"type":"object"}});
+    let catalog = |tools| json!({"type":"dynamic_tools_updated","payload":{"thread_id":SESSION_ID,"tools":tools}});
+    let rows = |update| {
+        [
+            message("user", "retired opener"),
+            update,
+            event("thread_rolled_back", json!({"num_turns":1})),
+            message("user", "replacement"),
+        ]
+    };
+    let namespace =
+        json!({"type":"namespace","name":"local","description":"Local tools","tools":[function]});
+    for tools in [json!([]), json!([function, namespace])] {
+        let read = rollback_title_read(&header, &rows(catalog(tools)), "")?;
+        assert_eq!(read.rollback_title, Known(Some("replacement".into())));
+        assert_eq!(visible_text(&read.snapshot), ["replacement"]);
+    }
+    for unrecognized in [
+        json!({"type":"dynamic_tool_call","payload":{"thread_id":SESSION_ID,"tools":[]}}),
+        catalog(json!([{"type":"function_call","arguments":"{}"}])),
+        json!({"type":"dynamic_tools_updated","payload":{"tools":[]}}),
+    ] {
+        assert_eq!(
+            rollback_title_read(&header, &rows(unrecognized), "")?.rollback_title,
+            Unknown
+        );
+    }
+    header["payload"]["history_mode"] = json!("paginated");
+    assert_eq!(
+        rollback_title_read(&header, &rows(catalog(json!([]))), "")?.rollback_title,
+        Unknown
+    );
     Ok(())
 }
 
@@ -1002,6 +1096,86 @@ fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
     } else {
         zstd::stream::encode_all(contents, 1).unwrap()
     }
+}
+
+#[test]
+fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport::{Direct, ImportOnly, Since};
+
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions/2026/05/15");
+    fs::create_dir_all(&folder)?;
+    let path = folder.join(format!("rollout-2026-05-15T01-02-03-{SESSION_ID}.jsonl"));
+    let base = json!({"thread_id":"55555555-5555-4555-8555-555555555555", "end_ordinal_exclusive":1, "end_byte_offset":100});
+    let tuple = json!(["55555555-5555-4555-8555-555555555555", 1, 100]);
+    let malformed_base =
+        json!({"thread_id":SESSION_ID, "end_ordinal_exclusive":0, "end_byte_offset":100});
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let adapter = CodexAdapter::with_root(home.path());
+    for (mode, prefix, expected) in [
+        (None, None, Direct),
+        (Some(json!("legacy")), None, Direct),
+        (Some(json!("paginated")), Some(&base), Since("0.167.0")),
+        (
+            Some(json!({"paginated":null})),
+            Some(&tuple),
+            Since("0.167.0"),
+        ),
+        (Some(json!("paginated")), None, Since("0.167.0")),
+        (Some(json!(null)), None, ImportOnly),
+        (Some(json!("future")), None, ImportOnly),
+        (Some(json!(42)), None, ImportOnly),
+        (None, Some(&base), ImportOnly),
+        (Some(json!("legacy")), Some(&base), ImportOnly),
+        (Some(json!({"legacy":null})), Some(&tuple), ImportOnly),
+        (Some(json!("paginated")), Some(&malformed_base), ImportOnly),
+    ] {
+        let mut header = json!({"type":"session_meta","payload":{"id":SESSION_ID}});
+        if let Some(mode) = mode {
+            header["payload"]["history_mode"] = mode;
+        }
+        if let Some(prefix) = prefix {
+            header["payload"]["history_base"] = prefix.clone();
+        }
+        let rows = format!("{header}\n{}\n", message("user", "retained request"));
+        fs::write(&path, &rows)?;
+        assert_eq!(
+            adapter.native_resume_support(&source)?,
+            expected,
+            "{header}"
+        );
+        assert_eq!(
+            visible_text(&adapter.read_session(&source)?),
+            ["retained request"]
+        );
+        assert_eq!(fs::read_to_string(&path)?, rows);
+    }
+    let header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"paginated"}});
+    fs::write(&path, header.to_string())?;
+    let restored_name = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    fs::rename(&path, &restored_name)?;
+    assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
+    fs::rename(restored_name, &path)?;
+    let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'paginated')",
+        [SESSION_ID, path.to_str().unwrap()],
+    )?;
+    let mut damaged = header;
+    damaged["payload"]["history_base"] = malformed_base;
+    fs::write(
+        &path,
+        format!("{damaged}\n{}\n", message("user", "readable leaf")),
+    )?;
+    assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
+    let snapshot = adapter.read_session(&source)?;
+    assert_eq!(visible_text(&snapshot), ["readable leaf"]);
+    assert!(omnis_core::import_conversation(&snapshot).truncated);
+    Ok(())
 }
 
 #[test]

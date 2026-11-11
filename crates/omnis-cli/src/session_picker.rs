@@ -545,8 +545,12 @@ impl PickerState {
     ) {
         let prior: HashMap<_, _> = names
             .into_iter()
-            .flat_map(|names| names.observed.iter())
-            .map(|row| (&row.session, row))
+            .flat_map(|names| {
+                names.inventory.observed.iter().filter_map(|row| {
+                    let name = names.inventory.observable_names.get(&row.session)?;
+                    Some((&row.session, (row.source_revision?, name)))
+                })
+            })
             .collect();
         for entry in entries {
             let Some(revision) = entry
@@ -555,20 +559,27 @@ impl PickerState {
             else {
                 continue;
             };
-            let observed = prior.get(&entry.session.session).filter(|row| {
-                row.source_revision
-                    .is_some_and(|source| source.matches_file_contents(revision))
+            let corroborated = names.and_then(|names| {
+                let assignment = names.prior_assignments.get(&entry.session.session.id)?;
+                names.inventory.corroborated_legacy_codex_name(
+                    &crate::indexed_session_metadata(&entry.session),
+                    assignment,
+                )
             });
+            let observed_name = prior
+                .get(&entry.session.session)
+                .filter(|(source, _)| source.matches_file_contents(revision))
+                .map(|(_, name)| name.as_str())
+                .or(corroborated);
             let current = self
                 .entry_positions
                 .get(&entry.key)
                 .map(|&i| &self.entries[i])
-                .filter(|old| old.source_revision() == Some(revision));
-            let old_name = current.map_or_else(
-                || observed.and_then(|row| row.title.as_deref()),
-                PickerEntry::provider_name,
-            );
-            let observed_name = observed.and_then(|row| row.title.as_deref());
+                .filter(|old| old.source_revision() == Some(revision))
+                .filter(|old| {
+                    !(old.cached && old.provider_name().is_none() && corroborated.is_some())
+                });
+            let old_name = current.map_or(observed_name, PickerEntry::provider_name);
             if (entry.provider_name().is_none() && names.is_none_or(|names| !names.complete))
                 || (current.is_some()
                     && old_name != observed_name
@@ -1516,7 +1527,7 @@ struct CachedPickerEntries {
 }
 
 fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let (sessions, titles) = store.cached_sessions_with_titles(None)?;
+    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -3112,9 +3123,8 @@ mod tests {
                 sessions: vec![workers::indexed_session(&observed)],
                 complete,
                 names: Some(std::sync::Arc::new(workers::CatalogNames {
-                    observed: store
-                        .indexed_sessions_for_provider(Provider::Codex)
-                        .unwrap(),
+                    inventory: store.observe_codex_catalog_inventory().unwrap(),
+                    prior_assignments: HashMap::new(),
                     complete: true,
                 })),
             }

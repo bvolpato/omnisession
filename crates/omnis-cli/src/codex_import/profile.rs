@@ -101,6 +101,92 @@ impl ImportProfile {
     }
 }
 
+pub(crate) fn launch_selects_session(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    session: &omnis_ir::SessionRef,
+    plan: &omnis_adapters::LaunchPlan,
+) -> Result<bool> {
+    use omnis_adapters::{CodexLaunchOverrides, EnvChange};
+
+    let directory = plan
+        .cwd
+        .as_deref()
+        .context("Codex launch has no working directory")?;
+    let mut overrides = CodexLaunchOverrides::default();
+    let mut launch_dir = directory.to_owned();
+    let mut unverified_project_config = false;
+    let mut args = plan.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(path) = option_value(arg, "--cd", "-C", &mut args)? {
+            launch_dir = directory.join(path);
+        } else if let Some(name) = option_value(arg, "--profile", "-p", &mut args)? {
+            if !plain_name(name) {
+                bail!("Codex --profile requires a plain profile name");
+            }
+            overrides.profile = Some(name.to_owned());
+        } else if let Some(assignment) = option_value(arg, "--config", "-c", &mut args)? {
+            unverified_project_config |= !apply_state_override(assignment, &mut overrides)?;
+        }
+    }
+    if unverified_project_config && overrides.sqlite_home.is_none() {
+        return Ok(false);
+    }
+    overrides.environment = plan
+        .env
+        .iter()
+        .rev()
+        .find(|change| match change {
+            EnvChange::Set { name, .. } | EnvChange::Remove(name) => {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case("CODEX_SQLITE_HOME")
+                } else {
+                    name == "CODEX_SQLITE_HOME"
+                }
+            }
+        })
+        .cloned();
+    adapter.native_selects_session_at(session, &launch_dir, &overrides)
+}
+
+fn apply_state_override(
+    assignment: &str,
+    overrides: &mut omnis_adapters::CodexLaunchOverrides,
+) -> Result<bool> {
+    let (key, value) = assignment
+        .split_once('=')
+        .context("Codex -c requires key=value")?;
+    let key = key.trim();
+    match key {
+        "sqlite_home" => {
+            let path = config_string(value).context("Codex sqlite_home must be a string")?;
+            overrides.sqlite_home = Some(path.into());
+        }
+        "project_root_markers" => {
+            overrides.project_root_markers = Some(
+                value
+                    .trim()
+                    .parse::<toml::Value>()
+                    .ok()
+                    .and_then(|value| value.try_into().ok())
+                    .context("Codex project_root_markers must be an array of strings")?,
+            );
+        }
+        // Codex splits CLI keys on literal dots. Project trust tables can change the selected database.
+        _ if matches!(
+            key.split('.').next(),
+            Some("projects" | "project_root_markers" | "sqlite_home")
+        ) =>
+        {
+            return Ok(false);
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
 /// Whether plain `codex`, with no launch profile, can open a session that uses `provider`.
 ///
 /// A configuration that cannot be read answers yes. Codex then reports the problem itself, and

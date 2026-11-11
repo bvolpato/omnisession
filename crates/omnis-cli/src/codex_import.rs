@@ -26,6 +26,7 @@ use crate::{
     provider_compatibility::MINIMUM_CODEX_VERSION,
 };
 mod profile;
+pub(crate) use profile::launch_selects_session;
 use profile::{ImportProfile, plain_codex_supplies};
 
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
