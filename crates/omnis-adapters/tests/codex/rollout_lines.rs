@@ -332,6 +332,10 @@ fn a_documentary_event_must_decode_to_reserve_its_public_position() {
             "original request",
         ),
         (
+            json!(["token_count", null, {"plan_type":{"plus":{}}}]),
+            "original request",
+        ),
+        (
             json!({"type":"token_count","rate_limits":{"primary":{"window_minutes":5}}}),
             "updated request",
         ),
@@ -387,6 +391,64 @@ fn a_documentary_event_must_decode_to_reserve_its_public_position() {
             assert_eq!(visible_text(&snapshot), [expected]);
             let search = omnis_core::trajectory_search_document(&snapshot);
             assert!(!search.source_complete && !search.text.contains("documentary only"));
+        }
+    }
+}
+
+#[test]
+fn rate_limit_enums_reserve_the_same_display_position_as_codex() {
+    let prior = stamped(page_user("turn", "id", "published"), 1);
+    for (limits, accepted) in [
+        (json!({"plan_type":"plus"}), true),
+        (json!({"plan_type":{"plus":{}}}), true),
+        (json!({"plan_type":{"future_plan":null}}), true),
+        (json!({"plan_type":{"future_plan":{}}}), true),
+        (json!({"plan_type":{"plus":{"unexpected":true}}}), false),
+        (
+            json!({"rate_limit_reached_type":"rate_limit_reached"}),
+            true,
+        ),
+        (
+            json!({"rate_limit_reached_type":{"rate_limit_reached":{}}}),
+            true,
+        ),
+        (
+            json!({"rate_limit_reached_type":{"rate_limit_reached":null}}),
+            true,
+        ),
+        (
+            json!({"rate_limit_reached_type":{"future_reached":{}}}),
+            false,
+        ),
+        (
+            json!({"rate_limit_reached_type":{"rate_limit_reached":[]}}),
+            false,
+        ),
+    ] {
+        let quota = stamped(event("token_count", json!({"rate_limits":limits})), 2);
+        for (ordinal, expected) in [
+            (2, if accepted { "published" } else { "revised" }),
+            (3, "revised"),
+        ] {
+            let revised = stamped(page_user("turn", "id", "revised"), ordinal);
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(
+                    vec![prior.clone(), quota.clone(), revised.clone()],
+                    preview,
+                    Some("paginated"),
+                )
+                .unwrap();
+                assert_eq!(
+                    visible_text(&snapshot),
+                    [expected],
+                    "{limits}, ordinal {ordinal}"
+                );
+                assert_eq!(
+                    omnis_core::trajectory_search_document(&snapshot).source_complete,
+                    accepted && ordinal == 3,
+                    "{limits}, ordinal {ordinal}"
+                );
+            }
         }
     }
 }

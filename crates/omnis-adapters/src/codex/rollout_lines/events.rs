@@ -96,7 +96,7 @@ pub(super) fn classify(payload: &Value) -> Wire {
         Some("token_count") => Wire::checked(
             arity(payload, 3, 3)
                 && optional("info", 1, checkpoint_wire::token_usage_info)
-                && optional("rate_limits", 2, rate_limits::valid),
+                && rate_limits::valid_token_count(payload),
         ),
         Some("task_started" | "turn_started") => Wire::checked(
             arity(payload, 7, 8)
