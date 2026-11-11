@@ -267,6 +267,7 @@ mod tests {
                 source_byte_count: None,
                 full_or_provider_limited: false,
                 document_hash: None,
+                sampled_file_bytes: None,
             },
         });
         for batch in [&checks[..2], &checks[2..]] {

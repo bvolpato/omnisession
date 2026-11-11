@@ -17,14 +17,58 @@ pub const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 
 /// Measurements of eligible, redacted text after event limits and before document limits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SearchProjection {
     pub byte_count: usize,
     /// SHA-256 of the eligible text with its event separators.
     pub digest: [u8; 32],
     /// SHA-256 before the last native record that contributed eligible text.
     pub before_last_record: [u8; 32],
+    /// Number of malformed interior records and the searchable bytes before the first gap.
+    pub interior_damage: Option<(usize, usize)>,
+    /// Physical length at which the JSONL head and tail windows were sampled.
+    pub sampled_file_bytes: Option<u64>,
+    state: sha2::Sha256,
 }
+
+impl SearchProjection {
+    #[must_use]
+    pub fn new(byte_count: usize, state: sha2::Sha256, before_last_record: sha2::Sha256) -> Self {
+        use sha2::Digest;
+        Self {
+            byte_count,
+            interior_damage: None,
+            sampled_file_bytes: None,
+            digest: state.clone().finalize().into(),
+            before_last_record: before_last_record.finalize().into(),
+            state,
+        }
+    }
+
+    /// Checks an older index digest that included the leading events of the missing record.
+    #[must_use]
+    pub fn matches_with_suffix(&self, suffix: &[u8], expected: &[u8]) -> bool {
+        use sha2::Digest;
+        self.state
+            .clone()
+            .chain_update(suffix)
+            .finalize()
+            .as_slice()
+            == expected
+    }
+}
+
+impl PartialEq for SearchProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.byte_count == other.byte_count
+            && self.digest == other.digest
+            && self.before_last_record == other.before_last_record
+            && self.interior_damage == other.interior_damage
+            && self.sampled_file_bytes == other.sampled_file_bytes
+    }
+}
+
+impl Eq for SearchProjection {}
 
 /// Splits a capped search document at the marker between its two retained windows.
 #[must_use]

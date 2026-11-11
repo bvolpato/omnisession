@@ -104,6 +104,7 @@ pub enum PriorSearchDocument {
     Partial {
         byte_count: usize,
         indexed_hash: [u8; 32],
+        sampled_file_bytes: Option<u64>,
     },
 }
 

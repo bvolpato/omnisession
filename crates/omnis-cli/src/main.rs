@@ -272,7 +272,7 @@ fn store_search_document(
         source_updated_at,
         source_revision,
         source_byte_count: document.source_byte_count,
-        projection: document.projection,
+        projection: document.projection.as_ref(),
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
         source_complete: full_read,

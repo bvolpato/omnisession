@@ -255,8 +255,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
         source_updated_submillis, provider_limited, title_authoritative,
-        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_prefix_hash
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26)
+        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -272,7 +272,10 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_byte_count = excluded.source_byte_count,
         indexed_byte_count = excluded.indexed_byte_count,
         projected_byte_count = excluded.projected_byte_count,
-        projected_prefix_hash = excluded.projected_prefix_hash,
+        sampled_file_bytes = excluded.sampled_file_bytes,
+        recovered_gap_start = NULL, observed_text_bytes = NULL, observed_text_hash = NULL,
+        projected_prefix_hash = NULL,
+        projected_record_prefix_hash = excluded.projected_record_prefix_hash,
         truncation_strategy = excluded.truncation_strategy,
         origin = excluded.origin,
         protected_by_bundle = max(
@@ -359,7 +362,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                                OR excluded.indexed_byte_count <>
                                    session_trajectories.indexed_byte_count
                                OR (excluded.projected_byte_count IS NOT NULL AND
-                                   (excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_prefix_hash IS NOT session_trajectories.projected_prefix_hash))
+                                   (excluded.sampled_file_bytes IS NOT session_trajectories.sampled_file_bytes OR excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_record_prefix_hash IS NOT session_trajectories.projected_record_prefix_hash OR session_trajectories.projected_prefix_hash IS NOT NULL))
                                OR excluded.truncation_strategy <>
                                    session_trajectories.truncation_strategy
                                OR excluded.origin <> session_trajectories.origin
@@ -601,7 +604,7 @@ pub struct TrajectoryDocument<'a> {
     pub source_updated_at: DateTime<Utc>,
     pub source_byte_count: usize,
     /// Eligible text measurements before the document-wide limit, when supplied by the reader.
-    pub projection: Option<omnis_ir::SearchProjection>,
+    pub projection: Option<&'a omnis_ir::SearchProjection>,
     pub indexed_byte_count: usize,
     pub truncation_strategy: &'a str,
     /// Whether the document came from a full source read rather than a preview, even when the
@@ -649,6 +652,7 @@ pub enum TrajectorySourceGuard {
         source_byte_count: Option<usize>,
         full_or_provider_limited: bool,
         document_hash: Option<[u8; 32]>,
+        sampled_file_bytes: Option<u64>,
     },
 }
 
@@ -993,13 +997,23 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                     self.session.provider == Provider::Antigravity
                         && self.verified_metadata.is_some()
                         && revision.file.is_some()
-                        && self.guard.matches_document_file(revision) != Some(true),
+                        && (self.guard.matches_document_file(revision) != Some(true)
+                            || self
+                                .document
+                                .projection
+                                .is_some_and(|p| p.interior_damage.is_some())),
                     self.document
                         .projection
                         .map(|p| i64::try_from(p.byte_count))
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
                     self.document.projection.map(|p| p.before_last_record),
+                    self.document
+                        .projection
+                        .and_then(|p| p.sampled_file_bytes)
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidSessionReference)?,
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -1036,6 +1050,13 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         guard?;
+        if self
+            .document
+            .projection
+            .is_some_and(|p| p.interior_damage.is_some())
+        {
+            return Ok(true);
+        }
         Ok(!self.retains_verified_antigravity_text(transaction, home)?)
     }
 
@@ -1070,7 +1091,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         let prior = transaction.prepare_cached(
-            "SELECT doc.id, doc.indexed_byte_count, doc.truncation_strategy, doc.source_file_id, doc.projected_byte_count, doc.projected_prefix_hash FROM session_trajectories AS doc
+            "SELECT doc.id, doc.indexed_byte_count, doc.truncation_strategy, doc.source_file_id, doc.projected_byte_count, doc.projected_prefix_hash, doc.projected_record_prefix_hash FROM session_trajectories AS doc
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
              WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id IN (?3,?6)
                AND doc.indexed_byte_count>0 AND doc.indexed_byte_count<=?4
@@ -1079,44 +1100,39 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             self.session.provider.to_string(), self.session.id, document.source_revision.file.map(Uuid::into_bytes),
             i64::try_from(MAX_TRAJECTORY_WRITE_BATCH_BYTES).expect("batch fits i64"),
             home.map(|home| home.as_os_str().as_encoded_bytes()), document.source_revision.legacy_file.map(Uuid::into_bytes)
-        ], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)? as usize, row.get::<_, String>(2)?, optional_uuid(row, 3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<Vec<u8>>>(5)?))).optional().map_err(database_error)?;
-        let Some((id, length, strategy, old_file, old_projected, old_prefix)) = prior else {
+        ], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)? as usize, row.get::<_, String>(2)?, optional_uuid(row, 3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<Vec<u8>>>(5)?, row.get::<_, Option<Vec<u8>>>(6)?))).optional().map_err(database_error)?;
+        let Some((id, length, strategy, old_file, old_projected, event_prefix, record_prefix)) =
+            prior
+        else {
             return Ok(false);
         };
+        let old_prefix = event_prefix.as_deref().or(record_prefix.as_deref());
         let same_prefix = document
             .projection
-            .is_some_and(|proof| old_prefix.as_deref() == Some(&proof.digest));
+            .is_some_and(|proof| old_prefix == Some(&proof.digest));
         let retain = if document.indexed_byte_count == 0 || same_prefix {
             true
         } else {
-            let windowed = strategy.ends_with("document_head_tail")
-                && document.truncation_strategy.ends_with("document_head_tail");
-            let known_count = |measured: Option<usize>, strategy: &str, raw| {
-                measured.or_else(|| (!strategy.contains("event")).then_some(raw))
-            };
-            let prior_count = known_count(
-                old_projected.and_then(|n| usize::try_from(n).ok()),
+            let window = ProjectionWindow::for_documents(
                 &strategy,
+                old_projected,
                 previous_bytes,
+                &document,
             );
-            let current_count = known_count(
-                document.projection.map(|p| p.byte_count),
-                document.truncation_strategy,
-                document.source_byte_count,
-            );
-            let window = if !windowed {
-                ProjectionWindow::Uncapped
-            } else if let Some((old, new)) = prior_count.zip(current_count) {
-                ProjectionWindow::Measured(old.saturating_sub(new))
-            } else {
-                ProjectionWindow::Legacy(previous_bytes - document.source_byte_count)
-            };
+            if !matches!(window, ProjectionWindow::Uncapped)
+                && event_prefix.is_none()
+                && record_prefix.is_some()
+                && document.projection.is_some()
+            {
+                return Ok(false);
+            }
             stored_text_contains_projection(
                 transaction,
                 id,
                 length,
                 document.redacted_text,
                 window,
+                document.projection.zip(event_prefix.as_deref()),
             )?
         };
         if retain && old_file != document.source_revision.file {
@@ -1138,6 +1154,109 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         Ok(retain)
     }
 
+    fn recover_interior_record(
+        &self,
+        transaction: &Transaction<'_>,
+        home: Option<&Path>,
+    ) -> Result<Option<(String, usize)>> {
+        let doc = self.document;
+        let Some((1, start)) = doc.projection.and_then(|p| p.interior_damage) else {
+            return Ok(None);
+        };
+        if self.session.provider != Provider::Antigravity
+            || doc.truncation_strategy != "source_incomplete"
+            || self.guard.matches_document_file(doc.source_revision) != Some(true)
+            || self.verified_metadata.is_none()
+        {
+            return Ok(None);
+        }
+        let Some(home) = home else {
+            return Ok(None);
+        };
+        let Some(prefix) = doc.redacted_text.get(..start) else {
+            return Ok(None);
+        };
+        let mut statement = transaction.prepare_cached(
+            "SELECT d.id, d.indexed_byte_count, d.complete,
+                    coalesce(d.projected_record_prefix_hash,d.projected_prefix_hash),
+                    d.recovered_gap_start, d.observed_text_bytes
+             FROM session_trajectories d
+             JOIN native_search_document_homes h ON h.trajectory_id=d.id AND h.source_file=d.source_file_id
+             WHERE d.provider=?1 AND d.session_id=?2 AND d.origin='native'
+               AND h.verification=1 AND h.source_home=?3
+               AND d.source_file_id IN (?4,?5) AND d.indexed_byte_count<=?6"
+        ).map_err(database_error)?;
+        let prior = statement
+            .query_row(
+                params![
+                    self.session.provider.to_string(),
+                    self.session.id,
+                    home.as_os_str().as_encoded_bytes(),
+                    doc.source_revision.file.map(Uuid::into_bytes),
+                    doc.source_revision.legacy_file.map(Uuid::into_bytes),
+                    i64::try_from(2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT)
+                        .expect("document cap fits i64"),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)? as usize,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<u32>>(4)?.map(|n| n as usize),
+                        row.get::<_, Option<u32>>(5)?.map(|n| n as usize),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((id, length, full, old_prefix, old_gap, observed_bytes)) = prior else {
+            return Ok(None);
+        };
+        let missing = match (old_gap, observed_bytes) {
+            (Some(previous_start), Some(previous_bytes)) if previous_start == start => {
+                length.checked_sub(previous_bytes)
+            }
+            _ if full
+                && old_prefix.as_deref() == Some(Sha256::digest(prefix.as_bytes()).as_slice()) =>
+            {
+                length.checked_sub(start)
+            }
+            _ => None,
+        };
+        let separator = if start == 0 && !doc.redacted_text.is_empty() && old_gap.is_none() {
+            "\n\n"
+        } else {
+            ""
+        };
+        let Some(missing) = missing.filter(|&n| {
+            n > 0
+                && doc
+                    .redacted_text
+                    .len()
+                    .saturating_add(n)
+                    .saturating_add(separator.len())
+                    <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+        }) else {
+            return Ok(None);
+        };
+        let Some(previous) = stored_projection_text(transaction, id, length)? else {
+            return Ok(None);
+        };
+        let Some(gap) = previous
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.get(..missing))
+        else {
+            return Ok(None);
+        };
+        let mut text = String::with_capacity(doc.redacted_text.len() + missing + separator.len());
+        text.push_str(prefix);
+        text.push_str(gap);
+        text.push_str(separator);
+        text.push_str(&doc.redacted_text[start..]);
+        Ok(Some((text, start)))
+    }
+
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
         let doc = self.document;
         connection
@@ -1152,7 +1271,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                       AND (NOT ?14 OR derived_title IS ?15)
                       AND title_authoritative IS ?16 AND source_file_id IS ?17
                       AND missing_ancestor_id IS ?18 AND source_contents_id IS ?19
-                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_prefix_hash IS ?21))
+                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_record_prefix_hash IS ?21 AND sampled_file_bytes IS ?22 AND projected_prefix_hash IS NULL))
                 )",
                 params![
                     self.session.provider.to_string(),
@@ -1179,6 +1298,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
                     doc.projection.map(|p| p.before_last_record),
+                    doc.projection.and_then(|p| p.sampled_file_bytes).map(i64::try_from).transpose().map_err(|_| StoreError::InvalidSessionReference)?,
                 ],
                 |row| row.get(0),
             )
@@ -1215,7 +1335,8 @@ const DOCUMENT_RECEIPT_SQL: &str =
          source_updated_submillis, source_complete, provider_limited, complete,
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
-         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash))
+         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes,
+         recovered_gap_start, observed_text_bytes, hex(observed_text_hash))
      FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
 
 fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
@@ -1254,9 +1375,9 @@ fn observed_file_state(
                 hex(failed.source_contents_id)) END),
             doc.source_file_id, catalog.source_file_id,
             CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END,
-            doc.source_byte_count, coalesce(doc.source_complete OR doc.provider_limited, 0),
+            coalesce(doc.observed_text_bytes,doc.source_byte_count), coalesce(doc.source_complete OR doc.provider_limited, 0),
             CASE WHEN doc.provider = 'antigravity' AND NOT (doc.source_complete OR doc.provider_limited)
-                      AND length(doc.content_hash) = 32 THEN doc.content_hash END
+                      AND length(doc.content_hash) = 32 THEN coalesce(doc.observed_text_hash,doc.content_hash) END, doc.sampled_file_bytes
          FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
          LEFT JOIN session_trajectories AS doc USING (provider, session_id)
          LEFT JOIN session_index AS catalog USING (provider, session_id)
@@ -1276,6 +1397,9 @@ fn observed_file_state(
                 ],
                 full_or_provider_limited: row.get(5)?,
                 document_hash: row.get(6)?,
+                sampled_file_bytes: row
+                    .get::<_, Option<i64>>(7)?
+                    .and_then(|n| u64::try_from(n).ok()),
                 source_byte_count: row
                     .get::<_, Option<i64>>(4)?
                     .map(usize::try_from)
@@ -2730,19 +2854,20 @@ impl Store {
             prepared.push(write);
         }
 
-        self.publish_trajectory_documents(&prepared, homes, verify)
+        self.publish_trajectory_documents(&prepared, remaining_bytes, homes, verify)
     }
 
     fn publish_trajectory_documents(
         &self,
         prepared: &[PreparedTrajectoryWrite<'_, '_>],
+        mut remaining: usize,
         homes: &HashMap<Provider, PathBuf>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let mut published = HashSet::with_capacity(prepared.len());
-        let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
+        let mut rewritten = Vec::with_capacity(prepared.len());
         let mut upsert_parent = transaction
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
@@ -2753,6 +2878,10 @@ impl Store {
             )? {
                 continue;
             }
+            let recovered = write.recover_interior_record(
+                &transaction,
+                homes.get(&write.session.provider).map(PathBuf::as_path),
+            )?;
             let verified_metadata = write.verified_metadata;
             let reuse_chunks = write.reuses_antigravity_chunks(&transaction)?;
             let trajectory_id = write.upsert_parent(&mut upsert_parent)?;
@@ -2790,9 +2919,18 @@ impl Store {
             if let Some(trajectory_id) = trajectory_id {
                 // A later write of the same session replaces an earlier one in this batch.
                 published.insert(trajectory_id);
-                if !reuse_chunks {
+                if !reuse_chunks || recovered.is_some() {
+                    let text = if let Some((text, start)) = recovered {
+                        remaining = remaining
+                            .checked_sub(text.len() - write.document.indexed_byte_count)
+                            .ok_or(StoreError::TrajectoryBatchTooLarge)?;
+                        store_recovered_gap(&transaction, trajectory_id, start, &text)?;
+                        std::borrow::Cow::Owned(text)
+                    } else {
+                        std::borrow::Cow::Borrowed(write.document.redacted_text)
+                    };
                     rewritten.retain(|(other, _)| *other != trajectory_id);
-                    rewritten.push((trajectory_id, write.document.redacted_text));
+                    rewritten.push((trajectory_id, text));
                 }
             } else if write.document.origin == SessionTrajectoryOrigin::ImportedBundle {
                 transaction
@@ -2805,7 +2943,11 @@ impl Store {
             }
         }
         drop(upsert_parent);
-        replace_trajectory_chunks(&transaction, &rewritten)?;
+        let chunks: Vec<_> = rewritten
+            .iter()
+            .map(|(id, text)| (*id, text.as_ref()))
+            .collect();
+        replace_trajectory_chunks(&transaction, &chunks)?;
         for write in prepared {
             if write.document.origin == SessionTrajectoryOrigin::Native
                 && write.document.source_revision.file.is_some()
@@ -4350,12 +4492,6 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
     if !has_column("provider_limited") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN provider_limited INTEGER NOT NULL DEFAULT 0 CHECK (provider_limited IN (0, 1))").map_err(database_error)?;
     }
-    if !has_column("projected_byte_count") {
-        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_byte_count INTEGER CHECK (projected_byte_count >= 0)").map_err(database_error)?;
-    }
-    if !has_column("projected_prefix_hash") {
-        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_prefix_hash BLOB CHECK (length(projected_prefix_hash)=32)").map_err(database_error)?;
-    }
     ensure_trajectory_version_columns(transaction, &columns)?;
     if missing_coverage {
         transaction
@@ -4376,6 +4512,24 @@ fn ensure_trajectory_version_columns(
     transaction: &Transaction<'_>,
     columns: &[String],
 ) -> Result<()> {
+    let has_column = |name: &str| columns.iter().any(|column| column == name);
+    if !has_column("projected_byte_count") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_byte_count INTEGER CHECK (projected_byte_count >= 0)").map_err(database_error)?;
+    }
+    if !has_column("projected_prefix_hash") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_prefix_hash BLOB CHECK (length(projected_prefix_hash)=32)").map_err(database_error)?;
+    }
+    if !has_column("sampled_file_bytes") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN sampled_file_bytes INTEGER CHECK (sampled_file_bytes >= 0)").map_err(database_error)?;
+    }
+    if !has_column("recovered_gap_start") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN recovered_gap_start INTEGER;
+            ALTER TABLE session_trajectories ADD COLUMN observed_text_bytes INTEGER;
+            ALTER TABLE session_trajectories ADD COLUMN observed_text_hash BLOB CHECK (length(observed_text_hash)=32)").map_err(database_error)?;
+    }
+    if !has_column("projected_record_prefix_hash") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_record_prefix_hash BLOB CHECK (length(projected_record_prefix_hash)=32)").map_err(database_error)?;
+    }
     if !columns.iter().any(|column| column == "document_version") {
         transaction
             .execute_batch(
@@ -4713,14 +4867,58 @@ enum ProjectionWindow {
     Legacy(usize),
 }
 
-// Match complete paragraphs in order. An omission may fall between two retained events.
-fn stored_text_contains_projection(
+impl ProjectionWindow {
+    fn for_documents(
+        strategy: &str,
+        old_projected: Option<i64>,
+        previous_bytes: usize,
+        document: &TrajectoryDocument<'_>,
+    ) -> Self {
+        let windowed = strategy.ends_with("document_head_tail")
+            && document.truncation_strategy.ends_with("document_head_tail");
+        let known_count = |measured: Option<usize>, strategy: &str, raw| {
+            measured.or_else(|| (!strategy.contains("event")).then_some(raw))
+        };
+        let prior_count = known_count(
+            old_projected.and_then(|n| usize::try_from(n).ok()),
+            strategy,
+            previous_bytes,
+        );
+        let current_count = known_count(
+            document.projection.map(|p| p.byte_count),
+            document.truncation_strategy,
+            document.source_byte_count,
+        );
+        if !windowed {
+            ProjectionWindow::Uncapped
+        } else if let Some((old, new)) = prior_count.zip(current_count) {
+            ProjectionWindow::Measured(old.saturating_sub(new))
+        } else {
+            ProjectionWindow::Legacy(previous_bytes - document.source_byte_count)
+        }
+    }
+}
+
+fn store_recovered_gap(
+    transaction: &Transaction<'_>,
+    id: i64,
+    start: usize,
+    text: &str,
+) -> Result<()> {
+    // Preserve the live digest and byte count for the next partial read.
+    transaction.execute(
+        "UPDATE session_trajectories SET recovered_gap_start=?2, observed_text_bytes=source_byte_count,
+         observed_text_hash=content_hash, indexed_byte_count=?3, source_byte_count=?3, content_hash=?4 WHERE id=?1",
+        params![id, i64::try_from(start).expect("bounded text"), i64::try_from(text.len()).expect("bounded text"), Sha256::digest(text.as_bytes()).as_slice()]
+    ).map_err(database_error)?;
+    Ok(())
+}
+
+fn stored_projection_text(
     transaction: &Transaction<'_>,
     id: i64,
     length: usize,
-    projection: &str,
-    window: ProjectionWindow,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let mut statement = transaction.prepare_cached(
         "SELECT stored_text FROM session_trajectory_chunk_rows WHERE trajectory_id=?1 ORDER BY chunk_index",
     ).map_err(database_error)?;
@@ -4729,26 +4927,58 @@ fn stored_text_contains_projection(
     let mut scratch = Vec::new();
     while let Some(row) = rows.next().map_err(database_error)? {
         let Some(chunk) = chunk_text(row.get_ref(0).map_err(database_error)?, &mut scratch) else {
-            return Ok(false);
+            return Ok(None);
         };
         let overlap = chunk_overlap_start(&previous);
         let Some(rest) = chunk.strip_prefix(&previous[overlap..]) else {
-            return Ok(false);
+            return Ok(None);
         };
         if previous.len().saturating_add(rest.len()) > length {
-            return Ok(false);
+            return Ok(None);
         }
         previous.push_str(rest);
     }
     if previous.len() != length {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(Some(previous))
+}
+
+// Match complete paragraphs in order. An omission may fall between two retained events.
+fn stored_text_contains_projection(
+    transaction: &Transaction<'_>,
+    id: i64,
+    length: usize,
+    projection: &str,
+    window: ProjectionWindow,
+    legacy_prefix: Option<(&omnis_ir::SearchProjection, &[u8])>,
+) -> Result<bool> {
+    let Some(previous) = stored_projection_text(transaction, id, length)? else {
+        return Ok(false);
+    };
     if !matches!(window, ProjectionWindow::Uncapped)
         && let (Some((old_head, old_tail)), Some((head, tail))) = (
             omnis_ir::search_document_windows(&previous),
             omnis_ir::search_document_windows(projection),
         )
     {
+        if let Some((proof, digest)) = legacy_prefix {
+            // R18 hashed through the penultimate event, including any earlier events of
+            // the omitted planner record. R19 hashed only records before that record.
+            let ProjectionWindow::Measured(delta) = window else {
+                return Ok(false);
+            };
+            let suffix = old_tail
+                .len()
+                .checked_sub(delta)
+                .and_then(|start| old_tail.get(start..));
+            return Ok(suffix.is_some_and(|rest| {
+                rest.starts_with("\n\n")
+                    && rest.rsplit_once("\n\n").is_some_and(|(before_last, _)| {
+                        proof.matches_with_suffix(before_last.as_bytes(), digest)
+                    })
+            }));
+        }
         let matches = |old: &str, current: &str, tail: bool| {
             let delta = match window {
                 ProjectionWindow::Measured(n) => {

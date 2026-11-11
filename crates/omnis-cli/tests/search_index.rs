@@ -372,6 +372,95 @@ fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
 }
 
 #[test]
+fn interior_damage_keeps_observed_and_previously_verified_search_text_separate() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 4);
+    let message = |text: &str| json!({"type":"PLANNER_RESPONSE","content":text}).to_string();
+    let write = |records: &[String]| fs::write(&path, records.join("\n")).unwrap();
+    let coverage = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            term,
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&env, state, &args)["results"][0]["coverage"].clone()
+    };
+    let broken = "{bad}".to_owned();
+    write(&[message("firstreply"), message("oldreply")]);
+    assert_eq!(coverage("warm", "oldreply", false), "complete");
+    write(&[message("firstreply"), broken.clone(), message("thirdreply")]);
+    assert_eq!(
+        state_json(&env, "warm", &["verify", &session])["omitted_events"],
+        1
+    );
+    let bundle = root.path().join("bundle.json");
+    state_json(
+        &env,
+        "warm",
+        &["export", &session, "--output", bundle.to_str().unwrap()],
+    );
+    let exported: PortableBundle = serde_json::from_slice(&fs::read(bundle).unwrap()).unwrap();
+    assert!(
+        exported
+            .snapshot
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+    );
+    assert!(
+        exported
+            .snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["text"] == "thirdreply")
+    );
+    assert!(
+        !exported
+            .snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["text"] == "oldreply")
+    );
+    assert_eq!(coverage("cold", "thirdreply", false), "preview");
+    assert_eq!(coverage("cold", "oldreply", true), serde_json::Value::Null);
+    assert_eq!(coverage("warm", "thirdreply", false), "preview");
+    assert_eq!(coverage("warm", "oldreply", true), "preview");
+    write(&[
+        message("firstreply"),
+        broken.clone(),
+        message("thirdreply"),
+        message("fourthreply"),
+        "{unfinished".to_owned(),
+    ]);
+    assert_eq!(coverage("warm", "fourthreply", false), "preview");
+    assert_eq!(coverage("warm", "oldreply", true), "preview");
+    write(&[
+        message("firstreply"),
+        message("repairedreply"),
+        message("thirdreply"),
+        message("fourthreply"),
+    ]);
+    assert_eq!(coverage("warm", "repairedreply", false), "complete");
+    assert_eq!(coverage("warm", "oldreply", true), serde_json::Value::Null);
+    write(&[
+        message("firstreply"),
+        broken.clone(),
+        message("thirdreply"),
+        broken,
+    ]);
+    assert_eq!(
+        state_json(&env, "warm", &["verify", &session])["omitted_events"],
+        2
+    );
+}
+
+#[test]
 fn partial_antigravity_search_indexes_newly_completed_turns() {
     use std::io::Write;
 
@@ -409,6 +498,52 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
     for state in ["warm", "cold"] {
         assert_eq!(coverage(state, "nextreply"), "preview", "{state}");
         assert_eq!(coverage(state, "firstreply"), "preview", "{state}");
+    }
+}
+
+#[test]
+fn growing_antigravity_history_moves_the_sampled_tail() {
+    use std::io::{BufWriter, Write};
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 3251);
+    let mut file = BufWriter::new(fs::File::create(&path).unwrap());
+    let private = "x".repeat(8192);
+    for index in 0..3250 {
+        writeln!(
+            file,
+            r#"{{"type":"PLANNER_RESPONSE","content":"message{index}","thinking":"{private}"}}"#
+        )
+        .unwrap();
+    }
+    write!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"newreply","thinking":""#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    let coverage = |state, term| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ],
+        )["results"][0]["coverage"]
+            .clone()
+    };
+    assert_eq!(coverage("warm", "message3249"), "preview");
+    file.write_all(&vec![b'z'; 512 * 1024]).unwrap();
+    file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
+        .unwrap();
+    drop(file);
+    for state in ["warm", "cold"] {
+        assert_eq!(coverage(state, "newreply"), "preview", "{state}");
     }
 }
 
@@ -1633,37 +1768,44 @@ fn event(
     }
 }
 
+fn write_capped_antigravity_history(
+    path: &Path,
+    changed: Option<(usize, &str)>,
+    grow_private_field: bool,
+) {
+    use std::io::{BufWriter, Read, Write};
+    let mut file = BufWriter::new(fs::File::create(path).unwrap());
+    for index in 0..62 {
+        let filler = format!(" ordinary {index:02}").repeat(3_000);
+        let marker = changed
+            .filter(|(at, _)| *at == index)
+            .map_or("", |(_, word)| word);
+        writeln!(
+            file,
+            r#"{{"type":"PLANNER_RESPONSE","content":"{marker}{filler}"}}"#
+        )
+        .unwrap();
+    }
+    write!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"{} verifiedreply","thinking":""#,
+        " ordinary".repeat(9_000)
+    )
+    .unwrap();
+    if grow_private_field {
+        std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+    }
+    writeln!(file, r#"","tool_calls":[{{"name":"firsttool","args":{{}}}},{{"name":"secondtool","args":{{}}}}]}}"#).unwrap();
+    file.flush().unwrap();
+}
+
 #[test]
 fn capped_antigravity_search_retains_only_compatible_verified_replies() {
     use sha2::Digest;
-    use std::io::{BufWriter, Read, Write};
 
     let root = tempdir().unwrap();
     let environment = TestEnvironment::new(root.path(), root.path().to_owned());
     let (session, path) = antigravity_history(&environment, 63);
-    let rewrite = |first: &str, grow_private_field: bool| {
-        let mut file = BufWriter::new(fs::File::create(&path).unwrap());
-        for index in 0..62 {
-            let filler = format!(" ordinary {index:02}").repeat(3_000);
-            let marker = if index == 0 { first } else { "" };
-            writeln!(
-                file,
-                r#"{{"type":"PLANNER_RESPONSE","content":"{marker}{filler}"}}"#
-            )
-            .unwrap();
-        }
-        write!(
-            file,
-            r#"{{"type":"PLANNER_RESPONSE","content":"{} verifiedreply","thinking":""#,
-            " ordinary".repeat(9_000)
-        )
-        .unwrap();
-        if grow_private_field {
-            std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
-        }
-        writeln!(file, r#"","tool_calls":[{{"name":"firsttool","args":{{}}}},{{"name":"secondtool","args":{{}}}}]}}"#).unwrap();
-        file.flush().unwrap();
-    };
     let hits = |state: &str, term: &str, cached: bool| {
         let mut args = vec![
             "search",
@@ -1691,7 +1833,7 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
             .unwrap()
     };
 
-    rewrite("", false);
+    write_capped_antigravity_history(&path, None, false);
     state_json(&environment, "shown", &["show", &session]);
     let expected_prefix = (0..62)
         .map(|index| format!(" ordinary {index:02}").repeat(3_000))
@@ -1703,7 +1845,7 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
         let digest: Vec<u8> = Connection::open(environment.home.join(state).join("store.sqlite3"))
             .unwrap()
             .query_row(
-                "SELECT projected_prefix_hash FROM session_trajectories",
+                "SELECT projected_record_prefix_hash FROM session_trajectories",
                 [],
                 |r| r.get(0),
             )
@@ -1715,15 +1857,21 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
         );
     }
 
+    for state in ["fringe-show", "fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "verifiedreply", false), 1);
+    }
+    Connection::open(environment.home.join("fringe-upgrade/store.sqlite3"))
+        .unwrap().execute("UPDATE session_trajectories SET projected_prefix_hash=projected_record_prefix_hash, projected_record_prefix_hash=NULL", []).unwrap();
+
     Connection::open(environment.home.join("shown/store.sqlite3"))
         .unwrap()
         .execute(
-            "UPDATE session_trajectories SET projected_byte_count=NULL, projected_prefix_hash=NULL",
+            "UPDATE session_trajectories SET projected_byte_count=NULL, projected_record_prefix_hash=NULL",
             [],
         )
         .unwrap();
 
-    rewrite("", true);
+    write_capped_antigravity_history(&path, None, true);
     state_json(&environment, "fresh", &["show", &session]);
     assert_eq!(hits("fresh", "ordinary", true), 1);
     assert_eq!(hits("fresh", "verifiedreply", true), 0);
@@ -1735,7 +1883,17 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
         assert_eq!(hits(state, "secondtool", true), 1, "{state}");
     }
 
-    rewrite("changedvisible", true);
+    write_capped_antigravity_history(&path, Some((34, "newfringeword")), true);
+    state_json(&environment, "fringe-show", &["show", &session]);
+    for state in ["fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "newfringeword", false), 1);
+    }
+    for state in ["fringe-show", "fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "newfringeword", true), 1);
+        assert_eq!(hits(state, "verifiedreply", true), 0);
+    }
+
+    write_capped_antigravity_history(&path, Some((0, "changedvisible")), true);
     assert_eq!(hits("searched", "changedvisible", false), 1);
     assert_eq!(hits("searched", "verifiedreply", true), 0);
 }

@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cell::Cell,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,10 +20,10 @@ use crate::{
     IncompleteTranscript, IndexRead, IndexedSearchDocument, LaunchPlan, LaunchTarget,
     NativeSession, PriorSearchDocument, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
-        estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp, paths_match,
-        provider_executable, provider_file, provider_root, sort_sessions, sqlite_snapshot,
-        store_is_missing, validate_provider, visit_json_lines_with_tail,
+        EventBuilder, JsonLineDamage, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp,
+        paths_match, provider_executable, provider_file, provider_root, sort_sessions,
+        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines_with_tail,
         visit_limited_search_edges, visit_streamed_json_file,
     },
 };
@@ -94,6 +93,21 @@ impl AntigravityAdapter {
         Ok((file, before.len(), native, observed))
     }
 
+    fn ensure_history_unchanged(
+        &self,
+        summary: &Summary,
+        path: &Path,
+        observed: crate::source_file::ObservedSourceFile,
+        handle: &std::fs::File,
+    ) -> Result<()> {
+        observed.ensure_unchanged(path, path, handle)?;
+        anyhow::ensure!(
+            self.source(summary).as_deref() == Some(path),
+            "Antigravity history changed during the search read"
+        );
+        Ok(())
+    }
+
     fn read_observed(
         &self,
         session: &SessionRef,
@@ -135,7 +149,7 @@ impl AntigravityAdapter {
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Antigravity)?;
         let summary = self.summary(&session.id)?;
-        let torn_tail = Cell::new(false);
+        let torn_tail = JsonLineDamage::default();
         self.read_summary(
             session,
             &summary,
@@ -184,7 +198,7 @@ impl AntigravityAdapter {
                 };
                 builder.push_oversized_record_notice(oversized, summary.updated_at);
                 verify_jsonl_history(summary, &builder)?;
-                record_incomplete_tail(&mut builder, tail, summary.updated_at);
+                record_jsonl_damage(&mut builder, tail, summary.updated_at);
             }
             Some(path) => {
                 push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
@@ -223,6 +237,7 @@ impl PreviousSearchPrefix {
             Some(PriorSearchDocument::Partial {
                 byte_count: n @ 1..,
                 indexed_hash,
+                ..
             }) => Some((n, indexed_hash)),
             _ => None,
         };
@@ -242,7 +257,102 @@ impl PreviousSearchPrefix {
         }
     }
 
-    fn verify_preview(&mut self, snapshot: &CanonicalSnapshot, torn: bool) -> Result<()> {
+    fn verify_sample_at(
+        file: &mut std::fs::File,
+        session: &SessionRef,
+        end: u64,
+        prior: PriorSearchDocument,
+    ) -> Result<bool> {
+        let PriorSearchDocument::Partial {
+            byte_count,
+            indexed_hash,
+            ..
+        } = prior
+        else {
+            return Ok(false);
+        };
+        let damage = JsonLineDamage::default();
+        let (records, _, tail_records) = crate::support::json_lines_preview_at(
+            file,
+            PREVIEW_RECORDS,
+            JsonLineTail::ReportIncomplete(&damage),
+            end,
+        )?;
+        let tail_start = records.len() - tail_records;
+        let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut document = SearchDocumentBuilder::default();
+        let mut boundaries = Vec::with_capacity(tail_records);
+        let mut head_bytes = 0;
+        let push =
+            |builder: &mut EventBuilder, document: &mut SearchDocumentBuilder, record: &Value| {
+                push_transcript_record(builder, record);
+                for event in builder.drain_events() {
+                    document.push(&event);
+                }
+            };
+        for (index, record) in records.iter().enumerate() {
+            if index == tail_start {
+                head_bytes = document.source_byte_count();
+            }
+            push(&mut builder, &mut document, record);
+            if index >= tail_start {
+                boundaries.push(document.source_byte_count());
+            }
+        }
+        let total = document.source_byte_count();
+        if total == byte_count {
+            return Ok(document.indexed_text_hash() == indexed_hash);
+        }
+        if !matches!(
+            prior,
+            PriorSearchDocument::Partial {
+                sampled_file_bytes: None,
+                ..
+            }
+        ) || total < byte_count
+        {
+            return Ok(false);
+        }
+        // Older receipts only identify the searchable length. The torn record could have shifted
+        // the left edge past more complete rows before its final bytes were appended.
+        let Some(target) =
+            (total - byte_count + head_bytes).checked_sub(if head_bytes == 0 { 2 } else { 0 })
+        else {
+            return Ok(false);
+        };
+        let Some(remove) = boundaries.iter().position(|&offset| offset == target) else {
+            return Ok(false);
+        };
+        let mut document = SearchDocumentBuilder::default();
+        for record in records[..tail_start]
+            .iter()
+            .chain(&records[tail_start + remove + 1..])
+        {
+            push(&mut builder, &mut document, record);
+        }
+        Ok(document.source_byte_count() == byte_count
+            && document.indexed_text_hash() == indexed_hash)
+    }
+
+    fn verified_preview(
+        &mut self,
+        preview: IndexRead,
+        session: &SessionRef,
+        mut file: std::fs::File,
+        length: u64,
+        prior: Option<PriorSearchDocument>,
+        torn: bool,
+    ) -> Result<IndexedSearchDocument> {
+        self.observe_preview(&preview.snapshot, torn);
+        self.verify(torn, &mut file, session, length, prior)?;
+        let mut indexed: IndexedSearchDocument = preview.into();
+        if let Some(projection) = &mut indexed.document.projection {
+            projection.sampled_file_bytes = Some(length);
+        }
+        Ok(indexed)
+    }
+
+    fn observe_preview(&mut self, snapshot: &CanonicalSnapshot, torn: bool) {
         if torn && self.expected.is_some() {
             let mut document = SearchDocumentBuilder::default();
             for event in &snapshot.events {
@@ -253,29 +363,52 @@ impl PreviousSearchPrefix {
                 }
             }
         }
-        self.verify(torn)
     }
 
-    fn verify(&self, torn: bool) -> Result<()> {
-        if torn && !self.verified {
-            return Err(IncompleteTranscript.into());
+    fn verify(
+        &self,
+        torn: bool,
+        file: &mut std::fs::File,
+        session: &SessionRef,
+        length: u64,
+        prior: Option<PriorSearchDocument>,
+    ) -> Result<()> {
+        if !torn || self.verified {
+            return Ok(());
         }
-        Ok(())
+        if let Some(
+            prior @ PriorSearchDocument::Partial {
+                sampled_file_bytes, ..
+            },
+        ) = prior
+        {
+            let extents = match sampled_file_bytes {
+                Some(old) if old <= length => vec![old],
+                Some(_) => Vec::new(),
+                None => crate::support::preceding_preview_extents(file, length)?,
+            };
+            for old in extents {
+                if Self::verify_sample_at(file, session, old, prior)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(IncompleteTranscript.into())
     }
 }
 
-fn record_incomplete_tail(
+fn record_jsonl_damage(
     builder: &mut EventBuilder,
     tail: JsonLineTail<'_>,
     timestamp: Option<DateTime<Utc>>,
 ) {
-    if matches!(tail, JsonLineTail::ReportIncomplete(torn) if torn.get()) {
+    if let Some(damage) = tail.damage().filter(|damage| damage.count() > 0) {
         builder.push(
             EventKind::ProviderEvent,
-            json!({"omitted_events": 1, "native_history_unverified": true, "incomplete_final_record": true}),
+            json!({"omitted_events": damage.count(), "native_history_unverified": true, "incomplete_final_record": damage.final_record()}),
             timestamp,
             ReplayPolicy::HistoricalOnly,
-            Some("omnisession.antigravity_incomplete_tail".to_owned()),
+            Some(if damage.final_record() { "omnisession.antigravity_incomplete_tail" } else { "omnisession.antigravity_malformed_record" }.to_owned()),
             None,
         );
     }
@@ -435,29 +568,21 @@ impl ProviderAdapter for AntigravityAdapter {
         validate_provider(session, Provider::Antigravity)?;
         let summary = self.summary(&session.id)?;
         let (file, length, native, observed) = self.open_history(&summary, path)?;
-        let handle = file.try_clone()?;
-        let require_same_source = || -> Result<()> {
-            observed.ensure_unchanged(path, path, &handle)?;
-            anyhow::ensure!(
-                self.source(&summary).as_deref() == Some(path),
-                "Antigravity history changed during the search read"
-            );
-            Ok(())
-        };
-        let torn = Cell::new(false);
+        let mut handle = file.try_clone()?;
+        let torn = JsonLineDamage::default();
         let tail = if matches!(prior, Some(PriorSearchDocument::RequireCompleteTail(_))) {
-            JsonLineTail::RequireComplete
+            JsonLineTail::RequireCompleteTail(&torn)
         } else {
             JsonLineTail::ReportIncomplete(&torn)
         };
         let mut prefix = PreviousSearchPrefix::new(prior);
         let limited = length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         if !limited && length > full_read_bytes {
-            let preview = self.read_observed(session, Some(path), true, tail);
-            require_same_source()?;
-            let preview = preview?;
-            prefix.verify_preview(&preview.snapshot, torn.get())?;
-            return Ok(preview.into());
+            let preview = self.read_observed(session, Some(path), true, tail)?;
+            let result =
+                prefix.verified_preview(preview, session, file, length, prior, torn.final_record());
+            self.ensure_history_unchanged(&summary, path, observed, &handle)?;
+            return result;
         }
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut title_source = EventBuilder::new(Provider::Antigravity, &session.id).snapshot(
@@ -469,7 +594,11 @@ impl ProviderAdapter for AntigravityAdapter {
         );
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
         let mut document = SearchDocumentBuilder::default();
+        let mut gap_start = None;
         let mut push = |record| {
+            if gap_start.is_none() && torn.interior_count() > 0 {
+                gap_start = Some(document.source_byte_count());
+            }
             let start = events.checkpoint();
             push_transcript_record(&mut events, &record);
             for event in events.drain_events() {
@@ -492,16 +621,24 @@ impl ProviderAdapter for AntigravityAdapter {
                 Ok(())
             })
         };
-        require_same_source()?;
+        let oversized = oversized.and_then(|count| {
+            prefix.verify(torn.final_record(), &mut handle, session, length, prior)?;
+            Ok(count)
+        });
+        self.ensure_history_unchanged(&summary, path, observed, &handle)?;
         let oversized = oversized?;
-        prefix.verify(torn.get())?;
         events.push_oversized_record_notice(oversized, summary.updated_at);
         verify_jsonl_history(&summary, &events)?;
-        record_incomplete_tail(&mut events, tail, summary.updated_at);
+        record_jsonl_damage(&mut events, tail, summary.updated_at);
         for event in events.drain_events() {
             document.push(&event);
         }
         let mut document = document.finish();
+        if !limited
+            && let (Some(start), Some(projection)) = (gap_start, document.projection.as_mut())
+        {
+            projection.interior_damage = Some((torn.interior_count(), start));
+        }
         if limited && prior_prefix.is_some() {
             document.source_complete = false;
             document.truncated = true;
@@ -512,7 +649,7 @@ impl ProviderAdapter for AntigravityAdapter {
             read: IndexRead {
                 search_record_groups: Vec::new(),
                 snapshot: title_source,
-                source_complete: !limited && !torn.get(),
+                source_complete: !limited && torn.count() == 0,
                 provider_limited: limited && prior_prefix.is_some(),
                 source_revision: native
                     .source_revision

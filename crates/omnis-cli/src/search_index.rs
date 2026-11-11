@@ -282,7 +282,7 @@ pub(crate) fn retryable_read_failure(error: &anyhow::Error) -> bool {
             // A temporary I/O failure says nothing about the session contents.
             || cause
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| matches!(error.kind(), io::ErrorKind::StorageFull | io::ErrorKind::Interrupted))
+                .is_some_and(|error| matches!(error.kind(), io::ErrorKind::StorageFull | io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof))
     })
 }
 
@@ -358,6 +358,7 @@ fn read_budget(
                 source_byte_count: Some(byte_count),
                 full_or_provider_limited,
                 document_hash,
+                sampled_file_bytes,
                 ..
             } if candidate.session.provider == Provider::Antigravity
                 && guard.matches_document_file(candidate.source_revision) == Some(true) =>
@@ -366,6 +367,7 @@ fn read_budget(
                     (false, Some(indexed_hash)) => PriorSearchDocument::Partial {
                         byte_count,
                         indexed_hash,
+                        sampled_file_bytes,
                     },
                     _ => PriorSearchDocument::RequireCompleteTail(byte_count),
                 })
@@ -1007,7 +1009,7 @@ impl PreparedIndex {
             source_updated_at: self.source_updated_at,
             source_revision: self.candidate.source_revision,
             source_byte_count: self.document.source_byte_count,
-            projection: self.document.projection,
+            projection: self.document.projection.as_ref(),
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,

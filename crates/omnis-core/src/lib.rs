@@ -53,7 +53,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::OhMyPi => 8,
-        Provider::Pi | Provider::Antigravity | Provider::AntigravityDesktop => 6,
+        Provider::Antigravity => 7,
+        Provider::Pi | Provider::AntigravityDesktop => 6,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -1268,13 +1269,9 @@ impl SearchDocumentBuilder {
     #[must_use]
     pub fn finish(self) -> SearchDocument {
         let document_truncated = self.retained.truncated();
-        let projection =
-            self.projection_hashes
-                .map(|(full, preceding, _)| omnis_ir::SearchProjection {
-                    byte_count: self.retained.total_byte_count,
-                    digest: full.finalize().into(),
-                    before_last_record: preceding.finalize().into(),
-                });
+        let projection = self.projection_hashes.map(|(full, preceding, _)| {
+            omnis_ir::SearchProjection::new(self.retained.total_byte_count, full, preceding)
+        });
         let text = self.retained.finish();
         let truncation_strategy = search_truncation_strategy(
             self.source_incomplete,
