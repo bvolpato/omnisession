@@ -103,6 +103,7 @@ pub(super) enum PendingCall {
 #[derive(Default)]
 pub(super) struct NativeCalls {
     pub(super) result_calls: HashMap<u64, u64>,
+    pub(super) source_keys: HashMap<u64, [u8; 32]>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
     // A later display result can identify the turn of both unstamped model records.
     pub(super) linked: HashMap<u64, u64>,
@@ -115,7 +116,19 @@ impl NativeCalls {
         turn: Option<String>,
         sequence: u64,
         owner: Option<u64>,
+        payload: &serde_json::Value,
     ) {
+        self.source_keys.insert(
+            sequence,
+            super::paginated_rollback::json_digest(&[
+                &payload["type"],
+                &payload["name"],
+                &payload["namespace"],
+                &payload["arguments"],
+                &payload["input"],
+                &payload["action"],
+            ]),
+        );
         self.pending
             .entry(id.to_owned())
             .or_default()
@@ -126,23 +139,23 @@ impl NativeCalls {
             });
     }
 
-    pub(super) fn pending_after(
+    pub(super) fn pending_occurrence(
         &self,
         id: &str,
         turn: &str,
-        result: u64,
+        result: Option<u64>,
         generated: bool,
     ) -> Option<PendingCall> {
         let mut matching = self.pending.get(id)?.iter().filter(|call| {
-            (call.turn.as_deref() == Some(turn) || (generated && call.turn.is_none()))
-                && call.sequence > result
+            call.turn.as_deref() == Some(turn) || (generated && call.turn.is_none())
         });
         let first = matching.next()?.sequence;
-        Some(if matching.next().is_some() {
-            PendingCall::Multiple
-        } else {
-            PendingCall::Unique(first)
-        })
+        if matching.next().is_some() {
+            return Some(PendingCall::Multiple);
+        }
+        result
+            .filter(|result| first > *result)
+            .map(|_| PendingCall::Unique(first))
     }
 
     pub(super) fn confirm_turn(&mut self, id: &str, sequence: u64, turn: &str, owner: Option<u64>) {
@@ -197,6 +210,7 @@ impl NativeCalls {
     }
 
     pub(super) fn retain(&mut self, mut exists: impl FnMut(u64) -> bool) {
+        self.source_keys.retain(|&seq, _| exists(seq));
         self.result_calls
             .retain(|&result, call| exists(result) && exists(*call));
         self.pending.retain(|_, calls| {

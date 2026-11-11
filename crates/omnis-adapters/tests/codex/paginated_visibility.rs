@@ -1710,3 +1710,44 @@ fn a_failed_second_command_keeps_its_status_when_the_call_id_is_reused() {
         }
     }
 }
+
+#[test]
+fn overlapping_calls_before_the_first_result_keep_the_unattributed_failure_separate() {
+    for mode in ["legacy", "paginated"] {
+        for turn in ["turn", "rollout-2"] {
+            let [call, first, mut display] = command_rows(turn, "reused", "first output");
+            let mut second = first.clone();
+            second["payload"]["output"] = "second output".into();
+            let item = display["payload"]["item"].as_object_mut().unwrap();
+            item.remove("aggregated_output");
+            item.insert("status".into(), "failed".into());
+            item.insert("exit_code".into(), 1.into());
+            let rows = vec![
+                event("task_started", json!({"turn_id":turn})),
+                page_user(turn, "u", "request"),
+                call.clone(),
+                call,
+                display,
+                first,
+                second,
+            ];
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                let failed: Vec<_> = snapshot
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == omnis_ir::EventKind::ToolFailed)
+                    .collect();
+                assert_eq!(failed.len(), 1, "{mode} {turn}");
+                assert!(failed[0].payload["output"].is_null(), "{mode} {turn}");
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(!search.source_complete, "{mode} {turn}");
+                for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                    for output in ["first output", "second output"] {
+                        assert_eq!(text.matches(output).count(), 1, "{mode} {turn}");
+                    }
+                }
+            }
+        }
+    }
+}

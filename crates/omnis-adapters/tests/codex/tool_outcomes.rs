@@ -1388,3 +1388,108 @@ fn a_command_correction_during_a_later_call_uses_the_proven_occurrence() {
         }
     }
 }
+
+#[test]
+fn mcp_structured_results_match_the_serialized_model_body_and_keep_display_text() {
+    let structured = json!({"code":"missing_file", "line":12});
+    let body = serde_json::to_string(&structured).unwrap();
+    let display = turn_item(
+        "turn",
+        &json!({"type":"McpToolCall","id":"cmd","tool":"lookup","server":"fixture","arguments":{},"status":"failed","result":{"content":[{"type":"text","text":"No such file"}],"structuredContent":structured,"isError":true}}),
+    );
+    for preview in [false, true] {
+        for mode in [None, Some("paginated")] {
+            for display_first in [false, true] {
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":"turn"})),
+                    call(Some("turn")),
+                ];
+                let raw = model_result(&body);
+                rows.extend(if display_first {
+                    [display.clone(), raw]
+                } else {
+                    [raw, display.clone()]
+                });
+                let snap = read_with_history_mode(rows, preview, mode).unwrap();
+                assert_eq!(results(&snap), [(&EventKind::ToolFailed, body.as_str())]);
+                let search = omnis_core::trajectory_search_document(&snap);
+                assert!(search.source_complete && search.text.contains("No such file"));
+                assert!(omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snap)).iter().any(|item| matches!(item,omnis_core::NativeTrajectoryItem::Tool {is_error:true,output,..} if output==&body)));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_long_dynamic_result_compares_the_original_bytes_before_shortening_them() {
+    let edge = "ü".repeat(16_384);
+    let raw_text = format!("{edge}a{edge}");
+    for middle in ["a", "z"] {
+        let display = turn_item(
+            "turn",
+            &json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":format!("{edge}{middle}{edge}")}]}),
+        );
+        let rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            call(Some("turn")),
+            model_result(&raw_text),
+            display,
+        ];
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let raw = snap
+                .events
+                .iter()
+                .find(|e| {
+                    e.source.raw_record_type.as_deref()
+                        == Some("response_item.function_call_output")
+                })
+                .unwrap();
+            assert_eq!(raw.kind == EventKind::ToolFailed, middle == "a");
+            assert!(
+                raw.payload["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("characters omitted")
+            );
+            let outcomes = omnis_core::plan_semantic_handoff(&snap).tool_outcomes;
+            assert_eq!(outcomes.len(), if middle == "a" { 1 } else { 2 });
+            assert!(snap.events.iter().all(|event| {
+                !event
+                    .payload
+                    .to_string()
+                    .contains("omnisession_codex_source_receipt")
+            }));
+        }
+    }
+}
+
+#[test]
+fn repeated_commands_with_the_same_inputs_can_be_distinguished_by_their_original_output() {
+    let shown = |text: &str, status: &str| {
+        let mut item = command("turn", status);
+        item["payload"]["item"]["aggregated_output"] = json!(text);
+        item
+    };
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        call(Some("turn")),
+        model_result("first native output"),
+        shown("first native output", "completed"),
+        call(Some("turn")),
+        model_result("second native output"),
+        shown("second native output", "completed"),
+        shown("first native output", "failed"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        assert_eq!(
+            results(&snapshot),
+            [
+                (&EventKind::ToolFailed, "first native output"),
+                (&EventKind::ToolCompleted, "second native output")
+            ]
+        );
+        assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+    }
+}

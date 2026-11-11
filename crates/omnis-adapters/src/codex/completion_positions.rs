@@ -1,6 +1,6 @@
 //! Keep published turn slots separate from the physical model results they can mirror.
 
-use super::paginated_rollback::json_digest;
+use super::tool_occurrences::{Match, Receipt};
 use super::{CodexHistory, CompletedKind, CompletionScope, EventBuilder, model_result_kind};
 use omnis_ir::{EventKind, OmniEvent, ReplayPolicy};
 use serde_json::{Value, json};
@@ -66,33 +66,12 @@ pub(super) fn pair(builder: &mut EventBuilder, display: u64, model: u64) -> bool
     paired
 }
 
-fn command_key(item: &Value) -> Option<[u8; 32]> {
-    if item["type"] != "CommandExecution" {
-        return None;
-    }
-    Some(json_digest(&[
-        &item["command"],
-        &item["cwd"],
-        &item["aggregated_output"],
-    ]))
-}
-
-fn call_key(builder: &mut EventBuilder, sequence: u64) -> Option<[u8; 32]> {
-    let call = &builder.event_at_mut(sequence)?.payload;
-    Some(json_digest(&[
-        &call["type"],
-        &call["name"],
-        &call["arguments"],
-        &call["input"],
-    ]))
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct Projection {
     pub(super) scope: CompletionScope,
     pub(super) original: Option<u64>,
     pub(super) peer: Option<u64>,
-    command: Option<[u8; 32]>,
+    receipt: Option<Receipt>,
     pending: Option<u64>,
     pub(super) wait_for_call: bool,
     pub(super) ambiguous: bool,
@@ -112,6 +91,47 @@ impl Projection {
 }
 
 impl CodexHistory {
+    fn call_identity_for_result(&self, result: u64) -> Option<&[u8; 32]> {
+        self.calls
+            .result_calls
+            .get(&result)
+            .and_then(|seq| self.calls.source_keys.get(seq))
+    }
+
+    fn matching_occurrence(
+        &self,
+        builder: &mut EventBuilder,
+        scope: (&str, &str),
+        item: &Value,
+        receipt: Option<Receipt>,
+        latest: Option<u64>,
+    ) -> Match {
+        let (turn, id) = scope;
+        let known = self.occurrences.find(turn, id, receipt);
+        let (Match::One(earlier), Some(latest)) = (&known, latest) else {
+            return known;
+        };
+        if *earlier == latest || self.occurrences.has_result(turn, id, latest) {
+            return known;
+        }
+        let earlier_call = self.call_identity_for_result(*earlier);
+        if earlier_call.is_some() && earlier_call != self.call_identity_for_result(latest) {
+            return known;
+        }
+        // Identical model calls can produce different results. Only the full original output
+        // distinguishes the newer, unpublished occurrence from a revision of the earlier one.
+        let mut matches = |seq| {
+            builder
+                .event_at_mut(seq)
+                .is_some_and(|e| super::completed_item::display_matches_model(item, &e.payload))
+        };
+        match (matches(*earlier), matches(latest)) {
+            (true, false) => known,
+            (false, true) => Match::One(latest),
+            _ => Match::Multiple,
+        }
+    }
+
     pub(super) fn completion_position(
         &mut self,
         builder: &mut EventBuilder,
@@ -121,7 +141,7 @@ impl CodexHistory {
         payload: &Value,
     ) -> Projection {
         let display = payload["type"] == "item_completed";
-        let command = command_key(&payload["item"]);
+        let receipt = Receipt::from_item(&payload["item"]);
         let historical = CompletionScope::Historical(kind);
         let positions = self.completed.get(turn);
         let get = |scope| positions?.get(&(scope, id.to_owned())).copied();
@@ -135,36 +155,41 @@ impl CodexHistory {
         let old_model = published.and_then(|p| p.model);
         let last_result = history.or(old_model);
         let generated = super::is_implicit_turn(turn) && self.current_turn_id() == Some(turn);
-        let candidate =
-            last_result.and_then(|result| self.calls.pending_after(id, turn, result, generated));
+        let candidate = self
+            .calls
+            .pending_occurrence(id, turn, last_result, generated);
         let multiple = matches!(candidate, Some(super::tool_history::PendingCall::Multiple));
         let pending = match candidate {
             Some(super::tool_history::PendingCall::Unique(seq)) => Some(seq),
             _ => None,
         };
-        let matches_previous = command.is_some() && previous.is_some_and(|p| p.command == command);
-        let unconfirmed_output = command.is_some()
-            && previous.is_none_or(|p| p.command.is_none())
+        let known =
+            self.matching_occurrence(builder, (turn, id), &payload["item"], receipt, last_result);
+        let prior = match known {
+            Match::One(seq) => Some(seq),
+            _ => None,
+        };
+        let multiple_receipts = matches!(known, Match::Multiple);
+        let unconfirmed_output = receipt.is_some()
+            && prior.is_none()
             && pending.is_some()
             && last_result
                 .and_then(|seq| builder.event_at_mut(seq))
                 .is_some_and(|event| {
-                    payload["item"]["aggregated_output"].is_string()
-                        && event.payload["output"] == payload["item"]["aggregated_output"]
+                    super::completed_item::display_matches_model(&payload["item"], &event.payload)
                 });
         let ambiguous = display
             && kind == CompletedKind::Tool
             && (multiple
+                || multiple_receipts
                 || unconfirmed_output
-                || (matches_previous
+                || (prior.is_some()
                     && pending.is_some_and(|next| {
-                        let past = last_result
-                            .and_then(|r| self.calls.result_calls.get(&r))
-                            .and_then(|s| call_key(builder, *s));
-                        past.is_none() || past == call_key(builder, next)
+                        let past = prior.and_then(|r| self.call_identity_for_result(r));
+                        past.is_none() || past == self.calls.source_keys.get(&next)
                     })));
         let wait_for_call = if display {
-            ambiguous || (pending.is_some() && kind == CompletedKind::Tool && !matches_previous)
+            ambiguous || (pending.is_some() && kind == CompletedKind::Tool && prior.is_none())
         } else {
             previous.is_some_and(|p| p.ambiguous)
         };
@@ -175,11 +200,11 @@ impl CodexHistory {
             detach: None,
             wait_for_call,
             pending,
-            command,
+            receipt,
             ambiguous,
         };
         if !self.paginated {
-            projection.original = history.filter(|_| display && !wait_for_call);
+            projection.original = prior.or(history).filter(|_| display && !wait_for_call);
             projection.peer = history.filter(|seq| {
                 !display
                     && !wait_for_call
@@ -191,8 +216,14 @@ impl CodexHistory {
         } else if display {
             projection.scope = CompletionScope::Published;
             projection.original = published.map(|p| p.sequence);
-            projection.peer = last_result.filter(|_| kind == CompletedKind::Tool && !wait_for_call);
-            projection.detach = old_model.filter(|_| !wait_for_call && old_model == last_result);
+            projection.peer = prior
+                .or(last_result)
+                .filter(|_| kind == CompletedKind::Tool && !wait_for_call);
+            projection.detach = old_model.filter(|_| {
+                !wait_for_call
+                    && old_model == last_result
+                    && (prior.is_none() || prior == old_model)
+            });
         } else {
             projection.peer = published
                 .filter(|slot| {
@@ -240,6 +271,10 @@ impl CodexHistory {
                 .filter(|position| position.sequence == slot)
             {
                 position.sequence = model;
+                if let Some(receipt) = position.receipt {
+                    self.occurrences
+                        .observe(self.aliases.resolve(&turn), id, model, receipt);
+                }
             }
             return;
         }
@@ -250,6 +285,10 @@ impl CodexHistory {
             .filter(|position| position.sequence == slot)
         {
             position.model = Some(model);
+            if let Some(receipt) = position.receipt {
+                self.occurrences
+                    .observe(self.aliases.resolve(&turn), id, model, receipt);
+            }
             self.paginated_answers.move_tool_display(slot, model);
             self.completed
                 .entry(self.aliases.resolve(&turn).to_owned())
@@ -261,7 +300,7 @@ impl CodexHistory {
                     ),
                     super::CompletedPosition {
                         kind: CompletedKind::Tool,
-                        command: None,
+                        receipt: None,
                         ambiguous: false,
                         sequence: model,
                         model: None,
@@ -272,8 +311,8 @@ impl CodexHistory {
 
     pub(super) fn remember_completion(
         &mut self,
-        turn: &str,
-        id: &str,
+        builder: &mut EventBuilder,
+        (turn, id): (&str, &str),
         kind: CompletedKind,
         projected: Projection,
         sequence: u64,
@@ -297,6 +336,22 @@ impl CodexHistory {
             .entry(self.aliases.resolve(turn).to_owned())
             .or_default();
         let published = (CompletionScope::Published, id.to_owned());
+        let key = (projected.scope, id.to_owned());
+        let matched_slot = peer.and_then(|s| {
+            positions
+                .get(if self.paginated { &published } else { &key })
+                .filter(|p| p.sequence == s)
+        });
+        let receipt = projected.receipt.or_else(|| matched_slot?.receipt);
+        let physical = builder
+            .event_at_mut(sequence)
+            .is_some_and(|e| model_output(e));
+        if let (Some(receipt), Some(model)) =
+            (receipt, if physical { Some(sequence) } else { peer })
+        {
+            self.occurrences
+                .observe(self.aliases.resolve(turn), id, model, receipt);
+        }
         if self.paginated
             && projected.scope != CompletionScope::Published
             && let Some(mirror) = peer
@@ -307,20 +362,18 @@ impl CodexHistory {
             slot.model = Some(sequence);
             self.paginated_answers.move_tool_display(mirror, sequence);
         }
-        let key = (projected.scope, id.to_owned());
-        let command = projected.command.or_else(|| {
-            peer.and_then(|p| {
-                positions
-                    .get(&key)
-                    .filter(|prior| prior.sequence == p)?
-                    .command
-            })
-        });
+        if !self.paginated
+            && projected.receipt.is_some()
+            && physical
+            && positions.get(&key).is_some_and(|p| p.sequence > sequence)
+        {
+            return;
+        }
         positions.insert(
             key,
             super::CompletedPosition {
                 kind,
-                command,
+                receipt,
                 ambiguous: projected.ambiguous,
                 sequence,
                 model: peer,

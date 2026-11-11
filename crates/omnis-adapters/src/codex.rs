@@ -39,6 +39,7 @@ mod paginated_workspace;
 mod rollout_cache;
 mod rollout_lines;
 mod tool_history;
+mod tool_occurrences;
 mod tool_revisions;
 mod turn_aliases;
 mod wire_enums;
@@ -851,7 +852,7 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
-    command: Option<[u8; 32]>,
+    receipt: Option<tool_occurrences::Receipt>,
     ambiguous: bool,
     model: Option<u64>,
     kind: CompletedKind,
@@ -894,6 +895,7 @@ struct CodexHistory {
     message_ids: MessageIds,
     aliases: TurnAliases,
     calls: NativeCalls,
+    occurrences: tool_occurrences::ToolOccurrences,
     display_revisions: DisplayRevisions,
     late_owners: HashMap<u64, u64>,
     display_positions: HashMap<u64, (u64, u64)>,
@@ -931,6 +933,7 @@ impl CodexHistory {
             message_ids: MessageIds::default(),
             aliases: TurnAliases::default(),
             calls: NativeCalls::default(),
+            occurrences: tool_occurrences::ToolOccurrences::default(),
             display_revisions: DisplayRevisions::default(),
             late_owners: HashMap::new(),
             display_positions: HashMap::new(),
@@ -1001,6 +1004,8 @@ impl CodexHistory {
             .outcomes
             .retain(|seq| builder.event_at_mut(seq).is_some());
         self.calls.retain(|seq| builder.event_at_mut(seq).is_some());
+        self.occurrences
+            .retain(|seq| builder.event_at_mut(seq).is_some());
         self.message_ids
             .retain(|seq| builder.event_at_mut(seq).is_some());
         self.completed.retain(|_, items| {
@@ -1553,6 +1558,7 @@ impl CodexHistory {
                     != Some("omnisession.codex_tool_display_mirror")
             });
         }
+        builder.visit_events_mut(|event| completed_item::clear_source_receipt(&mut event.payload));
         builder.order_delayed_messages(&self.display_positions);
     }
 
@@ -1887,7 +1893,7 @@ impl CodexHistory {
                 push_response_item(builder, payload, stamp, &mut self.items);
             }
             self.calls
-                .push(id, turn.map(str::to_owned), sequence, owner);
+                .push(id, turn.map(str::to_owned), sequence, owner, payload);
             let key = self.paginated_tool_id(payload, turn, id);
             self.observe_model_tool(Some(sequence), record, None, key);
             return true;
@@ -2076,7 +2082,7 @@ impl CodexHistory {
         {
             self.place_early_answer(builder, input, sequence);
         }
-        self.remember_completion(turn, id, kind, projection, sequence, peer);
+        self.remember_completion(builder, (turn, id), kind, projection, sequence, peer);
         Some(sequence)
     }
 
@@ -2194,6 +2200,7 @@ impl CodexHistory {
             && self.aliases.bind(turn, original)
         {
             self.message_ids.bind(turn, original);
+            self.occurrences.bind(turn, original);
             if let Some(known) = self.completed.remove(turn) {
                 self.completed
                     .entry(original.clone())
@@ -2629,7 +2636,7 @@ fn push_completed_item(
                 items.push_historical(
                     builder,
                     kind,
-                    payload,
+                    completed_item::with_source_receipt(payload, item),
                     timestamp,
                     "event_msg.item_completed".to_owned(),
                     id,
@@ -3005,7 +3012,7 @@ fn push_response_item(
     items.push_historical(
         builder,
         kind,
-        compact_tool_value(payload, None),
+        completed_item::with_source_receipt(compact_tool_value(payload, None), payload),
         timestamp,
         format!("response_item.{item_type}"),
         result_id,

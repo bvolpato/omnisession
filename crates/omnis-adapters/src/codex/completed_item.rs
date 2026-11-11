@@ -12,7 +12,10 @@ mod positional;
 mod private;
 mod receipts;
 
-pub(super) use receipts::{annotate_model_receipt, equivalent_model_receipt};
+pub(super) use receipts::{
+    annotate_model_receipt, clear_source_receipt, display_matches_model, equivalent_model_receipt,
+    with_source_receipt,
+};
 mod status;
 
 pub(super) fn prepare_event(payload: &mut Value) -> bool {
@@ -224,7 +227,11 @@ fn text_output(output: &Value) -> Option<Value> {
     let mut shown = Vec::new();
     for part in parts.iter().take(super::MAX_TOOL_ARRAY_ITEMS) {
         let text = match part["type"].as_str() {
-            Some("text" | "input_text" | "inputText") => part["text"].as_str(),
+            Some("text" | "input_text" | "inputText")
+                if part["_meta"]["codex/encryptedContent"] != true =>
+            {
+                part["text"].as_str()
+            }
             Some("resource") => part["resource"]["text"].as_str(),
             _ => None,
         };

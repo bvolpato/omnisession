@@ -852,3 +852,111 @@ fn a_completed_review_replaces_the_old_reply_with_its_published_findings() {
         }
     }
 }
+
+fn completed_lookup(status: &str) -> Value {
+    turn_item(
+        "turn",
+        &json!({
+            "type":"DynamicToolCall","id":"shared","tool":"lookup","arguments":{},
+            "status":status,"success":status=="completed","content_items":[{"type":"inputText","text":"first receipt"}]
+        }),
+    )
+}
+
+#[test]
+fn a_revised_tool_display_keeps_the_outcome_of_its_original_call() {
+    let call = |name: &str, arguments: Value| {
+        json!({"type":"response_item","payload":{
+        "type":"function_call","name":name,"arguments":arguments.to_string(),"call_id":"shared"}} )
+    };
+    let result = |text: &str| {
+        json!({"type":"response_item","payload":{
+        "type":"function_call_output","call_id":"shared","output":text}})
+    };
+    let command = |name: &str, status: &str, text: &str| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"CommandExecution","id":"shared","command":[name],"cwd":"file:///workspace",
+                "source":"agent","parsed_cmd":[],"status":status,"aggregated_output":text
+            }),
+        )
+    };
+    let first = call("exec_command", json!({"cmd":"first"}));
+    let second = call("exec_command", json!({"cmd":"second"}));
+    let finished = command("first", "completed", "first receipt");
+    let corrected = command("first", "failed", "first receipt");
+    for (scenario, records) in [
+        "late correction",
+        "both displayed",
+        "partial output",
+        "dynamic tool",
+    ]
+    .into_iter()
+    .zip([
+        vec![
+            first.clone(),
+            result("first receipt"),
+            finished.clone(),
+            second.clone(),
+            result("second receipt"),
+            corrected.clone(),
+        ],
+        vec![
+            first.clone(),
+            result("first receipt"),
+            finished,
+            second.clone(),
+            result("second receipt"),
+            command("second", "completed", "second receipt"),
+            corrected.clone(),
+        ],
+        vec![
+            first,
+            result("first receipt"),
+            command("first", "in_progress", "partial message"),
+            second,
+            corrected,
+            result("second receipt"),
+        ],
+        vec![
+            call("lookup", json!({})),
+            result("first receipt"),
+            completed_lookup("completed"),
+            call("other", json!({})),
+            completed_lookup("failed"),
+            result("second receipt"),
+        ],
+    ]) {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "request", "objective"),
+        ];
+        rows.extend(records);
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            let native = omnis_core::native_trajectory_items(&trajectory);
+            let outputs: Vec<_> = native
+                .iter()
+                .filter_map(|item| match item {
+                    omnis_core::NativeTrajectoryItem::Tool {
+                        output, is_error, ..
+                    } => Some((output.as_str(), *is_error)),
+                    omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                })
+                .collect();
+            assert_eq!(
+                outputs,
+                [("first receipt", true), ("second receipt", false)],
+                "{scenario}, preview={preview}"
+            );
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            for text in ["first receipt", "second receipt"] {
+                assert_eq!(handoff.matches(text).count(), 1, "{handoff}");
+            }
+            assert!(!handoff.contains("partial message"));
+        }
+    }
+}
