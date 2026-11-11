@@ -1637,6 +1637,18 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
     fs::copy(&primary, &copy).unwrap();
     fs::hard_link(&primary, &hardlink).unwrap();
     std::os::unix::fs::symlink(&primary, &symlink).unwrap();
+    let visible = fixture.root.join("visible-bin");
+    std::os::unix::fs::symlink(primary.parent().unwrap(), &visible).unwrap();
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+        json!(visible.join("codex"))
+    ));
+    for args in [
+        vec!["inspect", &source, "--target", "routed"],
+        vec!["resume", &source, "--in", "routed", "--no-fork"],
+    ] {
+        assert_remote_codex_error(&fixture, &args, REMOTE_CODEX_ERROR);
+    }
     for route in [copy, hardlink, symlink] {
         fixture.write_profiles(&format!(
             "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",

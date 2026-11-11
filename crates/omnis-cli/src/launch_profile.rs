@@ -662,7 +662,15 @@ impl AgentTarget {
             return Ok(true);
         };
         let provider = crate::provider_launch::resolved_provider_binary(self.provider).ok();
-        if provider.as_deref() == Some(program.as_path()) {
+        if let Some(provider) = provider.as_deref()
+            && (program == provider
+                || (program.file_name() == provider.file_name()
+                    && program
+                        .parent()
+                        .and_then(|dir| dir.canonicalize().ok())
+                        .as_deref()
+                        == provider.parent()))
+        {
             return Ok(true);
         }
         if self.provider == Provider::Codex
