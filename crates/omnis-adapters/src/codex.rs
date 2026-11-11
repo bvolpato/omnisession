@@ -1156,7 +1156,14 @@ impl CodexHistory {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
         match disposition {
-            Admission::Complete => self.push_verified(builder, record, index),
+            Admission::Complete => {
+                if record["type"] == "event_msg"
+                    && completed_item::omits_documentary_display(&record["payload"])
+                {
+                    self.rollout_lines.unsupported_display_items += 1;
+                }
+                self.push_verified(builder, record, index)
+            }
             Admission::ModelOnly => {
                 let event_type = (record["type"] == "event_msg")
                     .then(|| record["payload"]["type"].as_str())
@@ -1187,10 +1194,9 @@ impl CodexHistory {
         }
         let turn_id = payload["turn_id"].as_str();
         if event_type == Some("thread_rolled_back") {
-            let count = payload["num_turns"]
-                .as_u64()
+            let count = rollout_lines::rollback_turns(payload)
                 .context("Codex rollback marker has no valid num_turns")?;
-            self.rollback(builder, count);
+            self.rollback(builder, u64::from(count));
             return Ok(());
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
@@ -1336,8 +1342,7 @@ impl CodexHistory {
             return Ok(true);
         }
         if event_type == Some("thread_rolled_back") {
-            let count = payload["num_turns"]
-                .as_u64()
+            let count = rollout_lines::rollback_turns(payload)
                 .context("Codex rollback marker has no valid num_turns")?;
             self.withdraw_displayed_inputs(builder, usize::try_from(count).unwrap_or(usize::MAX));
             return Ok(true);
@@ -1470,6 +1475,11 @@ impl CodexHistory {
         }
         for (count, record, reason) in [
             (
+                self.rollout_lines.unsupported_display_items,
+                "omnisession.codex_unsupported_display",
+                "A Codex display item used an unsupported positional format. Its contents are omitted.",
+            ),
+            (
                 self.rollout_lines.invalid_checkpoints,
                 "omnisession.codex_invalid_checkpoint",
                 "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
@@ -1497,6 +1507,8 @@ impl CodexHistory {
                 "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
             } else if gap == OrdinalGap::Possible {
                 "A documentary Codex record follows a gap in the recorded positions. OmniSession could not verify whether any published history is missing."
+            } else if !self.paginated {
+                "The Codex rollout contains unreadable records. The handoff uses the last verified history."
             } else {
                 "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
             };
@@ -2173,6 +2185,8 @@ fn contains_rollback_marker(path: &Path) -> Result<bool> {
 fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
     const MARKER: &[u8] = b"thread_rolled_back";
     let marker = memchr::memmem::Finder::new(MARKER);
+    let tag = rollout_lines::ROLLBACK_TAG.to_string();
+    let numeric = memchr::memmem::Finder::new(tag.as_bytes());
     let escape = memchr::memmem::Finder::new(b"\\u00");
     let mut file = fs::File::open(path)?;
     // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
@@ -2187,6 +2201,14 @@ fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool
         let window = &buffer[..length];
         // Writers never need to escape letters, so an escaped letter may be hiding the marker.
         if marker.find(window).is_some()
+            // A possible numeric tag is enough to select the full reader, which checks its context.
+            || numeric.find_iter(window).any(|start| {
+                start.checked_sub(1).and_then(|i| window.get(i)).is_some_and(|b|
+                    matches!(b, b':' | b'[') || b.is_ascii_whitespace()
+                ) && window.get(start + tag.len()).is_some_and(|b|
+                    matches!(b, b',' | b'}') || b.is_ascii_whitespace()
+                )
+            })
             || escape
                 .find_iter(window)
                 .any(|position| escapes_ascii_letter(window.get(position + 4..position + 6)))
@@ -3470,6 +3492,11 @@ mod tests {
     fn naive_rollback_marker(bytes: &[u8]) -> bool {
         const MARKER: &[u8] = b"thread_rolled_back";
         bytes.windows(MARKER.len()).any(|window| window == MARKER)
+            || bytes.windows(4).any(|token| {
+                &token[1..3] == b"14"
+                    && (matches!(token[0], b'[' | b':') || token[0].is_ascii_whitespace())
+                    && (matches!(token[3], b',' | b'}') || token[3].is_ascii_whitespace())
+            })
             || bytes.windows(6).any(|window| {
                 window.starts_with(b"\\u00")
                     && std::str::from_utf8(&window[4..])
@@ -3523,6 +3550,10 @@ mod tests {
             marker in prop_oneof![
                 Just(String::new()),
                 Just("thread_rolled_back".to_owned()),
+                Just("[14,1]".to_owned()),
+                Just(r#"{"num_turns":1,"type":14}"#.to_owned()),
+                Just("[   14  ,1]".to_owned()),
+                Just("[ 140 ,1]".to_owned()),
                 Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
                 Just(format!("{}hread_rolled_back", json_escape(b't'))),
                 Just(format!("{}[31m", json_escape(0x1b))),

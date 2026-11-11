@@ -75,8 +75,38 @@ fn completed(payload: &Value) -> Wire {
     }
 }
 
+// Serde numbers the deserializable EventMsg variants in declaration order in Codex 0.167.1.
+pub(in super::super) const ROLLBACK_TAG: u8 = 14;
+
+pub(in super::super) fn rollback_turns(payload: &Value) -> Option<u32> {
+    u32::try_from(field(payload, "num_turns", 1)?.as_u64()?).ok()
+}
+
+fn name_event_tag(payload: &mut Value) {
+    super::name_numeric_tag(payload, |index| {
+        Some(match u8::try_from(index).ok()? {
+            ROLLBACK_TAG => "thread_rolled_back",
+            15 => "task_started",
+            17 => "task_complete",
+            18 => "token_count",
+            19 => "agent_message",
+            20 => "user_message",
+            59 => "turn_aborted",
+            66 => "item_completed",
+            _ => return None,
+        })
+    });
+}
+
 // Name native struct positions before either the display reader or the model reader sees the event.
 pub(super) fn prepare(payload: &mut Value) -> bool {
+    name_event_tag(payload);
+    if field(payload, "type", 0).and_then(Value::as_str) == Some("thread_rolled_back")
+        && field(payload, "num_turns", 1).is_some_and(Value::is_u64)
+        && rollback_turns(payload).is_none()
+    {
+        return false;
+    }
     let Some(parts) = payload.as_array() else {
         return true;
     };
@@ -141,11 +171,7 @@ pub(super) fn classify(payload: &Value) -> Wire {
         Some("agent_message") => Wire::checked(messages::agent(payload)),
         Some("user_message") => Wire::checked(messages::user(payload)),
         Some("item_completed") => completed(payload),
-        Some("thread_rolled_back") => Wire::checked(
-            get("num_turns")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| u32::try_from(n).is_ok()),
-        ),
+        Some("thread_rolled_back") => Wire::checked(rollback_turns(payload).is_some()),
         Some("token_count") => Wire::checked(
             optional("info", checkpoint_wire::token_usage_info)
                 && rate_limits::valid_token_count(payload),

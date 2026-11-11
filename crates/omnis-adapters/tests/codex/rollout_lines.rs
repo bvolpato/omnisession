@@ -516,6 +516,8 @@ fn positional_rollback_preserves_the_display_and_withdraws_the_same_model_turn()
     for rollback in [
         json!(["thread_rolled_back", 1]),
         json!({"type":"thread_rolled_back","num_turns":1}),
+        json!([14, 1]),
+        json!({"type":14,"num_turns":1}),
     ] {
         let mut rows = history.clone();
         rows.push(json!({"type":"event_msg","payload":rollback}));
@@ -545,5 +547,57 @@ fn positional_rollback_preserves_the_display_and_withdraws_the_same_model_turn()
                     .contains("second reply")
             );
         }
+    }
+}
+
+#[test]
+fn numeric_legacy_messages_and_rollback_respect_the_native_turn_count_range() {
+    let prefix = [
+        event("user_message", json!({"message":"first request"})),
+        event("agent_message", json!({"message":"first reply"})),
+        json!({"type":"event_msg","payload":[20,null,"second request",null,[],null,[],[],[],[],null]}),
+        json!({"type":"event_msg","payload":{"type":19,"message":"second reply"}}),
+    ];
+    for (rollback, keep_second) in [
+        (json!([14, 1]), false),
+        (json!({"type":14,"num_turns":1}), false),
+        (json!(["thread_rolled_back", 4_294_967_296_u64]), true),
+        (json!({"type":14,"num_turns":4_294_967_296_u64}), true),
+    ] {
+        let rows: Vec<_> = prefix
+            .iter()
+            .cloned()
+            .chain([json!({"type":"event_msg","payload":rollback})])
+            .collect();
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let text = visible_text(&snapshot);
+            assert!(text.contains(&"first request") && text.contains(&"first reply"));
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            if keep_second {
+                assert!(!search.source_complete, "damaged rollback: {rollback}");
+            }
+            for word in ["second request", "second reply"] {
+                assert_eq!(text.contains(&word), keep_second, "{rollback}");
+                assert_eq!(search.text.contains(word), keep_second);
+                assert_eq!(handoff.contains(word), keep_second);
+            }
+        }
+    }
+}
+
+#[test]
+fn damaged_numeric_legacy_message_cannot_publish_a_revision() {
+    let rows = vec![
+        event("agent_message", json!({"message":"published"})),
+        json!({"type":"event_msg","payload":[19,"invalid revision","unknown_phase"]}),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+        assert_eq!(visible_text(&snapshot), ["published"]);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(!search.source_complete && !search.text.contains("invalid revision"));
+        assert!(!omnis_core::render_semantic_handoff(&snapshot).contains("invalid revision"));
     }
 }

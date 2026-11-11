@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::{checkpoint_wire, completed_item};
 
 mod events;
+pub(super) use events::{ROLLBACK_TAG, rollback_turns};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Admission {
@@ -43,6 +44,7 @@ pub(super) struct RolloutLines {
     contiguous_next: u64,
     pub(super) invalid_checkpoints: usize,
     pub(super) invalid_messages: usize,
+    pub(super) unsupported_display_items: usize,
     pub(super) skipped: usize,
     pub(super) gap: OrdinalGap,
     pub(super) contested: bool,
@@ -156,6 +158,10 @@ impl RolloutLines {
             self.skipped += 1;
             return Wire::Invalid;
         }
+        // Vintage named events can predate the current wire schema. Numeric and positional
+        // events use the pinned Serde layout in both legacy and paginated history.
+        let encoded_event = record["type"] == "event_msg"
+            && (record["payload"].is_array() || record["payload"]["type"].is_number());
         // Ordinal admission and model reconstruction must see the same fields.
         let valid_content = match record["type"].as_str() {
             Some("compacted") => {
@@ -183,7 +189,7 @@ impl RolloutLines {
             self.invalid_messages += 1;
             return Wire::Invalid;
         }
-        if !paginated {
+        if !paginated && !encoded_event {
             return Wire::Decoded;
         }
         let wire = match record["type"].as_str() {
@@ -221,6 +227,20 @@ pub(super) fn valid_envelope(record: &Value) -> bool {
                     | "realtime_item"
             )
         )
+}
+
+/// Normalize a known numeric tag before the reader classifies or uses an event.
+pub(super) fn name_numeric_tag<'a>(value: &mut Value, name: impl FnOnce(u64) -> Option<&'a str>) {
+    let tag = match value {
+        Value::Array(parts) => parts.first_mut(),
+        Value::Object(fields) => fields.get_mut("type"),
+        _ => None,
+    };
+    if let Some(tag) = tag
+        && let Some(name) = tag.as_u64().and_then(name)
+    {
+        *tag = name.into();
+    }
 }
 
 /// Move a positional payload into its named representation without copying its contents.

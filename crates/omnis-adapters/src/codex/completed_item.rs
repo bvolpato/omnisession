@@ -23,7 +23,13 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
             false
         }
         Some("UserMessage") => prepare_user_message(&mut payload["item"]),
-        Some("AgentMessage") => assistant::valid(item),
+        Some("AgentMessage") => {
+            let item = &mut payload["item"];
+            item.get_mut("content")
+                .and_then(Value::as_array_mut)
+                .is_some_and(|parts| parts.iter_mut().all(positional::assistant_content))
+                && assistant::valid(item)
+        }
         Some("Plan") => item["text"].is_string(),
         Some("FunctionCallOutput") => {
             item["name"].is_string()
@@ -35,6 +41,25 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
         }
         _ => true,
     }
+}
+
+// A known historical item with an unverified positional layout cannot supply a display record.
+pub(super) fn omits_documentary_display(payload: &Value) -> bool {
+    payload["type"] == "item_completed"
+        && matches!(
+            payload["item"].get(0).and_then(Value::as_str),
+            Some(
+                "CommandExecution"
+                    | "FileChange"
+                    | "DynamicToolCall"
+                    | "McpToolCall"
+                    | "WebSearch"
+                    | "ImageView"
+                    | "ImageGeneration"
+                    | "CollabAgentToolCall"
+                    | "Extension"
+            )
+        )
 }
 
 pub(super) fn valid_envelope(payload: &Value) -> bool {
@@ -59,18 +84,8 @@ fn prepare_user_message(item: &mut Value) -> bool {
 
 // Codex decodes the whole UserInput list before publishing its item.
 fn user_input(part: &mut Value) -> bool {
-    // Serde also accepts a tagged text sequence. Give downstream mirror and rollback checks the same named fields.
-    if let Value::Array(fields) = part {
-        if !(2..=3).contains(&fields.len()) || fields[0] != "text" {
-            return false;
-        }
-        let keys = ["type", "text", "text_elements"];
-        *part = Value::Object(
-            keys.into_iter()
-                .map(str::to_owned)
-                .zip(fields.drain(..))
-                .collect(),
-        );
+    if !positional::user_input(part) {
+        return false;
     }
     match part["type"].as_str() {
         Some("text") => {

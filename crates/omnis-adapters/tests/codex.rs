@@ -559,7 +559,7 @@ fn codex_rollback_handles_zero_excess_and_consecutive_rollbacks() {
         message("assistant", "first answer"),
         message("user", "second request"),
         event("thread_rolled_back", json!({"num_turns": 1})),
-        event("thread_rolled_back", json!({"num_turns": u64::MAX})),
+        event("thread_rolled_back", json!({"num_turns": u32::MAX})),
         message("user", "fresh request"),
         message("assistant", "fresh answer"),
     ]).expect("saturating rollback");
@@ -624,23 +624,28 @@ fn codex_rollback_reports_surviving_tools_evicted_during_discarded_turn() {
 
 #[test]
 fn codex_preview_finds_rollback_outside_prefix_and_tail_samples() {
-    let mut records = vec![message("user", "discarded request")];
-    records.extend((0..1_050).map(|_| event("token_count", json!({}))));
-    records.push(event("thread_rolled_back", json!({"num_turns": 1})));
-    records.push(json!({"type": "response_item", "payload": {
-        "type": "reasoning", "encrypted_content": "x".repeat(5 * 1024 * 1024),
-    }}));
-    records.push(message("user", "replacement request"));
-    let encoded = records
-        .into_iter()
-        .map(|record| {
-            record
-                .to_string()
-                .replace("thread_rolled_back", r"thread_rolled_\u0062ack")
-        })
+    let middle = (0..1_050).map(|_| event("token_count", json!({})).to_string());
+    let prefix: Vec<_> = std::iter::once(message("user", "discarded request").to_string())
+        .chain(middle)
         .collect();
-    let snapshot = read_records_with_preview(encoded, true).expect("rollback-aware preview");
-    assert_eq!(visible_text(&snapshot), ["replacement request"]);
+    let tail = json!({"type": "response_item", "payload": {
+        "type": "reasoning", "encrypted_content": "x".repeat(5 * 1024 * 1024),
+    }})
+    .to_string();
+    for rollback in [
+        r#"{"type":"event_msg","payload":{"type":"thread_rolled_\u0062ack","num_turns":1}}"#,
+        r#"{"type":"event_msg","payload":[ 14 ,1]}"#,
+        r#"{"type":"event_msg","payload":{"num_turns":1,"type":14}}"#,
+    ] {
+        let mut records = prefix.clone();
+        records.extend([
+            rollback.to_owned(),
+            tail.clone(),
+            message("user", "replacement request").to_string(),
+        ]);
+        let snapshot = read_records_with_preview(records, true).expect("rollback-aware preview");
+        assert_eq!(visible_text(&snapshot), ["replacement request"]);
+    }
 }
 
 #[test]

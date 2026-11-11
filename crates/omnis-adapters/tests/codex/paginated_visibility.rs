@@ -1328,3 +1328,100 @@ fn guardian_entries_require_objects_and_preserve_nested_response_shapes() {
         assert_checkpoint_selection("guardian_history", json!([entry]), accepted);
     }
 }
+
+#[test]
+fn numeric_completed_items_publish_the_same_conversation_as_named_items() {
+    for (user, reply) in [
+        (
+            json!({"type":0,"id":"u","content":[{"type":0,"text":"published question"}]}),
+            json!({"type":3,"id":"a","content":[{"type":0,"text":"published answer"}]}),
+        ),
+        (
+            json!([0, "u", null, [[0, "published question"]]]),
+            json!([3, "a", [[0, "published answer"]]]),
+        ),
+        (
+            json!({"type":"UserMessage","id":"u","content":[{"type":"text","text":"published question"}]}),
+            json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"published answer"}]}),
+        ),
+    ] {
+        for preview in [false, true] {
+            let rows = vec![turn_item("turn", &user), turn_item("turn", &reply)];
+            let snapshot = read_with_history_mode(rows, preview, Some("paginated")).unwrap();
+            assert_eq!(
+                visible_text(&snapshot),
+                ["published question", "published answer"]
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete && search.text.contains("published answer"));
+            let handoff = omnis_core::import_conversation(&snapshot);
+            assert_eq!(handoff.messages.last().unwrap().text, "published answer");
+        }
+    }
+}
+
+#[test]
+fn numeric_completed_item_collisions_distinguish_known_malformed_and_future_tags() {
+    for (item, expected, contested) in [
+        (json!([18, "compaction"]), "published", false),
+        (
+            json!([3, "damaged", [[1, "unrecognized content"]]]),
+            "revised",
+            false,
+        ),
+        (json!({"type":19,"id":"future"}), "published", true),
+    ] {
+        let previous = page_user("turn", "u", "published");
+        let mut revised = page_user("turn", "u", "revised");
+        revised["ordinal"] = 2.into();
+        revised["timestamp"] = "2026-01-05T09:00:00Z".into();
+        for preview in [false, true] {
+            let rows = vec![previous.clone(), turn_item("turn", &item), revised.clone()];
+            let snapshot = read_with_history_mode(rows, preview, Some("paginated")).unwrap();
+            assert_eq!(visible_text(&snapshot), [expected], "{item}");
+            assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+            assert_eq!(
+                snapshot
+                    .events
+                    .iter()
+                    .any(|event| event.payload["contested_ordinal"] == true),
+                contested
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unsupported_documentary_item_marks_coverage_and_keeps_the_next_visible_reply() {
+    for item in [
+        json!([
+            6,
+            "command",
+            null,
+            null,
+            null,
+            ["pwd"],
+            "file:///workspace",
+            [],
+            "agent",
+            null,
+            "completed"
+        ]),
+        json!([11, "image", "file:///workspace/public.png"]),
+    ] {
+        let records = vec![
+            page_user("turn", "u", "published"),
+            turn_item("turn", &item),
+            turn_item("turn", &json!([3, "a", [[0, "kept answer"]]])),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(visible_text(&snapshot), ["published", "kept answer"]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete && search.text.contains("kept answer"));
+            assert!(!search.text.contains("public.png"));
+            assert!(omnis_core::import_conversation(&snapshot).truncated);
+        }
+    }
+}
