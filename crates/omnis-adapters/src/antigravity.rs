@@ -6,17 +6,20 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
+use omnis_core::{SearchDocumentBuilder, session_preview};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use prost::Message;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IncompleteTranscript, IndexedSearchDocument, LaunchPlan, LaunchTarget, NativeSession,
+    ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
         parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
         sort_sessions, sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
+        visit_streamed_json_file,
     },
 };
 
@@ -76,18 +79,19 @@ impl AntigravityAdapter {
 
         match self.source(&summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
-                if preview {
+                let oversized = if preview {
                     for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
                         push_transcript_record(&mut builder, &record);
                     }
+                    0
                 } else {
-                    let oversized_records =
-                        visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
-                            push_transcript_record(&mut builder, &record);
-                            Ok(())
-                        })?;
-                    builder.push_oversized_record_notice(oversized_records, summary.updated_at);
-                }
+                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                        push_transcript_record(&mut builder, &record);
+                        Ok(())
+                    })?
+                };
+                verify_jsonl_history(&summary, &builder)?;
+                builder.push_oversized_record_notice(oversized, summary.updated_at);
             }
             Some(path) => {
                 push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
@@ -109,6 +113,15 @@ impl AntigravityAdapter {
             captured_at,
         ))
     }
+}
+
+fn verify_jsonl_history(summary: &Summary, events: &EventBuilder) -> Result<()> {
+    if summary.step_count > 0 && events.checkpoint() == 0 {
+        return Err(IncompleteTranscript).with_context(|| format!(
+            "Antigravity session `{}` declares history but its transcript contains no readable steps", summary.id
+        ));
+    }
+    Ok(())
 }
 
 fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
@@ -195,6 +208,80 @@ impl ProviderAdapter for AntigravityAdapter {
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read(session, true)
+    }
+
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexedSearchDocument> {
+        let Some(path) = source_path.filter(|path| {
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                && path
+                    .metadata()
+                    .is_ok_and(|meta| meta.len() <= full_read_bytes)
+        }) else {
+            return self
+                .index_session(session, source_path, full_read_bytes)
+                .map(Into::into);
+        };
+        validate_provider(session, Provider::Antigravity)?;
+        let summary = self.summary(&session.id)?;
+        anyhow::ensure!(
+            self.source(&summary).as_deref() == Some(path),
+            "Antigravity history changed during the search read"
+        );
+        let file = std::fs::File::open(path)?;
+        let before = file.metadata()?;
+        let source_file = same_file::Handle::from_file(file.try_clone()?)?;
+        let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
+        let mut title_source = EventBuilder::new(Provider::Antigravity, &session.id).snapshot(
+            session.clone(),
+            nonempty(summary.title.clone()),
+            summary.project_path.clone(),
+            None,
+            captured_at,
+        );
+        let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut document = SearchDocumentBuilder::default();
+        let oversized =
+            visit_streamed_json_file(file, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                push_transcript_record(&mut events, &record);
+                for event in events.drain_events() {
+                    document.push(&event);
+                    if title_source.events.is_empty()
+                        && matches!(
+                            event.kind,
+                            EventKind::MessageUser | EventKind::MessageAssistant
+                        )
+                    {
+                        title_source.events.push(event);
+                        if session_preview(&title_source).first.is_none() {
+                            title_source.events.clear();
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        let after = path.metadata()?;
+        anyhow::ensure!(
+            before.len() == after.len()
+                && before.modified()? == after.modified()?
+                && source_file == same_file::Handle::from_path(path)?
+                && self.source(&summary).as_deref() == Some(path),
+            "Antigravity history changed during the search read"
+        );
+        verify_jsonl_history(&summary, &events)?;
+        events.push_oversized_record_notice(oversized, summary.updated_at);
+        for event in events.drain_events() {
+            document.push(&event);
+        }
+        Ok(IndexedSearchDocument {
+            document: document.finish(),
+            title_source,
+            source_complete: true,
+        })
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

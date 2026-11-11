@@ -115,6 +115,25 @@ fn lists_and_reads_synthetic_antigravity_session_without_mutation() {
             &EventKind::CommandExecuted,
         ]
     );
+    let indexed = adapter
+        .index_search_document(
+            &sessions[0].session,
+            sessions[0].source_path.as_deref(),
+            u64::MAX,
+        )
+        .unwrap();
+    assert_eq!(
+        indexed.document,
+        omnis_core::trajectory_search_document(&snapshot)
+    );
+    assert_eq!(
+        omnis_core::session_search_title(&indexed.title_source),
+        omnis_core::session_search_title(&snapshot)
+    );
+    assert_eq!(
+        omnis_core::session_preview(&indexed.title_source).first,
+        omnis_core::session_preview(&snapshot).first
+    );
     assert_eq!(snapshot.events[0].replay_policy, ReplayPolicy::Contextual);
     assert_eq!(
         snapshot.events[2].replay_policy,
@@ -195,6 +214,51 @@ fn discovery_selects_the_history_that_search_reads() {
     check(Some(&full), "full");
     fs::remove_file(database).unwrap();
     check(Some(&full), "full");
+}
+
+#[test]
+fn full_search_retries_empty_jsonl_and_streams_past_the_snapshot_record_limit() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    summary_database(root, root);
+    let logs = root
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let path = logs.join("transcript_full.jsonl");
+    fs::write(&path, "").unwrap();
+    let adapter = AntigravityAdapter::with_root(root);
+    let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let search =
+        || adapter.index_search_document(&listed.session, listed.source_path.as_deref(), u64::MAX);
+    assert!(
+        adapter
+            .preview_session(&listed.session)
+            .unwrap_err()
+            .is::<omnis_adapters::IncompleteTranscript>()
+    );
+    assert!(
+        search()
+            .err()
+            .unwrap()
+            .is::<omnis_adapters::IncompleteTranscript>()
+    );
+
+    let mut data = "{}\n".repeat(50_000);
+    data.push_str(concat!(
+        r#"{"type":"USER_INPUT","content":"middleword"}"#,
+        "\n"
+    ));
+    data.push_str(&"{}\n".repeat(50_000));
+    data.push_str(concat!(
+        r#"{"type":"USER_INPUT","content":"newestword"}"#,
+        "\n"
+    ));
+    fs::write(path, data).unwrap();
+    let indexed = search().unwrap();
+    assert_eq!(indexed.document.text, "middleword\n\nnewestword");
+    assert!(indexed.source_complete);
 }
 
 #[test]

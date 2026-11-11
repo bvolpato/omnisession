@@ -1016,44 +1016,92 @@ fn trajectory_search_document_with_limits(
     event_edge_limit: usize,
     document_edge_limit: usize,
 ) -> SearchDocument {
-    let mut retained = HeadTailText::new(document_edge_limit);
-    let mut source_byte_count = 0_usize;
-    let mut included_events = 0_usize;
-    let mut event_truncated = false;
-    let VisibleHistory {
-        events,
-        source_incomplete,
-        ..
-    } = visible_history(snapshot);
+    let visible = visible_history(snapshot);
+    let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
+    builder.source_incomplete = visible.source_incomplete;
+    for event in visible.events {
+        builder.push_text(event);
+    }
+    builder.finish()
+}
 
-    for event in events {
-        let Some(event_text) = search_event_text(event, event_edge_limit) else {
-            continue;
-        };
-        if event_text.text.trim().is_empty() {
-            continue;
+/// Builds one bounded search document from canonical events in conversation order.
+pub struct SearchDocumentBuilder {
+    retained: HeadTailText,
+    event_edge_limit: usize,
+    source_byte_count: usize,
+    has_text: bool,
+    event_truncated: bool,
+    source_incomplete: bool,
+}
+
+impl Default for SearchDocumentBuilder {
+    fn default() -> Self {
+        Self::with_limits(
+            SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
+            SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+        )
+    }
+}
+
+impl SearchDocumentBuilder {
+    const fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
+        Self {
+            retained: HeadTailText::new(document_edge_limit),
+            event_edge_limit,
+            source_byte_count: 0,
+            has_text: false,
+            event_truncated: false,
+            source_incomplete: false,
         }
-        if included_events != 0 {
-            source_byte_count = source_byte_count.saturating_add(2);
-            retained.push("\n\n");
-        }
-        included_events = included_events.saturating_add(1);
-        source_byte_count = source_byte_count.saturating_add(event_text.source_byte_count);
-        event_truncated |= event_text.truncated;
-        retained.push(&event_text.text);
     }
 
-    let document_truncated = retained.truncated();
-    let text = retained.finish();
-    let truncation_strategy =
-        search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
-    SearchDocument {
-        indexed_byte_count: text.len(),
-        text,
-        truncated: truncation_strategy != SearchTruncationStrategy::None,
-        source_complete: !source_incomplete,
-        source_byte_count,
-        truncation_strategy,
+    /// Adds searchable text and records source omissions. Secret events are excluded.
+    pub fn push(&mut self, event: &OmniEvent) {
+        if is_secret(event) {
+            return;
+        }
+        self.source_incomplete |= reports_omitted_events(event);
+        self.push_text(event);
+    }
+
+    fn push_text(&mut self, event: &OmniEvent) {
+        let Some(text) = search_event_text(event, self.event_edge_limit) else {
+            return;
+        };
+        if text.text.trim().is_empty() {
+            return;
+        }
+        if self.has_text {
+            self.source_byte_count = self.source_byte_count.saturating_add(2);
+            self.retained.push("\n\n");
+        }
+        self.has_text = true;
+        self.source_byte_count = self
+            .source_byte_count
+            .saturating_add(text.source_byte_count);
+        self.event_truncated |= text.truncated;
+        self.retained.push(&text.text);
+    }
+
+    /// Returns the redacted text and its coverage under the search limits.
+    #[must_use]
+    pub fn finish(self) -> SearchDocument {
+        let document_truncated = self.retained.truncated();
+        let text = self.retained.finish();
+        let truncation_strategy = search_truncation_strategy(
+            self.source_incomplete,
+            self.event_truncated,
+            document_truncated,
+        );
+        SearchDocument {
+            indexed_byte_count: text.len(),
+            text,
+            truncated: truncation_strategy != SearchTruncationStrategy::None,
+            source_complete: !self.source_incomplete,
+            source_byte_count: self.source_byte_count,
+            truncation_strategy,
+        }
     }
 }
 

@@ -17,10 +17,9 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
+use omnis_adapters::{AdapterRegistry, IndexRead, IndexedSearchDocument, NativeSession};
 use omnis_core::{
-    SearchDocument, search_document_version, session_search_title, trajectory_search_document,
-    workspace_paths_match,
+    SearchDocument, search_document_version, session_search_title, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -123,7 +122,7 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
 /// so a later pass can succeed even when the source time does not move.
 fn retryable_read_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
+        cause.is::<omnis_adapters::IncompleteTranscript>() || cause
             .downcast_ref::<rusqlite::Error>()
             .and_then(rusqlite::Error::sqlite_error_code)
             .is_some_and(|code| {
@@ -538,27 +537,29 @@ fn prepare_session(
     full_read_bytes: u64,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
-    let IndexRead {
-        snapshot,
+    let IndexedSearchDocument {
+        document,
+        title_source,
         source_complete,
     } = if imported {
-        read_session(registry, &candidate.session).map(|snapshot| IndexRead {
-            snapshot,
+        IndexRead {
+            snapshot: read_session(registry, &candidate.session)?,
             source_complete: true,
-        })
+        }
+        .into()
     } else {
-        registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            full_read_bytes,
-        )
-    }?;
-    let document = trajectory_search_document(&snapshot);
+        registry
+            .adapter(candidate.session.provider)?
+            .index_search_document(
+                &candidate.session,
+                candidate.source_path.as_deref(),
+                full_read_bytes,
+            )?
+    };
+    let captured_at = title_source.captured_at;
     let source_updated_at = candidate
         .updated_at
-        .map_or(snapshot.captured_at, |updated_at| {
-            updated_at.max(snapshot.captured_at)
-        });
+        .map_or(captured_at, |time| time.max(captured_at));
     let origin = if imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
@@ -570,7 +571,7 @@ fn prepare_session(
         source_updated_at,
         source_complete,
         origin,
-        title: session_search_title(&snapshot),
+        title: session_search_title(&title_source),
     })
 }
 

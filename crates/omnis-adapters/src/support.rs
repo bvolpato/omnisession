@@ -847,13 +847,22 @@ pub(crate) fn visit_streamed_json_lines(
     file_limit: u64,
     visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_limits(
-        path,
+    visit_streamed_json_file(File::open(path)?, file_limit, visit)
+}
+
+/// Folds records from an open file so callers can verify the identity of the source they read.
+pub(crate) fn visit_streamed_json_file(
+    file: File,
+    file_limit: u64,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
         JsonLinesLimits {
             records: usize::MAX,
             ..JsonLinesLimits::streamed(file_limit)
         },
-        visit,
+        |_, record| visit(record),
     )
 }
 
@@ -1223,6 +1232,18 @@ pub(crate) fn paths_match(recorded: &Path, requested: &Path) -> bool {
     workspace_paths_match(recorded, requested)
 }
 
+/// The available transcript does not yet contain the history declared by its provider.
+#[derive(Debug)]
+pub struct IncompleteTranscript;
+
+impl std::fmt::Display for IncompleteTranscript {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("provider transcript is incomplete")
+    }
+}
+
+impl std::error::Error for IncompleteTranscript {}
+
 pub(crate) struct EventBuilder {
     provider: Provider,
     session_id: String,
@@ -1291,6 +1312,10 @@ impl EventBuilder {
 
     pub(crate) fn checkpoint(&self) -> u64 {
         self.next_sequence
+    }
+
+    pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
+        self.events.drain(..)
     }
 
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {

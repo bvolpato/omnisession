@@ -43,6 +43,7 @@ pub use opencode::{
 };
 pub use pi::PiAdapter;
 pub use provider_process::{bounded_provider_output, provider_process};
+pub use support::IncompleteTranscript;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +72,24 @@ pub struct NativeSession {
 pub struct IndexRead {
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
+}
+
+/// The searchable result of a provider read, including its source time and coverage.
+pub struct IndexedSearchDocument {
+    pub document: omnis_core::SearchDocument,
+    /// Native metadata and the visible message used to derive a search title.
+    pub title_source: CanonicalSnapshot,
+    pub source_complete: bool,
+}
+
+impl From<IndexRead> for IndexedSearchDocument {
+    fn from(read: IndexRead) -> Self {
+        Self {
+            document: omnis_core::trajectory_search_document(&read.snapshot),
+            title_source: read.snapshot,
+            source_complete: read.source_complete,
+        }
+    }
 }
 
 /// Provider-specific launch input.
@@ -225,6 +244,21 @@ pub trait ProviderAdapter: Send + Sync {
             snapshot,
             source_complete,
         })
+    }
+
+    /// Builds the local search document with the provider's full-read or preview budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexedSearchDocument> {
+        self.index_session(session, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     /// Describes a fresh interactive provider launch.
