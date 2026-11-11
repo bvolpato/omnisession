@@ -330,7 +330,24 @@ fn read_budget(
     // A rejected duplicate may disappear before a retry selects the original file.
     let retry_full = failure.is_some() && candidate.source_revision.contents.is_some();
     // Read the full source when upgrading a document from a full or provider-limited read.
+    let same_antigravity_file = candidate.session.provider == Provider::Antigravity
+        && guard.matches_document_file(candidate.source_revision) == Some(true);
+    let upgrade_partial = same_antigravity_file
+        && prior.is_some_and(|state| {
+            state.document_version < candidate.document_version
+                && !state.source_complete
+                && !state.provider_limited
+        });
     let full = retry_full
+        || upgrade_partial
+        || (candidate.session.provider == Provider::Antigravity
+            && matches!(
+                guard,
+                TrajectorySourceGuard::Verified {
+                    fully_scanned: true,
+                    ..
+                }
+            ))
         || prior.is_some_and(|state| {
             (state.source_complete || state.provider_limited)
                 && (state.document_version < candidate.document_version
@@ -359,19 +376,20 @@ fn read_budget(
                 full_or_provider_limited,
                 document_hash,
                 sampled_file_bytes,
+                fully_scanned,
                 ..
-            } if candidate.session.provider == Provider::Antigravity
-                && guard.matches_document_file(candidate.source_revision) == Some(true) =>
-            {
-                Some(match (full_or_provider_limited, document_hash) {
-                    (false, Some(indexed_hash)) => PriorSearchDocument::Partial {
-                        byte_count,
-                        indexed_hash,
-                        sampled_file_bytes,
-                    },
-                    _ => PriorSearchDocument::RequireCompleteTail(byte_count),
-                })
-            }
+            } if same_antigravity_file => Some(match (full_or_provider_limited, document_hash) {
+                (false, Some(indexed_hash)) => PriorSearchDocument::Partial {
+                    byte_count,
+                    indexed_hash,
+                    sampled_file_bytes,
+                    recover_from_full_scan: upgrade_partial
+                        && sampled_file_bytes.is_none()
+                        && !fully_scanned
+                        && candidate.oversized(),
+                },
+                _ => PriorSearchDocument::RequireCompleteTail(byte_count),
+            }),
             _ => None,
         },
     }

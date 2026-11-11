@@ -245,16 +245,23 @@ fn store_search_document(
     guard: TrajectorySourceGuard,
     native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
-    // A picker sample must leave a previous full read eligible for the indexer's full budget.
+    // Let the indexer verify a damaged picker sample or update a previous full read.
     if (!full_read
         && session.provider == Provider::Antigravity
-        && matches!(
-            guard,
-            TrajectorySourceGuard::Verified {
-                full_or_provider_limited: true,
-                ..
-            }
-        ))
+        && (snapshot
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+            || matches!(
+                guard,
+                TrajectorySourceGuard::Verified {
+                    full_or_provider_limited: true,
+                    ..
+                } | TrajectorySourceGuard::Verified {
+                    fully_scanned: true,
+                    ..
+                }
+            )))
         || native_session.is_some_and(|(_, native)| has_empty_cli_history(native))
     {
         return Ok(false);

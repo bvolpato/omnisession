@@ -873,8 +873,9 @@ fn read_picker_preview(
     loop {
         let writer = store
             .and_then(|store| Some((store, preview_write_guard(store, &key.session, sender)?)));
-        // If the store is unavailable, only a full read can validate this native conversation.
-        let strict = full_read || (file_backed && writer.is_none());
+        // Antigravity verifies the selected file even when the store is unavailable.
+        let strict = full_read
+            || (file_backed && writer.is_none() && key.session.provider != Provider::Antigravity);
         let (read, source_time) = match read_search_snapshot(registry, &key.session, strict) {
             Ok(read) => read,
             Err(error) => {
@@ -948,13 +949,11 @@ fn read_picker_preview(
             } else {
                 publish_preview_title(registry, store, &key.session, sender);
             }
-        }
-        if let Some((store, _)) = writer
-            && file_backed
-        {
-            refresh_preview_failures(store, sender, preview_failures, |known| {
-                known.contains_key(&key.session)
-            });
+            if file_backed {
+                refresh_preview_failures(store, sender, preview_failures, |known| {
+                    known.contains_key(&key.session)
+                });
+            }
         }
         if key.session.provider == Provider::OhMyPi && source_time != key.updated_at {
             return None;

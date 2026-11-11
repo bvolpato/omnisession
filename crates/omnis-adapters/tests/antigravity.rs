@@ -123,10 +123,13 @@ fn lists_and_reads_synthetic_antigravity_session_without_mutation() {
             None,
         )
         .unwrap();
-    assert_eq!(
-        indexed.document,
-        omnis_core::trajectory_search_document(&snapshot)
-    );
+    let mut expected_document = omnis_core::trajectory_search_document(&snapshot);
+    expected_document
+        .projection
+        .as_mut()
+        .unwrap()
+        .fully_scanned_bytes = Some(transcript_before.len() as u64);
+    assert_eq!(indexed.document, expected_document);
     assert_eq!(
         omnis_core::session_search_title(&indexed.read.snapshot),
         omnis_core::session_search_title(&snapshot)
@@ -215,6 +218,39 @@ fn discovery_selects_the_history_that_search_reads() {
     check(Some(&full), "full");
     fs::remove_file(database).unwrap();
     check(Some(&full), "full");
+}
+
+#[test]
+fn observed_preview_reports_damage_and_keeps_the_messages_on_both_sides() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    summary_database(root, root);
+    let logs = root
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let path = logs.join("transcript_full.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"USER_INPUT","content":"question"}"#,
+            "\n{broken}\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"answer"}"#,
+        ),
+    )
+    .unwrap();
+
+    let adapter = AntigravityAdapter::with_root(root);
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    let read = adapter
+        .index_session(&session, Some(&path.canonicalize().unwrap()), 0)
+        .unwrap();
+    assert!(!read.source_complete);
+    let events = read.snapshot.events;
+    assert_eq!(events[0].payload["text"], "question");
+    assert_eq!(events[1].payload["text"], "answer");
+    assert_eq!(events[2].payload["omitted_events"], 1);
 }
 
 #[test]

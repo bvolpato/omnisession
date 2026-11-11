@@ -225,6 +225,25 @@ impl AntigravityAdapter {
     }
 }
 
+#[derive(Default)]
+struct DamagedRecordPositions {
+    interior_seen: usize,
+    starts: Vec<usize>,
+}
+
+impl DamagedRecordPositions {
+    fn observe(&mut self, damage: &JsonLineDamage, bytes: usize) {
+        if damage.interior_count() > self.interior_seen || damage.final_record() {
+            self.interior_seen = damage.interior_count();
+            if bytes <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+                && self.starts.last() != Some(&bytes)
+            {
+                self.starts.push(bytes);
+            }
+        }
+    }
+}
+
 // A growing partial transcript can publish more confirmed turns if its earlier search text still matches.
 struct PreviousSearchPrefix {
     expected: Option<(usize, [u8; 32])>,
@@ -272,63 +291,19 @@ impl PreviousSearchPrefix {
             return Ok(false);
         };
         let damage = JsonLineDamage::default();
-        let (records, _, tail_records) = crate::support::json_lines_preview_at(
+        let (records, _) = crate::support::json_lines_preview_at(
             file,
             PREVIEW_RECORDS,
             JsonLineTail::ReportIncomplete(&damage),
             end,
         )?;
-        let tail_start = records.len() - tail_records;
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
         let mut document = SearchDocumentBuilder::default();
-        let mut boundaries = Vec::with_capacity(tail_records);
-        let mut head_bytes = 0;
-        let push =
-            |builder: &mut EventBuilder, document: &mut SearchDocumentBuilder, record: &Value| {
-                push_transcript_record(builder, record);
-                for event in builder.drain_events() {
-                    document.push(&event);
-                }
-            };
-        for (index, record) in records.iter().enumerate() {
-            if index == tail_start {
-                head_bytes = document.source_byte_count();
+        for record in records {
+            push_transcript_record(&mut builder, &record);
+            for event in builder.drain_events() {
+                document.push(&event);
             }
-            push(&mut builder, &mut document, record);
-            if index >= tail_start {
-                boundaries.push(document.source_byte_count());
-            }
-        }
-        let total = document.source_byte_count();
-        if total == byte_count {
-            return Ok(document.indexed_text_hash() == indexed_hash);
-        }
-        if !matches!(
-            prior,
-            PriorSearchDocument::Partial {
-                sampled_file_bytes: None,
-                ..
-            }
-        ) || total < byte_count
-        {
-            return Ok(false);
-        }
-        // Older receipts only identify the searchable length. The torn record could have shifted
-        // the left edge past more complete rows before its final bytes were appended.
-        let Some(target) =
-            (total - byte_count + head_bytes).checked_sub(if head_bytes == 0 { 2 } else { 0 })
-        else {
-            return Ok(false);
-        };
-        let Some(remove) = boundaries.iter().position(|&offset| offset == target) else {
-            return Ok(false);
-        };
-        let mut document = SearchDocumentBuilder::default();
-        for record in records[..tail_start]
-            .iter()
-            .chain(&records[tail_start + remove + 1..])
-        {
-            push(&mut builder, &mut document, record);
         }
         Ok(document.source_byte_count() == byte_count
             && document.indexed_text_hash() == indexed_hash)
@@ -344,7 +319,7 @@ impl PreviousSearchPrefix {
         torn: bool,
     ) -> Result<IndexedSearchDocument> {
         self.observe_preview(&preview.snapshot, torn);
-        self.verify(torn, &mut file, session, length, prior)?;
+        self.verify(torn, &mut file, session, length, prior, None)?;
         let mut indexed: IndexedSearchDocument = preview.into();
         if let Some(projection) = &mut indexed.document.projection {
             projection.sampled_file_bytes = Some(length);
@@ -372,26 +347,31 @@ impl PreviousSearchPrefix {
         session: &SessionRef,
         length: u64,
         prior: Option<PriorSearchDocument>,
+        full_search_bytes: Option<usize>,
     ) -> Result<()> {
         if !torn || self.verified {
             return Ok(());
         }
+        // A full migration scan can recover more confirmed history than an older disjoint sample.
+        if let Some(PriorSearchDocument::Partial {
+            byte_count,
+            recover_from_full_scan: true,
+            ..
+        }) = prior
+            && full_search_bytes.is_some_and(|observed| observed > byte_count)
+        {
+            return Ok(());
+        }
         if let Some(
             prior @ PriorSearchDocument::Partial {
-                sampled_file_bytes, ..
+                sampled_file_bytes: Some(old),
+                ..
             },
         ) = prior
+            && old <= length
+            && Self::verify_sample_at(file, session, old, prior)?
         {
-            let extents = match sampled_file_bytes {
-                Some(old) if old <= length => vec![old],
-                Some(_) => Vec::new(),
-                None => crate::support::preceding_preview_extents(file, length)?,
-            };
-            for old in extents {
-                if Self::verify_sample_at(file, session, old, prior)? {
-                    return Ok(());
-                }
-            }
+            return Ok(());
         }
         Err(IncompleteTranscript.into())
     }
@@ -412,6 +392,29 @@ fn record_jsonl_damage(
             None,
         );
     }
+}
+
+fn finish_search_document(
+    document: SearchDocumentBuilder,
+    gaps: DamagedRecordPositions,
+    length: u64,
+    provider_limited: bool,
+) -> omnis_core::SearchDocument {
+    let mut document = document.finish();
+    if length <= MAX_STREAMED_TRANSCRIPT_FILE_SIZE
+        && let Some(projection) = document.projection.as_mut()
+    {
+        projection.fully_scanned_bytes = Some(length);
+        if gaps.interior_seen > 0 {
+            projection.interior_damage = Some(gaps.starts);
+        }
+    }
+    if provider_limited {
+        document.source_complete = false;
+        document.truncated = true;
+        document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
+    }
+    document
 }
 
 fn capture_first_message(snapshot: &mut CanonicalSnapshot, event: OmniEvent) {
@@ -548,7 +551,16 @@ impl ProviderAdapter for AntigravityAdapter {
             || source_path
                 .and_then(|path| path.metadata().ok())
                 .is_some_and(|metadata| metadata.len() > full_read_bytes);
-        self.read_observed(session, source_path, preview, JsonLineTail::RequireComplete)
+        if preview {
+            self.read_observed(
+                session,
+                source_path,
+                true,
+                JsonLineTail::ReportIncomplete(&JsonLineDamage::default()),
+            )
+        } else {
+            self.read_observed(session, source_path, false, JsonLineTail::RequireComplete)
+        }
     }
 
     fn index_search_document(
@@ -594,11 +606,9 @@ impl ProviderAdapter for AntigravityAdapter {
         );
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
         let mut document = SearchDocumentBuilder::default();
-        let mut gap_start = None;
+        let mut gaps = DamagedRecordPositions::default();
         let mut push = |record| {
-            if gap_start.is_none() && torn.interior_count() > 0 {
-                gap_start = Some(document.source_byte_count());
-            }
+            gaps.observe(&torn, document.source_byte_count());
             let start = events.checkpoint();
             push_transcript_record(&mut events, &record);
             for event in events.drain_events() {
@@ -622,7 +632,14 @@ impl ProviderAdapter for AntigravityAdapter {
             })
         };
         let oversized = oversized.and_then(|count| {
-            prefix.verify(torn.final_record(), &mut handle, session, length, prior)?;
+            prefix.verify(
+                torn.final_record(),
+                &mut handle,
+                session,
+                length,
+                prior,
+                (!limited).then(|| document.source_byte_count()),
+            )?;
             Ok(count)
         });
         self.ensure_history_unchanged(&summary, path, observed, &handle)?;
@@ -633,17 +650,9 @@ impl ProviderAdapter for AntigravityAdapter {
         for event in events.drain_events() {
             document.push(&event);
         }
-        let mut document = document.finish();
-        if !limited
-            && let (Some(start), Some(projection)) = (gap_start, document.projection.as_mut())
-        {
-            projection.interior_damage = Some((torn.interior_count(), start));
-        }
-        if limited && prior_prefix.is_some() {
-            document.source_complete = false;
-            document.truncated = true;
-            document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
-        }
+        gaps.observe(&torn, document.source_byte_count());
+        let document =
+            finish_search_document(document, gaps, length, limited && prior_prefix.is_some());
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {

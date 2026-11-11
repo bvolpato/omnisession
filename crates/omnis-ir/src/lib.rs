@@ -24,10 +24,12 @@ pub struct SearchProjection {
     pub digest: [u8; 32],
     /// SHA-256 before the last native record that contributed eligible text.
     pub before_last_record: [u8; 32],
-    /// Number of malformed interior records and the searchable bytes before the first gap.
-    pub interior_damage: Option<(usize, usize)>,
+    /// Searchable byte boundaries at damaged records in a full scan with interior damage.
+    pub interior_damage: Option<Vec<usize>>,
     /// Physical length at which the JSONL head and tail windows were sampled.
     pub sampled_file_bytes: Option<u64>,
+    /// Physical length scanned from start to end, including unreadable native records.
+    pub fully_scanned_bytes: Option<u64>,
     state: sha2::Sha256,
 }
 
@@ -39,6 +41,7 @@ impl SearchProjection {
             byte_count,
             interior_damage: None,
             sampled_file_bytes: None,
+            fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
             before_last_record: before_last_record.finalize().into(),
             state,
@@ -65,6 +68,7 @@ impl PartialEq for SearchProjection {
             && self.before_last_record == other.before_last_record
             && self.interior_damage == other.interior_damage
             && self.sampled_file_bytes == other.sampled_file_bytes
+            && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
 }
 

@@ -255,8 +255,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
         source_updated_submillis, provider_limited, title_authoritative,
-        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27)
+        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes, fully_scanned_bytes
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27, ?28)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -273,6 +273,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         indexed_byte_count = excluded.indexed_byte_count,
         projected_byte_count = excluded.projected_byte_count,
         sampled_file_bytes = excluded.sampled_file_bytes,
+        fully_scanned_bytes = excluded.fully_scanned_bytes,
         recovered_gap_start = NULL, observed_text_bytes = NULL, observed_text_hash = NULL,
         projected_prefix_hash = NULL,
         projected_record_prefix_hash = excluded.projected_record_prefix_hash,
@@ -362,7 +363,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                                OR excluded.indexed_byte_count <>
                                    session_trajectories.indexed_byte_count
                                OR (excluded.projected_byte_count IS NOT NULL AND
-                                   (excluded.sampled_file_bytes IS NOT session_trajectories.sampled_file_bytes OR excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_record_prefix_hash IS NOT session_trajectories.projected_record_prefix_hash OR session_trajectories.projected_prefix_hash IS NOT NULL))
+                                   (excluded.fully_scanned_bytes IS NOT session_trajectories.fully_scanned_bytes OR excluded.sampled_file_bytes IS NOT session_trajectories.sampled_file_bytes OR excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_record_prefix_hash IS NOT session_trajectories.projected_record_prefix_hash OR session_trajectories.projected_prefix_hash IS NOT NULL))
                                OR excluded.truncation_strategy <>
                                    session_trajectories.truncation_strategy
                                OR excluded.origin <> session_trajectories.origin
@@ -653,6 +654,7 @@ pub enum TrajectorySourceGuard {
         full_or_provider_limited: bool,
         document_hash: Option<[u8; 32]>,
         sampled_file_bytes: Option<u64>,
+        fully_scanned: bool,
     },
 }
 
@@ -1014,6 +1016,12 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         .map(i64::try_from)
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
+                    self.document
+                        .projection
+                        .and_then(|p| p.fully_scanned_bytes)
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidSessionReference)?,
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -1050,13 +1058,6 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         guard?;
-        if self
-            .document
-            .projection
-            .is_some_and(|p| p.interior_damage.is_some())
-        {
-            return Ok(true);
-        }
         Ok(!self.retains_verified_antigravity_text(transaction, home)?)
     }
 
@@ -1110,7 +1111,16 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         let same_prefix = document
             .projection
             .is_some_and(|proof| old_prefix == Some(&proof.digest));
-        let retain = if document.indexed_byte_count == 0 || same_prefix {
+        let retain = if document
+            .projection
+            .is_some_and(|p| p.interior_damage.is_some())
+        {
+            // Uncapped gaps can combine the old record with newly observed text.
+            // A capped prefix can protect the old document only when all observed text matches.
+            same_prefix
+                && (strategy.ends_with("document_head_tail")
+                    || document.truncation_strategy != "source_incomplete")
+        } else if document.indexed_byte_count == 0 || same_prefix {
             true
         } else {
             let window = ProjectionWindow::for_documents(
@@ -1160,7 +1170,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         home: Option<&Path>,
     ) -> Result<Option<(String, usize)>> {
         let doc = self.document;
-        let Some((1, start)) = doc.projection.and_then(|p| p.interior_damage) else {
+        let Some(starts) = doc.projection.and_then(|p| p.interior_damage.as_deref()) else {
             return Ok(None);
         };
         if self.session.provider != Provider::Antigravity
@@ -1173,11 +1183,8 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         let Some(home) = home else {
             return Ok(None);
         };
-        let Some(prefix) = doc.redacted_text.get(..start) else {
-            return Ok(None);
-        };
         let mut statement = transaction.prepare_cached(
-            "SELECT d.id, d.indexed_byte_count, d.complete,
+            "SELECT d.id, d.indexed_byte_count, d.source_complete AND d.truncation_strategy IN ('none','event_head_tail'),
                     coalesce(d.projected_record_prefix_hash,d.projected_prefix_hash),
                     d.recovered_gap_start, d.observed_text_bytes
              FROM session_trajectories d
@@ -1213,48 +1220,33 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         let Some((id, length, full, old_prefix, old_gap, observed_bytes)) = prior else {
             return Ok(None);
         };
-        let missing = match (old_gap, observed_bytes) {
-            (Some(previous_start), Some(previous_bytes)) if previous_start == start => {
-                length.checked_sub(previous_bytes)
-            }
-            _ if full
-                && old_prefix.as_deref() == Some(Sha256::digest(prefix.as_bytes()).as_slice()) =>
-            {
-                length.checked_sub(start)
-            }
-            _ => None,
-        };
-        let separator = if start == 0 && !doc.redacted_text.is_empty() && old_gap.is_none() {
-            "\n\n"
+        let candidate = if let (Some(start), Some(observed)) = (old_gap, observed_bytes) {
+            starts
+                .binary_search(&start)
+                .ok()
+                .and_then(|_| Some((start, length.checked_sub(observed)?)))
+        } else if full {
+            old_prefix.as_deref().and_then(|digest| {
+                let start = verified_gap_start(doc.redacted_text, starts, digest)?;
+                Some((start, length.checked_sub(start)?))
+            })
         } else {
-            ""
+            None
         };
-        let Some(missing) = missing.filter(|&n| {
-            n > 0
-                && doc
-                    .redacted_text
-                    .len()
-                    .saturating_add(n)
-                    .saturating_add(separator.len())
-                    <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
-        }) else {
+        let Some((start, missing)) = candidate else {
             return Ok(None);
         };
         let Some(previous) = stored_projection_text(transaction, id, length)? else {
             return Ok(None);
         };
-        let Some(gap) = previous
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.get(..missing))
-        else {
-            return Ok(None);
-        };
-        let mut text = String::with_capacity(doc.redacted_text.len() + missing + separator.len());
-        text.push_str(prefix);
-        text.push_str(gap);
-        text.push_str(separator);
-        text.push_str(&doc.redacted_text[start..]);
-        Ok(Some((text, start)))
+        Ok(recover_missing_record_text(
+            doc.redacted_text,
+            &previous,
+            start,
+            missing,
+            old_gap.is_some(),
+        )
+        .map(|text| (text, start)))
     }
 
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
@@ -1271,7 +1263,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                       AND (NOT ?14 OR derived_title IS ?15)
                       AND title_authoritative IS ?16 AND source_file_id IS ?17
                       AND missing_ancestor_id IS ?18 AND source_contents_id IS ?19
-                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_record_prefix_hash IS ?21 AND sampled_file_bytes IS ?22 AND projected_prefix_hash IS NULL))
+                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_record_prefix_hash IS ?21 AND sampled_file_bytes IS ?22 AND fully_scanned_bytes IS ?23 AND projected_prefix_hash IS NULL))
                 )",
                 params![
                     self.session.provider.to_string(),
@@ -1299,6 +1291,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         .map_err(|_| StoreError::InvalidSessionReference)?,
                     doc.projection.map(|p| p.before_last_record),
                     doc.projection.and_then(|p| p.sampled_file_bytes).map(i64::try_from).transpose().map_err(|_| StoreError::InvalidSessionReference)?,
+                    doc.projection.and_then(|p| p.fully_scanned_bytes).map(i64::try_from).transpose().map_err(|_| StoreError::InvalidSessionReference)?,
                 ],
                 |row| row.get(0),
             )
@@ -1335,7 +1328,7 @@ const DOCUMENT_RECEIPT_SQL: &str =
          source_updated_submillis, source_complete, provider_limited, complete,
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
-         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes,
+         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes, fully_scanned_bytes,
          recovered_gap_start, observed_text_bytes, hex(observed_text_hash))
      FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
 
@@ -1377,7 +1370,8 @@ fn observed_file_state(
             CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END,
             coalesce(doc.observed_text_bytes,doc.source_byte_count), coalesce(doc.source_complete OR doc.provider_limited, 0),
             CASE WHEN doc.provider = 'antigravity' AND NOT (doc.source_complete OR doc.provider_limited)
-                      AND length(doc.content_hash) = 32 THEN coalesce(doc.observed_text_hash,doc.content_hash) END, doc.sampled_file_bytes
+                      AND length(doc.content_hash) = 32 THEN coalesce(doc.observed_text_hash,doc.content_hash) END, doc.sampled_file_bytes,
+            doc.fully_scanned_bytes IS NOT NULL OR doc.recovered_gap_start IS NOT NULL
          FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
          LEFT JOIN session_trajectories AS doc USING (provider, session_id)
          LEFT JOIN session_index AS catalog USING (provider, session_id)
@@ -1397,6 +1391,7 @@ fn observed_file_state(
                 ],
                 full_or_provider_limited: row.get(5)?,
                 document_hash: row.get(6)?,
+                fully_scanned: row.get(8)?,
                 sampled_file_bytes: row
                     .get::<_, Option<i64>>(7)?
                     .and_then(|n| u64::try_from(n).ok()),
@@ -4519,6 +4514,9 @@ fn ensure_trajectory_version_columns(
     if !has_column("projected_prefix_hash") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_prefix_hash BLOB CHECK (length(projected_prefix_hash)=32)").map_err(database_error)?;
     }
+    if !has_column("fully_scanned_bytes") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN fully_scanned_bytes INTEGER CHECK (fully_scanned_bytes >= 0)").map_err(database_error)?;
+    }
     if !has_column("sampled_file_bytes") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN sampled_file_bytes INTEGER CHECK (sampled_file_bytes >= 0)").map_err(database_error)?;
     }
@@ -4897,6 +4895,68 @@ impl ProjectionWindow {
             ProjectionWindow::Legacy(previous_bytes - document.source_byte_count)
         }
     }
+}
+
+// Hash each confirmed byte once while testing the record boundaries in encounter order.
+fn verified_gap_start(text: &str, starts: &[usize], digest: &[u8]) -> Option<usize> {
+    let mut hash = Sha256::new();
+    let mut previous = 0;
+    for &start in starts {
+        hash.update(text.get(previous..start)?.as_bytes());
+        if hash.clone().finalize().as_slice() == digest {
+            return Some(start);
+        }
+        previous = start;
+    }
+    None
+}
+
+fn recover_missing_record_text(
+    observed: &str,
+    previous: &str,
+    start: usize,
+    missing: usize,
+    previously_recovered: bool,
+) -> Option<String> {
+    let separator = if start == 0 && !observed.is_empty() && !previously_recovered {
+        "\n\n"
+    } else {
+        ""
+    };
+    let size = observed
+        .len()
+        .checked_add(missing)?
+        .checked_add(separator.len())?;
+    if missing == 0 || size > 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT {
+        return None;
+    }
+    let (prefix, suffix) = observed.split_at_checked(start)?;
+    let gap = previous.strip_prefix(prefix)?.get(..missing)?;
+    let record = if start > 0 {
+        gap.strip_prefix("\n\n")?
+    } else if previously_recovered {
+        gap.strip_suffix("\n\n")?
+    } else {
+        gap
+    };
+    if suffix_contains_record(suffix, record) {
+        return None;
+    }
+    let mut text = String::with_capacity(size);
+    text.push_str(prefix);
+    text.push_str(gap);
+    text.push_str(separator);
+    text.push_str(suffix);
+    Some(text)
+}
+
+fn suffix_contains_record(suffix: &str, record: &str) -> bool {
+    !record.is_empty()
+        && suffix.match_indices(record).any(|(start, matched)| {
+            let end = start + matched.len();
+            (start == 0 || suffix[..start].ends_with("\n\n"))
+                && (end == suffix.len() || suffix[end..].starts_with("\n\n"))
+        })
 }
 
 fn store_recovered_gap(

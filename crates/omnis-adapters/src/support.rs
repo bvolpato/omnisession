@@ -1480,9 +1480,7 @@ fn json_lines_preview_with_policy(
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let (records, suffix, _) =
-        json_lines_preview_at(file, sample_records, tail_policy, metadata.len())?;
-    Ok((records, suffix))
+    json_lines_preview_at(file, sample_records, tail_policy, metadata.len())
 }
 
 /// Reconstructs the sampled windows at the supplied physical end of the transcript.
@@ -1491,7 +1489,7 @@ pub(crate) fn json_lines_preview_at(
     sample_records: usize,
     tail_policy: JsonLineTail<'_>,
     length: u64,
-) -> Result<(Vec<Value>, usize, usize)> {
+) -> Result<(Vec<Value>, usize)> {
     anyhow::ensure!(
         file.metadata()?.len() >= length,
         "transcript shortened during preview"
@@ -1500,13 +1498,13 @@ pub(crate) fn json_lines_preview_at(
     if end <= MAX_PREVIEW_TAIL_SIZE {
         let prefix = read_json_lines_prefix(file, MAX_PROVIDER_RECORDS, tail_policy, end)?;
         if prefix.at_eof {
-            return Ok((prefix.records, prefix.suffix_len, 0));
+            return Ok((prefix.records, prefix.suffix_len));
         }
     }
 
     let prefix = read_json_lines_prefix(file, sample_records, tail_policy, end)?;
     if prefix.at_eof {
-        return Ok((prefix.records, prefix.suffix_len, 0));
+        return Ok((prefix.records, prefix.suffix_len));
     }
     let (tail, tail_suffix) = json_lines_tail_with_offsets(file, sample_records, tail_policy, end)?;
     let overlap = tail.partition_point(|(offset, _)| *offset < prefix.end);
@@ -1523,27 +1521,7 @@ pub(crate) fn json_lines_preview_at(
     };
     let mut records = prefix.records;
     records.extend(tail.into_iter().skip(overlap).map(|(_, record)| record));
-    Ok((records, suffix, appended))
-}
-
-/// Returns boundaries around the most recently completed record for previews without a saved extent.
-pub(crate) fn preceding_preview_extents(file: &mut File, length: u64) -> Result<Vec<u64>> {
-    let start = length.saturating_sub(MAX_PREVIEW_TAIL_SIZE);
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.take(length - start).read_to_end(&mut bytes)?;
-    let mut position = bytes.len();
-    let mut extents = Vec::new();
-    for line in bytes.split_inclusive(|&byte| byte == b'\n').rev() {
-        position -= line.len();
-        if !line.iter().all(u8::is_ascii_whitespace) && (position > 0 || start == 0) {
-            extents.push(start + position as u64);
-            if extents.len() == 2 {
-                break;
-            }
-        }
-    }
-    Ok(extents)
+    Ok((records, suffix))
 }
 
 fn json_lines_tail_with_offsets(

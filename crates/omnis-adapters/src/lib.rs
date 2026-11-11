@@ -105,6 +105,8 @@ pub enum PriorSearchDocument {
         byte_count: usize,
         indexed_hash: [u8; 32],
         sampled_file_bytes: Option<u64>,
+        /// An older partial index lacks the location of its sampled windows.
+        recover_from_full_scan: bool,
     },
 }
 

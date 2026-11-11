@@ -461,6 +461,73 @@ fn interior_damage_keeps_observed_and_previously_verified_search_text_separate()
 }
 
 #[test]
+fn warm_search_recovers_only_verified_replies_absent_from_the_readable_suffix() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 3);
+    let reply = |text: &str| json!({"type":"PLANNER_RESPONSE","content":text}).to_string();
+    let search = |state: &str, term: &str| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                term,
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                "--show-text",
+            ],
+        )["results"]
+            .clone()
+    };
+    let first = reply("firstreply");
+    let second = reply("onlyonce");
+    let last = reply("verifiedthird");
+    fs::write(&path, format!("{first}\n{second}")).unwrap();
+    assert_eq!(search("insert", "onlyonce")[0]["coverage"], "complete");
+    fs::write(&path, format!("{first}\n{{broken}}\n{second}")).unwrap();
+    let warm = search("insert", "onlyonce");
+    let cold = search("cold", "onlyonce");
+    assert_eq!(warm[0]["snippet"], cold[0]["snippet"]);
+    assert_eq!(
+        warm[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .matches("onlyonce")
+            .count(),
+        1
+    );
+    fs::write(&path, format!("{first}\n{second}\n{last}")).unwrap();
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "complete");
+    fs::write(
+        &path,
+        format!("{first}\n{{broken}}\n{second}\n{{unfinished"),
+    )
+    .unwrap();
+    assert_eq!(
+        state_json(&env, "both", &["verify", &session])["omitted_events"],
+        2
+    );
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "preview");
+    let fourth = reply("confirmedfourth");
+    fs::write(
+        &path,
+        format!("{first}\n{{broken}}\n{second}\n{{unfinished\n{fourth}"),
+    )
+    .unwrap();
+    assert_eq!(search("both", "confirmedfourth")[0]["coverage"], "preview");
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "preview");
+    fs::write(&path, format!("{first}\n{second}\n{fourth}")).unwrap();
+    assert!(
+        search("both", "verifiedthird")
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn partial_antigravity_search_indexes_newly_completed_turns() {
     use std::io::Write;
 
@@ -501,14 +568,9 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
     }
 }
 
-#[test]
-fn growing_antigravity_history_moves_the_sampled_tail() {
-    use std::io::{BufWriter, Write};
-
-    let root = tempdir().unwrap();
-    let env = TestEnvironment::new(root.path(), root.path().to_owned());
-    let (_, path) = antigravity_history(&env, 3251);
-    let mut file = BufWriter::new(fs::File::create(&path).unwrap());
+fn large_antigravity_transcript(path: &std::path::Path) -> std::io::BufWriter<fs::File> {
+    use std::io::Write;
+    let mut file = std::io::BufWriter::new(fs::File::create(path).unwrap());
     let private = "x".repeat(8192);
     for index in 0..3250 {
         writeln!(
@@ -517,6 +579,62 @@ fn growing_antigravity_history_moves_the_sampled_tail() {
         )
         .unwrap();
     }
+    file.flush().unwrap();
+    file
+}
+
+#[test]
+fn damaged_full_scan_keeps_middle_turns_after_append() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 3251);
+    let mut file = large_antigravity_transcript(&path);
+    state_json(&env, "warm", &["show", &session]);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"!")
+        .unwrap();
+    let search = [
+        "search",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+        "message1800",
+    ];
+    assert_eq!(
+        state_json(&env, "warm", &search)["results"][0]["coverage"],
+        "preview"
+    );
+    writeln!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"appended"}}"#
+    )
+    .unwrap();
+    drop(file);
+    assert_eq!(
+        state_json(&env, "warm", &search)["results"][0]["coverage"],
+        "preview"
+    );
+    let mut cached = search.to_vec();
+    cached.push("--cached");
+    assert_eq!(
+        state_json(&env, "warm", &cached)["results"][0]["coverage"],
+        "preview"
+    );
+}
+
+#[test]
+fn growing_antigravity_history_moves_the_sampled_tail() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 3251);
+    let mut file = large_antigravity_transcript(&path);
     write!(
         file,
         r#"{{"type":"PLANNER_RESPONSE","content":"newreply","thinking":""#
