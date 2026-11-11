@@ -351,6 +351,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
            OR NOT (session_trajectories.source_complete OR session_trajectories.provider_limited)
            OR excluded.source_complete OR excluded.provider_limited)
       AND CASE
+          WHEN ?30 AND excluded.document_version > session_trajectories.document_version THEN 1
           WHEN excluded.provider = 'codex' THEN 1
           WHEN excluded.source_file_id IS NULL THEN session_trajectories.source_file_id IS NULL
           WHEN session_trajectories.source_file_id IS NULL THEN ?18 AND (
@@ -364,6 +365,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
           END
       AND (session_trajectories.native_summary = 0 OR ?18)
       AND CASE
+      WHEN ?30 AND excluded.document_version > session_trajectories.document_version THEN 1
       WHEN ?23 AND excluded.provider = 'codex' AND excluded.origin = 'native'
            AND session_trajectories.origin = 'native' AND excluded.source_file_id IS NOT NULL
            AND (excluded.source_file_id IS NOT session_trajectories.source_file_id
@@ -1211,6 +1213,7 @@ impl PreparedTrajectoryWrite<'_, '_> {
         statement: &mut rusqlite::Statement<'_>,
         title: &TrajectoryTitleWrite<'_>,
         selected: bool,
+        verified_partial: bool,
     ) -> Result<Option<i64>> {
         statement
             .query_row(
@@ -1248,6 +1251,7 @@ impl PreparedTrajectoryWrite<'_, '_> {
                     title.local == LocalOpenerEvidence::Current,
                     title.local == LocalOpenerEvidence::Withdrawn,
                     title.authoritative,
+                    verified_partial,
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -3576,12 +3580,14 @@ impl Store {
             write
                 .guard
                 .check(&transaction, write.session, Some(document))?;
-            if let Some(changed) =
-                scoped_native_documents::write(&transaction, write, context, &rewritten)?
-            {
-                scoped_documents += changed;
-                continue;
-            }
+            let verified_partial =
+                match scoped_native_documents::write(&transaction, write, context, &rewritten)? {
+                    scoped_native_documents::WriteResult::Handled(changed) => {
+                        scoped_documents += changed;
+                        continue;
+                    }
+                    scoped_native_documents::WriteResult::Primary(verified) => verified,
+                };
             codex_title_recheck::accept(&transaction, write, selected_metadata)?;
             let observed = matches!(write.guard, TrajectorySourceGuard::Observed(_));
             let native_codex = write.session.provider == Provider::Codex
@@ -3593,8 +3599,12 @@ impl Store {
             }
             let title = write.title_evidence(&transaction, observed)?;
             let reuse_chunks = write.reuses_revision_chunks(&transaction)?;
-            let trajectory_id =
-                write.upsert_parent(&mut upsert_parent, &title, selected_metadata.is_some())?;
+            let trajectory_id = write.upsert_parent(
+                &mut upsert_parent,
+                &title,
+                selected_metadata.is_some(),
+                verified_partial,
+            )?;
             if !context.publish_locator(&transaction, write, trajectory_id.is_some())? {
                 continue;
             }

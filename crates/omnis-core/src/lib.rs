@@ -53,14 +53,14 @@ const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 7;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 8;
 
 /// Search projection generation for this index entry.
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity => 10,
-        Provider::AntigravityDesktop => 11,
+        Provider::Antigravity => 11,
+        Provider::AntigravityDesktop => 12,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -1246,9 +1246,6 @@ fn trajectory_search_document_with_limits(
     }
 
     let document_truncated = retained.truncated();
-    if !document_truncated && !retained.contiguous_head {
-        desktop_projection = None;
-    }
     let text = retained.finish();
     let truncation_strategy =
         search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
@@ -1380,9 +1377,7 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
 }
 
 struct HeadTailText {
-    contiguous_head: bool,
     head: String,
-    head_byte_count: usize,
     tail: VecDeque<String>,
     tail_byte_count: usize,
     edge_limit: usize,
@@ -1392,9 +1387,7 @@ struct HeadTailText {
 impl HeadTailText {
     const fn new(edge_limit: usize) -> Self {
         Self {
-            contiguous_head: true,
             head: String::new(),
-            head_byte_count: 0,
             tail: VecDeque::new(),
             tail_byte_count: 0,
             edge_limit,
@@ -1403,13 +1396,11 @@ impl HeadTailText {
     }
 
     fn push(&mut self, value: &str) {
+        let head_remaining = self.edge_limit.saturating_sub(self.total_byte_count);
         self.total_byte_count = self.total_byte_count.saturating_add(value.len());
-        let head_remaining = self.edge_limit.saturating_sub(self.head_byte_count);
         let head_bytes = utf8_prefix_boundary(value, head_remaining);
         if head_bytes != 0 {
-            self.contiguous_head &= self.tail_byte_count == 0;
             self.head.push_str(&value[..head_bytes]);
-            self.head_byte_count += head_bytes;
         }
         if head_bytes == value.len() {
             return;
@@ -1454,8 +1445,10 @@ impl HeadTailText {
     }
 
     fn trim_tail(&mut self) {
-        while self.tail_byte_count > self.edge_limit {
-            let excess = self.tail_byte_count - self.edge_limit;
+        // If the head ends before a multibyte character, its unused bytes belong to the tail.
+        let tail_limit = self.edge_limit.saturating_mul(2) - self.head.len();
+        while self.tail_byte_count > tail_limit {
+            let excess = self.tail_byte_count - tail_limit;
             let Some(front) = self.tail.pop_front() else {
                 self.tail_byte_count = 0;
                 return;
@@ -5807,6 +5800,38 @@ mod tests {
             &with_middle.text,
             &after_restore.text
         ));
+    }
+
+    #[test]
+    fn streaming_search_text_preserves_utf8_and_separators_across_pushes() {
+        let exact = "abcde🦀1234567";
+        let mut stream = super::HeadTailText::new(exact.len() / 2);
+        stream.push(exact);
+        assert_eq!(stream.finish(), exact);
+
+        let parts = [
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "🦀goldfinch",
+            "\n\n",
+            "bluebird",
+            "\n\n",
+            "中🦀",
+        ];
+        let whole = parts.concat();
+        for limit in 0..=whole.len() {
+            let (expected, truncated) = super::head_tail_text(&whole, limit);
+            for chunks in [
+                parts.to_vec(),
+                whole.split_inclusive(|_: char| true).collect(),
+            ] {
+                let mut stream = super::HeadTailText::new(limit);
+                for piece in chunks {
+                    stream.push(piece);
+                }
+                assert_eq!(stream.truncated(), truncated);
+                assert_eq!(stream.finish(), expected, "edge limit {limit}");
+            }
+        }
     }
 
     #[test]

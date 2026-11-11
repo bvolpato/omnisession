@@ -142,7 +142,7 @@ impl PriorCoverage {
         has_gap: bool,
         home: Option<&[u8]>,
         hash: &[u8],
-        prior_text: impl FnOnce() -> Result<Option<Cow<'a, str>>>,
+        prior_text: impl Fn() -> Result<Option<Cow<'a, str>>>,
     ) -> Result<bool> {
         if !has_gap && self.contents != write.document.source_revision.contents {
             return Ok(true);
@@ -156,16 +156,27 @@ impl PriorCoverage {
                     retains_legacy_preview(&previous, write.document.redacted_text)
                 }));
         }
-        if has_gap
-            && let (Some(home), Some(contents), Some(file), Some(incoming)) = (
-                home,
-                self.contents,
-                write.document.source_revision.file,
-                write.document.desktop_step_proof,
-            )
-            && let Some(previous) =
+        let prior_steps = match (home, self.contents, write.document.source_revision.file) {
+            (Some(home), Some(contents), Some(file)) if has_gap => {
                 super::desktop_receipts::read(tx, &write.session.id, home, file, contents, hash)?
+            }
+            _ => None,
+        };
+        let incoming = write.document.desktop_step_proof;
+        if has_gap
+            && home.is_some()
+            && hash != write.content_hash
+            && prior_steps
+                .as_deref()
+                .is_none_or(|previous| Some(previous) == incoming)
+            && let Some(projection) = write.document.desktop_projection
+            && prior_text()?.is_some_and(|previous| {
+                projection.matches_legacy_utf8_text(&previous, write.document.redacted_text)
+            })
         {
+            return Ok(true);
+        }
+        if let (Some(previous), Some(incoming)) = (prior_steps, incoming) {
             if !retains_steps(&previous, incoming, self.full_or_limited) {
                 return Ok(false);
             }
@@ -199,16 +210,53 @@ impl PriorCoverage {
 }
 
 fn retains_standalone_text(previous: &str, incoming: &str) -> bool {
-    previous.is_empty()
-        || incoming.match_indices(previous).any(|(start, matched)| {
-            let end = start + matched.len();
-            (start == 0
-                || previous.starts_with(char::is_whitespace)
-                || incoming[..start].ends_with(char::is_whitespace))
-                && (end == incoming.len()
-                    || previous.ends_with(char::is_whitespace)
-                    || incoming[end..].starts_with(char::is_whitespace))
-        })
+    if previous.is_empty() {
+        return true;
+    }
+    let Some(first) = incoming.find(previous) else {
+        return false;
+    };
+    let standalone = |end: usize| {
+        let start = end - previous.len();
+        (start == 0
+            || previous.starts_with(char::is_whitespace)
+            || incoming[..start].ends_with(char::is_whitespace))
+            && (end == incoming.len()
+                || previous.ends_with(char::is_whitespace)
+                || incoming[end..].starts_with(char::is_whitespace))
+    };
+    let first_end = first + previous.len();
+    if standalone(first_end) {
+        return true;
+    }
+    if first_end == incoming.len() {
+        return false;
+    }
+
+    // A rejected match can end with the start of the next match. A KMP prefix table
+    // preserves that suffix without rescanning the transcript.
+    let needle = previous.as_bytes();
+    let mut prefixes = vec![0; needle.len()];
+    let advance = |mut matched: usize, byte: u8, prefixes: &[usize]| {
+        while matched > 0 && needle[matched] != byte {
+            matched = prefixes[matched - 1];
+        }
+        matched + usize::from(needle[matched] == byte)
+    };
+    for i in 1..needle.len() {
+        prefixes[i] = advance(prefixes[i - 1], needle[i], &prefixes);
+    }
+    let mut matched = prefixes[needle.len() - 1];
+    for (offset, &byte) in incoming.as_bytes()[first_end..].iter().enumerate() {
+        matched = advance(matched, byte, &prefixes);
+        if matched == needle.len() {
+            if standalone(first_end + offset + 1) {
+                return true;
+            }
+            matched = prefixes[matched - 1];
+        }
+    }
+    false
 }
 
 fn retains_legacy_preview(previous: &str, incoming: &str) -> bool {
@@ -236,7 +284,18 @@ fn retains_steps(previous: &[Uuid], incoming: &[Uuid], strict: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Uuid, retains_steps};
+    use super::{Uuid, retains_standalone_text, retains_steps};
+
+    #[test]
+    fn overlapping_legacy_matches_preserve_standalone_terms() {
+        assert!(retains_standalone_text(
+            "go\n\ngo",
+            "delivered cargo\n\ngo\n\ngo"
+        ));
+        assert!(retains_standalone_text("鳥 鳥", "青鳥 鳥 鳥\u{2003}"));
+        assert!(!retains_standalone_text("鳥 鳥", "青鳥 鳥 鳥類"));
+        assert!(!retains_standalone_text("go", "cargoes"));
+    }
 
     #[test]
     fn partial_reads_preserve_order_and_need_a_new_step_to_replace_full_coverage() {

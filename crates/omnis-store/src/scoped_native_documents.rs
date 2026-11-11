@@ -50,36 +50,41 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     chunks::initialize(tx)
 }
 
+pub(super) enum WriteResult {
+    Primary(bool),
+    Handled(usize),
+}
+
 /// Keeps each verified home’s search history when two homes publish the same session ID.
 pub(super) fn write(
     tx: &Transaction<'_>,
     write: &PreparedTrajectoryWrite<'_, '_>,
     context: TrajectoryWriteContext<'_>,
     rewritten: &[(i64, &str)],
-) -> Result<Option<usize>> {
+) -> Result<WriteResult> {
     let document = &write.document;
     let TrajectorySourceGuard::ObservedDocument(observed) = write.guard else {
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     };
     if !TrajectorySourceGuard::uses_catalog_home(write.session.provider)
         || document.origin == SessionTrajectoryOrigin::ImportedBundle
         || observed.document.is_none()
     {
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     }
     let provider = write.session.provider.to_string();
     let id = &write.session.id;
     let Some(home) = selected_home(tx, context, &provider, id, observed.catalog)? else {
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     };
     let (Some(file), Some(contents)) = (
         document.source_revision.file,
         document.source_revision.contents,
     ) else {
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     };
     let Some(primary) = coverage::Primary::read(tx, write)? else {
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     };
     let same_owner = primary.verified_home.as_deref() == Some(home.as_ref());
     let same_source = same_owner && primary.file == Some(file);
@@ -93,21 +98,23 @@ pub(super) fn write(
         };
         if !accepts {
             publish_read(tx, write, context, &home)?;
-            return Ok(Some(0));
+            return Ok(WriteResult::Handled(0));
         }
     }
     if same_source || legacy_file || (primary.verified_home.is_none() && !has_gap) {
-        return Ok(None);
+        return Ok(WriteResult::Primary(
+            same_source && has_gap && write.session.provider == crate::Provider::AntigravityDesktop,
+        ));
     }
     if (!has_gap || write.source_complete)
         && let Some(text) = primary.text(tx, rewritten)?
     {
         archive_primary(tx, primary.id, &text)?;
-        return Ok(None);
+        return Ok(WriteResult::Primary(false));
     }
     let changed = save_scoped(tx, write, &home, file, contents)?;
     publish_read(tx, write, context, &home)?;
-    Ok(Some(changed))
+    Ok(WriteResult::Handled(changed))
 }
 
 fn save_scoped(
@@ -130,8 +137,10 @@ fn save_scoped(
              truncation_strategy=excluded.truncation_strategy,stored_text=excluded.stored_text,
              source_complete=excluded.source_complete,complete=excluded.complete,provider_limited=excluded.provider_limited,
              derived_title=excluded.derived_title,source_updated_at=excluded.source_updated_at
-         WHERE (source_contents,stored_text,source_complete,complete,provider_limited,derived_title,source_updated_at) IS NOT
-               (excluded.source_contents,excluded.stored_text,excluded.source_complete,excluded.complete,excluded.provider_limited,excluded.derived_title,excluded.source_updated_at)",
+         WHERE (source_contents,stored_text,source_complete,complete,provider_limited,derived_title,source_updated_at,
+                indexed_byte_count,source_byte_count,truncation_strategy) IS NOT
+               (excluded.source_contents,excluded.stored_text,excluded.source_complete,excluded.complete,excluded.provider_limited,excluded.derived_title,excluded.source_updated_at,
+                excluded.indexed_byte_count,excluded.source_byte_count,excluded.truncation_strategy)",
     ).and_then(|mut statement| {
         statement.execute(params![
             provider, id, home, file.as_bytes(), contents.as_bytes(),
