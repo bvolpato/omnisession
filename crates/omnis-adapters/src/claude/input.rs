@@ -13,7 +13,7 @@ use omnis_ir::{EventKind, ReplayPolicy};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ClaudeTranscript, EventBuilder};
+use super::{ClaudeTranscript, EventBuilder, copies};
 use crate::support::{
     BoundedLine, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, MAX_PREVIEW_TAIL_SIZE, MAX_PROVIDER_RECORDS,
     MAX_STREAMED_TRANSCRIPT_LINE_SIZE, read_bounded_line_with_budget,
@@ -132,7 +132,7 @@ fn read_gap_links(
     file: &mut File,
     start: u64,
     end: u64,
-    transcript: &mut ClaudeTranscript,
+    observe: &mut impl FnMut(Observation<'_>),
 ) -> Result<bool> {
     let mut remaining = end - start;
     if remaining > MAX_PREVIEW_GAP_BYTES {
@@ -177,10 +177,51 @@ fn read_gap_links(
             let Some(parent) = record.parent_uuid else {
                 return Ok(false);
             };
-            transcript.observe(&json!({"type": record.kind, "uuid": id, "parentUuid": parent}));
+            observe(Observation::Link(
+                &json!({"type": record.kind, "uuid": id, "parentUuid": parent}),
+            ));
         }
     }
     Ok(remaining == 0)
+}
+
+#[derive(Clone, Copy)]
+enum Observation<'a> {
+    Record(&'a Value),
+    Link(&'a Value),
+    Tail(bool),
+}
+
+impl Observation<'_> {
+    fn apply_from(self, start: usize, position: &mut usize, transcript: &mut ClaudeTranscript) {
+        match self {
+            Self::Record(row) => {
+                let before = *position < start;
+                *position += 1;
+                if before && copies::identified(row).is_some() {
+                    return;
+                }
+            }
+            // A sampled gap has only link fields. It cannot prove that a raw record was copied.
+            Self::Link(_) if start > 0 && *position <= start => return,
+            _ => {}
+        }
+        self.apply(transcript);
+    }
+
+    fn apply(self, transcript: &mut ClaudeTranscript) {
+        match self {
+            Self::Record(row) | Self::Link(row) => transcript.observe(row),
+            Self::Tail(connected) => {
+                if !connected {
+                    transcript.compactions.pending = None;
+                    transcript.compactions.absent_anchors.clear();
+                    transcript.compactions.absent_summary_nodes.clear();
+                }
+                transcript.branch.start_sampled_tail(connected);
+            }
+        }
+    }
 }
 
 pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, InputCoverage)> {
@@ -191,12 +232,57 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
     }
     let length = metadata.len();
     let mut transcript = ClaudeTranscript::default();
+    let mut probe = copies::Probe::default();
+    let coverage = visit(&mut file, length, preview, |observation| {
+        if let Observation::Record(row) = observation {
+            probe.observe(row, &transcript.records);
+        }
+        observation.apply(&mut transcript);
+    })?;
+    let Some(proposed) = probe.proposed_start() else {
+        return Ok((transcript, coverage));
+    };
+    // Verify the entire copy while reducing it. A conflicting definition or a
+    // different restore boundary needs one further bounded pass on the same file.
+    transcript = ClaudeTranscript::default();
+    let mut index = copies::Occurrences::default();
+    let mut position = 0;
+    visit(&mut file, length, preview, |observation| {
+        match observation {
+            Observation::Record(row) => index.observe(row),
+            Observation::Tail(_) => index.start_tail(),
+            Observation::Link(_) => {}
+        }
+        observation.apply_from(proposed, &mut position, &mut transcript);
+    })?;
+    let start = index.restart().unwrap_or_default();
+    if start != proposed {
+        transcript = ClaudeTranscript::default();
+        position = 0;
+        visit(&mut file, length, preview, |observation| {
+            observation.apply_from(start, &mut position, &mut transcript);
+        })?;
+    }
+    let after = file.metadata()?;
+    if after.len() != metadata.len() || after.modified()? != metadata.modified()? {
+        bail!("Claude transcript changed while verifying a restored copy");
+    }
+    Ok((transcript, coverage))
+}
+
+fn visit(
+    file: &mut File,
+    length: u64,
+    preview: bool,
+    mut observe: impl FnMut(Observation<'_>),
+) -> Result<InputCoverage> {
+    file.rewind()?;
     let mut coverage = InputCoverage::default();
     if preview && length > MAX_PREVIEW_TAIL_SIZE * 2 {
         coverage.sampled = true;
         let mut messages = 0;
-        let head_end = coverage.scan(&mut file, MAX_PREVIEW_TAIL_SIZE, false, |record| {
-            transcript.observe(&record);
+        let head_end = coverage.scan(&mut *file, MAX_PREVIEW_TAIL_SIZE, false, |record| {
+            observe(Observation::Record(&record));
             messages += usize::from(record["type"] != "progress");
             Ok(messages < PREVIEW_RECORDS)
         })?;
@@ -204,7 +290,7 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
         // Start one byte early so a record exactly on the window boundary survives.
         let start = length - MAX_PREVIEW_TAIL_SIZE - 1;
         file.seek(SeekFrom::Start(start))?;
-        let mut reader = BufReader::new((&mut file).take(length - start));
+        let mut reader = BufReader::new((&mut *file).take(length - start));
         let skipped = reader.skip_until(b'\n')? as u64;
         let mut tail = VecDeque::new();
         let mut tail_messages = 0;
@@ -220,13 +306,10 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
             Ok(true)
         })?;
         let connected =
-            !tail_trimmed && read_gap_links(&mut file, head_end, start + skipped, &mut transcript)?;
-        if !connected {
-            transcript.compactions.pending = None;
-        }
-        transcript.branch.start_sampled_tail(connected);
+            !tail_trimmed && read_gap_links(file, head_end, start + skipped, &mut observe)?;
+        observe(Observation::Tail(connected));
         for record in tail {
-            transcript.observe(&record);
+            observe(Observation::Record(&record));
         }
     } else {
         let mut records = 0;
@@ -243,9 +326,9 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
                     bail!("provider file exceeds safe record limit");
                 }
             }
-            transcript.observe(&record);
+            observe(Observation::Record(&record));
             Ok(true)
         })?;
     }
-    Ok((transcript, coverage))
+    Ok(coverage)
 }

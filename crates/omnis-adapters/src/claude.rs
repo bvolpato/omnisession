@@ -1,4 +1,5 @@
 mod branch;
+mod copies;
 mod input;
 mod markers;
 mod membership;
@@ -330,12 +331,21 @@ impl io::Write for RecordDigest {
     }
 }
 
+impl RecordDigest {
+    fn of(record: &Value) -> [u8; 32] {
+        let mut digest = Self(Sha256::new());
+        serde_json::to_writer(&mut digest, record).expect("writing JSON to a digest cannot fail");
+        digest.0.finalize().into()
+    }
+}
+
 impl RecordCopies {
     fn signature(
         record: &Value,
         compactions: &Compactions,
         duplicates: &HashSet<Uuid>,
         is_summary: bool,
+        tracked_link: bool,
     ) -> Option<[u8; 32]> {
         // With an implicit parent, identical records can start different turns.
         let role = string_at(record, &[&["type"], &["message", "role"], &["role"]]);
@@ -350,14 +360,12 @@ impl RecordCopies {
                 })
             }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
-            _ => false,
+            _ => tracked_link && record_uuid(record, "parentUuid").is_some(),
         };
         if !fixed_parent || record["isMeta"] == true {
             return None;
         }
-        let mut digest = RecordDigest(Sha256::new());
-        serde_json::to_writer(&mut digest, record).expect("writing JSON to a digest cannot fail");
-        Some(digest.0.finalize().into())
+        Some(RecordDigest::of(record))
     }
 
     fn missing_parent(
@@ -448,6 +456,9 @@ struct Compactions {
     originals: HashMap<Uuid, ClaudeRecord>,
     by_id: HashMap<Uuid, usize>,
     by_summary: HashMap<usize, SummaryHeader>,
+    // A missing anchor can still connect later messages to the boundary that declared it.
+    absent_anchors: HashMap<Uuid, Option<AbsentAnchor>>,
+    absent_summary_nodes: HashMap<usize, Uuid>,
     pending: Option<usize>,
     paths: Paths,
     marker_paths: markers::MarkerPaths,
@@ -457,6 +468,24 @@ struct Compactions {
 struct CompactionHeader {
     order: usize,
     value: Value,
+}
+
+#[derive(Clone, Copy)]
+struct AbsentAnchor {
+    boundary_child: branch::Parent,
+    anchor_child: branch::Parent,
+}
+
+impl CompactionHeader {
+    fn anchor(&self) -> Option<Uuid> {
+        let metadata = &self.value["compactMetadata"];
+        let declaration = if metadata["preservedMessages"].is_null() {
+            &metadata["preservedSegment"]
+        } else {
+            &metadata["preservedMessages"]
+        };
+        record_uuid(declaration, "anchorUuid")
+    }
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -491,6 +520,31 @@ fn record_uuid(record: &Value, field: &str) -> Option<Uuid> {
 }
 
 impl Compactions {
+    fn boundary_child(
+        &self,
+        parent: Uuid,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) -> Option<branch::Parent> {
+        if self.absent_anchors.is_empty() {
+            return None;
+        }
+        let header = &self.headers[*self.by_id.get(&parent)?];
+        let anchor = header.anchor()?;
+        if records.contains_key(&anchor) {
+            return None;
+        }
+        Some(self.absent_anchors.get(&anchor)?.as_ref()?.boundary_child)
+    }
+
+    fn absent_anchor(&self, branch: &branch::Branch, parent: branch::Parent) -> Option<Uuid> {
+        if self.absent_summary_nodes.is_empty() {
+            return None;
+        }
+        self.absent_summary_nodes
+            .get(&branch.summary_for(parent)?)
+            .copied()
+    }
+
     fn declares_summary(&self, record: &Value, id: Option<Uuid>) -> bool {
         if self.by_id.is_empty()
             || record["type"] == "progress"
@@ -507,15 +561,7 @@ impl Compactions {
         } else {
             record_uuid(record, "parentUuid").and_then(|parent| self.by_id.get(&parent).copied())
         };
-        header.is_some_and(|header| {
-            let metadata = &self.headers[header].value["compactMetadata"];
-            let declaration = if metadata["preservedMessages"].is_null() {
-                &metadata["preservedSegment"]
-            } else {
-                &metadata["preservedMessages"]
-            };
-            record_uuid(declaration, "anchorUuid") == id
-        })
+        header.is_some_and(|header| self.headers[header].anchor() == id)
     }
 
     fn observe(&mut self, record: &Value, order: usize) {
@@ -605,6 +651,15 @@ impl Compactions {
         let Some(context) = self.context(Some(summary), records)? else {
             return Ok(None);
         };
+        Self::validate_context(&context, records, duplicates)?;
+        Ok(Some(context))
+    }
+
+    fn validate_context(
+        context: &PreservedContext,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+    ) -> Result<()> {
         if records.contains_key(&context.anchor) || duplicates.contains(&context.boundary) {
             return Err(anyhow!(
                 "retained compaction context has an ambiguous anchor"
@@ -634,7 +689,7 @@ impl Compactions {
                 ));
             }
         }
-        Ok(Some(context))
+        Ok(())
     }
 
     fn index_paths(&mut self, records: &HashMap<Uuid, ClaudeRecord>) {
@@ -1215,14 +1270,11 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
     } else {
         "Claude named this record as a compaction anchor without marking it as a summary"
     };
-    events.push(ClaudeEvent {
-        kind: EventKind::ProviderEvent,
-        payload: json!({"native_history_unverified":true,"reason":reason}),
-        timestamp: parse_timestamp(record.get("timestamp")),
-        replay_policy: ReplayPolicy::HistoricalOnly,
-        raw_type: Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY.into()),
-        source: record_uuid(record, "uuid").map(ClaudeEventSource::Record),
-    });
+    events.push(summary_gap(
+        record_uuid(record, "uuid"),
+        parse_timestamp(record.get("timestamp")),
+        reason,
+    ));
     if !marked {
         for mut part in parts {
             if part.kind != EventKind::CompactionCreated {
@@ -1241,6 +1293,17 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
             }
             events.push(part);
         }
+    }
+}
+
+fn summary_gap(id: Option<Uuid>, timestamp: Option<DateTime<Utc>>, reason: &str) -> ClaudeEvent {
+    ClaudeEvent {
+        kind: EventKind::ProviderEvent,
+        payload: json!({"native_history_unverified":true,"reason":reason}),
+        timestamp,
+        replay_policy: ReplayPolicy::HistoricalOnly,
+        raw_type: Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY.into()),
+        source: id.map(ClaudeEventSource::Record),
     }
 }
 
@@ -1398,6 +1461,8 @@ impl ClaudeTranscript {
                 &self.compactions,
                 &self.duplicate_records,
                 is_summary,
+                !self.record_copies.missing.is_empty()
+                    && self.record_copies.missing.contains_key(&id),
             );
             if self
                 .record_copies
@@ -1411,27 +1476,20 @@ impl ClaudeTranscript {
                 ) {
                     restored_order = Some(self.records[&id].order);
                 } else {
-                    if record["type"] != "system" {
+                    if record["type"] != "system" && !self.records[&id].branch.transparent {
                         self.branch.observe_existing(self.records[&id].branch);
                     }
                     return;
                 }
             }
         }
-        self.has_records = true;
-        self.metadata.observe_timestamp(record);
-        self.titles.observe(record);
-        if matches!(
-            record.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
-            self.has_conversation = true;
-            self.has_main_conversation |= main_record;
-        }
+        self.observe_metadata(record, main_record);
         if !main_record {
             return;
         }
-        self.metadata.observe_workspace(record);
+        if !is_summary && self.compactions.pending.is_some() {
+            self.link_absent_anchor(Some((record, record_parent)));
+        }
         self.compactions.observe(record, self.records.len());
         let start = self.events.len();
         if record["type"] != "progress" {
@@ -1465,7 +1523,7 @@ impl ClaudeTranscript {
                     Some("user" | "assistant")
                 ),
             };
-            let record = ClaudeRecord {
+            let definition = ClaudeRecord {
                 order: restored_order.unwrap_or(self.records.len()),
                 is_summary,
                 native_transcript,
@@ -1473,23 +1531,152 @@ impl ClaudeTranscript {
                 parent: record_parent,
                 events: start..self.events.len(),
             };
-            self.save_record(id, record, causal_parent, restored_order.is_some());
+            self.save_record(
+                id,
+                definition,
+                record,
+                causal_parent,
+                restored_order.is_some(),
+            );
         }
+    }
+
+    fn observe_metadata(&mut self, record: &Value, main_record: bool) {
+        self.has_records = true;
+        self.metadata.observe_timestamp(record);
+        self.titles.observe(record);
+        if matches!(
+            record.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
+            self.has_conversation = true;
+            self.has_main_conversation |= main_record;
+        }
+        if main_record {
+            self.metadata.observe_workspace(record);
+        }
+    }
+
+    fn link_absent_anchor(&mut self, next: Option<(&Value, Option<Uuid>)>) {
+        let Some(header) = self
+            .compactions
+            .pending
+            .map(|i| &self.compactions.headers[i])
+        else {
+            return;
+        };
+        let (Some(boundary), Some(anchor)) = (record_uuid(&header.value, "uuid"), header.anchor())
+        else {
+            return;
+        };
+        if let Some((next, next_parent)) = next {
+            let conversation = next["type"] != "progress"
+                && next["isMeta"] != true
+                && matches!(
+                    string_at(next, &[&["message", "role"], &["role"], &["type"]]),
+                    Some("user" | "assistant")
+                );
+            let new_boundary = next["type"] == "system" && next["subtype"] == "compact_boundary";
+            if !conversation
+                && !new_boundary
+                && next_parent != Some(anchor)
+                && next_parent != Some(boundary)
+            {
+                return;
+            }
+        } else {
+            // At EOF Claude applies a complete descriptor. An invalid descriptor leaves the previous conversation active.
+            let context = compaction_preserved_context(&header.value, |id| {
+                self.compactions.first_record(id, &self.records)
+            });
+            if !context.ok().flatten().is_some_and(|c| {
+                Compactions::validate_context(&c, &self.records, &self.duplicate_records).is_ok()
+            }) {
+                return;
+            }
+        }
+        if self.records.contains_key(&anchor) {
+            return;
+        }
+        if self.duplicate_records.contains(&boundary)
+            || self.compactions.absent_anchors.contains_key(&anchor)
+        {
+            self.compactions.absent_anchors.insert(anchor, None);
+            return;
+        }
+        // The descriptor supplies the two UUIDs. Only a coverage notice enters the transcript.
+        // A genuine summary can still arrive later and resolve the native UUID.
+        // A direct boundary child precedes the retained messages. A child of the
+        // declared anchor follows them. Both share the same earlier recovery history.
+        let mut link = json!({"type":"user","parentUuid":boundary});
+        let boundary_child = self.observe_anchor_gap(&link, boundary, anchor);
+        let previous = self.branch.selected_summary();
+        link["uuid"] = json!(anchor);
+        let anchor_child = self.observe_anchor_gap(&link, boundary, anchor);
+        self.update_retention(&link, previous, true);
+        self.compactions.absent_anchors.insert(
+            anchor,
+            Some(AbsentAnchor {
+                boundary_child,
+                anchor_child,
+            }),
+        );
+    }
+
+    fn observe_anchor_gap(&mut self, link: &Value, boundary: Uuid, anchor: Uuid) -> branch::Parent {
+        let start = self.events.len();
+        self.events.push(summary_gap(
+            Some(boundary),
+            None,
+            "Claude's compaction boundary declares a summary record missing from the transcript",
+        ));
+        let parent = self.branch.observe(
+            link,
+            true,
+            &self.records,
+            &self.duplicate_records,
+            &self.compactions,
+            start..self.events.len(),
+        );
+        self.compactions
+            .absent_summary_nodes
+            .insert(parent.node.expect("gap has a conversation node"), anchor);
+        parent
     }
 
     fn save_record(
         &mut self,
         id: Uuid,
         record: ClaudeRecord,
+        raw: &Value,
         causal_parent: Option<Uuid>,
         restored: bool,
     ) {
-        let gap = if self.branch.may_have_missing_parent(record.branch) {
+        let gap = if !self.record_copies.missing.is_empty()
+            || self.branch.may_have_missing_parent(record.branch)
+        {
             self.record_copies
                 .missing_parent(causal_parent, &self.records)
         } else {
             None
         };
+        let gap = gap
+            .or_else(|| self.compactions.absent_anchor(&self.branch, record.branch))
+            .or_else(|| {
+                record_uuid(raw, "sourceToolAssistantUUID")
+                    .filter(|issuer| !self.records.contains_key(issuer))
+            });
+        if gap.is_some()
+            && record.branch.transparent
+            && record.parent.is_some()
+            && raw["isMeta"] != true
+        {
+            // A repeated link can now connect its descendants to verified history.
+            self.record_copies
+                .current
+                .entry(id)
+                .or_insert_with(|| RecordDigest::of(raw));
+        }
         self.record_copies.set_missing(id, gap);
         if !self.records.contains_key(&id) {
             self.compactions
@@ -1600,6 +1787,7 @@ impl ClaudeTranscript {
     }
 
     fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>, branch::Ambiguity) {
+        self.link_absent_anchor(None);
         let mut path = self.branch.selected_path();
         let mut rewind = branch::Rewind::default();
         let mut retention = None;

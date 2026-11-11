@@ -32,6 +32,10 @@ fn result(id: &str, output: &str, failed: bool) -> Value {
 }
 
 fn read(rows: &[Value]) -> CanonicalSnapshot {
+    read_session(rows, false)
+}
+
+fn read_session(rows: &[Value], preview: bool) -> CanonicalSnapshot {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -40,9 +44,14 @@ fn read(rows: &[Value]) -> CanonicalSnapshot {
     for row in rows {
         writeln!(file, "{row}").unwrap();
     }
-    ClaudeAdapter::with_root(root.path())
-        .read_session(&SessionRef::new(Provider::Claude, id.to_string()))
-        .unwrap()
+    let adapter = ClaudeAdapter::with_root(root.path());
+    let session = SessionRef::new(Provider::Claude, id.to_string());
+    if preview {
+        adapter.preview_session(&session)
+    } else {
+        adapter.read_session(&session)
+    }
+    .unwrap()
 }
 
 fn tool_outcomes(snapshot: &CanonicalSnapshot) -> Vec<(String, bool)> {
@@ -2021,6 +2030,125 @@ fn an_empty_compaction_keeps_earlier_requests_in_recovery() {
 }
 
 #[test]
+fn a_missing_declared_anchor_keeps_retained_history_on_its_own_branch() {
+    let [header, summary] = compaction(3, 2, &[2]);
+    for descriptor in [
+        header["compactMetadata"].clone(),
+        json!({"preservedSegment":{"anchorUuid":Uuid::from_u128(4),
+            "headUuid":Uuid::from_u128(2),"tailUuid":Uuid::from_u128(2)}}),
+    ] {
+        let mut header = header.clone();
+        header["compactMetadata"] = descriptor;
+        let before = [
+            message(1, 0, "user", json!("Earlier request")),
+            message(2, 1, "assistant", json!("Retained decision")),
+            header,
+        ];
+        for parent in [2, 3, 4, 6] {
+            let mut rows = before.to_vec();
+            if parent == 6 {
+                rows.push(opaque(6, 4, "progress"));
+            }
+            rows.push(message(7, parent, "user", json!("Current request")));
+            let snapshot = read(&rows);
+            assert!(import_trajectory(&snapshot).truncated);
+            let text: Vec<_> = import_trajectory(&snapshot)
+                .items
+                .into_iter()
+                .map(|i| i.text)
+                .collect();
+            assert_eq!(text.last().unwrap(), "Current request");
+            assert_eq!(text.iter().any(|s| s == "Retained decision"), parent != 3);
+            assert!(!text.iter().any(|item| item.contains("Earlier request")));
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            assert!(
+                String::from_utf8(recovery)
+                    .unwrap()
+                    .contains("Earlier request")
+            );
+
+            rows.push(message(8, 0, "user", json!("Independent task")));
+            let independent = import_trajectory(&read(&rows));
+            assert!(!independent.truncated);
+            assert_eq!(independent.items.len(), 1);
+            rows.push(message(9, 4, "user", json!("Back to the boundary")));
+            let resumed = import_trajectory(&read(&rows));
+            assert!(resumed.truncated);
+            assert!(resumed.items.iter().any(|i| i.text == "Retained decision"));
+
+            rows.extend([
+                summary.clone(),
+                message(10, 4, "user", json!("Verified continuation")),
+            ]);
+            let verified = import_trajectory(&read(&rows));
+            assert!(!verified.truncated);
+            assert!(
+                verified
+                    .items
+                    .iter()
+                    .any(|i| i.text.ends_with("\nSummary 3"))
+            );
+            assert!(verified.items.iter().any(|i| i.text == "Retained decision"));
+
+            if parent == 6 {
+                continue;
+            }
+            let mut restored = before.to_vec();
+            let continuation = message(12, parent, "user", json!("Restored continuation"));
+            restored.extend([continuation.clone(), summary.clone(), continuation]);
+            let restored = import_trajectory(&read(&restored));
+            assert!(!restored.truncated);
+            assert_eq!(
+                restored.items.last().unwrap().text,
+                "Restored continuation",
+                "parent {parent}"
+            );
+        }
+        let mut unrelated = before.to_vec();
+        unrelated.push(message(11, 1, "user", json!("Rewind before compression")));
+        let rewind = import_trajectory(&read(&unrelated));
+        assert!(!rewind.truncated);
+        assert_eq!(rewind.items.len(), 2);
+        assert_eq!(rewind.items[0].text, "Earlier request");
+    }
+}
+
+#[test]
+fn a_terminal_boundary_uses_only_a_verified_retention_descriptor() {
+    for (retained, earlier_active, decision_active) in [
+        (Some(vec![2]), false, true),
+        (Some(Vec::new()), false, false),
+        (Some(vec![99]), true, true),
+        (None, true, true),
+    ] {
+        let [mut header, _] = compaction(3, 2, retained.as_deref().unwrap_or_default());
+        if retained.is_none() {
+            header.as_object_mut().unwrap().remove("compactMetadata");
+        }
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Earlier request")),
+            message(2, 1, "assistant", json!("Retained decision")),
+            header,
+        ]);
+        let handoff = import_trajectory(&snapshot);
+        assert!(handoff.truncated);
+        assert_eq!(
+            handoff.items.iter().any(|i| i.text == "Earlier request"),
+            earlier_active
+        );
+        assert_eq!(
+            handoff.items.iter().any(|i| i.text == "Retained decision"),
+            decision_active
+        );
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("Earlier request") && recovery.contains("Retained decision"));
+    }
+}
+
+#[test]
 fn an_unflagged_declared_anchor_scopes_incomplete_history_to_its_branch() {
     let [header, mut anchor] = compaction(3, 2, &[2]);
     anchor.as_object_mut().unwrap().remove("isCompactSummary");
@@ -2499,5 +2627,111 @@ fn another_verified_issuer_prevents_a_selected_result_from_claiming_a_missing_ca
                 ("verifiedleft".into(), false)
             ]
         );
+    }
+}
+
+#[test]
+fn a_copied_branch_returns_to_its_most_recently_created_leaf() {
+    let rows = [
+        message(1, 0, "user", json!("Root")),
+        message(2, 1, "assistant", json!("Earlier branch")),
+        message(3, 2, "user", json!("First child")),
+        message(4, 2, "user", json!("Second child")),
+        message(5, 3, "assistant", json!("Newest descendant")),
+        message(6, 1, "assistant", json!("Other branch")),
+    ];
+    let mut restored = rows.to_vec();
+    for (id, answer) in [
+        (4, "Second child"),
+        (2, "Newest descendant"),
+        (6, "Other branch"),
+    ] {
+        restored.push(rows[id - 1].clone());
+        assert_eq!(
+            import_trajectory(&read(&restored))
+                .items
+                .last()
+                .unwrap()
+                .text,
+            answer
+        );
+    }
+}
+
+#[test]
+fn a_complete_copy_after_an_ordered_fragment_restores_the_same_handoff() {
+    let mut complete = vec![
+        message(1, 0, "user", json!("First request")),
+        message(2, 1, "assistant", json!("First reply")),
+        message(3, 2, "user", json!("Withdrawn")),
+        message(4, 2, "user", json!("Replacement")),
+        block(5, 4, "parallel", json!([call("left")])),
+        block(6, 4, "parallel", json!([call("right")])),
+        linked_result(7, 6, 6, "right", "right output"),
+        linked_result(8, 7, 5, "left", "left output"),
+        message(9, 8, "assistant", json!("Decision")),
+    ];
+    complete.extend(compaction(10, 9, &[4, 5, 6, 7, 8, 9]));
+    complete.extend([
+        opaque(12, 11, "progress"),
+        opaque(13, 12, "attachment"),
+        message(14, 13, "assistant", json!("Final response")),
+    ]);
+
+    let history = |snapshot: &CanonicalSnapshot| {
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(snapshot, &mut recovery).unwrap();
+        (
+            import_trajectory(snapshot),
+            omnis_core::trajectory_search_document(snapshot),
+            recovery,
+        )
+    };
+    let original = read(&complete);
+    let (native, searchable, recovery) = history(&original);
+    assert!(searchable.source_complete && !native.truncated);
+    assert!(searchable.text.contains("Final response"));
+    assert!(!searchable.text.contains("Withdrawn"));
+    assert_eq!(
+        tool_outcomes(&original),
+        [
+            ("left output".into(), false),
+            ("right output".into(), false)
+        ]
+    );
+
+    let ids = 1..=complete.len();
+    for (name, members) in [
+        (
+            "withdrawn request omitted",
+            ids.clone().filter(|&id| id != 3).collect(),
+        ),
+        (
+            "parallel issuer omitted",
+            ids.filter(|&id| id != 5).collect(),
+        ),
+        ("progress and attachment", (12..=14).collect()),
+        ("checkpoint and tail", (10..=14).collect()),
+        ("nonadjacent records", vec![2, 6, 7, 9, 11, 14]),
+        (
+            "overlapping rootless checkpoint fragments",
+            vec![10, 11, 14, 9, 10, 12, 14],
+        ),
+        (
+            "successively fuller copies",
+            vec![1, 4, 14, 1, 4, 5, 7, 11, 14],
+        ),
+    ] {
+        let mut restored: Vec<_> = members
+            .into_iter()
+            .map(|id| complete[id - 1].clone())
+            .collect();
+        restored.extend_from_slice(&complete);
+        for preview in [false, true] {
+            let (imported, indexed, handoff) = history(&read_session(&restored, preview));
+            assert_eq!(imported, native, "{name}, preview={preview}");
+            assert_eq!(indexed, searchable, "{name}, preview={preview}");
+            assert_eq!(handoff, recovery, "{name}, preview={preview}");
+        }
     }
 }

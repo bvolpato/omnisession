@@ -16,6 +16,10 @@ pub(super) struct Paths {
 }
 
 impl Paths {
+    pub(super) fn len(&self) -> usize {
+        self.links.len()
+    }
+
     pub(super) fn active(&self) -> bool {
         !self.links.is_empty()
     }
@@ -192,6 +196,86 @@ impl Members {
             Self::Segment { tail, len } => paths.distance(index, *tail).is_some_and(|d| d < *len),
             Self::None => false,
         }
+    }
+}
+
+/// Finds the most recently created descendant of a copied message. Children can
+/// arrive on older branches, so the newest leaf need not be under the last direct child.
+#[derive(Default)]
+pub(super) struct Descendants {
+    indexed: usize,
+    blocks: Vec<NodeBlock>,
+}
+
+// The leaves are in tree order. Each internal entry is the newest record under it.
+struct NodeBlock {
+    newest: Vec<usize>,
+}
+
+impl NodeBlock {
+    fn new(first: usize, len: usize, paths: &Paths) -> Self {
+        let mut newest = vec![0; len];
+        newest.extend(first..first + len);
+        newest[len..].sort_unstable_by(|&a, &b| paths.walk_order((a, false), (b, false)));
+        for i in (1..len).rev() {
+            newest[i] = newest[2 * i].max(newest[2 * i + 1]);
+        }
+        Self { newest }
+    }
+
+    fn len(&self) -> usize {
+        self.newest.len() / 2
+    }
+
+    fn last_in(&self, node: usize, paths: &Paths) -> Option<usize> {
+        let len = self.len();
+        let leaves = &self.newest[len..];
+        let boundary = |leave| {
+            len + leaves.partition_point(|&i| paths.walk_order((i, false), (node, leave)).is_lt())
+        };
+        let (mut start, mut end) = (boundary(false), boundary(true));
+        if start == end {
+            return None;
+        }
+        let mut newest = 0;
+        while start < end {
+            if !start.is_multiple_of(2) {
+                newest = newest.max(self.newest[start]);
+                start += 1;
+            }
+            if !end.is_multiple_of(2) {
+                end -= 1;
+                newest = newest.max(self.newest[end]);
+            }
+            start /= 2;
+            end /= 2;
+        }
+        Some(newest)
+    }
+}
+
+impl Descendants {
+    pub(super) fn latest(&mut self, node: usize, paths: &Paths) -> usize {
+        if self.indexed != paths.len() {
+            let mut first = 0;
+            let mut index = 0;
+            while first < paths.len() {
+                let len = 1 << (paths.len() - first).ilog2();
+                // Full chronological blocks retain their tree order as later nodes arrive.
+                if self.blocks.get(index).is_none_or(|b| b.len() != len) {
+                    self.blocks.truncate(index);
+                    self.blocks.push(NodeBlock::new(first, len, paths));
+                }
+                first += len;
+                index += 1;
+            }
+            self.indexed = paths.len();
+        }
+        self.blocks
+            .iter()
+            .rev()
+            .find_map(|block| block.last_in(node, paths))
+            .unwrap_or(node)
     }
 }
 

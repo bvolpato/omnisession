@@ -40,6 +40,7 @@ pub(super) struct TrailingPath {
 
 #[derive(Default)]
 struct Node {
+    has_children: bool,
     uuid: Option<Uuid>,
     parent: Option<usize>,
     summary: Option<usize>,
@@ -581,15 +582,23 @@ pub(super) struct Branch {
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
-    sampled_copy_paths: Option<super::membership::Paths>,
+    copy_paths: super::membership::Paths,
+    copy_descendants: super::membership::Descendants,
     external_parents: Option<HashMap<Uuid, usize>>,
+}
+
+fn only_tool_results(record: &Value) -> bool {
+    super::value_at(record, &[&["message", "content"], &["content"]])
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            !parts.is_empty() && parts.iter().all(|part| part["type"] == "tool_result")
+        })
 }
 
 impl Branch {
     pub(super) fn start_sampled_tail(&mut self, connected: bool) {
         self.external_parents = Some(HashMap::new());
         if !connected {
-            self.sampled_copy_paths = Some(super::membership::Paths::default());
             self.tip = None;
             self.forked = true;
             self.active_rejection = None;
@@ -598,27 +607,24 @@ impl Branch {
     }
 
     pub(super) fn observe_existing(&mut self, parent: Parent) {
-        // When the gap hid the leaf, a run of copied records can recover a known branch.
-        let (Some(paths), Some(node)) = (&mut self.sampled_copy_paths, parent.node) else {
+        let Some(node) = parent.node else {
             return;
         };
-        if let Some(tip) = self.tip
-            && node <= tip
-        {
-            if node == tip {
+        let leaf = if self.nodes[node].has_children {
+            if !self.forked && self.tip.is_some() {
                 return;
             }
-            // An older copy may be an ancestor of a leaf we already recovered.
-            if !paths.active() {
-                for original in &self.nodes {
-                    paths.push(original.parent);
-                }
+            for original in &self.nodes[self.copy_paths.len()..] {
+                self.copy_paths.push(original.parent);
             }
-            if paths.distance(node, tip).is_some() {
-                return;
-            }
+            self.copy_descendants.latest(node, &self.copy_paths)
+        } else {
+            node
+        };
+        if self.tip == Some(leaf) {
+            return;
         }
-        self.tip = Some(node);
+        self.tip = Some(leaf);
         self.active_rejection = self.unverified_retention();
         self.select_retention();
     }
@@ -649,13 +655,21 @@ impl Branch {
     fn resolve_parent(
         &mut self,
         value: &Value,
+        is_summary: bool,
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> Parent {
         let Some((id, mut parent)) = value.as_str().and_then(|s| {
             let id = s.parse::<Uuid>().ok()?;
-            Some((id, records.get(&id)?.branch))
+            if !is_summary && let Some(gap) = compactions.boundary_child(id, records) {
+                return Some((id, gap));
+            }
+            let parent = records
+                .get(&id)
+                .map(|r| r.branch)
+                .or_else(|| Some(compactions.absent_anchors.get(&id)?.as_ref()?.anchor_child))?;
+            Some((id, parent))
         }) else {
             return self.unresolved_parent(value);
         };
@@ -699,8 +713,9 @@ impl Branch {
             missing_ancestor: self.missing_ancestor(),
             ..Parent::default()
         };
-        let mut resolve =
-            |value: &Value| self.resolve_parent(value, records, duplicates, compactions);
+        let mut resolve = |value: &Value| {
+            self.resolve_parent(value, is_summary, records, duplicates, compactions)
+        };
         if record["type"] == "system" && record["subtype"] == "compact_boundary" {
             // The logical parent connects earlier conversation for the recovery file.
             let parent = record
@@ -727,7 +742,6 @@ impl Branch {
                 ..parent
             };
         }
-        self.sampled_copy_paths = None;
         self.forked |= parent.node != previous.node;
         let index = self.nodes.len();
         if let Some(summary) = parent.unverified {
@@ -752,12 +766,7 @@ impl Branch {
         }
         // A tool-result transport continues its parent's turn. A mixed result with a
         // new request starts a turn for its descendants, as does an independent root.
-        let result_only = role == Some("user")
-            && super::value_at(record, &[&["message", "content"], &["content"]])
-                .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    !parts.is_empty() && parts.iter().all(|part| part["type"] == "tool_result")
-                });
+        let result_only = role == Some("user") && only_tool_results(record);
         let turn = if is_summary || (role == Some("user") && !result_only) {
             index
         } else {
@@ -768,7 +777,11 @@ impl Branch {
                 .or(parent.node)
                 .map_or(index, |node| self.nodes[node].turn)
         };
+        if let Some(index) = parent.node {
+            self.nodes[index].has_children = true;
+        }
         self.nodes.push(Node {
+            has_children: false,
             turn,
             uuid: super::record_uuid(record, "uuid"),
             parent: parent.node,
@@ -903,6 +916,10 @@ impl Branch {
 
     pub(super) fn selected_summary(&self) -> Option<usize> {
         self.nodes[self.tip?].summary
+    }
+
+    pub(super) fn summary_for(&self, parent: Parent) -> Option<usize> {
+        self.nodes[parent.node?].summary
     }
 
     fn retained_parent(
