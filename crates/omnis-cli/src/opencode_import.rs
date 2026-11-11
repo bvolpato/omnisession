@@ -858,6 +858,28 @@ mod tests {
         serde_json::from_slice(&output.stdout).expect("complete OpenCode JSON")
     }
 
+    fn verify_installed_fork(
+        import: &OpenCodeImport,
+        document: &Value,
+        read: impl Fn(&[&str]) -> Value,
+    ) {
+        let endpoint = format!("/api/session/{}/fork", import.target.id);
+        let body = r#"{"boundary":{"type":"through"}}"#;
+        let response = read(&["api", "--standalone", "POST", &endpoint, "-d", body]);
+        let id = response["data"]["id"].as_str().expect("forked session ID");
+        assert_ne!(id, import.target.id);
+        let child = read(&["export", id]);
+        assert_eq!(child["info"]["fork"]["sessionID"], import.target.id);
+        let last_message = document["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            child["info"]["fork"]["boundary"]["messageID"],
+            last_message["id"]
+        );
+        let target = SessionRef::new(Provider::OpenCode, id);
+        let snapshot = canonicalize_opencode_export(&target, &child).expect("exported fork");
+        assert!(readback_report(&snapshot, &import.expected_items).verified);
+    }
+
     #[test]
     #[ignore = "requires OMNI_TEST_OPENCODE_BIN"]
     fn installed_opencode_round_trips_isolated_bounded_history() {
@@ -925,11 +947,8 @@ mod tests {
             String::from_utf8_lossy(&imported.stderr)
         );
 
-        let listed = read_installed_opencode_json(
-            &binary,
-            &["session", "list", "--format", "json"],
-            isolated,
-        );
+        let read = |args: &[&str]| read_installed_opencode_json(&binary, args, isolated);
+        let listed = read(&["session", "list", "--format", "json"]);
         let row = listed
             .as_array()
             .expect("OpenCode session list")
@@ -937,8 +956,7 @@ mod tests {
             .find(|row| row["id"] == import.target.id)
             .expect("listed session");
         assert_eq!(row["title"].as_str(), Some(title.as_str()));
-        let document =
-            read_installed_opencode_json(&binary, &["export", &import.target.id], isolated);
+        let document = read(&["export", &import.target.id]);
         assert_eq!(document["info"]["title"].as_str(), Some(title.as_str()));
         let tool_parts = document["messages"]
             .as_array()
@@ -962,5 +980,9 @@ mod tests {
             "OpenCode read-back matched {} of {} items",
             report.matching_prefix, report.expected_messages
         );
+
+        if is_v2 {
+            verify_installed_fork(&import, &document, read);
+        }
     }
 }

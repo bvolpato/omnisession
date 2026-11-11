@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{self, ErrorKind, Read, Seek},
     path::Path,
     path::PathBuf,
@@ -10,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
@@ -45,8 +47,7 @@ impl Default for OpenCodeAdapter {
 
 /// Lists session records for one project, or for every project when `project` is `None`.
 ///
-/// `opencode session list` covers only its working directory's project, so all-project listing
-/// queries root sessions through the documented `opencode db` command, like `Session.listGlobal`.
+/// The native session list covers only its working directory's project.
 fn list_session_values(
     binary: &Path,
     project: Option<&Path>,
@@ -63,30 +64,10 @@ fn list_session_values(
                 Vec::new(),
             ));
         }
-        let api_args = [
-            "api",
-            "--standalone",
-            "session.list",
-            "--param",
-            "parentID=null",
-            "--param",
-            "archived=false",
-            "--param",
-            "limit=10000",
-        ];
-        return match command_json_if_installed(binary, &api_args, None) {
-            Ok(listed) => {
-                let count = listed.as_ref().map_or(0, |v| session_values(v).len());
-                let notes = (count >= ALL_PROJECT_SESSION_LIMIT)
-                    .then(|| {
-                        format!(
-                            "OpenCode listing stopped after the {ALL_PROJECT_SESSION_LIMIT} newest sessions."
-                        )
-                    })
-                    .into_iter()
-                    .collect();
-                Ok((listed, notes))
-            }
+        return match global_session_pages(ALL_PROJECT_SESSION_LIMIT, |path| {
+            command_json(binary, &["api", "--standalone", "GET", path], None)
+        }) {
+            Ok((rows, notes)) => Ok((Some(Value::Array(rows)), notes)),
             Err(_) => Ok((
                 command_json_if_installed(binary, &["session", "list", "--format", "json"], None)?,
                 vec![
@@ -131,6 +112,87 @@ fn list_session_values(
             ],
         )),
     }
+}
+
+#[derive(Deserialize)]
+struct SessionPage {
+    data: Vec<Value>,
+    cursor: SessionPageCursor,
+}
+
+#[derive(Deserialize)]
+struct SessionPageCursor {
+    next: Option<String>,
+}
+
+fn global_session_pages(
+    limit: usize,
+    mut request: impl FnMut(&str) -> Result<Value>,
+) -> Result<(Vec<Value>, Vec<String>)> {
+    let mut fetch =
+        |path: &str| -> Result<SessionPage> { Ok(serde_json::from_value(request(path)?)?) };
+    // The raw route accepts query parameters in the URL on both 2.0 and 2.2.
+    let mut page = fetch(&format!(
+        "/api/session?parentID=null&archived=false&limit={limit}"
+    ))?;
+    let mut rows = Vec::new();
+    let mut visible_ids = HashSet::new();
+    let mut used_cursors = HashSet::new();
+    let mut previous_end = None;
+    let note = loop {
+        let full = page.data.len() >= limit;
+        let page_end = page.data.last().and_then(|row| {
+            Some((
+                row["time"]["updated"].as_i64()?,
+                row["id"].as_str()?.to_owned(),
+            ))
+        });
+        for row in page.data {
+            // OpenCode 2.0 ignores the archived query parameter and includes archived roots.
+            if row["parentID"].is_null()
+                && row["time"]["archived"].is_null()
+                && let Some(id) = row["id"].as_str()
+                && visible_ids.insert(id.to_owned())
+            {
+                rows.push(row);
+                if rows.len() == limit {
+                    break;
+                }
+            }
+        }
+        if rows.len() == limit {
+            break Some(format!(
+                "OpenCode listing stopped after the {limit} newest sessions."
+            ));
+        }
+        // Both releases return a next cursor even on the last nonempty page.
+        if !full {
+            break None;
+        }
+        let Some(next) = page.cursor.next else {
+            break None;
+        };
+        let advanced = page_end
+            .as_ref()
+            .is_some_and(|end| previous_end.as_ref().is_none_or(|previous| end < previous));
+        if !advanced || next.is_empty() || !used_cursors.insert(next.clone()) {
+            break Some(
+                "OpenCode pagination did not advance. The all-project listing is incomplete."
+                    .to_owned(),
+            );
+        }
+        previous_end = page_end;
+        // The cursor carries the filters from the first request. Each request supplies its limit.
+        let path = format!(
+            "/api/session?limit={limit}&cursor={}",
+            encode_uri_component(&next)
+        );
+        let Ok(next_page) = fetch(&path) else {
+            break Some("OpenCode could not read another session page. The all-project listing is incomplete.".to_owned());
+        };
+        page = next_page;
+    };
+    Ok((rows, note.into_iter().collect()))
 }
 
 /// Resolves an `OpenCode` executable with validated npm launcher support on Windows.
@@ -234,9 +296,11 @@ pub fn fork_opencode_session_with_binary(
 ) -> Result<String> {
     ensure_provider_executable(binary)?;
     let endpoint = format!("{}/fork", session_endpoint(session_id)?);
+    // The through boundary includes the parent's newest message.
+    let boundary = r#"{"boundary":{"type":"through"}}"#;
     let output = command_json(
         binary,
-        &["api", "--standalone", "POST", &endpoint, "-d", "{}"],
+        &["api", "--standalone", "POST", &endpoint, "-d", boundary],
         cwd,
     )?;
     let child_id = string_at(&output, &[&["data", "id"], &["id"]])
@@ -264,7 +328,11 @@ fn session_endpoint(id: &str) -> Result<String> {
     if matches!(id, "" | "." | "..") {
         bail!("invalid OpenCode session ID path segment");
     }
-    let encoded: String = id
+    Ok(format!("/api/session/{}", encode_uri_component(id)))
+}
+
+fn encode_uri_component(value: &str) -> String {
+    value
         .bytes()
         .map(|byte| {
             if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -273,8 +341,7 @@ fn session_endpoint(id: &str) -> Result<String> {
                 format!("%{byte:02X}")
             }
         })
-        .collect();
-    Ok(format!("/api/session/{encoded}"))
+        .collect()
 }
 
 /// Captures JSON from a prepared `OpenCode` command without interactive input.
@@ -1045,6 +1112,62 @@ mod tests {
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 
+    #[test]
+    fn global_listing_fills_the_limit_after_archived_and_overlapping_pages() {
+        use serde_json::json;
+
+        let hidden = |id, updated| json!({"id":id,"time":{"updated":updated,"archived":0}});
+        let root = |id, updated| json!({"id":id,"time":{"updated":updated}});
+        let mut pages = [
+            ("/api/session?parentID=null&archived=false&limit=3", json!({
+                "data":[hidden("a",9), hidden("b",8), hidden("c",7)], "cursor":{"next":"older&+="}
+            })),
+            ("/api/session?limit=3&cursor=older%26%2B%3D", json!({
+                "data":[root("first",6), {"id":"child","parentID":"first"}, hidden("d",4)],
+                "cursor":{"next":"last"}
+            })),
+            ("/api/session?limit=3&cursor=last", json!({
+                "data":[root("first",6),root("second",3),root("third",2)], "cursor":{"next":null}
+            })),
+        ].into_iter();
+        let (rows, notes) = super::global_session_pages(3, |path| {
+            let (expected, reply) = pages.next().unwrap();
+            assert_eq!(path, expected);
+            Ok(reply)
+        })
+        .unwrap();
+        assert_eq!(
+            rows,
+            [root("first", 6), root("second", 3), root("third", 2)]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("3 newest sessions"));
+    }
+
+    #[test]
+    fn global_listing_keeps_verified_rows_when_pagination_stops() {
+        use serde_json::json;
+
+        let found = json!({"id":"root","time":{"updated":5}});
+        let archived = |time| json!({"id":"archive","time":{"updated":time,"archived":1}});
+        for second in [
+            json!({"data":[found,archived(3)],"cursor":{"next":"same-cursor"}}),
+            json!({"data":[found,archived(4)],"cursor":{"next":"different-cursor"}}),
+            json!({"data":[],"cursor":{"next":42}}),
+        ] {
+            let mut pages = [
+                json!({"data":[found,archived(4)],"cursor":{"next":"same-cursor"}}),
+                second,
+            ]
+            .into_iter();
+            let (rows, notes) =
+                super::global_session_pages(2, |_| Ok(pages.next().unwrap())).unwrap();
+            assert_eq!(rows.as_slice(), std::slice::from_ref(&found));
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains("incomplete"));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn exact_session_lookup_distinguishes_hidden_missing_and_unreadable_sessions() {
@@ -1070,7 +1193,7 @@ esac"#,
                 "2.2.0",
                 r#"
 case "$3:$4" in
-    session.list:*) echo '{"data":[]}' ;;
+    GET:/api/session\?*) echo '{"data":[],"cursor":{"next":null}}' ;;
     GET:/api/session/ses_hidden) echo '{"data":{"id":"ses_hidden","location":{"directory":"/project"}}}' ;;
     GET:/api/session/ses_verbose) printf '%09000d' 0 >&2; echo '{"data":{"id":"ses_verbose"}}' ;;
     GET:/api/session/ses_path%2F%3F%23%25%20%C3%A9) echo '{"id":"ses_path/?#% é"}' ;;
@@ -1196,11 +1319,12 @@ cat ./rows
 
     #[cfg(unix)]
     #[test]
-    fn api_forks_keep_session_ids_in_one_path_segment() {
+    fn api_forks_the_full_history_of_one_literal_session_id() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().expect("temporary OpenCode executable");
         let binary = temporary.path().join("opencode");
+        let expected_body = r#"{"boundary":{"type":"through"}}"#;
         for (session_id, endpoint) in [
             ("ses_normal-123", "/api/session/ses_normal-123/fork"),
             (
@@ -1211,7 +1335,7 @@ cat ./rows
             std::fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 2.2.0; exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{{}}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 2.2.0; exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{expected_body}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
                 ),
             )
             .expect("write OpenCode executable");
@@ -1280,8 +1404,8 @@ if (args.length === 1 && args[0] === "--version") {
     console.log("2.2.0");
 } else if (args.includes("models")) {
     console.log("synthetic/test-model");
-} else if (args.includes("session.list")) {
-    console.log(JSON.stringify([{ id: "ses_synthetic", directory: process.cwd() }]));
+} else if (args.includes("GET") && args.some(arg => arg.startsWith("/api/session?"))) {
+    console.log(JSON.stringify({data:[{ id: "ses_synthetic", directory: process.cwd() }], cursor:{next:null}}));
 } else {
     process.exit(1);
 }
