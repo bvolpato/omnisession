@@ -303,10 +303,11 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         if !retry_failed && current_failure {
             summary.failed_skipped += 1;
         } else {
+            // Discovery can leave a catalog entry for a file that changed before its first read.
             let pair_catalog = candidate.source_revision.file.is_some()
                 && (reconcile
                     || failure.is_some()
-                    || prior.is_some_and(|state| {
+                    || prior.is_none_or(|state| {
                         !candidate
                             .source_revision
                             .matches_file_contents(state.source_revision)
@@ -590,26 +591,21 @@ fn flush_batch(
     if batch.is_empty() {
         return;
     }
-    let documents = batch
-        .iter()
-        .map(|prepared| {
-            (
-                &prepared.candidate.session,
-                prepared.store_document(),
-                prepared.guard,
-            )
+    let documents = batch.iter().map(|prepared| {
+        (
+            &prepared.candidate.session,
+            prepared.store_document(),
+            prepared.guard,
+            prepared.verified_metadata.as_ref(),
+        )
+    });
+    if let Ok(indexed) =
+        store.upsert_selected_trajectory_documents_checked(documents, |session, revision| {
+            batch
+                .iter()
+                .find(|prepared| prepared.candidate.session == *session)
+                .is_some_and(|prepared| prepared.candidate.file_matches(revision))
         })
-        .collect::<Vec<_>>();
-    if !batch
-        .iter()
-        .any(|prepared| prepared.verified_metadata.is_some())
-        && let Ok(indexed) =
-            store.upsert_observed_trajectory_documents_checked(&documents, |session, revision| {
-                batch
-                    .iter()
-                    .find(|prepared| prepared.candidate.session == *session)
-                    .is_some_and(|prepared| prepared.candidate.file_matches(revision))
-            })
     {
         summary.indexed += indexed;
         for prepared in batch.drain(..) {
@@ -1370,6 +1366,51 @@ mod tests {
             store.search_session_trajectories("sampledneedle", 1)?,
             std::slice::from_ref(session)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn first_index_read_replaces_a_discovered_catalog_entry_with_its_current_header() -> Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        fs::create_dir(&root)?;
+        let path = root.join("first.jsonl");
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::PiAdapter::with_root(root));
+        let store = Store::open(temporary.path().join("store.sqlite3"))?;
+        let session = SessionRef::new(Provider::Pi, "first");
+        let select = |workspace: &str| -> Result<NativeSession> {
+            let header = json!({"type":"session","version":3,"id":session.id,"cwd":temporary.path().join(workspace)});
+            let message = json!({"type":"message","id":"ask","parentId":null,
+                "message":{"role":"user","content":format!("{workspace}body")}});
+            fs::write(&path, format!("{header}\n{message}\n"))?;
+            Ok(registry
+                .find_native_session(Provider::Pi, &session.id)?
+                .unwrap())
+        };
+        let prior = select("previous")?;
+        store.upsert_indexed_session(&crate::indexed_session_metadata(&prior))?;
+        let current = select("current")?;
+        let candidates = ordered_candidates(std::slice::from_ref(&current), None);
+        let result = index_candidates(
+            &registry,
+            &store,
+            candidates.clone(),
+            false,
+            &|| false,
+            &mut |_| {},
+        )?;
+        assert_eq!((result.stale, result.indexed, result.failed), (1, 1, 0));
+        assert_eq!(
+            store.indexed_sessions_for_provider(Provider::Pi)?,
+            [crate::indexed_session_metadata(&current)]
+        );
+        assert_eq!(
+            store.search_session_trajectories("currentbody", 1)?,
+            [session]
+        );
+        assert_eq!(pending_summary(&store, candidates)?.stale, 0);
         Ok(())
     }
 

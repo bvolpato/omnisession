@@ -700,9 +700,18 @@ pub struct TrajectoryIndexFailure {
     pub document_version: u32,
 }
 
+/// One search document, the prior state its reader observed, and any catalog read from the same file.
+pub type SelectedTrajectoryDocument<'s, 'd> = (
+    &'s SessionRef,
+    TrajectoryDocument<'d>,
+    TrajectorySourceGuard,
+    Option<&'s IndexedSession>,
+);
+
 struct PreparedTrajectoryWrite<'session, 'document> {
     session: &'session SessionRef,
     document: TrajectoryDocument<'document>,
+    verified_metadata: Option<&'session IndexedSession>,
     content_hash: Vec<u8>,
     guard: TrajectorySourceGuard,
     source_complete: bool,
@@ -713,12 +722,13 @@ struct PreparedTrajectoryWrite<'session, 'document> {
 
 impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
     fn new(
-        session: &'s SessionRef,
-        document: TrajectoryDocument<'d>,
-        guard: TrajectorySourceGuard,
+        (session, document, guard, verified_metadata): SelectedTrajectoryDocument<'s, 'd>,
         remaining_bytes: usize,
     ) -> Result<Self> {
         validate_session_ref(session)?;
+        if let Some(catalog) = verified_metadata {
+            validate_selected_catalog(session, document, guard, catalog)?;
+        }
         if (document.source_complete && document.provider_limited)
             || document.indexed_byte_count != document.redacted_text.len()
             || !valid_truncation_strategy(document.truncation_strategy)
@@ -744,6 +754,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             content_hash: Sha256::digest(document.redacted_text.as_bytes()).to_vec(),
             guard,
             document,
+            verified_metadata,
             source_complete,
             complete,
             source_byte_count: i64::try_from(document.source_byte_count)
@@ -799,6 +810,30 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             )
             .map_err(database_error)
     }
+}
+
+fn validate_selected_catalog(
+    session: &SessionRef,
+    document: TrajectoryDocument<'_>,
+    guard: TrajectorySourceGuard,
+    catalog: &IndexedSession,
+) -> Result<()> {
+    let revision = catalog.source_revision.unwrap_or_default();
+    if &catalog.session != session
+        || !TrajectorySourceGuard::uses_file_time(session.provider)
+        || !matches!(guard, TrajectorySourceGuard::Verified(_))
+        || document.origin != SessionTrajectoryOrigin::Native
+        || !(document.source_complete
+            || (document.source_revision.file.is_some()
+                && document.source_revision.contents.is_some()))
+        || revision.file != document.source_revision.file
+        || revision.contents != document.source_revision.contents
+        || document.truncation_strategy == "legacy_unknown"
+        || catalog.updated_at != Some(document.source_updated_at)
+    {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    Ok(())
 }
 
 const DOCUMENT_RECEIPT_SQL: &str =
@@ -1453,23 +1488,7 @@ impl Store {
     ///
     /// Returns an error when cached metadata cannot be read.
     pub fn indexed_sessions(&self) -> Result<Vec<IndexedSession>> {
-        let connection = self.connection.borrow();
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, updated_at_approximate, event_count, source_updated_submillis,
-                       source_file_id, source_contents_id
-                FROM session_index
-                ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id
-                ",
-            )
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], indexed_session_from_row)
-            .map_err(database_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| StoreError::CorruptStore)
+        self.read_indexed_sessions(None, true)
     }
 
     /// Returns cached metadata for one provider, ordered by most recent update.
@@ -1478,21 +1497,41 @@ impl Store {
     ///
     /// Returns an error when cached metadata cannot be read.
     pub fn indexed_sessions_for_provider(&self, provider: Provider) -> Result<Vec<IndexedSession>> {
+        self.read_indexed_sessions(Some(provider), true)
+    }
+
+    fn read_indexed_sessions(
+        &self,
+        provider: Option<Provider>,
+        visible_only: bool,
+    ) -> Result<Vec<IndexedSession>> {
+        let mut sql = String::from(
+            "SELECT provider, session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count, source_updated_submillis,
+                    source_file_id, source_contents_id
+             FROM session_index AS catalog WHERE 1",
+        );
+        if provider.is_some() {
+            sql.push_str(" AND catalog.provider = ?1");
+        }
+        if visible_only {
+            sql.push_str(
+                " AND (catalog.provider NOT IN ('pi','omp') OR NOT EXISTS (
+                    SELECT 1 FROM trajectory_index_failures AS failed
+                    WHERE failed.provider = catalog.provider AND failed.session_id = catalog.session_id
+                      AND failed.source_file_id IS NOT NULL AND failed.source_contents_id IS NOT NULL
+                      AND (failed.source_file_id IS NOT catalog.source_file_id
+                           OR failed.source_contents_id IS NOT catalog.source_contents_id)))",
+            );
+        }
+        sql.push_str(" ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id");
         let connection = self.connection.borrow();
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, updated_at_approximate, event_count, source_updated_submillis,
-                       source_file_id, source_contents_id
-                FROM session_index
-                WHERE provider = ?1
-                ORDER BY updated_at IS NULL, updated_at DESC, session_id
-                ",
-            )
-            .map_err(database_error)?;
+        let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         let rows = statement
-            .query_map(params![provider.to_string()], indexed_session_from_row)
+            .query_map(
+                rusqlite::params_from_iter(provider.map(|p| p.to_string())),
+                indexed_session_from_row,
+            )
             .map_err(database_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
@@ -1883,10 +1922,8 @@ impl Store {
         document: &TrajectoryDocument<'_>,
     ) -> Result<()> {
         self.upsert_trajectory_documents_with_limits(
-            std::iter::once((session, *document, TrajectorySourceGuard::NewerSource)),
-            1,
+            std::iter::once((session, *document, TrajectorySourceGuard::NewerSource, None)),
             usize::MAX,
-            None,
             |_, _| true,
         )
         .map(|_| ())
@@ -1911,11 +1948,9 @@ impl Store {
     ) -> Result<()> {
         self.upsert_trajectory_documents_with_limits(
             documents.iter().map(|&(session, document)| {
-                (session, document, TrajectorySourceGuard::NewerSource)
+                (session, document, TrajectorySourceGuard::NewerSource, None)
             }),
-            MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
-            None,
             |_, _| true,
         )
         .map(|_| ())
@@ -1957,17 +1992,30 @@ impl Store {
         documents: &[(&SessionRef, TrajectoryDocument<'_>, TrajectorySourceGuard)],
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
-        self.upsert_trajectory_documents_with_limits(
-            documents.iter().copied(),
-            MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
-            if documents.len() == 1 {
-                usize::MAX
-            } else {
-                MAX_TRAJECTORY_WRITE_BATCH_BYTES
-            },
-            None,
+        self.upsert_selected_trajectory_documents_checked(
+            documents
+                .iter()
+                .map(|&(session, document, guard)| (session, document, guard, None)),
             verify,
         )
+    }
+
+    /// Publishes a batch and any catalog metadata captured by its readers in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a catalog does not match its document, a selected file changed, or a write failed.
+    pub fn upsert_selected_trajectory_documents_checked<'s, 'd>(
+        &self,
+        documents: impl ExactSizeIterator<Item = SelectedTrajectoryDocument<'s, 'd>>,
+        verify: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> Result<usize> {
+        let max_indexed_bytes = if documents.len() == 1 {
+            usize::MAX
+        } else {
+            MAX_TRAJECTORY_WRITE_BATCH_BYTES
+        };
+        self.upsert_trajectory_documents_with_limits(documents, max_indexed_bytes, verify)
     }
 
     /// Captures the current search document before reading a source whose update time can repeat.
@@ -2022,69 +2070,39 @@ impl Store {
         guard: TrajectorySourceGuard,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
-        if !TrajectorySourceGuard::uses_file_time(metadata.session.provider)
-            || !matches!(guard, TrajectorySourceGuard::Verified(_))
-            || document.origin != SessionTrajectoryOrigin::Native
-            || !(document.source_complete
-                || (document.source_revision.file.is_some()
-                    && document.source_revision.contents.is_some()))
-            || metadata.source_revision.unwrap_or_default().file != document.source_revision.file
-            || metadata.source_revision.unwrap_or_default().contents
-                != document.source_revision.contents
-            || document.truncation_strategy == "legacy_unknown"
-            || metadata.updated_at != Some(document.source_updated_at)
-        {
-            return Err(StoreError::InvalidSessionReference);
-        }
-        self.upsert_trajectory_documents_with_limits(
-            std::iter::once((&metadata.session, document, guard)),
-            1,
-            usize::MAX,
-            Some(metadata),
+        self.upsert_selected_trajectory_documents_checked(
+            std::iter::once((&metadata.session, document, guard, Some(metadata))),
             verify,
         )
     }
 
     fn upsert_trajectory_documents_with_limits<'s, 'd>(
         &self,
-        documents: impl ExactSizeIterator<
-            Item = (
-                &'s SessionRef,
-                TrajectoryDocument<'d>,
-                TrajectorySourceGuard,
-            ),
-        >,
-        max_documents: usize,
+        documents: impl ExactSizeIterator<Item = SelectedTrajectoryDocument<'s, 'd>>,
         max_indexed_bytes: usize,
-        verified_metadata: Option<&IndexedSession>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
         if documents.len() == 0 {
             return Ok(0);
         }
-        if documents.len() > max_documents {
+        if documents.len() > MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS {
             return Err(StoreError::TrajectoryBatchTooLarge);
         }
 
         let mut remaining_bytes = max_indexed_bytes;
         let mut prepared = Vec::with_capacity(documents.len());
-        for (session, document, guard) in documents {
-            prepared.push(PreparedTrajectoryWrite::new(
-                session,
-                document,
-                guard,
-                remaining_bytes,
-            )?);
-            remaining_bytes -= document.indexed_byte_count;
+        for selected in documents {
+            let write = PreparedTrajectoryWrite::new(selected, remaining_bytes)?;
+            remaining_bytes -= write.document.indexed_byte_count;
+            prepared.push(write);
         }
 
-        self.publish_trajectory_documents(&prepared, verified_metadata, verify)
+        self.publish_trajectory_documents(&prepared, verify)
     }
 
     fn publish_trajectory_documents(
         &self,
         prepared: &[PreparedTrajectoryWrite<'_, '_>],
-        verified_metadata: Option<&IndexedSession>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
         let mut connection = self.connection.borrow_mut();
@@ -2094,6 +2112,7 @@ impl Store {
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
+            let verified_metadata = write.verified_metadata;
             let guard = write.guard.check(
                 &transaction,
                 write.session,
@@ -3316,7 +3335,8 @@ fn provider_index_matches(
     if store.session_index_refreshed_at(provider)?.is_none() {
         return Ok(false);
     }
-    let mut existing = store.indexed_sessions_for_provider(provider)?;
+    // Compare all stored rows so complete discovery can prune superseded catalog entries.
+    let mut existing = store.read_indexed_sessions(Some(provider), false)?;
     let mut incoming = sessions.iter().collect::<Vec<_>>();
     existing.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     incoming.sort_by(|left, right| left.session.id.cmp(&right.session.id));
@@ -5431,6 +5451,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_changed_source_rolls_back_its_catalog_and_the_other_documents_in_the_batch() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        let time = DateTime::from_timestamp(1000, 843).unwrap();
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(1)),
+            contents: Some(Uuid::from_u128(2)),
+            missing_ancestor: None,
+        };
+        let mut catalog = indexed_session(Provider::Pi, "selected", "Current catalog");
+        catalog.updated_at = Some(time);
+        catalog.source_revision = Some(revision);
+        let other = SessionRef::new(Provider::Claude, "neighbor");
+        let batch = [
+            (
+                &other,
+                physical_document("pearmarker", time, SourceRevision::default()),
+                super::TrajectorySourceGuard::NewerSource,
+                None,
+            ),
+            (
+                &catalog.session,
+                physical_document("plummarker", time, revision),
+                store.observe_verified_session(&catalog.session).unwrap(),
+                Some(&catalog),
+            ),
+        ];
+        assert!(matches!(
+            store.upsert_selected_trajectory_documents_checked(batch.into_iter(), |_, _| false),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert!(store.indexed_sessions().unwrap().is_empty());
+        assert!(store.trajectory_index_states().unwrap().is_empty());
+
+        let count = store
+            .upsert_selected_trajectory_documents_checked(batch.into_iter(), |session, selected| {
+                session == &catalog.session && selected == revision
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            store.indexed_sessions().unwrap(),
+            std::slice::from_ref(&catalog)
+        );
+        assert_eq!(
+            store.search_session_trajectories("pearmarker", 1).unwrap(),
+            [other]
+        );
+        assert_eq!(
+            store.search_session_trajectories("plummarker", 1).unwrap(),
+            [catalog.session]
+        );
+    }
+
     fn physical_document(
         text: &str,
         time: DateTime<Utc>,
@@ -5550,6 +5625,86 @@ mod tests {
         publish(updated, store.observe_verified_session(session).unwrap());
         assert!(store.trajectory_index_failures().unwrap().is_empty());
         assert!(hit("freshsource"));
+    }
+
+    #[test]
+    fn confirmed_file_failure_hides_superseded_catalog_metadata() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        let time = DateTime::from_timestamp(1000, 0).unwrap();
+        let revision = |n| SourceRevision {
+            file: Some(Uuid::from_u128(1)),
+            contents: Some(Uuid::from_u128(n)),
+            missing_ancestor: None,
+        };
+        let failed = revision(2);
+        let failure = super::TrajectoryIndexFailure {
+            source_file: failed.file,
+            source_contents: failed.contents,
+            source_updated_at: Some(time),
+            source_time_precise: true,
+            document_version: 6,
+        };
+        for (provider, previous) in [(Provider::Pi, None), (Provider::OhMyPi, Some(revision(1)))] {
+            let old = IndexedSession {
+                source_revision: previous,
+                updated_at: Some(time),
+                ..indexed_session(provider, "moved", "Old title")
+            };
+            let session = &old.session;
+            store.upsert_indexed_session(&old).unwrap();
+            let observed = store.observe_verified_session(session).unwrap();
+            let record = |selected| {
+                store.record_observed_trajectory_index_failure_checked(
+                    session,
+                    &failure,
+                    observed,
+                    |_, source| source == selected,
+                )
+            };
+            let listed = || store.indexed_sessions_for_provider(provider).unwrap();
+            assert!(matches!(
+                record(revision(3)),
+                Err(StoreError::TrajectorySourceChanged)
+            ));
+            assert_eq!(listed(), std::slice::from_ref(&old));
+            record(failed).unwrap();
+            assert!(listed().is_empty());
+            assert!(
+                store
+                    .indexed_sessions()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.session != *session)
+            );
+            let replacement = IndexedSession {
+                source_revision: Some(failed),
+                title: Some("Current title".into()),
+                project_path: Some("/new".into()),
+                ..old.clone()
+            };
+            store.upsert_indexed_session(&replacement).unwrap();
+            assert_eq!(listed(), std::slice::from_ref(&replacement));
+            let observed = store.observe_verified_session(session).unwrap();
+            store
+                .upsert_verified_session_document(
+                    &replacement,
+                    physical_document("currentbody", time, failed),
+                    observed,
+                )
+                .unwrap();
+            assert!(
+                !store
+                    .trajectory_index_failures()
+                    .unwrap()
+                    .contains_key(session)
+            );
+            assert!(matches!(
+                record(failed),
+                Err(StoreError::TrajectorySourceChanged)
+            ));
+            assert_eq!(listed(), std::slice::from_ref(&replacement));
+        }
     }
 
     #[test]

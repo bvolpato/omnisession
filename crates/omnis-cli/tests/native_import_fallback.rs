@@ -657,6 +657,20 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn close_progress_at_import(child: &mut Child, provider: &str) {
+    use std::io::{BufRead, BufReader};
+
+    let suffix = format!("into {provider}...");
+    let progress = BufReader::new(child.stderr.take().unwrap());
+    assert!(
+        progress
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| { line.starts_with("Importing ") && line.ends_with(&suffix) })
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
     use prost::Message;
@@ -705,7 +719,7 @@ fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
     drop(db);
 
     let executable = install_synthetic("cursor-agent", "#!/bin/sh\necho 2026.07.23-e383d2b\n");
-    let fork = fixture
+    let mut child = fixture
         .command()
         .env("OMNI_CURSOR_AGENT_BIN", executable)
         .args([
@@ -715,8 +729,12 @@ fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
             "cursor-cli",
             "--materialize-only",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    close_progress_at_import(&mut child, "Cursor CLI");
+    let fork = child.wait_with_output().unwrap();
     assert!(
         fork.status.success(),
         "{}",

@@ -486,9 +486,14 @@ fn resume_native_without_snapshot(
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
 
-    print_fidelity(&report)?;
-    println!("Launching {}...", request.agent_target());
-    flush_stdout()?;
+    if opencode_v2_fork.is_some() {
+        let _ = print_fidelity(&report);
+        notify_stdout(format_args!("Launching {}...", request.agent_target()));
+    } else {
+        print_fidelity(&report)?;
+        println!("Launching {}...", request.agent_target());
+        flush_stdout()?;
+    }
     let tracks_native_fork = matches!(request.target, Provider::Codex | Provider::Grok);
     let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
     let launch_result = run_launch(&plan);
@@ -519,8 +524,8 @@ fn resume_native_without_snapshot(
             ));
         }
     } else if !tracks_native_fork && opencode_v2_fork.is_none() && task_binding.is_some() {
-        eprintln!(
-            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
+        let _ = progress_line(
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
         );
     }
     Ok(())
@@ -619,9 +624,9 @@ fn link_native_fork(
 ) -> Result<()> {
     let provider = provider_name(source.provider);
     let Some(project) = project else {
-        progress_line(&format!(
+        let _ = progress_line(&format!(
             "warning: {provider} fork workspace was unavailable; lineage was not linked."
-        ))?;
+        ));
         return Ok(());
     };
     let candidates = match registry
@@ -630,10 +635,10 @@ fn link_native_fork(
     {
         Ok(candidates) => candidates,
         Err(error) => {
-            progress_line(&format!(
+            let _ = progress_line(&format!(
                 "warning: Could not discover {provider} fork: {}",
                 safe_terminal_line(&error.to_string())
-            ))?;
+            ));
             return Ok(());
         }
     };
@@ -646,7 +651,7 @@ fn link_native_fork(
                 candidates.len()
             )
         };
-        progress_line(&format!("warning: {warning}"))?;
+        let _ = progress_line(&format!("warning: {warning}"));
         return Ok(());
     };
 
@@ -663,10 +668,10 @@ fn record_native_fork_lineage(
     let store = match Store::open_default().context("opening OmniSession state") {
         Ok(store) => store,
         Err(error) => {
-            progress_line(&format!(
+            let _ = progress_line(&format!(
                 "warning: Could not record {provider} fork lineage: {}",
                 safe_terminal_line(&error.to_string())
-            ))?;
+            ));
             return Ok(());
         }
     };
@@ -679,10 +684,10 @@ fn record_native_fork_lineage(
         store.record_handoff(source, target, report.mode, &fidelity)
     };
     if let Err(error) = recorded {
-        progress_line(&format!(
+        let _ = progress_line(&format!(
             "warning: Could not record {provider} fork lineage: {}",
             safe_terminal_line(&error.to_string())
-        ))?;
+        ));
         return Ok(());
     }
     notify_stdout(format_args!(
@@ -1317,8 +1322,8 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
             ));
         }
     } else if context.task_binding.is_some() {
-        eprintln!(
-            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
+        let _ = progress_line(
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
         );
     }
     Ok(())
@@ -1507,11 +1512,11 @@ impl ImportInterrupt {
                 self.provider,
             )),
             None => {
-                eprintln!(
+                let _ = progress_line(&format!(
                     "Interrupted; {} native import did not complete ({}). Source session was not changed.",
                     self.provider,
                     safe_terminal_line(&error.to_string())
-                );
+                ));
                 Err(Interrupted.into())
             }
         }
@@ -2349,6 +2354,15 @@ fn readback_failure_details(
     }
 }
 
+// The provider has created the target. Verification and cleanup must continue if stderr closes.
+fn notify_verifying_import(target: &SessionRef) {
+    let _ = progress_line(&format!("Verifying imported session `{target}`..."));
+}
+
+fn notify_verified_import(target: &SessionRef) {
+    let _ = progress_line(&format!("Imported and verified `{target}`."));
+}
+
 pub(super) fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
@@ -2359,16 +2373,13 @@ pub(super) fn materialize_claude_import(
         import.history_items
     ))?;
     let write_guard = claude_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| claude_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -2391,14 +2402,14 @@ pub(super) fn materialize_codex_import(
         "Importing {history_items} trajectory items into Codex..."
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
-    progress_line(&format!("Verifying imported session `{target}`..."))?;
+    notify_verifying_import(&target);
     let readback = registry.read_session(&target);
     let report = readback
         .as_ref()
         .ok()
         .map(|snapshot| codex_import::readback_report(snapshot, &import.expected_messages));
     if report.as_ref().is_some_and(|report| report.verified) {
-        progress_line(&format!("Imported and verified `{target}`."))?;
+        notify_verified_import(&target);
         Ok(target)
     } else {
         let details = report.map_or_else(
@@ -2466,12 +2477,9 @@ fn materialize_opencode_import(
         // A queued worker can consume the input before a retry reports the path or session missing.
         return Err(unverified(anyhow!("OpenCode import exited with {status}")));
     }
-    let _ = progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ));
+    notify_verifying_import(&import.target);
     opencode_import::wait_for_readback(&mut export, import, deadline).map_err(unverified)?;
-    let _ = progress_line(&format!("Imported and verified `{}`.", import.target));
+    notify_verified_import(&import.target);
     Ok(())
 }
 
@@ -2496,16 +2504,13 @@ pub(super) fn materialize_grok_import(
         "Importing {history_items} trajectory items into Grok..."
     ))?;
     grok_import::materialize(import, binary, project)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| grok_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -2527,16 +2532,13 @@ pub(super) fn materialize_hermes_import(
         import.history_items
     ))?;
     hermes_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| hermes_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -2558,15 +2560,12 @@ pub(super) fn materialize_cursor_import(
         import.history_items
     ))?;
     cursor_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
         cursor_import::readback_matches(&snapshot, &import.expected_messages)
     });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         Err(error_after_rollback(
@@ -2588,16 +2587,13 @@ pub(super) fn materialize_pi_import(
         import.history_items
     ))?;
     pi_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| pi_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -2619,15 +2615,12 @@ pub(super) fn materialize_cursor_ide_import(
         import.history_items
     ))?;
     let write_guard = cursor_ide_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
         cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
     });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         Err(error_after_rollback(
@@ -2648,15 +2641,12 @@ pub(super) fn materialize_antigravity_import(
         import.history_items
     ))?;
     let write_guard = antigravity_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
+    notify_verifying_import(&import.target);
     let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
         antigravity_import::readback_matches(&snapshot, &import.expected_messages)
     });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         Err(error_after_rollback(
