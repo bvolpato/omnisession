@@ -970,7 +970,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             .map_err(database_error)
     }
 
-    fn should_publish(&self, transaction: &Transaction<'_>) -> Result<bool> {
+    fn should_publish(&self, transaction: &Transaction<'_>, home: Option<&Path>) -> Result<bool> {
         let revision = self.document.source_revision;
         let guard = self
             .guard
@@ -998,7 +998,57 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         {
             return Ok(false);
         }
-        guard.map(|()| true)
+        guard?;
+        Ok(!self.retains_verified_antigravity_text(transaction, home)?)
+    }
+
+    fn retains_verified_antigravity_text(
+        &self,
+        transaction: &Transaction<'_>,
+        home: Option<&Path>,
+    ) -> Result<bool> {
+        let document = self.document;
+        if self.session.provider != Provider::Antigravity
+            || document.origin != SessionTrajectoryOrigin::Native
+            || self.complete
+        {
+            return Ok(false);
+        }
+        let TrajectorySourceGuard::Verified {
+            source_byte_count: Some(previous_bytes),
+            ..
+        } = self.guard
+        else {
+            return Ok(false);
+        };
+        if previous_bytes == 0 {
+            return Ok(false);
+        }
+        if document.indexed_byte_count == 0 {
+            return Ok(true);
+        }
+        if !document
+            .truncation_strategy
+            .starts_with("source_incomplete")
+            || previous_bytes <= document.indexed_byte_count
+        {
+            return Ok(false);
+        }
+        let prior: Option<(i64, usize)> = transaction.prepare_cached(
+            "SELECT doc.id, doc.indexed_byte_count FROM session_trajectories AS doc
+             LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
+             WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id=?3
+               AND doc.indexed_byte_count>?4 AND doc.indexed_byte_count<=?5
+               AND (origin.source_home IS NULL OR (origin.verification=1 AND origin.source_home=?6))"
+        ).map_err(database_error)?.query_row(params![
+            self.session.provider.to_string(), self.session.id, document.source_revision.file.map(Uuid::into_bytes),
+            self.indexed_byte_count, i64::try_from(MAX_TRAJECTORY_WRITE_BATCH_BYTES).expect("batch fits i64"),
+            home.map(|home| home.as_os_str().as_encoded_bytes())
+        ], |row| Ok((row.get(0)?, row.get::<_, u32>(1)? as usize))).optional().map_err(database_error)?;
+        let Some((id, length)) = prior else {
+            return Ok(false);
+        };
+        stored_text_contains_projection(transaction, id, length, document.redacted_text)
     }
 
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
@@ -2599,7 +2649,10 @@ impl Store {
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
-            if !write.should_publish(&transaction)? {
+            if !write.should_publish(
+                &transaction,
+                homes.get(&write.session.provider).map(PathBuf::as_path),
+            )? {
                 continue;
             }
             let verified_metadata = write.verified_metadata;
@@ -4547,6 +4600,50 @@ fn insert_trajectory_chunks(
     Ok(())
 }
 
+// Match complete paragraphs in order. An omission may fall between two retained events.
+fn stored_text_contains_projection(
+    transaction: &Transaction<'_>,
+    id: i64,
+    length: usize,
+    projection: &str,
+) -> Result<bool> {
+    let mut statement = transaction.prepare_cached(
+        "SELECT stored_text FROM session_trajectory_chunk_rows WHERE trajectory_id=?1 ORDER BY chunk_index",
+    ).map_err(database_error)?;
+    let mut rows = statement.query([id]).map_err(database_error)?;
+    let mut previous = String::with_capacity(length);
+    let mut scratch = Vec::new();
+    while let Some(row) = rows.next().map_err(database_error)? {
+        let Some(chunk) = chunk_text(row.get_ref(0).map_err(database_error)?, &mut scratch) else {
+            return Ok(false);
+        };
+        let overlap = chunk_overlap_start(&previous);
+        let Some(rest) = chunk.strip_prefix(&previous[overlap..]) else {
+            return Ok(false);
+        };
+        if previous.len().saturating_add(rest.len()) > length {
+            return Ok(false);
+        }
+        previous.push_str(rest);
+    }
+    let mut paragraphs = previous.split("\n\n");
+    Ok(previous.len() == length
+        && projection
+            .split("\n\n")
+            .all(|part| paragraphs.any(|old| old == part)))
+}
+
+fn chunk_overlap_start(chunk: &str) -> usize {
+    chunk
+        .char_indices()
+        .rev()
+        .nth(SEARCH_QUERY_MAX_CHARS - 1)
+        .map_or(
+            chunk.len(),
+            |(index, _)| if index == 0 { chunk.len() } else { index },
+        )
+}
+
 fn utf8_chunks(value: &str, byte_limit: usize) -> impl Iterator<Item = &str> {
     let mut offset = 0_usize;
     std::iter::from_fn(move || {
@@ -4571,13 +4668,7 @@ fn utf8_chunks(value: &str, byte_limit: usize) -> impl Iterator<Item = &str> {
             offset = end;
         } else {
             // The next chunk repeats the last `SEARCH_QUERY_MAX_CHARS` characters of this one.
-            offset = chunk
-                .char_indices()
-                .rev()
-                .nth(SEARCH_QUERY_MAX_CHARS - 1)
-                .map(|(index, _)| offset + index)
-                .filter(|next| *next > offset)
-                .unwrap_or(end);
+            offset += chunk_overlap_start(chunk);
         }
         Some(chunk)
     })

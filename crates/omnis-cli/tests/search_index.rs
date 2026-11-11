@@ -216,20 +216,92 @@ fn assert_recovered_antigravity_prefix(environment: &TestEnvironment, id: &str, 
     );
 }
 
-#[test]
-fn oversized_antigravity_tail_preserves_verified_and_cold_search_results() {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let root = tempdir().unwrap();
-    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+fn antigravity_history(environment: &TestEnvironment, steps: u32) -> (String, PathBuf) {
     let home = environment.home.join("antigravity-cli");
     let id = Uuid::new_v4().to_string();
     let logs = home.join("brain").join(&id).join(".system_generated/logs");
     fs::create_dir_all(&logs).unwrap();
     let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
     catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
-    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'Catalog', 3, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
-    let path = logs.join("transcript_full.jsonl");
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'Catalog', ?2, '2026-07-28T12:00:00Z', '[]')", params![id, steps]).unwrap();
+    (
+        format!("antigravity:{id}"),
+        logs.join("transcript_full.jsonl"),
+    )
+}
+
+#[test]
+fn an_oversized_reply_preserves_verified_search_after_show_or_indexing() {
+    use std::io::{Read, Write};
+
+    for request in [
+        "",
+        "{\"type\":\"USER_INPUT\",\"content\":\"unchanged request\"}\n",
+    ] {
+        let root = tempdir().unwrap();
+        let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+        let (session, path) =
+            antigravity_history(&environment, if request.is_empty() { 1 } else { 2 });
+        let run = |state: &str, args: &[&str]| {
+            let output = environment
+                .command()
+                .env("OMNISESSION_HOME", root.path().join(state))
+                .arg("--json")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        let search = [
+            "search",
+            "verifiedreply",
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        let prefix = r#"{"type":"PLANNER_RESPONSE","content":"verifiedreply","thinking":""#;
+        fs::write(&path, format!("{request}{prefix}private\"}}")).unwrap();
+        for state in ["shown", "searched"] {
+            assert_eq!(run(state, &search)["results"][0]["coverage"], "complete");
+        }
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(request.as_bytes()).unwrap();
+        file.write_all(prefix.as_bytes()).unwrap();
+        std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+        file.write_all(b"\"}").unwrap();
+        drop(file);
+
+        let shown = run("shown", &["show", &session]);
+        let snapshot: CanonicalSnapshot = serde_json::from_value(shown).unwrap();
+        let omissions = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["omitted_events"].as_u64())
+            .sum::<u64>();
+        assert_eq!(omissions, 1);
+        assert_eq!(
+            snapshot.events.len(),
+            if request.is_empty() { 1 } else { 2 }
+        );
+        let live = run("searched", &search);
+        assert_eq!(live["results"][0]["coverage"], "complete");
+        let mut cached_search = search.to_vec();
+        cached_search.push("--cached");
+        for state in ["shown", "searched"] {
+            let cached = run(state, &cached_search);
+            assert_eq!(cached["results"][0]["coverage"], "complete", "{state}");
+        }
+    }
+}
+
+#[test]
+fn oversized_antigravity_tail_preserves_verified_and_cold_search_results() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&environment, 3);
     let prefix = concat!(
         r#"{"type":"USER_INPUT","content":"question"}"#,
         "\n",
