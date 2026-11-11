@@ -196,7 +196,12 @@ fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) 
     let attachment = if display {
         parts
             .iter()
-            .any(|part| matches!(part["type"].as_str(), Some("local_image" | "local_audio")))
+            .any(|part| {
+                matches!(
+                    part["type"].as_str(),
+                    Some("local_image" | "local_audio" | "image" | "audio")
+                )
+            })
             .then(|| {
                 let text: Vec<_> = parts
                     .iter()
@@ -221,6 +226,89 @@ fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) 
         hash.update(text.as_bytes());
     }
     (nonempty.then(|| hash.finalize().into()), attachment)
+}
+
+#[derive(Clone, Copy)]
+struct MediaShape {
+    signature: Key,
+    local: usize,
+}
+
+fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
+    let parts = payload["content"].as_array()?;
+    let (mut images, mut audio, mut local) = (0_usize, 0_usize, 0_usize);
+    for (i, part) in parts.iter().enumerate() {
+        match part["type"].as_str() {
+            Some("local_image" | "image" | "input_image") => images += 1,
+            Some("local_audio" | "audio" | "input_audio") => audio += 1,
+            _ => continue,
+        }
+        if matches!(part["type"].as_str(), Some("local_image" | "local_audio"))
+            || (!display && failed_attachments::local_path(parts, i).is_some())
+        {
+            local += 1;
+        }
+    }
+    if images + audio == 0 {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(images.to_be_bytes());
+    hash.update(audio.to_be_bytes());
+    for part in message_parts(parts, |_, _| true) {
+        hash.update(part.as_bytes());
+    }
+    Some(MediaShape {
+        signature: hash.finalize().into(),
+        local,
+    })
+}
+
+fn content_digest(payload: &Value) -> Key {
+    // A checkpoint can reuse an ID after editing the prompt or replacing an attachment.
+    // Hash the original structured content without retaining a second copy of media data.
+    struct Writer(Sha256);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer(Sha256::new());
+    serde_json::to_writer(&mut writer, &payload["content"]).expect("serializing JSON to a digest");
+    writer.0.finalize().into()
+}
+
+pub(super) struct ConfirmedInputCopies {
+    by_id: HashMap<(Key, Key), (u64, Key)>,
+    original: HashSet<u64>,
+}
+
+impl ConfirmedInputCopies {
+    pub(super) fn original_display_users(&self) -> &HashSet<u64> {
+        &self.original
+    }
+
+    fn witness(&self, item: &Value) -> Option<&(u64, Key)> {
+        if item["type"] != "message" || item["role"] != "user" {
+            return None;
+        }
+        let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str()?;
+        self.by_id.get(&(key(turn), key(item["id"].as_str()?)))
+    }
+
+    pub(super) fn has_witness(&self, item: &Value) -> bool {
+        self.witness(item).is_some()
+    }
+
+    pub(super) fn get(&self, item: &Value) -> Option<u64> {
+        let (sequence, content) = self.witness(item)?;
+        (*content == content_digest(item)).then_some(*sequence)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -251,6 +339,8 @@ struct Input {
     text: Option<Key>,
     spelling: Spelling,
     literal: Option<Key>,
+    model_content: Option<Key>,
+    media: Option<MediaShape>,
     ordinal: u64,
     // A migrated request can have a generated turn opening immediately before its display.
     display_start: u64,
@@ -302,6 +392,9 @@ impl Input {
             } else {
                 plain
             },
+            media: media_shape(payload, display),
+            model_content: (!display && turn.is_some() && id.is_some())
+                .then(|| content_digest(payload)),
             ordinal,
             display_start: ordinal,
             order: None,
@@ -417,6 +510,7 @@ impl PaginatedRollback {
                 // content-based identity until the model and display IDs identify the same item.
                 if old.text != input.text {
                     old.text = None;
+                    old.media = None;
                 }
             })
             .or_insert(input);
@@ -439,17 +533,14 @@ impl PaginatedRollback {
         }
     }
 
-    pub(super) fn count_after(&self, ordinal: u64) -> usize {
-        self.model.len() - self.model.partition_point(|input| input.ordinal <= ordinal)
+    pub(super) fn display_is_plain_text(&self, sequence: u64) -> bool {
+        self.displayed.get(&sequence).is_some_and(|shown| {
+            shown.spelling == Spelling::Text && shown.text.is_some() && shown.media.is_none()
+        })
     }
 
-    pub(super) fn original_display_users(&self, aliases: &HashMap<Key, Key>) -> HashSet<u64> {
-        let mut owners = HashMap::new();
-        self.match_model_inputs(0, aliases, &mut owners);
-        owners
-            .into_iter()
-            .filter_map(|(seq, status)| (status == Withdrawal::Confirmed).then_some(seq))
-            .collect()
+    pub(super) fn count_after(&self, ordinal: u64) -> usize {
+        self.model.len() - self.model.partition_point(|input| input.ordinal <= ordinal)
     }
 
     pub(super) fn boundary(&self, count: usize) -> Option<(u64, Option<u64>)> {
@@ -491,7 +582,7 @@ impl PaginatedRollback {
             }
             self.evicted = self.evicted.saturating_sub(extra);
         }
-        self.match_model_inputs(cut, aliases, &mut marked);
+        self.match_model_inputs(cut, aliases, &mut marked, |_, _, _| {});
         self.model.truncate(cut);
         for (seq, &status) in &marked {
             if let Some(shown) = self.displayed.get_mut(seq) {
@@ -501,11 +592,49 @@ impl PaginatedRollback {
         marked
     }
 
+    pub(super) fn confirmed_input_copies(
+        &self,
+        aliases: &HashMap<Key, Key>,
+        checkpoint: &[Value],
+    ) -> ConfirmedInputCopies {
+        let mut repeated = HashSet::new();
+        let mut seen = HashSet::new();
+        for input in &self.model {
+            if let Some(id) = input.turn.zip(input.id)
+                && !seen.insert(id)
+            {
+                repeated.insert(id);
+            }
+        }
+        let mut copies = HashMap::new();
+        let mut marked = HashMap::new();
+        self.match_model_inputs(0, aliases, &mut marked, |seq, raw, shown| {
+            if let Some(id) = raw.turn.zip(raw.id)
+                && !repeated.contains(&id)
+                && let Some(witness) = raw.model_content
+                && shown.text.is_some()
+                && (shown.text == raw.text || shown.text == raw.literal)
+            {
+                copies.insert(id, (seq, witness));
+            }
+        });
+        copies.retain(|_, (seq, _)| marked.get(seq) == Some(&Withdrawal::Confirmed));
+        self.match_checkpoint_inputs(aliases, checkpoint, &mut copies);
+        ConfirmedInputCopies {
+            by_id: copies,
+            original: marked
+                .into_iter()
+                .filter_map(|(seq, status)| (status == Withdrawal::Confirmed).then_some(seq))
+                .collect(),
+        }
+    }
+
     fn match_model_inputs(
         &self,
         cut: usize,
         aliases: &HashMap<Key, Key>,
         marked: &mut HashMap<u64, Withdrawal>,
+        mut confirm: impl FnMut(u64, Input, Input),
     ) {
         let mut raw_ids = IdIndex::<usize>::new();
         for (n, &raw) in self.model.iter().enumerate() {
@@ -552,7 +681,7 @@ impl PaginatedRollback {
                 .or_default()
                 .push((seq, shown));
         }
-        let (reserved, assigned) = self.match_ids(cut, &raw_ids, &by_id, marked);
+        let (reserved, assigned) = self.match_ids(cut, &raw_ids, &by_id, marked, &mut confirm);
         self.mark_unresolved_migration(cut, aliases, &reserved, &assigned, marked);
         let mut pending = HashMap::<_, Vec<(bool, Input)>>::new();
         for (n, &candidate) in self.model.iter().enumerate() {
@@ -580,7 +709,7 @@ impl PaginatedRollback {
         }
         for (key, raw) in pending {
             if let Some(shown) = by_text.get(&key) {
-                self.match_text(&raw, shown, &reserved, marked);
+                self.match_text(&raw, shown, &reserved, marked, &mut confirm);
             }
         }
     }
@@ -591,6 +720,7 @@ impl PaginatedRollback {
         raw_ids: &IdIndex<usize>,
         by_id: &IdIndex<u64>,
         marked: &mut HashMap<u64, Withdrawal>,
+        confirm: &mut impl FnMut(u64, Input, Input),
     ) -> (HashSet<u64>, HashSet<usize>) {
         let mut reserved = HashSet::new();
         let mut assigned = HashSet::new();
@@ -618,8 +748,11 @@ impl PaginatedRollback {
                     && !raw[0].1.inherited
                     && raw[0].1.segment == self.segment
                     && raw[0].1.ordinal.min(shown[0].1.ordinal) >= self.history_floor;
-                for &(seq, _) in shown {
+                for &(seq, input) in shown {
                     if reserved.insert(seq) && dropped {
+                        if confirmed {
+                            confirm(seq, raw[0].1, input);
+                        }
                         marked.insert(
                             seq,
                             if confirmed {
@@ -642,6 +775,7 @@ impl PaginatedRollback {
         shown: &[(u64, Input)],
         reserved: &HashSet<u64>,
         marked: &mut HashMap<u64, Withdrawal>,
+        confirm: &mut impl FnMut(u64, Input, Input),
     ) {
         let mut groups = HashMap::<Option<Key>, (Vec<(bool, Input)>, Vec<(u64, Input)>)>::new();
         for &(dropped, input) in raw {
@@ -684,8 +818,9 @@ impl PaginatedRollback {
                         a.ordinal.max(b.ordinal) < c.ordinal.min(d.ordinal)
                     });
             if paired {
-                for ((dropped, _), (seq, _)) in raw.into_iter().zip(displayed) {
+                for ((dropped, input), (seq, shown)) in raw.into_iter().zip(displayed) {
                     if dropped {
+                        confirm(seq, input, shown);
                         marked.entry(seq).or_insert(Withdrawal::Confirmed);
                     }
                 }

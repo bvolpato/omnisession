@@ -4,13 +4,13 @@ use sha2::{Digest, Sha256};
 const IMAGE: u8 = b'i';
 const AUDIO: u8 = b'a';
 
-/// Match the original request text and the local paths that Codex tried to attach.
+/// Match the original request text and all its attachment references.
 fn key(text: &[&str], mut paths: Vec<(u8, &str)>) -> Option<[u8; 32]> {
     if paths.is_empty() {
         return None;
     }
     // Legacy display events group local images and audio in separate arrays.
-    paths.sort_unstable();
+    paths.sort_by_key(|(kind, _)| *kind);
     let mut hash = Sha256::new();
     for (kind, path) in paths {
         hash.update([kind]);
@@ -27,58 +27,106 @@ fn key(text: &[&str], mut paths: Vec<(u8, &str)>) -> Option<[u8; 32]> {
 }
 
 pub(super) fn completed(content: &[Value], text: &[&str]) -> Option<[u8; 32]> {
-    let paths = content.iter().filter_map(|part| {
-        let kind = match part["type"].as_str()? {
-            "local_image" => IMAGE,
-            "local_audio" => AUDIO,
-            _ => return None,
-        };
-        Some((kind, part["path"].as_str()?))
-    });
+    let paths = content
+        .iter()
+        .filter_map(|part| match part["type"].as_str()? {
+            "local_image" => Some((IMAGE, part["path"].as_str()?)),
+            "local_audio" => Some((AUDIO, part["path"].as_str()?)),
+            "image" => reference(part, IMAGE),
+            "audio" => reference(part, AUDIO),
+            _ => None,
+        });
     key(text, paths.collect())
 }
 
 pub(super) fn legacy(payload: &Value, text: &str) -> Option<[u8; 32]> {
-    let paths = [("local_images", IMAGE), ("local_audio", AUDIO)]
+    let paths = [
+        ("local_images", IMAGE),
+        ("local_audio", AUDIO),
+        ("images", b'I'),
+        ("file_ids", b'F'),
+        ("audio", b'A'),
+    ]
+    .into_iter()
+    .flat_map(|(field, kind)| {
+        payload[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(move |path| Some((kind, path.as_str()?)))
+    });
+    let recorded_audio = payload["audio_references"]
+        .as_array()
         .into_iter()
-        .flat_map(|(field, kind)| {
-            payload[field]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(move |path| Some((kind, path.as_str()?)))
+        .flatten()
+        .filter_map(|p| {
+            let reference = reference(p, AUDIO)?;
+            (reference.0 != b'A' || payload["audio"].as_array().is_none_or(Vec::is_empty))
+                .then_some(reference)
         });
-    key(&[text], paths.collect())
+    key(&[text], paths.chain(recorded_audio).collect())
 }
 
 pub(super) fn model(content: &[Value], text: &[&str]) -> Option<[u8; 32]> {
-    let mut paths: Vec<_> = text
-        .iter()
-        .filter_map(|part| diagnostic_path(part))
-        .collect();
-    if paths.is_empty() {
-        return None;
-    }
-    // Successful local attachments in the same request retain their path in the opening tag.
-    paths.extend(content.windows(2).filter_map(|pair| {
-        let (prefix, kind) = match pair[1]["type"].as_str()? {
-            "input_image" => ("<image name=[Image #", IMAGE),
-            "input_audio" => ("<audio name=[Audio #", AUDIO),
-            _ => return None,
+    let mut paths = Vec::new();
+    for (i, part) in content.iter().enumerate() {
+        let kind = match part["type"].as_str() {
+            Some("input_image") => IMAGE,
+            Some("input_audio") => AUDIO,
+            Some("input_text") => {
+                if let Some(path) = part["text"].as_str().and_then(diagnostic_path) {
+                    paths.push(path);
+                }
+                continue;
+            }
+            _ => continue,
         };
-        let (number, path) = pair[0]["text"]
-            .as_str()?
-            .strip_prefix(prefix)?
-            .strip_suffix("\">")?
-            .split_once("] path=\"")?;
-        (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some((kind, path))
-    }));
+        let reference = reference(part, kind)?;
+        paths.push(local_path(content, i).map_or(reference, |path| (kind, path)));
+    }
     let original: Vec<_> = text
         .iter()
         .copied()
         .filter(|part| diagnostic_path(part).is_none())
         .collect();
     key(&original, paths)
+}
+
+fn reference(part: &Value, kind: u8) -> Option<(u8, &str)> {
+    let (url, inline, file) = if kind == IMAGE {
+        ("image_url", b'I', b'F')
+    } else {
+        ("audio_url", b'A', b'S')
+    };
+    part[url]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(|v| (inline, v))
+        .or_else(|| {
+            part["file_id"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(|v| (file, v))
+        })
+}
+
+pub(super) fn local_path(content: &[Value], index: usize) -> Option<&str> {
+    let prefix = match content[index]["type"].as_str()? {
+        "input_image" => "<image name=[Image #",
+        "input_audio" => "<audio name=[Audio #",
+        _ => return None,
+    };
+    let tag = content.get(index.checked_sub(1)?)?;
+    let (number, path) = tag["text"]
+        .as_str()?
+        .strip_prefix(prefix)?
+        .strip_suffix("\">")?
+        .split_once("] path=\"")?;
+    (tag["type"] == "input_text"
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && !path.is_empty())
+    .then_some(path)
 }
 
 // The protocol converts a failed local attachment into a separate input text part.

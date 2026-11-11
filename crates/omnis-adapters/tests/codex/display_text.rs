@@ -41,6 +41,7 @@ fn plan_mode_replies_keep_the_native_plan_and_only_its_surrounding_assistant_tex
         rows.push(raw_assistant("msg_4", &[literal]));
         for preview in [false, true] {
             let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
+            assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
             let text: Vec<_> = snapshot
                 .events
                 .iter()
@@ -92,8 +93,22 @@ fn unfinished_plan_markup_keeps_only_the_displayed_proposal() {
     for preview in [false, true] {
         let raw_only = read_records_with_preview(rows[..2].to_vec(), preview).unwrap();
         assert!(super::visible_text(&raw_only).is_empty());
+        assert!(!omnis_core::trajectory_search_document(&raw_only).source_complete);
+        assert!(omnis_core::import_conversation(&raw_only).truncated);
+        let notice = raw_only
+            .events
+            .iter()
+            .find(|event| omnis_core::reports_omitted_events(event))
+            .unwrap();
+        assert_eq!(notice.replay_policy, ReplayPolicy::HistoricalOnly);
+        assert!(
+            !serde_json::to_string(&raw_only)
+                .unwrap()
+                .contains("- unfinished")
+        );
         let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
         assert_eq!(super::visible_text(&snapshot), ["- unfinished", literal]);
+        assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
         assert_eq!(snapshot.events[0].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[0].payload["type"], "Plan");
     }
@@ -169,5 +184,58 @@ fn a_plan_keeps_its_position_entire_text_and_separate_identity() {
         assert_eq!(snapshot.events[0].payload["id"], "plan-1");
         assert_eq!(snapshot.events[2].payload["id"], "plan-2");
         assert_eq!(snapshot.events[3].kind, EventKind::ToolCalled);
+    }
+}
+
+#[test]
+fn a_plan_display_confirms_only_the_matching_proposal_in_its_turn() {
+    let begin = |turn| {
+        event(
+            "task_started",
+            json!({"turn_id":turn,"collaboration_mode_kind":"plan"}),
+        )
+    };
+    let display =
+        |turn, text| turn_item(turn, &json!({"type":"Plan","id":"some-plan","text":text}));
+    let raw = raw_assistant("model", &["<proposed_plan>\nsource-only\n</proposed_plan>"]);
+    let rows = vec![
+        begin("first"),
+        message("user", "first input"),
+        display("first", "source-only\n"),
+        begin("second"),
+        message("user", "second input"),
+        display("second", "different"),
+        raw.clone(),
+    ];
+    for preview in [false, true] {
+        let snap = read_records_with_preview(rows.clone(), preview).unwrap();
+        assert!(!omnis_core::trajectory_search_document(&snap).source_complete);
+        let mut confirmed = rows.clone();
+        confirmed.push(display("second", "source-only"));
+        assert!(
+            omnis_core::trajectory_search_document(
+                &read_records_with_preview(confirmed, preview).unwrap()
+            )
+            .source_complete
+        );
+        let mut rolled_back = rows.clone();
+        rolled_back.push(event("thread_rolled_back", json!({"num_turns":1})));
+        assert!(
+            omnis_core::trajectory_search_document(
+                &read_records_with_preview(rolled_back, preview).unwrap()
+            )
+            .source_complete
+        );
+        let earlier = vec![
+            begin("first"),
+            display("first", "source-only\n"),
+            raw.clone(),
+        ];
+        assert!(
+            omnis_core::trajectory_search_document(
+                &read_records_with_preview(earlier, preview).unwrap()
+            )
+            .source_complete
+        );
     }
 }

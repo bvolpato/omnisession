@@ -500,3 +500,184 @@ fn compaction_only_input_obeys_the_selected_model_window_and_keeps_the_public_di
         }
     }
 }
+
+#[test]
+fn checkpoint_uses_input_ownership_and_acceptance_order_across_its_suffix() {
+    let turn = "original";
+    let model = |id, role, text, order| {
+        let kind = if role == "user" {
+            "input_text"
+        } else {
+            "output_text"
+        };
+        json!({"type":"response_item", "metadata":{"user_input_order":order}, "payload":{
+            "type":"message","id":id,"role":role,"content":[{"type":kind,"text":text}],
+            "internal_chat_message_metadata_passthrough":{"turn_id":turn}}})
+    };
+    let first = model(
+        "msg_input_01948226-0000-7002-8000-000000000002",
+        "user",
+        "initial request",
+        1,
+    );
+    let queued = model(
+        "msg_input_01948226-0000-7003-8000-000000000003",
+        "user",
+        "queued request",
+        2,
+    );
+    let reply = turn_item(
+        turn,
+        &json!({"type":"AgentMessage","id":"reply","content":[{"type":"Text","text":"queued answer"}]}),
+    );
+    for (in_checkpoint, raw_order, stored_order, inherited, count, wanted) in [
+        (
+            true,
+            1,
+            2,
+            false,
+            0,
+            vec!["initial request", "queued answer", "queued request"],
+        ),
+        (true, 1, 2, false, 1, vec!["initial request"]),
+        (
+            true,
+            2,
+            1,
+            false,
+            1,
+            vec!["initial request", "queued answer"],
+        ),
+        (false, 1, 2, false, 1, vec!["initial request"]),
+        (
+            true,
+            2,
+            2,
+            true,
+            1,
+            vec!["initial request", "queued answer"],
+        ),
+    ] {
+        let early = model("reply", "assistant", "queued answer", raw_order);
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":turn})),
+            first.clone(),
+            page_user(turn, "item-1", "initial request"),
+            early.clone(),
+            reply.clone(),
+        ];
+        let mut retained = vec![first.clone(), early];
+        retained[1]["metadata"]["user_input_order"] = stored_order.into();
+        if inherited {
+            retained[1]["metadata"]["inherited_user_message"] = true.into();
+        }
+        if in_checkpoint {
+            rows.extend([queued.clone(), page_user(turn, "item-2", "queued request")]);
+            retained.push(queued.clone());
+        }
+        rows.push(json!({"type":"compacted", "payload":{"message":"", "window_number":1,
+            "replacement_history":retained.iter().map(|r| &r["payload"]).collect::<Vec<_>>(),
+            "replacement_history_metadata":retained.iter().map(|r| &r["metadata"]).collect::<Vec<_>>()}}));
+        if !in_checkpoint {
+            rows.extend([queued.clone(), page_user(turn, "item-2", "queued request")]);
+        }
+        rows.push(event("thread_rolled_back", json!({"num_turns":count})));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let active = omnis_core::import_conversation(&snapshot);
+            assert_eq!(
+                active
+                    .messages
+                    .iter()
+                    .map(|row| row.text.as_str())
+                    .collect::<Vec<_>>(),
+                wanted,
+                "in_checkpoint={in_checkpoint} raw={raw_order} stored={stored_order} inherited={inherited} count={count} preview={preview}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rollback_preserves_an_answer_when_a_numbered_window_has_no_instruction() {
+    let mut rows = exchange("old", "old request", "old answer", true);
+    rows.push(
+        json!({"type":"compacted", "payload":{"message":"", "window_number":2,
+        "replacement_history":[{"type":"compaction", "encrypted_content":"synthetic"}]}}),
+    );
+    let mut after = exchange("after", "unused", "still active", true);
+    after.retain(|r| {
+        r["payload"]["role"] != "user" && r["payload"]["item"]["type"] != "UserMessage"
+    });
+    rows.extend(after);
+    rows.push(event("thread_rolled_back", json!({"num_turns":3})));
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let active = omnis_core::import_conversation(&snapshot);
+        assert_eq!(
+            active
+                .messages
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            ["still active"]
+        );
+        assert!(visible_text(&snapshot).contains(&"old request"));
+    }
+}
+
+#[test]
+fn a_withdrawn_checkpoint_owner_keeps_its_later_display_reply_out_of_the_handoff() {
+    let task = exchange("first", "first request", "first answer", true);
+    let second = exchange("second", "second request", "unused reply", true);
+    let mut retained: Vec<_> = task
+        .iter()
+        .filter(|r| r["type"] == "response_item")
+        .map(|r| r["payload"].clone())
+        .collect();
+    retained.push(
+        second
+            .iter()
+            .find(|r| r["payload"]["role"] == "user")
+            .unwrap()["payload"]
+            .clone(),
+    );
+    let mut rows = task;
+    rows.extend(second.into_iter().filter(|r| {
+        r["payload"]["type"] == "task_started" || r["payload"]["item"]["type"] == "UserMessage"
+    }));
+    rows.push(json!({"type":"compacted","payload":{"message":"", "window_number":3,"replacement_history":retained}}));
+    rows.push(turn_item("second", &json!({"type":"AgentMessage","id":"late-b","content":[{"type":"Text","text":"reply to second"}]})));
+    rows.extend(exchange(
+        "separate",
+        "separate request",
+        "separate reply",
+        false,
+    ));
+    rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let active = omnis_core::import_conversation(&snapshot);
+        assert_eq!(
+            active
+                .messages
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "first request",
+                "first answer",
+                "separate request",
+                "separate reply"
+            ]
+        );
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        assert!(
+            String::from_utf8(recovery)
+                .unwrap()
+                .contains("### Previous Codex display (Assistant, withdrawn from model context)\n\n> reply to second")
+        );
+    }
+}

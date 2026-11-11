@@ -1332,6 +1332,10 @@ impl EventBuilder {
         self.events.iter().for_each(visit);
     }
 
+    pub(crate) fn visit_events_mut(&mut self, visit: impl FnMut(&mut OmniEvent)) {
+        self.events.iter_mut().for_each(visit);
+    }
+
     pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
         self.events.retain(keep);
     }

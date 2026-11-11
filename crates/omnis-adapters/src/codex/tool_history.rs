@@ -26,6 +26,14 @@ impl PendingOutcomes {
         let index = match known {
             Some(seq) => queue.iter().position(|entry| entry.sequence == seq),
             None => queue.iter().position(|entry| {
+                if !display
+                    && turn.is_none()
+                    && owner
+                        .zip(entry.owner)
+                        .is_some_and(|(left, right)| left != right)
+                {
+                    return false;
+                }
                 turn.zip(entry.turn.as_deref()).is_none_or(|(a, b)| {
                     a == b
                         || (super::is_implicit_turn(a) != super::is_implicit_turn(b)

@@ -127,6 +127,145 @@ fn a_surviving_raw_reply_cannot_validate_another_turn_or_item() {
 }
 
 #[test]
+fn generated_reply_ids_follow_the_matching_model_occurrence() {
+    let mut early = model("turn", "raw-reply", "assistant", "answer to queued request");
+    early["metadata"] = json!({"user_input_order":2});
+    let mut queued = model("turn", "second", "user", "queued request");
+    queued["metadata"] = json!({"user_input_order":2});
+    let mut rows = vec![
+        start("turn"),
+        model("turn", "first", "user", "keep"),
+        page_user("turn", "item-1", "keep"),
+        early,
+        shown("turn", "item-2", "answer to queued request"),
+        queued,
+        page_user("turn", "item-3", "queued request"),
+        rollback(),
+    ];
+    check(
+        &rows,
+        &["keep", "answer to queued request", "queued request"],
+        &["keep"],
+    );
+    rows.extend([
+        start("fresh"),
+        model("fresh", "new", "user", "new request"),
+        page_user("fresh", "item-4", "new request"),
+        model(
+            "fresh",
+            "new-reply",
+            "assistant",
+            "answer to queued request",
+        ),
+        shown("fresh", "item-5", "answer to queued request"),
+    ]);
+    check(
+        &rows,
+        &[
+            "keep",
+            "answer to queued request",
+            "queued request",
+            "new request",
+            "answer to queued request",
+        ],
+        &["keep", "new request", "answer to queued request"],
+    );
+}
+
+#[test]
+fn indistinguishable_generated_replies_stay_in_recovery_after_a_partial_rollback() {
+    let mut early = model("turn", "a", "assistant", "repeated reply");
+    early["metadata"] = json!({"user_input_order":1});
+    let mut late = model("turn", "b", "assistant", "repeated reply");
+    late["metadata"] = json!({"user_input_order":2});
+    let mut queued = model("turn", "q", "user", "queued");
+    queued["metadata"] = json!({"user_input_order":2});
+    let rows = vec![
+        start("turn"),
+        model("turn", "first", "user", "keep"),
+        page_user("turn", "first", "keep"),
+        early,
+        shown("turn", "item-1", "repeated reply"),
+        late,
+        queued,
+        page_user("turn", "q", "queued"),
+        rollback(),
+    ];
+    let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+    let reply = snap
+        .events
+        .iter()
+        .find(|e| e.payload["text"] == "repeated reply")
+        .unwrap();
+    assert_eq!(reply.payload["omnisession_codex_rollback"], "unverified");
+}
+
+#[test]
+fn rollback_transfers_only_the_previously_displayed_surviving_reply_version() {
+    for with_checkpoint in [false, true] {
+        let first = model("turn", "first", "user", "keep");
+        let old = model("turn", "reply", "assistant", "original public reply");
+        let mut rows = vec![
+            start("turn"),
+            first.clone(),
+            page_user("turn", "first", "keep"),
+            old.clone(),
+            shown("turn", "reply", "original public reply"),
+        ];
+        if with_checkpoint {
+            rows.push(json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[first["payload"],old["payload"]]}}));
+        }
+        rows.extend([
+            model("turn", "later", "user", "withdrawn request"),
+            page_user("turn", "later", "withdrawn request"),
+            model("turn", "reply", "assistant", "withdrawn revised reply"),
+            shown("turn", "reply", "withdrawn revised reply"),
+            rollback(),
+        ]);
+        check(
+            &rows,
+            &["keep", "withdrawn revised reply", "withdrawn request"],
+            &["keep", "original public reply"],
+        );
+        let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+        let markdown = omnis_core::render_markdown_export(&snap);
+        let (active, previous) = markdown.split_once("## Previous Codex display").unwrap();
+        assert!(!active.contains("withdrawn revised reply"));
+        assert!(previous.contains("withdrawn revised reply"));
+    }
+}
+
+#[test]
+fn a_surviving_model_only_revision_never_becomes_public_text() {
+    let rows = [
+        start("turn"),
+        model("turn", "first", "user", "keep"),
+        page_user("turn", "first", "keep"),
+        model("turn", "reply", "assistant", "never publicly displayed"),
+        model("turn", "later", "user", "withdrawn request"),
+        page_user("turn", "later", "withdrawn request"),
+        model("turn", "reply", "assistant", "withdrawn revised reply"),
+        shown("turn", "reply", "withdrawn revised reply"),
+        rollback(),
+    ];
+    let snap = read_with_history_mode(rows.to_vec(), false, Some("paginated")).unwrap();
+    let history = omnis_core::import_conversation(&snap);
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        ["keep"]
+    );
+    assert!(
+        !serde_json::to_string(&snap)
+            .unwrap()
+            .contains("never publicly displayed")
+    );
+}
+
+#[test]
 fn rollback_uses_native_call_acceptance_and_keeps_orphaned_receipts_in_recovery() {
     for (kind, order, inherited, late_receipt, call_kept, receipt_kept) in [
         ("function_call", 2, false, false, false, false),

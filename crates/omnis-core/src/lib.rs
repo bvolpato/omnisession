@@ -1515,6 +1515,8 @@ fn import_conversation_with_limit(
         .is_some_and(|event| source_compaction_text(event).is_some());
 
     for event in events {
+        let active = active_codex_event(snapshot, event);
+        let event = active.as_ref();
         let (role, text, message_truncated) = match event.kind {
             EventKind::MessageUser | EventKind::MessageAssistant => {
                 let role = if event.kind == EventKind::MessageUser {
@@ -2040,7 +2042,12 @@ fn collect_import_candidates(
     }
 
     for event in events {
-        let Some((candidate, item_truncated)) = import_candidate(event, item_limits) else {
+        let active = if item_limits.redact {
+            active_codex_event(snapshot, event)
+        } else {
+            Cow::Borrowed(event)
+        };
+        let Some((candidate, item_truncated)) = import_candidate(&active, item_limits) else {
             continue;
         };
         truncated |= item_truncated;
@@ -2225,7 +2232,7 @@ pub struct SemanticHandoffPlan {
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
     let mut events = visible_events(snapshot);
-    events.retain(|event| codex_rollback(snapshot, event).is_none());
+    events.retain(|event| has_active_codex_event(snapshot, event));
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2236,7 +2243,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                     role: HandoffRole::User,
                     text,
                 }),
-            EventKind::MessageAssistant => message_text(event)
+            EventKind::MessageAssistant => message_text(&active_codex_event(snapshot, event))
                 .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
@@ -2719,6 +2726,40 @@ fn codex_rollback(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<Cod
     }
 }
 
+/// Codex can withdraw a revision while retaining an earlier published spelling of the same reply.
+fn restored_codex_answer<'a>(
+    snapshot: &CanonicalSnapshot,
+    event: &'a OmniEvent,
+) -> Option<&'a str> {
+    let text = event
+        .payload
+        .get("omnisession_codex_prior_display")?
+        .as_str()?;
+    (event.kind == EventKind::MessageAssistant
+        && event.replay_policy == ReplayPolicy::Contextual
+        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+        && codex_rollback(snapshot, event).is_some()
+        && !text.trim().is_empty())
+    .then_some(text)
+}
+
+fn has_active_codex_event(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> bool {
+    codex_rollback(snapshot, event).is_none() || restored_codex_answer(snapshot, event).is_some()
+}
+
+fn active_codex_event<'a>(
+    snapshot: &CanonicalSnapshot,
+    event: &'a OmniEvent,
+) -> Cow<'a, OmniEvent> {
+    let Some(text) = restored_codex_answer(snapshot, event) else {
+        return Cow::Borrowed(event);
+    };
+    Cow::Owned(OmniEvent {
+        payload: serde_json::json!({ "text": text }),
+        ..event.clone()
+    })
+}
+
 fn has_recoverable_codex_rollback(snapshot: &CanonicalSnapshot) -> bool {
     snapshot.session.provider == Provider::Codex
         && snapshot
@@ -2771,7 +2812,7 @@ fn visible_import_events(
         ..
     } = visible_history(snapshot);
     if use_latest_compaction {
-        events.retain(|event| codex_rollback(snapshot, event).is_none());
+        events.retain(|event| has_active_codex_event(snapshot, event));
     } else {
         // Read-back verifies the actual target, including unexpected withdrawn history.
         source_incomplete |= events
@@ -6587,9 +6628,15 @@ mod tests {
         assert!(!text.contains("contents of the referenced file"));
     }
 
-    #[test]
-    fn codex_rollback_keeps_the_previous_display_out_of_active_handoffs() {
-        let snapshot = snapshot_with_events(vec![
+    fn codex_display_after_rollback() -> CanonicalSnapshot {
+        let mut revised = event(
+            6,
+            EventKind::MessageAssistant,
+            json!({"text":"discarded revision", "omnisession_codex_rollback":"withdrawn",
+                "omnisession_codex_prior_display":"first published reply"}),
+        );
+        revised.source.raw_record_type = Some("event_msg.item_completed".into());
+        snapshot_with_events(vec![
             event(
                 1,
                 EventKind::MessageUser,
@@ -6603,7 +6650,8 @@ mod tests {
             event(
                 3,
                 EventKind::MessageUser,
-                json!({"text":"withdrawn request", "omnisession_codex_rollback":"withdrawn"}),
+                json!({"text":"withdrawn request", "omnisession_codex_rollback":"withdrawn",
+                    "omnisession_codex_prior_display":"unverified user direction"}),
             ),
             event(
                 4,
@@ -6615,7 +6663,13 @@ mod tests {
                 EventKind::MessageAssistant,
                 json!({"text":"unverified answer", "omnisession_codex_rollback":"unverified"}),
             ),
-        ]);
+            revised,
+        ])
+    }
+
+    #[test]
+    fn codex_rollback_keeps_the_previous_display_out_of_active_handoffs() {
+        let snapshot = codex_display_after_rollback();
         let conversation = import_conversation(&snapshot);
         assert_eq!(
             conversation
@@ -6623,7 +6677,11 @@ mod tests {
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
-            ["keep this request", "retained plan"]
+            [
+                "keep this request",
+                "retained plan",
+                "first published reply"
+            ]
         );
         let trajectory = import_trajectory(&snapshot);
         assert_eq!(
@@ -6632,7 +6690,11 @@ mod tests {
                 .iter()
                 .map(|item| item.text.as_str())
                 .collect::<Vec<_>>(),
-            ["keep this request", "retained plan"]
+            [
+                "keep this request",
+                "retained plan",
+                "first published reply"
+            ]
         );
         assert_eq!(trajectory.tool_events, 0);
         assert!(!trajectory.truncated);
@@ -6647,7 +6709,17 @@ mod tests {
         let mut recovery = Vec::new();
         super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
         let recovery = String::from_utf8(recovery).unwrap();
-        for text in ["withdrawn request", "withdrawn result", "unverified answer"] {
+        assert!(active.contains("first published reply"));
+        assert!(active_export.contains("first published reply"));
+        assert!(recovery.contains("### Restored Codex reply (Assistant)"));
+        assert!(recovery.contains("first published reply"));
+        assert!(!active.contains("unverified user direction"));
+        for text in [
+            "withdrawn request",
+            "withdrawn result",
+            "unverified answer",
+            "discarded revision",
+        ] {
             assert!(!active.contains(text));
             assert!(!active_export.contains(text));
             assert!(old_display.contains(text));

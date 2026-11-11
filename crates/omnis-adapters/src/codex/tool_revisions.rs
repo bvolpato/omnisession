@@ -47,6 +47,13 @@ impl PreviousDisplay {
         )
     }
 
+    pub(super) fn displayed_text(&self) -> Option<&str> {
+        if !self.was_displayed_message() {
+            return None;
+        }
+        self.payload.as_ref()?.get("text")?.as_str()
+    }
+
     fn matches(&self, event: &OmniEvent) -> bool {
         self.kind == event.kind
             && self

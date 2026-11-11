@@ -1,6 +1,9 @@
 //! Recover original turns when migration named the public turn from a rollout ordinal.
 
-use super::{HashMap, HashSet, IdKind, Input, Key, PaginatedRollback, Withdrawal};
+use super::{
+    HashMap, HashSet, IdKind, Input, Key, MAX_CANONICAL_EVENTS, PaginatedRollback, Value,
+    Withdrawal, content_digest, input_spelling, key, model_instruction, uuid_v7,
+};
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum Signature {
@@ -125,6 +128,127 @@ impl PaginatedRollback {
             .collect()
     }
 
+    /// Some migrations retain the model copy only inside the compaction checkpoint.
+    pub(super) fn match_checkpoint_inputs(
+        &self,
+        aliases: &HashMap<Key, Key>,
+        checkpoint: &[Value],
+        copies: &mut HashMap<(Key, Key), (u64, Key)>,
+    ) {
+        if checkpoint.len() > MAX_CANONICAL_EVENTS || self.history_floor != 0 {
+            return;
+        }
+        let raw_turns: HashSet<_> = self.model.iter().filter_map(|raw| raw.turn).collect();
+        let mut displayed = HashMap::new();
+        for (&seq, shown) in &self.displayed {
+            if shown.segment != self.segment || shown.withdrawal.is_some() {
+                continue;
+            }
+            let Some((turn, spelling)) = shown.turn.zip(shown.text) else {
+                continue;
+            };
+            let turn = aliases.get(&turn).copied().unwrap_or(turn);
+            if raw_turns.contains(&turn) {
+                continue;
+            }
+            displayed
+                .entry((turn, spelling))
+                .and_modify(|prior| *prior = None)
+                .or_insert((shown.kind == IdKind::GeneratedDisplay).then_some(seq));
+        }
+        if displayed.is_empty() {
+            return;
+        }
+        let mut seen_ids = HashSet::new();
+        let mut repeated_ids = HashSet::new();
+        let mut by_spelling = HashMap::new();
+        for item in checkpoint {
+            if item["type"] != "message" || item["role"] != "user" || !model_instruction(item) {
+                continue;
+            }
+            let Some(turn) = item["internal_chat_message_metadata_passthrough"]["turn_id"]
+                .as_str()
+                .filter(|t| uuid_v7(t))
+            else {
+                continue;
+            };
+            let turn = key(turn);
+            let id = item["id"].as_str();
+            if let Some(id) = id
+                && !seen_ids.insert((turn, key(id)))
+            {
+                repeated_ids.insert((turn, key(id)));
+            }
+            let (plain, attachment) = input_spelling(item, false);
+            let Some(spelling) = attachment.or(plain) else {
+                continue;
+            };
+            let scope = (turn, spelling);
+            let Some(Some(&seq)) = displayed.get(&scope).map(Option::as_ref) else {
+                continue;
+            };
+            let stable = id.filter(|id| {
+                id.strip_prefix("msg_input_")
+                    .is_some_and(|suffix| uuid::Uuid::try_parse(suffix).is_ok())
+            });
+            let entry = stable.map(|id| ((turn, key(id)), (seq, content_digest(item))));
+            by_spelling
+                .entry(scope)
+                .and_modify(|entry| *entry = None)
+                .or_insert(entry);
+        }
+        for (id, witness) in by_spelling.into_values().flatten() {
+            if !repeated_ids.contains(&id) {
+                copies.insert(id, witness);
+            }
+        }
+    }
+
+    /// A path on one side and an inline or file reference on the other cannot prove identity.
+    fn mark_unresolved_media(
+        &self,
+        cut: usize,
+        aliases: &HashMap<Key, Key>,
+        reserved: &HashSet<u64>,
+        assigned: &HashSet<usize>,
+        marked: &mut HashMap<u64, Withdrawal>,
+    ) {
+        let mut candidates = HashMap::new();
+        for (n, raw) in self.model.iter().enumerate().skip(cut) {
+            let Some(media) = raw.media.filter(|_| !assigned.contains(&n)) else {
+                continue;
+            };
+            for scope in [raw.turn, None] {
+                let bounds = candidates
+                    .entry((raw.window, scope, media.signature))
+                    .or_insert((media.local, media.local));
+                bounds.0 = bounds.0.min(media.local);
+                bounds.1 = bounds.1.max(media.local);
+            }
+        }
+        for (&seq, shown) in &self.displayed {
+            let Some(media) = shown.media else { continue };
+            if shown.withdrawal.is_some()
+                || reserved.contains(&seq)
+                || (shown.id.is_some()
+                    && !matches!(shown.kind, IdKind::GeneratedDisplay | IdKind::LiveDisplay))
+            {
+                continue;
+            }
+            let scope = if shown.generated_turn {
+                shown.turn.and_then(|turn| aliases.get(&turn).copied())
+            } else {
+                shown.turn
+            };
+            if candidates
+                .get(&(shown.window, scope, media.signature))
+                .is_some_and(|&(min, max)| min != media.local || max != media.local)
+            {
+                marked.insert(seq, Withdrawal::Unverified);
+            }
+        }
+    }
+
     pub(super) fn mark_unresolved_migration(
         &self,
         cut: usize,
@@ -133,6 +257,7 @@ impl PaginatedRollback {
         assigned: &HashSet<usize>,
         marked: &mut HashMap<u64, Withdrawal>,
     ) {
+        self.mark_unresolved_media(cut, aliases, reserved, assigned, marked);
         let mut candidates = HashSet::new();
         let mut flexible_text = HashSet::new();
         for (index, raw) in self.model.iter().enumerate().skip(cut) {

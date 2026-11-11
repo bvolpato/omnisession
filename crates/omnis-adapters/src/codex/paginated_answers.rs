@@ -1,15 +1,18 @@
 //! Match paginated replies and documentary tool items to the native model window.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::MAX_CANONICAL_EVENTS;
-use super::message_mirrors::{MessageIdentity, ScopedMessageId};
+use super::message_mirrors::ScopedMessageId;
 use super::paginated_rollback::Withdrawal;
 
 type TurnAliases = HashMap<[u8; 32], [u8; 32]>;
+
+mod occurrences;
+use occurrences::{AnswerOccurrences, ConfirmedAnswers};
 
 fn resolved(aliases: &TurnAliases, (role, turn, id): ScopedMessageId) -> ScopedMessageId {
     (role, aliases.get(&turn).copied().unwrap_or(turn), id)
@@ -63,11 +66,6 @@ impl CallCopies {
     }
 }
 
-struct ModelAnswer {
-    key: ScopedMessageId,
-    position: Position,
-}
-
 struct Position {
     ordinal: u64,
     order: Option<u64>,
@@ -105,9 +103,7 @@ struct ModelTool {
 
 #[derive(Default)]
 pub(super) struct PaginatedAnswers {
-    model: VecDeque<ModelAnswer>,
-    displayed: BTreeMap<u64, ScopedMessageId>,
-    after_rollback: HashMap<ScopedMessageId, bool>,
+    answers: AnswerOccurrences,
     tools: BTreeMap<u64, ModelTool>,
     tool_displays: BTreeMap<u64, ToolId>,
     removed_calls: HashMap<ScopedMessageId, CallCopies>,
@@ -117,9 +113,7 @@ pub(super) struct PaginatedAnswers {
 
 impl PaginatedAnswers {
     pub(super) fn segment(&mut self) {
-        self.model.clear();
-        self.displayed.clear();
-        self.after_rollback.clear();
+        self.answers = AnswerOccurrences::default();
         self.tools.clear();
         self.tool_displays.clear();
         self.removed_calls.clear();
@@ -132,23 +126,40 @@ impl PaginatedAnswers {
     }
 
     pub(super) fn model(&mut self, record: &Value, ordinal: u64) {
-        let payload = &record["payload"];
-        let identity = MessageIdentity::new(
-            payload["internal_chat_message_metadata_passthrough"]["turn_id"].as_str(),
-            payload["id"].as_str(),
-            false,
-        );
-        let Some(key) = identity.scoped(true) else {
-            return;
-        };
-        if self.model.len() == MAX_CANONICAL_EVENTS {
-            self.model.pop_front();
+        self.answers.model(record, ordinal);
+    }
+
+    pub(super) fn archive_changed_reply(
+        &mut self,
+        builder: &mut super::EventBuilder,
+        previous: Option<&(u64, super::PreviousDisplay)>,
+    ) {
+        if let Some((seq, previous)) = previous
+            && let Some(prior) = previous.displayed_text()
+            && builder
+                .event_at_mut(*seq)
+                .and_then(|e| e.payload["text"].as_str())
+                != Some(prior)
+        {
+            self.answers.archive(*seq, prior);
         }
-        self.model.push_back(ModelAnswer {
-            key,
-            position: Position::new(record, ordinal, true),
-        });
-        self.after_rollback.remove(&resolved(&self.aliases, key));
+    }
+
+    pub(super) fn confirmed_answer_copies(&self, aliases: &TurnAliases) -> ConfirmedAnswers {
+        self.answers.confirmed(aliases)
+    }
+
+    pub(super) fn finish_answers(&mut self) -> HashMap<u64, Option<Withdrawal>> {
+        self.answers.rulings(&self.aliases)
+    }
+
+    pub(super) fn project_answer(
+        &self,
+        seq: u64,
+        checkpoint: Option<&super::paginated_checkpoint::PaginatedCheckpoint>,
+        status: Option<Withdrawal>,
+    ) -> (Option<Withdrawal>, Option<&str>) {
+        self.answers.project(seq, checkpoint, status)
     }
 
     pub(super) fn model_tool(
@@ -243,15 +254,8 @@ impl PaginatedAnswers {
     }
 
     /// A completed item can arrive after Codex has already rolled back its model copy.
-    pub(super) fn display(&mut self, sequence: u64, turn: &str, id: &str) -> Option<bool> {
-        let key = MessageIdentity::new(Some(turn), Some(id), true).scoped(true)?;
-        self.displayed.insert(sequence, key);
-        if self.displayed.len() > MAX_CANONICAL_EVENTS {
-            self.displayed.pop_first();
-        }
-        self.after_rollback
-            .get(&resolved(&self.aliases, key))
-            .copied()
+    pub(super) fn display(&mut self, sequence: u64, turn: &str, id: &str, text: &str) {
+        self.answers.display(sequence, turn, id, text);
     }
 
     pub(super) fn rollback(
@@ -259,28 +263,8 @@ impl PaginatedAnswers {
         boundary_ordinal: u64,
         order: Option<u64>,
     ) -> HashMap<u64, Option<Withdrawal>> {
-        self.after_rollback.clear();
-        for answer in &mut self.model {
-            // Codex can accept a reply after a queued instruction and write it before that instruction.
-            answer.position.rollback(boundary_ordinal, order);
-            // If Codex recorded this ID more than once, one surviving copy keeps it in the model window.
-            *self
-                .after_rollback
-                .entry(resolved(&self.aliases, answer.key))
-                .or_insert(true) &= answer.position.removed;
-        }
-        let mut marked: HashMap<_, _> = self
-            .displayed
-            .iter()
-            .filter_map(|(&sequence, &key)| {
-                Some((
-                    sequence,
-                    self.after_rollback
-                        .get(&resolved(&self.aliases, key))?
-                        .then_some(Withdrawal::Confirmed),
-                ))
-            })
-            .collect();
+        self.answers.rollback(boundary_ordinal, order);
+        let mut marked = HashMap::new();
         self.removed_calls.clear();
         self.call_scopes.clear();
         for tool in self.tools.values_mut() {
@@ -310,13 +294,7 @@ impl PaginatedAnswers {
     }
 
     pub(super) fn discard_before(&mut self, first_sequence: u64) {
-        while self
-            .displayed
-            .first_key_value()
-            .is_some_and(|(&seq, _)| seq < first_sequence)
-        {
-            self.displayed.pop_first();
-        }
+        self.answers.discard_before(first_sequence);
         self.tools = self.tools.split_off(&first_sequence);
         self.tool_displays = self.tool_displays.split_off(&first_sequence);
     }

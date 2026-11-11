@@ -39,6 +39,73 @@ fn model_result_before_a_generated_turn_survives_a_repeated_display_completion()
 }
 
 #[test]
+fn a_rollback_keeps_the_published_command_and_only_its_admitted_inputs_model_result() {
+    let turn = "rollout-4";
+    let mut first = message("user", "first");
+    first["payload"]["id"] = "u1".into();
+    first["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id": turn});
+    for same_input in [false, true] {
+        for repeat in [false, true] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id": turn})),
+                first.clone(),
+                page_user(turn, "u1", "first"),
+                command(turn, "completed"),
+            ];
+            let second = message("user", "second");
+            if !same_input {
+                rows.push(second.clone());
+            }
+            rows.extend([call(None), model_result("model reply")]);
+            if same_input {
+                rows.push(second);
+            }
+            if repeat {
+                rows.push(command(turn, "completed"));
+            }
+            rows.push(event("thread_rolled_back", json!({"num_turns": 1})));
+            for preview in [false, true] {
+                let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
+                assert_eq!(visible_text(&snapshot), ["first"]);
+                let (kind, output, source) = if same_input {
+                    (
+                        EventKind::ToolCompleted,
+                        "model reply",
+                        "response_item.function_call_output",
+                    )
+                } else {
+                    (
+                        EventKind::CommandExecuted,
+                        "display result",
+                        "event_msg.item_completed",
+                    )
+                };
+                assert_eq!(results(&snapshot), [(&kind, output)]);
+                assert_eq!(
+                    snapshot
+                        .events
+                        .iter()
+                        .find(|e| e.kind == kind)
+                        .unwrap()
+                        .source
+                        .raw_record_type
+                        .as_deref(),
+                    Some(source)
+                );
+                assert_eq!(
+                    snapshot
+                        .events
+                        .iter()
+                        .filter(|e| e.kind == EventKind::ToolCalled)
+                        .count(),
+                    usize::from(same_input)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn corrected_display_status_keeps_model_output_and_reused_call_ids_are_separate() {
     let rows = vec![
         event("task_started", json!({"turn_id":"first"})),
