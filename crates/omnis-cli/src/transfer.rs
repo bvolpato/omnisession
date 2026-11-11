@@ -121,9 +121,12 @@ fn resume_from_snapshot(
         ))?;
         progress_line("Reading source trajectory...")?;
     }
-    let snapshot = registry
+    let mut snapshot = registry
         .read_session_indexed(source)
         .with_context(|| format!("reading `{source}`"))?;
+    if snapshot.session.provider == Provider::OhMyPi {
+        snapshot.title = omnis_core::continuation_title(&snapshot).map(str::to_owned);
+    }
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }

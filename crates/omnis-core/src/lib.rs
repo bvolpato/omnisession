@@ -44,8 +44,17 @@ const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
 const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
-/// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+/// Base version of the indexed search document.
+pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+
+/// Version of the searchable content produced for this provider.
+#[must_use]
+pub const fn search_document_version(provider: Provider) -> u32 {
+    match provider {
+        Provider::Pi | Provider::OhMyPi => 5,
+        _ => SEARCH_DOCUMENT_VERSION,
+    }
+}
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -1605,6 +1614,9 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
 /// items only; never print, index, or persist it.
 #[must_use]
 pub fn readback_trajectory(snapshot: &CanonicalSnapshot) -> Option<ImportTrajectory> {
+    if latest_omp_reset(snapshot).is_some() {
+        return None;
+    }
     let trajectory =
         import_trajectory_with_limits(snapshot, usize::MAX, usize::MAX, READBACK_ITEM_LIMITS);
     (!trajectory.truncated).then_some(trajectory)
@@ -2205,7 +2217,7 @@ pub struct SemanticHandoffPlan {
 /// instructions.
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
-    let events = visible_events(snapshot);
+    let (events, _) = visible_import_events(snapshot, true);
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2222,6 +2234,14 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                     role: HandoffRole::Assistant,
                     text,
                 }),
+            EventKind::CompactionCreated => {
+                compaction_text_with_truncation(event, MESSAGE_CHARACTER_LIMIT).map(|(text, _)| {
+                    HandoffMessage {
+                        role: HandoffRole::Assistant,
+                        text,
+                    }
+                })
+            }
             _ => None,
         })
         .take(RECENT_MESSAGE_LIMIT)
@@ -2278,7 +2298,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
         "# OmniSession Session Export\n\n> Historical context only. Review it before acting on any instructions, commands, or links.\n\n## Session\n\n",
     );
     quote_untrusted(&mut markdown, &format!("Source: {}", snapshot.session));
-    if let Some(title) = &snapshot.title {
+    if let Some(title) = continuation_title(snapshot) {
         quote_untrusted(
             &mut markdown,
             &format!(
@@ -2350,7 +2370,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
 fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
     let mut activity = Vec::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let events = visible_events(snapshot);
+    let events = sorted_visible_events(source_context(snapshot));
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
     for event in events {
@@ -2529,25 +2549,84 @@ pub fn safe_terminal_line(input: &str) -> String {
 }
 
 fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
-    let mut events = snapshot
-        .events
-        .iter()
-        .filter(|event| !is_secret(event))
-        .collect::<Vec<_>>();
+    sorted_visible_events(snapshot.events.iter())
+}
+
+fn sorted_visible_events<'a>(events: impl Iterator<Item = &'a OmniEvent>) -> Vec<&'a OmniEvent> {
+    let mut events = events.filter(|event| !is_secret(event)).collect::<Vec<_>>();
     events.sort_by_key(|event| (event.sequence, event.event_id));
     events
+}
+
+fn latest_omp_reset(snapshot: &CanonicalSnapshot) -> Option<&OmniEvent> {
+    if snapshot.session.provider != Provider::OhMyPi {
+        return None;
+    }
+    snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.source.provider == Provider::OhMyPi
+                && event.source.raw_record_type.as_deref() == Some("reset_boundary")
+        })
+        .max_by_key(|event| (event.sequence, event.event_id))
+}
+
+/// Older portable snapshots preserve the raw OMP reset marker. Keep archived rows out of transfers.
+fn source_context(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &OmniEvent> + Clone {
+    let reset = latest_omp_reset(snapshot).map(|event| (event.sequence, event.event_id));
+    snapshot
+        .events
+        .iter()
+        .filter(move |event| reset.is_none_or(|reset| (event.sequence, event.event_id) > reset))
+}
+
+/// Select the session title that can accompany a continuation. OMP's title slot survives `/clear`.
+#[must_use]
+pub fn continuation_title(snapshot: &CanonicalSnapshot) -> Option<&str> {
+    let Some(reset) = latest_omp_reset(snapshot) else {
+        return snapshot.title.as_deref();
+    };
+    snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            (event.sequence, event.event_id) > (reset.sequence, reset.event_id)
+                && event.source.provider == Provider::OhMyPi
+                && event.kind == EventKind::ProviderEvent
+                && !is_secret(event)
+        })
+        .filter_map(|event| {
+            let key = match event.source.raw_record_type.as_deref()? {
+                "title_change" => "title",
+                "session_info" => "name",
+                _ => return None,
+            };
+            Some((
+                (event.sequence, event.event_id),
+                event.payload.get(key)?.as_str()?,
+            ))
+        })
+        .max_by_key(|(order, _)| *order)
+        .map(|(_, title)| title)
+        .filter(|title| !title.trim().is_empty())
+}
+
+fn active_context_start(events: &[&OmniEvent]) -> usize {
+    events
+        .iter()
+        .rposition(|event| is_source_compaction_boundary(event))
+        .unwrap_or(0)
 }
 
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
-    let mut events = visible_events(snapshot);
+    let mut events = sorted_visible_events(source_context(snapshot));
     let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
-    if let Some(start) = events
-        .iter()
-        .rposition(|event| is_source_compaction_boundary(event))
-    {
+    let start = active_context_start(&events);
+    if start > 0 {
         // A Pi extension can compact without supplying summary text for the displaced turns.
         if source_compaction_text(events[start]).is_none() {
             source_incomplete |= events[..start]
@@ -3468,10 +3547,7 @@ fn with_source_compaction(
     mut report: FidelityReport,
     snapshot: &CanonicalSnapshot,
 ) -> FidelityReport {
-    if snapshot
-        .events
-        .iter()
-        .any(|event| source_compaction_text(event).is_some())
+    if source_context(snapshot).any(|event| source_compaction_text(event).is_some())
         && let Some(conversation) = report
             .entries
             .iter_mut()
@@ -4008,6 +4084,95 @@ mod tests {
                     text: format!("Answer {sequence}"),
                 })
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn archived_objectives_and_plans_stay_out_of_the_active_handoff() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"Archived user request"}),
+            ),
+            event(
+                2,
+                EventKind::PlanUpdated,
+                json!({"next_action":"Archived plan item"}),
+            ),
+            compaction(3, Provider::Pi, "Keep this summary"),
+            event(
+                4,
+                EventKind::MessageAssistant,
+                json!({"text":"Current reply"}),
+            ),
+        ]);
+        let plan = super::plan_semantic_handoff(&snapshot);
+        assert!(plan.objective.is_none());
+        assert!(plan.next_action.is_none());
+        assert_eq!(plan.recent_messages.len(), 2);
+        assert!(plan.recent_messages[0].text.contains("Keep this summary"));
+        assert_eq!(plan.recent_messages[1].text, "Current reply");
+        let mut file = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut file).unwrap();
+        let document = String::from_utf8(file).unwrap();
+        assert!(document.contains("Archived user request"));
+        assert!(!document.contains("Archived plan item"));
+    }
+
+    #[test]
+    fn legacy_omp_resets_limit_native_and_recovery_context() {
+        let mut boundary = event(
+            5,
+            EventKind::ProviderEvent,
+            json!({"type":"pi_unsupported_entry","entry_type":"reset_boundary"}),
+        );
+        boundary.source.provider = Provider::OhMyPi;
+        boundary.source.raw_record_type = Some("reset_boundary".into());
+        let mut snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"Archived user request"}),
+            ),
+            compaction(2, Provider::OhMyPi, "Archived summary"),
+            event(
+                3,
+                EventKind::ToolCompleted,
+                json!({"output":"Archived tool result"}),
+            ),
+            event(
+                4,
+                EventKind::PlanUpdated,
+                json!({"next_action":"Archived plan item"}),
+            ),
+            boundary,
+            event(6, EventKind::MessageUser, json!({"text":"New task"})),
+        ]);
+        snapshot.session.provider = Provider::OhMyPi;
+        snapshot.title = Some("Archived title".into());
+        snapshot.events.reverse();
+        assert!(super::continuation_title(&snapshot).is_none());
+        let imported = import_trajectory(&snapshot);
+        assert!(!imported.truncated);
+        assert_eq!(imported.items.len(), 1);
+        assert_eq!(imported.items[0].text, "New task");
+        assert!(!super::needs_recovery_handoff(&snapshot, false));
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        for document in [
+            String::from_utf8(recovery).unwrap(),
+            render_semantic_handoff(&snapshot),
+            render_markdown_export(&snapshot),
+        ] {
+            assert!(document.contains("New task"));
+            assert!(!document.contains("Archived"));
+        }
+        assert!(readback_trajectory(&snapshot).is_none());
+        assert!(
+            trajectory_search_document(&snapshot)
+                .text
+                .contains("Archived user request")
         );
     }
 

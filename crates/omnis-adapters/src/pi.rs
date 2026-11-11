@@ -222,10 +222,25 @@ enum HeaderState {
     Parsed(Result<PiHeader>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchEntryKind {
+    Compaction,
+    Reset,
+    Other,
+}
+
+fn branch_entry_kind(provider: Provider, entry: &Value) -> BranchEntryKind {
+    match entry["type"].as_str() {
+        Some("compaction") => BranchEntryKind::Compaction,
+        Some("reset_boundary") if provider == Provider::OhMyPi => BranchEntryKind::Reset,
+        _ => BranchEntryKind::Other,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PiTopologyEntry {
     parent_id: Option<String>,
-    is_compaction: bool,
+    kind: BranchEntryKind,
     first_kept_entry_id: Option<String>,
     location: JsonLineLocation,
 }
@@ -282,7 +297,7 @@ impl PiTranscriptIndex {
         else {
             return;
         };
-        let entry_type = record.get("type").and_then(Value::as_str);
+        let kind = branch_entry_kind(provider, record);
         self.by_id.insert(
             id.to_owned(),
             PiTopologyEntry {
@@ -290,8 +305,8 @@ impl PiTranscriptIndex {
                     .get("parentId")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                is_compaction: entry_type == Some("compaction"),
-                first_kept_entry_id: (entry_type == Some("compaction"))
+                kind,
+                first_kept_entry_id: (kind == BranchEntryKind::Compaction)
                     .then(|| {
                         record
                             .get("firstKeptEntryId")
@@ -377,7 +392,7 @@ fn topology_path(
 
     Ok(order_compaction(
         path,
-        |(_, entry)| entry.is_compaction,
+        |(_, entry)| entry.kind,
         |(_, entry)| entry.first_kept_entry_id.as_deref(),
         |(id, _)| Some(*id),
     )
@@ -393,7 +408,11 @@ fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc>
         .unwrap_or(fallback)
 }
 
-fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<(&Value, bool)>> {
+fn session_path(
+    records: &[Value],
+    provider: Provider,
+    allow_missing_ancestors: bool,
+) -> Result<Vec<(&Value, bool)>> {
     let entries = records
         .iter()
         .skip(1)
@@ -431,36 +450,45 @@ fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<
     path.reverse();
     Ok(order_compaction(
         path,
-        |entry| entry["type"] == "compaction",
+        |entry| branch_entry_kind(provider, entry),
         |entry| entry["firstKeptEntryId"].as_str(),
         |entry| entry["id"].as_str(),
     )
     .collect())
 }
 
-/// Move the latest compaction ahead of its retained entries, following Pi's `buildContextEntries`.
-/// Flag any older compactions in that range so their summaries stay in the retained conversation.
+/// Position the latest compaction ahead of its retained entries and identify older summaries in that range.
+/// An Oh My Pi clear starts a new task. Keep its marker before any subsequent compaction, even if
+/// the compaction's retained entry ID points into the previous task.
 fn order_compaction<T>(
     mut path: Vec<T>,
-    is_compaction: impl Fn(&T) -> bool,
+    entry_kind: impl Fn(&T) -> BranchEntryKind,
     first_kept_id: impl Fn(&T) -> Option<&str>,
     entry_id: impl Fn(&T) -> Option<&str>,
 ) -> impl Iterator<Item = (T, bool)> {
-    let latest = path.iter().rposition(&is_compaction);
+    let latest = path
+        .iter()
+        .rposition(|entry| entry_kind(entry) == BranchEntryKind::Compaction);
     let boundary = latest.map(|latest| {
-        let start = first_kept_id(&path[latest])
+        let mut start = first_kept_id(&path[latest])
             .and_then(|id| {
                 path[..latest]
                     .iter()
                     .position(|entry| entry_id(entry) == Some(id))
             })
             .unwrap_or(latest);
+        if let Some(reset) = path[start..latest]
+            .iter()
+            .rposition(|entry| entry_kind(entry) == BranchEntryKind::Reset)
+        {
+            start += reset + 1;
+        }
         path[start..=latest].rotate_right(1);
         start
     });
     path.into_iter().enumerate().map(move |(index, entry)| {
-        let retained_compaction =
-            boundary.is_some_and(|start| index > start) && is_compaction(&entry);
+        let retained_compaction = boundary.is_some_and(|start| index > start)
+            && entry_kind(&entry) == BranchEntryKind::Compaction;
         (entry, retained_compaction)
     })
 }
@@ -487,7 +515,12 @@ fn entry_timestamp(entry: &Value) -> Option<DateTime<Utc>> {
     parse_timestamp(entry.get("timestamp"))
 }
 
-fn emit_entry(builder: &mut EventBuilder, entry: &Value, retained_compaction: bool) {
+fn emit_entry(
+    builder: &mut EventBuilder,
+    provider: Provider,
+    entry: &Value,
+    retained_compaction: bool,
+) {
     let timestamp = entry_timestamp(entry);
     let raw_type = raw_type(entry);
     match raw_type.as_deref() {
@@ -501,15 +534,29 @@ fn emit_entry(builder: &mut EventBuilder, entry: &Value, retained_compaction: bo
             if retained_compaction {
                 payload["retained_by_compaction"] = Value::Bool(true);
             }
+            // Pi includes older retained summary messages. Oh My Pi only displays them in its archive.
+            let policy = if retained_compaction && provider == Provider::OhMyPi {
+                ReplayPolicy::HistoricalOnly
+            } else {
+                ReplayPolicy::Contextual
+            };
             builder.push(
                 EventKind::CompactionCreated,
                 payload,
                 timestamp,
-                ReplayPolicy::Contextual,
+                policy,
                 raw_type,
                 None,
             );
         }
+        Some("reset_boundary" | "title_change") if provider == Provider::OhMyPi => builder.push(
+            EventKind::ProviderEvent,
+            selected_entry_metadata(entry),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            raw_type,
+            None,
+        ),
         Some("branch_summary") => emit_branch_summary(builder, entry, timestamp, raw_type),
         Some("custom_message") => emit_custom_message(builder, entry, timestamp, raw_type),
         Some("model_change" | "thinking_level_change" | "label" | "session_info" | "custom") => {
@@ -857,6 +904,8 @@ fn selected_entry_metadata(entry: &Value) -> Value {
             "type": entry_type,
             "name": entry.get("name").cloned().unwrap_or(Value::Null),
         }),
+        Some("reset_boundary") => json!({ "type": entry_type }),
+        Some("title_change") => json!({ "type": entry_type, "title": entry.get("title") }),
         Some("custom" | "custom_message") => json!({
             "type": entry_type,
             "custom_type": entry.get("customType").cloned().unwrap_or(Value::Null),
@@ -896,8 +945,8 @@ fn snapshot_from_records(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for (entry, retained) in session_path(records, false)? {
-        emit_entry(&mut builder, entry, retained);
+    for (entry, retained) in session_path(records, session.provider, false)? {
+        emit_entry(&mut builder, session.provider, entry, retained);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     Ok(builder.snapshot(
@@ -954,7 +1003,7 @@ fn snapshot_from_open_file(
                     return Err(error);
                 }
             };
-        emit_entry(&mut builder, &entry, retained);
+        emit_entry(&mut builder, session.provider, &entry, retained);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     stamp.ensure_unchanged(reader.get_ref())?;
@@ -976,8 +1025,8 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for (entry, retained) in session_path(records, true)? {
-        emit_entry(&mut builder, entry, retained);
+    for (entry, retained) in session_path(records, session.provider, true)? {
+        emit_entry(&mut builder, session.provider, entry, retained);
     }
     Ok(builder.snapshot(
         session.clone(),
@@ -1269,6 +1318,76 @@ mod tests {
             assert!(history.contains("recover earlier decision"));
             assert!(!history.contains("discarded sibling"));
         }
+    }
+
+    #[test]
+    fn omp_keeps_the_clear_marker_before_a_later_compaction_and_archives_older_summaries() {
+        let header = json!({"type":"session","version":3,"id":"session","cwd":"/workspace","timestamp":"2026-01-01T00:00:00Z"});
+        let message = |id: &str, parent: Option<&str>| {
+            json!({
+                "type":"message","id":id,"parentId":parent,"timestamp":"2026-01-01T00:00:00Z",
+                "message":{"role":"user","content":id}
+            })
+        };
+        let compact = |id: &str, parent: &str, kept: &str| {
+            json!({
+                "type":"compaction","id":id,"parentId":parent,"timestamp":"2026-01-01T00:00:00Z",
+                "summary":id,"tokensBefore":10,"firstKeptEntryId":kept
+            })
+        };
+        let records = [
+            json!({"type":"title","v":1,"title":"Archived title","pad":"","source":"user","updatedAt":"2026-01-01T00:00:00Z"}),
+            header,
+            message("old request", None),
+            compact("pre-clear summary", "old request", "old request"),
+            json!({"type":"reset_boundary","id":"clear","parentId":"pre-clear summary","timestamp":"2026-01-01T00:00:00Z"}),
+            message("first retained", Some("clear")),
+            compact("intermediate summary", "first retained", "first retained"),
+            message("second retained", Some("intermediate summary")),
+            compact("latest summary", "second retained", "old request"),
+            json!({"type":"title_change","id":"rename","parentId":"latest summary","timestamp":"2026-01-01T00:00:00Z","title":"Current title","source":"user"}),
+            message("final turn", Some("rename")),
+        ];
+        let temporary = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            temporary.path(),
+            "session.jsonl",
+            &serialized_records(&records),
+        );
+        let session = SessionRef::new(Provider::OhMyPi, "session");
+        let adapter = PiAdapter::oh_my_pi_with_root(temporary.path());
+        let snapshot = assert_matches_snapshot_oracle(&adapter, &session, &path, &records, 0);
+        let preview = adapter.preview_session_at(&session, Some(&path)).unwrap();
+        let reset_and_titles = |snapshot: &omnis_ir::CanonicalSnapshot| {
+            let marker = snapshot
+                .events
+                .iter()
+                .position(|event| event.source.raw_record_type.as_deref() == Some("reset_boundary"))
+                .unwrap();
+            assert!(
+                snapshot.events[..marker]
+                    .iter()
+                    .any(|event| event.payload["text"] == "old request")
+            );
+            let after = &snapshot.events[marker + 1..];
+            assert_eq!(after[0].payload["summary"], "latest summary");
+            assert!(
+                after
+                    .iter()
+                    .any(
+                        |event| event.source.raw_record_type.as_deref() == Some("title_change")
+                            && event.payload["title"] == "Current title"
+                    )
+            );
+            assert!(
+                after
+                    .iter()
+                    .any(|event| event.payload["summary"] == "intermediate summary"
+                        && event.replay_policy == ReplayPolicy::HistoricalOnly)
+            );
+        };
+        reset_and_titles(&snapshot);
+        reset_and_titles(&preview);
     }
 
     #[test]

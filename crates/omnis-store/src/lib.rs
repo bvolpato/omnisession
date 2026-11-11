@@ -246,7 +246,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         document_version = excluded.document_version,
         derived_title = coalesce(excluded.derived_title, session_trajectories.derived_title)
     WHERE excluded.document_version >= session_trajectories.document_version AND (
-       excluded.document_version > session_trajectories.document_version
+       (excluded.document_version > session_trajectories.document_version
+        AND excluded.source_complete >= session_trajectories.source_complete)
        OR excluded.source_updated_at > session_trajectories.source_updated_at
        OR (
            excluded.source_updated_at = session_trajectories.source_updated_at
@@ -1522,8 +1523,8 @@ impl Store {
 
     /// Stores one versioned search document.
     ///
-    /// An older document version never replaces a newer one, and a newer version replaces any
-    /// older document for the same session regardless of source state.
+    /// Only current or newer document versions can write. If the source has not advanced,
+    /// a version upgrade must preserve full source coverage.
     ///
     /// # Errors
     ///
@@ -4067,18 +4068,24 @@ mod tests {
             )
             .expect("full source head-tail");
         let preview = "preview-only transient-edge";
-        store
-            .upsert_session_trajectory_document(
-                &session,
-                preview,
-                source_updated_at,
-                preview.len(),
-                preview.len(),
-                "none",
-                false,
-                SessionTrajectoryOrigin::Native,
-            )
-            .expect("same-state preview");
+        for document_version in [0, 1] {
+            store
+                .upsert_trajectory_document(
+                    &session,
+                    &TrajectoryDocument {
+                        redacted_text: preview,
+                        source_updated_at,
+                        source_byte_count: preview.len(),
+                        indexed_byte_count: preview.len(),
+                        truncation_strategy: "none",
+                        source_complete: false,
+                        origin: SessionTrajectoryOrigin::Native,
+                        document_version,
+                        derived_title: None,
+                    },
+                )
+                .expect("same-state preview");
+        }
 
         assert_eq!(
             store

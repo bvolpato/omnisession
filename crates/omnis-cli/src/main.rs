@@ -183,7 +183,7 @@ fn store_search_document(
             truncation_strategy: document.truncation_strategy.as_str(),
             source_complete: full_read,
             origin,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+            document_version: omnis_core::search_document_version(session.provider),
             derived_title: derived_title.as_deref(),
         },
     )?;
@@ -1788,7 +1788,7 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         println!("{}", serde_json::to_string_pretty(&safe)?);
     } else {
         println!("Source: {session}");
-        if let Some(title) = &snapshot.title {
+        if let Some(title) = omnis_core::continuation_title(&snapshot) {
             println!("Title: {}", safe_terminal_line(&redact_secrets(title)));
         }
         println!("Events: {}", snapshot.events.len());
