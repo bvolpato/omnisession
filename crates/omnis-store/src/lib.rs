@@ -292,6 +292,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
+      AND (excluded.provider NOT IN ('antigravity', 'antigravity-desktop')
+           OR excluded.origin <> 'native' OR session_trajectories.origin <> 'native'
+           OR excluded.source_complete OR excluded.provider_limited
+           OR (NOT session_trajectories.provider_limited AND
+               (NOT session_trajectories.source_complete
+                OR (excluded.source_file_id IS NULL AND session_trajectories.source_file_id IS NULL))))
       AND (excluded.provider NOT IN ('pi','omp') OR excluded.origin <> 'native'
            OR session_trajectories.origin <> 'native' OR (
                (excluded.source_file_id IS NOT NULL OR session_trajectories.source_file_id IS NULL)
@@ -680,6 +686,8 @@ impl TrajectorySourceGuard {
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
+    /// Searchable bytes observed by the previous read before document truncation.
+    pub source_byte_count: usize,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     /// False for historical rows written before the index recorded file time below a millisecond.
@@ -843,7 +851,8 @@ fn validate_selected_catalog(
 ) -> Result<()> {
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
-        || !TrajectorySourceGuard::uses_file_time(session.provider)
+        || !(TrajectorySourceGuard::uses_file_time(session.provider)
+            || session.provider == Provider::Antigravity)
         || !matches!(guard, TrajectorySourceGuard::Verified(_))
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete
@@ -1727,6 +1736,30 @@ impl Store {
         timestamp.map(timestamp_from_db).transpose()
     }
 
+    /// Returns whether a catalogued session needs a new reader after an older document or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored index versions cannot be read.
+    pub fn has_outdated_search_index(&self, provider: Provider, version: u32) -> Result<bool> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM session_index AS catalog
+                    LEFT JOIN session_trajectories AS document USING (provider, session_id)
+                    LEFT JOIN trajectory_index_failures AS failure USING (provider, session_id)
+                    WHERE catalog.provider = ?1
+                      AND (document.document_version IS NOT NULL OR failure.document_version IS NOT NULL)
+                      AND coalesce(document.document_version, 0) < ?2
+                      AND coalesce(failure.document_version, 0) < ?2
+                )",
+                params![provider.to_string(), version],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     /// Records a provider-store check without replacing its last valid snapshot.
     ///
     /// # Errors
@@ -2436,7 +2469,7 @@ impl Store {
         let connection = self.connection.borrow();
         connection.query_row(
             "SELECT source_updated_at, source_complete, document_version, source_updated_submillis,
-                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id
+                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id, source_byte_count
              FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
             params![session.provider.to_string(), session.id], |row| state_from_row(row, 0),
         ).optional().map_err(database_error)
@@ -2455,7 +2488,7 @@ impl Store {
             .prepare(
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version,
                     source_updated_submillis, provider_limited, title_authoritative, source_file_id,
-                    missing_ancestor_id, source_contents_id FROM session_trajectories",
+                    missing_ancestor_id, source_contents_id, source_byte_count FROM session_trajectories",
             )
             .map_err(database_error)?;
         let mut rows = statement.query([]).map_err(database_error)?;
@@ -4456,6 +4489,9 @@ fn state_from_row(
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })?;
     Ok(TrajectoryIndexState {
+        source_byte_count: usize::try_from(row.get::<_, i64>(column + 9)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(column + 9, Type::Integer, Box::new(error))
+        })?,
         source_revision: source_revision_from_row(row, column + 6)?,
         source_updated_at,
         source_complete: row.get(column + 1)?,
@@ -4519,6 +4555,7 @@ fn valid_truncation_strategy(strategy: &str) -> bool {
             | "source_incomplete_event_and_document_head_tail"
             | "legacy_bounded"
             | "legacy_unknown"
+            | "provider_read_limit"
     )
 }
 
@@ -4532,7 +4569,7 @@ fn valid_trajectory_coverage(
     }
     match strategy {
         "none" | "source_incomplete" => source_byte_count == indexed_byte_count,
-        "legacy_bounded" | "legacy_unknown" => true,
+        "legacy_bounded" | "legacy_unknown" | "provider_read_limit" => true,
         _ => source_byte_count > indexed_byte_count,
     }
 }
@@ -5650,6 +5687,106 @@ mod tests {
                 .expect("newer preview is searchable"),
             [session]
         );
+    }
+
+    #[test]
+    fn antigravity_search_upgrade_preserves_full_history_until_a_full_read() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let time = Utc::now();
+        let later = time + chrono::Duration::seconds(1);
+        for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+            let listing = indexed_session(provider, "history", "History");
+            store.upsert_indexed_session(&listing).unwrap();
+            let session = listing.session;
+            let searchable = |text: &str| {
+                store
+                    .search_session_trajectories(text, 10)
+                    .unwrap()
+                    .contains(&session)
+            };
+            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
+            let failure = crate::TrajectoryIndexFailure {
+                source_updated_at: Some(time),
+                source_file: None,
+                source_contents: None,
+                source_time_precise: true,
+                document_version: 5,
+            };
+            store
+                .record_trajectory_index_failure(&session, &failure)
+                .unwrap();
+            assert!(store.has_outdated_search_index(provider, 6).unwrap());
+            let write =
+                |text: &str, document_version, source_updated_at, source_complete, strategy| {
+                    store
+                        .upsert_trajectory_document(
+                            &session,
+                            &TrajectoryDocument {
+                                redacted_text: text,
+                                source_updated_at,
+                                source_revision: if provider == Provider::Antigravity
+                                    && document_version == 6
+                                {
+                                    SourceRevision {
+                                        file: Some(Uuid::from_u128(1)),
+                                        contents: Some(Uuid::from_u128(2)),
+                                        missing_ancestor: None,
+                                    }
+                                } else {
+                                    SourceRevision::default()
+                                },
+                                title_authoritative: false,
+                                provider_limited: strategy == "provider_read_limit",
+                                source_byte_count: text.len(),
+                                indexed_byte_count: text.len(),
+                                truncation_strategy: strategy,
+                                source_complete,
+                                origin: SessionTrajectoryOrigin::Native,
+                                document_version,
+                                derived_title: None,
+                            },
+                        )
+                        .unwrap();
+                };
+            write("middleword", 5, time, true, "none");
+            for preview_time in [time, later] {
+                write("preview", 6, preview_time, false, "none");
+                let state = &store.trajectory_index_states().unwrap()[&session];
+                assert_eq!(state.document_version, 5);
+                assert!(store.has_outdated_search_index(provider, 6).unwrap());
+                assert!(searchable("middleword"));
+            }
+            if provider == Provider::Antigravity {
+                write(
+                    "middleword latestword",
+                    6,
+                    later,
+                    false,
+                    "provider_read_limit",
+                );
+                write("preview", 6, later, false, "none");
+                let state = store.trajectory_index_states().unwrap()[&session];
+                assert!(state.provider_limited);
+                assert!(!state.source_complete);
+                assert!(searchable("latestword"));
+            }
+            write("upgradedword", 6, later, true, "none");
+            if provider == Provider::Antigravity {
+                write(
+                    "sample",
+                    6,
+                    later + chrono::Duration::seconds(1),
+                    false,
+                    "none",
+                );
+            }
+            let state = &store.trajectory_index_states().unwrap()[&session];
+            assert_eq!(state.document_version, 6);
+            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
+            assert!(state.source_complete);
+            assert!(searchable("upgradedword"));
+        }
     }
 
     #[test]

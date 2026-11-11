@@ -6,17 +6,23 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_core::{SearchDocumentBuilder, SearchTruncationStrategy, session_preview};
+use omnis_ir::{
+    CanonicalSnapshot, EventKind, OmniEvent, Provider, ReplayPolicy, SessionRef, SourceRevision,
+};
 use prost::Message;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IncompleteTranscript, IndexRead, IndexedSearchDocument, LaunchPlan, LaunchTarget,
+    NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes,
+        json_lines_preview_with_tail, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, sort_sessions, sqlite_snapshot, store_is_missing,
+        validate_provider, visit_json_lines_with_tail, visit_limited_search_edges,
+        visit_streamed_json_file,
     },
 };
 
@@ -60,61 +66,155 @@ impl AntigravityAdapter {
             .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
     }
 
-    fn transcript(&self, id: &str) -> Option<PathBuf> {
+    fn source(&self, summary: &Summary) -> Option<PathBuf> {
         let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        let logs = root
-            .join("brain")
-            .join(id)
-            .join(".system_generated")
-            .join("logs");
-        ["transcript_full.jsonl", "transcript.jsonl"]
-            .into_iter()
-            .find_map(|name| provider_file(root, &logs.join(name)))
+        validate_id(&summary.id).ok()?;
+        selected_history(root, &history_paths(root, &summary.id))
     }
 
-    fn conversation_database(&self, id: &str) -> Option<PathBuf> {
-        let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        provider_file(root, &root.join("conversations").join(format!("{id}.db")))
+    fn read_observed(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        preview: bool,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::Antigravity)?;
+        let summary = self.summary(&session.id)?;
+        let selected = self.source(&summary);
+        anyhow::ensure!(
+            path.is_none_or(|path| selected.as_deref() == Some(path)),
+            "Antigravity history changed during the search read"
+        );
+        let native = summary.native_session(selected.clone());
+        let read = self.read_summary(session, &summary, preview);
+        let current = self.summary(&session.id)?;
+        anyhow::ensure!(
+            self.source(&current) == selected
+                && current.updated_at == summary.updated_at
+                && current.native_session(selected).source_revision == native.source_revision,
+            "Antigravity history changed during the search read"
+        );
+        Ok(IndexRead {
+            snapshot: read?,
+            source_complete: !preview,
+            provider_limited: false,
+            source_revision: native.source_revision.unwrap_or_default(),
+            native_session: Some(native),
+        })
     }
 
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Antigravity)?;
         let summary = self.summary(&session.id)?;
+        self.read_summary(session, &summary, preview)
+    }
+
+    fn read_summary(
+        &self,
+        session: &SessionRef,
+        summary: &Summary,
+        preview: bool,
+    ) -> Result<CanonicalSnapshot> {
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
-        if let Some(path) = self.transcript(&session.id) {
-            if preview {
-                for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
-                    push_transcript_record(&mut builder, &record);
-                }
-            } else {
-                let oversized_records =
-                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+        match self.source(summary) {
+            Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
+                let oversized = if preview {
+                    for record in json_lines_preview_with_tail(
+                        &path,
+                        PREVIEW_RECORDS,
+                        JsonLineTail::RequireComplete,
+                    )? {
                         push_transcript_record(&mut builder, &record);
-                        Ok(())
-                    })?;
-                builder.push_oversized_record_notice(oversized_records, summary.updated_at);
+                    }
+                    0
+                } else {
+                    visit_json_lines_with_tail(
+                        &path,
+                        MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+                        JsonLineTail::RequireComplete,
+                        |record| {
+                            push_transcript_record(&mut builder, &record);
+                            Ok(())
+                        },
+                    )?
+                };
+                verify_jsonl_history(summary, &builder)?;
+                builder.push_oversized_record_notice(oversized, summary.updated_at);
             }
-        } else if let Some(path) = self.conversation_database(&session.id) {
-            push_database_steps(self.root()?, &path, &mut builder)?;
-        } else if summary.step_count > 0 {
-            return Err(anyhow!(
-                "Antigravity session `{}` declares history but has no readable transcript",
-                session.id
-            ));
+            Some(path) => {
+                push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
+            }
+            None if summary.step_count > 0 => {
+                return Err(anyhow!(
+                    "Antigravity session `{}` declares history but has no readable transcript",
+                    session.id
+                ));
+            }
+            None => {}
         }
 
         Ok(builder.snapshot(
             session.clone(),
-            nonempty(summary.title),
-            summary.project_path,
+            nonempty(summary.title.clone()),
+            summary.project_path.clone(),
             None,
             captured_at,
         ))
     }
+}
+
+fn capture_first_message(snapshot: &mut CanonicalSnapshot, event: OmniEvent) {
+    if snapshot.events.is_empty()
+        && matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        )
+    {
+        snapshot.events.push(event);
+        if session_preview(snapshot).first.is_none() {
+            snapshot.events.clear();
+        }
+    }
+}
+
+fn verify_jsonl_history(summary: &Summary, events: &EventBuilder) -> Result<()> {
+    if summary.step_count > 0 && events.checkpoint() == 0 {
+        return Err(IncompleteTranscript).with_context(|| format!(
+            "Antigravity session `{}` declares history but its transcript contains no readable steps", summary.id
+        ));
+    }
+    Ok(())
+}
+
+fn selected_history(root: &Path, paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find_map(|path| provider_file(root, path))
+}
+
+pub(super) fn selected_transcript_revision(
+    session: &SessionRef,
+    path: &Path,
+) -> Option<SourceRevision> {
+    if path.extension().is_none_or(|ext| ext != "jsonl") {
+        return None;
+    }
+    validate_id(&session.id).ok()?;
+    let adapter = AntigravityAdapter::default();
+    let root = adapter.root.as_deref()?;
+    let selected = selected_history(root, &history_paths(root, &session.id))?;
+    (selected == path)
+        .then(|| crate::source_file_revision(&selected))
+        .flatten()
+}
+
+fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
+    let logs = root.join("brain").join(id).join(".system_generated/logs");
+    [
+        logs.join("transcript_full.jsonl"),
+        logs.join("transcript.jsonl"),
+        root.join("conversations").join(format!("{id}.db")),
+    ]
 }
 
 impl Default for AntigravityAdapter {
@@ -169,18 +269,8 @@ impl ProviderAdapter for AntigravityAdapter {
             {
                 continue;
             }
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Antigravity, summary.id.clone()),
-                title: nonempty(summary.title),
-                project_path: summary.project_path,
-                git_branch: None,
-                created_at: None,
-                updated_at: summary.updated_at,
-                updated_at_approximate: false,
-                event_count: summary.step_count,
-                source_path: self.conversation_database(&summary.id),
-                source_revision: None,
-            });
+            let source_path = self.source(&summary);
+            sessions.push(summary.native_session(source_path));
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -192,6 +282,129 @@ impl ProviderAdapter for AntigravityAdapter {
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read(session, true)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.read_observed(session, source_path, false)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        let preview = full_read_bytes == 0
+            || source_path
+                .and_then(|path| path.metadata().ok())
+                .is_some_and(|metadata| metadata.len() > full_read_bytes);
+        self.read_observed(session, source_path, preview)
+    }
+
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+        prior_search_bytes: Option<usize>,
+    ) -> Result<IndexedSearchDocument> {
+        let Some(path) =
+            source_path.filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        else {
+            return self
+                .index_session(session, source_path, full_read_bytes)
+                .map(Into::into);
+        };
+        validate_provider(session, Provider::Antigravity)?;
+        let summary = self.summary(&session.id)?;
+        anyhow::ensure!(
+            self.source(&summary).as_deref() == Some(path),
+            "Antigravity history changed during the search read"
+        );
+        let file = std::fs::File::open(path)
+            .context("Antigravity history changed during the search read")?;
+        let before = file.metadata()?;
+        let native = summary.native_session(Some(path.to_owned()));
+        let observed = crate::source_file::ObservedSourceFile::from_open_file(path, &file, &before)
+            .context("Antigravity history changed during the search read")?;
+        anyhow::ensure!(
+            native.source_revision == Some(observed.revision),
+            "Antigravity history changed during the search read"
+        );
+        let handle = file.try_clone()?;
+        let require_same_source = || -> Result<()> {
+            observed.ensure_unchanged(path, path, &handle)?;
+            anyhow::ensure!(
+                self.source(&summary).as_deref() == Some(path),
+                "Antigravity history changed during the search read"
+            );
+            Ok(())
+        };
+        let limited = before.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
+        if !limited && before.len() > full_read_bytes {
+            let preview = self.index_session(session, Some(path), full_read_bytes);
+            require_same_source()?;
+            return preview.map(Into::into);
+        }
+        let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
+        let mut title_source = EventBuilder::new(Provider::Antigravity, &session.id).snapshot(
+            session.clone(),
+            nonempty(summary.title.clone()),
+            summary.project_path.clone(),
+            None,
+            captured_at,
+        );
+        let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut document = SearchDocumentBuilder::default();
+        let mut push = |record| {
+            push_transcript_record(&mut events, &record);
+            for event in events.drain_events() {
+                document.push(&event);
+                capture_first_message(&mut title_source, event);
+            }
+            document.source_byte_count()
+        };
+        let oversized = if limited {
+            visit_limited_search_edges(file, prior_search_bytes, PREVIEW_RECORDS, &mut push)
+                .map(|()| 0)
+        } else {
+            visit_streamed_json_file(
+                file,
+                MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+                JsonLineTail::RequireComplete,
+                |record| {
+                    push(record);
+                    Ok(())
+                },
+            )
+        };
+        require_same_source()?;
+        let oversized = oversized?;
+        verify_jsonl_history(&summary, &events)?;
+        events.push_oversized_record_notice(oversized, summary.updated_at);
+        for event in events.drain_events() {
+            document.push(&event);
+        }
+        let mut document = document.finish();
+        if limited && prior_search_bytes.is_some() {
+            document.source_complete = false;
+            document.truncated = true;
+            document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
+        }
+        Ok(IndexedSearchDocument {
+            document,
+            read: IndexRead {
+                snapshot: title_source,
+                source_complete: !limited,
+                provider_limited: limited && prior_search_bytes.is_some(),
+                source_revision: observed.revision,
+                native_session: Some(native),
+            },
+        })
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -237,6 +450,37 @@ struct Summary {
     step_count: usize,
     updated_at: Option<DateTime<Utc>>,
     project_path: Option<PathBuf>,
+}
+
+impl Summary {
+    fn native_session(&self, source_path: Option<PathBuf>) -> NativeSession {
+        let session = SessionRef::new(Provider::Antigravity, self.id.clone());
+        let revision = source_path
+            .as_deref()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .and_then(crate::source_file_revision);
+        let updated_at = self.updated_at.or_else(|| {
+            source_path
+                .as_ref()?
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()
+                .map(Into::into)
+        });
+        NativeSession {
+            session,
+            title: nonempty(self.title.clone()),
+            project_path: self.project_path.clone(),
+            git_branch: None,
+            created_at: None,
+            updated_at,
+            updated_at_approximate: false,
+            event_count: self.step_count,
+            source_path,
+            source_revision: revision,
+        }
+    }
 }
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
@@ -427,8 +671,15 @@ pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
 ) -> Result<usize> {
-    push_database_steps_with_limits(root, database, builder, DatabaseReadLimits::default())
+    push_database_steps_with_limits(
+        root,
+        database,
+        builder,
+        declared_steps,
+        DatabaseReadLimits::default(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -454,6 +705,7 @@ fn push_database_steps_with_limits(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
     limits: DatabaseReadLimits,
 ) -> Result<usize> {
     let snapshot = sqlite_snapshot(root, database)
@@ -463,55 +715,87 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
-    let mut statement = snapshot
+    if stored == 0 && declared_steps > 0 {
+        return Err(anyhow!(
+            "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+        ));
+    }
+    let (key, newest_first) = database_step_order(&snapshot.connection)?;
+    // Look at sizes first so a skipped step does not read its blob or displace a smaller one.
+    let mut statement = snapshot.connection.prepare(&format!(
+        "SELECT {key}, CASE WHEN typeof(step_payload) = 'blob' THEN length(step_payload) END, \
+         CASE WHEN typeof(idx) = 'integer' THEN idx END \
+         FROM steps ORDER BY {newest_first} LIMIT ?1"
+    ))?;
+    let mut payload_by_key = snapshot
         .connection
-        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;
-    let mut rows = statement.query(rusqlite::params![
-        i64::try_from(limits.row_bytes)?,
-        i64::try_from(limits.records)?,
-    ])?;
+        .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
+    let mut rows = statement.query([i64::try_from(limits.records)?])?;
+    let mut retained = Vec::new();
     let mut decoded = 0;
-    let mut visited = 0;
     let mut remaining_wire = limits.wire_bytes;
     let mut remaining_history = limits.history_bytes;
-    let mut omitted = stored.saturating_sub(limits.records);
     let mut unsupported = 0;
+    let mut damaged = 0;
+    let mut previous_index = None;
+    let mut order_verified = true;
     while let Some(row) = rows.next()? {
-        let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
-        visited += 1;
-        if bytes > limits.row_bytes {
-            omitted += 1;
+        let index: Option<i64> = row.get(2)?;
+        order_verified &= index.is_some() && index != previous_index;
+        previous_index = index;
+        let Some(length) = row.get::<_, Option<i64>>(1)?.filter(|length| *length > 0) else {
+            damaged += 1;
+            continue;
+        };
+        let bytes = usize::try_from(length)?;
+        if bytes > limits.row_bytes || bytes > remaining_wire {
             continue;
         }
-        if bytes > remaining_wire {
-            omitted = omitted.saturating_add(stored.min(limits.records) - visited + 1);
-            break;
-        }
         remaining_wire -= bytes;
-        let payload = row.get::<_, Vec<u8>>(1)?;
-        let step = ProtoStep::decode(payload.as_slice())?;
+        let row_key = rusqlite::types::ToSqlOutput::Borrowed(row.get_ref(0)?);
+        let payload: Vec<u8> = payload_by_key.query_row([row_key], |record| record.get(0))?;
+        let Ok(step) = ProtoStep::decode(payload.as_slice()) else {
+            damaged += 1;
+            continue;
+        };
         decoded += 1;
         let event = database_step_event(step, &payload);
         unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
         let bytes = estimated_event_bytes(&event.payload);
-        if bytes > remaining_history {
-            omitted += 1;
-        } else {
+        if bytes <= remaining_history {
             remaining_history -= bytes;
-            builder.push(
-                event.kind,
-                event.payload,
-                event.timestamp,
-                event.replay_policy,
-                Some(event.record_type),
-                None,
-            );
+            retained.push(event);
         }
     }
-    if omitted > 0 || unsupported > 0 {
+    if decoded == 0 && damaged > 0 {
+        return Err(anyhow!(
+            "no Antigravity steps could be decoded ({damaged} selected step payloads were missing or invalid)"
+        ));
+    }
+    let omitted = stored.max(declared_steps) - retained.len();
+    for event in retained.into_iter().rev() {
+        builder.push(
+            event.kind,
+            event.payload,
+            event.timestamp,
+            event.replay_policy,
+            Some(event.record_type),
+            None,
+        );
+    }
+    if omitted > 0 || unsupported > 0 || !order_verified {
+        let mut notice =
+            json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
+        if !order_verified {
+            notice["native_history_unverified"] = json!(true);
+        }
+        if declared_steps > stored {
+            notice["declared_steps"] = json!(declared_steps);
+            notice["stored_steps"] = json!(stored);
+        }
         builder.push(
             EventKind::ProviderEvent,
-            json!({"omitted_events": omitted, "unsupported_text_records": unsupported}),
+            notice,
             None,
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.antigravity_step_limit".to_owned()),
@@ -519,6 +803,27 @@ fn push_database_steps_with_limits(
         );
     }
     Ok(decoded)
+}
+
+fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static str, &'static str)> {
+    let without_rowid: bool = connection.query_row(
+        "SELECT wr FROM pragma_table_list('steps') WHERE schema = 'main' AND type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !without_rowid {
+        return Ok(("_rowid_", "idx DESC, _rowid_ DESC"));
+    }
+    let indexed_by_step: bool = connection.query_row(
+        "SELECT count(*) = 1 AND min(lower(name)) = 'idx' FROM pragma_table_info('steps') WHERE pk > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        indexed_by_step,
+        "Antigravity steps have neither a rowid nor an idx primary key"
+    );
+    Ok(("idx", "idx DESC"))
 }
 
 struct DatabaseStepEvent {
@@ -770,28 +1075,40 @@ mod tests {
             ],
         );
 
-        let mut builder = EventBuilder::new(
-            Provider::Antigravity,
-            "11111111-1111-4111-8111-111111111111",
-        );
-        let decoded =
-            push_database_steps(temporary.path(), &database, &mut builder).expect("native steps");
-        assert_eq!(decoded, 2);
-        let snapshot = builder.snapshot(
-            SessionRef::new(
+        let assert_messages = |order_verified| {
+            let session = SessionRef::new(
                 Provider::Antigravity,
                 "11111111-1111-4111-8111-111111111111",
-            ),
-            None,
-            None,
-            None,
-            Utc::now(),
-        );
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
-        assert_eq!(snapshot.events[0].payload["text"], "question");
-        assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
-        assert_eq!(snapshot.events[1].payload["text"], "answer");
+            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
+            assert_eq!(
+                push_database_steps(temporary.path(), &database, &mut builder, 2).unwrap(),
+                2
+            );
+            let snapshot = builder.snapshot(session, None, None, None, Utc::now());
+            assert_eq!(snapshot.events.len(), if order_verified { 2 } else { 3 });
+            if !order_verified {
+                assert_eq!(
+                    snapshot.events[2].payload["native_history_unverified"],
+                    true
+                );
+            }
+            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+            assert_eq!(snapshot.events[0].payload["text"], "question");
+            assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
+            assert_eq!(snapshot.events[1].payload["text"], "answer");
+        };
+        assert_messages(true);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE restored AS SELECT * FROM steps ORDER BY idx;
+             DROP TABLE steps;
+             ALTER TABLE restored RENAME TO steps;
+             UPDATE steps SET idx = 0;",
+            )
+            .unwrap();
+        assert_messages(false);
     }
 
     #[test]
@@ -800,15 +1117,18 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let database = temporary.path().join("conversation.db");
-        let step = synthetic_step(
-            14,
-            Some(proto_step::Step::UserInput(ProtoUserInput {
-                query: "Synthetic visible history".to_owned(),
-                ..ProtoUserInput::default()
-            })),
-        );
-        let wire_bytes = step.encoded_len();
-        write_steps_database(&database, &[step.clone(), step]);
+        let text = ["First visible request", "Final visible request"];
+        let steps = text.map(|query| {
+            synthetic_step(
+                14,
+                Some(proto_step::Step::UserInput(ProtoUserInput {
+                    query: query.to_owned(),
+                    ..ProtoUserInput::default()
+                })),
+            )
+        });
+        let wire_bytes = steps[1].encoded_len();
+        write_steps_database(&database, &steps);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
@@ -818,72 +1138,117 @@ mod tests {
             .unwrap();
         drop(connection);
         let before = std::fs::read(&database).unwrap();
-        let visible_bytes = crate::support::estimated_event_bytes(
-            &serde_json::json!({"text":"Synthetic visible history"}),
+        let visible_bytes =
+            crate::support::estimated_event_bytes(&serde_json::json!({"text": text[1]}));
+        let row_limit = super::DatabaseReadLimits {
+            row_bytes: wire_bytes,
+            ..super::DatabaseReadLimits::default()
+        };
+        let session = SessionRef::new(
+            Provider::Antigravity,
+            "11111111-1111-4111-8111-111111111111",
         );
-        for (limits, omitted) in [
+        for (limits, expected) in [
+            (row_limit, &text[..]),
             (
                 super::DatabaseReadLimits {
-                    row_bytes: wire_bytes,
-                    ..super::DatabaseReadLimits::default()
-                },
-                1,
-            ),
-            (
-                super::DatabaseReadLimits {
-                    row_bytes: 1024,
                     history_bytes: visible_bytes,
-                    ..super::DatabaseReadLimits::default()
+                    ..row_limit
                 },
-                2,
+                &text[1..],
             ),
             (
                 super::DatabaseReadLimits {
-                    records: 1,
+                    records: 2,
+                    ..row_limit
+                },
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    wire_bytes: steps.iter().map(Message::encoded_len).sum(),
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[..],
             ),
             (
                 super::DatabaseReadLimits {
                     wire_bytes,
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    records: 1,
+                    ..row_limit
+                },
+                &text[..0],
             ),
         ] {
-            let mut builder = EventBuilder::new(
-                Provider::Antigravity,
-                "11111111-1111-4111-8111-111111111111",
-            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
             let decoded = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
                 &mut builder,
+                3,
                 limits,
             )
             .unwrap();
-            assert!(decoded > 0);
-            let snapshot = builder.snapshot(
-                SessionRef::new(
-                    Provider::Antigravity,
-                    "11111111-1111-4111-8111-111111111111",
-                ),
-                None,
-                None,
-                None,
-                Utc::now(),
-            );
-            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
-            assert_eq!(
-                snapshot.events[0].payload["text"],
-                "Synthetic visible history"
-            );
-            let notice = snapshot.events.last().unwrap();
-            assert_eq!(notice.payload["omitted_events"], omitted);
+            assert!(decoded >= expected.len());
+            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
+            let (notice, messages) = snapshot.events.split_last().unwrap();
+            let actual = messages
+                .iter()
+                .map(|message| message.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            assert_eq!(notice.payload["omitted_events"], 3 - expected.len());
             assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
         }
         assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn damaged_database_steps_do_not_hide_a_readable_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        let id = "11111111-1111-4111-8111-111111111111";
+        let request = synthetic_step(
+            14,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "Latest readable request".into(),
+                ..ProtoUserInput::default()
+            })),
+        );
+        write_steps_database(&database, &[request]);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 15, NULL), (2, 14, x'80'), (3, 14, 'invalid'), (4, 14, x'')",
+        )
+        .unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        assert_eq!(
+            push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap(),
+            1
+        );
+        let snapshot = builder.snapshot(
+            SessionRef::new(Provider::Antigravity, id),
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(
+            snapshot.events[0].payload["text"],
+            "Latest readable request"
+        );
+        assert_eq!(snapshot.events[1].payload["omitted_events"], 5);
+        assert_eq!(snapshot.events[1].payload["declared_steps"], 6);
+        assert_eq!(snapshot.events[1].payload["stored_steps"], 5);
+        conn.execute("DELETE FROM steps WHERE idx = 0", []).unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        assert!(push_database_steps(temporary.path(), &database, &mut builder, 6).is_err());
     }
 
     #[test]
@@ -966,7 +1331,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         );
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
             1
         );
         let snapshot = builder.snapshot(

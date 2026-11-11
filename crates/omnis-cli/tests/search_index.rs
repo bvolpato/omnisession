@@ -22,6 +22,134 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[test]
+fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_path_buf());
+    let session = SessionRef::new(Provider::AntigravityDesktop, Uuid::new_v4().to_string());
+    let histories = environment.home.join("antigravity-desktop/conversations");
+    fs::create_dir_all(&histories).unwrap();
+    Connection::open(histories.join(format!("{}.db", session.id)))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES (0, x'080e9a010b0a096672657368776f7264');",
+        )
+        .unwrap();
+
+    fs::create_dir_all(&environment.state_root).unwrap();
+    let index = environment.state_root.join("store.sqlite3");
+    let store = Store::open(&index).unwrap();
+    let old_time = Utc::now() + chrono::Duration::hours(1);
+    store
+        .upsert_session_trajectory(&session, "obsolete wording", old_time, true)
+        .unwrap();
+    Connection::open(index)
+        .unwrap()
+        .execute("UPDATE session_trajectories SET document_version = 5", [])
+        .unwrap();
+    store
+        .record_trajectory_index_failure(
+            &session,
+            &omnis_store::TrajectoryIndexFailure {
+                source_updated_at: Some(old_time),
+                source_file: None,
+                source_contents: None,
+                source_time_precise: true,
+                document_version: 5,
+            },
+        )
+        .unwrap();
+
+    let search = environment
+        .command()
+        .args([
+            "--json",
+            "search",
+            "--provider",
+            "antigravity-desktop",
+            "--all-projects",
+            "freshword",
+        ])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{search:?}");
+    assert!(
+        String::from_utf8(search.stdout)
+            .unwrap()
+            .contains(&session.id)
+    );
+    assert_eq!(
+        store
+            .search_session_trajectories("freshword", 1)
+            .unwrap()
+            .first(),
+        Some(&session)
+    );
+    assert!(
+        !store
+            .trajectory_index_failures()
+            .unwrap()
+            .contains_key(&session)
+    );
+    let warm = environment
+        .command()
+        .args(["--json", "index", "--provider", "antigravity-desktop"])
+        .output()
+        .unwrap();
+    assert!(warm.status.success(), "{warm:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(summary["stale"], 0);
+}
+
+#[test]
+fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = environment.home.join("antigravity-cli");
+    let id = Uuid::new_v4().to_string();
+    let logs = home.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'History', 2, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
+    let search = |term: &str| {
+        let output = environment
+            .command()
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let preferred = logs.join("transcript_full.jsonl");
+    let fallback = logs.join("transcript.jsonl");
+    let first = r#"{"type":"USER_INPUT","content":"firstword"}"#;
+    let last = r#"{"type":"USER_INPUT","content":"restoredword"}"#;
+    fs::write(&preferred, first).unwrap();
+    assert_eq!(search("firstword")["results"].as_array().unwrap().len(), 1);
+    fs::rename(&preferred, &fallback).unwrap();
+    fs::write(&fallback, r#"{"type":"USER_INPUT","content":"torn"#).unwrap();
+    let failed = search("firstword");
+    assert_eq!(failed["index"]["failed"], 1);
+    assert_eq!(failed["results"].as_array().unwrap().len(), 1);
+    fs::write(&fallback, first).unwrap();
+    assert_eq!(search("firstword")["index"]["indexed"], 1);
+    fs::write(&preferred, format!("{first}\n{last}")).unwrap();
+    assert_eq!(
+        search("restoredword")["results"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {

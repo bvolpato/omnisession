@@ -303,15 +303,12 @@ pub(super) fn spawn_cache_updates(
         let freshness = PROVIDERS.map(|provider| {
             (
                 provider,
-                store
-                    .session_index_checked_at(provider)
-                    .map_err(|error| error.to_string()),
+                picker_discovery_due(&store, provider, cache_loaded),
             )
         });
-        for (provider, checked_at) in freshness {
-            let refresh = match checked_at {
-                Ok(Some(checked_at)) => !cache_loaded || !session_cache_is_fresh(checked_at),
-                Ok(None) => true,
+        for (provider, due) in freshness {
+            let refresh = match due {
+                Ok(due) => due,
                 Err(error) => {
                     if sender
                         .send(PickerUpdate::Warning(format!(
@@ -346,6 +343,27 @@ pub(super) fn spawn_cache_updates(
             );
         }
     });
+}
+
+fn picker_discovery_due(
+    store: &Store,
+    provider: Provider,
+    cache_loaded: bool,
+) -> omnis_store::Result<bool> {
+    if !cache_loaded
+        || !store
+            .session_index_checked_at(provider)?
+            .is_some_and(session_cache_is_fresh)
+    {
+        return Ok(true);
+    }
+    // Cached metadata has no source paths. Rediscover these sessions for the background reader.
+    match provider {
+        Provider::Antigravity | Provider::AntigravityDesktop => {
+            store.has_outdated_search_index(provider, omnis_core::search_document_version(provider))
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) fn spawn_all_provider_updates(
@@ -604,7 +622,7 @@ fn read_picker_preview(
     let mut retry = true;
     loop {
         let writer = store.and_then(|store| {
-            let observed = if file_backed {
+            let observed = if file_backed || key.session.provider == Provider::Antigravity {
                 store.observe_verified_session(&key.session)
             } else {
                 search_index::observe_source(store, &key.session)

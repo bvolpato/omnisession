@@ -132,7 +132,9 @@ impl IndexedSessionReader for AdapterRegistry {
         };
         let mut retry = true;
         loop {
-            let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+            let observed = if TrajectorySourceGuard::uses_file_time(session.provider)
+                || session.provider == Provider::Antigravity
+            {
                 store
                     .observe_verified_session(session)
                     .map(|guard| (None, guard))
@@ -181,7 +183,7 @@ impl IndexedSessionReader for AdapterRegistry {
                     return Ok(snapshot);
                 }
             };
-            let version = omnis_core::search_document_version(snapshot.session.provider);
+            let version = search_version(session, &snapshot);
             let current = prior.is_some_and(|state| {
                 state.document_version > version
                     || (state.source_complete
@@ -212,6 +214,14 @@ impl IndexedSessionReader for AdapterRegistry {
             }
             return Ok(snapshot);
         }
+    }
+}
+
+fn search_version(session: &SessionRef, snapshot: &CanonicalSnapshot) -> u32 {
+    if session.provider == Provider::Imported {
+        omnis_core::imported_search_document_version(snapshot.session.provider)
+    } else {
+        omnis_core::search_document_version(session.provider)
     }
 }
 
@@ -247,17 +257,19 @@ fn store_search_document(
         source_complete: full_read,
         provider_limited: false,
         origin,
-        document_version: omnis_core::search_document_version(snapshot.session.provider),
+        document_version: search_version(session, snapshot),
         derived_title: derived_title.as_deref(),
         title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
     };
-    let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let rewritten = if source_revision.file.is_some()
+        || TrajectorySourceGuard::uses_file_time(session.provider)
+    {
         let native = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
-        let verify = |_: &SessionRef, expected: SourceRevision| {
+        let verify = |selected: &SessionRef, expected: SourceRevision| {
             native
                 .source_path
                 .as_deref()
-                .and_then(omnis_adapters::source_file_revision)
+                .and_then(|path| omnis_adapters::selected_search_file_revision(selected, path))
                 .is_some_and(|current| expected.matches_file_contents(current))
         };
         store.upsert_verified_session_document_checked(
@@ -1054,7 +1066,9 @@ fn search_text(
 }
 
 fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
-    if conversation.complete {
+    if conversation.truncation_strategy == "provider_read_limit" {
+        "source-limit"
+    } else if conversation.complete {
         "complete"
     } else if head_tail_coverage(conversation) {
         "head-tail"
@@ -1239,7 +1253,9 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
-    if TrajectorySourceGuard::uses_file_time(session.provider) {
+    if TrajectorySourceGuard::uses_file_time(session.provider)
+        || session.provider == Provider::Antigravity
+    {
         let adapter = registry.adapter(session.provider)?;
         let read = if full_read {
             adapter.read_full_index_at(session, None)?

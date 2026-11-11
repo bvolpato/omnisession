@@ -46,6 +46,16 @@ pub use pi::{InvalidPiTree, PiAdapter};
 pub use provider_process::{bounded_provider_output, provider_process};
 pub use source_file::source_file_revision;
 pub use support::TranscriptReadLimit;
+pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
+
+/// Reads the revision of the file selected for this session in the configured provider store.
+#[must_use]
+pub fn selected_search_file_revision(session: &SessionRef, path: &Path) -> Option<SourceRevision> {
+    if session.provider == Provider::Antigravity {
+        return antigravity::selected_transcript_revision(session, path);
+    }
+    source_file_revision(path)
+}
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +92,22 @@ pub struct IndexRead {
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+}
+
+/// The searchable result of a provider read, including its source time and coverage.
+pub struct IndexedSearchDocument {
+    pub document: omnis_core::SearchDocument,
+    /// Native metadata and the visible message used to derive a search title.
+    pub read: IndexRead,
+}
+
+impl From<IndexRead> for IndexedSearchDocument {
+    fn from(read: IndexRead) -> Self {
+        Self {
+            document: omnis_core::trajectory_search_document(&read.snapshot),
+            read,
+        }
+    }
 }
 
 /// Provider-specific launch input.
@@ -316,6 +342,22 @@ pub trait ProviderAdapter: Send + Sync {
                 self.read_session_at(session, source_path)
             }
         })
+    }
+
+    /// Builds the local search document with the provider's full-read or preview budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+        _prior_search_bytes: Option<usize>,
+    ) -> Result<IndexedSearchDocument> {
+        self.index_session(session, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     /// Describes a fresh interactive provider launch.

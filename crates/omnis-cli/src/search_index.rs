@@ -17,10 +17,10 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
+use omnis_adapters::{AdapterRegistry, IndexRead, IndexedSearchDocument, NativeSession};
 use omnis_core::{
-    SearchDocument, search_document_version, session_search_title, trajectory_search_document,
-    workspace_paths_match,
+    SearchDocument, imported_search_document_version, search_document_version,
+    session_search_title, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -75,7 +75,7 @@ impl IndexCandidate {
     fn file_matches(&self, revision: SourceRevision) -> bool {
         self.source_path
             .as_deref()
-            .and_then(omnis_adapters::source_file_revision)
+            .and_then(|path| omnis_adapters::selected_search_file_revision(&self.session, path))
             .is_some_and(|current| current.matches_file_contents(revision))
     }
 
@@ -135,7 +135,9 @@ pub(crate) fn observe_source(
     store: &Store,
     session: &SessionRef,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
-    if TrajectorySourceGuard::uses_file_time(session.provider) {
+    if TrajectorySourceGuard::uses_file_time(session.provider)
+        || session.provider == Provider::Antigravity
+    {
         store.observe_trajectory_document(session)
     } else {
         Ok(TrajectorySourceGuard::NewerSource)
@@ -154,7 +156,7 @@ pub(crate) fn needs_index(
         return false;
     }
     state.document_version < version
-        || (candidate.source_revision.file.is_some()
+        || ((candidate.source_revision.file.is_some() || (candidate.session.provider == Provider::Antigravity && state.source_revision.file.is_some()))
             && !candidate.source_revision.matches_file_contents(state.source_revision))
         || (candidate.session.provider == Provider::OhMyPi
             && !state.source_complete
@@ -206,6 +208,7 @@ pub(crate) fn retryable_read_failure(error: &anyhow::Error) -> bool {
             })
             // Adapters report sources rewritten during a snapshot or read with this wording.
             || cause.to_string().contains("changed during")
+            || cause.is::<omnis_adapters::IncompleteTranscript>()
             // A temporary I/O failure says nothing about the session contents.
             || cause
                 .downcast_ref::<std::io::Error>()
@@ -242,20 +245,36 @@ pub(crate) fn ordered_candidates(
         .collect()
 }
 
-fn read_budget(candidate: &IndexCandidate, prior: Option<&TrajectoryIndexState>) -> u64 {
+#[derive(Clone, Copy)]
+struct ReadBudget {
+    bytes: u64,
+    prior_search_bytes: Option<usize>,
+}
+
+fn read_budget(candidate: &IndexCandidate, prior: Option<&TrajectoryIndexState>) -> ReadBudget {
     // Read the full source when upgrading a document from a full or provider-limited read.
-    if prior.is_some_and(|state| {
+    let full = prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
             && (state.document_version < candidate.document_version
+                || (candidate.session.provider == Provider::Antigravity
+                    && !candidate
+                        .source_revision
+                        .matches_file_contents(state.source_revision))
                 || (candidate.source_revision.file.is_some()
                     && (state.source_revision.file.is_none()
                         || state.source_revision.contents.is_none()))
                 || (TrajectorySourceGuard::uses_file_time(candidate.session.provider)
                     && !state.source_time_precise))
-    }) {
-        u64::MAX
-    } else {
-        FULL_READ_SOURCE_BYTES
+    });
+    ReadBudget {
+        bytes: if full {
+            u64::MAX
+        } else {
+            FULL_READ_SOURCE_BYTES
+        },
+        prior_search_bytes: prior
+            .filter(|_| full && candidate.session.provider == Provider::Antigravity)
+            .map(|state| state.source_byte_count),
     }
 }
 
@@ -269,7 +288,7 @@ struct Pending {
 fn imported_document_versions(store: &Store) -> Result<HashMap<String, u32>> {
     let mut versions = HashMap::new();
     for &provider in Provider::ALL {
-        let version = search_document_version(provider);
+        let version = imported_search_document_version(provider);
         if version != search_document_version(Provider::Imported) {
             let ids = store.bundle_ids_for_source_provider(provider)?;
             versions.extend(ids.into_iter().map(|id| (id, version)));
@@ -403,12 +422,13 @@ pub(crate) fn index_candidates(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
-        // Read an oversized full transcript on the calling thread to bound peak memory.
-        (reads_transcript_file(candidate.session.provider)
-            && (*budget == FULL_READ_SOURCE_BYTES || !candidate.oversized()))
-        .then(|| prepare_session(registry, candidate, *guard, *budget))
-    };
+    let prepare =
+        |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, ReadBudget)| {
+            // Read an oversized full transcript on the calling thread to bound peak memory.
+            (reads_transcript_file(candidate.session.provider)
+                && (budget.bytes == FULL_READ_SOURCE_BYTES || !candidate.oversized()))
+            .then(|| prepare_session(registry, candidate, *guard, *budget))
+        };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
@@ -652,7 +672,9 @@ fn reread_after_conflict(
     candidate: &IndexCandidate,
 ) -> anyhow::Result<PreparedIndex> {
     let session = &candidate.session;
-    let guard = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let guard = if TrajectorySourceGuard::uses_file_time(session.provider)
+        || candidate.source_revision.file.is_some()
+    {
         store.observe_verified_session(session)?
     } else {
         observe_source(store, session)?
@@ -778,10 +800,10 @@ fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
     guard: TrajectorySourceGuard,
-    full_read_bytes: u64,
+    budget: ReadBudget,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
-    let (read, source_updated_at) = if imported {
+    let (indexed, source_updated_at) = if imported {
         let snapshot = read_session(registry, &candidate.session)?;
         let updated_at = snapshot.captured_at;
         (
@@ -791,15 +813,20 @@ fn prepare_session(
                 snapshot,
                 source_complete: true,
                 provider_limited: false,
-            },
+            }
+            .into(),
             Some(updated_at),
         )
     } else if candidate.source_revision.file.is_some() {
-        let read = registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            full_read_bytes,
-        )?;
+        let indexed = registry
+            .adapter(candidate.session.provider)?
+            .index_search_document(
+                &candidate.session,
+                candidate.source_path.as_deref(),
+                budget.bytes,
+                budget.prior_search_bytes,
+            )?;
+        let read = &indexed.read;
         anyhow::ensure!(
             candidate
                 .source_revision
@@ -810,19 +837,25 @@ fn prepare_session(
             .native_session
             .as_ref()
             .and_then(|native| native.updated_at);
-        (read, modified)
+        (indexed, modified)
     } else {
         registry.observe_search_read(
             &candidate.session,
             candidate.source_path.as_deref(),
             |adapter, path| {
-                let read = adapter.index_session(&candidate.session, path, full_read_bytes)?;
-                let captured = read.snapshot.captured_at;
+                let indexed = adapter.index_search_document(
+                    &candidate.session,
+                    path,
+                    budget.bytes,
+                    budget.prior_search_bytes,
+                )?;
+                let captured = indexed.read.snapshot.captured_at;
                 let updated_at = candidate.updated_at.unwrap_or(captured).max(captured);
-                Ok((read, updated_at))
+                Ok((indexed, updated_at))
             },
         )?
     };
+    let IndexedSearchDocument { document, read } = indexed;
     let IndexRead {
         snapshot,
         source_complete,
@@ -830,7 +863,6 @@ fn prepare_session(
         native_session,
         source_revision,
     } = read;
-    let document = trajectory_search_document(&snapshot);
     let source_updated_at = source_updated_at
         .ok_or_else(|| anyhow::anyhow!("transcript changed during search read"))?;
     let origin = if imported {
@@ -850,7 +882,10 @@ fn prepare_session(
         previous_failure: None,
         verified_metadata: native_session
             .as_ref()
-            .filter(|_| matches!(guard, TrajectorySourceGuard::Verified(_)))
+            .filter(|_| {
+                source_revision.file.is_some()
+                    && matches!(guard, TrajectorySourceGuard::Verified(_))
+            })
             .map(crate::indexed_session_metadata),
         candidate: selected,
         document,
@@ -1004,6 +1039,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            source_byte_count: 0,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(true),
             source_updated_at: now,
@@ -1051,6 +1087,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            source_byte_count: 0,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(false),
             source_updated_at: now,
@@ -1363,7 +1400,16 @@ mod tests {
         })?;
         let candidate = IndexCandidate::from_session(&listed).unwrap();
         let guard = store.observe_verified_session(session)?;
-        prepare_session(&registry, &candidate, guard, 0)?.store(&store)?;
+        prepare_session(
+            &registry,
+            &candidate,
+            guard,
+            ReadBudget {
+                bytes: 0,
+                prior_search_bytes: None,
+            },
+        )?
+        .store(&store)?;
 
         let document = store.trajectory_index_state(session)?.unwrap();
         assert!(!document.source_complete && !document.provider_limited);
@@ -1461,7 +1507,10 @@ mod tests {
             &registry,
             &candidate,
             observe_source(&store, &session)?,
-            FULL_READ_SOURCE_BYTES,
+            ReadBudget {
+                bytes: FULL_READ_SOURCE_BYTES,
+                prior_search_bytes: None,
+            },
         )?;
         replace("bravo")?;
         let guard = store.observe_verified_session(&session)?;
