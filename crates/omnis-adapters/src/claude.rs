@@ -39,6 +39,7 @@ pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
     session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
     notes: Arc<Mutex<Vec<String>>>,
+    listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl ClaudeAdapter {
@@ -48,6 +49,7 @@ impl ClaudeAdapter {
             projects_root: Some(projects_root.into()),
             session_files: Arc::default(),
             notes: Arc::default(),
+            listed_paths: Arc::default(),
         }
     }
 
@@ -114,6 +116,21 @@ impl ClaudeAdapter {
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
+    fn session_path(&self, id: &str, hint: Option<&Path>) -> Result<PathBuf> {
+        if let (Some(root), Some(hint)) = (self.projects_root.as_deref(), hint) {
+            let known = self
+                .listed_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(id)
+                .is_some_and(|path| path == hint);
+            if known && let Some(path) = provider_file(root, hint) {
+                return Ok(path);
+            }
+        }
+        self.find_session(id)
+    }
+
     fn history_index(&self) -> ClaudeHistory {
         let Some(config_root) = self.projects_root.as_deref().and_then(Path::parent) else {
             return ClaudeHistory::default();
@@ -176,6 +193,7 @@ impl Default for ClaudeAdapter {
                 .map(|root| root.join("projects")),
             session_files: Arc::default(),
             notes: Arc::default(),
+            listed_paths: Arc::default(),
         }
     }
 }
@@ -1072,15 +1090,15 @@ impl ProviderAdapter for ClaudeAdapter {
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
             let mut sessions = Vec::new();
             for (id, path) in session_files {
-                if selected
-                    .get(id)
-                    .is_some_and(|chosen| chosen.as_ref() != Some(path))
-                {
-                    continue;
-                }
                 let Some(path) = files.as_mut().and_then(|files| files.resolve(path)) else {
                     continue;
                 };
+                if selected
+                    .get(id)
+                    .is_some_and(|chosen| chosen.as_ref() != Some(&path))
+                {
+                    continue;
+                }
                 let indexed = history.sessions.get(id);
                 let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
                 let fallback = sample
@@ -1133,6 +1151,14 @@ impl ProviderAdapter for ClaudeAdapter {
             }
             sessions
         });
+        self.listed_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                sessions
+                    .iter()
+                    .filter_map(|s| Some((s.session.id.clone(), s.source_path.clone()?))),
+            );
         *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -1189,9 +1215,9 @@ impl ProviderAdapter for ClaudeAdapter {
     fn search_transcript_path(
         &self,
         session: &SessionRef,
-        _hint: Option<&Path>,
+        hint: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        self.find_session(&session.id).map(Some)
+        self.session_path(&session.id, hint).map(Some)
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1201,10 +1227,10 @@ impl ProviderAdapter for ClaudeAdapter {
     fn read_session_at(
         &self,
         session: &SessionRef,
-        _source_path: Option<&Path>,
+        source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         let mut transcript = ClaudeTranscript::default();
         let oversized_records =
             visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
@@ -1221,11 +1247,11 @@ impl ProviderAdapter for ClaudeAdapter {
     fn preview_session_at(
         &self,
         session: &SessionRef,
-        _source_path: Option<&Path>,
+        source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         const SAMPLE_RECORDS: usize = 1_024;
         validate_provider(session, Provider::Claude)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
         let mut transcript = ClaudeTranscript::default();
         for record in records {

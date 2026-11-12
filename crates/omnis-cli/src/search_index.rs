@@ -32,7 +32,7 @@ use omnis_store::{
 use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
-const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 // Retry failures saved by readers that could not fall back at the transcript limit.
 const INDEX_FAILURE_VERSION: u32 = SEARCH_DOCUMENT_VERSION + 1;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -228,6 +228,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
                 candidate.revision.map(|revision| revision.bytes),
                 candidate.updated_at,
                 SEARCH_DOCUMENT_VERSION,
+                crate::search_index::FULL_READ_SOURCE_BYTES,
             )?;
             stale.push(candidate);
         }

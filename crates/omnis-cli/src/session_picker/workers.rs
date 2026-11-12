@@ -455,7 +455,12 @@ struct PickerPreviewRead {
 }
 
 impl PickerPreviewRead {
-    fn store(&self, store: &Store, key: &PreviewKey) -> omnis_store::Result<PreviewTitle> {
+    fn store(
+        &self,
+        registry: &AdapterRegistry,
+        store: &Store,
+        key: &PreviewKey,
+    ) -> Result<PreviewTitle> {
         let snapshot = &self.read.snapshot;
         let origin = if key.session.provider == Provider::Imported {
             SessionTrajectoryOrigin::ImportedBundle
@@ -474,7 +479,7 @@ impl PickerPreviewRead {
             provider_limited: self.read.provider_limited,
         };
         crate::store_search_document(
-            store,
+            (store, Some(registry)),
             &key.session,
             snapshot,
             &trajectory_search_document(snapshot),
@@ -483,9 +488,7 @@ impl PickerPreviewRead {
             (observed, source),
         )?;
         if key.session.provider == Provider::Claude {
-            store
-                .trajectory_title(&key.session)
-                .map(PreviewTitle::Indexed)
+            Ok(PreviewTitle::Indexed(store.trajectory_title(&key.session)?))
         } else {
             Ok(PreviewTitle::FromPreview)
         }
@@ -518,6 +521,7 @@ fn read_picker_preview(
                 revision.map(|r| r.bytes),
                 key.updated_at,
                 omnis_core::SEARCH_DOCUMENT_VERSION,
+                crate::search_index::FULL_READ_SOURCE_BYTES,
             )
             .unwrap_or(false)
     }) {
@@ -585,7 +589,7 @@ pub(super) fn spawn_preview_updates(
                     let read = read_picker_preview(&registry, &key, store.as_ref());
                     read.map_or(PreviewValue::Unavailable, |preview| {
                         if let Some(store) = &store {
-                            match preview.store(store, &key) {
+                            match preview.store(&registry, store, &key) {
                                 Ok(title) => indexed_title = title,
                                 Err(error) => {
                                     let _ = sender.send(PickerUpdate::Warning(format!(

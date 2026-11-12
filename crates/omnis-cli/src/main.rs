@@ -150,7 +150,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 if !current {
                     let document = trajectory_search_document(&snapshot);
                     if let Err(error) = store_search_document(
-                        &store,
+                        (&store, Some(self)),
                         session,
                         &snapshot,
                         &document,
@@ -186,16 +186,16 @@ impl IndexedSessionReader for AdapterRegistry {
 /// reported by the adapter stay visible through the document's truncation strategy, so a full
 /// read of such a source is current and does not need indexing again.
 fn store_search_document(
-    store: &Store,
+    (store, registry): (&Store, Option<&AdapterRegistry>),
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     document: &omnis_core::SearchDocument,
     full_read: bool,
     origin: SessionTrajectoryOrigin,
     source: (chrono::DateTime<Utc>, omnis_store::TrajectorySource),
-) -> omnis_store::Result<Option<String>> {
+) -> Result<Option<String>> {
     let derived_title = omnis_core::session_search_title(snapshot);
-    let index_document = omnis_store::TrajectoryDocument {
+    let mut index_document = omnis_store::TrajectoryDocument {
         source: source.1,
         redacted_text: &document.text,
         source_updated_at: source.0,
@@ -207,12 +207,28 @@ fn store_search_document(
         document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
         derived_title: derived_title.as_deref(),
     };
-    if full_read || source.1.provider_limited {
-        store.upsert_trajectory_document(session, &index_document)?;
-    } else {
-        store.upsert_trajectory_preview(session, &index_document)?;
+    for _ in 0..4 {
+        if full_read || source.1.provider_limited {
+            store.upsert_trajectory_document(session, &index_document)?;
+        } else {
+            store.upsert_trajectory_preview(session, &index_document)?;
+        }
+        let (Some(registry), Some(key)) = (registry, source.1.revision) else {
+            return Ok(derived_title);
+        };
+        let observed = store.trajectory_write_guard(session)?;
+        if observed == omnis_store::TrajectoryWriteGuard::Existing(Some(key)) {
+            return Ok(derived_title);
+        }
+        anyhow::ensure!(
+            registry
+                .search_revision(session, None)?
+                .is_some_and(|revision| revision.key == key),
+            "selected transcript changed before publishing its search document"
+        );
+        index_document.source.expected = observed;
     }
-    Ok(derived_title)
+    anyhow::bail!("concurrent trajectory updates prevented publishing the search document")
 }
 
 fn build_search_index(
@@ -2615,7 +2631,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         .context("indexing imported bundle metadata")?;
     let document = trajectory_search_document(&bundle.snapshot);
     store_search_document(
-        store,
+        (store, None),
         &imported,
         &bundle.snapshot,
         &document,

@@ -512,7 +512,8 @@ impl TranscriptRevision {
     ///
     /// Returns an error when the file metadata cannot be read.
     pub fn read(path: &Path) -> io::Result<Self> {
-        let stamp = SnapshotFileStamp::read(path)?;
+        let path = path.canonicalize()?;
+        let stamp = SnapshotFileStamp::read(&path)?;
         let modified = DateTime::<Utc>::from(stamp.modified);
         let mut hash = Sha256::new();
         hash.update(path.as_os_str().as_encoded_bytes());

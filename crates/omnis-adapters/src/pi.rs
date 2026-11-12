@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     time::SystemTime,
 };
 
@@ -34,12 +35,14 @@ const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
 pub struct PiAdapter {
     provider: Provider,
     sessions_root: Option<PathBuf>,
+    listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl PiAdapter {
     #[must_use]
     pub fn with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
+            listed_paths: Arc::default(),
             provider: Provider::Pi,
             sessions_root: Some(sessions_root.into()),
         }
@@ -48,6 +51,7 @@ impl PiAdapter {
     #[must_use]
     pub fn oh_my_pi() -> Self {
         Self {
+            listed_paths: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: crate::oh_my_pi_sessions_root(),
         }
@@ -56,13 +60,15 @@ impl PiAdapter {
     #[must_use]
     pub fn oh_my_pi_with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
+            listed_paths: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: Some(sessions_root.into()),
         }
     }
 
     fn session_files(&self) -> Vec<PathBuf> {
-        self.sessions_root
+        let mut paths: Vec<PathBuf> = self
+            .sessions_root
             .as_deref()
             .map(|root| {
                 nested_files(root, 1, None)
@@ -73,7 +79,9 @@ impl PiAdapter {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        paths.sort();
+        paths
     }
 
     fn find_session(&self, id: &str) -> Result<PathBuf> {
@@ -84,7 +92,7 @@ impl PiAdapter {
     }
 
     fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
-        let hinted = source_path.and_then(|source_path| {
+        let validate = |source_path: &Path| {
             let root = self.sessions_root.as_deref()?;
             let path = provider_file(root, source_path)?;
             if !path
@@ -97,8 +105,19 @@ impl PiAdapter {
                 .ok()
                 .filter(|header| header.id == id)
                 .map(|_| path)
-        });
-        hinted.map_or_else(|| self.find_session(id), Ok)
+        };
+        let listed = self
+            .listed_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned();
+        if let Some(path) = listed.as_deref().and_then(validate) {
+            return Ok(path);
+        }
+        source_path
+            .and_then(validate)
+            .map_or_else(|| self.find_session(id), Ok)
     }
 }
 
@@ -112,6 +131,7 @@ impl Default for PiAdapter {
                     .map(|root| root.join("sessions"))
             });
         Self {
+            listed_paths: Arc::default(),
             provider: Provider::Pi,
             sessions_root,
         }
@@ -1014,10 +1034,17 @@ impl ProviderAdapter for PiAdapter {
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
+        let mut listed_paths = HashMap::new();
         for path in self.session_files() {
             let Ok(header) = read_header(&path, self.provider) else {
                 continue;
             };
+            let std::collections::hash_map::Entry::Vacant(entry) =
+                listed_paths.entry(header.id.clone())
+            else {
+                continue;
+            };
+            entry.insert(path.clone());
             if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
                 continue;
             }
@@ -1037,6 +1064,10 @@ impl ProviderAdapter for PiAdapter {
                 source_path: Some(path),
             });
         }
+        *self
+            .listed_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = listed_paths;
         sort_sessions(&mut sessions);
         Ok(sessions)
     }
@@ -1046,7 +1077,13 @@ impl ProviderAdapter for PiAdapter {
         session: &SessionRef,
         hint: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        self.session_path(&session.id, hint).map(Some)
+        self.session_path(&session.id, None)
+            .or_else(|error| {
+                hint.map_or(Err(error), |path| {
+                    self.session_path(&session.id, Some(path))
+                })
+            })
+            .map(Some)
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {

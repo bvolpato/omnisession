@@ -2140,14 +2140,15 @@ impl Store {
         bytes: Option<i64>,
         updated_at: Option<DateTime<Utc>>,
         version: u32,
+        full_read_bytes: u64,
     ) -> Result<bool> {
         self.connection.borrow().query_row(
             "SELECT EXISTS (SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
                 AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))
-                AND source_complete AND ((?5 IS NOT NULL AND source_revision IS NOT ?5 AND (source_file_bytes IS NULL OR source_file_bytes >= ?6))
+                AND source_complete AND ((?5 IS NOT NULL AND source_revision IS NOT ?5 AND (source_file_bytes IS NULL OR source_file_bytes >= ?6 OR ?6 <= ?7))
                 OR (document_version < ?3 AND (CASE WHEN ?5 IS NOT NULL THEN source_revision = ?5
                     ELSE ?4 IS NULL OR source_updated_at >= ?4 END))))",
-            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis()), revision, bytes],
+            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis()), revision, bytes, i64::try_from(full_read_bytes).unwrap_or(i64::MAX)],
             |row| row.get(0),
         ).map_err(database_error)
     }
