@@ -2151,3 +2151,48 @@ fn compressed_archive_uses_the_name_and_reply_of_the_registered_generation() -> 
     assert_eq!(visible_text(&read.snapshot), ["Archived reply"]);
     Ok(())
 }
+
+#[test]
+fn assigned_legacy_opener_survives_only_agreeing_archive_copies() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().canonicalize()?;
+    let active_dir = home.join("sessions");
+    let archived_dir = home.join("archived_sessions");
+    fs::create_dir(&active_dir)?;
+    fs::create_dir(&archived_dir)?;
+    let file = format!("rollout-2026-10-02T00-00-00-{SESSION_ID}.jsonl");
+    let active = active_dir.join(&file);
+    let archived = archived_dir.join(file);
+    let opener = "Synthetic first question";
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example","history_mode":"legacy"}});
+    let text = format!(
+        "{header}\n{}\n{}\n",
+        message("user", opener),
+        message("assistant", "Reply A")
+    );
+    fs::write(&active, &text)?;
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,?3,?3)",
+        rusqlite::params![SESSION_ID, active.to_str(), opener],
+    )?;
+    let index = home.join("session_index.jsonl");
+    fs::write(
+        &index,
+        json!({"id":SESSION_ID,"thread_name":opener}).to_string(),
+    )?;
+    fs::copy(&active, &archived)?;
+    check_gui_title(&home, &active, Some(opener))?;
+    fs::write(&archived, text.replace("Reply A", "Reply B"))?;
+    check_gui_title(&home, &active, None)?;
+    fs::copy(&active, &archived)?;
+    fs::write(
+        &index,
+        json!({"id":SESSION_ID,"thread_name":"Unrelated stale name"}).to_string(),
+    )?;
+    check_gui_title(&home, &active, None)?;
+    fs::remove_file(&index)?;
+    check_gui_title(&home, &active, None)?;
+    Ok(())
+}

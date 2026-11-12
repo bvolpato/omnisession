@@ -8,6 +8,7 @@ pub(super) const WHITESPACE: &str = " \t\n\r\u{b}\u{c}\u{85}\u{a0}\u{1680}\u{200
 pub(super) enum StateName {
     #[default]
     Index,
+    CorroboratedIndex,
     Gui(Option<String>),
     Guardian(String),
 }
@@ -15,13 +16,17 @@ pub(super) enum StateName {
 impl StateName {
     pub(super) fn projection(columns: &HashMap<String, i64>) -> String {
         if columns.get("id") != Some(&1) || !columns.contains_key("history_mode") {
-            return "NULL, 0, 0".into();
+            return "NULL, 0, 0, 0".into();
         }
-        let legacy = if columns.contains_key("title") && columns.contains_key("first_user_message")
+        let (legacy, corroborated) = if columns.contains_key("title")
+            && columns.contains_key("first_user_message")
         {
-            "CASE WHEN trim(title, ?2) IS NOT trim(first_user_message, ?2) THEN title END"
+            (
+                "CASE WHEN trim(title, ?2) IS NOT trim(first_user_message, ?2) THEN title END",
+                "history_mode IS 'legacy' AND trim(title, ?2) = ?3 AND trim(first_user_message, ?2) = ?3",
+            )
         } else {
-            "NULL"
+            ("NULL", "0")
         };
         let paginated = if columns.contains_key("name") {
             "name"
@@ -39,7 +44,7 @@ impl StateName {
             "0"
         };
         format!(
-            "trim(CASE history_mode WHEN 'paginated' THEN {paginated} WHEN 'legacy' THEN {legacy} END, ?2), {authoritative}, {guardian}"
+            "trim(CASE history_mode WHEN 'paginated' THEN {paginated} WHEN 'legacy' THEN {legacy} END, ?2), {authoritative}, {guardian}, {corroborated}"
         )
     }
 
@@ -57,13 +62,14 @@ impl StateName {
                 Self::Guardian(text)
             }
             Some(text) => Self::Gui(Some(text)),
+            None if row.get::<_, bool>(6).unwrap_or(false) => Self::CorroboratedIndex,
             None => Self::Index,
         }
     }
 
     pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
         match self {
-            Self::Index => indexed(),
+            Self::Index | Self::CorroboratedIndex => indexed(),
             Self::Gui(name) => name.clone(),
             Self::Guardian(name) => indexed().or_else(|| Some(name.clone())),
         }

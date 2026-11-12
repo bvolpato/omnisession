@@ -21,6 +21,8 @@ use super::{
 };
 use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
 
+const COPY_COMPARISON_BYTES: u64 = 64 * 1024 * 1024;
+
 pub(super) type CurrentRolloutStamp = (PathBuf, SqliteSourceStamp);
 
 pub(super) fn ids(path: &Path) -> Option<(&str, &str)> {
@@ -95,10 +97,28 @@ impl CurrentRollouts {
         self.rows_in(&self.root(home)?, ids)
     }
 
+    pub(super) fn rows_with_titles<'a>(
+        &self,
+        home: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+        titles: &HashMap<String, String>,
+    ) -> Result<HashMap<String, CurrentRollout>> {
+        self.read_rows(&self.root(home)?, ids, Some(titles))
+    }
+
     pub(super) fn rows_in<'a>(
         &self,
         root: &Path,
         ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, CurrentRollout>> {
+        self.read_rows(root, ids, None)
+    }
+
+    fn read_rows<'a>(
+        &self,
+        root: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+        titles: Option<&HashMap<String, String>>,
     ) -> Result<HashMap<String, CurrentRollout>> {
         let mut ids = ids.into_iter().peekable();
         if ids.peek().is_none() {
@@ -155,9 +175,13 @@ impl CurrentRollouts {
                     if let Some(pointer) = statement
                         .query_row(
                             rusqlite::params_from_iter(
-                                [id, gui_names::WHITESPACE]
-                                    .into_iter()
-                                    .take(parameter_count),
+                                [
+                                    Some(id),
+                                    Some(gui_names::WHITESPACE),
+                                    titles.and_then(|names| names.get(id)).map(String::as_str),
+                                ]
+                                .into_iter()
+                                .take(parameter_count),
                             ),
                             |row| {
                                 Ok(CurrentRollout {
@@ -221,6 +245,56 @@ pub(super) struct CurrentFile {
 impl CurrentRollout {
     pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
         self.name.title(indexed)
+    }
+
+    pub(super) fn corroborates_index_at(&self, selected: &Path) -> bool {
+        matches!(self.name, gui_names::StateName::CorroboratedIndex)
+            && (self.path == selected
+                || self
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|path| selected.canonicalize().is_ok_and(|current| current == path)))
+    }
+
+    pub(super) fn index_copies_match<'a>(
+        &self,
+        home: &Path,
+        id: &str,
+        selected: &Path,
+        candidates: impl Iterator<Item = &'a Path>,
+    ) -> Result<bool> {
+        let root = fs::canonicalize(home)?;
+        if !live_rollout_path(home, &root, selected) {
+            return Ok(false);
+        }
+        let Some(original) = self.check(selected, id)? else {
+            return Ok(false);
+        };
+        let mut digest = None;
+        let mut remaining = COPY_COMPARISON_BYTES;
+        let mut saw_selected = false;
+        let mut saw_copy = false;
+        for path in candidates {
+            if path == selected {
+                saw_selected = true;
+                continue;
+            }
+            if rollout_file::jsonl_file_name(path) != rollout_file::jsonl_file_name(selected)
+                || !live_rollout_path(home, &root, path)
+            {
+                return Ok(false);
+            }
+            let Some(copy) = self.check(path, id)? else {
+                return Ok(false);
+            };
+            if !copies_match(&original, &copy, &mut digest, &mut remaining)? {
+                return Ok(false);
+            }
+            saw_copy = true;
+        }
+        Ok(saw_selected
+            && saw_copy
+            && CodexAdapter::index_file_revision(selected) == Some(original.revision))
     }
 
     pub(super) fn archived_for_launch(&self) -> bool {
@@ -423,7 +497,7 @@ impl CurrentRollout {
         copies.dedup();
         let mut selected: Option<CurrentFile> = None;
         let mut digest = None;
-        let mut bytes = 64 * 1024 * 1024;
+        let mut bytes = COPY_COMPARISON_BYTES;
         for path in copies {
             if !accessible(home, root, &path)? {
                 continue;

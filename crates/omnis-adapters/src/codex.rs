@@ -598,6 +598,21 @@ impl CodexAdapter {
         })
     }
 
+    fn named_rows<'a>(
+        &self,
+        home: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, current_rollout::CurrentRollout>> {
+        self.current
+            .rows_with_titles(home, ids, &self.title_index().titles)
+    }
+
+    fn header_cache(&self, home: &Path) -> Option<RolloutCache> {
+        self.rollout_cache
+            .as_deref()
+            .and_then(|path| RolloutCache::load(path, home))
+    }
+
     fn selected_title(
         &self,
         selected: &SelectedRollout,
@@ -608,7 +623,20 @@ impl CodexAdapter {
         let indexed = || {
             let title = self.title_index().titles.get(&session.id)?;
             let scan = scan();
-            (scan.unique_path(&session.id) == Some(session.path.as_path())).then(|| title.clone())
+            if scan.unique_path(&session.id) == Some(session.path.as_path()) {
+                return Some(title.clone());
+            }
+            if scan.notes.is_empty()
+                && let Some(row) = row
+                && row.corroborates_index_at(&session.path)
+                && let Some(home) = self.codex_home.as_deref()
+                && row
+                    .index_copies_match(home, &session.id, &session.path, scan.paths(&session.id))
+                    .unwrap_or(false)
+            {
+                return Some(title.clone());
+            }
+            None
         };
         match row {
             Some(row) if selected.from_registry || row.ordinary_path_is(&session.path) => {
@@ -635,11 +663,8 @@ impl CodexAdapter {
             .iter()
             .filter(|s| s.session.provider == Provider::Codex)
             .map(|s| s.session.id.as_str());
-        let rows = self.current.rows(home, ids);
-        let mut cache = self
-            .rollout_cache
-            .as_deref()
-            .and_then(|path| RolloutCache::load(path, home));
+        let rows = self.named_rows(home, ids);
+        let mut cache = self.header_cache(home);
         for cached in sessions
             .iter_mut()
             .filter(|s| s.session.provider == Provider::Codex)
@@ -736,11 +761,7 @@ impl CodexAdapter {
         let Some(home) = self.codex_home.as_deref() else {
             return CodexListing::default();
         };
-        let mut cache = self
-            .rollout_cache
-            .as_deref()
-            .zip(self.codex_home.as_deref())
-            .and_then(|(path, home)| RolloutCache::load(path, home));
+        let mut cache = self.header_cache(home);
         let legacy = scan.legacy_paths(home, cache.as_mut());
         let ids = || {
             scan.candidates.keys().chain(
@@ -749,7 +770,7 @@ impl CodexAdapter {
                     .filter(|id| !scan.candidates.contains_key(*id)),
             )
         };
-        let rows = match self.current.rows(home, ids().map(String::as_str)) {
+        let rows = match self.named_rows(home, ids().map(String::as_str)) {
             Ok(rows) => rows,
             Err(error) => {
                 return CodexListing {
@@ -784,6 +805,11 @@ impl CodexAdapter {
                     continue;
                 }
             };
+            if row.is_some_and(|row| row.corroborates_index_at(&selected.session.path))
+                && scan.unique_path(id).is_none()
+            {
+                requires_scan = true;
+            }
             let title = self.selected_title(&selected, row, || Arc::clone(&scan));
             let mut session = selected.session;
             if current_rollout::ids(&session.path).is_none()
@@ -912,7 +938,11 @@ impl CodexAdapter {
         let Ok(canonical_home) = fs::canonicalize(home) else {
             return Ok(None);
         };
-        let rows = self.current.rows(home, [id])?;
+        let rows = if with_title {
+            self.named_rows(home, [id])?
+        } else {
+            self.current.rows(home, [id])?
+        };
         let row = rows.get(id);
         let finish = |mut selected: SelectedRollout| {
             if with_title {
