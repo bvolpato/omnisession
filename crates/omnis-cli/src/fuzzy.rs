@@ -32,7 +32,24 @@ impl SearchFields {
             (session.git_branch.clone(), NAME_BONUS),
             (project.map(|path| path.display().to_string()), 0),
             (Some(session.session.provider.to_string()), 0),
-            (Some(session.session.id.clone()), 0),
+            (
+                Some(
+                    if matches!(
+                        session.session.provider,
+                        omnis_ir::Provider::Pi | omnis_ir::Provider::OhMyPi
+                    ) {
+                        session
+                            .session
+                            .id
+                            .split_once("@workspace=")
+                            .map_or(session.session.id.as_str(), |(id, _)| id)
+                            .to_owned()
+                    } else {
+                        session.session.id.clone()
+                    },
+                ),
+                0,
+            ),
         ];
         Self {
             fields: candidates

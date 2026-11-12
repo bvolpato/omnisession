@@ -107,11 +107,11 @@ impl PiAdapter {
                 && header.id == id
                 && bound
                     .as_ref()
-                    .is_none_or(|workspace| paths_match(workspace, &header.cwd))
+                    .is_none_or(|workspace| workspace == &header.cwd)
             {
                 if let Some((_, workspace)) = &found {
                     anyhow::ensure!(
-                        paths_match(workspace, &header.cwd),
+                        workspace == &header.cwd,
                         "multiple Pi workspaces contain session `{id}`"
                     );
                 } else {
@@ -148,8 +148,7 @@ impl PiAdapter {
             read_header(&path, self.provider)
                 .ok()
                 .filter(|header| {
-                    header.id == id
-                        && workspace.is_none_or(|expected| paths_match(expected, &header.cwd))
+                    header.id == id && workspace.is_none_or(|expected| expected == header.cwd)
                 })
                 .map(|_| path)
         };
@@ -1116,7 +1115,7 @@ impl ProviderAdapter for PiAdapter {
                 continue;
             }
             let seen = workspaces.entry(header.id.clone()).or_default();
-            if seen.iter().any(|cwd| paths_match(cwd, &header.cwd)) {
+            if seen.contains(&header.cwd) {
                 continue;
             }
             let first = seen.is_empty();
@@ -1155,6 +1154,15 @@ impl ProviderAdapter for PiAdapter {
             .unwrap_or_else(PoisonError::into_inner) = workspace_copies;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        let directory = listed
+            .project_path
+            .as_deref()
+            .context("Pi listing omitted its workspace")?;
+        self.bind_workspace_copy(&listed.session, directory)?;
+        Ok(Some(directory.to_owned()))
     }
 
     fn native_workspace(&self, session: &SessionRef) -> Result<Option<crate::NativeWorkspace>> {

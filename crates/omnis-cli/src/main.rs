@@ -131,8 +131,15 @@ impl IndexedSessionReader for AdapterRegistry {
         if let Ok(store) = &store
             && matches!(session.provider, Provider::Pi | Provider::OhMyPi)
         {
-            select_pi_snapshot(store, &snapshot, revision)?;
-            guard = Some(store.trajectory_write_guard(session)?);
+            match select_pi_snapshot(store, &snapshot, revision)
+                .and_then(|()| Ok(store.trajectory_write_guard(session)?))
+            {
+                Ok(selected) => guard = Some(selected),
+                Err(error) => {
+                    eprintln!("warning: local trajectory index unavailable: {error}");
+                    return Ok(snapshot);
+                }
+            }
         }
         anyhow::ensure!(
             revision == self.search_revision(session, None)?,
@@ -527,11 +534,7 @@ fn cached_search_sessions(
         .provider
         .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
     {
-        let copies = if args.all_projects {
-            store.cached_all_pi_copies()?
-        } else {
-            store.cached_pi_copies(&pi_workspace_key(project))?
-        };
+        let copies = store.cached_all_pi_copies()?;
         let keys = copies
             .iter()
             .map(|s| (&s.session, &s.project_path))
@@ -612,18 +615,37 @@ fn select_pi_search_copies(
             sessions.extend(copies);
         }
     }
-    for session in sessions {
-        if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
-            && let Some(path) = &session.project_path
-        {
-            let Some(workspace) = store.pi_copy_key(&session.session, path)? else {
-                continue;
-            };
-            let id = pi_copy_selector(&session.session.id, &workspace);
-            store.alias_pi_document(&session.session, &workspace, &id)?;
-            session.session.id = id;
+    qualify_pi_sessions(store, sessions, true)
+}
+
+fn qualify_pi_sessions(
+    store: &Store,
+    sessions: &mut [NativeSession],
+    searching: bool,
+) -> Result<()> {
+    let rows = sessions
+        .iter_mut()
+        .filter(|s| {
+            matches!(s.session.provider, Provider::Pi | Provider::OhMyPi)
+                && s.project_path.is_some()
+        })
+        .collect::<Vec<_>>();
+    let inputs = rows
+        .iter()
+        .filter_map(|s| Some((s.session.clone(), s.project_path.clone()?)))
+        .collect::<Vec<_>>();
+    let keys = store.pi_copy_keys(&inputs)?;
+    let mut aliases = Vec::new();
+    for (row, key) in rows.into_iter().zip(keys) {
+        if let Some(workspace) = key {
+            let id = pi_copy_selector(&row.session.id, &workspace);
+            if searching {
+                aliases.push((row.session.clone(), workspace, id.clone()));
+            }
+            row.session.id = id;
         }
     }
+    store.alias_pi_documents(&aliases)?;
     Ok(())
 }
 
@@ -1811,6 +1833,22 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     };
     let (mut sessions, warnings) =
         discover_sessions(registry, args.provider, project.as_deref(), None);
+    for copies in pi_index_batches(registry, args.provider)? {
+        sessions.extend(copies);
+    }
+    let mut rows = Vec::new();
+    for session in &sessions {
+        if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+            && let Some(path) = &session.project_path
+        {
+            rows.push((path.clone(), indexed_session_metadata(session), None));
+        }
+    }
+    if !rows.is_empty() {
+        let store = Store::open_default()?;
+        store.select_pi_workspaces(&rows)?;
+        qualify_pi_sessions(&store, &mut sessions, false)?;
+    }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 

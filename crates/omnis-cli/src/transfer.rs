@@ -345,7 +345,7 @@ fn picked_clipboard_handoff(
         );
         return Ok(());
     }
-    crate::handoff::run(registry, &source.to_string(), json_output)
+    crate::handoff::run_selected(registry, source, json_output)
 }
 
 fn start_new_session(

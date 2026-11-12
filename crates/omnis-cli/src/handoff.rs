@@ -18,8 +18,16 @@ const CLIPBOARD_BYTE_LIMIT: usize = 4_000;
 
 pub(super) fn run(registry: &AdapterRegistry, selector: &str, json_output: bool) -> Result<()> {
     let source = resolve_session_ref(registry, selector)?;
+    run_selected(registry, &source, json_output)
+}
+
+pub(super) fn run_selected(
+    registry: &AdapterRegistry,
+    source: &omnis_ir::SessionRef,
+    json_output: bool,
+) -> Result<()> {
     let snapshot = registry
-        .read_session_indexed(&source)
+        .read_session_indexed(source)
         .with_context(|| format!("reading `{source}`"))?;
     let snapshot = sanitize_snapshot(snapshot);
     let harness = provider_name(snapshot.session.provider);

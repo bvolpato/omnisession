@@ -318,7 +318,12 @@ pub(super) fn spawn_cache_updates(
         });
         for (provider, checked_at) in freshness {
             let refresh = match checked_at {
-                Ok(Some(checked_at)) => !cache_loaded || !session_cache_is_fresh(checked_at),
+                Ok(Some(checked_at)) => {
+                    !cache_loaded
+                        || !session_cache_is_fresh(checked_at)
+                        || matches!(provider, Provider::Pi | Provider::OhMyPi)
+                            && store.has_pi_duplicates(provider).unwrap_or(false)
+                }
                 Ok(None) => true,
                 Err(error) => {
                     if sender
@@ -428,6 +433,30 @@ pub(super) fn spawn_provider_update(
                 for note in notes {
                     if sender.send(PickerUpdate::Warning(note)).is_err() {
                         return;
+                    }
+                }
+                if matches!(provider, Provider::Pi | Provider::OhMyPi)
+                    && let Ok(adapter) = registry.adapter(provider)
+                {
+                    let mut matcher = omnis_core::SessionWorkspaceMatcher::new(&current_project);
+                    let preferred = adapter
+                        .additional_search_sessions()
+                        .into_iter()
+                        .filter(|session| {
+                            session
+                                .project_path
+                                .as_deref()
+                                .is_some_and(|path| matcher.matches(provider, path))
+                        })
+                        .map(|s| (s.session.clone(), s))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    for row in &mut sessions {
+                        if let Some(copy) = preferred.get(&row.session)
+                            && let Some(path) = &copy.project_path
+                            && adapter.bind_workspace_copy(&row.session, path).is_ok()
+                        {
+                            row.clone_from(copy);
+                        }
                     }
                 }
                 populate_approximate_updated_at(&mut sessions);
@@ -663,6 +692,9 @@ pub(super) fn spawn_trajectory_search_updates(
             let result = store.as_ref().map_or_else(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
+                    store
+                        .scope_pi_picker_rows(&request.pi_rows)
+                        .map_err(|error| error.to_string())?;
                     store
                         .search_session_trajectory_page_for_sessions(
                             &request.query,

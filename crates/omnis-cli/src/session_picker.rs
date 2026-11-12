@@ -453,7 +453,7 @@ impl PickerState {
         let Some(entry) =
             self.selected_entry()
                 .filter(|entry| match entry.session.session.provider {
-                    Provider::Claude => true,
+                    Provider::Claude | Provider::Pi | Provider::OhMyPi => true,
                     Provider::Imported => false,
                     _ => entry.cached,
                 })
@@ -849,6 +849,22 @@ impl PickerState {
         Some(TrajectorySearchRequest {
             generation: self.trajectory_search_generation,
             query: self.query.clone(),
+            pi_rows: self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.session.session.provider,
+                        Provider::Pi | Provider::OhMyPi
+                    )
+                })
+                .filter_map(|entry| {
+                    Some((
+                        entry.session.session.clone(),
+                        entry.session.project_path.clone()?,
+                    ))
+                })
+                .collect(),
             eligible_sessions: self
                 .entries
                 .iter()
@@ -1278,6 +1294,23 @@ fn cached_picker_entries(
         .into_iter()
         .map(workers::native_session)
         .collect::<Vec<_>>();
+    let mut matcher = SessionWorkspaceMatcher::new(current_project);
+    let copies = store
+        .cached_all_pi_copies()?
+        .into_iter()
+        .filter(|row| {
+            row.project_path
+                .as_deref()
+                .is_some_and(|path| matcher.matches(row.session.provider, path))
+        })
+        .map(workers::native_session)
+        .collect::<Vec<_>>();
+    let ids = copies
+        .iter()
+        .map(|row| &row.session)
+        .collect::<HashSet<_>>();
+    sessions.retain(|row| !ids.contains(&row.session));
+    sessions.extend(copies);
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -1374,6 +1407,7 @@ struct TrajectorySearchRequest {
     generation: u64,
     query: String,
     eligible_sessions: Vec<SessionRef>,
+    pi_rows: Vec<(SessionRef, PathBuf)>,
 }
 
 #[derive(Default)]
@@ -1665,14 +1699,29 @@ fn select_picker_row(
                 },
             )))
         }
-        TargetOutcome::ClipboardHandoff => {
-            Ok(RowSelection::Selected(PickerOutcome::ClipboardHandoff {
-                session,
-            }))
-        }
+        TargetOutcome::ClipboardHandoff => Ok(select_clipboard_source(
+            state,
+            registry,
+            current_project,
+            session,
+        )),
         TargetOutcome::Back => Ok(RowSelection::Back),
         TargetOutcome::Cancel => Ok(RowSelection::Cancel),
     }
+}
+
+fn select_clipboard_source(
+    state: &mut PickerState,
+    registry: &AdapterRegistry,
+    current_project: &Path,
+    session: SessionRef,
+) -> RowSelection {
+    if matches!(session.provider, Provider::Pi | Provider::OhMyPi)
+        && let Err(error) = state.verify_selected_workspace(registry, current_project)
+    {
+        return RowSelection::Notice(safe_terminal_line(&format!("{error:#}")));
+    }
+    RowSelection::Selected(PickerOutcome::ClipboardHandoff { session })
 }
 
 fn requested_target(
