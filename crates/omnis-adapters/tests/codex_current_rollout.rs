@@ -169,6 +169,46 @@ fn legacy_sqlite_path_without_uuid_owns_the_thread_and_fails_closed() -> Result<
 }
 
 #[test]
+fn an_unreadable_renamed_selection_only_retires_a_proven_different_file() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().canonicalize()?;
+    let logs = home.join("sessions");
+    fs::create_dir(&logs)?;
+    let old = logs.join(format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"));
+    let selected = logs.join("rollout-imported.jsonl");
+    let metadata = json!({"type":"session_meta","payload":{"id":THREAD, "history_mode":"legacy"}});
+    fs::write(&old, format!("{metadata}\n"))?;
+    let prior = CodexAdapter::index_file_revision(&old).unwrap();
+    let db = select(&home, &selected)?;
+    db.execute(
+        "UPDATE threads SET history_mode='legacy' WHERE id=?1",
+        [THREAD],
+    )?;
+    let unavailable = || -> Result<bool> {
+        let adapter = CodexAdapter::with_root(&home);
+        assert!(
+            adapter
+                .read_session(&SessionRef::new(Provider::Codex, THREAD))
+                .is_err()
+        );
+        Ok(adapter
+            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(prior))])?
+            .contains(THREAD))
+    };
+
+    // An oversized header prevents verification on every platform while metadata stays readable.
+    fs::File::create(&selected)?.set_len(3 * 1024 * 1024)?;
+    assert!(unavailable()?);
+    fs::remove_file(&selected)?;
+    fs::hard_link(&old, &selected)?;
+    fs::File::create(&selected)?.set_len(3 * 1024 * 1024)?;
+    assert!(!unavailable()?);
+    fs::remove_file(&old)?;
+    assert!(!unavailable()?);
+    Ok(())
+}
+
+#[test]
 fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<()> {
     let home = tempfile::tempdir()?;
     let path = home.path().join(format!(

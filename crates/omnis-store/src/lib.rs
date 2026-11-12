@@ -3206,7 +3206,8 @@ impl Store {
         &self,
         session: Option<&SessionRef>,
     ) -> Result<std::collections::HashMap<SessionRef, IndexedTitle>> {
-        let mut sql = format!("SELECT provider, session_id, coalesce(({INACTIVE_HOME_TITLE}), CASE WHEN NOT ({FOREIGN_PENDING_NAME}) THEN derived_title END), document_version,
+        let visible_title = visible_trajectory_title_sql();
+        let mut sql = format!("SELECT provider, session_id, {visible_title}, document_version,
             source_updated_at, source_updated_submillis, coalesce(title_authoritative, source_complete),
             CASE WHEN trajectories.provider = 'omp' AND coalesce(trajectories.title_authoritative, trajectories.source_complete)
              THEN (SELECT coalesce(catalog.source_updated_submillis, 0)
@@ -6512,10 +6513,26 @@ const FOREIGN_PENDING_NAME: &str = "trajectories.provider='codex' AND trajectori
           AND p.source_file_id=trajectories.source_file_id AND p.source_contents_id=trajectories.source_contents_id
           AND p.title=trajectories.derived_title)";
 
+const FOREIGN_CATALOG_NAMES: &str = "SELECT t.id AS trajectory_id,t.session_id,i.codex_home,t.source_file_id,t.source_contents_id,t.derived_title AS title
+         FROM session_trajectories t JOIN session_index i ON i.provider=t.provider AND i.session_id=t.session_id
+         WHERE t.provider='codex' AND t.origin='native'
+           AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
+           AND i.codex_home IS NOT NULL AND i.codex_home IS NOT (SELECT home FROM current_codex_home)
+           AND NOT i.codex_legacy_name AND NOT i.updated_at_approximate AND i.updated_at=t.source_updated_at
+           AND i.source_file_id=t.source_file_id AND i.source_contents_id=t.source_contents_id
+           AND omnis_compact_search_title(i.title)=t.derived_title";
+
+fn visible_trajectory_title_sql() -> String {
+    format!("coalesce(({INACTIVE_HOME_TITLE}), CASE WHEN NOT ({FOREIGN_PENDING_NAME})
+       AND NOT EXISTS (SELECT 1 FROM ({FOREIGN_CATALOG_NAMES}) n WHERE n.trajectory_id=trajectories.id)
+       THEN nullif(trajectories.derived_title,'') END)")
+}
+
 fn indexed_titles_sql() -> String {
+    let visible_title = visible_trajectory_title_sql();
     format!("SELECT trajectories.provider, trajectories.session_id,
                 CASE WHEN failed.session_id IS NULL AND catalog.session_id IS NULL
-                     THEN coalesce(({INACTIVE_HOME_TITLE}), CASE WHEN NOT ({FOREIGN_PENDING_NAME}) THEN nullif(trajectories.derived_title, '') END) END,
+                     THEN {visible_title} END,
                 CASE WHEN catalog.session_id IS NOT NULL THEN catalog.source_file_id
                      WHEN failed.session_id IS NOT NULL THEN failed.source_file_id ELSE trajectories.source_file_id END,
                 CASE WHEN catalog.session_id IS NOT NULL THEN catalog.source_contents_id
@@ -7357,7 +7374,9 @@ fn withdraw_other_home_name(
            AND d.source_file_id IS i.source_file_id AND (i.source_file_id IS NULL OR i.source_file_id=?2)
            AND (i.source_file_id IS NULL OR (d.source_contents_id=i.source_contents_id AND d.source_updated_at=i.updated_at)
                 OR (d.source_contents_id=?4 AND d.source_updated_at=?5))
-           AND d.derived_title IN (i.title,omnis_compact_search_title(i.title))",
+           AND d.derived_title IN (i.title,omnis_compact_search_title(i.title))
+           AND NOT EXISTS (SELECT 1 FROM codex_pending_catalog_titles p WHERE p.trajectory_id=d.id AND p.codex_home=h.home
+               AND p.source_file_id=d.source_file_id AND p.source_contents_id=d.source_contents_id AND p.title=d.derived_title)",
         params![selected.session.id, file.into_bytes(), recheck, contents.into_bytes(), selected.updated_at.map(|t| t.timestamp_millis())],
     ).map_err(database_error)?;
     Ok(())
@@ -7467,6 +7486,11 @@ fn select_pending_name(
     name_observed: bool,
     recheck: bool,
 ) -> Result<()> {
+    connection.prepare_cached(&format!(
+        "INSERT INTO codex_pending_catalog_titles(trajectory_id,codex_home,source_file_id,source_contents_id,title,evidence)
+         SELECT trajectory_id,codex_home,source_file_id,source_contents_id,title,'provider_name'
+         FROM ({FOREIGN_CATALOG_NAMES}) WHERE session_id=?1
+         ON CONFLICT(trajectory_id) DO NOTHING")).map_err(database_error)?.execute([&session.id]).map_err(database_error)?;
     connection.execute(
         "INSERT INTO codex_inactive_pending_names(trajectory_id,codex_home,source_file_id,source_contents_id,title,evidence)
          SELECT p.trajectory_id,p.codex_home,p.source_file_id,p.source_contents_id,p.title,p.evidence
@@ -13815,6 +13839,55 @@ mod tests {
             store.trajectory_title(&row.session).unwrap().as_deref(),
             Some("Known opener")
         );
+    }
+
+    #[test]
+    fn unchanged_rollout_retains_each_homes_verified_assignment() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        let outer = Store::open(&path).unwrap();
+        let inner = Store::open(&path).unwrap();
+        inner
+            .connection
+            .borrow()
+            .execute("UPDATE current_codex_home SET home='/inner'", [])
+            .unwrap();
+        let (mut row, doc) =
+            old_explicit_title(&outer, "unchanged", Uuid::from_u128(9), Some("Old label"));
+        row.updated_at = Some(doc.source_updated_at);
+        row.updated_at_approximate = false;
+        outer.upsert_indexed_session(&row).unwrap();
+        let refresh = |store: &Store, name: Option<&str>, complete: bool| {
+            let selected = IndexedSession {
+                title: name.map(str::to_owned),
+                ..row.clone()
+            };
+            let inventory = store.observe_codex_catalog_inventory().unwrap();
+            store
+                .merge_codex_search_catalog(&[selected], complete, &inventory.observed)
+                .unwrap();
+            store.trajectory_title(&row.session).unwrap()
+        };
+        assert_eq!(inner.trajectory_title(&row.session).unwrap(), None);
+        assert_eq!(refresh(&inner, None, true), None);
+        assert_eq!(refresh(&outer, None, false).as_deref(), doc.derived_title);
+        assert_eq!(
+            refresh(&inner, Some("Inner name"), true).as_deref(),
+            Some("Inner name")
+        );
+        for _ in 0..2 {
+            assert_eq!(refresh(&outer, None, false).as_deref(), doc.derived_title);
+            assert_eq!(refresh(&inner, None, false).as_deref(), Some("Inner name"));
+        }
+        assert_eq!(
+            refresh(&outer, Some("Renamed"), true).as_deref(),
+            Some("Renamed")
+        );
+        assert_eq!(refresh(&inner, None, false).as_deref(), Some("Inner name"));
+        assert_eq!(refresh(&outer, None, false).as_deref(), Some("Renamed"));
+        assert_eq!(refresh(&inner, None, true), None);
+        assert_eq!(refresh(&outer, None, false).as_deref(), Some("Renamed"));
+        assert_eq!(refresh(&inner, None, false), None);
     }
 
     fn reopen_without_pending_home(store: &Store, legacy_path: &Path) -> Store {

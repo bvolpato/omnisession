@@ -642,7 +642,7 @@ impl CodexAdapter {
         let Some(observed) = ObservedRollout::read(path) else {
             return false;
         };
-        if !observed.has_file_identity
+        if observed.physical_identity.is_none()
             || observed.revision.contents.is_none()
             || reported.source_revision != Some(observed.revision)
             || !uniquely_scoped_rollout(home, path)
@@ -2849,6 +2849,7 @@ impl ProviderAdapter for CodexAdapter {
             .current
             .rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
         let (scan, _) = self.session_scan(None);
+        let mut replacements = Vec::new();
         for (id, revision) in prior {
             match rows.get(id) {
                 Some(row) if row.requires_selection(home) => {
@@ -2857,8 +2858,18 @@ impl ProviderAdapter for CodexAdapter {
                             unavailable.insert(id.clone());
                         }
                         Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
-                            if let Some(selected) = row.generation(id)
-                                && let Some(file) = revision.and_then(|revision| revision.file)
+                            let Some(file) = revision.and_then(|revision| revision.file) else {
+                                continue;
+                            };
+                            if row.has_legacy_name() {
+                                if let Some(prior) = scan
+                                    .paths(id)
+                                    .find(|path| Self::index_file_id(path) == Some(file))
+                                    && row.recorded_file_replaces(home, prior, file)
+                                {
+                                    replacements.push((id, row, prior, file));
+                                }
+                            } else if let Some(selected) = row.generation(id)
                                 && scan.paths(id).any(|path| {
                                     current_rollout::ids(path)
                                         .is_some_and(|(_, generation)| generation != selected)
@@ -2883,6 +2894,16 @@ impl ProviderAdapter for CodexAdapter {
                     unavailable.insert(id.clone());
                 }
                 _ => {}
+            }
+        }
+        if !replacements.is_empty() {
+            let current = self
+                .current
+                .rows(home, replacements.iter().map(|(id, ..)| id.as_str()))?;
+            for (id, row, prior, file) in replacements {
+                if current.get(id) == Some(row) && row.recorded_file_replaces(home, prior, file) {
+                    unavailable.insert(id.clone());
+                }
             }
         }
         Ok(unavailable)

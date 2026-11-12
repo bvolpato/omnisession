@@ -10,7 +10,7 @@ use uuid::Uuid;
 /// File identity and metadata captured together for a selected provider transcript.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ObservedSourceFile {
-    pub(crate) has_file_identity: bool,
+    pub(crate) physical_identity: Option<[u64; 2]>,
     pub(crate) revision: SourceRevision,
     pub(crate) modified: Option<DateTime<Utc>>,
 }
@@ -101,12 +101,15 @@ impl ObservedSourceFile {
             ([metadata.dev(), metadata.ino()], metadata.ino() != 0)
         };
         #[cfg(any(unix, windows))]
-        let file = Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened());
+        let (file, physical_identity) = (
+            Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened()),
+            has_file_identity.then_some(object),
+        );
         #[cfg(not(any(unix, windows)))]
-        let (file, has_file_identity) = (path_id, false);
+        let (file, physical_identity) = (path_id, None);
         let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
-            has_file_identity,
+            physical_identity,
             modified,
             revision: SourceRevision {
                 file: Some(file),

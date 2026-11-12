@@ -1077,7 +1077,6 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
 #[test]
 fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
     use omnis_adapters::{CodexAdapter, ProviderAdapter};
-    use omnis_ir::Provider;
     use omnis_store::{IndexedSession, Store};
 
     let fixture = Fixture::new();
@@ -1102,6 +1101,12 @@ fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
             event_count: native.event_count,
         })
         .unwrap();
+    let db = rusqlite::Connection::open(state.join("store.sqlite3")).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE session_index SET codex_home=?1 WHERE provider='codex' AND session_id=?2 AND title='Amber Heron'
+           AND NOT EXISTS (SELECT 1 FROM session_trajectories WHERE provider='codex' AND session_id=?2)",
+        rusqlite::params![codex.canonicalize().unwrap().to_str().unwrap(), CODEX_ID],
+    ).unwrap(), 1);
     write_jsonl(
         &codex.join("session_index.jsonl"),
         &[json!({
@@ -1116,16 +1121,17 @@ fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
         assert_eq!(result_sessions(&found), [format!("codex:{CODEX_ID}")]);
         assert_eq!(found["results"][0]["title"], "Violet Quokka");
     }
-    assert_eq!(
-        store.trajectory_title(&native.session).unwrap().as_deref(),
-        Some("Violet Quokka")
-    );
-    assert!(
-        store
-            .session_index_checked_at(Provider::Codex)
-            .unwrap()
-            .is_none()
-    );
+    let cached = fixture.search_json(&["--cached", "--provider", "codex", "--show-text", "Quokka"]);
+    assert_eq!(result_sessions(&cached), [format!("codex:{CODEX_ID}")]);
+    assert_eq!(cached["results"][0]["title"], "Violet Quokka");
+    let recorded_check: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_index_checks)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!recorded_check);
 }
 
 #[test]
