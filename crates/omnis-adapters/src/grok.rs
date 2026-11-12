@@ -596,6 +596,13 @@ struct GrokMetadata {
     expected_updates: Option<u64>,
 }
 
+struct CumulativeText {
+    offset: usize,
+    marker_index: usize,
+    text: String,
+    markers: Vec<(usize, Value)>,
+}
+
 struct PendingMessage {
     kind: EventKind,
     text: String,
@@ -603,7 +610,8 @@ struct PendingMessage {
     alternate_content: Vec<(usize, Vec<Value>)>,
     alternate_markers: Vec<(usize, Value)>,
     content_unreadable: bool,
-    cumulative_text: Option<(usize, String)>,
+    content_limited: bool,
+    cumulative_text: Option<CumulativeText>,
     has_source_text: bool,
     timestamp: Option<DateTime<Utc>>,
     raw_type: Option<String>,
@@ -775,6 +783,8 @@ struct NativeMessageGroup {
     message_id: Option<String>,
     native_id: Option<String>,
     attachments: HashMap<[u8; 32], (usize, usize)>,
+    canonical_text: Sha256,
+    required_text: HashSet<[u8; 32]>,
     has_chunk: bool,
     has_fallback: bool,
 }
@@ -811,6 +821,7 @@ fn empty_text_descriptor(block: &Value) -> bool {
 impl NativeMessageGroup {
     fn needs_fallback(&self) -> bool {
         (self.has_fallback && !self.has_chunk)
+            || !self.required_text.is_empty()
             || self
                 .attachments
                 .values()
@@ -841,6 +852,9 @@ impl NativeMessageGroup {
         }
         if self.kind.is_some() {
             let canonical = &update["content"];
+            if let Some(text) = block_text(canonical).filter(|text| !text.is_empty()) {
+                self.canonical_text.update(text.as_bytes());
+            }
             if attachment_block(canonical) {
                 self.attachments
                     .entry(block_digest(canonical))
@@ -849,16 +863,15 @@ impl NativeMessageGroup {
             }
             for body in message_bodies(update).filter(|body| !std::ptr::eq(*body, canonical)) {
                 let mut occurrences = HashMap::<_, usize>::new();
-                let matching_text = std::cell::OnceCell::new();
+                let mut damaged_text = false;
                 for block in message_blocks(body) {
                     if block.is_null()
                         || matches!(classify_message_block(block), MessageBlock::Text(_))
                     {
                         continue;
                     }
-                    if empty_text_descriptor(block)
-                        && *matching_text.get_or_init(|| redundant_damaged_text(body, canonical))
-                    {
+                    if empty_text_descriptor(block) {
+                        damaged_text = true;
                         continue;
                     }
                     if !attachment_block(block) {
@@ -870,11 +883,30 @@ impl NativeMessageGroup {
                     let (_, needed) = self.attachments.entry(digest).or_default();
                     *needed = (*needed).max(*count);
                 }
+                if damaged_text && !redundant_damaged_text(body, canonical) {
+                    let mut alternate = Sha256::new();
+                    let mut has_text = false;
+                    for block in message_blocks(body) {
+                        if let Some(text) = block_text(block).filter(|text| !text.is_empty()) {
+                            alternate.update(text.as_bytes());
+                            has_text = true;
+                        }
+                    }
+                    if has_text {
+                        self.required_text.insert(alternate.finalize().into());
+                    } else if occurrences.is_empty() {
+                        return false;
+                    }
+                }
+            }
+            if !self.required_text.is_empty() {
+                let digest: [u8; 32] = self.canonical_text.clone().finalize().into();
+                self.required_text.remove(&digest);
             }
             self.has_fallback |= cumulative_fallback(update).is_some();
             self.has_chunk |= block_text(&update["content"]).is_some_and(|text| !text.is_empty());
         }
-        self.attachments.len() <= MAX_GROK_PRESERVED_RECORDS
+        self.attachments.len() + self.required_text.len() <= MAX_GROK_PRESERVED_RECORDS
     }
 }
 
@@ -1085,7 +1117,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v12");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v13");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1343,17 +1375,16 @@ impl GrokUpdateProcessor {
             message_content(update, &mut self.preservation, &mut alternate_markers);
         let cumulative_text = if has_source_text && cumulative_fallback(update).is_some() {
             has_source_text = false;
-            Some(std::mem::take(&mut text))
+            Some(CumulativeText {
+                offset: 0,
+                marker_index: 0,
+                text: std::mem::take(&mut text),
+                markers: std::mem::take(&mut alternate_markers),
+            })
         } else {
             None
         };
-        if text.is_empty()
-            && cumulative_text.is_none()
-            && self.preservation.omitted_events > omitted_before
-        {
-            flush_message(builder, &mut self.pending);
-            return;
-        }
+        let content_limited = self.preservation.omitted_events > omitted_before;
         if content_unreadable {
             self.malformed_updates = self.malformed_updates.saturating_add(1);
         }
@@ -1363,8 +1394,10 @@ impl GrokUpdateProcessor {
                 if gap {
                     pending.text.push_str("\n[Source records omitted]\n");
                 }
-                if let Some(text) = cumulative_text {
-                    pending.cumulative_text = Some((pending.text.len(), text));
+                if let Some(mut fallback) = cumulative_text {
+                    fallback.offset = pending.text.len();
+                    fallback.marker_index = pending.alternate_markers.len();
+                    pending.cumulative_text = Some(fallback);
                 }
                 pending.has_source_text |= has_source_text;
                 let offset = pending.text.len();
@@ -1381,6 +1414,7 @@ impl GrokUpdateProcessor {
                         .map(|view| (pending.content.len(), view)),
                 );
                 pending.content_unreadable |= content_unreadable;
+                pending.content_limited |= content_limited;
             }
             _ => {
                 flush_message(builder, &mut self.pending);
@@ -1394,7 +1428,8 @@ impl GrokUpdateProcessor {
                         .collect(),
                     content,
                     content_unreadable,
-                    cumulative_text: cumulative_text.map(|text| (0, text)),
+                    content_limited,
+                    cumulative_text,
                     has_source_text,
                     timestamp,
                     raw_type,
@@ -1597,10 +1632,7 @@ fn message_content(
     if let Some(content) = body {
         let deferred = message_bodies(update)
             .next()
-            .is_some_and(|primary| !std::ptr::eq(primary, content))
-            && !message_blocks(content)
-                .iter()
-                .any(|block| block_text(block).is_some_and(|text| !text.is_empty()));
+            .is_some_and(|primary| !std::ptr::eq(primary, content));
         for block in message_blocks(content) {
             match classify_message_block(block) {
                 MessageBlock::Text(chunk) => {
@@ -1619,6 +1651,10 @@ fn message_content(
                 }
                 MessageBlock::Attachment => {
                     if !preservation.retain(block) {
+                        const OMITTED: &str = "\n[Source attachment omitted by collection limit]\n";
+                        if !text.ends_with(OMITTED) {
+                            text.push_str(OMITTED);
+                        }
                         continue;
                     }
                     if deferred {
@@ -1656,7 +1692,11 @@ fn message_content(
                 if *count > *retained {
                     *retained = *count;
                     content_unreadable |= partial_attachment_block(block)
-                        || matches!(classify_message_block(block), MessageBlock::Malformed(Some(text)) if !text.is_empty());
+                        || matches!(classify_message_block(block), MessageBlock::Malformed(Some(text)) if !text.is_empty())
+                        || (matches!(classify_message_block(block), MessageBlock::Malformed(_))
+                            && block
+                                .get("text")
+                                .is_some_and(|text| !text.is_string() && !text.is_null()));
                     if preservation.retain(block) {
                         historical_content.push(block.clone());
                     }
@@ -1868,24 +1908,35 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     };
     let mut text = pending.text;
     let mut additions = Vec::new();
+    let mut markers = pending.alternate_markers;
     if !pending.has_source_text
-        && let Some((offset, fallback)) = pending.cumulative_text
+        && let Some(fallback) = pending.cumulative_text
     {
-        additions.push((offset, fallback));
+        text.insert_str(fallback.offset, &fallback.text);
+        for (offset, _) in &mut markers[fallback.marker_index..] {
+            *offset += fallback.text.len();
+        }
+        markers.splice(
+            fallback.marker_index..fallback.marker_index,
+            fallback
+                .markers
+                .into_iter()
+                .map(|(offset, block)| (offset + fallback.offset, block)),
+        );
     }
     let mut canonical = HashMap::new();
-    if !pending.alternate_markers.is_empty() {
+    if !markers.is_empty() {
         for block in &pending.content {
             *canonical.entry(block.clone()).or_insert(0usize) += 1;
         }
     }
     let content = reconcile_message_evidence(pending.content, &pending.alternate_content);
-    if !pending.alternate_markers.is_empty() {
+    if !markers.is_empty() {
         let mut available = HashMap::new();
         for block in &content {
             *available.entry(block).or_insert(0usize) += 1;
         }
-        for (offset, block) in &pending.alternate_markers {
+        for (offset, block) in &markers {
             let used = canonical.entry(block.clone()).or_default();
             if *used < available.get(block).copied().unwrap_or_default() {
                 additions.push((*offset, attachment_notice(block).to_owned()));
@@ -1908,9 +1959,14 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let mut payload = json!({ "text": text });
     if pending.content_unreadable {
         payload["content_unreadable"] = Value::Bool(true);
-        if let Some(id) = pending.message_id {
-            payload["message_id"] = Value::String(id);
-        }
+    }
+    if pending.content_limited {
+        payload["content_limited"] = Value::Bool(true);
+    }
+    if (pending.content_unreadable || pending.content_limited)
+        && let Some(id) = pending.message_id
+    {
+        payload["message_id"] = Value::String(id);
     }
     let opaque = content
         .iter()
@@ -1936,11 +1992,20 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
         pending.raw_type,
         None,
     );
+    report_message_omissions(builder, pending.timestamp, opaque, nontext_blocks);
+}
+
+fn report_message_omissions(
+    builder: &mut EventBuilder,
+    timestamp: Option<DateTime<Utc>>,
+    opaque: usize,
+    nontext_blocks: usize,
+) {
     if opaque > 0 {
         builder.push(
             EventKind::ProviderEvent,
             json!({"unsupported_text_records":opaque,"raw_records_preserved":true}),
-            pending.timestamp,
+            timestamp,
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.unsupported_history".to_owned()),
             None,
@@ -1954,7 +2019,7 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
                     "event_kind": "attachment",
                     "reason": "Attachments remain in canonical historical metadata; native transfer carries documentary text only",
                 }),
-                pending.timestamp,
+                timestamp,
                 ReplayPolicy::HistoricalOnly,
                 Some("omnisession.unsupported_content".to_owned()),
                 None,
@@ -2546,10 +2611,24 @@ mod tests {
         let chunk = |content: Value| json!({"sessionUpdate":"agent_message_chunk","messageId":"reply","content":content});
         let mut cumulative = chunk(json!({"type":"text","text":""}));
         cumulative["message"] = json!({"content":[resource]});
-        for updates in [
-            vec![chunk(resource.clone()), cumulative.clone()],
-            vec![cumulative.clone(), chunk(resource.clone())],
-            vec![cumulative],
+        let mut caption = cumulative.clone();
+        caption["message"]["content"] = json!([resource, {"type":"text","text":"caption"}]);
+        let notice = attachment_notice(&resource);
+        for (updates, expected) in [
+            (
+                vec![chunk(resource.clone()), cumulative.clone()],
+                notice.to_owned(),
+            ),
+            (
+                vec![cumulative.clone(), chunk(resource.clone())],
+                notice.to_owned(),
+            ),
+            (vec![cumulative], notice.to_owned()),
+            (
+                vec![chunk(resource.clone()), caption.clone()],
+                format!("{notice}caption"),
+            ),
+            (vec![caption], format!("{notice}caption")),
         ] {
             let root = tempfile::tempdir().unwrap();
             write_session(root.path(), SESSION_ID, &json!({"id":SESSION_ID}), &updates);
@@ -2557,7 +2636,7 @@ mod tests {
                 .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
                 .unwrap();
             let message = &snapshot.events[0].payload;
-            assert_eq!(message["text"], attachment_notice(&resource));
+            assert_eq!(message["text"], expected);
             assert_eq!(message["content"], json!([resource]));
         }
     }
@@ -2687,6 +2766,35 @@ mod tests {
                 omnis_core::import_conversation(&snapshot).truncated,
                 partial
             );
+        }
+    }
+
+    #[test]
+    fn native_message_group_matches_cumulative_evidence_across_chunks() {
+        let resource =
+            json!({"type":"resource","resource":{"uri":"file:///sample","text":"contents"}});
+        let chunk = |content| json!({"sessionUpdate":"agent_message_chunk","messageId":"turn","content":content});
+        let alias = |body| {
+            let mut update = chunk(json!({"type":"text","text":""}));
+            update["message"] = json!({"content":body});
+            update
+        };
+        for (body, direct) in [
+            (json!([resource, {"type":"text"}]), true),
+            (json!([resource, "copperfinch", {"type":"text"}]), true),
+            (json!([resource, "new text", {"type":"text"}]), false),
+            (json!([resource, resource, {"type":"text"}]), false),
+        ] {
+            let mut group = NativeMessageGroup::default();
+            for update in [
+                chunk(resource.clone()),
+                chunk(json!({"type":"text","text":"copper"})),
+                alias(body),
+                chunk(json!({"type":"text","text":"finch"})),
+            ] {
+                assert!(group.observe(&update));
+            }
+            assert_eq!(!group.needs_fallback(), direct);
         }
     }
 
@@ -3749,23 +3857,26 @@ mod tests {
             [
                 &EventKind::ProviderEvent,
                 &EventKind::MessageUser,
+                &EventKind::MessageUser,
                 &EventKind::ToolCalled,
                 &EventKind::MessageAssistant,
                 &EventKind::ProviderEvent,
                 &EventKind::ProviderEvent
             ]
         );
+        assert_eq!(snapshot.events[1].payload["content_limited"], true);
+        assert!(snapshot.events[1].payload.get("content").is_none());
         assert_eq!(
-            snapshot.events[1].payload["text"],
+            snapshot.events[2].payload["text"],
             "Unchanged visible question"
         );
         assert_eq!(
-            snapshot.events[3].payload["text"],
+            snapshot.events[4].payload["text"],
             "Unchanged visible answer"
         );
-        assert_eq!(snapshot.events[4].payload["omitted_events"], 3);
+        assert_eq!(snapshot.events[5].payload["omitted_events"], 3);
         assert_eq!(
-            snapshot.events[4].source.raw_record_type.as_deref(),
+            snapshot.events[5].source.raw_record_type.as_deref(),
             Some("omnisession.collection_limit")
         );
         assert!(omnis_core::import_trajectory(&snapshot).truncated);
