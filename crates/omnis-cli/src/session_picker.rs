@@ -5661,7 +5661,7 @@ mod tests {
 
     #[test]
     fn a_single_excerpt_requires_complete_message_coverage_for_the_only_message_label() {
-        let current = Path::new("/workspace");
+        let current = fixture_workspace();
         let mut state = PickerState::new(
             vec![session(Provider::Codex, "session", current, None)],
             current,
@@ -6046,7 +6046,7 @@ mod tests {
 
     #[test]
     fn codex_assistant_opener_stays_in_the_preview_without_naming_the_session() {
-        let project = Path::new("/workspace");
+        let project = fixture_workspace();
         let answer = "Scarlet Finch answer";
         for (provider, source_provider, expected_title) in [
             (Provider::Codex, Provider::Codex, "Untitled session"),

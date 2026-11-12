@@ -382,6 +382,7 @@ fn history_workspace_stays_authoritative_for_discovery() {
         .list_sessions(Some(Path::new("/workspace/indexed")))
         .expect("indexed discovery");
     assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].git_branch.as_deref(), Some("fixture"));
     assert_eq!(
         sessions[0].project_path.as_deref(),
         Some(Path::new("/workspace/indexed"))
@@ -392,6 +393,78 @@ fn history_workspace_stays_authoritative_for_discovery() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn worker_records_cannot_supply_the_main_workspace_or_branch() {
+    let temporary = TempDir::new().unwrap();
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).unwrap();
+    let main = "/workspace/main";
+    let side = json!({"type":"assistant", "isSidechain":true, "cwd":"/workspace/side", "gitBranch":"worker"});
+    let team = json!({"type":"assistant", "teamName":"workers", "cwd":"/workspace/team", "gitBranch":"team"});
+    let records = [
+        json!({"type":"system", "gitBranch":"topic"}),
+        side.clone(),
+        team.clone(),
+        user_request(main),
+        side,
+        team,
+    ];
+    write_jsonl(&projects.join(format!("{SESSION_ID}.jsonl")), &records);
+
+    let adapter = ClaudeAdapter::with_root(projects);
+    for indexed in [false, true] {
+        if indexed {
+            write_jsonl(
+                &temporary.path().join("history.jsonl"),
+                &[history_record(
+                    SESSION_ID,
+                    main,
+                    "prompt",
+                    1_767_225_600_000,
+                )],
+            );
+        }
+        let sessions = adapter.list_sessions(None).unwrap();
+        assert_eq!(sessions[0].project_path.as_deref(), Some(Path::new(main)));
+        assert_eq!(sessions[0].git_branch.as_deref(), Some("topic"));
+    }
+
+    let session = SessionRef::new(Provider::Claude, SESSION_ID);
+    for snapshot in [
+        adapter.read_session(&session),
+        adapter.preview_session(&session),
+    ] {
+        let workspace = snapshot.unwrap().workspace;
+        assert_eq!(workspace.current_dir, Path::new(main));
+        assert_eq!(workspace.git.branch.as_deref(), Some("topic"));
+    }
+}
+
+#[test]
+fn history_discovery_reads_a_branch_change_at_the_unterminated_tail() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).unwrap();
+    let first = json!({"type":"user", "cwd":"/workspace/demo", "gitBranch":"initial"});
+    let last = json!({"type":"assistant", "cwd":"/workspace/demo", "gitBranch":"latest"});
+    let transcript = format!("{first}\n{}\n{last}", padded_assistant(100 * 1024));
+    fs::write(projects.join(format!("{SESSION_ID}.jsonl")), transcript).unwrap();
+    write_jsonl(
+        &temporary.path().join("history.jsonl"),
+        &[history_record(
+            SESSION_ID,
+            "/workspace/demo",
+            "prompt",
+            1_767_225_600_000,
+        )],
+    );
+
+    let sessions = ClaudeAdapter::with_root(projects)
+        .list_sessions(None)
+        .unwrap();
+    assert_eq!(sessions[0].git_branch.as_deref(), Some("latest"));
 }
 
 #[test]
