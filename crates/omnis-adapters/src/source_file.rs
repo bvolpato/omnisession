@@ -10,6 +10,7 @@ use uuid::Uuid;
 /// File identity and metadata captured together for a selected provider transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObservedSourceFile {
+    pub(crate) physical_identity: Option<[u64; 2]>,
     pub(crate) revision: SourceRevision,
     #[cfg(any(unix, windows))]
     object: [u64; 2],
@@ -102,15 +103,15 @@ impl ObservedSourceFile {
             canonical.as_os_str().as_encoded_bytes(),
         );
         #[cfg(windows)]
-        let object = {
+        let (object, has_file_identity) = {
             use std::os::windows::fs::MetadataExt;
             if let Ok(info) = winapi_util::file::information(file)
                 && info.file_index() != 0
             {
-                [info.volume_serial_number(), info.file_index()]
+                ([info.volume_serial_number(), info.file_index()], true)
             } else {
                 // Some network filesystems expose a creation time but no file index.
-                [u64::MAX, metadata.creation_time()]
+                ([u64::MAX, metadata.creation_time()], false)
             }
         };
         if !metadata.is_file() {
@@ -122,16 +123,20 @@ impl ObservedSourceFile {
             .ok()
             .filter(|ticks| *ticks > 0);
         #[cfg(unix)]
-        let object = {
+        let (object, has_file_identity) = {
             use std::os::unix::fs::MetadataExt;
-            [metadata.dev(), metadata.ino()]
+            ([metadata.dev(), metadata.ino()], metadata.ino() != 0)
         };
         #[cfg(any(unix, windows))]
-        let file = Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened());
+        let (file, physical_identity) = (
+            Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened()),
+            has_file_identity.then_some(object),
+        );
         #[cfg(not(any(unix, windows)))]
-        let file = path_id;
+        let (file, physical_identity) = (path_id, None);
         let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
+            physical_identity,
             #[cfg(any(unix, windows))]
             object,
             #[cfg(windows)]

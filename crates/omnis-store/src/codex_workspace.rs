@@ -5,13 +5,13 @@ use std::{
     path::PathBuf,
 };
 
-use omnis_ir::{Provider, SessionRef, SourceRevision};
+use omnis_ir::{Provider, SourceRevision};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use uuid::Uuid;
 
 use crate::{
-    DATABASE_FILE_NAME, Result, StoreError, active_codex_home, database_error, reject_symlink,
-    state_root,
+    DATABASE_FILE_NAME, PreparedTrajectoryWrite, Result, SessionTrajectoryOrigin, StoreError,
+    TrajectorySourceGuard, active_codex_home, database_error, reject_symlink, state_root,
 };
 
 const UNCERTAIN_LEGACY_SOURCE: &str =
@@ -167,11 +167,11 @@ impl CodexWorkspace {
     pub(super) fn record(
         &self,
         transaction: &Transaction<'_>,
-        session: &SessionRef,
-        revision: SourceRevision,
-        content_hash: &[u8],
+        write: &PreparedTrajectoryWrite<'_, '_>,
         require_full_source: bool,
     ) -> Result<()> {
+        let session = write.session;
+        let revision = write.document.source_revision;
         if session.provider != Provider::Codex
             || !self.source_revision.matches_file_contents(revision)
         {
@@ -195,9 +195,29 @@ impl CodexWorkspace {
                AND (NOT ?7 OR source_complete)
              ON CONFLICT(trajectory_id) DO UPDATE SET source_file_id=excluded.source_file_id,
                 source_contents_id=excluded.source_contents_id,project_path=excluded.project_path,git_branch=excluded.git_branch",
-            params![session.id, file, contents, project_path, self.git_branch, content_hash, require_full_source]
+            params![session.id, file, contents, project_path, self.git_branch, write.content_hash, require_full_source]
         ).map_err(database_error)?;
         if saved == 0 {
+            // A preview can update a name while search keeps the full text and its verified workspace.
+            if !write.source_complete
+                && write.document.origin == SessionTrajectoryOrigin::Native
+                && matches!(write.guard, TrajectorySourceGuard::ObservedRevision(_))
+                && self.source_revision == revision
+                && transaction.query_row(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM visible_trajectories t JOIN codex_indexed_workspaces w ON w.trajectory_id=t.id
+                         WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native' AND t.source_complete
+                           AND t.source_file_id=?2 AND t.source_contents_id=?3
+                           AND w.source_file_id=t.source_file_id AND w.source_contents_id=t.source_contents_id
+                           AND w.project_path IS ?4 AND w.git_branch IS ?5
+                           AND NOT EXISTS (SELECT 1 FROM codex_workspace_rechecks p WHERE p.trajectory_id=t.id
+                               AND p.source_file_id=t.source_file_id AND p.source_contents_id=t.source_contents_id))",
+                    params![session.id, file, contents, project_path, self.git_branch],
+                    |row| row.get::<_, bool>(0),
+                ).map_err(database_error)?
+            {
+                return Ok(());
+            }
             return Err(StoreError::TrajectorySourceChanged);
         }
         transaction.execute(

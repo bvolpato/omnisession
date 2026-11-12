@@ -364,7 +364,8 @@ fn normalized_local(path: &Path) -> Option<PathBuf> {
 }
 
 /// Resolves local symlinks one at a time so their targets are checked before filesystem access.
-fn resolve_local_path(path: &Path) -> Option<PathBuf> {
+#[must_use]
+pub fn resolve_local_path(path: &Path) -> Option<PathBuf> {
     resolve_local_components(normalized_local(path)?)
 }
 

@@ -17,11 +17,13 @@ pub(crate) struct SearchFields {
 }
 
 impl SearchFields {
-    pub(crate) fn new(session: &NativeSession, derived_title: Option<&str>) -> Self {
+    pub(crate) fn new<'a>(
+        session: &NativeSession,
+        derived_titles: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
         let project = session.project_path.as_deref();
         let candidates = [
             (session.title.clone(), TITLE_BONUS),
-            (derived_title.map(str::to_owned), TITLE_BONUS),
             (
                 project
                     .and_then(|path| path.file_name())
@@ -54,6 +56,11 @@ impl SearchFields {
         Self {
             fields: candidates
                 .into_iter()
+                .chain(
+                    derived_titles
+                        .into_iter()
+                        .map(|title| (Some(title.to_owned()), TITLE_BONUS)),
+                )
                 .filter_map(|(value, bonus)| value.map(|value| (lowercase_chars(&value), bonus)))
                 .filter(|(value, _)| !value.is_empty())
                 .collect(),

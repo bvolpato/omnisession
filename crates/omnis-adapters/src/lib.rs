@@ -37,7 +37,7 @@ pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use cursor_identity::{
     cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
 };
-pub use grok::GrokAdapter;
+pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
@@ -68,6 +68,16 @@ pub struct ProviderInstallation {
     pub data_root: Option<PathBuf>,
 }
 
+pub use omnis_core::NativeSessionName;
+
+/// Name assignments that still agree with the native index used for a listing.
+pub struct ObservedSessionNames {
+    /// Confirmed assignments, including readable rows after the last damaged row.
+    pub names: std::sync::Arc<HashMap<String, String>>,
+    /// Whether an omitted ID confirms that the thread has no assignment.
+    pub complete: bool,
+}
+
 /// Metadata returned by session discovery. Transcript content is intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeSession {
@@ -89,6 +99,8 @@ pub struct NativeSession {
 pub enum RollbackTitle {
     #[default]
     Unknown,
+    /// The source is an ordinary local session. Its opening title remains unconfirmed.
+    UnknownLocal,
     /// An empty title means the surviving transcript has no eligible user opener.
     Known(Option<String>),
     /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
@@ -122,7 +134,7 @@ impl WithdrawnOpeners {
 
     fn after_gap(&self) -> RollbackTitle {
         if self.hashes.is_empty() && !self.overflowed {
-            RollbackTitle::Unknown
+            RollbackTitle::UnknownLocal
         } else {
             RollbackTitle::UnknownAfterWithdrawal(self.clone())
         }
@@ -173,6 +185,8 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Physical file whose ownership was checked independently of display metadata.
+    pub ownership_revision: Option<SourceRevision>,
     pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
     /// Exclusive event sequence at the first gap in an otherwise sequential read.
     pub verified_prefix_end: Option<u64>,
@@ -305,6 +319,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    ownership_revision: None,
                     verified_prefix_end: None,
                     database_aliases: std::sync::Arc::default(),
                     search_record_groups: Vec::new(),
@@ -322,6 +337,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        ownership_revision: None,
         verified_prefix_end: None,
         database_aliases: std::sync::Arc::default(),
         search_record_groups: Vec::new(),
@@ -510,6 +526,11 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(NativeResumeSupport::Direct)
     }
 
+    /// IDs with a conflicting or unreadable native source in the last discovery pass.
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
     ///
     /// # Errors
@@ -570,6 +591,92 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Returns whether a missing provider name confirms that the session has no name.
+    fn session_titles_are_complete(&self) -> bool {
+        false
+    }
+
+    /// Reads selected name observations for a batch of session IDs, paths, and file revisions.
+    fn listed_session_names(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Rechecks the named rows selected by discovery before their search documents are published.
+    fn listed_session_names_still_current(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Returns name assignments and clears confirmed for the selected paths and file revisions.
+    fn observed_listed_names(
+        &self,
+        sessions: &[NativeSession],
+    ) -> HashMap<String, NativeSessionName> {
+        let requested: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .filter_map(|s| {
+                Some((
+                    s.session.id.as_str(),
+                    s.source_path.as_deref()?,
+                    s.source_revision?,
+                ))
+            })
+            .collect();
+        let mut names = self.listed_session_names(&requested);
+        sessions
+            .iter()
+            .filter(|session| session.session.provider == Provider::Codex)
+            .filter_map(|session| {
+                let id = &session.session.id;
+                let name = names.remove(id)?;
+                name.confirms(session.title.as_deref())
+                    .then(|| (id.clone(), name))
+            })
+            .collect()
+    }
+
+    /// Returns GUI assignments and clears that match the selected sessions.
+    fn gui_session_names(&self, sessions: &[NativeSession]) -> HashMap<String, Option<String>> {
+        self.observed_listed_names(sessions)
+            .into_iter()
+            .filter_map(|(id, name)| {
+                if let NativeSessionName::Gui(title) = name {
+                    Some((id, title))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the individually confirmed assignments in the name index used for discovery.
+    /// Only a complete index also confirms that omitted IDs have no assignment.
+    fn observed_session_names(&self) -> Option<ObservedSessionNames> {
+        None
+    }
+
+    /// Reads the latest name assignment for one session.
+    fn native_session_name(&self, _id: &str) -> NativeSessionName {
+        NativeSessionName::Unknown
+    }
+
+    /// Returns earlier readable assignments that can corroborate a saved name for the same rollout.
+    /// An unreadable later row prevents these assignments from establishing the current name.
+    fn prior_session_names(&self, _sessions: &[&NativeSession]) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    /// Checks whether the name still matches the provider's index after a session read.
+    fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
+        self.native_session_name(id).confirms(name)
+    }
+
     /// Returns the cached Codex sessions that their recorded rollout selections rule out.
     ///
     /// # Errors
@@ -616,6 +723,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),

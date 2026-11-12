@@ -125,7 +125,7 @@ fn project(
         history.source_ordinal = source_index;
         history.compact(&mut builder);
         if inherited {
-            session.report_unread_history_base(&mut builder);
+            super::report_unread_ancestor(&mut builder, session.updated_at);
         }
         if history.omitted_tool_events > 0 {
             notice(session, &mut builder, history.omitted_tool_events);

@@ -740,7 +740,7 @@ fn external_import_marker_keeps_the_authored_reply() {
 }
 
 #[test]
-fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
+fn gaps_in_the_name_index_warn_without_hiding_rollouts_or_later_names() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");
     fs::write(
@@ -756,16 +756,12 @@ fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
     .expect("synthetic rollout");
     fs::write(
         temporary.path().join("session_index.jsonl"),
-        [
-            json!({"id": SESSION_ID, "thread_name": "Original synthetic title", "updated_at": "2026-01-01T00:00:00Z"}),
-            json!({"id": SESSION_ID, "thread_name": "x".repeat(2 * 1024 * 1024), "updated_at": "2026-01-02T00:00:00Z"}),
-            json!({"id": SESSION_ID, "thread_name": "Renamed synthetic title", "updated_at": "2026-01-03T00:00:00Z"}),
-        ]
-        .iter()
-        .map(Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-            + "\n",
+        format!(
+            "{}\n{}\n \t\r\n{{incomplete private fragment\n{}\n",
+            json!({"id": SESSION_ID, "thread_name": "Original synthetic title"}),
+            json!({"id": SESSION_ID, "thread_name": "x".repeat(2 * 1024 * 1024)}),
+            json!({"id": SESSION_ID, "thread_name": "Renamed synthetic title"}),
+        ),
     )
     .expect("synthetic session index");
 
@@ -777,17 +773,109 @@ fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
         sessions[0].title.as_deref(),
         Some("Renamed synthetic title")
     );
-    let notes = adapter.discovery_notes();
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("session_index.jsonl") && note.contains("1 oversized")),
-        "{notes:?}"
-    );
+    assert!(adapter.discovery_is_complete());
+    assert!(!adapter.session_titles_are_complete());
+    let warnings = adapter.discovery_notes().join("\n");
+    for kind in ["1 malformed", "1 oversized"] {
+        assert!(
+            warnings
+                .lines()
+                .any(|line| line.contains("session_index.jsonl") && line.contains(kind)),
+            "{warnings}"
+        );
+    }
+    assert!(!warnings.contains("private fragment"));
+    assert!(!warnings.contains("synthetic title"));
     let snapshot = adapter
         .read_session(&SessionRef::new(Provider::Codex, SESSION_ID))
         .expect("Codex read");
     assert_eq!(snapshot.title.as_deref(), Some("Renamed synthetic title"));
+}
+
+#[test]
+fn failed_sqlite_discovery_preserves_independent_name_observations() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    fs::write(
+        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        header.to_string(),
+    )?;
+    fs::write(
+        home.path().join("state_5.sqlite"),
+        b"unreadable sqlite contents",
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let sidecar = home.path().join("session_index.jsonl");
+    let renamed = json!({"id":SESSION_ID,"thread_name":"Latest name"});
+    for (contents, complete, name) in [
+        (String::new(), true, None),
+        (format!("{{\n{renamed}\n"), false, Some("Latest name")),
+    ] {
+        fs::write(&sidecar, contents)?;
+        assert!(adapter.list_sessions(None)?.is_empty());
+        assert!(!adapter.discovery_is_complete());
+        let observed = adapter
+            .observed_session_names()
+            .expect("sidecar read before SQLite");
+        assert_eq!(observed.complete, complete);
+        assert_eq!(observed.names.get(SESSION_ID).map(String::as_str), name);
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn earlier_names_corroborate_only_rollouts_with_one_possible_home() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let flat = root.path().join("flat");
+    let outer = root.path().join("outer");
+    let inner = outer.join("sessions/team");
+    let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID}});
+    for home in [&flat, &inner] {
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions)?;
+        fs::write(
+            sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+            format!("{header}\n"),
+        )?;
+    }
+    let assignment = |name: &str| json!({"id":SESSION_ID, "thread_name":name});
+    let old = assignment("Old name");
+    let recent = assignment("  Last recorded name  ");
+    let damaged = format!("{old}\n{{torn\n{recent}\n{{torn again\n");
+    for home in [&flat, &outer, &inner] {
+        fs::write(home.join("session_index.jsonl"), &damaged)?;
+    }
+    for home in [&flat, &outer, &inner] {
+        let adapter = CodexAdapter::with_root(home);
+        let session = adapter
+            .find_native_session(SESSION_ID)?
+            .expect("selected rollout");
+        assert!(session.title.is_none());
+        assert_eq!(
+            adapter.native_session_name(SESSION_ID),
+            omnis_adapters::NativeSessionName::Unknown
+        );
+        let prior = adapter.prior_session_names(&[&session]);
+        assert_eq!(
+            prior.get(SESSION_ID).map(String::as_str),
+            (home == &flat).then_some("  Last recorded name  ")
+        );
+        let current = assignment("Confirmed name");
+        fs::write(
+            home.join("session_index.jsonl"),
+            format!("{damaged}{current}\n"),
+        )?;
+        assert!(
+            adapter
+                .native_session_name(SESSION_ID)
+                .confirms(Some("Confirmed name"))
+        );
+        assert!(adapter.prior_session_names(&[&session]).is_empty());
+    }
+    Ok(())
 }
 
 #[test]
@@ -1260,7 +1348,7 @@ fn rollback_title_read(
 
 #[test]
 fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> anyhow::Result<()> {
-    use omnis_adapters::RollbackTitle::{Known, Unknown};
+    use omnis_adapters::RollbackTitle::{Known, Unknown, UnknownLocal};
 
     let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
     let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
@@ -1268,7 +1356,7 @@ fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> a
     for rows in [vec![old()], vec![old(), rollback(0)]] {
         let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
         assert_eq!(full.rollback_title, Known(Some("old opener".into())));
-        assert_eq!(sampled.rollback_title, Unknown);
+        assert_eq!(sampled.rollback_title, UnknownLocal);
     }
     for (rows, expected) in [
         (vec![old(), rollback(1)], Known(None)),
@@ -1389,7 +1477,7 @@ fn dynamic_tool_catalog_preserves_an_ordinary_rollback_title() -> anyhow::Result
 
 #[test]
 fn bounded_reconstruction_distinguishes_gaps_before_and_after_withdrawal() -> anyhow::Result<()> {
-    use omnis_adapters::RollbackTitle::Unknown;
+    use omnis_adapters::RollbackTitle::UnknownLocal;
 
     let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
     let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
@@ -1409,11 +1497,11 @@ fn bounded_reconstruction_distinguishes_gaps_before_and_after_withdrawal() -> an
     let early_gap = format!("{{malformed\n{}\n", rollback(1));
     assert_eq!(
         rollback_title_read(&header, &[old()], &early_gap)?.rollback_title,
-        Unknown
+        UnknownLocal
     );
     assert_eq!(
         rollback_title_read(&header, &[old(), rollback(1), old()], "{malformed\n")?.rollback_title,
-        Unknown
+        UnknownLocal
     );
     assert!(
         rollback_title_read(
@@ -1678,6 +1766,15 @@ fn codex_preview_reports_sampling_after_rollback_reconstruction() {
         snapshot.events.last().unwrap().payload["omitted_events"],
         75
     );
+    let prefix_end = snapshot.events.last().unwrap().payload["prefix_end_sequence"]
+        .as_u64()
+        .expect("position of the first skipped request");
+    let in_prefix = snapshot
+        .events
+        .iter()
+        .take_while(|event| event.sequence < prefix_end)
+        .count();
+    assert_eq!(in_prefix, 512);
     assert!(omnis_core::import_conversation(&snapshot).truncated);
     assert!(!visible_text(&snapshot).contains(&"request 1099"));
 }
@@ -1715,6 +1812,126 @@ fn codex_skips_oversized_records_and_reports_omission() {
         2
     );
     assert!(omnis_core::import_conversation(&snapshot).truncated);
+}
+
+#[test]
+fn codex_reports_malformed_records_without_losing_verified_openers() {
+    for opener_before_gap in [true, false] {
+        let mut records = Vec::new();
+        if opener_before_gap {
+            records.push(message("user", "opening request").to_string());
+        }
+        records.extend([
+            "\t ".to_owned(),
+            r#"{"type":"response_item""#.to_owned(),
+            message("user", "later request").to_string(),
+        ]);
+        let snapshot = read_records_with_preview(records, false).unwrap();
+        let notice = snapshot.events.last().unwrap();
+        assert_eq!(
+            notice.source.raw_record_type.as_deref(),
+            Some("omnisession.codex_malformed_records")
+        );
+        assert_eq!(notice.payload["malformed_records"], 1);
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
+        assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+        assert_eq!(
+            omnis_core::session_message_prefix_is_known(&snapshot, true),
+            opener_before_gap
+        );
+    }
+}
+
+#[test]
+fn codex_prefix_ends_at_the_first_skipped_source_record() {
+    let oversized = message("user", &"x".repeat(16 * 1024 * 1024)).to_string();
+    for preview in [true, false] {
+        for original_precedes_gap in [true, false] {
+            let mut records = Vec::new();
+            if original_precedes_gap {
+                records.push(message("user", "original request").to_string());
+            }
+            records.extend([
+                oversized.clone(),
+                message("user", "later request").to_string(),
+            ]);
+            let snapshot = read_records_with_preview(records, preview).expect("bounded rollout");
+            let raw_type = if preview {
+                "omnisession.codex_preview_prefix"
+            } else {
+                "omnisession.record_size_limit"
+            };
+            let bound = snapshot
+                .events
+                .iter()
+                .find(|event| event.source.raw_record_type.as_deref() == Some(raw_type))
+                .and_then(|event| event.payload["prefix_end_sequence"].as_u64())
+                .expect("known contiguous source prefix");
+            let proven = snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser && event.sequence < bound)
+                .map(|event| event.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                proven,
+                original_precedes_gap
+                    .then_some("original request")
+                    .as_slice()
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_middle() {
+    let padding = event("token_count", json!({"padding":"x".repeat(64 * 1024)})).to_string();
+    for known_opener in [true, false] {
+        let mut records = Vec::new();
+        if known_opener {
+            records.push(message("user", "recorded opening").to_string());
+        }
+        records.extend(std::iter::repeat_n("{}".to_owned(), 1_024));
+        records.push(message("user", "request in unread middle").to_string());
+        records.extend(std::iter::repeat_n(padding.clone(), 80));
+        records.push(message("user", "later request").to_string());
+        let preview = read_records_with_preview(records, true).unwrap();
+        assert!(!visible_text(&preview).contains(&"request in unread middle"));
+        assert_eq!(
+            omnis_core::session_message_prefix_is_known(&preview, false),
+            known_opener
+        );
+        assert!(!omnis_core::trajectory_search_document(&preview).source_complete);
+        assert!(omnis_core::import_conversation(&preview).truncated);
+    }
+}
+
+#[test]
+fn codex_preview_certifies_absence_only_after_reading_through_eof() {
+    const MIB: usize = 1024 * 1024;
+    let metadata = event("token_count", json!({"padding": "x".repeat(MIB)})).to_string();
+    let hidden_user = message("user", &"h".repeat(MIB)).to_string();
+    for (middle, tail_bytes, visible_bytes, known) in [
+        (Some(&metadata), 0, None, true),
+        (None, 2 * MIB, Some(2 * MIB), true),
+        (Some(&metadata), 2 * MIB, Some(2 * MIB), false),
+        (Some(&hidden_user), 2 * MIB, Some(2 * MIB), false),
+        (Some(&metadata), 5 * MIB, None, false),
+    ] {
+        let mut records = vec![metadata.clone(); 3];
+        records.extend(middle.cloned());
+        records.push(metadata.clone());
+        if tail_bytes > 0 {
+            records.push(message("user", &"x".repeat(tail_bytes)).to_string());
+        }
+        let snapshot = read_records_with_preview(records, true).expect("bounded preview");
+        let lengths: Vec<_> = visible_text(&snapshot).into_iter().map(str::len).collect();
+        assert_eq!(lengths, visible_bytes.as_slice());
+        assert_eq!(
+            omnis_core::session_message_prefix_is_known(&snapshot, false),
+            known
+        );
+    }
 }
 
 #[test]
@@ -2348,8 +2565,8 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
         let path = folder.join(format!("rollout-{SESSION_ID}.{extension}"));
         let session = SessionRef::new(Provider::Codex, SESSION_ID);
         let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/fixture"}});
-        for damaged in [false, true] {
-            let between = if damaged {
+        for (damaged, opener_before_gap) in [(false, true), (true, true), (true, false)] {
+            let unreadable = if damaged {
                 "{invalid private fragment}\n"
             } else {
                 ""
@@ -2360,8 +2577,10 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
                 ""
             };
             let contents = format!(
-                "{header}\n{}\n \t\r\n{between}{}\n{ending}",
+                "{header}\n{}{}\n \t\r\n{}{}\n{ending}",
+                if opener_before_gap { "" } else { unreadable },
                 message("user", "opening"),
+                if opener_before_gap { unreadable } else { "" },
                 message("assistant", "readable reply")
             );
             let bytes = match extension {
@@ -2384,7 +2603,10 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
                     .iter()
                     .find(|event| event.payload["malformed_records"] == 2)
                     .unwrap();
-                assert_eq!(notice.payload["prefix_end_sequence"], 1);
+                assert_eq!(
+                    notice.payload["prefix_end_sequence"],
+                    u64::from(opener_before_gap)
+                );
             }
             for snapshot in [
                 full.snapshot,
@@ -2396,6 +2618,10 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
                     .snapshot,
             ] {
                 assert_eq!(visible_text(&snapshot), ["opening", "readable reply"]);
+                assert_eq!(
+                    omnis_core::session_message_prefix_is_known(&snapshot, true),
+                    opener_before_gap
+                );
                 let missing = snapshot
                     .events
                     .iter()
@@ -2692,6 +2918,10 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
         omnis_adapters::CodexWorkspaceProjection::Observed(Some(surviving_dir.clone()))
     );
     assert!(text.iter().all(|message| !message.starts_with("discarded")));
+    assert!(omnis_core::session_message_prefix_is_known(
+        &read.snapshot,
+        false
+    ));
     let text_bytes = text.iter().map(|text| text.len()).sum::<usize>();
     let metadata_bytes: usize = read
         .snapshot
@@ -2704,6 +2934,98 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     assert_eq!(read.snapshot.workspace.root, surviving_dir);
     assert!(!read.source_complete);
     assert!(omnis_core::import_conversation(&read.snapshot).truncated);
+}
+
+#[test]
+fn compressed_rollout_titles_depend_on_the_first_gap() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID}});
+    let oversized = json!({"type":"response_item", "payload":{
+        "type":"message","role":"user","content":[{"type":"input_image","image_url":"a".repeat(16 * 1024 * 1024)}]
+    }}).to_string();
+    let follow_up = message("user", "visible follow-up");
+    for extension in ["gz", "zst"] {
+        let home = tempfile::tempdir()?;
+        let archive = home.path().join("archived_sessions");
+        fs::create_dir(&archive)?;
+        let path = archive.join(format!("rollout-{SESSION_ID}.jsonl.{extension}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        for opener_before_gap in [true, false] {
+            let opener = if opener_before_gap {
+                format!("{}\n", message("user", "verified opener"))
+            } else {
+                String::new()
+            };
+            let raw = format!("{header}\n{opener}{oversized}\n{follow_up}\n");
+            fs::write(&path, encode_rollout(raw.as_bytes(), extension))?;
+            let adapter = CodexAdapter::with_root(home.path());
+            let indexed = adapter.index_session(&session, Some(&path), 16 * 1024 * 1024)?;
+            assert!(!indexed.source_complete);
+            for (snapshot, full_read) in [
+                (indexed.snapshot, false),
+                (adapter.read_session(&session)?, true),
+            ] {
+                assert_eq!(visible_text(&snapshot).last(), Some(&"visible follow-up"));
+                assert_eq!(
+                    omnis_core::session_message_prefix_is_known(&snapshot, full_read),
+                    opener_before_gap,
+                    "{extension}, full read {full_read}, opener before gap {opener_before_gap}"
+                );
+            }
+        }
+        let raw = format!(
+            "{header}\n{}\n{}\n{follow_up}\n",
+            message("user", &"x".repeat(4 * 1024 * 1024)),
+            event("thread_rolled_back", json!({"num_turns":0})),
+        );
+        fs::write(&path, encode_rollout(raw.as_bytes(), extension))?;
+        let adapter = CodexAdapter::with_root(home.path());
+        let preview = adapter.preview_session(&session)?;
+        assert_eq!(visible_text(&preview), ["visible follow-up"]);
+        assert!(!omnis_core::session_message_prefix_is_known(
+            &preview, false
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_previews_confirm_absence_when_no_records_are_missing() -> anyhow::Result<()> {
+    let metadata = json!({"type":"turn_context","payload":{"model":"synthetic","padding":"x".repeat(1024 * 1024)}});
+    let edge = format!("{metadata}\n").repeat(3);
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID}});
+    let rollback = event("thread_rolled_back", json!({"num_turns":0}));
+    for extension in ["gz", "zst"] {
+        let home = tempfile::tempdir()?;
+        let folder = home.path().join("sessions");
+        fs::create_dir(&folder)?;
+        let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.{extension}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        for (body, known) in [
+            (edge.repeat(2), true),
+            (
+                format!(
+                    "{edge}{edge}{}\n{edge}{edge}",
+                    message("user", "unsampled request")
+                ),
+                false,
+            ),
+            (format!("{edge}{edge}broken JSON\n{rollback}\n"), false),
+            (format!("{edge}{edge}{rollback}\n"), true),
+        ] {
+            fs::write(
+                &path,
+                encode_rollout(format!("{header}\n{body}").as_bytes(), extension),
+            )?;
+            let adapter = CodexAdapter::with_root(home.path());
+            let preview = adapter.preview_session(&session)?;
+            assert!(visible_text(&preview).is_empty());
+            assert_eq!(
+                omnis_core::session_message_prefix_is_known(&preview, false),
+                known
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -3044,6 +3366,12 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
     )?;
     let check = |expected: Option<&str>| check_gui_title(home.path(), &path, expected);
     check(Some("🛰️ Orbital notes"))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert_eq!(
+        adapter.gui_session_names(&listed).get(SESSION_ID),
+        Some(&Some("🛰️ Orbital notes".to_owned()))
+    );
     fs::write(
         &index,
         json!({"id": SESSION_ID, "thread_name": "Earlier sidebar name"}).to_string(),
@@ -3054,26 +3382,20 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
     )?;
     check(Some("Renamed"))?;
     db.execute("UPDATE threads SET name = NULL", [])?;
+    assert!(adapter.gui_session_names(&listed).is_empty());
+    let cleared = adapter.list_sessions(None)?;
+    assert_eq!(
+        adapter.gui_session_names(&cleared).get(SESSION_ID),
+        Some(&None)
+    );
     check(None)?;
     drop(db);
     check(None)?;
     assert!(!db_path.with_extension("sqlite-wal").exists());
     assert!(!db_path.with_extension("sqlite-shm").exists());
 
-    let other = tempfile::tempdir()?;
-    let other_path = other.path().join(path.file_name().unwrap());
-    fs::copy(&path, &other_path)?;
     let db = rusqlite::Connection::open(&db_path)?;
-    db.execute(
-        "UPDATE threads SET rollout_path = ?1, name = 'Foreign title'",
-        [other_path.to_str()],
-    )?;
-    assert!(
-        CodexAdapter::with_root(home.path())
-            .list_sessions(None)?
-            .is_empty()
-    );
-    db.execute("UPDATE threads SET rollout_path=?1", [path.to_str()])?;
+    check_foreign_gui_rollout(home.path(), &path, &db)?;
     db.execute_batch(
         "ALTER TABLE threads ADD COLUMN title TEXT;
         ALTER TABLE threads ADD COLUMN first_user_message TEXT;
@@ -3107,6 +3429,27 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
     #[cfg(unix)]
     check_linked_gui_config(home.path(), &path)?;
     check_archived_gui_name(home.path(), &path, &db)?;
+    Ok(())
+}
+
+fn check_foreign_gui_rollout(
+    home: &Path,
+    path: &Path,
+    db: &rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let other = tempfile::tempdir()?;
+    let other_path = other.path().join(path.file_name().unwrap());
+    fs::copy(path, &other_path)?;
+    db.execute(
+        "UPDATE threads SET rollout_path = ?1, name = 'Foreign title'",
+        [other_path.to_str()],
+    )?;
+    assert!(
+        CodexAdapter::with_root(home)
+            .list_sessions(None)?
+            .is_empty()
+    );
+    db.execute("UPDATE threads SET rollout_path=?1", [path.to_str()])?;
     Ok(())
 }
 
@@ -3242,6 +3585,20 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         );
         Ok(())
     };
+    fs::write(
+        home.path().join("session_index.jsonl"),
+        format!(
+            "{{\n{}\n",
+            json!({"id":SESSION_ID,"thread_name":"Original name"})
+        ),
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert!(!adapter.session_titles_are_complete());
+    assert_eq!(
+        adapter.observed_listed_names(&listed).get(SESSION_ID),
+        Some(&omnis_adapters::NativeSessionName::Absent)
+    );
     check(&original, &one, None)?;
     let state = home.path().join("alternate");
     fs::create_dir(&state)?;

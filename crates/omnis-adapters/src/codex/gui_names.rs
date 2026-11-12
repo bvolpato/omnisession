@@ -4,7 +4,7 @@ use rusqlite::Row;
 
 pub(super) const WHITESPACE: &str = " \t\n\r\u{b}\u{c}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) enum StateName {
     #[default]
     Index,
@@ -64,14 +64,6 @@ impl StateName {
             Some(text) => Self::Gui(Some(text)),
             None if row.get::<_, bool>(6).unwrap_or(false) => Self::CorroboratedIndex,
             None => Self::Index,
-        }
-    }
-
-    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
-        match self {
-            Self::Index | Self::CorroboratedIndex => indexed(),
-            Self::Gui(name) => name.clone(),
-            Self::Guardian(name) => indexed().or_else(|| Some(name.clone())),
         }
     }
 }
