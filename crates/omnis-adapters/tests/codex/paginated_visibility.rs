@@ -1671,7 +1671,7 @@ fn a_failed_second_command_keeps_its_status_when_the_call_id_is_reused() {
             ("second", "second outcome", true),
         ] {
             let [mut call, result, mut display] = command_rows(turn, "reused", output);
-            call["payload"]["name"] = name.into();
+            call["payload"]["arguments"] = json!({"cmd":name}).to_string().into();
             display["payload"]["item"]["command"] = json!([name]);
             rows.push(call);
             if failed {
@@ -1937,6 +1937,75 @@ fn a_pending_reused_call_does_not_keep_the_previous_legacy_output_display() {
                 if !rollback {
                     assert_eq!(text.matches("gamma cue").count(), 1, "{text}");
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_late_function_output_correction_survives_only_with_its_owning_turn() {
+    let [call, result, _] = command_rows("first", "cmd", "original raw output");
+    let display = |turn: &str, name: &str, namespace: &str, text: &str| {
+        turn_item(
+            turn,
+            &json!({
+                "type":"FunctionCallOutput","id":"cmd","name":name,"namespace":namespace,"output":text
+            }),
+        )
+    };
+    let initial = display("first", "lookup", "oldspace", "original raw output");
+    let prefix = vec![
+        event("task_started", json!({"turn_id":"first"})),
+        page_user("first", "u", "first request"),
+        call,
+        result,
+        initial,
+        event("task_complete", json!({"turn_id":"first"})),
+        event("task_started", json!({"turn_id":"second"})),
+        page_user("second", "u", "second request"),
+    ];
+    for (owner, survives) in [("first", true), ("second", false), ("unspecified", false)] {
+        let mut rows = prefix.clone();
+        let mut revision = display(
+            owner,
+            "correctedlookup",
+            "revisedspace",
+            "corrected published body",
+        );
+        if owner == "unspecified" {
+            revision["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("turn_id");
+        }
+        rows.push(revision);
+        let before = read_with_history_mode(rows.clone(), false, Some("legacy")).unwrap();
+        assert_eq!(
+            omnis_core::trajectory_search_document(&before)
+                .text
+                .contains("revisedspace"),
+            owner != "unspecified",
+            "{owner}"
+        );
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            for text in [&search.text, &handoff] {
+                assert_eq!(
+                    text.matches("original raw output").count(),
+                    1,
+                    "{owner}: {text}"
+                );
+                for part in [
+                    "corrected published body",
+                    "revisedspace",
+                    "correctedlookup",
+                ] {
+                    assert_eq!(text.contains(part), survives, "{owner}: {text}");
+                }
+                assert!(!text.contains("second request"));
             }
         }
     }

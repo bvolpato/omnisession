@@ -76,6 +76,7 @@ pub(super) struct Projection {
     pub(super) scope: CompletionScope,
     pub(super) original: Option<u64>,
     pub(super) peer: Option<u64>,
+    display_identity: Option<super::tool_history::DisplayCallIdentity>,
     receipt: Option<Receipt>,
     pending: Option<u64>,
     deferred_output: Option<[u8; 32]>,
@@ -119,19 +120,8 @@ impl CodexHistory {
                 .event_at_mut(seq)
                 .is_some_and(|event| matches(&event.payload))
         };
-        let command = super::tool_history::CommandIdentity::display(item);
-        let tool = (item["type"] == "DynamicToolCall")
-            .then(|| item["tool"].as_str())
-            .flatten()
-            .map(|name| super::paginated_rollback::json_digest(&name));
-        let call_matches = |seq: &u64| {
-            if let Some(tool) = tool {
-                return self.calls.function_names.get(seq).map(|name| *name == tool);
-            }
-            command
-                .zip(self.calls.commands.get(seq).copied())
-                .map(|(a, b)| a.agrees(b))
-        };
+        let identity = super::tool_history::DisplayCallIdentity::from_item(item);
+        let call_matches = |seq: &u64| self.calls.display_matches_call(identity?, *seq);
         let input_agrees = |seq| self.calls.result_calls.get(&seq).and_then(call_matches);
         let known = self
             .occurrences
@@ -182,7 +172,10 @@ impl CodexHistory {
                     return known;
                 }
                 let earlier = self.call_identity_for_result(old);
-                if !self.calls.commands.contains_key(&next)
+                if !matches!(
+                    identity,
+                    Some(super::tool_history::DisplayCallIdentity::Dynamic(_))
+                ) && !self.calls.commands.contains_key(&next)
                     && earlier.is_some()
                     && earlier != self.calls.source_keys.get(&next)
                 {
@@ -206,6 +199,68 @@ impl CodexHistory {
             }
             other => other,
         }
+    }
+
+    pub(super) fn reject_pending_display(
+        &mut self,
+        builder: &mut EventBuilder,
+        turn: Option<&str>,
+        id: &str,
+        call: &super::tool_history::ScopedRecord,
+        output: &Value,
+    ) -> bool {
+        let scope = if self.paginated {
+            CompletionScope::Published
+        } else {
+            CompletionScope::Historical(CompletedKind::Tool)
+        };
+        let key = (scope, id.to_owned());
+        let turn = turn
+            .filter(|turn| {
+                self.completed
+                    .get(self.aliases.resolve(turn))
+                    .is_some_and(|slots| slots.contains_key(&key))
+            })
+            .or_else(|| {
+                self.items
+                    .outcomes
+                    .pending_display_turn(id, turn, call.owner)
+            });
+        let Some(slot) = turn
+            .and_then(|turn| self.completed.get_mut(self.aliases.resolve(turn)))
+            .and_then(|slots| slots.get_mut(&key))
+        else {
+            return false;
+        };
+        let Some(event) = builder.event_at_mut(slot.sequence) else {
+            return false;
+        };
+        if slot.ambiguous
+            || slot.model.is_some()
+            || event.source.raw_record_type.as_deref() != Some("event_msg.item_completed")
+            || !matches!(
+                event.payload["type"].as_str(),
+                Some("CommandExecution" | "DynamicToolCall")
+            )
+        {
+            return false;
+        }
+        let compatible = slot
+            .display_identity
+            .and_then(|identity| self.calls.display_matches_call(identity, call.sequence));
+        if compatible.unwrap_or_else(|| {
+            event.payload["type"] == "CommandExecution"
+                && super::completed_item::pending_command_output_matches(&event.payload, output)
+        }) {
+            return false;
+        }
+        slot.ambiguous = true;
+        unattribute_display(&mut event.payload);
+        self.items
+            .outcomes
+            .take(id, false, Some(slot.sequence), None, None);
+        self.ambiguous_receipts += 1;
+        true
     }
 
     fn reject_deferred_output(
@@ -239,6 +294,48 @@ impl CodexHistory {
         true
     }
 
+    fn project_legacy_output(
+        &self,
+        builder: &mut EventBuilder,
+        (turn, id): (&str, &str),
+        item: &Value,
+        sequence: u64,
+        projection: &mut Projection,
+    ) {
+        projection.scope = CompletionScope::LegacyOutput;
+        projection.original = Some(sequence);
+        if projection.pending.is_some() {
+            return;
+        }
+        let matches_output = super::completed_item::model_output_matcher(item);
+        let mut best = 0;
+        for result in self.occurrences.results(turn, id) {
+            let Some(&call) = self.calls.result_calls.get(&result) else {
+                continue;
+            };
+            let same_name = builder
+                .event_at_mut(call)
+                .is_some_and(|event| event.payload["name"] == item["name"]);
+            let same_body = builder
+                .event_at_mut(result)
+                .is_some_and(|event| matches_output(&event.payload));
+            let evidence = u8::from(same_name) + u8::from(same_body);
+            match evidence.cmp(&best) {
+                std::cmp::Ordering::Greater => {
+                    best = evidence;
+                    projection.pending = Some(call);
+                    projection.ambiguous = false;
+                }
+                std::cmp::Ordering::Equal if projection.pending != Some(call) => {
+                    projection.pending = None;
+                    projection.ambiguous = true;
+                }
+                _ => {}
+            }
+        }
+        projection.wait_for_call |= projection.ambiguous;
+    }
+
     pub(super) fn completion_position(
         &mut self,
         builder: &mut EventBuilder,
@@ -248,7 +345,8 @@ impl CodexHistory {
         payload: &Value,
     ) -> Projection {
         let display = payload["type"] == "item_completed";
-        let receipt = Receipt::from_item(&payload["item"]);
+        let item = &payload["item"];
+        let receipt = Receipt::from_item(item);
         let historical = CompletionScope::Historical(kind);
         let positions = self.completed.get(turn);
         let get = |scope| positions?.get(&(scope, id.to_owned())).copied();
@@ -268,14 +366,7 @@ impl CodexHistory {
             .calls
             .pending_occurrence(id, turn, last_result, generated);
         let pending = candidate.and_then(PendingCall::after_result);
-        let known = self.match_display(
-            builder,
-            (turn, id),
-            &payload["item"],
-            receipt,
-            candidate,
-            last_result,
-        );
+        let known = self.match_display(builder, (turn, id), item, receipt, candidate, last_result);
         let prior = match known {
             Match::One(seq) => Some(seq),
             _ => None,
@@ -291,6 +382,7 @@ impl CodexHistory {
             rejected || previous.is_some_and(|p| p.ambiguous)
         };
         let mut projection = Projection {
+            display_identity: super::tool_history::DisplayCallIdentity::from_item(item),
             scope: historical,
             original: None,
             peer: None,
@@ -311,11 +403,14 @@ impl CodexHistory {
                 projection.pending = None;
                 return projection;
             }
-            if let Some(slot) =
-                legacy_output.filter(|_| payload["item"]["type"] == "FunctionCallOutput")
-            {
-                projection.scope = CompletionScope::LegacyOutput;
-                projection.original = Some(slot.sequence);
+            if let Some(slot) = legacy_output.filter(|_| item["type"] == "FunctionCallOutput") {
+                self.project_legacy_output(
+                    builder,
+                    (turn, id),
+                    item,
+                    slot.sequence,
+                    &mut projection,
+                );
                 return projection;
             }
             projection.original = prior.or(history).filter(|_| display && !wait_for_call);
@@ -413,6 +508,7 @@ impl CodexHistory {
                         id.to_owned(),
                     ),
                     super::CompletedPosition {
+                        display_identity: None,
                         pending_output_call: None,
                         kind: CompletedKind::Tool,
                         receipt: None,
@@ -509,9 +605,7 @@ impl CodexHistory {
         if projected.scope == CompletionScope::LegacyOutput {
             if let Some(slot) = positions.get_mut(&key) {
                 slot.ambiguous = projected.ambiguous;
-                if projected.wait_for_call {
-                    slot.pending_output_call = projected.pending;
-                }
+                slot.pending_output_call = projected.pending;
             }
             return;
         }
@@ -538,6 +632,7 @@ impl CodexHistory {
         positions.insert(
             key,
             super::CompletedPosition {
+                display_identity: projected.display_identity,
                 pending_output_call: None,
                 kind,
                 receipt,

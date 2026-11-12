@@ -2,6 +2,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use serde_json::Value;
+
+use super::paginated_rollback::json_digest;
+
 #[derive(Default)]
 pub(super) struct PendingOutcomes {
     model: HashMap<String, VecDeque<ScopedRecord>>,
@@ -25,26 +29,9 @@ impl PendingOutcomes {
         let queue = opposite.get_mut(id)?;
         let index = match known {
             Some(seq) => queue.iter().position(|entry| entry.sequence == seq),
-            None => queue.iter().position(|entry| {
-                if id.is_empty() {
-                    return turn.is_some() && turn == entry.turn.as_deref();
-                }
-                if !display
-                    && turn.is_none()
-                    && owner
-                        .zip(entry.owner)
-                        .is_some_and(|(left, right)| left != right)
-                {
-                    return false;
-                }
-                turn.zip(entry.turn.as_deref()).is_none_or(|(a, b)| {
-                    a == b
-                        || (super::is_implicit_turn(a) != super::is_implicit_turn(b)
-                            && owner
-                                .zip(entry.owner)
-                                .is_none_or(|(left, right)| left == right))
-                })
-            }),
+            None => queue
+                .iter()
+                .position(|entry| entry.matches(id, display, turn, owner)),
         };
         let matched = queue.remove(index?)?;
         if queue.is_empty() {
@@ -75,6 +62,20 @@ impl PendingOutcomes {
             });
     }
 
+    pub(super) fn pending_display_turn(
+        &self,
+        id: &str,
+        turn: Option<&str>,
+        owner: Option<u64>,
+    ) -> Option<&str> {
+        self.display
+            .get(id)?
+            .iter()
+            .find(|entry| entry.matches(id, false, turn, owner))?
+            .turn
+            .as_deref()
+    }
+
     pub(super) fn retain_models(&mut self) {
         self.display.clear();
     }
@@ -93,6 +94,29 @@ pub(super) struct ScopedRecord {
     pub(super) sequence: u64,
     pub(super) turn: Option<String>,
     pub(super) owner: Option<u64>,
+}
+
+impl ScopedRecord {
+    fn matches(&self, id: &str, display: bool, turn: Option<&str>, owner: Option<u64>) -> bool {
+        if id.is_empty() {
+            return turn.is_some() && turn == self.turn.as_deref();
+        }
+        if !display
+            && turn.is_none()
+            && owner
+                .zip(self.owner)
+                .is_some_and(|(left, right)| left != right)
+        {
+            return false;
+        }
+        turn.zip(self.turn.as_deref()).is_none_or(|(a, b)| {
+            a == b
+                || (super::is_implicit_turn(a) != super::is_implicit_turn(b)
+                    && owner
+                        .zip(self.owner)
+                        .is_none_or(|(left, right)| left == right))
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -177,11 +201,56 @@ impl CommandIdentity {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DisplayCallIdentity {
+    Command(Option<CommandIdentity>),
+    Dynamic([u8; 32]),
+}
+
+impl DisplayCallIdentity {
+    pub(super) fn from_item(item: &Value) -> Option<Self> {
+        match item["type"].as_str()? {
+            "CommandExecution" => Some(Self::Command(CommandIdentity::display(item))),
+            "DynamicToolCall" => Some(Self::Dynamic(json_digest(&[
+                &item["namespace"],
+                &item["tool"],
+                item.get("arguments")?,
+            ]))),
+            _ => None,
+        }
+    }
+}
+
+struct RecordedFunction {
+    dynamic: Option<[u8; 32]>,
+    may_run_command: bool,
+}
+
+impl RecordedFunction {
+    fn from_call(payload: &Value) -> Option<Self> {
+        if payload["type"] != "function_call" {
+            return None;
+        }
+        let name = payload["name"].as_str()?;
+        let args = payload["arguments"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+        Some(Self {
+            dynamic: args
+                .map(|args| json_digest(&[&payload["namespace"], &payload["name"], &args])),
+            may_run_command: matches!(
+                name,
+                "exec_command" | "write_stdin" | "shell" | "shell_command" | "local_shell"
+            ),
+        })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct NativeCalls {
     pub(super) result_calls: HashMap<u64, u64>,
     pub(super) overlapping: HashSet<u64>,
-    pub(super) function_names: HashMap<u64, [u8; 32]>,
+    functions: HashMap<u64, RecordedFunction>,
     pub(super) commands: HashMap<u64, CommandIdentity>,
     pub(super) source_keys: HashMap<u64, [u8; 32]>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
@@ -190,6 +259,34 @@ pub(super) struct NativeCalls {
 }
 
 impl NativeCalls {
+    pub(super) fn display_matches_call(
+        &self,
+        display: DisplayCallIdentity,
+        sequence: u64,
+    ) -> Option<bool> {
+        match display {
+            DisplayCallIdentity::Dynamic(input) => {
+                self.source_keys.contains_key(&sequence).then(|| {
+                    self.functions
+                        .get(&sequence)
+                        .is_some_and(|call| call.dynamic == Some(input))
+                })
+            }
+            DisplayCallIdentity::Command(command) => {
+                if self
+                    .functions
+                    .get(&sequence)
+                    .is_some_and(|call| !call.may_run_command)
+                {
+                    return Some(false);
+                }
+                command
+                    .zip(self.commands.get(&sequence).copied())
+                    .map(|(a, b)| a.agrees(b))
+            }
+        }
+    }
+
     pub(super) fn push(
         &mut self,
         id: &str,
@@ -213,11 +310,8 @@ impl NativeCalls {
                     .insert(sequence, CommandIdentity::new(&args.cmd, cwd));
                 serde_json::Value::String(args.cmd)
             });
-        if payload["type"] == "function_call"
-            && let Some(name) = payload["name"].as_str()
-        {
-            self.function_names
-                .insert(sequence, super::paginated_rollback::json_digest(&name));
+        if let Some(call) = RecordedFunction::from_call(payload) {
+            self.functions.insert(sequence, call);
         }
         if let Some(queue) = self.pending.get(id) {
             for call in queue.iter().filter(|call| {
@@ -328,7 +422,7 @@ impl NativeCalls {
 
     pub(super) fn retain(&mut self, mut exists: impl FnMut(u64) -> bool) {
         self.overlapping.retain(|seq| exists(*seq));
-        self.function_names.retain(|&seq, _| exists(seq));
+        self.functions.retain(|&seq, _| exists(seq));
         self.commands.retain(|&seq, _| exists(seq));
         self.source_keys.retain(|&seq, _| exists(seq));
         self.result_calls

@@ -1335,3 +1335,97 @@ fn an_overlapping_or_conflicting_command_keeps_its_unattributed_failure() {
         }
     }
 }
+
+#[test]
+fn a_command_published_before_its_call_requires_compatible_execution_evidence() {
+    for (name, args, argv, diagnostic, paired) in [
+        (
+            "exec_command",
+            json!({"cmd":"second"}),
+            json!(["/bin/sh", "-c", "second"]),
+            "published diagnostic",
+            true,
+        ),
+        (
+            "exec_command",
+            json!({"cmd":"first"}),
+            json!(["/bin/sh", "-c", "second"]),
+            "published diagnostic",
+            false,
+        ),
+        (
+            "lookup",
+            json!({}),
+            json!(["/bin/sh", "-c", "second"]),
+            "published diagnostic",
+            false,
+        ),
+        (
+            "exec_command",
+            json!({"cmd":"first"}),
+            json!(["fixture-wrapper", "--run", "second"]),
+            "published diagnostic",
+            false,
+        ),
+        (
+            "exec_command",
+            json!({"cmd":"second"}),
+            json!(["fixture-wrapper", "--run", "second"]),
+            "raw receipt",
+            true,
+        ),
+    ] {
+        for display_first in [false, true] {
+            for turn in ["turn", "rollout-2"] {
+                let mut display = command_display("second", "failed", diagnostic);
+                display["payload"]["turn_id"] = turn.into();
+                display["payload"]["item"]["command"] = argv.clone();
+                let call = physical_call(name, &args);
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":turn})),
+                    page_user(turn, "user", "request"),
+                ];
+                rows.extend(if display_first {
+                    [display, call]
+                } else {
+                    [call, display]
+                });
+                rows.push(physical_result("raw receipt"));
+                for mode in ["paginated", "legacy"] {
+                    for preview in [false, true] {
+                        let snapshot =
+                            read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                        let search = omnis_core::trajectory_search_document(&snapshot);
+                        let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                        assert_eq!(
+                            search.source_complete, paired,
+                            "{name} {argv} {display_first} {mode}"
+                        );
+                        for text in [search.text, handoff] {
+                            assert_eq!(text.matches("raw receipt").count(), 1, "{text}");
+                            assert_eq!(text.contains("published diagnostic"), !paired, "{text}");
+                        }
+                        let raw = snapshot
+                            .events
+                            .iter()
+                            .find(|event| {
+                                event.source.raw_record_type.as_deref()
+                                    == Some("response_item.function_call_output")
+                            })
+                            .unwrap();
+                        assert_eq!(raw.kind == EventKind::ToolFailed, paired);
+                        let trajectory = omnis_core::import_trajectory(&snapshot);
+                        let native = omnis_core::native_trajectory_items(&trajectory);
+                        assert_eq!(
+                            native.iter().any(|entry| matches!(
+                                entry,
+                                omnis_core::NativeTrajectoryItem::Tool { is_error: true, .. }
+                            )),
+                            paired
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

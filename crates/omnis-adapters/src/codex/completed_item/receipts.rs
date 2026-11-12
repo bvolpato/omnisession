@@ -265,6 +265,12 @@ pub(in super::super) fn model_output_matcher(source: &Value) -> impl Fn(&Value) 
     }
 }
 
+pub(in super::super) fn pending_command_output_matches(display: &Value, output: &Value) -> bool {
+    model_body(output)
+        .map(hex::encode)
+        .is_some_and(|key| display[WITNESS]["body"] == key)
+}
+
 pub(in super::super) fn equivalent_model_receipt(display: &Value, model: &Value) -> bool {
     match display["type"].as_str() {
         Some("CommandExecution") => true,

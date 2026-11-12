@@ -56,7 +56,7 @@ fn a_rollback_keeps_the_published_command_and_only_its_admitted_inputs_model_res
             if !same_input {
                 rows.push(second.clone());
             }
-            rows.extend([call(None), model_result("model reply")]);
+            rows.extend([exec_call(None, "example"), model_result("model reply")]);
             if same_input {
                 rows.push(second);
             }
@@ -194,6 +194,13 @@ fn an_unstamped_model_result_before_a_new_generated_turn_rolls_back_with_its_dis
     }
 }
 
+fn exec_call(turn: Option<&str>, command: &str) -> Value {
+    let mut record = call(turn);
+    record["payload"]["name"] = "exec_command".into();
+    record["payload"]["arguments"] = json!({"cmd":command}).to_string().into();
+    record
+}
+
 fn call(turn: Option<&str>) -> Value {
     let mut result = json!({"type":"response_item","payload":{"type":"function_call","call_id":"cmd","name":"example","arguments":"{}"}});
     if let Some(turn) = turn {
@@ -204,8 +211,8 @@ fn call(turn: Option<&str>) -> Value {
 
 #[test]
 fn a_late_native_call_and_its_unstamped_output_keep_the_calling_turn() {
-    let first_call = call(None);
-    let late_call = call(Some("first"));
+    let first_call = exec_call(None, "example");
+    let late_call = exec_call(Some("first"), "example");
     for after_start in [false, true] {
         let mut rows = vec![
             event("task_started", json!({"turn_id":"first"})),
@@ -340,7 +347,7 @@ fn a_retained_generated_turn_keeps_its_original_call_owner_after_rollback() {
         event("thread_rolled_back", json!({"num_turns":1})),
         event("task_started", json!({"turn_id":"third"})),
         page_user("third", "u3", "also discard"),
-        call(Some("original")),
+        exec_call(Some("original"), "example"),
         model_result("original result"),
         command("original", "completed"),
         event("thread_rolled_back", json!({"num_turns":1})),
@@ -397,7 +404,7 @@ fn a_generated_call_keeps_the_input_that_issued_it_when_its_unstamped_result_arr
     let mut rows = vec![
         event("task_started", json!({"turn_id":"rollout-2"})),
         page_user("rollout-2", "u1", "keep"),
-        call(None),
+        exec_call(None, "example"),
         event("task_complete", json!({"turn_id":"rollout-2"})),
         event("task_started", json!({"turn_id":"second"})),
         page_user("second", "u2", "discard"),
@@ -433,7 +440,7 @@ fn repeating_a_command_completion_after_a_steer_keeps_the_original_owner() {
         let mut rows = vec![
             event("task_started", json!({"turn_id":"named"})),
             page_user("named", "u1", "first"),
-            call(None),
+            exec_call(None, "example"),
             model_result("first result"),
             command("named", "completed"),
             page_user("named", "u2", "second"),
@@ -500,7 +507,7 @@ fn rolling_back_a_steer_restores_the_previous_legacy_tool_status() {
     let mut rows = vec![
         event("task_started", json!({"turn_id":"named"})),
         page_user("named", "u1", "first"),
-        call(None),
+        exec_call(None, "example"),
         model_result("model receipt"),
         command("named", "failed"),
         page_user("named", "u2", "second"),
@@ -542,7 +549,7 @@ fn legacy_display_revisions_keep_the_earlier_payload_or_a_later_model_receipt() 
         let mut rows = vec![
             event("task_started", json!({"turn_id":"named"})),
             page_user("named", "u1", "first"),
-            call(None),
+            exec_call(None, "example"),
             command("named", "failed"),
             page_user("named", "u2", "second"),
             correction.clone(),
@@ -1081,7 +1088,11 @@ fn replacing_a_published_slot_preserves_one_physical_model_result() {
         if !command_first {
             records.push(message.clone());
         }
-        records.extend([call(Some("turn")), model_result("recorded result"), display]);
+        records.extend([
+            exec_call(Some("turn"), "example"),
+            model_result("recorded result"),
+            display,
+        ]);
         if command_first {
             records.push(message);
         }
@@ -1113,7 +1124,7 @@ fn image_view_replacing_a_command_keeps_its_path_and_the_physical_receipt() {
     let rows = vec![
         event("task_started", json!({"turn_id":"turn"})),
         page_user("turn", "request", "inspect fixture"),
-        call(Some("turn")),
+        exec_call(Some("turn"), "example"),
         model_result("physical receipt"),
         command("turn", "failed"),
         turn_item("turn", &image),
@@ -1135,7 +1146,7 @@ fn a_request_replacing_a_command_keeps_its_slot_when_the_model_result_arrives() 
     for late_result in [false, true] {
         let mut records = vec![
             event("task_started", json!({"turn_id":"turn"})),
-            call(Some("turn")),
+            exec_call(Some("turn"), "example"),
         ];
         let result = model_result("physical output");
         if !late_result {
@@ -1181,7 +1192,7 @@ fn a_published_file_change_keeps_its_patch_when_it_replaces_a_command_receipt() 
         json!({"type":"FileChange","id":"cmd","changes":{"fixture.rs":[0,"added fixture line"]}});
     let records = vec![
         event("task_started", json!({"turn_id":"turn"})),
-        call(Some("turn")),
+        exec_call(Some("turn"), "example"),
         model_result("physical result"),
         command("turn", "failed"),
         turn_item("turn", &change),
@@ -1212,12 +1223,11 @@ fn reused_call_ids_assign_display_status_to_the_matching_result_occurrence() {
             first["payload"]["item"]["command"] = json!(["first"]);
             let mut second = command("turn", "failed");
             second["payload"]["item"]["command"] = json!(["second"]);
-            let mut second_call = call(Some("turn"));
-            second_call["payload"]["name"] = json!("second");
+            let second_call = exec_call(Some("turn"), "second");
             let output = model_result("second result");
             let mut rows = vec![
                 event("task_started", json!({"turn_id":"turn"})),
-                call(Some("turn")),
+                exec_call(Some("turn"), "first"),
                 model_result("first result"),
                 first,
                 second_call,
@@ -1262,7 +1272,7 @@ fn restoring_a_published_command_reuses_its_physical_result() {
     );
     let rows = vec![
         event("task_started", json!({"turn_id":"turn"})),
-        call(Some("turn")),
+        exec_call(Some("turn"), "example"),
         model_result("only output"),
         failed.clone(),
         image,
@@ -1298,6 +1308,9 @@ fn failed_published_tool_receipts_transfer_the_matching_raw_output_once() {
                 for raw_text in ["lookup receipt", "different physical output"] {
                     let mut raw_call = call(Some("turn"));
                     raw_call["payload"]["name"] = "lookup".into();
+                    if item["type"] == "DynamicToolCall" {
+                        raw_call["payload"]["namespace"] = item["namespace"].clone();
+                    }
                     let mut rows = vec![event("task_started", json!({"turn_id":"turn"})), raw_call];
                     let raw = model_result(raw_text);
                     let display = turn_item("turn", &item);
@@ -1341,10 +1354,10 @@ fn a_command_correction_during_a_later_call_uses_the_proven_occurrence() {
         first["payload"]["item"]["aggregated_output"] = json!("first physical");
         let mut revision = first.clone();
         revision["payload"]["item"]["status"] = json!("failed");
-        let first_call = call(Some("turn"));
+        let first_call = exec_call(Some("turn"), "first");
         let mut next_call = first_call.clone();
         if !indistinguishable {
-            next_call["payload"]["name"] = json!("second");
+            next_call = exec_call(Some("turn"), "second");
         }
         let mut rows = vec![
             event("task_started", json!({"turn_id":"turn"})),
@@ -1475,10 +1488,10 @@ fn repeated_commands_with_the_same_inputs_can_be_distinguished_by_their_original
     };
     let rows = vec![
         event("task_started", json!({"turn_id":"turn"})),
-        call(Some("turn")),
+        exec_call(Some("turn"), "example"),
         model_result("first native output"),
         shown("first native output", "completed"),
-        call(Some("turn")),
+        exec_call(Some("turn"), "example"),
         model_result("second native output"),
         shown("second native output", "completed"),
         shown("first native output", "failed"),
@@ -1813,6 +1826,241 @@ fn corrected_function_body_releases_the_previous_display_identity() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_published_function_output_names_the_matching_reused_call() {
+    let shown = |name, body| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"FunctionCallOutput","id":"cmd","name":name,"output":body
+            }),
+        )
+    };
+    let named_call = |name| {
+        let mut row = call(Some("turn"));
+        row["payload"]["name"] = Value::String(name);
+        row
+    };
+    for identical in [false, true] {
+        for raw_first in [true, false] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                page_user("turn", "u", "request"),
+                named_call("firsttool".into()),
+                model_result(if identical { "gamma cue" } else { "alpha cue" }),
+                shown("firsttool", "beta cue"),
+                named_call("secondtool".into()),
+            ];
+            let raw = model_result("gamma cue");
+            let display = shown("secondtool", "gamma cue");
+            rows.extend(if raw_first {
+                [raw, display]
+            } else {
+                [display, raw]
+            });
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+                let results: Vec<_> = snapshot
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.source.raw_record_type.as_deref()
+                            == Some("response_item.function_call_output")
+                    })
+                    .collect();
+                assert_eq!(results.len(), 2);
+                assert!(results[0].payload["omnisession_codex_tool_display"].is_null());
+                assert_eq!(
+                    results[1].payload["omnisession_codex_tool_display"]["name"],
+                    "secondtool"
+                );
+                for text in [
+                    omnis_core::trajectory_search_document(&snapshot).text,
+                    omnis_core::render_semantic_handoff(&snapshot),
+                ] {
+                    assert_eq!(
+                        text.matches("gamma cue").count(),
+                        1 + usize::from(identical),
+                        "{text}"
+                    );
+                    assert!(!text.contains("beta cue"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dynamic_display_failure_requires_the_same_function_input() {
+    let mut lookup = call(Some("turn"));
+    lookup["payload"]["name"] = "lookup".into();
+    lookup["payload"]["namespace"] = "catalog".into();
+    lookup["payload"]["arguments"] = r#"{ "query": "old", "page": 2 }"#.into();
+    for (namespace, arguments, matched) in [
+        (json!("catalog"), json!({"page":2,"query":"old"}), true),
+        (json!("catalog"), json!({"page":2,"query":"new"}), false),
+        (json!("catalog"), json!({"page":"2","query":"old"}), false),
+        (json!("other"), json!({"page":2,"query":"old"}), false),
+        (Value::Null, json!({"page":2,"query":"old"}), false),
+    ] {
+        let display = turn_item(
+            "turn",
+            &json!({
+                "type":"DynamicToolCall", "id":"cmd", "tool":"lookup", "namespace":namespace,
+                "arguments":arguments, "status":"failed", "success":false,
+                "content_items":[{"type":"inputText","text":"alpha cue"}]
+            }),
+        );
+        for mode in [None, Some("paginated")] {
+            for (order, records) in [
+                (
+                    "display before call",
+                    [display.clone(), lookup.clone(), model_result("alpha cue")],
+                ),
+                (
+                    "display before result",
+                    [lookup.clone(), display.clone(), model_result("alpha cue")],
+                ),
+                (
+                    "display after result",
+                    [lookup.clone(), model_result("alpha cue"), display.clone()],
+                ),
+            ] {
+                let mut rows = vec![event("task_started", json!({"turn_id":"turn"}))];
+                rows.extend(records);
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                    let projection = omnis_core::trajectory_search_document(&snap);
+                    assert_eq!(
+                        projection.source_complete, matched,
+                        "{mode:?} {order} {namespace} {arguments}"
+                    );
+                    let imported = omnis_core::import_trajectory(&snap);
+                    let items = omnis_core::native_trajectory_items(&imported);
+                    let recorded_failure = items.iter().any(|item| matches!(item,
+                        omnis_core::NativeTrajectoryItem::Tool { output, is_error: true, .. } if output == "alpha cue"
+                    ));
+                    assert_eq!(recorded_failure, matched, "{items:?}");
+                    let expected = if matched {
+                        EventKind::ToolFailed
+                    } else {
+                        EventKind::ToolCompleted
+                    };
+                    assert_eq!(results(&snap), [(&expected, "alpha cue")]);
+                    if !matched {
+                        assert!(
+                            snap.events
+                                .iter()
+                                .any(|event| event.kind == EventKind::ToolFailed
+                                    && event.payload["arguments"] == arguments),
+                            "{items:?}"
+                        );
+                    }
+                    assert!(omnis_core::render_semantic_handoff(&snap).contains("alpha cue"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_dynamic_calls_with_the_same_result_use_the_published_arguments() {
+    let mut first = call(Some("turn"));
+    first["payload"]["name"] = "lookup".into();
+    first["payload"]["arguments"] = r#"{"query":"old"}"#.into();
+    let mut second = first.clone();
+    second["payload"]["arguments"] = r#"{"query":"new"}"#.into();
+    let display = turn_item(
+        "turn",
+        &json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup",
+        "arguments":{"query":"new"},"status":"failed","success":false,
+        "content_items":[{"type":"inputText","text":"alpha cue"}]}),
+    );
+    for display_first in [false, true] {
+        let raw = model_result("alpha cue");
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            first.clone(),
+            raw.clone(),
+            second.clone(),
+        ];
+        rows.extend(if display_first {
+            [display.clone(), raw]
+        } else {
+            [raw, display.clone()]
+        });
+        for mode in [None, Some("paginated")] {
+            for preview in [false, true] {
+                let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                assert_eq!(
+                    results(&snap),
+                    [
+                        (&EventKind::ToolCompleted, "alpha cue"),
+                        (&EventKind::ToolFailed, "alpha cue")
+                    ],
+                    "{mode:?} {preview} {display_first}"
+                );
+                assert!(omnis_core::trajectory_search_document(&snap).source_complete);
+                let trajectory = omnis_core::import_trajectory(&snap);
+                let inputs = omnis_core::native_trajectory_items(&trajectory)
+                    .into_iter()
+                    .filter_map(|item| {
+                        if let omnis_core::NativeTrajectoryItem::Tool {
+                            input, is_error, ..
+                        } = item
+                        {
+                            Some((input["query"].as_str()?.to_owned(), is_error))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(inputs, [("old".into(), false), ("new".into(), true)]);
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_legacy_function_outputs_keep_both_physical_results_and_the_display() {
+    let display = |name, body| {
+        turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"cmd","name":name,"output":body}),
+        )
+    };
+    for (name, body) in [("example", "same raw"), ("changed", "different display")] {
+        let rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            call(Some("turn")),
+            model_result("same raw"),
+            display("example", "old display"),
+            call(Some("turn")),
+            model_result("same raw"),
+            display(name, body),
+        ];
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            assert_eq!(results(&snapshot).len(), 3);
+            assert!(
+                snapshot
+                    .events
+                    .iter()
+                    .filter(|e| e.source.raw_record_type.as_deref()
+                        == Some("response_item.function_call_output"))
+                    .all(|e| e.payload["omnisession_codex_tool_display"].is_null())
+            );
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert!(text.contains(body));
+                assert!(!text.contains("old display"));
             }
         }
     }

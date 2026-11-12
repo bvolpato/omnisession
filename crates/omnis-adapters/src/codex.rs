@@ -2148,6 +2148,7 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
+    display_identity: Option<tool_history::DisplayCallIdentity>,
     pending_output_call: Option<u64>,
     deferred_output: Option<[u8; 32]>,
     receipt: Option<tool_occurrences::Receipt>,
@@ -3229,6 +3230,27 @@ impl CodexHistory {
         new_turn && owner.is_none()
     }
 
+    fn owns_implicit_call(&self, named: &str, id: &str) -> bool {
+        // A generated turn can remain open after the next raw input has arrived.
+        // Use it only while its confirmed request is the most recent checkpoint.
+        let Some(owner) = self.named_turns.get(named) else {
+            return false;
+        };
+        let completed = self.completed.get(named).is_some_and(|items| {
+            items
+                .get(&(CompletionScope::Published, id.to_owned()))
+                .is_some_and(|p| p.kind == CompletedKind::Tool)
+                || items.contains_key(&(
+                    CompletionScope::Historical(CompletedKind::Tool),
+                    id.to_owned(),
+                ))
+        });
+        self.turns
+            .last()
+            .is_some_and(|turn| turn.sequence == *owner)
+            && !completed
+    }
+
     fn push_model_tool(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
         if record["type"] != "response_item" {
             return false;
@@ -3247,22 +3269,12 @@ impl CodexHistory {
             .or(active)
             .is_some_and(|turn| !is_implicit_turn(turn));
         if let Some(id) = scoped_model_call_id(payload, scoped) {
-            // A generated turn can remain open after the next raw input has arrived.
-            // Use it only while its confirmed request is the most recent checkpoint.
-            let turn = stamped.or(active).or_else(|| {
-                let named = self.aliases.resolve(current?);
-                let owner = self.named_turns.get(named)?;
-                let completed = self.completed.get(named).is_some_and(|items| {
-                    items
-                        .get(&(CompletionScope::Published, id.to_owned()))
-                        .is_some_and(|p| p.kind == CompletedKind::Tool)
-                        || items.contains_key(&(
-                            CompletionScope::Historical(CompletedKind::Tool),
-                            id.to_owned(),
-                        ))
-                });
-                (self.turns.last()?.sequence == *owner && !completed).then_some(named)
+            let known = stamped.or(active);
+            let implicit = current.filter(|_| known.is_none()).and_then(|current| {
+                let named = self.aliases.resolve(current);
+                self.owns_implicit_call(named, id).then(|| named.to_owned())
             });
+            let turn = known.or(implicit.as_deref());
             let sequence = builder.checkpoint();
             let owner = turn.and_then(|turn| self.named_turns.get(turn).copied());
             if let Some(owner) = owner.filter(|_| turn != self.current_turn_id()) {
@@ -3290,6 +3302,9 @@ impl CodexHistory {
             .or_else(|| call.as_ref()?.turn.as_deref())
             .or(active)
             .map(str::to_owned);
+        let rejected = call.as_ref().is_some_and(|call| {
+            self.reject_pending_display(builder, turn.as_deref(), id, call, &payload["output"])
+        });
         let sequence = if let Some(turn) = &turn {
             self.push_identified_item(builder, payload, turn, id, stamp)
         } else {
@@ -3301,7 +3316,9 @@ impl CodexHistory {
                         .is_some_and(|call| call.sequence >= input.request_sequence))
                 .then_some(input.sequence)
             });
+            self.items.tool_projection.wait_for_call = rejected;
             push_response_item(builder, payload, stamp, &mut self.items);
+            self.items.tool_projection.wait_for_call = false;
             self.items.tool_owner = None;
             self.finish_unscoped_result(id);
             self.items.projected
@@ -3443,7 +3460,10 @@ impl CodexHistory {
             && payload["item"]["type"] != "AgentMessage")
             .then(|| self.named_turns.get(&native_turn).copied())
             .flatten();
-        if let Some(owner) = owner.filter(|_| original.is_none()).or(item_owner) {
+        if let Some(owner) = owner
+            .filter(|_| sequence >= checkpoint.sequence)
+            .or(item_owner)
+        {
             self.late_owners.entry(sequence).or_insert(owner);
         } else if new_turn {
             let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
