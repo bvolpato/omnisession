@@ -940,6 +940,27 @@ impl CodexAdapter {
         }
     }
 
+    fn index_rollout(
+        &self,
+        session: &SessionRef,
+        native: CodexSession,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        let changed = source_path.is_some_and(|path| path != native.path);
+        let read = self.read_selected(native, |native, revision| {
+            let selected_path = native.path.clone();
+            let mut read = native.index(session, full_read_bytes, revision)?;
+            read.observe_inherited_workspace(&selected_path)?;
+            Ok(read)
+        });
+        if changed {
+            read.context("selected Codex rollout changed during indexing")
+        } else {
+            read
+        }
+    }
+
     fn find_session(&self, id: &str, source_path: Option<&Path>) -> Result<CodexSession> {
         Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
         self.resolve_rollout(id, source_path, true)?
@@ -3048,18 +3069,18 @@ impl ProviderAdapter for CodexAdapter {
     ) -> Result<IndexRead> {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session(&session.id, source_path)?;
-        let changed = source_path.is_some_and(|path| path != native.path);
-        let read = self.read_selected(native, |native, revision| {
-            let selected_path = native.path.clone();
-            let mut read = native.index(session, full_read_bytes, revision)?;
-            read.observe_inherited_workspace(&selected_path)?;
-            Ok(read)
-        });
-        if changed {
-            read.context("selected Codex rollout changed during indexing")
-        } else {
-            read
-        }
+        self.index_rollout(session, native, source_path, full_read_bytes)
+    }
+
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::Codex)?;
+        let native = self.require_rollout(&session.id, source_path)?.session;
+        self.index_rollout(session, native, source_path, full_read_bytes)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

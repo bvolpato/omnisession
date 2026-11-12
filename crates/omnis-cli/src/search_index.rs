@@ -251,17 +251,30 @@ pub(crate) fn projection_read_budget(
     }
 }
 
-fn needs_legacy_projection_check(
+fn legacy_projection_source(
     guard: TrajectorySourceGuard,
     updated_at: Option<DateTime<Utc>>,
-) -> bool {
+    revision: SourceRevision,
+) -> Option<SourceRevision> {
     let TrajectorySourceGuard::ObservedRevision(Some(prior)) = guard else {
-        return false;
+        return None;
     };
-    matches!(prior.document_version, 4 | 5)
+    if updated_at.is_some_and(|time| source_time_changed(Provider::Codex, time, &prior)) {
+        return None;
+    }
+    if matches!(prior.document_version, 4 | 5)
         && prior.source_complete
         && prior.source_revision == SourceRevision::default()
-        && updated_at.is_none_or(|time| !source_time_changed(Provider::Codex, time, &prior))
+    {
+        return Some(prior.source_revision);
+    }
+    // Retries and picker previews can revisit a wider partial projection after its tail repair.
+    (!prior.source_complete
+        && (6..=search_document_version(Provider::Codex)).contains(&prior.document_version)
+        && revision.file.is_some()
+        && revision.contents.is_some()
+        && revision.matches_file_contents(prior.source_revision))
+    .then_some(prior.source_revision)
 }
 
 pub(crate) fn verify_legacy_search_read(
@@ -276,13 +289,22 @@ pub(crate) fn verify_legacy_search_read(
         || session.provider != Provider::Codex
         || read.source_revision.file.is_none()
         || read.source_revision.contents.is_none()
-        || !needs_legacy_projection_check(guard, Some(time))
     {
         return Ok(read);
     }
-    let Some(hash) = store.legacy_codex_projection_hash(session, time)? else {
+    let Some(source) = legacy_projection_source(guard, Some(time), read.source_revision) else {
         return Ok(read);
     };
+    let Some(hash) = store.codex_projection_hash(session, time, source)? else {
+        return Ok(read);
+    };
+    if source.file.is_some() {
+        use sha2::{Digest, Sha256};
+        let sample = trajectory_search_document(&read.snapshot);
+        if Sha256::digest(sample.text.as_bytes())[..] == hash {
+            return Ok(read);
+        }
+    }
     let selected_path = || -> Result<PathBuf> {
         registry
             .find_native_session(Provider::Codex, &session.id)?
@@ -336,7 +358,8 @@ pub(crate) fn needs_index(
     if state.document_version > version {
         return false;
     }
-    state.document_version < version
+    state.legacy_tail_receipt.is_some()
+        || state.document_version < version
         || (candidate.session.provider == Provider::Codex && (candidate.source_revision.file != state.source_revision.file || candidate.source_revision.contents != state.source_revision.contents))
         || (candidate.source_revision.file.is_some()
             && !candidate.source_revision.matches_file_contents(state.source_revision))
@@ -443,7 +466,8 @@ fn read_budget(
     // Read the full source when upgrading a document from a full or provider-limited read.
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
-            && (state.document_version < candidate.document_version
+            && (state.legacy_tail_receipt.is_some()
+                || state.document_version < candidate.document_version
                 || (candidate.source_revision.file.is_some()
                     && (state.source_revision.file.is_none()
                         || state.source_revision.contents.is_none()))
@@ -669,6 +693,9 @@ fn guard_index_reads(
                 continue;
             }
             guard
+        } else if let Some(receipt) = prior.and_then(|state| state.legacy_tail_receipt) {
+            // The repaired sample can reveal an earlier timestamp. Replace only the observed preview.
+            TrajectorySourceGuard::ObservedDocument(Some(receipt))
         } else if prior.is_none()
             && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
         {
@@ -724,7 +751,8 @@ pub(crate) fn index_candidates(
     let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
         // Read an oversized full transcript on the calling thread to bound peak memory.
         (reads_transcript_file(candidate.session.provider)
-            && !needs_legacy_projection_check(*guard, candidate.updated_at)
+            && legacy_projection_source(*guard, candidate.updated_at, candidate.source_revision)
+                .is_none()
             && (*budget == FULL_READ_SOURCE_BYTES || candidate.can_upgrade_preview()))
         .then(|| prepare_session(registry, candidate, *guard, *budget, None))
     };
@@ -1575,7 +1603,7 @@ fn read_candidate(
             Some(updated_at),
         )
     } else if candidate.session.provider == Provider::Codex {
-        let read = registry.index_session(
+        let read = registry.adapter(Provider::Codex)?.index_search_document(
             &candidate.session,
             candidate.source_path.as_deref(),
             full_read_bytes,
@@ -1841,6 +1869,7 @@ mod tests {
         let budget = |stored, selected, updated_at, document_version| {
             projection_read_budget(
                 TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
+                    legacy_tail_receipt: None,
                     source_updated_at: time,
                     title_authoritative: Some(true),
                     source_time_precise: true,
@@ -1890,9 +1919,77 @@ mod tests {
     }
 
     #[test]
+    fn a_delayed_tail_repair_cannot_replace_a_concurrent_repair() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("store.sqlite3");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        let candidate = candidate(Some(now), None);
+        let session = candidate.session.clone();
+        let old = TrajectoryDocument {
+            source_revision: SourceRevision::default(),
+            redacted_text: "old",
+            source_updated_at: now,
+            source_byte_count: 3,
+            indexed_byte_count: 3,
+            truncation_strategy: "none",
+            source_complete: false,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: candidate.document_version,
+            derived_title: None,
+            withdrawn_title: None,
+            title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
+            title_authoritative: false,
+        };
+        store.upsert_trajectory_document(&session, &old)?;
+        // A legacy writer assigns the content hash without recording a tail reader version.
+        rusqlite::Connection::open(path)?.execute(
+            "UPDATE session_trajectories SET content_hash = content_hash",
+            [],
+        )?;
+        let pending = pending(&store, vec![candidate], false)?;
+        let registry = AdapterRegistry::new();
+        let guards = || {
+            guard_index_reads(
+                &mut FileSelections::new(&registry),
+                &store,
+                pending.stale.clone(),
+                &pending.failures,
+            )
+        };
+        let guard = guards()?[0].1;
+        let winner = TrajectoryDocument {
+            redacted_text: "new",
+            source_updated_at: now - chrono::Duration::seconds(2),
+            ..old
+        };
+        assert_eq!(
+            store.upsert_observed_trajectory_documents_counted(&[(&session, winner, guard)])?,
+            1
+        );
+        let delayed = TrajectoryDocument {
+            redacted_text: "bad",
+            ..winner
+        };
+        assert!(matches!(
+            store.upsert_observed_trajectory_documents_counted(&[(
+                &session,
+                delayed,
+                guards()?[0].1
+            )]),
+            Err(omnis_store::StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(store.search_session_trajectories("new", 1)?, [session]);
+        Ok(())
+    }
+
+    #[test]
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            legacy_tail_receipt: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(true),
             source_updated_at: now,
@@ -1940,6 +2037,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            legacy_tail_receipt: None,
             source_updated_at: now,
             source_revision: candidate(Some(now), Some(path.clone())).source_revision,
             source_complete: false,

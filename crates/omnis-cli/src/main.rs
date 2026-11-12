@@ -1379,12 +1379,13 @@ fn omp_title_is_current(
         .verified_at
         .zip(session.updated_at)
         .is_some_and(|((version, stored), listed)| {
-            version == omnis_core::search_document_version(Provider::OhMyPi)
-                && if cached {
-                    record.cached_at == Some(listed)
-                } else {
-                    stored == listed
-                }
+            let current = omnis_core::search_document_version(Provider::OhMyPi);
+            if cached {
+                // Version 8 already verified the active branch title, including explicit clears.
+                (8..=current).contains(&version) && record.cached_at == Some(listed)
+            } else {
+                version == current && stored == listed
+            }
         })
 }
 

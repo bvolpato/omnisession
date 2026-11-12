@@ -1575,6 +1575,19 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
         assert!(!hit("Topazjackdaw"));
         assert!(hit("Visible"));
         assert_eq!(fixture.index_codex()["stale"], 0);
+        if !substituted {
+            // Older readers marked a verified projection partial when the rollout had malformed records.
+            for version in 6..=omnis_core::search_document_version(omnis_ir::Provider::Codex) {
+                assert_eq!(db.execute(
+                    "UPDATE session_trajectories SET document_version=?2, source_complete=0, tail_reader_version=0 WHERE session_id=?1",
+                    rusqlite::params![CODEX_ID, version],
+                ).unwrap(), 1);
+                assert_eq!(fixture.index_codex()["indexed"], 1);
+                assert!(hit("Bronzekestrel"));
+                assert!(hit("Visible"));
+                assert_eq!(fixture.index_codex()["stale"], 0);
+            }
+        }
     }
 }
 

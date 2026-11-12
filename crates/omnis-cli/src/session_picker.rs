@@ -4314,7 +4314,7 @@ mod tests {
             listed.session.clone(),
             omnis_store::IndexedTitle {
                 title: Some("Verified rename".into()),
-                verified_at: Some((omnis_core::search_document_version(provider), time)),
+                verified_at: Some((8, time)),
                 cached_at: Some(time),
                 ..Default::default()
             },
