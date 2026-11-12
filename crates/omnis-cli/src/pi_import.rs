@@ -1102,7 +1102,7 @@ mod tests {
             &ConfirmedPiFile::capture(
                 &selected.target,
                 &selected.target_path,
-                &fs::canonicalize(&workspace).unwrap(),
+                Path::new(&selected.cwd),
             )
             .unwrap(),
             &root,
