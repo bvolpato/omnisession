@@ -2767,7 +2767,7 @@ impl CodexHistory {
             if let Some(checkpoint) = self.pending_turn.take() {
                 self.turns.push(checkpoint);
             }
-        } else if self.seen_client_submission == Some(true) {
+        } else {
             for checkpoint in self.turns.iter_mut().skip(first + 1) {
                 checkpoint.collapsed = true;
             }
@@ -2814,11 +2814,10 @@ impl CodexHistory {
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
-            if self
-                .native_start
-                .as_ref()
-                .is_some_and(|task| record["payload"]["turn_id"] == task.id)
-            {
+            if self.native_start.as_ref().is_some_and(|task| {
+                let id = &record["payload"]["turn_id"];
+                *id == task.id || id.is_null()
+            }) {
                 self.finish_native_task();
             }
             self.native_start = None;
@@ -3075,6 +3074,7 @@ struct MirrorGroup {
     last_text: Option<(MediaDigest, Option<MediaDigest>)>,
     kind: EventKind,
     pending: HashMap<bool, PendingMessages>,
+    image_pairs: ImagePairs,
     paired_position: Option<usize>,
     native_position: Option<usize>,
     reorder: bool,
@@ -3094,6 +3094,7 @@ impl MirrorGroup {
             kind: EventKind::ProviderEvent,
             last_text: None,
             pending: HashMap::new(),
+            image_pairs: ImagePairs::default(),
             paired_position: None,
             native_position: None,
             reorder: false,
@@ -3120,18 +3121,23 @@ impl MirrorGroup {
         {
             group.pending.clear();
             group.order.clear();
+            group.image_pairs = ImagePairs::default();
         }
         group.kind.clone_from(&message.kind);
         group.last_text = Some((message.text, message.alternative));
         group.paired_position = None;
         group.reorder = false;
         let opposite = !message.event;
+        group.image_pairs.add_credit();
         if let Some(candidates) = group.pending.get_mut(&opposite)
-            && let Some(index) = candidates.matching(&message)
+            && let Some((index, partner)) = group.image_pairs.match_row(candidates, &message)
         {
             let (candidate, prior) = &candidates.rows[&index];
             let prefer_text = candidate.text != message.text && message.event;
             let prior = *prior;
+            group
+                .image_pairs
+                .remember(partner.as_ref().unwrap_or(&message), candidate);
             if message.kind == EventKind::MessageUser {
                 candidates.remove(index);
                 group.order.remove(&index);
@@ -3140,8 +3146,8 @@ impl MirrorGroup {
                 }
             }
             group.paired_position = prior;
-            if message.event && message.kind == EventKind::MessageUser && group.scoped {
-                group.reorder = prior < group.native_position || prefer_text;
+            if message.event && message.kind == EventKind::MessageUser {
+                group.reorder = prefer_text || (group.scoped && prior < group.native_position);
                 group.native_position = if group.reorder { position } else { prior };
             }
             return MirrorObservation::Paired(prior);
@@ -3171,6 +3177,86 @@ impl MirrorGroup {
             }
         }
         MirrorObservation::Distinct
+    }
+}
+
+#[derive(Clone, Default)]
+struct ImagePairs {
+    by_text: HashMap<MediaDigest, Vec<[VisibleMessage; 2]>>,
+    retained_parts: usize,
+    credit: usize,
+}
+
+impl ImagePairs {
+    fn add_credit(&mut self) {
+        self.credit = (self.credit + 32).min(MAX_CANONICAL_EVENTS);
+    }
+
+    fn remember(&mut self, first: &VisibleMessage, other: &VisibleMessage) {
+        let parts =
+            first.media.as_ref().map_or(0, Vec::len) + other.media.as_ref().map_or(0, Vec::len);
+        if self.retained_parts + parts > MAX_CANONICAL_EVENTS
+            || first.text != other.text
+            || ![first, other].iter().any(|row| {
+                row.media
+                    .iter()
+                    .flatten()
+                    .any(|part| matches!(part, MessageMedia::Image { detail: None, .. }))
+            })
+        {
+            return;
+        }
+        let pair = if first.event {
+            [other.clone(), first.clone()]
+        } else {
+            [first.clone(), other.clone()]
+        };
+        self.by_text.entry(first.text).or_default().push(pair);
+        self.retained_parts += parts;
+    }
+
+    fn match_row(
+        &mut self,
+        pending: &PendingMessages,
+        row: &VisibleMessage,
+    ) -> Option<(usize, Option<VisibleMessage>)> {
+        let mut direct_budget = usize::MAX;
+        if let Some(index) = pending.matching(row, &mut direct_budget) {
+            return Some((index, None));
+        }
+        if !pending.indexes.contains_key(&MirrorKey::Text(row.text)) {
+            return None;
+        }
+        let pairs = self.by_text.get_mut(&row.text)?;
+        let side = usize::from(row.event);
+        let mut visited = HashMap::<usize, Option<usize>>::new();
+        let mut queue = VecDeque::<Option<usize>>::from([None]);
+        while let Some(source) = queue.pop_front() {
+            let current = source.map_or(row, |index| &pairs[index][side]);
+            if let Some(mut index) = source
+                && let Some(open) = pending.matching(current, &mut self.credit)
+                && pending.rows[&open].0.text == row.text
+            {
+                let displaced = current.clone();
+                loop {
+                    let previous = visited[&index];
+                    pairs[index][side] = previous.map_or(row, |p| &pairs[p][side]).clone();
+                    let Some(parent) = previous else { break };
+                    index = parent;
+                }
+                return Some((open, Some(displaced)));
+            }
+            for (index, pair) in pairs.iter().enumerate() {
+                self.credit = self
+                    .credit
+                    .checked_sub(1 + current.media.as_ref().map_or(0, Vec::len))?;
+                if !visited.contains_key(&index) && current.mirrors(&pair[1 - side]) {
+                    visited.insert(index, source);
+                    queue.push_back(Some(index));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -3212,7 +3298,7 @@ impl PendingMessages {
         }
     }
 
-    fn matching(&self, message: &VisibleMessage) -> Option<usize> {
+    fn matching(&self, message: &VisibleMessage, budget: &mut usize) -> Option<usize> {
         let groups = message.lookup_keys(true);
         let mut max = (0, 0, true);
         for key in groups
@@ -3234,6 +3320,10 @@ impl PendingMessages {
         })?;
         let mut best = None;
         let mut consider = |index: &usize| {
+            let Some(remaining) = budget.checked_sub(1) else {
+                return true;
+            };
+            *budget = remaining;
             let candidate = &self.rows[index].0;
             if candidate.mirrors(message) {
                 let score = candidate.specificity(message);
@@ -3259,8 +3349,8 @@ struct VisibleMessage {
     text: MediaDigest,
     alternative: Option<MediaDigest>,
     event: bool,
-    item_id: Option<String>,
-    client_id: Option<String>,
+    item_id: Option<MediaDigest>,
+    client_id: Option<MediaDigest>,
     media: Option<Vec<MessageMedia>>,
 }
 
@@ -3275,7 +3365,7 @@ enum MessageMedia {
         url: Option<MediaDigest>,
         file: Option<MediaDigest>,
         path: Option<MediaDigest>,
-        detail: Option<String>,
+        detail: Option<MediaDigest>,
     },
     LocalAudio(MediaDigest),
     Audio {
@@ -3342,7 +3432,7 @@ impl VisibleMessage {
         .into_iter()
         .flatten()
         .find_map(Value::as_str)
-        .map(str::to_owned);
+        .map(media_digest);
         let media = if kind == EventKind::MessageUser {
             request_media(payload, event)
         } else {
@@ -3374,7 +3464,7 @@ impl VisibleMessage {
             client_id: payload["client_id"]
                 .as_str()
                 .or_else(|| record["client_id"].as_str())
-                .map(str::to_owned),
+                .map(media_digest),
             media,
         }
     }
@@ -3393,7 +3483,7 @@ impl VisibleMessage {
             (&self.client_id, MirrorKey::Client as fn(_) -> _),
             (&self.item_id, MirrorKey::Item as fn(_) -> _),
         ] {
-            let digest = id.as_deref().map(media_digest);
+            let digest = *id;
             if !matching || digest.is_some() {
                 let mut keys = vec![key(digest)];
                 if matching {
@@ -3404,7 +3494,7 @@ impl VisibleMessage {
         }
         for (index, media) in self.media.iter().flatten().enumerate() {
             if let MessageMedia::Image { detail, .. } = media {
-                let digest = detail.as_deref().map(media_digest);
+                let digest = *detail;
                 if !matching || digest.is_some() {
                     let mut keys = vec![MirrorKey::Detail(index, digest)];
                     if matching {
@@ -3510,7 +3600,7 @@ fn event_images(
         .map(|(index, value)| {
             let reference = media_digest(value.as_str()?);
             let detail = match details.get(index).filter(|v| !v.is_null()) {
-                Some(v) => Some(v.as_str()?.to_owned()),
+                Some(v) => Some(media_digest(v.as_str()?)),
                 None => None,
             };
             Some(MessageMedia::Image {
@@ -3618,7 +3708,7 @@ fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageMedia>> {
                     let detail = if part["detail"].is_null() {
                         None
                     } else {
-                        Some(part["detail"].as_str()?.to_owned())
+                        Some(media_digest(part["detail"].as_str()?))
                     };
                     let image = MessageMedia::Image {
                         url,
@@ -3653,6 +3743,9 @@ fn push_message_text(
     last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let message = VisibleMessage::new(record, kind.clone(), text);
+    if message.alternative.is_some() && !last_visible.as_ref().is_some_and(|group| group.scoped) {
+        builder.track_codex_provisional_opener();
+    }
     let observation = MirrorGroup::observe(
         last_visible,
         message,

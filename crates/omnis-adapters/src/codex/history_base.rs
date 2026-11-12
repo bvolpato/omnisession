@@ -620,22 +620,20 @@ fn matches_request_receipt(request: &Value, completed: &Value) -> bool {
     let is_image = |part: Option<&Value>| part.is_some_and(|p| p["type"] == "input_image");
     let mut parts = raw.iter().enumerate();
     while let Some((index, part)) = parts.next() {
-        if let Some(path) = super::local_audio_path(raw, index + 1) {
-            if saved
-                .next_if(|candidate| {
-                    candidate["type"] == "local_audio" && candidate["path"].as_str() == Some(path)
-                })
-                .is_none()
-            {
-                return false;
-            }
-            parts.nth(1);
-            continue;
-        }
         if saved
             .next_if(|candidate| same_input_part(part, candidate))
             .is_some()
         {
+            continue;
+        }
+        if let Some(path) = super::local_audio_path(raw, index + 1)
+            && saved
+                .next_if(|candidate| {
+                    candidate["type"] == "local_audio" && candidate["path"].as_str() == Some(path)
+                })
+                .is_some()
+        {
+            parts.nth(1);
             continue;
         }
         // Local image framing can be absent from the user's saved input.
@@ -1613,7 +1611,7 @@ struct PrefixCursor {
     malformed: bool,
     damage: Option<&'static str>,
     damaged_preamble_settings: bool,
-    subagent_gap_placed: bool,
+    missing_subagent_requests: bool,
     evidence: SequenceEvidence,
 }
 
@@ -1625,9 +1623,18 @@ impl PrefixCursor {
             malformed: false,
             damage: None,
             damaged_preamble_settings: false,
-            subagent_gap_placed: false,
+            missing_subagent_requests: false,
             evidence: SequenceEvidence::default(),
         }
+    }
+
+    fn missing_ordinal(&mut self, start: VisibleStart, record: &Value, segment: &Segment) {
+        self.missing_subagent_requests = start.subagent.is_some()
+            && !self.malformed
+            && (self.damage.is_none() || self.missing_subagent_requests)
+            && owned_event(record, &segment.path)
+            && request_text(record).is_some();
+        self.damage = Some(MISSING_ORDINAL);
     }
 
     fn observe(
@@ -1662,22 +1669,16 @@ impl PrefixCursor {
             self.next = ordinal;
             self.max_reserved_gap = 0;
             let through_subagent_start = start.subagent.is_some_and(|cutoff| ordinal <= cutoff);
-            let follows_subagent_start = start
-                .subagent
-                .is_some_and(|cutoff| cutoff.checked_add(1) == Some(ordinal));
-            if self.damage == Some(MISSING_ORDINAL) && inferred.is_none() && follows_subagent_start
-            {
-                self.subagent_gap_placed = true;
-            }
             if !hidden
                 && segment.recovery.is_some()
                 && (self.damage.is_some() || inferred.is_some())
                 && (through_subagent_start
-                    || (self.subagent_gap_placed
+                    || (self.missing_subagent_requests
                         && self.damage == Some(MISSING_ORDINAL)
                         && inferred.is_none()
                         && owned_event(record, &segment.path)
-                        && ((follows_subagent_start && message_role(record) == Some("assistant"))
+                        && start.subagent.is_some_and(|cutoff| ordinal >= cutoff)
+                        && (message_role(record) == Some("assistant")
                             || request_text(record).is_some()
                             || is_non_turn_body(record)
                             || (recoverable_control(record, &segment.path)
@@ -1687,7 +1688,7 @@ impl PrefixCursor {
                         && start.ordinal().is_none_or(|begin| ordinal >= begin)))
             {
                 self.damage = None;
-                self.subagent_gap_placed = false;
+                self.missing_subagent_requests = false;
                 self.damaged_preamble_settings = false;
             }
             if !hidden
@@ -1699,17 +1700,15 @@ impl PrefixCursor {
                         && plan.withheld_mirrors.binary_search(&row).is_err()
                 })
             {
-                self.subagent_gap_placed = start.subagent == Some(ordinal);
-                self.damage = Some(MISSING_ORDINAL);
+                self.missing_ordinal(start, record, segment);
             }
             if !hidden && self.damage.is_none() {
                 self.malformed = false;
             }
         } else {
             if !hidden {
-                self.subagent_gap_placed = false;
                 self.damaged_preamble_settings = preamble && start.owned_settings(record);
-                self.damage = Some(MISSING_ORDINAL);
+                self.missing_ordinal(start, record, segment);
             }
             if self.malformed {
                 return Ok(false);

@@ -2277,24 +2277,40 @@ fn native_image_mirrors_prefer_explicit_detail() -> anyhow::Result<()> {
             json!({"message":"image","file_ids":["img"],"file_id_details":[detail]}),
         )
     };
-    for body in [
-        [
-            saved(Some("low")),
-            saved(None),
-            raw(Some("low")),
-            raw(Some("high")),
-        ],
-        [
-            saved(Some("low")),
-            saved(Some("high")),
-            raw(None),
-            raw(Some("high")),
-        ],
-    ] {
-        let mut rows = vec![event("task_started", json!({"turn_id":"turn"}))];
-        rows.extend(body);
-        rows.push(event("task_complete", json!({"turn_id":"turn"})));
-        assert_eq!(visible_text(&read_records(rows)?), ["image", "image"]);
+    for wildcard_on_raw in [false, true] {
+        for wild_first in [false, true] {
+            for low_first in [false, true] {
+                let mut raw_details = [Some("low"), Some("high")];
+                let mut event_details = [None, Some("low")];
+                if !wild_first {
+                    event_details.reverse();
+                }
+                if !low_first {
+                    raw_details.reverse();
+                }
+                if wildcard_on_raw {
+                    std::mem::swap(&mut raw_details, &mut event_details);
+                }
+                for raw_slots in [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]] {
+                    let mut rows = vec![event("task_started", json!({"turn_id":"turn"}))];
+                    let mut raw_parts = raw_details.into_iter();
+                    let mut saved_parts = event_details.into_iter();
+                    for index in 0..4 {
+                        rows.push(if raw_slots.contains(&index) {
+                            raw(raw_parts.next().unwrap())
+                        } else {
+                            saved(saved_parts.next().unwrap())
+                        });
+                    }
+                    rows.push(event("task_complete", json!({"turn_id":"turn"})));
+                    assert_eq!(
+                        visible_text(&read_records(rows)?),
+                        ["image", "image"],
+                        "{raw_slots:?} {raw_details:?} {event_details:?}"
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2306,25 +2322,47 @@ fn native_multipart_mirrors_preserve_event_text_and_unmatched_raw() -> anyhow::R
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"input_text","text":" part"}));
-    for (saved, expected) in [
-        (Some("Next part"), vec!["Next part"]),
-        (Some("Next  part"), vec!["Next\n part", "Next  part"]),
-        (None, vec!["Next\n part"]),
-    ] {
-        let mut rows = vec![
-            event("task_started", json!({"turn_id":"turn"})),
-            raw.clone(),
-        ];
-        if let Some(saved) = saved {
-            rows.push(event("user_message", json!({"message":saved})));
+    for scoped in [false, true] {
+        for (saved, expected) in [
+            (Some("Next part"), vec!["Next part"]),
+            (Some("Next  part"), vec!["Next\n part", "Next  part"]),
+            (None, vec!["Next\n part"]),
+        ] {
+            let mut rows = Vec::new();
+            if scoped {
+                rows.push(event("task_started", json!({"turn_id":"turn"})));
+            }
+            rows.push(raw.clone());
+            if let Some(saved) = saved {
+                rows.push(event("user_message", json!({"message":saved})));
+            }
+            rows.push(event("task_complete", json!({"turn_id":"turn"})));
+            for preview in [false, true] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(rows.clone(), preview)?),
+                    expected
+                );
+            }
         }
-        rows.push(event("task_complete", json!({"turn_id":"turn"})));
-        for preview in [false, true] {
-            assert_eq!(
-                visible_text(&read_records_with_preview(rows.clone(), preview)?),
-                expected
-            );
-        }
+    }
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    raw["payload"]["content"][0]["text"] = json!("Key");
+    raw["payload"]["content"][1]["text"] = json!("stone");
+    let rows = [
+        raw,
+        event("user_message", json!({"message":"Keystone"})),
+        event("task_started", json!({"turn_id":"later"})),
+        event("user_message", json!({"message":"withdrawn"})),
+        event("task_complete", json!({"turn_id":"later"})),
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ];
+    let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
+    for read in [full, sampled] {
+        assert_eq!(visible_text(&read.snapshot), ["Keystone"]);
+        assert_eq!(
+            read.rollback_title,
+            omnis_adapters::RollbackTitle::Known(Some("Keystone".into()))
+        );
     }
     Ok(())
 }
@@ -2358,6 +2396,49 @@ fn sampled_mirror_order_preserves_the_surviving_native_opener() -> anyhow::Resul
             read.rollback_title,
             omnis_adapters::RollbackTitle::Known(Some("Native first".into()))
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn named_raw_requests_and_anonymous_interruptions_each_count_as_one_task() -> anyhow::Result<()> {
+    for (terminal, payload, attributed) in [
+        ("turn_aborted", json!({}), true),
+        ("turn_aborted", json!({"turn_id":null}), true),
+        ("turn_aborted", json!({"turn_id":"C"}), true),
+        ("turn_aborted", json!({"turn_id":"other"}), false),
+        ("task_complete", json!({}), true),
+        ("task_complete", json!({"turn_id":null}), true),
+    ] {
+        let rows = vec![
+            event("task_started", json!({"turn_id":"A"})),
+            message("user", "older"),
+            event("task_complete", json!({"turn_id":"A"})),
+            event("task_started", json!({"turn_id":"B"})),
+            message("user", "first"),
+            message("assistant", "first reply"),
+            message("user", "second"),
+            message("assistant", "second reply"),
+            event("task_complete", json!({"turn_id":"B"})),
+            event("task_started", json!({"turn_id":"C"})),
+            message("assistant", "interrupted"),
+            event(terminal, payload),
+        ];
+        for count in [1, 2] {
+            let mut records = rows.clone();
+            records.push(event("thread_rolled_back", json!({"num_turns":count})));
+            let expected: &[&str] = match (attributed, count) {
+                (true, 1) => &["older", "first", "first reply", "second", "second reply"],
+                (true, _) | (false, 1) => &["older"],
+                _ => &[],
+            };
+            for preview in [true, false] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(records.clone(), preview)?),
+                    expected
+                );
+            }
+        }
     }
     Ok(())
 }

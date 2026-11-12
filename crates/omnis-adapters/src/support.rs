@@ -1891,6 +1891,14 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn track_codex_provisional_opener(&mut self) {
+        if let Some(opener) = &mut self.rollback_opener
+            && opener.first_message.is_none()
+        {
+            opener.mirror_openers.get_or_insert_with(BTreeMap::new);
+        }
+    }
+
     pub(crate) fn remove_codex_mirror(&mut self, sequence: u64) {
         self.removed_mirrors.insert(sequence);
         if let Some(opener) = &mut self.rollback_opener

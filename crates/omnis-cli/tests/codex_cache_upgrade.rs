@@ -147,7 +147,7 @@ impl Fixture {
 
     fn downgrade(&self) {
         let db = Connection::open(self.0.path().join("omni/store.sqlite3")).unwrap();
-        for (session, version) in [(AVAILABLE, 37), (OFFLINE, 36), (NAMED, 35)] {
+        for (session, version) in [(AVAILABLE, 39), (OFFLINE, 38), (NAMED, 37)] {
             let changed = db
                 .execute(
                     "UPDATE session_trajectories SET document_version = ?2 WHERE provider = 'codex'

@@ -919,7 +919,7 @@ fn add_receipt_media(rows: &mut [Value], diff: &str) {
             .unwrap()
             .push(json!({"type":"audio","file_id":"audio-file"}));
     }
-    if diff.ends_with("local audio") {
+    if diff.ends_with("local audio") || diff.ends_with("literal audio") {
         let path = "/synthetic/voice memo.wav";
         let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
         parts.extend([
@@ -927,6 +927,23 @@ fn add_receipt_media(rows: &mut [Value], diff: &str) {
             json!({"type":"input_audio","audio_url":"data:audio/wav;base64,UklGRg=="}),
             json!({"type":"input_text","text":"</audio>"}),
         ]);
+        if diff.ends_with("literal audio") {
+            let url = if diff == "wrong literal audio" {
+                "different"
+            } else {
+                "data:audio/wav;base64,UklGRg=="
+            };
+            let opening = parts[1]["text"].clone();
+            rows[5]["payload"]["item"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .extend([
+                    json!({"type":"text","text":opening}),
+                    json!({"type":"audio","audio_url":url}),
+                    json!({"type":"text","text":"</audio>"}),
+                ]);
+            return;
+        }
         if diff == "incomplete local audio" {
             parts.pop();
         }
@@ -959,6 +976,8 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
         "matching wrapped image",
         "matching uploaded audio",
         "matching local audio",
+        "matching literal audio",
+        "wrong literal audio",
         "wrong local audio",
         "incomplete local audio",
         "wrong image",
@@ -1333,17 +1352,90 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
                 .iter()
                 .map(|m| m.text.as_str())
                 .collect();
-            let expected = if foreign_anchor && !marker {
-                vec!["local request", "leaf request"]
-            } else if marker || anchor <= cutoff + 1 {
-                vec!["local reply", "local request", "leaf request"]
-            } else {
-                vec!["leaf request"]
-            };
+            let expected = vec!["local reply", "local request", "leaf request"];
             assert_eq!(
                 texts, expected,
                 "marker={marker}, cutoff={cutoff}, anchor={anchor}"
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for (missing, gap) in [
+        (2, "requests"),
+        (4, "requests"),
+        (2, "foreign"),
+        (2, "rollback"),
+        (2, "malformed"),
+    ] {
+        let mut meta = header(PARENT, 0, None, false);
+        meta["payload"]["subagent_history_start_ordinal"] = json!(3);
+        let mut rows = vec![meta];
+        for _ in 0..missing {
+            let mut request = message(0, "unplaced");
+            request.as_object_mut().unwrap().remove("ordinal");
+            rows.push(request);
+        }
+        match gap {
+            "foreign" => rows[1]["payload"]["thread_id"] = json!(REVERT),
+            "rollback" => {
+                rows[1] = json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+            }
+            "malformed" => rows[1] = json!({"type":"damaged_marker"}),
+            _ => (),
+        }
+        let first = 3 + missing;
+        for (ordinal, text, role) in [
+            (first, "first reply", "assistant"),
+            (first + 1, "next request", "user"),
+            (first + 2, "next reply", "assistant"),
+        ] {
+            let mut item = message(ordinal, text);
+            item["payload"]["role"] = json!(role);
+            rows.push(item);
+        }
+        write(&dir, &format!("2026-01-01T00-00-00-{PARENT}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-02T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, first + 3, Some(bookmark(PARENT, &rows)), false),
+                message(first + 4, "leaf"),
+            ],
+        )?;
+        if gap == "malformed" {
+            let path = dir.join(format!("rollout-2026-01-01T00-00-00-{PARENT}.jsonl"));
+            fs::write(
+                &path,
+                fs::read_to_string(&path)?.replace("\"damaged_marker\"", "!damaged_marker\""),
+            )?;
+        }
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [PARENT, REVERT] {
+            if id == PARENT && gap != "requests" {
+                continue;
+            }
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let texts: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect();
+            let mut expected = if gap == "requests" {
+                vec!["first reply", "next request", "next reply"]
+            } else {
+                vec![]
+            };
+            if id == REVERT {
+                expected.push("leaf");
+            }
+            assert_eq!(texts, expected, "missing={missing}, gap={gap}, id={id}");
         }
     }
     Ok(())
