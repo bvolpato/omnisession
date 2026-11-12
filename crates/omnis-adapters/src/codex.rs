@@ -62,6 +62,12 @@ struct CodexFileScan {
     active_links: Vec<PathBuf>,
 }
 
+#[derive(Default)]
+struct LegacyPaths<'a> {
+    by_id: HashMap<String, Vec<&'a Path>>,
+    unidentified: HashMap<&'a Path, Vec<&'a Path>>,
+}
+
 impl CodexFileScan {
     fn current(&self) -> bool {
         self.directories.len() <= SCAN_LIMIT
@@ -74,25 +80,34 @@ impl CodexFileScan {
                 })
     }
 
-    fn legacy_paths(
-        &self,
-        home: &Path,
-        mut cache: Option<&mut RolloutCache>,
-    ) -> HashMap<String, Vec<&Path>> {
-        let mut legacy = HashMap::<String, Vec<&Path>>::new();
-        let Ok(root) = fs::canonicalize(home) else {
-            return legacy;
-        };
+    fn legacy_paths(&self, home: &Path, mut cache: Option<&mut RolloutCache>) -> LegacyPaths<'_> {
+        let mut legacy = LegacyPaths::default();
+        let root = fs::canonicalize(home).ok();
         for path in &self.files {
-            if !current_rollout::canonical_name(path)
-                && live_rollout_path(home, &root, path)
+            if current_rollout::canonical_name(path) {
+                continue;
+            }
+            if root
+                .as_ref()
+                .is_some_and(|root| live_rollout_path(home, root, path))
                 && let Ok(Some(session)) = listed_session(path, cache.as_deref_mut())
             {
                 // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
-                legacy.entry(session.id).or_default().push(path);
+                legacy.by_id.entry(session.id).or_default().push(path);
+            } else if let Some(name) = rollout_file::jsonl_file_name(path) {
+                legacy.unidentified.entry(name).or_default().push(path);
             }
         }
         legacy
+    }
+
+    fn thread_ids<'a>(&'a self, legacy: &'a LegacyPaths<'_>) -> impl Iterator<Item = &'a String> {
+        self.candidates.keys().chain(
+            legacy
+                .by_id
+                .keys()
+                .filter(|id| !self.candidates.contains_key(*id)),
+        )
     }
 
     fn listed_rollout(
@@ -127,7 +142,7 @@ impl CodexFileScan {
     fn index_paths(
         &self,
         selected: &SelectedRollout,
-        legacy: &HashMap<String, Vec<&Path>>,
+        legacy: &LegacyPaths<'_>,
     ) -> Option<Vec<PathBuf>> {
         if !self.notes.is_empty() {
             return None;
@@ -135,22 +150,18 @@ impl CodexFileScan {
         let session = &selected.session;
         let mut paths: Vec<_> = self
             .paths(&session.id)
-            .chain(legacy.get(&session.id).into_iter().flatten().copied())
+            .chain(legacy.by_id.get(&session.id).into_iter().flatten().copied())
             .map(Path::to_owned)
             .collect();
         if selected.from_registry {
             // SQLite can select a physical representation whose filename has no thread ID.
             paths.push(session.path.clone());
         }
-        if current_rollout::ids(&session.path).is_none() {
-            // Keep same-named copies in the comparison even when their headers are unreadable.
-            let name = rollout_file::jsonl_file_name(&session.path);
-            paths.extend(
-                self.files
-                    .iter()
-                    .filter(|path| rollout_file::jsonl_file_name(path) == name)
-                    .cloned(),
-            );
+        if current_rollout::ids(&session.path).is_none()
+            && let Some(name) = rollout_file::jsonl_file_name(&session.path)
+            && let Some(unknown) = legacy.unidentified.get(name)
+        {
+            paths.extend(unknown.iter().map(|path| path.to_path_buf()));
         }
         paths.sort_unstable();
         paths.dedup();
@@ -715,6 +726,7 @@ impl CodexAdapter {
             let row = rows.get(id);
             if let Some(path) = scan.unique_path(id)
                 && legacy
+                    .by_id
                     .get(id)
                     .is_none_or(|files| files.iter().all(|&file| file == path))
                 && row.is_none_or(|row| row.ordinary_path_is(path))
@@ -805,14 +817,7 @@ impl CodexAdapter {
         };
         let mut cache = self.header_cache(home);
         let legacy = scan.legacy_paths(home, cache.as_mut());
-        let ids = || {
-            scan.candidates.keys().chain(
-                legacy
-                    .keys()
-                    .filter(|id| !scan.candidates.contains_key(*id)),
-            )
-        };
-        let rows = match self.named_rows(home, ids().map(String::as_str)) {
+        let rows = match self.named_rows(home, scan.thread_ids(&legacy).map(String::as_str)) {
             Ok(rows) => rows,
             Err(error) => {
                 return CodexListing {
@@ -834,7 +839,7 @@ impl CodexAdapter {
                 - scan.candidates.values().map(Vec::len).sum::<usize>(),
             ..Default::default()
         };
-        for id in ids() {
+        for id in scan.thread_ids(&legacy) {
             let row = rows.get(id);
             let selected = match scan.listed_rollout(home, id, row, cache.as_mut(), &mut invalid) {
                 Ok(Some(selected)) => selected,
@@ -847,7 +852,7 @@ impl CodexAdapter {
                 }
             };
             if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
-                && (scan.unique_path(id).is_none() || legacy.contains_key(id))
+                && (scan.unique_path(id).is_none() || legacy.by_id.contains_key(id))
             {
                 requires_scan = true;
             }
@@ -856,6 +861,7 @@ impl CodexAdapter {
             let mut session = selected.session;
             if current_rollout::ids(&session.path).is_none()
                 && legacy
+                    .by_id
                     .get(id)
                     .is_some_and(|files| files.contains(&session.path.as_path()))
             {
