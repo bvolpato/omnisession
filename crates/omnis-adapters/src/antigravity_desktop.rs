@@ -137,6 +137,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             fs::read_dir(&conversations).context("listing Antigravity Desktop conversations")?;
         let mut sessions = Vec::new();
         let mut databases = 0;
+        let mut archived_desktop_ids = Vec::new();
         let mut unverified_desktop_ids = Vec::new();
         let mut missing_desktop_summary_ids = Vec::new();
         for (count, entry) in entries.enumerate() {
@@ -175,7 +176,10 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             // summary, so listing them would only show sessions that cannot be read.
             if let Some(directory) = &annotations {
                 match archived(directory, id) {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        archived_desktop_ids.push(id.to_owned());
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         if unverified_desktop_ids.is_empty() {
@@ -207,6 +211,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             notes,
             desktop_summaries_unavailable: summaries.is_none() && databases != 0,
             missing_desktop_summary_ids,
+            archived_desktop_ids,
             unverified_desktop_ids,
         })
     }

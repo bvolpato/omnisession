@@ -644,6 +644,7 @@ impl DiscoveryScope {
         CatalogListing {
             scope: self,
             file_at: Some(file_at),
+            archived_desktop_ids: &[],
             database_alias_counts: None,
         }
     }
@@ -687,10 +688,18 @@ type DatabaseAliasCounts<'a> = &'a dyn Fn(&str) -> Option<usize>;
 pub struct CatalogListing<'a> {
     scope: DiscoveryScope,
     file_at: Option<&'a dyn Fn(usize) -> Option<Uuid>>,
+    archived_desktop_ids: &'a [String],
     database_alias_counts: Option<DatabaseAliasCounts<'a>>,
 }
 
 impl<'a> CatalogListing<'a> {
+    /// Records the IDs whose Desktop archive annotations were verified in this listing.
+    #[must_use]
+    pub fn with_archived_desktop_ids(mut self, ids: &'a [String]) -> Self {
+        self.archived_desktop_ids = ids;
+        self
+    }
+
     /// Supplies counts declared by verified IDE database summaries in this listing.
     #[must_use]
     pub fn with_database_alias_counts(mut self, counts: &'a dyn Fn(&str) -> Option<usize>) -> Self {
@@ -704,6 +713,7 @@ impl From<DiscoveryScope> for CatalogListing<'_> {
         Self {
             scope,
             file_at: None,
+            archived_desktop_ids: &[],
             database_alias_counts: None,
         }
     }
@@ -2903,11 +2913,8 @@ impl Store {
         guard: discovery::CatalogWrite<'_>,
         catalog: Option<CatalogNameObservations<'_>>,
     ) -> Result<bool> {
-        let CatalogListing {
-            scope,
-            file_at,
-            database_alias_counts,
-        } = scope.into();
+        let listing = scope.into();
+        let scope = listing.scope;
         if scope == DiscoveryScope::Workspace
             && (matches!(guard, discovery::CatalogWrite::Publish(..))
                 || sessions.is_empty() && matches!(guard, discovery::CatalogWrite::Unchecked))
@@ -2932,6 +2939,9 @@ impl Store {
         if !guard.permits(&transaction, sessions, &unverified)? {
             return Ok(false);
         }
+        let archived_ids = listing.archived_desktop_ids;
+        discovery::remove_archived_ide_aliases(&transaction, provider, home, archived_ids)?;
+        let alias_counts = listing.database_alias_counts;
         let adjusted;
         let mut rows_changed = true;
         let mut missing = Vec::new();
@@ -2975,12 +2985,12 @@ impl Store {
                         home,
                         &summaries_unavailable,
                         desktop_generation,
-                        database_alias_counts.and_then(|counts| counts(&session.session.id)),
+                        alias_counts.and_then(|counts| counts(&session.session.id)),
                     )?;
                 }
             }
         }
-        if let (Some(home), Some(file_at)) = (home, file_at) {
+        if let (Some(home), Some(file_at)) = (home, listing.file_at) {
             qualify_legacy_document_homes(&transaction, home, sessions, file_at)?;
         }
         if complete {
@@ -14615,6 +14625,52 @@ mod tests {
         store.upsert_indexed_session(&seen).unwrap();
         assert!(visible(&a, &seen.session));
         assert!(visible(&b, &seen.session));
+    }
+
+    #[test]
+    fn confirmed_ide_archives_remove_only_catalog_rows_in_the_observed_home() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let provider = Provider::AntigravityIde;
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let archive_ids = ["archived".to_owned(), "other-home".to_owned()];
+        let archive = |home: &Path| {
+            let attempt = store
+                .mark_session_discovery_attempted(provider, 15, home)
+                .unwrap();
+            store
+                .publish_session_discovery(
+                    &attempt,
+                    &[],
+                    super::DiscoveryScope::PartialProvider
+                        .with_source_files(&|_| None)
+                        .with_archived_desktop_ids(&archive_ids),
+                    Utc::now(),
+                )
+                .unwrap();
+        };
+        for (home, id) in [(&a, "missing"), (&a, "archived"), (&b, "other-home")] {
+            store
+                .cache_discovered_sessions(
+                    provider,
+                    &[indexed_session(provider, id, id)],
+                    super::DiscoveryScope::PartialProvider,
+                    Some(home),
+                )
+                .unwrap();
+        }
+        archive(&a);
+        let visible = |home: &Path| {
+            store
+                .indexed_sessions_for_provider_in_home(provider, home)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.session.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(&a), ["missing"]);
+        assert_eq!(visible(&b), ["other-home"]);
     }
 
     #[test]

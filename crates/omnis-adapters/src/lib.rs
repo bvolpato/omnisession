@@ -115,6 +115,8 @@ pub struct NativeListing {
     pub desktop_summaries_unavailable: bool,
     /// Listed Desktop databases with no entry in a readable summary file.
     pub missing_desktop_summary_ids: Vec<String>,
+    /// Desktop database IDs with a verified archive annotation.
+    pub archived_desktop_ids: Vec<String>,
     /// Desktop database IDs whose archive annotations could not be verified.
     pub unverified_desktop_ids: Vec<String>,
 }
@@ -129,8 +131,10 @@ pub struct SearchSourceObservation {
     /// Canonical native home verified together with this session.
     pub home: PathBuf,
     selected_home: PathBuf,
-    paths: Vec<(PathBuf, Option<support::SnapshotFileStamp>)>,
+    paths: Vec<(PathBuf, FileObservation)>,
 }
+
+type FileObservation = std::result::Result<Option<support::SnapshotFileStamp>, std::io::ErrorKind>;
 
 impl SearchSourceObservation {
     fn capture(
@@ -138,14 +142,27 @@ impl SearchSourceObservation {
         paths: Vec<PathBuf>,
         read: impl FnOnce() -> Result<NativeSession>,
     ) -> Result<Self> {
+        Self::capture_with_optional(root, paths, Vec::new(), read)
+    }
+
+    fn capture_with_optional(
+        root: &Path,
+        paths: Vec<PathBuf>,
+        optional: Vec<PathBuf>,
+        read: impl FnOnce() -> Result<NativeSession>,
+    ) -> Result<Self> {
         let home = root.canonicalize()?;
-        let paths = paths
+        let mut paths = paths
             .into_iter()
             .map(|path| {
                 let stamp = optional_stamp(&path)?;
-                Ok((path, stamp))
+                Ok((path, Ok(stamp)))
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        paths.extend(optional.into_iter().map(|path| {
+            let stamp = optional_stamp(&path).map_err(|error| error.kind());
+            (path, stamp)
+        }));
         let session = read()?;
         let revision = session
             .source_revision
@@ -181,7 +198,7 @@ impl SearchSourceObservation {
             optional_stamp(&path)?.is_none(),
             "provider source changed during search read"
         );
-        self.paths.push((path, None));
+        self.paths.push((path, Ok(None)));
         Ok(())
     }
 
@@ -191,9 +208,10 @@ impl SearchSourceObservation {
         self.selected_home
             .canonicalize()
             .is_ok_and(|home| home == self.home)
-            && self.paths.iter().all(|(path, before)| {
-                optional_stamp(path).is_ok_and(|after| after.as_ref() == before.as_ref())
-            })
+            && self
+                .paths
+                .iter()
+                .all(|(path, before)| optional_stamp(path).map_err(|error| error.kind()) == *before)
     }
 }
 

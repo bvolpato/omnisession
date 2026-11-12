@@ -151,7 +151,8 @@ fn complete_snapshot_read(
     snapshot: CanonicalSnapshot,
 ) -> omnis_adapters::IndexRead {
     let source_complete = provider == Provider::Imported
-        || !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot);
+        || (!omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot)
+            && !omnis_adapters::AntigravityIdeAdapter::has_unreadable_log_records(&snapshot));
     let provider_limited = provider != Provider::Imported
         && omnis_adapters::AntigravityAdapter::has_omitted_stored_steps(&snapshot);
     omnis_adapters::IndexRead {
@@ -368,7 +369,7 @@ fn store_observed_search_document(
                 Some(&observation.home),
                 observation.desktop_summaries_unavailable,
                 document,
-                guard,
+                search_index::guard_observed_steps(guard, observation),
                 |_, revision| source.verifies(revision),
             )
             .map(|rewritten| rewritten != 0);
@@ -867,6 +868,7 @@ impl<'a> CatalogCheck<'a> {
             desktop_summaries_unavailable: unavailable,
             missing_desktop_summary_ids,
             unverified_desktop_ids,
+            archived_desktop_ids,
         } = listing;
         let indexed = if self.persist {
             rows.iter().map(indexed_session_metadata).collect()
@@ -899,6 +901,7 @@ impl<'a> CatalogCheck<'a> {
                 &indexed,
                 scope
                     .with_source_files(&file_at)
+                    .with_archived_desktop_ids(archived_desktop_ids)
                     .with_database_alias_counts(&alias_count),
             )?);
         }
@@ -918,6 +921,7 @@ impl<'a> CatalogCheck<'a> {
         if let DiscoveryOwnership::Wide(attempt, checkpoint) = &self.ownership {
             let scope = scope
                 .with_source_files(&file_at)
+                .with_archived_desktop_ids(archived_desktop_ids)
                 .with_database_alias_counts(&alias_count);
             return Ok(if let Some(checkpoint) = checkpoint {
                 store.publish_at_discovery_checkpoint(
@@ -1422,6 +1426,22 @@ fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     }
 }
 
+fn cached_ide_home(
+    registry: &AdapterRegistry,
+    provider: Option<Provider>,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if provider.is_some_and(|p| p != Provider::AntigravityIde) {
+        return None;
+    }
+    registry
+        .discovery_cache_home(Provider::AntigravityIde)
+        .unwrap_or_else(|error| {
+            warnings.push(format!("Skipping cached Antigravity IDE sessions: {error}"));
+            None
+        })
+}
+
 fn cached_native_sessions(
     snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
     args: &SearchArgs,
@@ -1586,14 +1606,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     }
     let (hits, has_more) = store.read_trajectory_search(|snapshot| {
         let titles = if args.cached {
-            let ide_home = if args
-                .provider
-                .is_none_or(|provider| provider == Provider::AntigravityIde)
-            {
-                registry.discovery_cache_home(Provider::AntigravityIde)?
-            } else {
-                None
-            };
+            let ide_home = cached_ide_home(registry, args.provider, &mut warnings);
             let (native, titles) =
                 cached_native_sessions(snapshot, args, &project, ide_home.as_deref())?;
             sessions.extend(native);

@@ -490,6 +490,7 @@ impl PickerState {
             provider,
             picker_entries(sessions, current_project, cached),
             true,
+            &[],
         );
     }
 
@@ -498,6 +499,7 @@ impl PickerState {
         provider: Provider,
         mut entries: Vec<PickerEntry>,
         complete: bool,
+        archived_ids: &[String],
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
@@ -524,11 +526,14 @@ impl PickerState {
         }
         if matches!(provider, Provider::Antigravity | Provider::AntigravityIde) && !complete {
             let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
+            let archived: HashSet<_> = archived_ids.iter().map(String::as_str).collect();
             self.entries.retain_mut(|entry| {
                 if entry.session.session.provider != provider {
                     return true;
                 }
-                if observed.contains(entry.key.as_str()) {
+                if observed.contains(entry.key.as_str())
+                    || archived.contains(entry.session.session.id.as_str())
+                {
                     return false;
                 }
                 entry.cached = true;
@@ -3290,6 +3295,7 @@ mod tests {
 
             workers::SessionCacheUpdate::Listed {
                 database_alias_counts: HashMap::new(),
+                archived_ids: Vec::new(),
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 scope: if complete {
@@ -4400,9 +4406,9 @@ mod tests {
         let found = session(Provider::Codex, "found", project, Some("Fresh session"));
         let mut state = PickerState::new(vec![cached], project, None, true);
         let found_entries = || picker_entries(vec![found.clone()], project, false);
-        state.update_provider_entries(Provider::Codex, found_entries(), false);
+        state.update_provider_entries(Provider::Codex, found_entries(), false, &[]);
         assert_eq!(state.entries.len(), 2);
-        state.update_provider_entries(Provider::Codex, found_entries(), true);
+        state.update_provider_entries(Provider::Codex, found_entries(), true, &[]);
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].session.session, found.session);
     }
@@ -6140,7 +6146,7 @@ mod tests {
                 Some(file)
             )]
         );
-        state.update_provider_entries(provider, Vec::new(), false);
+        state.update_provider_entries(provider, Vec::new(), false, &[]);
         state.trajectory_search_deadline = Some(Instant::now());
         let offline = state.due_trajectory_search_request().unwrap();
         assert_eq!(offline.homes, homes);
@@ -6480,6 +6486,7 @@ mod tests {
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                archived_ids: Vec::new(),
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
                 names: None,
@@ -6523,6 +6530,7 @@ mod tests {
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                archived_ids: Vec::new(),
                 provider: Provider::Claude,
                 names: None,
                 result: Ok((
@@ -6582,6 +6590,7 @@ mod tests {
             provider,
             picker_entries(vec![observed.clone()], current, false),
             false,
+            &[],
         );
         assert_eq!(state.visible_indices().len(), 1);
         assert_eq!(
@@ -6603,6 +6612,7 @@ mod tests {
             provider,
             picker_entries(vec![omitted], current, false),
             false,
+            &[],
         );
         assert_eq!(state.visible_indices().len(), 1);
         let retained = state.selected_entry().unwrap();
@@ -6611,8 +6621,37 @@ mod tests {
         assert!(retained.session.source_path.is_none());
         state.index_deadline = Some(Instant::now());
         assert!(state.due_index_request().unwrap().is_empty());
-        state.update_provider_entries(provider, Vec::new(), true);
+        state.update_provider_entries(provider, Vec::new(), true, &[]);
         assert!(state.visible_indices().is_empty());
+    }
+
+    #[test]
+    fn partial_ide_listing_removes_only_confirmed_archives() {
+        let project = Path::new("/workspace");
+        let provider = Provider::AntigravityIde;
+        let records =
+            ["archived", "unverified", "missing"].map(|id| session(provider, id, project, None));
+        let mut state = PickerState::new(records.to_vec(), project, Some(provider), false);
+        state.update_provider_entries(provider, Vec::new(), false, &["archived".to_owned()]);
+        assert!(state.entries.iter().all(|row| row.cached));
+        let ids = state
+            .entries
+            .iter()
+            .map(|row| row.session.session.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids, HashSet::from(["unverified", "missing"]));
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![records[0].clone()], project, false),
+            false,
+            &[],
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|row| row.session.session.id == "archived" && !row.cached)
+        );
     }
 
     #[test]

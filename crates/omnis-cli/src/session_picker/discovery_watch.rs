@@ -33,6 +33,7 @@ pub(super) fn spawn(
             Ok(None) => {}
             Err(error) => {
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    archived_ids: Vec::new(),
                     provider,
                     names: None,
                     result: Err(error),
@@ -65,6 +66,7 @@ fn wait_for_catalog(
             });
         if result.is_err() {
             let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                archived_ids: Vec::new(),
                 provider,
                 names: None,
                 result: Ok((Vec::new(), true)),
@@ -118,6 +120,7 @@ fn wait_for_catalog(
     let entries = normalized_picker_entries(sessions, project, true);
     verify_home(attempt.home())?;
     let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+        archived_ids: Vec::new(),
         provider,
         names: None,
         result: Ok((entries, true)),

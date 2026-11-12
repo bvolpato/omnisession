@@ -28,10 +28,11 @@ use crate::{
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
         nested_files_matching, parse_timestamp, paths_match, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot_bounded, validate_provider, visit_json_lines,
+        sort_sessions, sqlite_snapshot_bounded, validate_provider, visit_json_lines_with_omissions,
     },
 };
 
+const UNVERIFIED_LOG: &str = "omnisession.antigravity_ide_unverified_history";
 const PREVIEW_RECORDS: usize = 128;
 const SUMMARY_KEY: &str = "antigravityUnifiedStateSync.trajectorySummaries";
 const MAX_SUMMARIES_BYTES: i64 = 64 * 1024 * 1024;
@@ -71,6 +72,22 @@ impl AntigravityIdeAdapter {
             )),
             ..Self::with_root(root)
         }
+    }
+
+    /// Returns whether a standalone IDE transcript read omitted records.
+    #[must_use]
+    pub fn has_unreadable_log_records(snapshot: &CanonicalSnapshot) -> bool {
+        snapshot.session.provider == Provider::AntigravityIde
+            && snapshot.events.iter().rev().take(2).any(|event| {
+                event.source.provider == Provider::AntigravityIde
+                    && matches!(
+                        event.source.raw_record_type.as_deref(),
+                        Some(UNVERIFIED_LOG | "omnisession.record_size_limit")
+                    )
+                    && event.payload["omitted_events"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+            })
     }
 
     /// Uses a specific IDE user-data directory without consulting other profiles.
@@ -213,8 +230,15 @@ impl AntigravityIdeAdapter {
         let mut metadata = LogMetadata::default();
         let mut builder = EventBuilder::new(Provider::AntigravityIde, &session.id);
         let mut retention = HistoryRetention::new(MAX_HISTORY_BYTES, MAX_HISTORY_RECORDS);
-        if preview {
-            for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
+        let mut skips = if preview {
+            let sample = crate::support::json_lines_preview_with_omissions(
+                &path,
+                PREVIEW_RECORDS,
+                u64::MAX,
+                crate::support::MAX_TRANSCRIPT_LINE_SIZE,
+                |_, _| crate::support::WorkspaceGap::Other,
+            )?;
+            for record in sample.records {
                 metadata.observe(&record);
                 retention.push_record(&mut builder, &record);
             }
@@ -222,14 +246,23 @@ impl AntigravityIdeAdapter {
                 PREVIEW_RECORDS,
                 metadata.updated_at.unwrap_or_else(Utc::now),
             );
+            sample.omissions
         } else {
-            let oversized = visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+            visit_json_lines_with_omissions(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
                 metadata.observe(&record);
                 retention.push_record(&mut builder, &record);
                 Ok(())
-            })?;
-            builder.push_oversized_record_notice(oversized, metadata.updated_at);
-        }
+            })?
+        };
+        retention.omitted_events += skips.malformed;
+        retention.omitted_raw_records += skips.total();
+        skips.malformed = 0;
+        let record_limit = if preview {
+            crate::support::MAX_TRANSCRIPT_LINE_SIZE
+        } else {
+            crate::support::MAX_STREAMED_TRANSCRIPT_LINE_SIZE
+        };
+        builder.push_json_line_omissions(skips, record_limit, None, metadata.updated_at);
         metadata.merge_summary(self.summaries().get(&session.id));
         let captured_at = metadata
             .updated_at
@@ -397,19 +430,24 @@ impl ProviderAdapter for AntigravityIdeAdapter {
                     listed.is_none_or(|listed| listed == path),
                     "Antigravity IDE history source changed during search read"
                 );
-                let mut paths = vec![path.clone()];
+                let mut optional = Vec::new();
                 if let Some(metadata) = &self.metadata_root {
                     let database = metadata.join("User/globalStorage/state.vscdb");
-                    paths.push(crate::support::sidecar(&database, "-wal"));
-                    paths.push(database);
+                    optional.push(crate::support::sidecar(&database, "-wal"));
+                    optional.push(database);
                 }
-                let mut observed = SearchSourceObservation::capture(root, paths, || {
-                    ensure!(
-                        self.transcript(&session.id).as_ref() == Some(&path),
-                        "Antigravity IDE history source changed during search read"
-                    );
-                    log_session(&session.id, path, self.summaries().get(&session.id))
-                })?;
+                let mut observed = SearchSourceObservation::capture_with_optional(
+                    root,
+                    vec![path.clone()],
+                    optional,
+                    || {
+                        ensure!(
+                            self.transcript(&session.id).as_ref() == Some(&path),
+                            "Antigravity IDE history source changed during search read"
+                        );
+                        log_session(&session.id, path, self.summaries().get(&session.id))
+                    },
+                )?;
                 if let Some(desktop) = self.compatibility_root() {
                     observed.watch_absent(
                         desktop
@@ -803,7 +841,7 @@ impl HistoryRetention {
 
     fn finish(self, builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
         // The provider documents the path, not the record schema. Even recognized records
-        // cannot prove full native history, and the tolerant JSONL visitor may skip corruption.
+        // cannot prove full native history.
         builder.push(
             EventKind::ProviderEvent,
             json!({
@@ -814,7 +852,7 @@ impl HistoryRetention {
             }),
             timestamp,
             ReplayPolicy::HistoricalOnly,
-            Some("omnisession.antigravity_ide_unverified_history".to_owned()),
+            Some(UNVERIFIED_LOG.to_owned()),
             None,
         );
     }
@@ -1301,6 +1339,8 @@ mod tests {
             assert_eq!(event.replay_policy, ReplayPolicy::HistoricalOnly);
         }
         let notice = &snapshot.events.last().unwrap().payload;
+        assert_eq!(notice["omitted_events"], 1);
+        assert!(AntigravityIdeAdapter::has_unreadable_log_records(&snapshot));
         assert_eq!(notice["unsupported_text_records"], 3);
         assert_eq!(notice["native_history_unverified"], true);
         assert!(omnis_core::import_conversation(&snapshot).truncated);

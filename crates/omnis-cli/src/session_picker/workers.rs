@@ -31,9 +31,26 @@ use crate::{
 };
 
 pub(super) struct DiscoveryUpdate {
+    pub(super) archived_ids: Vec<String>,
     pub(super) provider: Provider,
     pub(super) result: anyhow::Result<(Vec<PickerEntry>, bool)>,
     pub(super) names: Option<Arc<CatalogNames>>,
+}
+
+impl DiscoveryUpdate {
+    fn apply(self, state: &mut PickerState, warnings: &mut Vec<String>) {
+        match self.result {
+            Ok((mut entries, complete)) => {
+                if self.provider == Provider::Codex {
+                    state.reconcile_discovered_names(&mut entries, self.names.as_deref());
+                }
+                state.update_provider_entries(self.provider, entries, complete, &self.archived_ids);
+            }
+            Err(error) => {
+                record_picker_warning(warnings, format!("{}: {error}", self.provider));
+            }
+        }
+    }
 }
 
 pub(super) struct CatalogNames {
@@ -48,6 +65,7 @@ pub(super) enum SessionCacheUpdate {
         sessions: Vec<IndexedSession>,
         scope: DiscoveryScope,
         database_alias_counts: HashMap<String, usize>,
+        archived_ids: Vec<String>,
         names: Option<Arc<CatalogNames>>,
         attempt: Option<SessionDiscoveryAttempt>,
         publication: Option<Sender<Option<bool>>>,
@@ -85,6 +103,7 @@ impl SessionCacheUpdate {
             names,
             attempt,
             publication,
+            archived_ids: listing.archived_desktop_ids.clone(),
             database_alias_counts,
         }
     }
@@ -95,6 +114,7 @@ impl SessionCacheUpdate {
                 provider,
                 sessions,
                 scope,
+                archived_ids,
                 database_alias_counts,
                 names,
                 attempt,
@@ -122,7 +142,8 @@ impl SessionCacheUpdate {
                         &sessions,
                         scope
                             .with_source_files(&file_at)
-                            .with_database_alias_counts(&count),
+                            .with_database_alias_counts(&count)
+                            .with_archived_desktop_ids(&archived_ids),
                         Utc::now(),
                     );
                     if let Some(publication) = publication {
@@ -817,6 +838,7 @@ fn spawn_provider_update_in_home(
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
                     result: Ok((entries, complete)),
+                    archived_ids: listing.archived_desktop_ids,
                     names,
                 }));
             }
@@ -831,6 +853,7 @@ fn spawn_provider_update_in_home(
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
                     result: Err(error),
+                    archived_ids: Vec::new(),
                     names: None,
                 }));
             }
@@ -985,7 +1008,8 @@ fn read_picker_preview(
         || source
             .as_ref()
             .is_some_and(|source| source.origin == SessionTrajectoryOrigin::NativeSummary))
-        && !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot);
+        && (!omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot)
+            && !omnis_adapters::AntigravityIdeAdapter::has_unreadable_log_records(&snapshot));
     Ok((
         IndexRead {
             native_session: None,
@@ -1495,17 +1519,7 @@ pub(super) fn receive_updates(
             }
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
-                match update.result {
-                    Ok((mut entries, complete)) => {
-                        if update.provider == Provider::Codex {
-                            state.reconcile_discovered_names(&mut entries, update.names.as_deref());
-                        }
-                        state.update_provider_entries(update.provider, entries, complete);
-                    }
-                    Err(error) => {
-                        record_picker_warning(warnings, format!("{}: {error}", update.provider));
-                    }
-                }
+                update.apply(state, warnings);
             }
             PickerUpdate::RefreshStarted(provider) => {
                 pending.insert(provider);

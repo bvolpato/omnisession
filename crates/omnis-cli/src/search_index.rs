@@ -270,17 +270,23 @@ fn guard_observed_home(
     observation: Option<&SearchSourceObservation>,
 ) -> TrajectorySourceGuard {
     observation.map_or(guard, |source| {
-        let guard = guard.for_published_catalog_home(&source.home);
-        if source.is_ide_desktop_database() && !source.desktop_summaries_unavailable {
-            guard.with_database_alias_step_count(source.session.event_count)
-        } else {
-            guard.with_catalog_step_count(
-                source.session.session.provider,
-                source.session.event_count,
-                source.desktop_summaries_unavailable,
-            )
-        }
+        guard_observed_steps(guard.for_published_catalog_home(&source.home), source)
     })
+}
+
+pub(super) fn guard_observed_steps(
+    guard: TrajectorySourceGuard,
+    source: &SearchSourceObservation,
+) -> TrajectorySourceGuard {
+    if source.is_ide_desktop_database() && !source.desktop_summaries_unavailable {
+        guard.with_database_alias_step_count(source.session.event_count)
+    } else {
+        guard.with_catalog_step_count(
+            source.session.session.provider,
+            source.session.event_count,
+            source.desktop_summaries_unavailable,
+        )
+    }
 }
 
 pub(crate) fn observe_source(
@@ -1694,7 +1700,8 @@ pub(super) fn index_source_coverage(
     guard: TrajectorySourceGuard,
 ) -> Option<(bool, TrajectorySourceGuard)> {
     if session.provider == Provider::Imported
-        || !AntigravityAdapter::has_missing_database_steps(snapshot)
+        || (!AntigravityAdapter::has_missing_database_steps(snapshot)
+            && !AntigravityIdeAdapter::has_unreadable_log_records(snapshot))
     {
         return Some((source_complete, guard));
     }

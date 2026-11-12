@@ -247,6 +247,31 @@ pub(super) enum CatalogWrite<'a> {
     Merge(&'a SessionDiscoveryCheckpoint),
 }
 
+pub(super) fn remove_archived_ide_aliases(
+    tx: &Transaction<'_>,
+    provider: Provider,
+    home: Option<&Path>,
+    ids: &[String],
+) -> Result<()> {
+    if provider != Provider::AntigravityIde || ids.is_empty() {
+        return Ok(());
+    }
+    let home = home.ok_or(StoreError::InvalidSessionReference)?;
+    let mut delete = tx
+        .prepare_cached(
+            "DELETE FROM session_index WHERE provider='antigravity-ide' AND session_id=?1
+         AND EXISTS (SELECT 1 FROM native_catalog_homes WHERE provider='antigravity-ide'
+                     AND session_id=?1 AND verified AND home=?2)",
+        )
+        .map_err(database_error)?;
+    for id in ids {
+        delete
+            .execute(params![id, home.as_os_str().as_encoded_bytes()])
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 impl CatalogWrite<'_> {
     pub(super) fn desktop_generation(
         &self,
@@ -406,6 +431,7 @@ impl Store {
             return Err(StoreError::InvalidSessionReference);
         }
         if sessions.is_empty()
+            && listing.archived_desktop_ids.is_empty()
             && (listing.scope != DiscoveryScope::Workspace || checkpoint.workspace.is_none())
         {
             return self.discovery_checkpoint_is_current(checkpoint);

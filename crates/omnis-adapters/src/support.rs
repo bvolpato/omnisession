@@ -1100,6 +1100,18 @@ pub(crate) fn visit_json_lines(
     visit_json_lines_with_tail(path, file_limit, JsonLineTail::SkipMalformed, visit)
 }
 
+pub(crate) fn visit_json_lines_with_omissions(
+    path: &Path,
+    file_limit: u64,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(File::open(path)?),
+        JsonLinesLimits::streamed(file_limit),
+        |_, record| visit(record),
+    )
+}
+
 pub(crate) fn visit_json_lines_with_tail(
     path: &Path,
     file_limit: u64,
@@ -1131,6 +1143,7 @@ pub(crate) fn visit_json_lines_with_offsets(
     visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+        .map(|skips| skips.oversized)
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -1176,13 +1189,14 @@ fn visit_json_lines_with_limits(
     visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
         visit(record)
     })
+    .map(|skips| skips.oversized)
 }
 
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
     mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
-) -> Result<usize> {
+) -> Result<JsonLineSkips> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1197,7 +1211,7 @@ fn visit_json_lines_with_offsets_and_limits(
         |_, _| WorkspaceGap::Other,
         |location, record, _| visit(location, record),
     )
-    .map(|(omissions, _)| omissions.oversized)
+    .map(|(omissions, _)| omissions)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
