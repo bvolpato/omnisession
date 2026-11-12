@@ -15,6 +15,7 @@ mod pi;
 mod provider_process;
 mod source_file;
 mod support;
+pub use support::TranscriptRevision;
 #[cfg(all(test, unix))]
 mod test_support;
 
@@ -371,6 +372,12 @@ pub trait NativeSelectionInventory: Send + Sync {
     /// Returns the entry chosen by the provider's exact-ID rule.
     fn selected(&self, id: &str) -> Option<&NativeSession>;
 
+    /// Returns the provider file named by the original discovery row.
+    fn selected_copy(&self, id: &str, path: &Path) -> Option<&NativeSession> {
+        self.selected(id)
+            .filter(|row| row.source_path.as_deref() == Some(path))
+    }
+
     /// Checks known paths together and returns the result for each request in order.
     /// If a transcript changed, the adapter can check its previously observed header.
     fn validate(&self, requests: &[(&str, &Path, SourceRevision)]) -> Vec<bool>;
@@ -387,6 +394,48 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
+
+    /// Binds an explicit source workspace for a native ID shared by multiple files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot select that workspace.
+    fn bind_workspace_copy(
+        &self,
+        _session: &SessionRef,
+        _workspace: &Path,
+        _file: Option<&Path>,
+        _object: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        anyhow::bail!("this provider does not support workspace-qualified sessions")
+    }
+
+    /// Returns the verified file selected for a native read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected file is ambiguous or unavailable.
+    fn selected_source(&self, _session: &SessionRef) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// Returns other physical copies found by an unscoped discovery pass.
+    fn additional_search_sessions(&self) -> Vec<NativeSession> {
+        Vec::new()
+    }
+
+    /// Returns the selected physical transcript for providers with file-based search revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot resolve the selected session.
+    fn search_transcript_path(
+        &self,
+        _session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(hint.map(Path::to_owned))
+    }
 
     /// Finds candidates for live indexing in one project, including recorded workspace changes.
     ///
@@ -439,6 +488,19 @@ pub trait ProviderAdapter: Send + Sync {
             .find(|session| session.session.id == id))
     }
 
+    /// Finds an exact ID, with an optional workspace for providers whose listings depend on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn find_native_session_with_project(
+        &self,
+        id: &str,
+        _project: Option<&Path>,
+    ) -> Result<Option<NativeSession>> {
+        self.find_native_session(id)
+    }
+
     /// Reads the effective workspace when it can differ from the discovery metadata.
     ///
     /// # Errors
@@ -446,6 +508,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error when the provider cannot determine the effective directory.
     fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
         Ok(None)
+    }
+
+    /// Checks workspace evidence for a session the user selected from a provider listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected session cannot be identified or read.
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        if let Some(workspace) = self.native_workspace(&listed.session)? {
+            return Ok(workspace.directory);
+        }
+        let live = self
+            .find_native_session_with_project(&listed.session.id, listed.project_path.as_deref())?
+            .filter(|session| session.session == listed.session)
+            .ok_or_else(|| anyhow!("the provider did not return the selected session"))?;
+        Ok(live.project_path)
     }
 
     /// Describes whether the provider can continue the stored representation by its session ID.
@@ -755,6 +833,8 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
+        let selected_path = self.search_transcript_path(session, source_path)?;
+        let source_path = selected_path.as_deref();
         let over_budget = source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
@@ -960,6 +1040,30 @@ impl AdapterRegistry {
             .preview_session_at(session, source_path)
     }
 
+    /// Reads the physical revision of the provider's selected transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider selection or filesystem errors.
+    pub fn search_revision(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<TranscriptRevision>> {
+        if !matches!(
+            session.provider,
+            Provider::Claude | Provider::Codex | Provider::Pi | Provider::OhMyPi
+        ) {
+            return Ok(None);
+        }
+        self.adapter(session.provider)?
+            .search_transcript_path(session, hint)?
+            .as_deref()
+            .map(TranscriptRevision::read)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Reads a source and its indexing time. A file change during the read leaves the time unset.
     ///
     /// For adapters without a file clock, the reader supplies the provider's timestamp.
@@ -997,8 +1101,8 @@ impl AdapterRegistry {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        self.adapter(session.provider)?
-            .index_session(session, source_path, full_read_bytes)
+        let adapter = self.adapter(session.provider)?;
+        adapter.index_session(session, source_path, full_read_bytes)
     }
 
     /// Dispatches native resume or fork planning to provider adapter.

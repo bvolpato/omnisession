@@ -16,7 +16,7 @@ use std::sync::{
 };
 
 use anyhow::Context;
-use omnis_adapters::{GrokAdapter, ProviderAdapter};
+use omnis_adapters::ProviderAdapter;
 use omnis_ir::{SessionRef, SourceRevision};
 use omnis_store::{
     CatalogObservation, CatalogRetry, IndexedTrajectoryTitle, SelectedSessionObservation,
@@ -127,7 +127,7 @@ pub(super) enum PickerUpdate {
     ResumeIndex(Vec<NativeSession>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
-        key: PreviewKey,
+        key: Box<PreviewKey>,
         value: PreviewValue,
         metadata: Box<PreviewMetadata>,
     },
@@ -182,37 +182,31 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let search_index_stop = Arc::new(AtomicBool::new(false));
     let preview_failures = Arc::new(PreviewFailures::default());
 
-    // Grok index and preview reads use the catalog snapshot that supplied their candidates.
-    let grok = GrokAdapter::default();
-    let worker_registry = || {
-        let mut registry = AdapterRegistry::with_local_adapters();
-        registry.register(grok.clone());
-        registry
-    };
+    let registry = Arc::new(AdapterRegistry::with_local_adapters());
     spawn_index_writer(sender.clone(), index_receiver);
     spawn_cache_updates(
+        Arc::clone(&registry),
         sender.clone(),
         index_sender.clone(),
         current_project.to_path_buf(),
-        Arc::new(worker_registry()),
         changed_codex,
     );
     spawn_preview_updates(
+        Arc::clone(&registry),
         sender.clone(),
         preview_receiver,
         refresh_codex,
         Arc::clone(&preview_failures),
-        Arc::new(worker_registry()),
         index_sender,
         current_project.to_path_buf(),
     );
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
     spawn_search_index(
+        registry,
         sender.clone(),
         search_index_receiver,
         Arc::clone(&search_index_stop),
         preview_failures,
-        worker_registry(),
     );
     spawn_update_check(sender);
 
@@ -227,11 +221,11 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
 
 // Newer candidate lists replace the running pass; stopping the picker ends it.
 pub(super) fn spawn_search_index(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<IndexCandidate>>,
     stop: Arc<AtomicBool>,
     preview_failures: Arc<PreviewFailures>,
-    registry: AdapterRegistry,
 ) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
@@ -400,11 +394,41 @@ pub(super) fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(parsed)
 }
 
+pub(super) fn alias_cached_pi_titles(store: &Store, entries: &[PickerEntry]) {
+    let rows = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.session.session.provider,
+                Provider::Pi | Provider::OhMyPi
+            )
+        })
+        .filter_map(|entry| {
+            Some((
+                entry.session.session.clone(),
+                entry.session.project_path.clone()?,
+                crate::pi_file_key(&entry.session),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if let Ok(keys) = store.pi_copy_keys(&rows) {
+        let aliases = rows
+            .into_iter()
+            .zip(keys)
+            .filter_map(|((session, path, file), key)| {
+                let alias = crate::pi_copy_selector(&session.id, file.as_deref().unwrap_or(&path));
+                Some((session, key?, alias))
+            })
+            .collect::<Vec<_>>();
+        let _ = store.alias_pi_documents(&aliases);
+    }
+}
+
 pub(super) fn spawn_cache_updates(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
-    registry: Arc<AdapterRegistry>,
     changed_codex: Receiver<()>,
 ) {
     thread::spawn(move || {
@@ -412,7 +436,7 @@ pub(super) fn spawn_cache_updates(
             let _ = sender.send(PickerUpdate::Cached(Err(
                 "session index is unavailable".to_owned()
             )));
-            spawn_all_provider_updates(&sender, &index_sender, &current_project, &registry);
+            spawn_all_provider_updates(&registry, &sender, &index_sender, &current_project);
             return;
         };
         let cached =
@@ -434,7 +458,7 @@ pub(super) fn spawn_cache_updates(
         let mut refreshed_codex = false;
         for (provider, due) in freshness {
             let refresh = match due {
-                Ok(due) => due,
+                Ok(due) => due || matches!(provider, Provider::Pi | Provider::OhMyPi),
                 Err(error) => {
                     if sender
                         .send(PickerUpdate::Warning(format!(
@@ -466,12 +490,12 @@ pub(super) fn spawn_cache_updates(
                 return;
             }
             start_provider_update(
+                &registry,
                 &sender,
                 &index_sender,
                 &current_project,
                 provider,
                 Some(&store),
-                &registry,
             );
             refreshed_codex |= provider == Provider::Codex;
         }
@@ -480,12 +504,12 @@ pub(super) fn spawn_cache_updates(
         // preview observes the change. Discovery supplies the new workspace and source stamp.
         if !refreshed_codex && changed_codex.recv().is_ok() {
             start_provider_update(
+                &registry,
                 &sender,
                 &index_sender,
                 &current_project,
                 Provider::Codex,
                 Some(&store),
-                &registry,
             );
         }
     });
@@ -561,30 +585,30 @@ fn picker_discovery_due(
 }
 
 pub(super) fn spawn_all_provider_updates(
+    registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
-    registry: &Arc<AdapterRegistry>,
 ) {
     for provider in PROVIDERS {
         start_provider_update(
+            registry,
             sender,
             index_sender,
             current_project,
             provider,
             None,
-            registry,
         );
     }
 }
 
 pub(super) fn start_provider_update(
+    registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
     store: Option<&Store>,
-    registry: &Arc<AdapterRegistry>,
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
         let observation = store.and_then(|store| match store.observe_session_catalog(provider) {
@@ -597,12 +621,12 @@ pub(super) fn start_provider_update(
             }
         });
         spawn_provider_update(
+            Arc::clone(registry),
             sender.clone(),
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
             observation,
-            Arc::clone(registry),
         );
     }
 }
@@ -693,12 +717,12 @@ fn codex_catalog_names(
 }
 
 pub(super) fn spawn_provider_update(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
     observation: Option<CatalogObservation>,
-    registry: Arc<AdapterRegistry>,
 ) {
     thread::spawn(move || {
         if provider == Provider::Codex {
@@ -780,7 +804,10 @@ pub(super) fn spawn_provider_update(
         let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
             provider,
             result,
-            complete: true,
+            complete: !matches!(provider, Provider::Pi | Provider::OhMyPi)
+                && registry
+                    .adapter(provider)
+                    .is_ok_and(ProviderAdapter::discovery_is_complete),
             names: None,
         }));
     });
@@ -880,6 +907,9 @@ pub(super) fn discover_for_picker(
                     }
                 }
             }
+        }
+        if matches!(provider, Provider::Pi | Provider::OhMyPi) {
+            sessions.extend(registry.adapter(provider)?.additional_search_sessions());
         }
         return Ok(normalized_picker_entries(sessions, current_project, false));
     }
@@ -1099,7 +1129,7 @@ fn grok_preview_update(
         });
     }
     PickerUpdate::Preview {
-        key,
+        key: Box::new(key),
         value,
         metadata: Box::new(PreviewMetadata {
             read_revision,
@@ -1109,11 +1139,11 @@ fn grok_preview_update(
 }
 
 pub(super) fn spawn_preview_updates(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewRequest>>,
     refresh_codex: SyncSender<()>,
     preview_failures: Arc<PreviewFailures>,
-    registry: Arc<AdapterRegistry>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
 ) {
@@ -1167,7 +1197,7 @@ pub(super) fn spawn_preview_updates(
                     )
                     .unwrap_or((PreviewValue::Unavailable, None));
                     PickerUpdate::Preview {
-                        key,
+                        key: Box::new(key),
                         value,
                         metadata: Box::new(PreviewMetadata {
                             read_revision,
@@ -1187,12 +1217,12 @@ pub(super) fn spawn_preview_updates(
                 {
                     refreshed_grok_catalog = true;
                     start_provider_update(
+                        &registry,
                         &sender,
                         &index_sender,
                         &current_project,
                         Provider::Grok,
                         store.as_ref(),
-                        &registry,
                     );
                 }
                 if sender.send(update).is_err() {
@@ -1470,7 +1500,7 @@ pub(super) fn preview_update(
         })
     };
     PickerUpdate::Preview {
-        key,
+        key: Box::new(key),
         value,
         metadata: Box::new(metadata),
     }
@@ -1580,6 +1610,81 @@ fn publish_preview_title(
     }
 }
 
+fn read_pi_preview(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    key: &PreviewKey,
+    sender: &Sender<PickerUpdate>,
+    full_read: bool,
+    failures: &PreviewFailures,
+) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
+    let path = key.copy_path.as_deref()?;
+    let expected = match &key.source {
+        Some(PreviewSource::File(revision)) => revision.file?,
+        _ => return None,
+    };
+    let adapter = registry.adapter(key.session.provider).ok()?;
+    let native = adapter.selected_session_at(&key.session.id, path).ok()??;
+    if native.source_revision.and_then(|r| r.file) != Some(expected)
+        || native.project_path != key.copy_directory
+    {
+        return None;
+    }
+    let writer = store.and_then(|store| {
+        let workspace = native.project_path.clone()?;
+        let revision = omnis_adapters::TranscriptRevision::read(path).ok()?.key;
+        store
+            .select_pi_workspaces(&[(workspace, crate::indexed_pi_copy(&native), Some(revision))])
+            .ok()?;
+        Some((store, preview_write_guard(store, &key.session, sender)?))
+    });
+    let read = if full_read {
+        adapter.read_full_index_at(&key.session, Some(path))
+    } else {
+        adapter
+            .index_session(
+                &key.session,
+                Some(path),
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+            )
+            .or_else(|_| adapter.index_session(&key.session, Some(path), 0))
+    };
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => {
+            let revision =
+                report_rejected_preview(registry, writer, &error, key, sender, failures).ok()??;
+            return Some((PreviewValue::Unavailable, Some(revision)));
+        }
+    };
+    let revision = read.source_revision;
+    if revision.file != Some(expected)
+        || !preview_source_matches(key, read.native_session.as_ref(), revision)
+    {
+        return None;
+    }
+    if let (Some((store, guard)), Some(observed)) = (writer, read.native_session.as_ref())
+        && let Some(time) = observed.updated_at
+        && let Err(error) = crate::store_verified_search_document(
+            store,
+            &key.session,
+            &read,
+            read.source_complete || read.provider_limited,
+            time,
+            guard,
+            Some((registry, observed)),
+        )
+    {
+        let _ = sender.send(PickerUpdate::Warning(format!(
+            "trajectory index write: {error}"
+        )));
+    }
+    Some((
+        PreviewValue::from_read(read, key.continuation_after, true),
+        Some(revision),
+    ))
+}
+
 fn read_provider_preview(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -1591,6 +1696,20 @@ fn read_provider_preview(
     if key.session.provider == Provider::OpenCode && !full_read {
         return None;
     }
+    if matches!(key.session.provider, Provider::Pi | Provider::OhMyPi) {
+        return read_pi_preview(registry, store, key, sender, full_read, preview_failures);
+    }
+    read_other_preview(registry, store, key, sender, preview_failures)
+}
+
+fn read_other_preview(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    key: &PreviewKey,
+    sender: &Sender<PickerUpdate>,
+    preview_failures: &PreviewFailures,
+) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
+    let full_read = key.continuation_after.is_some();
     let imported = key.session.provider == Provider::Imported;
     let file_backed =
         omnis_store::TrajectorySourceGuard::verifies_search_file(key.session.provider);
@@ -1769,6 +1888,35 @@ pub(super) fn spawn_trajectory_search_updates(
             let result = store.as_ref().map_or_else(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
+                    if request.eligible_sessions.iter().any(|s| {
+                        matches!(s.session.provider, Provider::Pi | Provider::OhMyPi)
+                            && s.session.id.ends_with("@unverified")
+                    }) {
+                        store
+                            .unassigned_pi_sessions()
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let keys = store
+                        .pi_copy_keys(&request.pi_rows)
+                        .map_err(|error| error.to_string())?;
+                    let aliases = request
+                        .pi_rows
+                        .iter()
+                        .zip(keys)
+                        .filter_map(|((session, path, file), key)| {
+                            Some((
+                                session.clone(),
+                                key?,
+                                crate::pi_copy_selector(
+                                    &session.id,
+                                    file.as_deref().unwrap_or(path),
+                                ),
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    store
+                        .alias_pi_documents(&aliases)
+                        .map_err(|error| error.to_string())?;
                     crate::scope_search_trajectories(
                         &AdapterRegistry::with_local_adapters(),
                         store,
@@ -1863,7 +2011,7 @@ pub(super) fn receive_updates(
                 key,
                 value,
                 metadata,
-            } => receive_preview(state, key, value, *metadata),
+            } => receive_preview(state, *key, value, *metadata),
             PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
             PickerUpdate::TrajectorySearch { generation, result } => {
                 if generation == state.trajectory_search_generation {
@@ -1968,7 +2116,7 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         updated_at_approximate: session.updated_at_approximate,
         source_revision: session.source_revision,
         event_count: session.event_count,
-        source_path: None,
+        source_path: session.source_path,
     }
 }
 
@@ -2030,6 +2178,8 @@ mod tests {
         preferred.flush()?;
         let native = selected()?;
         let key = PreviewKey {
+            copy_path: None,
+            copy_directory: None,
             session: native.session.clone(),
             source: native.source_revision.map(PreviewSource::File),
             updated_at: native.updated_at,
@@ -2098,6 +2248,8 @@ mod tests {
         let failures = PreviewFailures::default();
         let (sender, updates) = mpsc::channel();
         let mut key = PreviewKey {
+            copy_path: native.source_path.clone(),
+            copy_directory: native.project_path.clone(),
             session: native.session.clone(),
             source: Some(PreviewSource::File(native.source_revision.unwrap())),
             updated_at: native.updated_at,
@@ -2196,7 +2348,7 @@ mod grok_preview_tests {
             directory.join("summary.json"),
             serde_json::json!({"id":id,"num_messages":1}).to_string(),
         )?;
-        let adapter = GrokAdapter::with_root(root.path());
+        let adapter = omnis_adapters::GrokAdapter::with_root(root.path());
         for (update, uncertain) in [
             (
                 serde_json::json!({"sessionUpdate":"future_message_chunk","data":{"text":"Example"}}),
@@ -2268,7 +2420,7 @@ mod grok_preview_tests {
             serde_json::json!({"id":id}).to_string(),
         )?;
         std::fs::write(directory.join("updates.jsonl"), serde_json::json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update"}}}).to_string())?;
-        let adapter = GrokAdapter::with_root(root.path());
+        let adapter = omnis_adapters::GrokAdapter::with_root(root.path());
         let session = SessionRef::new(Provider::Grok, id);
         let prior = adapter.index_session(&session, None, u64::MAX)?;
         std::fs::write(directory.join("plan.json"), "[]")?;
@@ -2276,6 +2428,8 @@ mod grok_preview_tests {
         let mut registry = AdapterRegistry::new();
         registry.register(adapter);
         let key = PreviewKey {
+            copy_path: None,
+            copy_directory: None,
             session,
             source: selected.source_revision.map(PreviewSource::File),
             updated_at: None,

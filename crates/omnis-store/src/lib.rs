@@ -50,8 +50,14 @@ const DATABASE_FILE_NAME: &str = "store.sqlite3";
 /// store, because it cannot tell what a later version changed. Versions before format 1 do not
 /// read the number. They fail when they open a format 1 store, because the chunk table is a view.
 /// Format 2 keeps separate search documents for Codex homes that contain the same session ID.
-const STORE_FORMAT: i64 = 2;
-
+/// Format 3 isolates Pi search documents when different workspaces contain the same native ID.
+/// Format 4 preserves the first workspace owner and hides secondary keys from open older readers.
+/// Format 5 consolidates legacy Pi search scopes by the workspace recorded in each copy.
+/// Format 6 reconciles legacy Pi copy ownership with successful and failed index observations.
+/// Format 7 indexes physical Pi copies and includes scoped documents recovered without a primary.
+/// Format 8 quarantines conflicting legacy ownership evidence without deleting trajectory rows.
+/// Format 9 retains legacy Pi listing metadata separately from native source ownership.
+const STORE_FORMAT: i64 = 9;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -312,8 +318,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
         source_updated_submillis, provider_limited, title_authoritative,
-        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes, fully_scanned_bytes, verified_record_time
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27, ?28, ?29)
+        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes, fully_scanned_bytes, verified_record_time, pi_workspace, pi_native_id
+    ) VALUES (?1, CASE WHEN coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'')='' THEN ?2 ELSE ?2||char(0)||coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'') END, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27, ?28, ?29, coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),''), CASE WHEN coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'')<>'' THEN ?2 END)
     ON CONFLICT DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -348,6 +354,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
+            WHEN excluded.provider = 'claude' AND (excluded.source_complete OR excluded.document_version > session_trajectories.document_version)
+                THEN excluded.derived_title
             WHEN excluded.source_file_id IS NOT NULL AND session_trajectories.source_file_id IS NOT NULL
                 AND (excluded.source_file_id IS NOT session_trajectories.source_file_id
                      OR excluded.source_contents_id IS NOT session_trajectories.source_contents_id)
@@ -461,6 +469,9 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
         ancestor_revisions = excluded.ancestor_revisions,
         missing_ancestor_id = excluded.missing_ancestor_id,
         source_complete = excluded.source_complete,
+        source_revision = excluded.source_revision,
+        source_file_bytes = excluded.source_file_bytes,
+        provider_limited = excluded.provider_limited,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
         source_byte_count = excluded.source_byte_count,
@@ -538,6 +549,8 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
         )
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        NOT session_trajectories.codex_workspace_current
+       OR (excluded.source_revision IS NOT NULL AND excluded.source_revision IS NOT session_trajectories.source_revision)
+       OR (excluded.provider_limited AND NOT session_trajectories.provider_limited)
        OR excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
        OR (?19 AND excluded.source_complete AND excluded.origin = 'native'
@@ -757,8 +770,10 @@ impl CatalogRetry {
 }
 
 /// Cached provider metadata used to render session discovery without transcript reads.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexedSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
     pub session: SessionRef,
     /// The selected native file when the provider can identify it.
     pub source_revision: Option<SourceRevision>,
@@ -813,6 +828,24 @@ impl SessionTrajectoryOrigin {
             Self::ImportedBundle => "imported_bundle",
         }
     }
+}
+
+/// Index state observed before reading the provider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrajectoryWriteGuard {
+    #[default]
+    Unchecked,
+    Missing,
+    Existing(Option<i64>),
+}
+
+/// Physical source evidence collected during a trajectory read.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TrajectorySource {
+    pub expected: TrajectoryWriteGuard,
+    pub file_bytes: Option<i64>,
+    pub revision: Option<i64>,
+    pub provider_limited: bool,
 }
 
 /// One redacted search document with coverage, provenance, and version metadata.
@@ -1301,7 +1334,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         if self.document.source_revision.file.is_some() {
             transaction
                 .execute(
-                    "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2 AND (provider <> 'codex' OR codex_home=(SELECT home FROM current_codex_home))",
+                    "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2 AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'') AND (provider <> 'codex' OR codex_home=(SELECT home FROM current_codex_home))",
                     params![self.session.provider.to_string(), self.session.id],
                 )
                 .map_err(database_error)?;
@@ -2050,6 +2083,254 @@ impl Store {
         Ok(store)
     }
 
+    /// Returns the observed physical identity, or the saved path from a legacy catalog.
+    #[must_use]
+    pub fn pi_file_key(revision: Option<SourceRevision>, path: Option<&Path>) -> Option<PathBuf> {
+        revision
+            .and_then(|r| r.file)
+            .map(|file| PathBuf::from(format!("file/{file}")))
+            .or_else(|| path.map(Path::to_owned))
+    }
+
+    /// Returns the observed object behind a saved Pi copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be read.
+    pub fn pi_recorded_object(&self, session: &SessionRef, key: &Path) -> Result<Option<Uuid>> {
+        self.connection.borrow().query_row("SELECT json_extract(metadata,'$.source_revision.file') FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3 AND json_valid(metadata)",params![session.provider.to_string(),session.id,key.to_str()],|r|r.get::<_,Option<String>>(0)).optional().map(|result|result.flatten().and_then(|id|Uuid::parse_str(&id).ok())).map_err(database_error)
+    }
+
+    /// Formats the public reference for a persisted Pi copy key.
+    #[must_use]
+    pub fn pi_copy_selector(id: &str, key: &Path) -> String {
+        let digest = Sha256::digest(key.as_os_str().as_encoded_bytes());
+        format!("{id}@workspace={}", hex::encode(digest))
+    }
+
+    /// Returns recorded workspace keys for Pi native IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the copy catalog cannot be read.
+    pub fn pi_projects(&self, session: &SessionRef) -> Result<Vec<PathBuf>> {
+        let db = self.connection.borrow();
+        let mut query = db
+            .prepare(
+                "SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2
+            UNION SELECT project FROM pi_search_primary WHERE provider=?1 AND session_id=?2",
+            )
+            .map_err(database_error)?;
+        query
+            .query_map(params![session.provider.to_string(), session.id], |row| {
+                row.get::<_, String>(0).map(PathBuf::from)
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)
+    }
+
+    /// Resolves recorded header directories to persistent keys in one catalog query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy catalog cannot be read.
+    pub fn pi_copy_keys(
+        &self,
+        sessions: &[(SessionRef, PathBuf, Option<PathBuf>)],
+    ) -> Result<Vec<Option<PathBuf>>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inputs =
+            serde_json::to_string(sessions).map_err(|_| StoreError::InvalidWorkspaceRoot)?;
+        let db = self.connection.borrow();
+        let mut query=db.prepare("WITH input AS MATERIALIZED (
+            SELECT key, json_extract(value,'$[0].provider') AS provider,json_extract(value,'$[0].id') AS session_id,
+                   json_extract(value,'$[1]') AS path, json_extract(value,'$[2]') AS file FROM json_each(?1))
+            SELECT coalesce((SELECT project FROM pi_search_copies c WHERE c.provider=i.provider AND c.session_id=i.session_id
+                  AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=i.path AND coalesce('file/'||json_extract(c.metadata,'$.source_revision.file'),json_extract(c.metadata,'$.source_path')) IS i.file),
+                 (SELECT p.project FROM pi_search_primary p JOIN session_index s USING(provider,session_id)
+                  WHERE p.provider=i.provider AND p.session_id=i.session_id AND i.file IS NULL AND s.project_path=i.path AND p.project<>'' AND NOT EXISTS(SELECT 1 FROM pi_search_copies x WHERE x.provider=i.provider AND x.session_id=i.session_id)))
+            FROM input i ORDER BY i.key").map_err(database_error)?;
+        query
+            .query_map([inputs], |r| {
+                r.get::<_, Option<String>>(0).map(|v| v.map(PathBuf::from))
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)
+    }
+
+    /// Returns the directory recorded in the header of this workspace copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be read.
+    pub fn pi_recorded_directory(
+        &self,
+        session: &SessionRef,
+        key: &Path,
+    ) -> Result<Option<PathBuf>> {
+        self.connection.borrow().query_row("SELECT json_extract(metadata,'$.project_path') FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",params![session.provider.to_string(),session.id,key.to_str()], |row|row.get::<_,Option<String>>(0)).optional().map(|value|value.flatten().map(PathBuf::from)).map_err(database_error)
+    }
+
+    /// Returns the recorded physical file for a copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be read.
+    pub fn pi_recorded_file(&self, session: &SessionRef, key: &Path) -> Result<Option<PathBuf>> {
+        self.connection.borrow().query_row("SELECT json_extract(metadata,'$.source_path') FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",params![session.provider.to_string(),session.id,key.to_str()], |row|row.get::<_,Option<String>>(0)).optional().map(|value|value.flatten().map(PathBuf::from)).map_err(database_error)
+    }
+
+    /// Reads the last verified transcript revision for a historical copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be read.
+    pub fn pi_recorded_revision(&self, session: &SessionRef, key: &Path) -> Result<Option<i64>> {
+        self.connection.borrow().query_row("SELECT t.source_revision FROM session_trajectories t JOIN pi_search_primary p ON p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id) WHERE p.provider=?1 AND p.session_id=?2 AND t.pi_workspace=CASE WHEN p.project=?3 THEN '' ELSE ?3 END",params![session.provider.to_string(),session.id,key.to_str()],|r|r.get(0)).optional().map(Option::flatten).map_err(database_error)
+    }
+
+    /// Selects a physical search document under its workspace-qualified reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary search scope cannot be set.
+    pub fn alias_pi_documents(&self, copies: &[(SessionRef, PathBuf, String)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let keys =
+            serde_json::to_string(copies).map_err(|_| StoreError::InvalidSessionReference)?;
+        self.connection.borrow().execute("WITH input(provider,id,project,selector) AS (
+             SELECT json_extract(value,'$[0].provider'), json_extract(value,'$[0].id'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?1)
+        ) INSERT OR REPLACE INTO pi_document_aliases
+          SELECT t.id,input.selector FROM input JOIN pi_search_primary p ON p.provider=input.provider AND p.session_id=input.id
+          JOIN session_trajectories t ON t.provider=input.provider AND t.session_id=CASE WHEN p.project=input.project THEN input.id ELSE input.id||char(0)||input.project END
+            AND t.pi_workspace=CASE WHEN p.project=input.project THEN '' ELSE input.project END", [keys]).map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Exposes retained documents whose physical source is unknown for global search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be read.
+    pub fn unassigned_pi_sessions(&self) -> Result<Vec<IndexedSession>> {
+        let db = self.connection.borrow();
+        db.execute("INSERT OR REPLACE INTO pi_document_aliases SELECT t.id,t.session_id || '@unverified' FROM session_trajectories t JOIN pi_search_primary p USING(provider,session_id) WHERE p.project='' AND t.pi_workspace=''",[]).map_err(database_error)?;
+        let mut q=db.prepare("SELECT t.provider,t.session_id || '@unverified',t.derived_title,NULL,NULL,NULL,t.source_updated_at,1,0,0,NULL,NULL FROM session_trajectories t JOIN pi_search_primary p USING(provider,session_id) WHERE p.project='' AND t.pi_workspace=''").map_err(database_error)?;
+        q.query_map([], indexed_session_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)
+    }
+
+    /// Reports preserved legacy Pi documents whose workspace is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership metadata cannot be read.
+    pub fn has_unassigned_pi_history(&self) -> Result<bool> {
+        self.connection.borrow().query_row("SELECT EXISTS(SELECT 1 FROM pi_search_primary p JOIN session_trajectories t USING(provider,session_id) WHERE p.project='' AND t.pi_workspace='')",[],|row|row.get(0)).map_err(database_error)
+    }
+
+    /// Reads metadata for all cataloged Pi copies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be read.
+    pub fn cached_all_pi_copies(&self) -> Result<Vec<IndexedSession>> {
+        let db = self.connection.borrow();
+        let mut query = db
+            .prepare("SELECT metadata FROM pi_search_copies WHERE json_valid(metadata)")
+            .map_err(database_error)?;
+        let rows = query
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(database_error)?;
+        let mut copies = Vec::new();
+        for row in rows {
+            if let Ok(copy) = serde_json::from_str(&row.map_err(database_error)?) {
+                copies.push(copy);
+            }
+        }
+        Ok(copies)
+    }
+
+    /// Selects the previously indexed Pi copies for this project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the saved metadata cannot be read.
+    pub fn cached_pi_copies(&self, project: &Path) -> Result<Vec<IndexedSession>> {
+        let project = workspace_root_to_string(project)?;
+        let db = self.connection.borrow();
+        db.execute("INSERT OR REPLACE INTO selected_pi_copies SELECT c.provider,c.session_id,CASE WHEN p.project=c.project THEN '' ELSE c.project END FROM pi_search_copies c LEFT JOIN pi_search_primary p USING(provider,session_id) WHERE c.project=?1", [&project]).map_err(database_error)?;
+        let mut query = db
+            .prepare("SELECT metadata FROM pi_search_copies WHERE project=?1")
+            .map_err(database_error)?;
+        let rows = query
+            .query_map([project], |r| r.get::<_, String>(0))
+            .map_err(database_error)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(database_error)?)
+                .map_err(|_| StoreError::CorruptStore)
+        })
+        .collect()
+    }
+
+    /// Selects document owners for Pi sessions from their recorded workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if workspace metadata cannot be persisted.
+    pub fn select_pi_workspaces(
+        &self,
+        sessions: &[(PathBuf, IndexedSession, Option<i64>)],
+    ) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.connection.borrow_mut();
+        let tx = immediate_transaction(&mut db)?;
+        for (project, session, revision) in sessions {
+            if !matches!(session.session.provider, Provider::Pi | Provider::OhMyPi) {
+                return Err(StoreError::InvalidSessionReference);
+            }
+            let provider = session.session.provider.to_string();
+            let id = &session.session.id;
+            let existing = tx.query_row("SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3 AND (coalesce('file/'||json_extract(metadata,'$.source_revision.file'),json_extract(metadata,'$.source_path')) IS ?4 OR (json_extract(metadata,'$.source_revision.file') IS NULL AND EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=?1 AND p.session_id=?2 WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2 AND t.source_revision=?5 AND t.pi_workspace=CASE WHEN p.project=pi_search_copies.project THEN '' ELSE pi_search_copies.project END))) ORDER BY json_extract(metadata,'$.source_path') IS NULL LIMIT 1",params![provider,id,session.project_path.as_deref().and_then(Path::to_str),Self::pi_file_key(session.source_revision,session.source_path.as_deref()).as_deref().and_then(Path::to_str),revision],|row|row.get::<_,String>(0)).optional().map_err(database_error)?;
+            let recorded = session
+                .project_path
+                .as_deref()
+                .unwrap_or(project)
+                .to_str()
+                .ok_or(StoreError::InvalidWorkspaceRoot)?;
+            let project = if let Some(key) = existing {
+                key
+            } else {
+                let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3 UNION ALL SELECT 1 FROM pi_retired_keys WHERE provider=?1 AND session_id=?2 AND project=?3)",params![provider,id,recorded],|row|row.get(0)).map_err(database_error)?;
+                if occupied {
+                    format!("copy/{}", Uuid::new_v4())
+                } else {
+                    recorded.to_owned()
+                }
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO pi_search_primary VALUES (?1,?2,CASE WHEN EXISTS (SELECT 1 FROM session_trajectories WHERE provider=?1 AND session_id=?2 AND pi_workspace='' AND (source_revision IS NULL OR source_revision IS NOT ?4)) THEN '' ELSE ?3 END)",
+                params![provider, id, project,revision],
+            )
+            .map_err(database_error)?;
+            tx.execute("UPDATE pi_search_primary SET project=?3 WHERE provider=?1 AND session_id=?2 AND project<>?3 AND EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND session_id=?2 AND pi_workspace='' AND source_revision=?4) AND NOT EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace=?3)",params![provider,id,project,revision]).map_err(database_error)?;
+            let metadata = serde_json::to_string(session).map_err(|_| StoreError::CorruptStore)?;
+            tx.execute("INSERT INTO pi_search_copies VALUES (?1,?2,?3,?4) ON CONFLICT DO UPDATE SET metadata=excluded.metadata WHERE metadata<>excluded.metadata",params![provider,id,project,metadata]).map_err(database_error)?;
+            tx.execute("INSERT OR REPLACE INTO selected_pi_copies SELECT ?1,?2,CASE WHEN project=?3 THEN '' ELSE ?3 END FROM pi_search_primary WHERE provider=?1 AND session_id=?2",params![provider,id,project]).map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)
+    }
+
     /// Opens `OMNISESSION_HOME` or `~/.omnisession` as state root.
     ///
     /// # Errors
@@ -2706,6 +2987,50 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
+    /// Applies the caller's title redaction to metadata cached by older pickers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot update every affected row and record the migration.
+    pub fn redact_legacy_index_titles(&self, redact: fn(&str) -> String) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let migrated: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM store_migrations WHERE name = 'redact_index_titles')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if migrated {
+            return Ok(());
+        }
+        let transaction = immediate_transaction(&mut connection)?;
+        let claimed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO store_migrations(name) VALUES ('redact_index_titles')",
+                [],
+            )
+            .map_err(database_error)?;
+        if claimed != 0 {
+            transaction
+                .create_scalar_function(
+                    "omnis_redact_title",
+                    1,
+                    FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+                    move |ctx| Ok(redact(&ctx.get::<String>(0)?)),
+                )
+                .map_err(database_error)?;
+            transaction
+                .execute(
+                    "UPDATE session_index SET title = omnis_redact_title(title)
+                     WHERE title IS NOT NULL AND title != omnis_redact_title(title)",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
+    }
+
     fn codex_home_for(&self, provider: Provider) -> Option<&str> {
         self.codex_home
             .as_deref()
@@ -2920,6 +3245,74 @@ impl Store {
         transaction.commit().map_err(database_error)
     }
 
+    /// Removes the cached document for the confirmed Pi file. A confirmed deletion also clears its active binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the physical owner cannot be identified or the transaction fails.
+    pub fn forget_pi_copy(
+        &self,
+        session: &SessionRef,
+        file: &Path,
+        revision: i64,
+        object: Option<Uuid>,
+        confirmed_directory: Option<&Path>,
+    ) -> Result<()> {
+        if !matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        let mut db = self.connection.borrow_mut();
+        let tx = immediate_transaction(&mut db)?;
+        let provider = session.provider.to_string();
+        let id = &session.id;
+        let path = file.to_str().ok_or(StoreError::InvalidWorkspaceRoot)?;
+        let mut q=tx.prepare("SELECT c.project, json_extract(c.metadata,'$.project_path'), p.project=c.project FROM pi_search_copies c JOIN pi_search_primary p USING(provider,session_id) WHERE c.provider=?1 AND c.session_id=?2 AND json_valid(c.metadata) AND ((?5 IS NOT NULL AND json_extract(c.metadata,'$.source_revision.file')=?5) OR (json_extract(c.metadata,'$.source_revision.file') IS NULL AND (json_extract(c.metadata,'$.source_path') IS NULL OR json_extract(c.metadata,'$.source_path')=?3) AND EXISTS(SELECT 1 FROM session_trajectories t WHERE t.provider=c.provider AND coalesce(t.pi_native_id,t.session_id)=c.session_id AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END AND t.source_revision=?4)))").map_err(database_error)?;
+        let keys = q
+            .query_map(
+                params![
+                    provider,
+                    id,
+                    path,
+                    revision,
+                    object.map(|id| id.to_string())
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?;
+        drop(q);
+        for (key, workspace, primary) in keys {
+            if confirmed_directory.is_some() {
+                tx.execute("UPDATE session_bindings SET is_current=0 WHERE provider=?1 AND session_id=?2 AND is_current=1",params![provider,Self::pi_copy_selector(id,Path::new(&key))]).map_err(database_error)?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO pi_retired_keys VALUES(?1,?2,?3)",
+                params![provider, id, key],
+            )
+            .map_err(database_error)?;
+            tx.execute("DELETE FROM session_trajectories WHERE provider=?1 AND coalesce(pi_native_id,session_id)=?2 AND pi_workspace=?3",params![provider,id,if primary {""}else{&key}]).map_err(database_error)?;
+            tx.execute("DELETE FROM trajectory_index_failures WHERE provider=?1 AND session_id=?2 AND pi_workspace=?3",params![provider,id,if primary {""}else{&key}]).map_err(database_error)?;
+            tx.execute("UPDATE pi_search_primary SET project='' WHERE provider=?1 AND session_id=?2 AND project=?3",params![provider,id,key]).map_err(database_error)?;
+            tx.execute(
+                "DELETE FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",
+                params![provider, id, key],
+            )
+            .map_err(database_error)?;
+            tx.execute("DELETE FROM session_index WHERE provider=?1 AND session_id=?2 AND project_path=?3 AND NOT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3)",params![provider,id,workspace]).map_err(database_error)?;
+        }
+        if let Some(directory) = confirmed_directory {
+            tx.execute("UPDATE session_bindings SET is_current=0 WHERE provider=?1 AND session_id=?2 AND is_current=1 AND NOT EXISTS(SELECT 1 FROM pi_search_copies c WHERE c.provider=?1 AND c.session_id=?2 AND (NOT json_valid(c.metadata) OR json_extract(c.metadata,'$.source_path') IS NOT NULL OR json_extract(c.metadata,'$.project_path') IS NOT ?3 OR EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id WHERE t.provider=c.provider AND coalesce(t.pi_native_id,t.session_id)=c.session_id AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END AND t.source_revision IS NOT NULL)))",params![provider,id,directory.to_str()]).map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)
+    }
+
     /// Removes cached metadata and redacted search content for one native session.
     ///
     /// Current routing bindings to the session are deactivated. Native provider data,
@@ -2933,6 +3326,9 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider = session.provider.to_string();
+        if matches!(session.provider,Provider::Pi|Provider::OhMyPi) && transaction.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 UNION ALL SELECT 1 FROM session_trajectories WHERE provider=?1 AND coalesce(pi_native_id,session_id)=?2)",params![provider,session.id],|row|row.get::<_,bool>(0)).map_err(database_error)? {
+            return Err(StoreError::InvalidSessionReference);
+        }
         remove_codex_workspace(&transaction, session, self.codex_home.as_deref())?;
         transaction
             .execute(
@@ -3012,9 +3408,9 @@ impl Store {
             .map(|binding| binding.session);
         let provider = session.provider.to_string();
         for statement in [
-            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2
+            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2 AND provider NOT IN ('pi','omp')
                  AND (provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home))",
-            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2 AND provider NOT IN ('pi','omp')
                  AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))",
             "UPDATE session_bindings SET is_current = 0
              WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
@@ -3906,6 +4302,26 @@ impl Store {
         source_updated_at: DateTime<Utc>,
         document_version: u32,
     ) -> Result<bool> {
+        self.session_trajectory_source_is_current_at_revision(
+            session,
+            None,
+            source_updated_at,
+            document_version,
+        )
+    }
+
+    /// Checks source identity and coverage before skipping a full index write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid reference or unreadable index.
+    pub fn session_trajectory_source_is_current_at_revision(
+        &self,
+        session: &SessionRef,
+        revision: Option<i64>,
+        source_updated_at: DateTime<Utc>,
+        document_version: u32,
+    ) -> Result<bool> {
         validate_session_ref(session)?;
         let connection = self.connection.borrow();
         connection
@@ -3914,8 +4330,8 @@ impl Store {
                     SELECT 1 FROM visible_trajectories
                     WHERE provider = ?1 AND session_id = ?2
                       AND source_complete = 1 AND source_updated_at >= ?3 AND (provider <> 'codex' OR source_updated_at = ?3) AND document_version >= ?4
-                      AND (NOT ?5 OR (source_updated_at = ?3 AND source_updated_submillis = ?6))
-                      AND (provider <> 'codex' OR origin <> 'native' OR document_version >= ?7)
+                      AND (?7 IS NULL OR source_revision = ?7) AND (NOT ?5 OR (source_updated_at = ?3 AND source_updated_submillis = ?6))
+                      AND (provider <> 'codex' OR origin <> 'native' OR document_version >= ?8)
                 )",
                 params![
                     session.provider.to_string(),
@@ -3924,11 +4340,51 @@ impl Store {
                     document_version,
                     TrajectorySourceGuard::uses_file_time(session.provider),
                     source_submillis(session.provider, source_updated_at),
+                    revision,
                     omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
                 ],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(database_error)
+    }
+
+    /// Reads the current revision for a conditional trajectory write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be read.
+    pub fn trajectory_write_guard(&self, session: &SessionRef) -> Result<TrajectoryWriteGuard> {
+        self.connection.borrow().query_row(
+            "SELECT source_revision FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2",
+            params![session.provider.to_string(), session.id], |row| row.get(0)
+        ).optional().map(|row| row.map_or(TrajectoryWriteGuard::Missing, TrajectoryWriteGuard::Existing)).map_err(database_error)
+    }
+
+    /// Checks whether a complete search document still covers the observed source time
+    /// and needs an upgrade to the requested version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be read.
+    pub fn needs_full_projection_upgrade(
+        &self,
+        session: &SessionRef,
+        revision: Option<i64>,
+        bytes: Option<i64>,
+        updated_at: Option<DateTime<Utc>>,
+        version: u32,
+        full_read_bytes: u64,
+    ) -> Result<bool> {
+        self.connection.borrow().query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_trajectories WHERE provider = ?1 AND coalesce(pi_native_id,session_id) = ?2
+                AND pi_workspace = coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'')
+                AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))
+                AND source_complete AND ((?5 IS NOT NULL AND source_revision IS NOT ?5 AND (source_file_bytes IS NULL OR source_file_bytes >= ?6 OR ?6 <= ?7))
+                OR (document_version < ?3 AND (CASE WHEN ?5 IS NOT NULL THEN source_revision = ?5
+                    ELSE ?4 IS NULL OR source_updated_at >= ?4 END))))",
+            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis()), revision, bytes, i64::try_from(full_read_bytes).unwrap_or(i64::MAX)],
+            |row| row.get(0),
+        ).map_err(database_error)
     }
 
     /// Reads one document's coverage, source timestamp, and version before opening its source.
@@ -4028,7 +4484,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, document_version, source_updated_submillis,
-                        source_file_id, source_contents_id, ancestor_revisions FROM trajectory_index_failures WHERE provider <> 'codex' OR codex_home = ?1",
+                        source_file_id, source_contents_id, ancestor_revisions FROM trajectory_index_failures AS f WHERE (provider <> 'codex' OR codex_home = ?1) AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies AS s WHERE s.provider=f.provider AND s.session_id=f.session_id),'')",
             )
             .map_err(database_error)?;
         let rows = statement
@@ -4147,8 +4603,8 @@ impl Store {
         )?;
         transaction.execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at, source_updated_submillis, source_file_id, source_contents_id, ancestor_revisions, codex_home
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     provider, session_id, source_updated_at, document_version, failed_at, source_updated_submillis, source_file_id, source_contents_id, ancestor_revisions, codex_home, pi_workspace
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),''))
                  ON CONFLICT DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
                      source_updated_submillis = excluded.source_updated_submillis,
@@ -4222,7 +4678,7 @@ impl Store {
         connection
             .execute(
                 "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2
-                 AND (provider <> 'codex' OR codex_home = ?3)",
+                 AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'') AND (provider <> 'codex' OR codex_home = ?3)",
                 params![
                     session.provider.to_string(),
                     session.id,
@@ -4797,6 +5253,8 @@ impl Store {
         transaction
             .execute_batch(
                 "
+                CREATE TABLE IF NOT EXISTS store_migrations (name TEXT PRIMARY KEY) WITHOUT ROWID;
+
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL CHECK (length(trim(name)) > 0),
@@ -4878,20 +5336,12 @@ impl Store {
                     document_version INTEGER NOT NULL CHECK (document_version >= 0),
                     failed_at INTEGER NOT NULL,
                     PRIMARY KEY (provider, session_id)
-                ) WITHOUT ROWID;
-
-                ",
+                ) WITHOUT ROWID;",
             )
             .map_err(database_error)?;
         initialize_index_schemas(&transaction, stored_format)?;
         transaction.commit().map_err(database_error)?;
-        if stored_format < STORE_FORMAT {
-            codex_document_home::initialize(&mut connection, initialize_provider_receipt_schemas)?;
-            // Deleting promoted gaps cascades to their chunks after the format swap restores foreign keys.
-            let transaction = immediate_transaction(&mut connection)?;
-            database_receipts::promote_gap_projections(&transaction)?;
-            transaction.commit().map_err(database_error)?;
-        }
+        upgrade_trajectory_keys(&mut connection, stored_format)?;
         codex_workspace::install_display_upgrade_trigger(&connection)
     }
 
@@ -6127,7 +6577,7 @@ fn single_clause_page_sql(
              {candidate_chunks}
              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
          )
-         SELECT trajectories.provider, trajectories.session_id,
+         SELECT trajectories.provider, coalesce((SELECT selector FROM pi_document_aliases WHERE id=trajectories.id),trajectories.pi_native_id,trajectories.session_id),
                 {SEARCH_COVERAGE_COLUMNS}, ranked_chunks.chunk_id, 0
          FROM ranked_chunks
          INNER JOIN session_trajectories AS trajectories
@@ -6209,7 +6659,7 @@ fn multi_clause_page_sql(
                     best_clause_matches.trajectory_id
              WHERE clause_rank_order = 1
          )
-         SELECT trajectories.provider, trajectories.session_id,
+         SELECT trajectories.provider, coalesce((SELECT selector FROM pi_document_aliases WHERE id=trajectories.id),trajectories.pi_native_id,trajectories.session_id),
                 {SEARCH_COVERAGE_COLUMNS},
                 best_snippets.chunk_id, best_snippets.clause_index
          FROM ranked_trajectories
@@ -6231,14 +6681,22 @@ fn initialize_trajectory_scope(connection: &Connection, codex_home: Option<&str>
     connection
         .execute_batch(
             "CREATE TEMP TABLE current_codex_home (home TEXT);
-         CREATE TEMP VIEW visible_trajectories AS SELECT * FROM main.session_trajectories AS t
-         WHERE t.provider <> 'codex'
-            OR (t.origin = 'native' AND t.codex_workspace_current
-                AND t.codex_home = (SELECT home FROM current_codex_home));
+         CREATE TEMP TABLE selected_pi_copies(provider TEXT, session_id TEXT, project TEXT, PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
+         INSERT OR REPLACE INTO selected_pi_copies
+             SELECT i.provider,i.session_id,c.project FROM main.session_index i
+             JOIN main.pi_search_copies c ON c.provider=i.provider AND c.session_id=i.session_id
+             JOIN main.pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id
+             WHERE CASE WHEN json_valid(c.metadata) THEN json_extract(c.metadata,'$.project_path') END=i.project_path AND c.project<>p.project;
+         CREATE TEMP TABLE pi_document_aliases(id INTEGER PRIMARY KEY,selector TEXT NOT NULL);
+         CREATE TEMP VIEW visible_trajectories AS SELECT coalesce(a.selector,t.pi_native_id,t.session_id) AS session_id,t.*
+             FROM main.session_trajectories t LEFT JOIN pi_document_aliases a ON a.id=t.id
+             WHERE (a.id IS NOT NULL OR t.pi_workspace=CASE WHEN t.provider IN ('pi','omp') THEN coalesce((SELECT project FROM selected_pi_copies p WHERE p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id)),'') ELSE '' END)
+               AND (t.provider<>'codex' OR (t.origin='native' AND t.codex_workspace_current AND t.codex_home=(SELECT home FROM current_codex_home)));
          CREATE TEMP VIEW scoped_session_index AS SELECT * FROM main.session_index
          WHERE provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home);
-         CREATE TEMP VIEW scoped_trajectory_failures AS SELECT * FROM main.trajectory_index_failures
-         WHERE provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home);
+         CREATE TEMP VIEW scoped_trajectory_failures AS SELECT * FROM main.trajectory_index_failures AS f
+         WHERE (provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home))
+           AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies AS p WHERE p.provider=f.provider AND p.session_id=f.session_id),'');
          CREATE TEMP VIEW observed_session_index AS
          WITH observed AS (
              SELECT 'codex' AS provider, w.session_id,
@@ -6431,10 +6889,21 @@ fn provider_index_matches(
     existing.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     incoming.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     Ok(existing.len() == incoming.len()
-        && existing
-            .iter()
-            .zip(incoming)
-            .all(|(left, right)| left == right))
+        && existing.iter().zip(incoming).all(|(left, right)| {
+            left.session == right.session
+                && left.source_revision == right.source_revision
+                && catalog_submillis(left) == catalog_submillis(right)
+                && left.title == right.title
+                && left.project_path.as_deref().map(Path::as_os_str)
+                    == right.project_path.as_deref().map(Path::as_os_str)
+                && left.git_branch == right.git_branch
+                && left.created_at.as_ref().map(DateTime::timestamp_millis)
+                    == right.created_at.as_ref().map(DateTime::timestamp_millis)
+                && left.updated_at.as_ref().map(DateTime::timestamp_millis)
+                    == right.updated_at.as_ref().map(DateTime::timestamp_millis)
+                && left.updated_at_approximate == right.updated_at_approximate
+                && left.event_count == right.event_count
+        }))
 }
 
 fn prune_stale_native_trajectories(
@@ -6458,7 +6927,7 @@ fn prune_stale_native_trajectories(
                AND NOT EXISTS (
                    SELECT 1 FROM session_index
                    WHERE session_index.provider = session_trajectories.provider
-                     AND session_index.session_id = session_trajectories.session_id
+                     AND session_index.session_id = coalesce(session_trajectories.pi_native_id,session_trajectories.session_id)
                      AND (session_index.provider <> 'codex'
                           OR session_index.codex_home = session_trajectories.codex_home)
                )",
@@ -6609,7 +7078,7 @@ fn initialize_index_schemas(transaction: &Transaction<'_>, stored_format: i64) -
     initialize_trajectory_schema(transaction, stored_format)?;
     ensure_source_time_columns(transaction)?;
     initialize_source_revision_schema(transaction)?;
-    if stored_format == STORE_FORMAT {
+    if stored_format >= 2 {
         initialize_provider_receipt_schemas(transaction)?;
         database_receipts::promote_gap_projections(transaction)?;
     }
@@ -6624,11 +7093,177 @@ fn initialize_index_schemas(transaction: &Transaction<'_>, stored_format: i64) -
              ALTER TABLE codex_workspace_observations ADD COLUMN source_contents_id BLOB;",
             )
             .map_err(database_error)?;
-        if stored_format == STORE_FORMAT {
+        if stored_format >= 2 {
             initialize_codex_document_triggers(transaction)?;
         }
     }
     Ok(())
+}
+
+fn upgrade_trajectory_keys(connection: &mut Connection, format: i64) -> Result<()> {
+    if format < 2 {
+        codex_document_home::initialize(connection, initialize_provider_receipt_schemas)?;
+        let transaction = immediate_transaction(connection)?;
+        database_receipts::promote_gap_projections(&transaction)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if format < 3 {
+        initialize_pi_workspace_documents(connection)?;
+    }
+    if format < 4 {
+        isolate_pi_workspace_documents(connection)?;
+    }
+    if format < 5 {
+        normalize_pi_workspace_documents(connection)?;
+    }
+    if format < 6 {
+        recover_pi_workspace_owners(connection)?;
+    }
+    if format < 7 {
+        initialize_pi_document_lookup(connection)?;
+    }
+    if format < 8 {
+        let tx = immediate_transaction(connection)?;
+        tx.execute("UPDATE pi_search_primary AS p SET project='' WHERE EXISTS (SELECT 1 FROM trajectory_index_failures failed JOIN trajectory_index_failures scoped USING(provider,session_id)
+            WHERE failed.provider=p.provider AND failed.session_id=p.session_id AND failed.pi_workspace='' AND scoped.pi_workspace<>'' AND scoped.pi_workspace=p.project)",[]).map_err(database_error)?;
+        tx.pragma_update(None, "user_version", 8)
+            .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+    }
+    if format < STORE_FORMAT {
+        preserve_pi_list_observations(connection)?;
+    }
+    Ok(())
+}
+
+fn preserve_pi_list_observations(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS pi_retired_keys(provider TEXT NOT NULL,session_id TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(provider,session_id,project))").map_err(database_error)?;
+    tx.execute("UPDATE pi_search_primary AS p SET project='' WHERE EXISTS(SELECT 1 FROM session_trajectories t WHERE t.provider=p.provider AND t.session_id=p.session_id AND t.pi_workspace='' AND t.source_revision IS NULL)",[]).map_err(database_error)?;
+    let sessions = {
+        let mut rows=tx.prepare("SELECT provider,session_id,title,project_path,git_branch,created_at,updated_at,updated_at_approximate,event_count,source_updated_submillis,source_file_id,source_contents_id FROM session_index WHERE provider IN ('pi','omp') AND project_path IS NOT NULL").map_err(database_error)?;
+        rows.query_map([], indexed_session_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?
+    };
+    for session in sessions {
+        let metadata = serde_json::to_string(&session).map_err(|_| StoreError::CorruptStore)?;
+        let path = session
+            .project_path
+            .as_deref()
+            .and_then(Path::to_str)
+            .ok_or(StoreError::InvalidWorkspaceRoot)?;
+        tx.execute("INSERT OR IGNORE INTO pi_search_copies SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3)",params![session.session.provider.to_string(),session.session.id,path,metadata]).map_err(database_error)?;
+    }
+    tx.pragma_update(None, "user_version", STORE_FORMAT)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn initialize_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(database_error)?;
+    if version >= 3 {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE session_trajectories ADD COLUMN pi_workspace TEXT NOT NULL DEFAULT '';
+        DROP INDEX session_trajectory_codex_home;
+        CREATE UNIQUE INDEX session_trajectory_codex_home ON session_trajectories
+        (provider,session_id,provider='codex' AND origin='native',
+         CASE WHEN provider='codex' AND origin='native' THEN coalesce(codex_home,'') ELSE '' END, pi_workspace);
+        CREATE TABLE pi_search_copies(provider TEXT NOT NULL, session_id TEXT NOT NULL, project TEXT NOT NULL,
+             metadata TEXT NOT NULL, PRIMARY KEY(provider,session_id,project)) WITHOUT ROWID;
+        CREATE TRIGGER prune_pi_search_copy AFTER DELETE ON session_trajectories WHEN old.pi_workspace <> '' BEGIN
+           DELETE FROM pi_search_copies WHERE provider=old.provider AND session_id=old.session_id AND project=old.pi_workspace;
+        END;
+        ALTER TABLE trajectory_index_failures ADD COLUMN pi_workspace TEXT NOT NULL DEFAULT '';
+        DROP INDEX trajectory_index_failure_home;
+        CREATE UNIQUE INDEX trajectory_index_failure_home ON trajectory_index_failures
+        (provider,session_id,CASE WHEN provider='codex' THEN coalesce(codex_home,'') ELSE '' END,pi_workspace);").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 3)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn isolate_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(database_error)?;
+    if version >= 4 {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE session_trajectories ADD COLUMN pi_native_id TEXT;
+        CREATE TABLE pi_search_primary(provider TEXT NOT NULL,session_id TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
+        INSERT INTO pi_search_primary SELECT provider,session_id,project_path FROM session_index WHERE provider IN ('pi','omp') AND project_path IS NOT NULL;
+        UPDATE session_trajectories SET pi_native_id=session_id, session_id=session_id || char(0) || pi_workspace WHERE pi_workspace<>'';
+        DROP TRIGGER prune_pi_search_copy;
+        CREATE TRIGGER prune_pi_search_copy AFTER DELETE ON session_trajectories WHEN old.pi_workspace<>'' BEGIN
+            DELETE FROM pi_search_copies WHERE provider=old.provider AND session_id=old.pi_native_id AND project=old.pi_workspace;
+        END;").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 4)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn normalize_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(database_error)?;
+    if version >= 5 {
+        return Ok(());
+    }
+    // A format 3 list observation could name the secondary copy even after its read failed.
+    tx.execute("UPDATE pi_search_primary SET project='' WHERE EXISTS (SELECT 1 FROM session_trajectories t WHERE t.provider=pi_search_primary.provider AND t.pi_native_id=pi_search_primary.session_id AND (t.pi_workspace=pi_search_primary.project OR EXISTS (SELECT 1 FROM pi_search_copies c WHERE c.provider=t.provider AND c.session_id=t.pi_native_id AND c.project=t.pi_workspace AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=pi_search_primary.project)))", []).map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 5)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn recover_pi_workspace_owners(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(database_error)?;
+    if version >= 6 {
+        return Ok(());
+    }
+    tx.execute_batch("UPDATE pi_search_primary AS p SET project=''
+        WHERE EXISTS(SELECT 1 FROM trajectory_index_failures f JOIN session_index i USING(provider,session_id)
+           WHERE f.provider=p.provider AND f.session_id=p.session_id AND f.pi_workspace=''
+           AND f.source_updated_at=i.updated_at AND p.project=i.project_path
+           AND EXISTS(SELECT 1 FROM trajectory_index_failures scoped WHERE scoped.provider=f.provider AND scoped.session_id=f.session_id AND scoped.pi_workspace<>'')
+           AND EXISTS(SELECT 1 FROM pi_search_copies c WHERE c.provider=p.provider AND c.session_id=p.session_id
+                      AND json_extract(c.metadata,'$.project_path')=i.project_path));
+        UPDATE pi_search_primary AS p SET project=(
+            SELECT c.project FROM pi_search_copies c JOIN session_index i USING(provider,session_id)
+            WHERE c.provider=p.provider AND c.session_id=p.session_id AND json_extract(c.metadata,'$.project_path')=i.project_path
+        ) WHERE p.project='' AND EXISTS(
+            SELECT 1 FROM session_index i JOIN session_trajectories t USING(provider,session_id)
+            JOIN pi_search_copies c ON c.provider=i.provider AND c.session_id=i.session_id AND json_extract(c.metadata,'$.project_path')=i.project_path
+            WHERE i.provider=p.provider AND i.session_id=p.session_id AND t.pi_workspace='' AND t.source_updated_at=i.updated_at
+              AND t.indexed_at>=i.indexed_at AND NOT EXISTS(SELECT 1 FROM trajectory_index_failures f
+                  WHERE f.provider=i.provider AND f.session_id=i.session_id AND f.pi_workspace='' AND f.source_updated_at=i.updated_at)
+              AND NOT EXISTS(SELECT 1 FROM session_trajectories scoped WHERE scoped.provider=i.provider AND scoped.pi_native_id=i.session_id
+                  AND scoped.pi_workspace=c.project AND scoped.indexed_at>=t.indexed_at)
+        );").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 6)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn initialize_pi_document_lookup(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    tx.execute_batch("INSERT OR IGNORE INTO pi_search_primary SELECT DISTINCT provider,session_id,'' FROM pi_search_copies;
+        INSERT OR IGNORE INTO pi_search_primary SELECT provider,session_id,'' FROM session_trajectories WHERE provider IN ('pi','omp') AND pi_workspace='';
+        CREATE INDEX IF NOT EXISTS pi_copy_header_directory ON pi_search_copies(provider,session_id,json_extract(metadata,'$.project_path')) WHERE json_valid(metadata);").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 7)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
 }
 
 fn initialize_provider_receipt_schemas(transaction: &Transaction<'_>) -> Result<()> {
@@ -6904,6 +7539,15 @@ fn ensure_trajectory_version_columns(
     transaction: &Transaction<'_>,
     columns: &[String],
 ) -> Result<()> {
+    for name in ["source_revision", "source_file_bytes"] {
+        if !columns.iter().any(|column| column == name) {
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE session_trajectories ADD COLUMN {name} INTEGER"
+                ))
+                .map_err(database_error)?;
+        }
+    }
     let has_column = |name: &str| columns.iter().any(|column| column == name);
     if !has_column("projected_byte_count") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_byte_count INTEGER CHECK (projected_byte_count >= 0)").map_err(database_error)?;
@@ -8108,6 +8752,7 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     let file = optional_uuid(row, 10)?;
     let contents = optional_uuid(row, 11)?;
     Ok(IndexedSession {
+        source_path: None,
         session: SessionRef::new(provider, row.get::<_, String>(1)?),
         source_revision: file.map(|file| SourceRevision {
             legacy_file: None,
@@ -9191,6 +9836,7 @@ fn update_observed_failure(
         .execute(
             &format!(
                 "{action} WHERE provider = ?1 AND session_id = ?2 AND (provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home))
+                 AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'')
                  AND source_updated_at IS ?3 AND document_version = ?4
                  AND source_file_id IS ?5 AND source_contents_id IS ?6 AND source_updated_submillis IS ?7 AND ancestor_revisions IS ?8"
             ),
@@ -10898,6 +11544,72 @@ mod tests {
     }
 
     #[test]
+    fn pi_workspace_documents_keep_their_owner_when_discovery_order_changes() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("store.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let primary = directory.path().join("z");
+        let restored = directory.path().join("a");
+        let mut record = indexed_session(Provider::Pi, "shared", "Session");
+        let now = Utc::now();
+        for (workspace, word, object) in [(&primary, "bluepuffin", 1), (&restored, "goldrobin", 2)]
+        {
+            record.source_revision = Some(SourceRevision {
+                file: Some(Uuid::from_u128(object)),
+                ..SourceRevision::default()
+            });
+            record.project_path = Some(workspace.clone());
+            record.source_path = Some(workspace.join("session.jsonl"));
+            store
+                .select_pi_workspaces(&[(workspace.clone(), record.clone(), None)])
+                .unwrap();
+            store
+                .upsert_session_trajectory(&record.session, word, now, true)
+                .unwrap();
+        }
+        let reopened = Store::open(database).unwrap();
+        for (workspace, expected, excluded) in [
+            (&restored, "goldrobin", "bluepuffin"),
+            (&primary, "bluepuffin", "goldrobin"),
+        ] {
+            assert_eq!(
+                reopened.cached_pi_copies(workspace).unwrap()[0]
+                    .project_path
+                    .as_ref(),
+                Some(workspace)
+            );
+            assert_eq!(
+                reopened.search_session_trajectories(expected, 5).unwrap(),
+                [record.session.clone()]
+            );
+            assert!(
+                reopened
+                    .search_session_trajectories(excluded, 5)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(reopened.forget_session(&record.session).is_err());
+        reopened
+            .forget_pi_copy(
+                &record.session,
+                &restored.join("session.jsonl"),
+                1,
+                Some(Uuid::from_u128(2)),
+                Some(&restored),
+            )
+            .unwrap();
+        assert!(reopened.cached_pi_copies(&restored).unwrap().is_empty());
+        reopened.cached_pi_copies(&primary).unwrap();
+        assert_eq!(
+            reopened
+                .search_session_trajectories("bluepuffin", 5)
+                .unwrap(),
+            [record.session]
+        );
+    }
+
+    #[test]
     fn unowned_codex_cache_rows_require_a_new_read_before_they_are_visible() {
         let temporary = tempdir().unwrap();
         let store = Store::open(temporary.path().join("cache")).unwrap();
@@ -11521,7 +12233,9 @@ mod tests {
     fn unchanged_provider_refresh_preserves_index_rows() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
-        let session = indexed_session(Provider::Claude, "stable", "Stable title");
+        let mut session = indexed_session(Provider::Claude, "stable", "Stable title");
+        session.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789);
+        session.updated_at = DateTime::from_timestamp(1_700_003_600, 987_654_321);
         store
             .replace_indexed_sessions(Provider::Claude, std::slice::from_ref(&session))
             .expect("initial refresh");
@@ -11550,6 +12264,92 @@ mod tests {
             )
             .expect("retained row");
         assert_eq!(indexed_at, 42);
+    }
+
+    #[test]
+    fn provider_refresh_updates_the_exact_workspace_path() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let mut session = indexed_session(Provider::Hermes, "stable", "Stable title");
+        session.project_path = Some("/host/repo".into());
+        store
+            .replace_indexed_sessions(Provider::Hermes, std::slice::from_ref(&session))
+            .expect("initial refresh");
+
+        session.project_path = Some("//host/repo".into());
+        store
+            .replace_indexed_sessions(Provider::Hermes, &[session])
+            .expect("refresh moved session");
+
+        let cached = store
+            .indexed_sessions_for_provider(Provider::Hermes)
+            .expect("cached sessions");
+        assert_eq!(
+            cached[0].project_path.as_deref().map(Path::as_os_str),
+            Some(Path::new("//host/repo").as_os_str())
+        );
+    }
+
+    #[test]
+    fn removing_one_physical_pi_file_preserves_its_sibling_and_restores_the_binding() {
+        let db = tempdir().unwrap();
+        let workspace = db.path();
+        let store = Store::open(workspace.join("store.sqlite3")).unwrap();
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let mut entry = indexed_session(provider, "shared", "title");
+            entry.project_path = Some(workspace.to_owned());
+            let target = &entry.session.clone();
+            let task = store
+                .create_or_get_task(provider.to_string(), workspace)
+                .unwrap();
+            store.bind_session(task.id, "main", target).unwrap();
+            for (name, word, index) in [
+                ("a.jsonl", "goldrobin", 1_u128),
+                ("a.jsonl", "bluepuffin", 2),
+            ] {
+                entry.source_revision = Some(SourceRevision {
+                    file: Some(Uuid::from_u128(index)),
+                    ..Default::default()
+                });
+                entry.source_path = Some(workspace.join(name));
+                store
+                    .select_pi_workspaces(&[(workspace.to_owned(), entry.clone(), None)])
+                    .unwrap();
+                store
+                    .upsert_session_trajectory(target, word, Utc::now(), true)
+                    .unwrap();
+            }
+            store
+                .forget_pi_copy(
+                    target,
+                    &workspace.join("a.jsonl"),
+                    2,
+                    Some(Uuid::from_u128(2)),
+                    None,
+                )
+                .unwrap();
+            let docs = store.cached_all_pi_copies().unwrap();
+            let remaining = docs.iter().find(|row| &row.session == target).unwrap();
+            assert_eq!(
+                remaining.source_path.as_deref(),
+                Some(workspace.join("a.jsonl").as_path())
+            );
+            assert_eq!(
+                remaining.source_revision.unwrap().file,
+                Some(Uuid::from_u128(1))
+            );
+            assert!(store.current_binding(task.id, "main").unwrap().is_some());
+            store
+                .forget_pi_copy(
+                    target,
+                    &workspace.join("a.jsonl"),
+                    1,
+                    Some(Uuid::from_u128(1)),
+                    Some(workspace),
+                )
+                .unwrap();
+            assert!(store.current_binding(task.id, "main").unwrap().is_none());
+        }
     }
 
     #[test]
@@ -14461,6 +15261,7 @@ mod tests {
 
     fn indexed_session(provider: Provider, id: &str, title: &str) -> IndexedSession {
         IndexedSession {
+            source_path: None,
             source_revision: None,
             session: SessionRef::new(provider, id),
             title: Some(title.to_owned()),

@@ -151,6 +151,7 @@ impl Store {
                 params![provider.to_string(), home.as_os_str().as_encoded_bytes()],
                 |row| {
                     Ok(IndexedSession {
+                        source_path: None,
                         session: SessionRef::new(provider, row.get::<_, String>(0)?),
                         source_revision: Some(super::source_revision_from_row(row, 1)?),
                         title: None,

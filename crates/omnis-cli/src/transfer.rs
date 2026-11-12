@@ -27,13 +27,12 @@ use super::{
     build_native_fork_report, build_native_materialization_report_for_snapshot,
     build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
-    cursor_ide_import, cursor_import, delete_native_session, display_command,
-    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import, json, launch_json,
-    opencode_import, pi_import, print_fidelity, progress_line, redact_secrets,
-    render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
-    runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches_for_session, spawn_launch, transfer_repository_matches,
-    wait_for_launch, workspace_paths_match, workspace_root,
+    cursor_ide_import, cursor_import, display_command, fidelity_report_for_snapshot, flush_stdout,
+    grok_import, hermes_import, json, launch_json, opencode_import, pi_import, print_fidelity,
+    progress_line, redact_secrets, render_semantic_handoff, resolve_session_ref,
+    resolved_provider_binary, run_launch, runnable_target_providers, safe_terminal_line,
+    self_update, session_picker, source_workspace_matches_for_session, spawn_launch,
+    transfer_repository_matches, wait_for_launch, workspace_paths_match, workspace_root,
 };
 
 pub(super) fn resume(
@@ -361,7 +360,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
     resume(
         registry,
         &ResumeArgs {
-            source: Some(source.to_string()),
+            source: Some(args.source.clone()),
             target: Some(target),
             source_provider: None,
             all_projects: false,
@@ -542,7 +541,10 @@ pub(super) fn resume_project(
     allow_workspace_mismatch: bool,
     selection: Option<&session_picker::PickerSelection>,
 ) -> Result<PathBuf> {
-    if let Some(selection) = selection.filter(|selection| selection.workspace_override.is_some()) {
+    if let Some(selection) = selection.filter(|selection| {
+        selection.workspace.replacement().is_some()
+            || (source.provider == Provider::Claude && selection.across_projects)
+    }) {
         return selected_workspace(snapshot, selection);
     }
     if allow_workspace_mismatch || source_workspace_matches_for_session(source, snapshot, current)?
@@ -606,7 +608,17 @@ fn resume_workspace(
         allow_workspace_mismatch,
         selection,
     )?;
-    let matches = transfer_repository_matches(&request.source, &read.snapshot, &project)?;
+    let matches = if selection.is_some_and(|choice| choice.workspace.replacement().is_some())
+        && !(request.source.provider == Provider::Imported
+            && read.snapshot.workspace.root.is_absolute())
+    {
+        is_cursor_workspace_file(
+            read.snapshot.session.provider,
+            &read.snapshot.workspace.root,
+        ) && omnis_core::cursor_workspace_matches(&read.snapshot.workspace.root, &project)
+    } else {
+        transfer_repository_matches(&request.source, &read.snapshot, &project)?
+    };
     Ok((project, matches))
 }
 
@@ -911,9 +923,22 @@ fn native_resume_workspace(
     let current = continuation_caller_directory(request.target == Provider::Codex)?;
     if request.target != Provider::CursorCli {
         if let Some(selection) = &request.picker_selection {
-            let project =
-                selected_native_workspace(selection, selection.project_path.as_deref(), &current)?;
-            let repository_matches = workspace_paths_match(&project, &current);
+            let native = registry
+                .adapter(request.source.provider)?
+                .native_workspace(&request.source)?;
+            let recorded = native
+                .as_ref()
+                .and_then(|workspace| workspace.directory.as_deref())
+                .or(selection.project_path.as_deref());
+            let project = selected_native_workspace(selection, recorded, &current)?;
+            let repository_matches = if selection.workspace.replacement().is_some() {
+                recorded.is_some_and(|folder| {
+                    is_cursor_workspace_file(request.source.provider, folder)
+                        && omnis_core::cursor_workspace_matches(folder, &project)
+                })
+            } else {
+                recorded.is_some_and(|folder| workspace_paths_match(folder, &project))
+            };
             return Ok((project, repository_matches));
         }
         if request.target == Provider::Codex {
@@ -921,28 +946,33 @@ fn native_resume_workspace(
             return Ok((current, true));
         }
     }
-    let session = registry
-        .find_native_session(request.source.provider, &request.source.id)?
-        .with_context(|| format!("finding `{}` metadata", request.source))?;
+    let recorded = if matches!(request.source.provider, Provider::Pi | Provider::OhMyPi) {
+        registry
+            .adapter(request.source.provider)?
+            .native_workspace(&request.source)?
+            .and_then(|workspace| workspace.directory)
+    } else {
+        registry
+            .find_native_session(request.source.provider, &request.source.id)?
+            .with_context(|| format!("finding `{}` metadata", request.source))?
+            .project_path
+    };
     if request.target == Provider::CursorCli {
         return cursor_session_workspace(
             request.target,
-            session.project_path.as_deref(),
+            recorded.as_deref(),
             &current,
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
         );
     }
-    let matches = session
-        .project_path
+    let matches = recorded
         .as_deref()
         .is_some_and(|recorded| workspace_paths_match(recorded, &current));
     if matches || args.allow_workspace_mismatch {
         return Ok((current, matches));
     }
-    let recorded = session
-        .project_path
-        .context("source session has no recorded workspace")?;
+    let recorded = recorded.context("source session has no recorded workspace")?;
     bail!(
         "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
         safe_terminal_line(&recorded.display().to_string()),
@@ -965,7 +995,7 @@ pub(super) fn cursor_session_workspace(
     let stored = recorded.filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path));
     let physical = stored.map(local_workspace).transpose()?.flatten();
     let workspace_file = physical.as_deref().is_some_and(Path::is_file);
-    let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
+    let chosen = selection.and_then(|selection| selection.workspace.replacement());
     let chosen_physical = chosen
         .map(|path| {
             local_workspace(path)?.context(
@@ -1056,32 +1086,46 @@ pub(super) fn selected_native_workspace(
     recorded: Option<&Path>,
     current: &Path,
 ) -> Result<PathBuf> {
-    let chosen = selection.workspace_override.as_deref();
-    let directory = chosen
-        .or(recorded)
-        .context("selected session has no recorded workspace")?;
-    if chosen.is_none()
-        && ((selection.session.provider == Provider::Codex && !directory.is_absolute())
-            || omnis_core::may_reach_network(directory)
-            || selection
-                .project_path
-                .as_deref()
-                .is_some_and(|shown| !workspace_paths_match(shown, directory)))
+    if let Some(chosen) = confirmed_launch_directory(selection)? {
+        return Ok(chosen);
+    }
+    let directory = recorded.context("selected session has no recorded workspace")?;
+    if (selection.session.provider == Provider::Codex && !directory.is_absolute())
+        || omnis_core::may_reach_network(directory)
+        || selection
+            .project_path
+            .as_deref()
+            .is_some_and(|shown| !workspace_paths_match(shown, directory))
     {
         bail!("selected session workspace changed during discovery");
     }
     let listed = omnis_core::canonicalize_path(directory)
         .context("selected session workspace no longer exists")?;
     let selected = workspace_root(listed)?;
-    if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
-    {
+    if !selection.across_projects && !workspace_paths_match(&selected, current) {
         bail!("selected session workspace changed during discovery");
     }
-    Ok(if chosen.is_some() || selection.across_projects {
+    Ok(if selection.across_projects {
         selected
     } else {
         current.to_path_buf()
     })
+}
+
+fn confirmed_launch_directory(
+    selection: &session_picker::PickerSelection,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = selection.workspace.replacement() else {
+        return Ok(None);
+    };
+    let directory = if selection.target.provider == Provider::CursorIde {
+        omnis_core::cursor_launch_folder(path)
+    } else {
+        Some(omnis_core::canonicalize_path(path)?).filter(|path| path.is_dir())
+    };
+    Ok(Some(directory.context(
+        "the confirmed destination folder is no longer available",
+    )?))
 }
 
 fn codex_native_launch(
@@ -1131,14 +1175,10 @@ fn codex_native_launch(
         selection,
         allow_workspace_mismatch,
     )?;
-    let override_dir = selection.is_some_and(|selection| selection.workspace_override.is_some())
+    let override_dir = selection
+        .is_some_and(|selection| selection.workspace.replacement().is_some())
         || (selection.is_none() && allow_workspace_mismatch);
-    let startup_matches = startup.as_deref().is_some_and(|startup| {
-        startup.as_os_str() == directory.as_os_str()
-            || (startup.is_absolute()
-                && !omnis_core::may_reach_network(startup)
-                && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == directory))
-    });
+    let startup_matches = codex_startup_matches(startup.as_deref(), &directory);
     let effective = profile_workspace(target, &directory, allow_workspace_mismatch)?;
     let matches = if effective.as_os_str() == directory.as_os_str() {
         matches
@@ -1192,6 +1232,15 @@ fn codex_native_launch(
     );
     crate::search_index::confirm_index_ancestors(registry, &directories.ancestors)?;
     Ok((plan, matches))
+}
+
+fn codex_startup_matches(startup: Option<&Path>, directory: &Path) -> bool {
+    startup.is_some_and(|startup| {
+        startup.as_os_str() == directory.as_os_str()
+            || (startup.is_absolute()
+                && !omnis_core::may_reach_network(startup)
+                && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == directory))
+    })
 }
 
 #[derive(Debug)]
@@ -1304,7 +1353,7 @@ fn codex_continuation_directory(
     selection: Option<&session_picker::PickerSelection>,
     allow_workspace_mismatch: bool,
 ) -> Result<(PathBuf, bool)> {
-    let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
+    let chosen = selection.and_then(|selection| selection.workspace.replacement());
     let use_caller = selection.is_none() && allow_workspace_mismatch;
     let matches = codex_directory_matches(workspace, project);
     if !matches && chosen.is_none() && !use_caller {
@@ -1394,12 +1443,8 @@ fn selected_workspace(
     snapshot: &CanonicalSnapshot,
     selection: &session_picker::PickerSelection,
 ) -> Result<PathBuf> {
-    if let Some(chosen) = &selection.workspace_override {
-        if selection.target.provider == Provider::CursorIde {
-            return omnis_core::cursor_launch_folder(chosen)
-                .context("the selected Cursor IDE destination is not an available local folder");
-        }
-        return Ok(workspace_root(chosen)?);
+    if let Some(chosen) = confirmed_launch_directory(selection)? {
+        return Ok(chosen);
     }
     if snapshot.session.provider == Provider::Codex && !snapshot.workspace.root.is_absolute() {
         bail!("selected Codex session has no verified workspace");
@@ -1928,7 +1973,7 @@ fn handoff_workspace_warning(context: &ResumeContext<'_>) -> Result<Option<&'sta
             && (context.args.allow_workspace_mismatch
                 || context
                     .picker_selection
-                    .is_some_and(|selection| selection.workspace_override.is_some()))
+                    .is_some_and(|selection| selection.workspace.replacement().is_some()))
         {
             Some(
                 "# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n",
@@ -2143,6 +2188,9 @@ impl RecordedLineage {
     fn undo(self, target: &SessionRef) -> Result<()> {
         let store = Store::open_default().context("opening OmniSession state")?;
         let Some((task_id, branch)) = self.task_binding else {
+            if matches!(target.provider, Provider::Pi | Provider::OhMyPi) {
+                return Ok(());
+            }
             return store
                 .forget_session(target)
                 .context("forgetting rolled-back session");
@@ -2873,7 +2921,7 @@ fn resume_via_pi_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install(name);
-    let rollback = || pi_import::rollback(import);
+    let rollback = || rollback_pi_import(import);
     if let Err(error) = materialize_pi_import(context.registry, import, binary) {
         let error = interrupt.materialization_failed(error, || {
             roll_back_published(context.registry, &import.target, rollback)
@@ -3333,6 +3381,20 @@ pub(super) fn materialize_cursor_import(
     }
 }
 
+fn rollback_pi_import(import: &pi_import::PiImport) -> Result<()> {
+    let revision = omnis_adapters::TranscriptRevision::read(&import.target_path)?;
+    let object = omnis_adapters::source_file_revision(&import.target_path).and_then(|r| r.file);
+    pi_import::rollback(import)?;
+    Store::open_default()?.forget_pi_copy(
+        &import.target,
+        &import.target_path,
+        revision.key,
+        object,
+        None,
+    )?;
+    Ok(())
+}
+
 pub(super) fn materialize_pi_import(
     registry: &AdapterRegistry,
     import: &pi_import::PiImport,
@@ -3356,7 +3418,7 @@ pub(super) fn materialize_pi_import(
         let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
             anyhow!("{name} import failed read-back verification ({details})"),
-            pi_import::rollback(import),
+            rollback_pi_import(import),
             name,
         ))
     }
@@ -3577,7 +3639,7 @@ fn pick_resume_source(
         &new_session_targets,
         args.materialize_only.then_some(&can_copy),
         &DELETE_PROVIDERS,
-        &|session, workspace| delete_native_session(registry, session, workspace),
+        registry,
     )
 }
 
@@ -3720,7 +3782,7 @@ mod tests {
             across_projects: false,
             fork: true,
             mode: None,
-            workspace_override: None,
+            workspace: crate::session_picker::PickerWorkspace::Recorded,
         };
         super::verify_grok_native_selection(&registry, &selection)?;
         let native = group.join(id);
@@ -3852,7 +3914,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: None,
+            workspace: crate::session_picker::PickerWorkspace::Recorded,
         };
         let explicit = |project: &std::path::Path| {
             verify_test_native_launch(&registry, &selection, None, project)
@@ -3887,7 +3949,7 @@ mod tests {
         assert_eq!(plan.args, expected);
 
         selection.project_path = Some(root.path().join("missing"));
-        selection.workspace_override = Some(first.clone());
+        selection.workspace = crate::session_picker::PickerWorkspace::Replacement(first.clone());
         let plan = launch(&selection)?;
         assert_eq!(plan.cwd, Some(omnis_core::canonicalize_path(&first)?));
         assert_eq!(plan.args, expected);

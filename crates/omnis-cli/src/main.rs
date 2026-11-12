@@ -277,6 +277,24 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
+fn select_pi_index(store: &Store, registry: &AdapterRegistry, session: &SessionRef) -> Result<()> {
+    let adapter = registry.adapter(session.provider)?;
+    let path = adapter
+        .selected_source(session)?
+        .context("selected Pi transcript is unavailable")?;
+    let native = adapter
+        .selected_session_at(&session.id, &path)?
+        .context("selected Pi transcript changed before indexing")?;
+    let metadata = indexed_pi_copy(&native);
+    let workspace = metadata
+        .project_path
+        .clone()
+        .context("selected Pi transcript has no recorded workspace")?;
+    let revision = omnis_adapters::TranscriptRevision::read(&path)?.key;
+    store.select_pi_workspaces(&[(workspace, metadata, Some(revision))])?;
+    Ok(())
+}
+
 fn record_selected_read_failure(
     registry: &AdapterRegistry,
     store: &Store,
@@ -378,6 +396,20 @@ fn read_verified_session(
             return full_index_read(registry, session, None);
         }
     };
+    if matches!(session.provider, Provider::Pi | Provider::OhMyPi)
+        && let Err(error) = select_pi_index(&store, registry, session)
+    {
+        eprintln!("warning: local trajectory index unavailable: {error}");
+        return full_index_read(registry, session, None);
+    }
+    read_indexed_native(registry, session, &store)
+}
+
+fn read_indexed_native(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    store: &Store,
+) -> Result<omnis_adapters::IndexRead> {
     let mut retry = true;
     loop {
         let observed = if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
@@ -409,7 +441,7 @@ fn read_verified_session(
                 if let Ok((_, guard)) = &observed
                     && let Err(write_error) = search_index::record_strict_read_failure(
                         &mut search_index::FileSelections::new(registry),
-                        &store,
+                        store,
                         *guard,
                         &error,
                     )
@@ -448,7 +480,7 @@ fn read_verified_session(
         });
         if !current
             && let Err(error) = store_verified_search_document(
-                &store,
+                store,
                 session,
                 &read,
                 true,
@@ -843,6 +875,28 @@ fn store_verified_search_document(
     Ok(rewritten != 0)
 }
 
+fn pi_index_batches(
+    registry: &AdapterRegistry,
+    filter: Option<Provider>,
+) -> Result<Vec<Vec<NativeSession>>> {
+    let mut batches = Vec::<Vec<NativeSession>>::new();
+    let mut counts = HashMap::<SessionRef, usize>::new();
+    for provider in [Provider::Pi, Provider::OhMyPi]
+        .into_iter()
+        .filter(|p| filter.is_none_or(|f| f == *p))
+    {
+        for copy in registry.adapter(provider)?.additional_search_sessions() {
+            let batch = counts.entry(copy.session.clone()).or_default();
+            if *batch == batches.len() {
+                batches.push(Vec::new());
+            }
+            batches[*batch].push(copy);
+            *batch += 1;
+        }
+    }
+    Ok(batches)
+}
+
 fn build_search_index(
     registry: &AdapterRegistry,
     args: &IndexArgs,
@@ -854,13 +908,31 @@ fn build_search_index(
         discover_sessions(registry, args.provider, None, DiscoveryUse::Index(&store));
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
-    let summary = index_with_interrupt(
+    let mut summary = index_with_interrupt(
         registry,
         &store,
         candidates,
         args.retry_failed,
         !json_output,
     )?;
+    for copies in pi_index_batches(registry, args.provider)? {
+        if summary.stopped {
+            break;
+        }
+        let extra = index_with_interrupt(
+            registry,
+            &store,
+            search_index::ordered_candidates(&copies, current.as_deref()),
+            args.retry_failed,
+            !json_output,
+        )?;
+        summary.candidates += extra.candidates;
+        summary.stale += extra.stale;
+        summary.indexed += extra.indexed;
+        summary.failed += extra.failed;
+        summary.failed_skipped += extra.failed_skipped;
+        summary.stopped |= extra.stopped;
+    }
     let seconds = started.elapsed().as_secs_f64();
     if json_output {
         println!(
@@ -1505,6 +1577,13 @@ const SEARCH_TITLE_MIN_WIDTH: usize = 16;
 const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
 const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 
+fn indexed_pi_copy(session: &NativeSession) -> IndexedSession {
+    IndexedSession {
+        source_path: session.source_path.clone(),
+        ..indexed_session_metadata(session)
+    }
+}
+
 fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     let catalog_time = |time: Option<chrono::DateTime<Utc>>| {
         if session.session.provider == Provider::Codex {
@@ -1514,6 +1593,7 @@ fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
         }
     };
     IndexedSession {
+        source_path: None,
         source_revision: session.source_revision.map(|revision| SourceRevision {
             missing_ancestor: None,
             ..revision
@@ -1578,7 +1658,7 @@ fn cached_search_sessions(
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>, Vec<IndexedTrajectoryTitle>)> {
     let (rows, titles) = store.cached_sessions_with_titles(args.provider)?;
-    let (indexed, titles, mut warnings) = scope_cached_native_catalog(
+    let (mut indexed, titles, mut warnings) = scope_cached_native_catalog(
         registry,
         store,
         args.provider,
@@ -1586,6 +1666,39 @@ fn cached_search_sessions(
         rows,
         titles,
     )?;
+    if args
+        .provider
+        .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
+    {
+        let copies = store.cached_all_pi_copies()?;
+        let keys = copies
+            .iter()
+            .map(|s| (&s.session, s.project_path.as_deref().map(Path::as_os_str)))
+            .collect::<HashSet<_>>();
+        indexed.retain(|s| {
+            !keys.contains(&(&s.session, s.project_path.as_deref().map(Path::as_os_str)))
+        });
+        indexed.extend(
+            copies
+                .into_iter()
+                .filter(|s| args.provider.is_none_or(|p| p == s.session.provider)),
+        );
+    }
+    if args
+        .provider
+        .is_none_or(|provider| matches!(provider, Provider::Pi | Provider::OhMyPi))
+        && store.has_unassigned_pi_history()?
+    {
+        if args.all_projects {
+            indexed.extend(
+                store
+                    .unassigned_pi_sessions()?
+                    .into_iter()
+                    .filter(|s| args.provider.is_none_or(|p| p == s.session.provider)),
+            );
+        }
+        warnings.push("The local index retains older Pi history whose workspace could not be verified. Open the original transcript to verify its copy.".to_owned());
+    }
     let sources = titles
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
@@ -1620,7 +1733,7 @@ fn cached_search_sessions(
             updated_at: session.updated_at,
             updated_at_approximate: session.updated_at_approximate,
             event_count: session.event_count,
-            source_path: None,
+            source_path: session.source_path,
         })
         .collect::<Vec<_>>();
     if args
@@ -1690,6 +1803,96 @@ struct SearchHit<'a> {
     conversation: Option<SessionTrajectoryMatch>,
 }
 
+fn select_pi_search_copies(
+    registry: &AdapterRegistry,
+    store: &Store,
+    args: &SearchArgs,
+    project: &Path,
+    sessions: &mut Vec<NativeSession>,
+    index: &mut search_index::IndexSummary,
+    json_output: bool,
+) -> Result<()> {
+    if !args.cached {
+        for copies in pi_index_batches(registry, args.provider)? {
+            if !index.stopped {
+                let candidates = search_index::ordered_candidates(&copies, Some(project));
+                let extra = if args.no_index {
+                    search_index::pending_summary(registry, store, candidates)?
+                } else {
+                    index_with_interrupt(registry, store, candidates, false, !json_output)?
+                };
+                index.candidates += extra.candidates;
+                index.stale += extra.stale;
+                index.indexed += extra.indexed;
+                index.failed += extra.failed;
+                index.failed_skipped += extra.failed_skipped;
+                index.stopped |= extra.stopped;
+            }
+            sessions.extend(copies);
+        }
+    }
+    qualify_pi_sessions(store, sessions, true)
+}
+
+fn qualify_pi_sessions(
+    store: &Store,
+    sessions: &mut [NativeSession],
+    searching: bool,
+) -> Result<()> {
+    let rows = sessions
+        .iter_mut()
+        .filter(|s| {
+            matches!(s.session.provider, Provider::Pi | Provider::OhMyPi)
+                && s.project_path.is_some()
+        })
+        .collect::<Vec<_>>();
+    let inputs = rows
+        .iter()
+        .filter_map(|s| Some((s.session.clone(), s.project_path.clone()?, pi_file_key(s))))
+        .collect::<Vec<_>>();
+    let keys = store.pi_copy_keys(&inputs)?;
+    let mut aliases = Vec::new();
+    for (row, key) in rows.into_iter().zip(keys) {
+        if let Some(workspace) = key {
+            let id = pi_copy_selector(&row.session.id, &workspace);
+            if searching {
+                aliases.push((row.session.clone(), workspace, id.clone()));
+            }
+            row.session.id = id;
+        }
+    }
+    store.alias_pi_documents(&aliases)?;
+    Ok(())
+}
+
+fn sort_search_copies(sessions: &mut Vec<NativeSession>) {
+    sessions.sort_by_key(|session| Reverse(session.updated_at));
+    let mut seen = HashSet::new();
+    sessions.retain(|session| {
+        seen.insert((
+            session.session.clone(),
+            session.source_path.clone(),
+            session
+                .project_path
+                .as_ref()
+                .map(|p| p.as_os_str().to_owned()),
+        ))
+    });
+}
+
+fn report_pending_search(no_index: bool, index: &search_index::IndexSummary) {
+    if index.stopped {
+        eprintln!(
+            "note: indexing interrupted; results cover sessions indexed so far. Search again to finish indexing."
+        );
+    } else if no_index && index.stale > 0 {
+        eprintln!(
+            "note: {} sessions are new or changed since indexing; their conversation text was not searched.",
+            index.stale
+        );
+    }
+}
+
 fn validated_search_query(args: &SearchArgs) -> Result<String> {
     let query = args.query.join(" ");
     if query.trim().is_empty() {
@@ -1730,10 +1933,8 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
                 .to_owned(),
         );
     }
-    sessions.sort_by_key(|session| Reverse(session.updated_at));
-    let mut seen = HashSet::new();
-    sessions.retain(|session| seen.insert(session.session.clone()));
-    let index = if args.cached {
+    sort_search_copies(&mut sessions);
+    let mut index = if args.cached {
         search_index::IndexSummary {
             candidates: sessions.len(),
             ..search_index::IndexSummary::default()
@@ -1746,6 +1947,15 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
+    select_pi_search_copies(
+        registry,
+        &store,
+        args,
+        &project,
+        &mut sessions,
+        &mut index,
+        json_output,
+    )?;
     if !args.cached {
         refresh_search_workspaces(&mut sessions, (!args.all_projects).then_some(&project))?;
     }
@@ -1824,16 +2034,7 @@ fn print_search_results(
     for warning in warnings {
         eprintln!("warning: {}", safe_terminal_line(warning));
     }
-    if index.stopped {
-        eprintln!(
-            "note: indexing interrupted; results cover sessions indexed so far. Search again to finish indexing."
-        );
-    } else if args.no_index && index.stale > 0 {
-        eprintln!(
-            "note: {} sessions are new or changed since indexing; their conversation text was not searched.",
-            index.stale
-        );
-    }
+    report_pending_search(args.no_index, index);
     Ok(())
 }
 
@@ -2919,8 +3120,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if let Err(error) = migrate_imported_bundle_sources() {
-        eprintln!("warning: local imported source migration: {error}");
+    if let Err(error) = migrate_local_index() {
+        eprintln!("warning: local index migration: {error}");
     }
     let registry = AdapterRegistry::with_local_adapters();
     match command_or_resume(cli.command) {
@@ -3258,6 +3459,28 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         project.as_deref(),
         DiscoveryUse::List,
     );
+    for copies in pi_index_batches(registry, args.provider)? {
+        sessions.extend(copies);
+    }
+    let mut rows = Vec::new();
+    for session in &sessions {
+        if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+            && let Some(path) = &session.project_path
+        {
+            let revision = session
+                .source_path
+                .as_deref()
+                .and_then(|p| omnis_adapters::TranscriptRevision::read(p).ok())
+                .map(|r| r.key);
+            rows.push((path.clone(), indexed_pi_copy(session), revision));
+        }
+    }
+    if !rows.is_empty()
+        && let Ok(store) = Store::open_default()
+        && store.select_pi_workspaces(&rows).is_ok()
+    {
+        qualify_pi_sessions(&store, &mut sessions, false)?;
+    }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 
@@ -3313,8 +3536,8 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
             updated_at: session.updated_at,
             updated_at_approximate: session.updated_at_approximate,
             event_count: session.event_count,
-            source_path: None,
-            source_revision: None,
+            source_path: session.source_path,
+            source_revision: session.source_revision,
         });
     }
     Ok((sessions, warnings))
@@ -3409,6 +3632,72 @@ fn session_json(session: &NativeSession) -> Value {
     value
 }
 
+fn pi_file_key(native: &NativeSession) -> Option<PathBuf> {
+    Store::pi_file_key(native.source_revision, native.source_path.as_deref())
+}
+fn pi_copy_selector(id: &str, workspace: &Path) -> String {
+    Store::pi_copy_selector(id, workspace)
+}
+
+fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Result<SessionRef> {
+    if !matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
+        return Ok(session);
+    }
+    anyhow::ensure!(
+        !session.id.ends_with("@unverified"),
+        "the workspace and source file of this cached conversation are unknown"
+    );
+    let qualified = session
+        .id
+        .rsplit_once("@workspace=")
+        .map(|(id, _)| id.to_owned());
+    let selector = session.id.clone();
+    if let Some(id) = &qualified {
+        session.id.clone_from(id);
+    }
+    let catalog = Store::open_default().and_then(|store| Ok((store.pi_projects(&session)?, store)));
+    let (projects, store) = match catalog {
+        Ok(value) => value,
+        Err(_) if qualified.is_none() => return Ok(session),
+        Err(error) => return Err(error.into()),
+    };
+    if !projects.is_empty() {
+        if qualified.is_none()
+            && projects
+                .iter()
+                .filter(|key| !key.as_os_str().is_empty())
+                .count()
+                <= 1
+        {
+            return Ok(session);
+        }
+        let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;
+        let adapter = registry.adapter(session.provider)?;
+        let file = store.pi_recorded_file(&session, workspace)?;
+        let object = store.pi_recorded_object(&session, workspace)?;
+        adapter.bind_workspace_copy(
+            &session,
+            store
+                .pi_recorded_directory(&session, workspace)?
+                .as_deref()
+                .unwrap_or(workspace),
+            file.as_deref(),
+            object,
+        )?;
+        if object.is_none() {
+            let expected = store.pi_recorded_revision(&session, workspace)?;
+            anyhow::ensure!(
+                expected.is_some()
+                    && registry.search_revision(&session, None)?.map(|r| r.key) == expected,
+                "the physical file of this historical Pi copy could not be verified"
+            );
+        }
+    } else if qualified.is_some() {
+        bail!("the selected Pi workspace copy is unavailable");
+    }
+    Ok(session)
+}
+
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {
     if selector.contains(':') {
         let mut session = selector.parse::<SessionRef>()?;
@@ -3422,7 +3711,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
                 })?
                 .to_string();
         }
-        return Ok(session);
+        return resolve_pi_copy(registry, session);
     }
     if selector.trim().is_empty() {
         bail!("session ID cannot be empty");
@@ -3500,7 +3789,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
             safe_terminal_line(&selected.to_string())
         ))?;
     }
-    Ok(selected)
+    resolve_pi_copy(registry, selected)
 }
 
 fn select_discovered_session(
@@ -4010,6 +4299,8 @@ fn validate_session_workspace(
     session: &SessionRef,
     project: &Path,
 ) -> Result<()> {
+    let selected = resolve_pi_copy(registry, session.clone())?;
+    let session = &selected;
     let read = registry
         .read_selected_session_indexed(session, None)
         .with_context(|| format!("validating `{session}`"))?;
@@ -4308,6 +4599,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     let imported = imported_session_ref(bundle.manifest.bundle_id);
     store
         .upsert_indexed_session(&IndexedSession {
+            source_path: None,
             source_revision: None,
             session: imported.clone(),
             title: bundle.snapshot.title.as_deref().map(redact_secrets),
@@ -4336,8 +4628,11 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     Ok(())
 }
 
-fn migrate_imported_bundle_sources() -> Result<()> {
+fn migrate_local_index() -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
+    store
+        .redact_legacy_index_titles(redact_secrets)
+        .context("redacting legacy session titles")?;
     for bundle_id in store
         .bundle_ids_missing_imported_source()
         .context("finding imported sources needing migration")?
@@ -4855,16 +5150,7 @@ fn delete_native_session(
             let binary = resolved_provider_binary(Provider::Antigravity)?;
             Some(antigravity_import::delete_session(session, &binary)?)
         }
-        Provider::Pi => {
-            pi_import::delete_session(
-                session,
-                native
-                    .source_path
-                    .as_deref()
-                    .context("Pi session discovery omitted source path")?,
-            )?;
-            None
-        }
+        Provider::Pi => bail!("Pi deletion requires a confirmed physical transcript"),
         Provider::CursorCli => {
             cursor_import::delete_session(
                 session,
@@ -5236,7 +5522,7 @@ mod tests {
     use crate::provider_compatibility::{
         Capability, PROVIDER_PRIORITY, Platform, supports_capability_on,
     };
-    use crate::session_picker::PickerSelection;
+    use crate::session_picker::{PickerSelection, PickerWorkspace};
     use crate::transfer::reject_unsupported_target;
 
     const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
@@ -5365,6 +5651,7 @@ mod tests {
             )
             .expect("synthetic store");
             let entries = [true, false].map(|local| super::IndexedSession {
+                source_path: None,
                 source_revision: None,
                 session: SessionRef::new(
                     Provider::Codex,
@@ -6012,7 +6299,7 @@ mod tests {
                 target: Provider::Codex.into(),
                 fork: false,
                 mode: None,
-                workspace_override: None,
+                workspace: PickerWorkspace::Recorded,
             }),
         };
 
@@ -6049,7 +6336,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(chosen.path().to_path_buf()),
+            workspace: PickerWorkspace::Replacement(chosen.path().to_path_buf()),
         };
 
         assert_eq!(
@@ -6064,7 +6351,7 @@ mod tests {
         let stale = PickerSelection {
             project_path: Some(chosen.path().to_path_buf()),
             across_projects: true,
-            workspace_override: None,
+            workspace: PickerWorkspace::Recorded,
             ..selection
         };
         let error =
@@ -6115,7 +6402,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(service.clone()),
+            workspace: PickerWorkspace::Replacement(service.clone()),
         };
 
         assert_eq!(
@@ -6127,7 +6414,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace"),
-            chosen_path
+            service
         );
         assert_eq!(
             resume_project(
@@ -6138,7 +6425,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            chosen_path
+            service
         );
         let cursor = PickerSelection {
             target: Provider::CursorIde.into(),

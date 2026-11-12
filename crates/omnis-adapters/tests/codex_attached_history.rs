@@ -416,7 +416,7 @@ fn a_subagent_cutoff_survives_a_damaged_header_ordinal() -> Result<()> {
             NativeResumeSupport::ImportOnly
         );
         let bounded = adapter.index_session(&session, None, 1)?;
-        let expected_dir = (!unplaced).then(|| "/workspace".into());
+        let expected_dir = (!unplaced).then(|| WORKSPACE.into());
         assert_eq!(
             bounded.workspace_projection,
             omnis_adapters::CodexWorkspaceProjection::Observed(expected_dir)

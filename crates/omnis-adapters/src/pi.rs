@@ -4,6 +4,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     time::SystemTime,
 };
 
@@ -48,11 +49,19 @@ impl std::fmt::Display for InvalidPiTree {
 
 impl std::error::Error for InvalidPiTree {}
 
+#[derive(Debug, Default)]
+struct PiCopySelection {
+    bound: HashMap<String, (PathBuf, Option<PathBuf>, Option<Uuid>)>,
+    listed: HashMap<PathBuf, (String, PathBuf)>,
+    additional: Vec<NativeSession>,
+}
+
 /// Read-only Pi coding-agent session adapter.
 #[derive(Clone, Debug)]
 pub struct PiAdapter {
     provider: Provider,
     sessions_root: Option<PathBuf>,
+    copies: Arc<Mutex<PiCopySelection>>,
 }
 
 impl PiAdapter {
@@ -61,6 +70,7 @@ impl PiAdapter {
         Self {
             provider: Provider::Pi,
             sessions_root: Some(sessions_root.into()),
+            copies: Arc::default(),
         }
     }
 
@@ -69,6 +79,7 @@ impl PiAdapter {
         Self {
             provider: Provider::OhMyPi,
             sessions_root: crate::oh_my_pi_sessions_root(),
+            copies: Arc::default(),
         }
     }
 
@@ -77,6 +88,7 @@ impl PiAdapter {
         Self {
             provider: Provider::OhMyPi,
             sessions_root: Some(sessions_root.into()),
+            copies: Arc::default(),
         }
     }
 
@@ -97,19 +109,57 @@ impl PiAdapter {
     }
 
     fn find_file(&self, id: &str) -> Result<Option<SelectedPiFile>> {
-        self.session_files()
-            .find_map(|result| match result {
-                Ok(file) if file.header.id == id => Some(Ok(file)),
+        let bound = self
+            .copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bound
+            .get(id)
+            .cloned();
+        if let Some((cwd, Some(path), object)) = &bound {
+            let matches = |file: &SelectedPiFile| {
+                file.header.cwd.as_os_str() == cwd.as_os_str()
+                    && object.is_none_or(|id| file.observed.revision.file == Some(id))
+            };
+            if let Some(file) = self.hinted_file(id, path).filter(matches) {
+                return Ok(Some(file));
+            }
+            if object.is_some() {
+                return self
+                    .session_files()
+                    .filter_map(Result::ok)
+                    .find(|f| f.header.id == id && matches(f))
+                    .map(Some)
+                    .context("selected Pi file is unavailable or changed");
+            }
+            bail!("selected Pi file is unavailable or changed");
+        }
+        let mut found = None;
+        for result in self.session_files() {
+            match result {
+                Ok(file)
+                    if file.header.id == id
+                        && bound.as_ref().is_none_or(|(cwd, _, _)| {
+                            cwd.as_os_str() == file.header.cwd.as_os_str()
+                        }) =>
+                {
+                    ensure!(
+                        found.is_none(),
+                        "multiple Pi workspaces or files contain session `{id}`"
+                    );
+                    found = Some(file);
+                }
                 Err(error)
                     if error
                         .downcast_ref::<ChangedPiHeader>()
                         .is_some_and(|header| header.id.as_deref() == Some(id)) =>
                 {
-                    Some(Err(error))
+                    return Err(error);
                 }
-                _ => None,
-            })
-            .transpose()
+                _ => {}
+            }
+        }
+        Ok(found)
     }
 
     fn hinted_file(&self, id: &str, path: &Path) -> Option<SelectedPiFile> {
@@ -123,8 +173,24 @@ impl PiAdapter {
     }
 
     fn select_file(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedPiFile> {
-        if let Some(file) = source_path.and_then(|path| self.hinted_file(id, path)) {
-            return Ok(file);
+        let copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+        let bound = copies.bound.contains_key(id);
+        let listed = source_path
+            .and_then(|path| copies.listed.get(path))
+            .cloned();
+        drop(copies);
+        if !bound && let Some(path) = source_path {
+            let file = self.hinted_file(id, path);
+            if let Some((native, cwd)) = listed.filter(|(native, _)| native == id) {
+                return file
+                    .filter(|f| {
+                        f.header.id == native && f.header.cwd.as_os_str() == cwd.as_os_str()
+                    })
+                    .context("selected Pi file changed during discovery");
+            }
+            if let Some(file) = file {
+                return Ok(file);
+            }
         }
         self.find_file(id)?
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
@@ -135,10 +201,23 @@ impl PiAdapter {
         files: impl Iterator<Item = SelectedPiFile>,
         project: Option<&Path>,
     ) -> Vec<NativeSession> {
-        let mut sessions: Vec<_> = files
-            .filter(|file| project.is_none_or(|project| paths_match(&file.header.cwd, project)))
-            .map(|file| file.native_session(self.provider))
-            .collect();
+        let mut sessions = Vec::new();
+        let mut selection = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+        selection.listed.clear();
+        selection.additional.clear();
+        let mut seen = HashSet::new();
+        for file in files.filter(|file| project.is_none_or(|p| paths_match(&file.header.cwd, p))) {
+            selection.listed.insert(
+                file.selected.clone(),
+                (file.header.id.clone(), file.header.cwd.clone()),
+            );
+            let native = file.native_session(self.provider);
+            if seen.insert(native.session.id.clone()) {
+                sessions.push(native);
+            } else {
+                selection.additional.push(native);
+            }
+        }
         sort_sessions(&mut sessions);
         sessions
     }
@@ -355,6 +434,14 @@ impl NativeSelectionInventory for PiSelectionInventory {
         self.files.get(self.winners.get(id)?)?.native.as_ref()
     }
 
+    fn selected_copy(&self, id: &str, path: &Path) -> Option<&NativeSession> {
+        self.files
+            .get(path)?
+            .native
+            .as_ref()
+            .filter(|native| native.session.id == id)
+    }
+
     fn validate(&self, requests: &[(&str, &Path, SourceRevision)]) -> Vec<bool> {
         let Some(last) = requests.iter().map(|(_, path, _)| *path).max() else {
             return Vec::new();
@@ -404,7 +491,7 @@ impl NativeSelectionInventory for PiSelectionInventory {
             .map(|(id, path, revision)| {
                 first_change.is_none_or(|first| *path < first)
                     && !changed_sources.contains(path)
-                    && self.selected(id).is_some_and(|native| {
+                    && self.selected_copy(id, path).is_some_and(|native| {
                         native.source_path.as_deref() == Some(*path)
                             && native
                                 .source_revision
@@ -427,6 +514,7 @@ impl Default for PiAdapter {
         Self {
             provider: Provider::Pi,
             sessions_root,
+            copies: Arc::default(),
         }
     }
 }
@@ -1661,20 +1749,13 @@ impl ProviderAdapter for PiAdapter {
         &self,
         project: Option<&Path>,
     ) -> Result<(Vec<NativeSession>, Vec<String>)> {
-        let mut seen = HashSet::new();
         let mut changed = false;
-        let selected = self.session_files().filter_map(|result| match result {
-            Ok(file) if seen.insert(file.header.id.clone()) => Some(file),
+        let selected = self.session_files().filter_map(|file| match file {
+            Ok(file) => Some(file),
             Err(error) => {
-                if let Some(header) = error.downcast_ref::<ChangedPiHeader>() {
-                    changed = true;
-                    if let Some(id) = &header.id {
-                        seen.insert(id.clone());
-                    }
-                }
+                changed |= error.is::<ChangedPiHeader>();
                 None
             }
-            Ok(_) => None,
         });
         let sessions = self.sessions_in_project(selected, project);
         let notes = if changed {
@@ -1688,11 +1769,73 @@ impl ProviderAdapter for PiAdapter {
         Ok((sessions, notes))
     }
 
+    fn additional_search_sessions(&self) -> Vec<NativeSession> {
+        self.copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .additional
+            .clone()
+    }
+
     fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
         Ok(self
-            .find_file(id)?
-            .filter(|file| file.selected == source_path)
+            .hinted_file(id, source_path)
             .map(|file| file.native_session(self.provider)))
+    }
+
+    fn selected_source(&self, session: &SessionRef) -> Result<Option<PathBuf>> {
+        Ok(self.find_file(&session.id)?.map(|f| f.selected))
+    }
+
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(Some(self.select_file(&session.id, hint)?.selected))
+    }
+
+    fn bind_workspace_copy(
+        &self,
+        session: &SessionRef,
+        cwd: &Path,
+        file: Option<&Path>,
+        object: Option<Uuid>,
+    ) -> Result<()> {
+        self.copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bound
+            .insert(
+                session.id.clone(),
+                (cwd.to_owned(), file.map(Path::to_owned), object),
+            );
+        self.find_file(&session.id)?
+            .context("selected Pi workspace copy is unavailable")?;
+        Ok(())
+    }
+
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        let cwd = listed
+            .project_path
+            .as_deref()
+            .context("Pi listing omitted its workspace")?;
+        self.bind_workspace_copy(
+            &listed.session,
+            cwd,
+            listed.source_path.as_deref(),
+            listed.source_revision.and_then(|r| r.file),
+        )?;
+        Ok(Some(cwd.to_owned()))
+    }
+
+    fn native_workspace(&self, session: &SessionRef) -> Result<Option<crate::NativeWorkspace>> {
+        let file = self.select_file(&session.id, None)?;
+        Ok(Some(crate::NativeWorkspace {
+            directory: Some(file.header.cwd.clone()),
+            startup_directory: Some(file.header.cwd),
+            git: omnis_ir::GitState::default(),
+        }))
     }
 
     fn selection_inventory(&self) -> Result<Option<Box<dyn NativeSelectionInventory>>> {
@@ -1733,8 +1876,13 @@ impl ProviderAdapter for PiAdapter {
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
         validate_provider(session, self.provider)?;
-        self.select_file(&session.id, source_path)?
-            .read(session, Some(full_read_bytes))
+        match source_path {
+            Some(path) => self
+                .hinted_file(&session.id, path)
+                .context("the selected Pi source is unavailable or changed")?,
+            None => self.select_file(&session.id, None)?,
+        }
+        .read(session, Some(full_read_bytes))
     }
 
     fn search_timestamp_file(
@@ -1784,7 +1932,14 @@ impl ProviderAdapter for PiAdapter {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, self.provider)?;
-        let reference = if self.provider == Provider::OhMyPi {
+        let reference = if self.provider == Provider::OhMyPi
+            || self
+                .copies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .bound
+                .contains_key(&session.id)
+        {
             self.select_file(&session.id, None)?
                 .selected
                 .into_os_string()
@@ -1885,7 +2040,27 @@ mod tests {
     }
 
     #[test]
-    fn search_resolves_duplicate_ids_before_filtering_by_project() {
+    fn disappeared_listed_copy_cannot_resolve_to_another_workspace() {
+        let root = tempfile::tempdir().expect("Pi store");
+        for name in ["first", "second"] {
+            let workspace = root.path().join(name);
+            fs::create_dir(&workspace).unwrap();
+            let header = json!({"type":"session","version":3,"id":"shared","cwd":workspace});
+            fs::write(workspace.join("session.jsonl"), format!("{header}\n")).unwrap();
+        }
+        let adapter = PiAdapter::with_root(root.path());
+        adapter.list_sessions(None).unwrap();
+        let copy = adapter
+            .additional_search_sessions()
+            .pop()
+            .expect("secondary copy");
+        let path = copy.source_path.unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(adapter.read_session_at(&copy.session, Some(&path)).is_err());
+    }
+
+    #[test]
+    fn search_exposes_each_duplicate_in_its_recorded_project() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sessions");
         let north = temp.path().join("north");
@@ -1917,8 +2092,9 @@ mod tests {
             PiAdapter::oh_my_pi_with_root(&root),
         ] {
             let session = SessionRef::new(adapter.provider(), "same");
+            assert!(adapter.read_full_index_at(&session, None).is_err());
             let explicit = adapter
-                .read_full_index_at(&session, None)
+                .read_full_index_at(&session, Some(&chosen))
                 .unwrap()
                 .native_session
                 .unwrap();
@@ -1933,12 +2109,10 @@ mod tests {
             );
             assert_paths(
                 adapter.list_search_sessions(Some(&south)).unwrap(),
-                &[&unique],
+                &[&duplicate, &unique],
             );
-            assert_paths(
-                adapter.list_sessions(None).unwrap(),
-                &[&duplicate, &unique, &chosen],
-            );
+            assert_paths(adapter.list_sessions(None).unwrap(), &[&unique, &chosen]);
+            assert_paths(adapter.additional_search_sessions(), &[&duplicate]);
             assert_paths(
                 adapter.list_sessions(Some(&south)).unwrap(),
                 &[&duplicate, &unique],
@@ -2040,7 +2214,7 @@ mod tests {
                 inventory.selected("same-id").unwrap().source_path.as_ref(),
                 Some(&earlier)
             );
-            assert_eq!(inventory.validate(&later_request), [false]);
+            assert_eq!(inventory.validate(&later_request), [true]);
         }
     }
 

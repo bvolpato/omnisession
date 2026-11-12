@@ -7569,6 +7569,19 @@ impl ProviderAdapter for CodexAdapter {
         Ok(Some(native))
     }
 
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        let path = self.find_session(&session.id, hint)?.path;
+        anyhow::ensure!(
+            hint.is_none_or(|hint| hint == path),
+            "selected Codex rollout changed during indexing"
+        );
+        Ok(Some(path))
+    }
+
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Codex)?;
         let selected = self.require_rollout(&session.id, None)?;

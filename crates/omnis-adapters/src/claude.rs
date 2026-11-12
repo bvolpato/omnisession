@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, ProviderFiles, nested_files_matching, omitted_images_text, parse_timestamp,
+        EventBuilder, ProviderFiles, nested_file_inventory, omitted_images_text, parse_timestamp,
         paths_match, provider_executable, provider_file, provider_root, sample_files_concurrently,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
     },
@@ -46,8 +46,15 @@ const MAX_PROMPT_TITLE_CHARACTERS: usize = 200;
 #[derive(Clone, Debug)]
 pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
-    session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
+    session_files: Arc<OnceLock<ClaudeFiles>>,
     notes: Arc<Mutex<Vec<String>>>,
+    listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeFiles {
+    paths: Vec<(String, PathBuf)>,
+    limited: bool,
 }
 
 impl ClaudeAdapter {
@@ -57,15 +64,16 @@ impl ClaudeAdapter {
             projects_root: Some(projects_root.into()),
             session_files: Arc::default(),
             notes: Arc::default(),
+            listed_paths: Arc::default(),
         }
     }
 
-    fn discover_session_files(&self) -> Vec<(String, PathBuf)> {
+    fn discover_session_files(&self) -> ClaudeFiles {
         let Some(root) = self.projects_root.as_deref() else {
-            return Vec::new();
+            return ClaudeFiles::default();
         };
         // Subagent logs and tool results outnumber transcripts, so skip them before the budgets apply.
-        nested_files_matching(root, 8, &|path, is_dir| {
+        let (paths, limited) = nested_file_inventory(root, 8, &|path, is_dir| {
             if is_dir {
                 return path
                     .file_name()
@@ -77,57 +85,120 @@ impl ClaudeAdapter {
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .is_some_and(|stem| Uuid::parse_str(stem).is_ok())
-        })
-        .into_iter()
-        .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path)))
-        .collect()
+        });
+        ClaudeFiles {
+            paths: paths
+                .into_iter()
+                .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path)))
+                .collect(),
+            limited,
+        }
     }
 
-    fn session_files(&self) -> &[(String, PathBuf)] {
+    fn session_files(&self) -> &ClaudeFiles {
         self.session_files
             .get_or_init(|| self.discover_session_files())
     }
 
     fn find_session(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
-        // Transcripts live at `<project>/<id>.jsonl`, so exact reads don't depend on discovery budgets.
-        let direct = self.projects_root.as_deref().and_then(|root| {
-            std::fs::read_dir(root)
-                .ok()?
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-                .find_map(|entry| provider_file(root, &entry.path().join(format!("{id}.jsonl"))))
-        });
-        if let Some(path) = direct {
+        let root = self
+            .projects_root
+            .as_deref()
+            .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))?;
+        let filename = format!("{id}.jsonl");
+        if let Ok(entries) = std::fs::read_dir(root) {
+            // Exact reads check the native project locations before bounded legacy discovery.
+            let directories = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path()));
+            let direct = std::iter::once(root.to_owned())
+                .chain(directories)
+                .filter_map(|directory| provider_file(root, &directory.join(&filename)));
+            if let Some(path) = unique_transcript(id, direct)? {
+                return Ok(path);
+            }
+        }
+        let from_listing = |files: &[(String, PathBuf)]| {
+            unique_transcript(
+                id,
+                files
+                    .iter()
+                    .filter(|(candidate, _)| candidate == id)
+                    .filter_map(|(_, path)| provider_file(root, path)),
+            )
+        };
+        if let Some(path) = from_listing(&self.session_files().paths)? {
             return Ok(path);
         }
-        self.session_files()
-            .iter()
-            .find_map(|(candidate, path)| (candidate == id).then(|| path.clone()))
-            .or_else(|| {
-                self.discover_session_files()
-                    .into_iter()
-                    .find_map(|(candidate, path)| (candidate == id).then_some(path))
-            })
-            .and_then(|path| {
-                self.projects_root
-                    .as_deref()
-                    .and_then(|root| provider_file(root, &path))
-            })
+        from_listing(&self.discover_session_files().paths)?
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
-    fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
-        Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
-        let hinted = source_path.and_then(|source_path| {
-            let root = self.projects_root.as_deref()?;
-            let expected_name = format!("{id}.jsonl");
-            if source_path.file_name()?.to_str()? != expected_name {
-                return None;
+    fn session_path(&self, id: &str, hint: Option<&Path>) -> Result<PathBuf> {
+        if let (Some(root), Some(hint)) = (self.projects_root.as_deref(), hint) {
+            let known = self
+                .listed_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(id)
+                .is_some_and(|path| path == hint);
+            if known && let Some(path) = provider_file(root, hint) {
+                return Ok(path);
             }
-            provider_file(root, source_path)
-        });
-        hinted.map_or_else(|| self.find_session(id), Ok)
+        }
+        self.find_session(id)
+    }
+
+    fn listed_transcripts(&self, notes: &mut Vec<String>) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.projects_root.as_deref() else {
+            return Vec::new();
+        };
+        let inventory = self.session_files();
+        let mut by_id: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for (id, path) in &inventory.paths {
+            by_id.entry(id).or_default().push(path.clone());
+        }
+        if inventory.limited {
+            let projects = std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path());
+            for directory in std::iter::once(root.to_owned()).chain(projects) {
+                for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl")
+                        && let Some(paths) = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .and_then(|id| by_id.get_mut(id))
+                        && entry.file_type().is_ok_and(|kind| kind.is_file())
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        let mut selected = Vec::with_capacity(by_id.len());
+        for (id, mut paths) in by_id {
+            paths.sort();
+            paths.dedup();
+            let direct = |path: &PathBuf| {
+                path.strip_prefix(root)
+                    .is_ok_and(|p| p.components().count() <= 2)
+            };
+            if paths.iter().any(direct) {
+                paths.retain(direct);
+            }
+            if paths.len() == 1 {
+                selected.push((id.to_owned(), paths.remove(0)));
+            } else {
+                notes.push(format!("multiple transcripts match Claude session `{id}`"));
+            }
+        }
+        selected
     }
 
     fn history_index(&self) -> ClaudeHistory {
@@ -173,6 +244,18 @@ impl ClaudeAdapter {
     }
 }
 
+fn unique_transcript(
+    id: &str,
+    mut paths: impl Iterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let first = paths.next();
+    anyhow::ensure!(
+        paths.next().is_none(),
+        "multiple transcripts match Claude session `{id}`"
+    );
+    Ok(first)
+}
+
 impl Default for ClaudeAdapter {
     fn default() -> Self {
         Self {
@@ -180,6 +263,7 @@ impl Default for ClaudeAdapter {
                 .map(|root| root.join("projects")),
             session_files: Arc::default(),
             notes: Arc::default(),
+            listed_paths: Arc::default(),
         }
     }
 }
@@ -221,6 +305,9 @@ struct TitleCandidates {
 
 impl TitleCandidates {
     fn observe(&mut self, record: &Value) {
+        if thread_ownership(record) != ThreadOwnership::Main {
+            return;
+        }
         let generated = match record.get("type").and_then(Value::as_str) {
             Some("summary") => string_at(record, &[&["summary"], &["title"]]),
             Some("ai-title") => string_at(record, &[&["aiTitle"]]),
@@ -1159,8 +1246,48 @@ fn is_transcript_record(record: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadOwnership {
+    Main,
+    Sidechain,
+    Unknown,
+}
+
+fn thread_ownership(record: &Value) -> ThreadOwnership {
+    match (record.get("isSidechain"), record.get("teamName")) {
+        (Some(Value::Bool(true)), _) | (_, Some(Value::String(_))) => ThreadOwnership::Sidechain,
+        (None | Some(Value::Bool(false)), None | Some(Value::Null)) => ThreadOwnership::Main,
+        _ => ThreadOwnership::Unknown,
+    }
+}
+
+#[derive(Default)]
+struct ThreadCoverage {
+    has_conversation: bool,
+    has_possible_main_conversation: bool,
+}
+
+impl ThreadCoverage {
+    fn observe(&mut self, record: &Value) -> ThreadOwnership {
+        let ownership = thread_ownership(record);
+        if matches!(record["type"].as_str(), Some("assistant" | "user")) {
+            self.has_conversation = true;
+            self.has_possible_main_conversation |= ownership != ThreadOwnership::Sidechain;
+        }
+        ownership
+    }
+
+    fn validate(&self, session: &SessionRef) -> Result<()> {
+        anyhow::ensure!(
+            !self.has_conversation || self.has_possible_main_conversation,
+            "Claude session `{session}` is a sidechain and cannot be resumed directly"
+        );
+        Ok(())
+    }
+}
+
 fn is_main_record(record: &Value) -> bool {
-    record["isSidechain"] != true && record["teamName"].as_str().is_none()
+    thread_ownership(record) == ThreadOwnership::Main
 }
 
 impl ClaudeMetadata {
@@ -1168,7 +1295,9 @@ impl ClaudeMetadata {
         if let Some(cwd) = string_at(record, &[&["cwd"]]) {
             self.project_path = Some(PathBuf::from(cwd));
         }
-        if let Some(branch) = string_at(record, &[&["gitBranch"]]) {
+        if thread_ownership(record) == ThreadOwnership::Main
+            && let Some(branch) = string_at(record, &[&["gitBranch"]])
+        {
             self.git_branch = Some(branch.to_owned());
         }
     }
@@ -1592,6 +1721,13 @@ fn claude_session_metadata(record: &Value) -> Option<Value> {
     })
 }
 
+struct AmbiguousResponse {
+    id: ResponseId,
+    position: usize,
+    writer: Option<String>,
+    metadata: ClaudeEvent,
+}
+
 #[derive(Default)]
 struct ClaudeTranscript {
     branch: branch::Branch,
@@ -1603,8 +1739,10 @@ struct ClaudeTranscript {
     record_copies: RecordCopies,
     compactions: Compactions,
     has_records: bool,
-    has_conversation: bool,
-    has_main_conversation: bool,
+    coverage: ThreadCoverage,
+    omitted_events: usize,
+    ambiguous_responses: Vec<AmbiguousResponse>,
+    ambiguous_retention: bool,
 }
 
 impl ClaudeTranscript {
@@ -1674,7 +1812,13 @@ impl ClaudeTranscript {
     }
 
     fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
-        let main_record = is_main_record(record);
+        let ownership = self.coverage.observe(record);
+        let main_record = ownership == ThreadOwnership::Main;
+        if ownership == ThreadOwnership::Unknown {
+            self.observe_metadata(record, false);
+            self.observe_unknown(record);
+            return;
+        }
         let id = record_uuid(record, "uuid");
         let record_parent = record_uuid(record, "parentUuid");
         let causal_parent = self.causal_parent(record, record_parent);
@@ -1710,6 +1854,9 @@ impl ClaudeTranscript {
         }
         if !is_summary && self.compactions.pending.is_some() {
             self.link_absent_anchor(Some((record, record_parent)));
+        }
+        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
+            self.ambiguous_retention = false;
         }
         self.compactions.observe(record, self.records.len());
         let start = self.events.len();
@@ -1757,6 +1904,127 @@ impl ClaudeTranscript {
         }
     }
 
+    fn observe_unknown(&mut self, record: &Value) {
+        let mut possible = Vec::new();
+        push_events(&mut possible, record, record["isCompactSummary"] == true);
+        for event in possible {
+            if event.raw_type.as_deref() == Some("omnisession.session_metadata")
+                && let Some(id) = response_id(record)
+            {
+                self.ambiguous_responses.push(AmbiguousResponse {
+                    id,
+                    position: self.events.len(),
+                    writer: record["agentId"].as_str().map(str::to_owned),
+                    metadata: event,
+                });
+            } else {
+                self.omitted_events += 1;
+            }
+        }
+        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
+            self.ambiguous_retention |= !self.compactions.headers.is_empty()
+                || !record["compactMetadata"]["preservedMessages"].is_null();
+        }
+        if let Some(id) = record_uuid(record, "uuid") {
+            let native_transcript = is_transcript_record(record);
+            let kind = if native_transcript {
+                "system"
+            } else {
+                "progress"
+            };
+            let mut link = json!({"type":kind,"uuid":id});
+            if let Some(parent) = record.get("parentUuid") {
+                link["parentUuid"] = parent.clone();
+            }
+            let position = self.events.len();
+            let branch = self.branch.observe(
+                &link,
+                false,
+                &self.records,
+                &self.duplicate_records,
+                &self.compactions,
+                position..position,
+            );
+            let parent = record_uuid(record, "parentUuid");
+            let definition = ClaudeRecord {
+                millis: None,
+                order: self.records.len(),
+                is_summary: false,
+                native_transcript,
+                branch,
+                parent,
+                events: position..position,
+            };
+            self.save_record(id, definition, None, parent, false);
+        }
+    }
+
+    fn count_unknown_metadata(&mut self, order: Option<&[usize]>) {
+        if self.ambiguous_responses.is_empty() {
+            return;
+        }
+        let starts_scope = |event: &ClaudeEvent| {
+            matches!(
+                event.kind,
+                EventKind::MessageUser | EventKind::CompactionCreated
+            ) || event.raw_type.as_deref() == Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY)
+        };
+        let boundaries: Vec<_> = self
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| starts_scope(e).then_some(i))
+            .collect();
+        let mut confirmed = HashMap::new();
+        let mut scope = None;
+        for position in 0..order.map_or(self.events.len(), <[usize]>::len) {
+            let index = order.map_or(position, |order| order[position]);
+            let event = &self.events[index];
+            if starts_scope(event) {
+                scope = Some(index);
+            }
+            if let Some(ClaudeEventSource::Response(node)) = event.source
+                && let Some((id, writer)) = self.branch.response_identity(node)
+            {
+                confirmed
+                    .entry((id, writer, scope))
+                    .or_insert_with(Vec::new)
+                    .push(index);
+            }
+        }
+        for occurrences in confirmed.values_mut() {
+            occurrences.sort_unstable();
+        }
+        for candidate in &self.ambiguous_responses {
+            let split = boundaries.partition_point(|index| *index < candidate.position);
+            let scope = split.checked_sub(1).map(|i| boundaries[i]);
+            let key = (&candidate.id, candidate.writer.as_deref(), scope);
+            let redundant = confirmed.get(&key).is_some_and(|occurrences| {
+                let end = occurrences.partition_point(|index| *index <= candidate.position);
+                let Some(index) = end.checked_sub(1).map(|i| occurrences[i]) else {
+                    return false;
+                };
+                let proven = &self.events[index];
+                let mut payload = if index < candidate.position {
+                    proven.payload.clone()
+                } else {
+                    if candidate.metadata.timestamp != proven.timestamp {
+                        return false;
+                    }
+                    candidate.metadata.payload.clone()
+                };
+                let other = if index < candidate.position {
+                    &candidate.metadata.payload
+                } else {
+                    &proven.payload
+                };
+                merge_response_metadata(&mut payload, other);
+                payload == proven.payload
+            });
+            self.omitted_events += usize::from(!redundant);
+        }
+    }
+
     fn observe_branch_events(
         &mut self,
         record: &Value,
@@ -1782,13 +2050,6 @@ impl ClaudeTranscript {
         self.has_records = true;
         let timestamp = self.metadata.observe_timestamp(record);
         self.titles.observe(record);
-        if matches!(
-            record.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
-            self.has_conversation = true;
-            self.has_main_conversation |= main_record;
-        }
         if main_record {
             self.metadata.observe_workspace(record);
         }
@@ -2220,11 +2481,8 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        if !sampled && self.has_conversation && !self.has_main_conversation {
-            return Err(anyhow!(
-                "Claude session `{}` is a sidechain and cannot be resumed directly",
-                session.id
-            ));
+        if !sampled {
+            self.coverage.validate(session)?;
         }
         Ok(())
     }
@@ -2297,9 +2555,11 @@ impl ClaudeTranscript {
             || self.branch.needs_event_order(&self.events)
         {
             let (order, error, ambiguous) = self.selected_events();
+            self.count_unknown_metadata(Some(&order));
             self.reorder_events(order);
             (error, ambiguous)
         } else {
+            self.count_unknown_metadata(None);
             (None, branch::Ambiguity::default())
         };
         self.branch.fold_response_metadata(&mut self.events);
@@ -2311,6 +2571,17 @@ impl ClaudeTranscript {
             event.append_to(&mut builder, &mut latest_summary);
         }
         coverage.report(&mut builder, metadata.updated_at);
+        self.omitted_events += usize::from(self.ambiguous_retention);
+        if self.omitted_events > 0 {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"omitted_events": self.omitted_events, "reason": "Claude records have ambiguous thread ownership."}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.ambiguous_claude_thread".to_owned()),
+                None,
+            );
+        }
         let mut report_unverified = |raw_type: &str, reason: &str| {
             builder.push(
                 EventKind::ProviderEvent,
@@ -2401,8 +2672,9 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let history = self.history_index();
-        let mut sessions = sample_files_concurrently(self.session_files(), |session_files| {
+        let mut history = self.history_index();
+        let selected = self.listed_transcripts(&mut history.notes);
+        let mut sessions = sample_files_concurrently(&selected, |session_files| {
             let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
             let mut sessions = Vec::new();
@@ -2463,9 +2735,73 @@ impl ProviderAdapter for ClaudeAdapter {
             }
             sessions
         });
+        self.listed_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                sessions
+                    .iter()
+                    .filter_map(|s| Some((s.session.id.clone(), s.source_path.clone()?))),
+            );
         *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        let session = &listed.session;
+        validate_provider(session, Provider::Claude)?;
+        let path = self.find_session(&session.id)?;
+        let mut workspace: Option<PathBuf> = None;
+        let mut uncertain = false;
+        let mut has_records = false;
+        let mut coverage = ThreadCoverage::default();
+        let mut main_workspace_seen = false;
+        let skipped = crate::support::visit_streamed_json_records_with_offsets(
+            &mut BufReader::new(File::open(path)?),
+            crate::support::MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+            |_, line| {
+                let record = match line {
+                    crate::support::JsonlRecord::Complete(value)
+                    | crate::support::JsonlRecord::Unterminated(value) => value,
+                    crate::support::JsonlRecord::Malformed => {
+                        uncertain = true;
+                        return Ok(());
+                    }
+                };
+                has_records = true;
+                let ownership = coverage.observe(&record);
+                if ownership != ThreadOwnership::Sidechain
+                    && let Some(directory) = string_at(&record, &[&["cwd"]])
+                {
+                    main_workspace_seen |= ownership == ThreadOwnership::Main;
+                    let directory = Path::new(directory);
+                    // Restored or rewound branches can name different folders. The user
+                    // must choose the destination when the transcript does not agree.
+                    if let Some(previous) = &workspace {
+                        uncertain |= previous.as_os_str() != directory.as_os_str();
+                    } else {
+                        workspace = Some(directory.to_owned());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        anyhow::ensure!(
+            has_records,
+            "Claude session `{session}` contains no valid records"
+        );
+        coverage.validate(session)?;
+        Ok(workspace
+            .filter(|path| main_workspace_seen && !uncertain && skipped == 0 && path.is_absolute()))
+    }
+
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        self.session_path(&session.id, hint).map(Some)
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -2873,6 +3209,47 @@ mod tests {
     }
 
     #[test]
+    fn a_retained_ambiguous_turn_does_not_hide_other_retained_replies() {
+        let reply = uuid::Uuid::new_v4();
+        let uncertain = uuid::Uuid::new_v4();
+        let boundary = uuid::Uuid::new_v4();
+        let anchor = uuid::Uuid::new_v4();
+        let snapshot = snapshot_from_records(&[
+            json!({"type":"assistant","uuid":reply,"message":{"content":"Confirmed reply"}}),
+            json!({"type":"user","uuid":uncertain,"teamName":42,"message":{"content":"Uncertain turn"}}),
+            json!({"type":"system","uuid":boundary,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":{"anchorUuid":anchor,"uuids":[reply,uncertain]}}}),
+            json!({"type":"user","uuid":anchor,"parentUuid":boundary,"isCompactSummary":true,"message":{"content":"Summary"}}),
+        ]);
+        let visible = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["Summary", "Confirmed reply"]);
+        assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
+    }
+
+    #[test]
+    fn ambiguous_response_metadata_can_move_across_a_compaction_summary() {
+        let reply = uuid::Uuid::new_v4();
+        let boundary = uuid::Uuid::new_v4();
+        let anchor = uuid::Uuid::new_v4();
+        let snapshot = snapshot_from_records(&[
+            json!({"type":"assistant","isSidechain":"unknown","message":{"id":"response","model":"test","content":[]}}),
+            json!({"type":"assistant","uuid":reply,"message":{"id":"response","model":"test","content":"Retained answer"}}),
+            json!({"type":"system","uuid":boundary,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":{"anchorUuid":anchor,"uuids":[reply]}}}),
+            json!({"type":"user","uuid":anchor,"parentUuid":boundary,"isCompactSummary":true,"message":{"content":"Summary"}}),
+        ]);
+        assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["text"] == "Retained answer")
+        );
+    }
+
+    #[test]
     fn retained_segment_walks_opaque_records_without_importing_another_branch() {
         let head = "11111111-1111-4111-8111-111111111111";
         let bridge = "22222222-2222-4222-8222-222222222222";
@@ -2881,7 +3258,7 @@ mod tests {
         let boundary = "55555555-5555-4555-8555-555555555555";
         let records = vec![
             json!({"type": "user", "uuid": head, "message": {"role": "user", "content": "Check the result"}}),
-            json!({"type": "attachment", "uuid": bridge, "parentUuid": head, "attachment": {"type": "future_unknown", "content": "opaque metadata"}}),
+            json!({"type": "attachment", "uuid": bridge, "isSidechain": "unknown", "parentUuid": head, "attachment": {"type": "future_unknown", "content": "opaque metadata"}}),
             json!({"type": "assistant", "uuid": tail, "parentUuid": bridge, "message": {"role": "assistant", "content": "The result is ready"}}),
             json!({"type": "assistant", "parentUuid": head, "message": {"role": "assistant", "content": "A superseded branch"}}),
             json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedSegment": {"headUuid": head, "anchorUuid": anchor, "tailUuid": tail}}}),
