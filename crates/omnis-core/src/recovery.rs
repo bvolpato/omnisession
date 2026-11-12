@@ -15,7 +15,7 @@ use super::{
     visible_events,
 };
 
-/// A bounded import can omit records, or the source summary can replace earlier messages.
+/// Returns whether a bounded import or a compaction boundary leaves out recoverable history.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
     if import_truncated || has_recoverable_codex_rollback(snapshot) {
@@ -73,6 +73,15 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
     }
     let heading = match event.kind {
         EventKind::CompactionCreated => {
+            if event.replay_policy == ReplayPolicy::HistoricalOnly
+                && event.source.provider == super::Provider::Claude
+                && event.source.raw_record_type.as_deref()
+                    == Some(super::CLAUDE_MISSING_COMPACTION_SUMMARY)
+            {
+                return event.payload["text"].as_str().map(|text| {
+                    RecoveryEntry::Message("Unverified Claude compaction anchor", text)
+                });
+            }
             let heading = if codex_replacement_length(event).is_some() {
                 "Codex compaction note outside the replacement history"
             } else {
