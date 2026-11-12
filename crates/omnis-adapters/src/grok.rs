@@ -698,10 +698,24 @@ fn native_message_block(content: &Value) -> bool {
 
 fn native_message_content(update: &Value) -> bool {
     let content = &update["content"];
-    native_message_block(content)
-        && !malformed_message_block(content)
-        && message_body(update)
-            .is_none_or(|body| std::ptr::eq(content, body) || cumulative_fallback(update).is_some())
+    if !native_message_block(content) || malformed_message_block(content) {
+        return false;
+    }
+    let body = message_body(update);
+    if body.is_some_and(|body| std::ptr::eq(content, body)) {
+        return true;
+    }
+    for candidate in message_bodies(update) {
+        if message_blocks(candidate).iter().any(|block| {
+            !block.is_null() && !matches!(classify_message_block(block), MessageBlock::Text(_))
+        }) {
+            return false;
+        }
+        if body.is_some_and(|body| std::ptr::eq(candidate, body)) {
+            break;
+        }
+    }
+    body.is_none() || cumulative_fallback(update).is_some()
 }
 
 fn native_tool_content(value: &Value) -> bool {
@@ -741,6 +755,13 @@ fn native_tool_status(value: &Value) -> bool {
     )
 }
 
+fn grok_message_id(update: &Value) -> Option<&str> {
+    string_at(
+        update,
+        &[&["messageId"], &["message_id"], &["message", "id"]],
+    )
+}
+
 #[derive(Default)]
 struct NativeMessageGroup {
     kind: Option<EventKind>,
@@ -756,7 +777,7 @@ impl NativeMessageGroup {
 
     fn observe(&mut self, update: &Value) -> bool {
         let kind = update["sessionUpdate"].as_str().and_then(message_kind);
-        let id = update["messageId"].as_str();
+        let id = grok_message_id(update);
         if kind != self.kind || id != self.message_id.as_deref() {
             if self.needs_fallback() {
                 return false;
@@ -978,7 +999,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v8");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v9");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1223,11 +1244,7 @@ impl GrokUpdateProcessor {
             flush_message(builder, &mut self.pending);
             return;
         }
-        let message_id = string_at(
-            update,
-            &[&["messageId"], &["message_id"], &["message", "id"]],
-        )
-        .map(str::to_owned);
+        let message_id = grok_message_id(update).map(str::to_owned);
         let omitted_before = self.preservation.omitted_events;
         let (mut text, content, content_unreadable, mut has_source_text) =
             message_content(update, &mut self.preservation);
@@ -1372,8 +1389,11 @@ fn classify_message_block(block: &Value) -> MessageBlock<'_> {
     match block["type"].as_str() {
         Some("text") => text.map_or(MessageBlock::Malformed(None), MessageBlock::Text),
         Some("image" | "audio" | "resource_link" | "resource") => {
-            let empty_media =
-                matches!(block["type"].as_str(), Some("image" | "audio")) && block["data"] == "";
+            let has_image_uri = block["type"] == "image"
+                && block["uri"].as_str().is_some_and(|uri| !uri.is_empty());
+            let empty_media = matches!(block["type"].as_str(), Some("image" | "audio"))
+                && block["data"] == ""
+                && !has_image_uri;
             if native_message_block(block) && !empty_media {
                 MessageBlock::Attachment
             } else {
@@ -1452,22 +1472,23 @@ fn message_content(
     let mut text = String::new();
     let mut historical_content = Vec::new();
     let mut content_unreadable = false;
-    let body = message_body(update).or_else(|| {
-        message_bodies(update).find(|value| {
-            let canonical_empty = update.get("content").is_some_and(|block| {
-                std::ptr::eq(block, *value) && block["type"] == "text" && block["text"] == ""
-            });
-            canonical_empty
-                || message_blocks(value)
-                    .iter()
-                    .any(|block| !block.is_null() && block_text(block).is_none())
+    let historical_block = |block: &Value| {
+        !block.is_null() && !matches!(classify_message_block(block), MessageBlock::Text(_))
+    };
+    let body = message_body(update)
+        .or_else(|| {
+            message_bodies(update).find(|value| message_blocks(value).iter().any(historical_block))
         })
-    });
+        .or_else(|| {
+            update
+                .get("content")
+                .filter(|block| block["type"] == "text" && block["text"] == "")
+        });
     if let Some(body) = body {
         for value in message_bodies(update).take_while(|value| !std::ptr::eq(*value, body)) {
             for block in message_blocks(value)
                 .iter()
-                .filter(|block| !block.is_null() && block_text(block).is_none())
+                .filter(|block| historical_block(block))
             {
                 if partial_attachment_block(block) {
                     content_unreadable = true;
@@ -2231,6 +2252,27 @@ mod tests {
     }
 
     #[test]
+    fn fallback_keeps_partial_attachment_fields() {
+        let descriptor = json!({"type":"image","data":"YWJj"});
+        let empty_text = json!({"type":"text","text":""});
+        let body = json!({"content":empty_text,"message":{"content":[descriptor]}});
+        let (text, retained, partial, _) =
+            message_content(&body, &mut GrokPreservationBudget::default());
+        assert!(partial);
+        assert!(text.contains("content unreadable"));
+        assert_eq!(retained, [descriptor]);
+        let descriptor = json!({"type":"image","mimeType":"image/png","text":""});
+        let body = json!({"content":descriptor,"message":{"text":"recovered reply"}});
+        let (text, retained, partial, _) =
+            message_content(&body, &mut GrokPreservationBudget::default());
+        assert!(partial);
+        assert_eq!(text, "recovered reply");
+        assert_eq!(retained, [descriptor]);
+        let image = json!({"type":"image","data":"","mimeType":"image/png","uri":"file:///synthetic/image"});
+        assert!(native_message_content(&json!({"content":image})));
+    }
+
+    #[test]
     fn attachment_evidence_is_distinct_from_recovered_text() {
         let incomplete = json!({"type":"image","data":"YWJj"});
         assert!(partial_attachment_block(&incomplete));
@@ -2313,6 +2355,33 @@ mod tests {
                 omnis_core::import_conversation(&snapshot).truncated,
                 partial
             );
+        }
+    }
+
+    #[test]
+    fn native_fork_checks_nested_message_ids_and_cumulative_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("updates.jsonl");
+        let chunk = |id, text, body| json!({"params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text},"message":{"id":id,"content":body}}}});
+        for (id, body, support) in [
+            ("a", json!(["silver"]), NativeResumeSupport::Direct),
+            ("b", json!(["silver"]), NativeResumeSupport::ImportOnly),
+            (
+                "a",
+                json!(["silver", {"type":"resource","resource":{"uri":"file:///sample","text":"document"}}]),
+                NativeResumeSupport::ImportOnly,
+            ),
+        ] {
+            fs::write(
+                &log,
+                format!(
+                    "{}\n{}",
+                    chunk("a", "first", Value::Null),
+                    chunk(id, "", body)
+                ),
+            )
+            .unwrap();
+            assert_eq!(native_update_headers(&log, SESSION_ID, 2).unwrap(), support);
         }
     }
 
