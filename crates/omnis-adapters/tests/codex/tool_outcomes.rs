@@ -2283,3 +2283,64 @@ fn conflicting_function_output_evidence_and_qualified_names_agree_in_either_orde
         }
     }
 }
+
+#[test]
+fn a_new_published_name_needs_an_identifiable_function_occurrence() {
+    let named = |name| {
+        let mut row = call(Some("turn"));
+        row["payload"]["name"] = json!(name);
+        row
+    };
+    for reused in [false, true] {
+        for raw_first in [true, false] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                named("actual"),
+            ];
+            let alpha = model_result("alpha cue");
+            let display = turn_item(
+                "turn",
+                &json!({"type":"FunctionCallOutput","id":"cmd","name":"unrecorded","output":"alpha cue"}),
+            );
+            let raw = if reused {
+                rows.extend([alpha, named("later")]);
+                model_result("gamma cue")
+            } else {
+                alpha
+            };
+            rows.extend(if raw_first {
+                [raw, display]
+            } else {
+                [display, raw]
+            });
+            for mode in [None, Some("paginated")] {
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snap);
+                    let context = format!("{reused} {raw_first} {mode:?} {preview}");
+                    assert_eq!(search.source_complete, !reused, "{context}");
+                    let trajectory = omnis_core::import_trajectory(&snap);
+                    assert!(
+                        trajectory
+                            .items
+                            .iter()
+                            .any(|item| item.text.contains("unrecorded"))
+                    );
+                    assert_eq!(
+                        results(&snap).len(),
+                        if reused { 3 } else { 1 },
+                        "{context}"
+                    );
+                    for text in [search.text, omnis_core::render_semantic_handoff(&snap)] {
+                        assert_eq!(
+                            text.matches("alpha cue").count(),
+                            1 + usize::from(reused),
+                            "{context} {text}"
+                        );
+                        assert!(text.contains("unrecorded"));
+                    }
+                }
+            }
+        }
+    }
+}

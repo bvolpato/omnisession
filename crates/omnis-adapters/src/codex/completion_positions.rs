@@ -208,7 +208,7 @@ impl CodexHistory {
                 if !matches!(
                     identity,
                     Some(super::tool_history::DisplayCallIdentity::Dynamic(_))
-                ) && !self.calls.commands.contains_key(&next)
+                ) && !self.calls.has_command(next)
                     && earlier.is_some()
                     && earlier != self.calls.source_keys.get(&next)
                 {
@@ -349,6 +349,7 @@ impl CodexHistory {
         let mut best = 0;
         let mut selected = Match::Missing;
         let mut count = 0;
+        let mut named_candidate = false;
         for result in self.occurrences.results(turn, id) {
             let Some(&call) = self.calls.result_calls.get(&result) else {
                 continue;
@@ -357,6 +358,7 @@ impl CodexHistory {
             let name = builder
                 .event_at_mut(call)
                 .is_some_and(|event| matches_name(event));
+            named_candidate |= name;
             let body = builder
                 .event_at_mut(result)
                 .is_some_and(|event| matches_output(&event.payload));
@@ -381,6 +383,9 @@ impl CodexHistory {
                 _ => Match::Missing,
             };
         }
+        if count > 1 && !named_candidate {
+            return Match::Multiple;
+        }
         selected
     }
 
@@ -394,6 +399,9 @@ impl CodexHistory {
     ) -> Projection {
         let display = payload["type"] == "item_completed";
         let item = &payload["item"];
+        if display {
+            self.resolve_before_revision(builder, turn, id);
+        }
         let receipt = Receipt::from_item(item);
         let historical = CompletionScope::Historical(kind);
         let positions = self.completed.get(turn);
@@ -434,7 +442,7 @@ impl CodexHistory {
                 ambiguous
                     && matches!(
                         item["type"].as_str(),
-                        Some("FunctionCallOutput" | "DynamicToolCall")
+                        Some("FunctionCallOutput" | "DynamicToolCall" | "CommandExecution")
                     )
             }),
             display_identity: super::tool_history::DisplayCallIdentity::from_item(item),

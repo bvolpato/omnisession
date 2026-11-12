@@ -1443,13 +1443,14 @@ fn shell_command_receipts_match_the_executed_command_in_each_record_order() {
         let paired = code == 1 && body == diagnostic;
         let call = physical_call(
             "shell_command",
-            &json!({"command":command,"workdir":"/workspace"}),
+            &json!({"command":command,"workdir":"//workspace/fixtures"}),
         );
         let result = physical_result(&format!(
             "Exit code: {code}\nWall time: 0 seconds\nOutput:\n{body}"
         ));
         let mut display = command_display("cat absent-fixture", "failed", diagnostic);
         display["payload"]["item"]["command"] = json!(["/bin/sh", "-c", "cat absent-fixture"]);
+        display["payload"]["item"]["cwd"] = "file:///workspace/fixtures".into();
         display["payload"]["item"]["exit_code"] = 1.into();
         for order in [
             [&call, &display, &result],
@@ -1554,6 +1555,46 @@ fn repeated_shell_command_matches_each_native_exit_receipt() {
                     })
                     .collect();
                 assert_eq!(statuses, [false, true], "{mode} {display_first}");
+            }
+        }
+    }
+}
+
+#[test]
+fn provider_command_wrappers_preserve_timeout_truncation_and_exit_evidence() {
+    let display = format!("{}missing{}", "α".repeat(20_000), "z".repeat(20_000));
+    let truncated = format!(
+        "{}…{} chars truncated…{}",
+        "α".repeat(4),
+        display.chars().count() - 12,
+        "z".repeat(8)
+    );
+    for (name, shown, raw, exit, paired) in [
+        ("shell_command","partial output","Exit code: 124\nWall time: 1 seconds\nOutput:\ncommand timed out after 1000 milliseconds\npartial output".to_owned(),124,true),
+        ("shell_command","different output","Exit code: 124\nWall time: 1 seconds\nOutput:\ncommand timed out after 1000 milliseconds\npartial output".to_owned(),124,false),
+        ("shell_command",display.as_str(), format!("Exit code: 1\nWall time: 0 seconds\nOutput:\n{truncated}"),1,true),
+        ("shell_command",display.as_str(),format!("Exit code: 1\nWall time: 0 seconds\nOutput:\n{truncated}X"),1,false),
+        ("shell_command","abcdefghijkL","Exit code: 1\nWall time: 0 seconds\nOutput:\nab…2 tokens truncated…kL".to_owned(),1,true),
+        ("exec_command","missing","Chunk ID: ab12cd\nWall time: 0.0420 seconds\nProcess exited with code 1\nOriginal token count: 4\nOutput:\nmissing".to_owned(),1,true),
+        ("exec_command","missing","Chunk ID: ab12cd\nWall time: 0.0420 seconds\nProcess exited with code 0\nOriginal token count: 4\nOutput:\nfirst".to_owned(),1,false)
+    ] {
+        for raw_first in [true,false] {
+            let field = if name=="exec_command" {"cmd"} else {"command"};
+            let mut records=vec![event("task_started",json!({"turn_id":"turn"})),page_user("turn","user","request"),
+            physical_call(name,&json!({(field):"cat file"}))];
+            let mut item=command_display("cat file","failed",shown);
+            item["payload"]["item"]["exit_code"]=exit.into();
+            let raw=physical_result(&raw);
+            records.extend(if raw_first{[raw,item]} else {[item,raw]});
+            for mode in ["legacy","paginated"] {
+                for preview in [false,true] {
+                    let snapshot=read_with_history_mode(records.clone(),preview,Some(mode)).unwrap();
+                    assert_eq!(omnis_core::trajectory_search_document(&snapshot).source_complete, paired, "{name} {exit} {mode} {raw_first} {paired}");
+                    let raw=snapshot.events.iter().find(|e|e.source.raw_record_type.as_deref()==Some("response_item.function_call_output")).unwrap();
+                    assert_eq!(raw.kind==EventKind::ToolFailed,paired);
+                    let items=omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snapshot));
+                    assert_eq!(items.iter().any(|item| matches!(item,omnis_core::NativeTrajectoryItem::Tool{is_error:true,..})), paired);
+                }
             }
         }
     }

@@ -146,9 +146,9 @@ impl PendingCall {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CommandIdentity {
+pub(super) struct CommandIdentity<D = [u8; 32]> {
     command: [u8; 32],
-    directory: Option<[u8; 32]>,
+    directory: Option<D>,
 }
 
 impl CommandIdentity {
@@ -182,6 +182,16 @@ impl CommandIdentity {
         Some(Self::new(command, directory))
     }
 
+    fn agrees(self, other: CommandIdentity<directory::RecordedDirectory>) -> bool {
+        self.command == other.command
+            && self
+                .directory
+                .zip(other.directory)
+                .is_none_or(|(published, raw)| raw.matches(published))
+    }
+}
+
+impl CommandIdentity<directory::RecordedDirectory> {
     fn from_call(payload: &Value) -> Option<(String, Self)> {
         if payload["type"] != "function_call" {
             return None;
@@ -203,20 +213,14 @@ impl CommandIdentity {
         let identity = Self::new(&command, directory);
         Some((command, identity))
     }
+}
 
-    fn new(command: &str, directory: Option<[u8; 32]>) -> Self {
+impl<D> CommandIdentity<D> {
+    fn new(command: &str, directory: Option<D>) -> Self {
         Self {
             command: json_digest(&command),
             directory,
         }
-    }
-
-    pub(super) fn agrees(self, other: Self) -> bool {
-        self.command == other.command
-            && self
-                .directory
-                .zip(other.directory)
-                .is_none_or(|(a, b)| a == b)
     }
 }
 
@@ -270,7 +274,7 @@ pub(super) struct NativeCalls {
     pub(super) result_calls: HashMap<u64, u64>,
     pub(super) overlapping: HashSet<u64>,
     functions: HashMap<u64, RecordedFunction>,
-    pub(super) commands: HashMap<u64, CommandIdentity>,
+    commands: HashMap<u64, CommandIdentity<directory::RecordedDirectory>>,
     pub(super) source_keys: HashMap<u64, [u8; 32]>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
     // A later display result can identify the turn of both unstamped model records.
@@ -278,6 +282,10 @@ pub(super) struct NativeCalls {
 }
 
 impl NativeCalls {
+    pub(super) fn has_command(&self, sequence: u64) -> bool {
+        self.commands.contains_key(&sequence)
+    }
+
     pub(super) fn display_matches_call(
         &self,
         display: DisplayCallIdentity,

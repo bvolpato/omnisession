@@ -28,7 +28,19 @@ pub(super) fn from_uri(uri: &str) -> Option<[u8; 32]> {
     )
 }
 
-pub(super) fn from_path(path: &str) -> Option<[u8; 32]> {
+#[derive(Clone, Copy)]
+pub(super) struct RecordedDirectory {
+    path: [u8; 32],
+    unc: Option<[u8; 32]>,
+}
+
+impl RecordedDirectory {
+    pub(super) fn matches(&self, published: [u8; 32]) -> bool {
+        self.path == published || self.unc == Some(published)
+    }
+}
+
+pub(super) fn from_path(path: &str) -> Option<RecordedDirectory> {
     if path.contains('\0') {
         return None;
     }
@@ -40,17 +52,30 @@ pub(super) fn from_path(path: &str) -> Option<[u8; 32]> {
             .get(2)
             .is_some_and(|s| matches!(s, b'/' | b'\\'));
     if drive {
-        return normalized(None, true, path.split(['/', '\\']));
+        return Some(RecordedDirectory {
+            path: normalized(None, true, path.split(['/', '\\']))?,
+            unc: None,
+        });
     }
-    if let Some(unc) = path.strip_prefix(r"\\").or_else(|| path.strip_prefix("//")) {
-        let mut components = unc.split(['/', '\\']);
-        let host = components.next()?;
-        if matches!(host, "" | "." | ".." | "?") {
-            return None;
-        }
-        return normalized(Some(host), true, components);
+    if let Some(unc) = path.strip_prefix(r"\\") {
+        return Some(RecordedDirectory {
+            path: unc_key(unc)?,
+            unc: None,
+        });
     }
-    normalized(None, false, path.strip_prefix('/')?.split('/'))
+    Some(RecordedDirectory {
+        path: normalized(None, false, path.strip_prefix('/')?.split('/'))?,
+        unc: path.strip_prefix("//").and_then(unc_key),
+    })
+}
+
+fn unc_key(unc: &str) -> Option<[u8; 32]> {
+    let mut components = unc.split(['/', '\\']);
+    let host = components.next()?;
+    if matches!(host, "" | "." | ".." | "?") {
+        return None;
+    }
+    normalized(Some(host), true, components)
 }
 
 fn is_drive(component: &str) -> bool {
@@ -114,17 +139,29 @@ mod tests {
                 r"\\MACHINE\SHARE\..\case file",
                 r"\\machine\other\case file",
             ),
+            (
+                "file:///workspace/fixtures",
+                "//workspace/fixtures",
+                "//WORKSPACE/fixtures",
+            ),
+            (
+                "file://workspace/fixtures",
+                "//WORKSPACE/Fixtures",
+                "//workspace/other",
+            ),
+            ("file:///workspace", "///workspace", "//other"),
             ("file:///work/%5Cname", r"/work/\name", "/work/name"),
         ] {
             let expected = from_uri(uri).unwrap();
-            assert_eq!(from_path(same), Some(expected), "{uri}");
-            assert_ne!(from_path(different).unwrap(), expected, "{uri}");
+            assert!(from_path(same).unwrap().matches(expected), "{uri}");
+            assert!(!from_path(different).unwrap().matches(expected), "{uri}");
         }
-        assert_eq!(from_path(r"\\?\C:\folder"), from_uri("file:///C:/folder"));
-        assert_eq!(
-            from_path(r"\\?\UNC\server\share\folder"),
-            from_uri("file://server/share/folder")
-        );
+        for (raw, uri) in [
+            (r"\\?\C:\folder", "file:///C:/folder"),
+            (r"\\?\UNC\server\share\folder", "file://server/share/folder"),
+        ] {
+            assert!(from_path(raw).unwrap().matches(from_uri(uri).unwrap()));
+        }
         assert!(from_path("C:relative").is_none());
         assert!(from_uri("file:///C:/encoded%5Cseparator").is_none());
         assert!(from_uri("file:///%00/bad/path/dGVzdA").is_none());

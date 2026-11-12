@@ -2111,3 +2111,111 @@ fn superseded_and_rolled_back_function_displays_do_not_keep_provisional_uncertai
         }
     }
 }
+
+#[test]
+fn distinct_deferred_displays_apply_to_each_physical_result() {
+    for shell in [false, true] {
+        let records = |text: &str, failed: bool| {
+            let code = i32::from(failed);
+            let raw = if shell {
+                format!("Exit code: {code}\nWall time: 0.1 seconds\nOutput:\n{text}")
+            } else {
+                text.to_owned()
+            };
+            let [mut call, result, mut display] = command_rows("turn", "same", &raw);
+            if shell {
+                call["payload"]["name"] = "shell_command".into();
+                call["payload"]["arguments"] = json!({"command":"pwd"}).to_string().into();
+                display["payload"]["item"]["aggregated_output"] = text.into();
+                display["payload"]["item"]["status"] =
+                    (if failed { "failed" } else { "completed" }).into();
+                display["payload"]["item"]["exit_code"] = code.into();
+            } else {
+                call["payload"]["name"] = "lookup".into();
+                display = turn_item(
+                    "turn",
+                    &json!({"type":"DynamicToolCall","id":"same","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":text}]}),
+                );
+            }
+            (call, result, display)
+        };
+        let (first, a, failed_a) = records("ALPHA", true);
+        let (second, b, failed_b) = records("BETA", true);
+        let (third, c, _) = records("GAMMA", false);
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            first,
+            a,
+            second,
+            failed_a,
+        ];
+        if shell {
+            let (_, ok, _) = records("GAMMA", false);
+            rows.push(ok);
+        } else {
+            rows.extend([b, third, failed_b, c]);
+        }
+        for mode in ["legacy", "paginated"] {
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                let outcomes =
+                    omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snapshot));
+                let flags: Vec<_> = outcomes
+                    .iter()
+                    .filter_map(|i| match i {
+                        omnis_core::NativeTrajectoryItem::Tool { is_error, .. } => Some(*is_error),
+                        omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                    })
+                    .collect();
+                let expected = if shell {
+                    vec![true, false]
+                } else {
+                    vec![true, true, false]
+                };
+                assert_eq!(flags, expected, "shell {shell}, {mode}");
+                assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+                let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                assert_eq!(handoff.matches("ALPHA").count(), 1);
+                assert_eq!(handoff.matches("GAMMA").count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn revising_an_identified_deferred_failure_restores_its_own_result_status() {
+    let [mut call, alpha, _] = command_rows("turn", "same", "ALPHA");
+    call["payload"]["name"] = "lookup".into();
+    let mut beta = alpha.clone();
+    beta["payload"]["output"] = "BETA".into();
+    let display = |failed| {
+        turn_item(
+            "turn",
+            &json!({"type":"DynamicToolCall","id":"same","tool":"lookup","arguments":{},"status":if failed {"failed"} else {"completed"},"success":!failed,"content_items":[{"type":"inputText","text":"ALPHA"}]}),
+        )
+    };
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        call.clone(),
+        alpha,
+        call,
+        display(true),
+        beta,
+        display(false),
+    ];
+    for mode in ["legacy", "paginated"] {
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+            let flags: Vec<_> =
+                omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snapshot))
+                    .into_iter()
+                    .filter_map(|i| match i {
+                        omnis_core::NativeTrajectoryItem::Tool { is_error, .. } => Some(is_error),
+                        omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                    })
+                    .collect();
+            assert_eq!(flags, [false, false], "{mode}");
+        }
+    }
+}
