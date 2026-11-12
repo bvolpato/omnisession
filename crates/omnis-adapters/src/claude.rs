@@ -1647,6 +1647,11 @@ impl ClaudeTranscript {
                 .branch
                 .excludes_copy(id, &self.records, &self.compactions)
         {
+            if self.record_copies.missing.contains_key(&id)
+                && self.branch.verify_excluded_parent(id, &mut self.records)
+            {
+                self.record_copies.missing.remove(&id);
+            }
             return false;
         }
         if (is_meta_message(record) || is_turn_duration(record))

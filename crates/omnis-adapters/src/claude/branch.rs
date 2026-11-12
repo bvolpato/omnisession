@@ -649,6 +649,7 @@ pub(super) struct Branch {
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
+    fork_parents: HashSet<usize>,
     suffix_children: HashMap<(usize, Uuid), usize>,
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
@@ -753,12 +754,15 @@ impl Branch {
         }
         self.index_parents();
         let mut cursor = self.tip;
+        let mut linear = true;
         while let Some(node) = cursor {
+            linear &= !self.fork_parents.contains(&node);
             if let Some(retained) = self.suffix_parents.get(&node) {
                 return retained.node.is_some_and(|node| {
                     self.copy_paths.distance(original, node).is_some_and(|n| {
                         n > 0
-                            || (tail
+                            || (linear
+                                && tail
                                 && self
                                     .suffix_children
                                     .get(&(summary, retained.uuid))
@@ -821,7 +825,7 @@ impl Branch {
         let request_clock = records[&uuid]
             .parent
             .and_then(|id| records.get(&id)?.millis);
-        let mut select_child = false;
+        let mut candidates = Vec::new();
         while let Some(alias) = pending.pop() {
             if !visited.insert(alias) {
                 continue;
@@ -835,8 +839,7 @@ impl Branch {
                 {
                     if self.nodes[child].parent != Some(node) {
                         changes.insert(child, node);
-                        select_child |=
-                            clock.is_none() || clock != request_clock || record.millis != clock;
+                        candidates.push(id);
                     }
                 } else if record.branch.transparent {
                     record.branch.node = Some(node);
@@ -848,10 +851,55 @@ impl Branch {
         }
         if !changes.is_empty() {
             self.reparent_copies(&changes, records);
-            if select_child {
-                self.observe_existing(parent, compactions);
+            let mut latest = None;
+            while let Some(id) = candidates.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let record = &records[&id];
+                if children.contains_key(&id) {
+                    candidates.extend(&children[&id]);
+                }
+                if record
+                    .branch
+                    .node
+                    .is_some_and(|i| self.nodes[i].uuid == Some(id))
+                    && (clock.is_none() || clock != request_clock || record.millis != clock)
+                {
+                    let rank = (record.millis, record.order, id);
+                    latest = Some(latest.map_or(rank, |old| std::cmp::max(old, rank)));
+                }
+            }
+            if let Some((_, _, id)) = latest {
+                self.observe_existing(records[&id].branch, compactions);
             }
         }
+    }
+
+    pub(super) fn verify_excluded_parent(
+        &mut self,
+        id: Uuid,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
+    ) -> bool {
+        let Some(node) = records[&id]
+            .parent
+            .and_then(|parent| self.raw_copy_parent(parent, records))
+        else {
+            return false;
+        };
+        if self.nodes[node].missing_ancestor {
+            return false;
+        }
+        let record = records.get_mut(&id).expect("indexed copy");
+        record.branch.missing_ancestor = false;
+        if let Some(node) = record
+            .branch
+            .node
+            .filter(|&i| self.nodes[i].uuid == Some(id))
+        {
+            self.nodes[node].missing_ancestor = false;
+        }
+        true
     }
 
     pub(super) fn recover_hidden_parent(
@@ -1770,6 +1818,9 @@ impl Branch {
             self.parent_turn(parent).unwrap_or(index)
         };
         if let Some(index) = parent.node {
+            if self.nodes[index].has_children {
+                self.fork_parents.insert(index);
+            }
             self.nodes[index].has_children = true;
         } else if let Some(opaque) = parent.opaque {
             self.root_attachments.insert(index, opaque);
@@ -3171,6 +3222,7 @@ impl Branch {
             // A verified outcome can link the next parallel result to its original response.
             // An ordinary user message supplies no such evidence.
             let mut transport = declared.issuer.filter(|_| origin.is_some());
+            let mut documentary_transport = None;
             for position in node.events.clone() {
                 // A withdrawn row contributes only individually verified outcomes.
                 if partial {
@@ -3188,7 +3240,10 @@ impl Branch {
                 let (call, priority) =
                     match found.resolve(self, &declared, lookup, events, position) {
                         MatchedOutput::Call(call, priority) => (call, priority),
-                        MatchedOutput::Documentary => continue,
+                        MatchedOutput::Documentary => {
+                            documentary_transport = declared.issuer;
+                            continue;
+                        }
                         MatchedOutput::Unresolved => {
                             transport = None;
                             continue;
@@ -3211,6 +3266,7 @@ impl Branch {
                 let repeated = available && call.repeated && selected && active[call.node];
                 if !paired && !retained && !repeated {
                     if selected && declared.returned_to_removed_call(self, call) {
+                        documentary_transport = declared.issuer;
                         found.results.keep_recovery_only(position);
                     } else if active[index] && priority == ResultSource::Linked {
                         found.results.withhold(position);
@@ -3222,6 +3278,8 @@ impl Branch {
                         call,
                         priority,
                         paired,
+                        direct: call_parent == Some(call.node)
+                            && declared.source == ToolSource::Absent,
                         epoch: epoch[index],
                     },
                     selected.then_some(declared.source),
@@ -3234,7 +3292,7 @@ impl Branch {
             declared.finish_transport(
                 self,
                 events,
-                transport,
+                transport.or(documentary_transport),
                 &mut transports,
                 &mut retained_links,
             );
@@ -3262,6 +3320,7 @@ struct ToolLookup<'a> {
 
 #[derive(Clone, Copy)]
 struct CandidateOutput {
+    direct: bool,
     call: ToolCall,
     priority: ResultSource,
     paired: bool,
@@ -3328,11 +3387,20 @@ impl<'a> ResultEvidence<'a> {
             return MatchedOutput::Unresolved;
         };
         if lookup.selected
-            && priority == ResultSource::CallId
             && self
                 .outcomes
                 .get(&(call, false, None))
-                .is_some_and(|prior| prior.has_explicit_output(position, events))
+                .is_some_and(|prior| {
+                    (priority == ResultSource::CallId
+                        && prior.priority == ResultSource::SelectedLinked
+                        || (prior.direct
+                            && lookup.parent != Some(call.node)
+                            && matches!(
+                                declared.source,
+                                ToolSource::Record(_) | ToolSource::Duplicate { .. }
+                            )))
+                        && prior.differs(position, events)
+                })
         {
             self.results.keep_recovery_only(position);
             return MatchedOutput::Unresolved;
@@ -3349,6 +3417,7 @@ impl<'a> ResultEvidence<'a> {
         rewind: &Rewind,
     ) {
         let CandidateOutput {
+            direct,
             call,
             mut priority,
             paired,
@@ -3374,8 +3443,8 @@ impl<'a> ResultEvidence<'a> {
         let scope = if paired { None } else { epoch };
         self.outcomes
             .entry((call, !paired, scope))
-            .and_modify(|outcome| outcome.consider(priority, position, events))
-            .or_insert(Outcome::new(priority, position));
+            .and_modify(|outcome| outcome.consider(priority, position, direct, events))
+            .or_insert(Outcome::new(priority, position, direct));
     }
 }
 
@@ -3816,28 +3885,36 @@ enum ResultSource {
 }
 
 struct Outcome {
+    direct: bool,
     priority: ResultSource,
     position: Option<usize>,
 }
 
 impl Outcome {
-    fn has_explicit_output(&self, position: usize, events: &[ClaudeEvent]) -> bool {
-        self.priority == ResultSource::SelectedLinked
-            && self.position.is_some_and(|prior| {
-                events[prior].kind != events[position].kind
-                    || events[prior].payload != events[position].payload
-            })
+    fn differs(&self, position: usize, events: &[ClaudeEvent]) -> bool {
+        self.position.is_some_and(|prior| {
+            events[prior].kind != events[position].kind
+                || events[prior].payload != events[position].payload
+        })
     }
 
-    fn new(priority: ResultSource, position: usize) -> Self {
+    fn new(priority: ResultSource, position: usize, direct: bool) -> Self {
         Self {
+            direct,
             priority,
             position: Some(position),
         }
     }
 
-    fn consider(&mut self, priority: ResultSource, position: usize, events: &[ClaudeEvent]) {
+    fn consider(
+        &mut self,
+        priority: ResultSource,
+        position: usize,
+        direct: bool,
+        events: &[ClaudeEvent],
+    ) {
         if priority > self.priority {
+            self.direct = direct;
             self.priority = priority;
             self.position = Some(position);
         } else if priority == self.priority

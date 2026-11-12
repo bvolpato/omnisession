@@ -5973,3 +5973,174 @@ fn duration_repair_uses_source_timestamps_to_select_the_existing_reply() {
         }
     }
 }
+
+#[test]
+fn copying_a_retained_tail_rewinds_a_fork_below_its_direct_child() {
+    for forked in [false, true] {
+        let hidden = meta_user(3, 2);
+        let mut rows = vec![
+            message(1, 0, "user", json!("Initial task")),
+            message(2, 1, "assistant", json!("Retained reply")),
+            hidden.clone(),
+        ];
+        rows.extend(compaction(6, 3, &[2, 3]));
+        rows.extend([
+            message(8, 3, "user", json!("New request")),
+            message(9, 8, "assistant", json!("First answer")),
+        ]);
+        if forked {
+            rows.push(message(10, 8, "assistant", json!("Second answer")));
+        }
+        rows.push(hidden);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let expected: &[&str] = if forked {
+                &["Summary 6", "Retained reply"]
+            } else {
+                &["Summary 6", "Retained reply", "New request", "First answer"]
+            };
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Retained reply"));
+                for marker in ["New request", "First answer"] {
+                    assert_eq!(text.contains(marker), !forked);
+                }
+                assert!(!text.contains("Second answer"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_later_issuer_claim_cannot_replace_a_directly_observed_result() {
+    let rows = [
+        message(1, 0, "user", json!("Read file")),
+        file_calls(2, 1, "file.txt", &["x"]),
+        message(3, 2, "user", json!([result("x", "First output", false)])),
+        linked_result(4, 3, 2, "x", "Later output"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert_eq!(tool_outcomes(&snapshot), [("First output".into(), false)]);
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            assert!(text.contains("First output"));
+        }
+    }
+}
+
+fn at_second(mut row: Value, second: u8) -> Value {
+    row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+    row
+}
+
+#[test]
+fn a_later_follow_up_resolves_a_duration_even_when_its_first_reply_is_tied() {
+    let duration = at_second(turn_duration(2, 1), 1);
+    for followed in [false, true] {
+        let mut rows = vec![
+            duration.clone(),
+            at_second(message(3, 2, "assistant", json!("Known reply")), 1),
+        ];
+        if followed {
+            rows.push(at_second(message(4, 3, "user", json!("Later request")), 5));
+        }
+        rows.extend([
+            at_second(message(1, 0, "user", json!("Known request")), 1),
+            duration.clone(),
+        ]);
+        let expected: &[&str] = if followed {
+            &["Known request", "Known reply", "Later request"]
+        } else {
+            &["Known request"]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                for marker in expected {
+                    assert!(text.contains(marker));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn repairing_a_duration_selects_the_sibling_with_the_latest_timestamp() {
+    let duration = at_second(turn_duration(2, 1), 1);
+    let rows = [
+        duration.clone(),
+        at_second(message(3, 2, "assistant", json!("Newer answer")), 5),
+        at_second(message(4, 2, "assistant", json!("Older answer")), 3),
+        at_second(message(1, 0, "user", json!("Known request")), 2),
+        duration,
+    ];
+    check_selected_messages(&rows, &["Known request", "Newer answer"], &["Older answer"]);
+}
+
+#[test]
+fn an_unknown_result_in_a_parent_row_cannot_hide_a_known_late_output() {
+    for unknown in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read files")),
+            file_calls(2, 1, "file.txt", &["x", "y"]),
+            meta_user(3, 2),
+        ];
+        rows.extend(compaction(6, 3, &[3]));
+        let mut content = vec![result("x", "First output", false)];
+        if unknown {
+            content.push(result("unknown", "Unknown output", false));
+        }
+        rows.extend([
+            meta_user(8, 3),
+            message(9, 8, "user", json!(content)),
+            message(10, 9, "user", json!([result("y", "Second output", false)])),
+            message(11, 10, "assistant", json!("Done")),
+        ]);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert!(tool_outcomes(&snapshot).is_empty());
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                for marker in ["First output", "Second output", "Done"] {
+                    assert!(text.contains(marker), "{marker}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn continuing_from_a_repaired_hidden_row_has_complete_parent_coverage() {
+    let hidden = meta_user(2, 1);
+    let mut rows = vec![
+        hidden.clone(),
+        message(3, 2, "assistant", json!("Early reply")),
+        message(1, 0, "user", json!("Original task")),
+        message(4, 1, "assistant", json!("Retained reply")),
+    ];
+    rows.extend(compaction(6, 4, &[4]));
+    rows.extend([hidden, message(8, 2, "assistant", json!("New answer"))]);
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let handoff = import_trajectory(&snapshot);
+        let selected = handoff_messages(&handoff);
+        assert!(
+            selected.contains(&"New answer") && !selected.contains(&"Early reply"),
+            "{selected:?}"
+        );
+        assert!(!handoff.truncated);
+        assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+    }
+}
