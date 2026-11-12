@@ -115,6 +115,7 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),

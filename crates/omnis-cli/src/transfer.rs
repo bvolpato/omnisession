@@ -453,8 +453,15 @@ pub(super) fn requires_import_for_native_resume(
     }
     match registry
         .adapter(target.provider)?
-        .native_resume_support(source)?
-    {
+        .native_resume_support(source)
+        .inspect_err(|error| {
+            if source.provider == Provider::Grok
+                && let Err(cause) =
+                    crate::search_index::reject_cached_grok_preflight(registry, source, error)
+            {
+                eprintln!("warning: local trajectory index refresh: {cause}");
+            }
+        })? {
         omnis_adapters::NativeResumeSupport::Direct => Ok(false),
         omnis_adapters::NativeResumeSupport::ImportOnly => Ok(true),
         omnis_adapters::NativeResumeSupport::Since(minimum) => {
@@ -637,6 +644,11 @@ fn resume_native_without_snapshot(
         build_native_fork_report(request.source.provider, repository_matches)
     };
     let report = launch_fidelity(request.agent_target(), report)?;
+    if let Some(selection) = &request.picker_selection
+        && selection.session.provider == Provider::Grok
+    {
+        verify_grok_native_selection(registry, selection)?;
+    }
     if preview {
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
@@ -663,6 +675,23 @@ fn resume_native_without_snapshot(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
         );
     }
+    Ok(())
+}
+
+fn verify_grok_native_selection(
+    registry: &AdapterRegistry,
+    selection: &session_picker::PickerSelection,
+) -> Result<()> {
+    let shown = selection
+        .source_revision
+        .context("the selected Grok session has no verified source revision")?;
+    let selected = registry.find_native_session(Provider::Grok, &selection.session.id)?;
+    anyhow::ensure!(
+        selected
+            .and_then(|session| session.source_revision)
+            .is_some_and(|live| shown.matches_file_contents(live)),
+        "selected Grok source changed before native launch"
+    );
     Ok(())
 }
 
@@ -3576,6 +3605,37 @@ mod tests {
     };
     use crate::launch_profile::{self, LaunchProfile};
     use omnis_adapters::EnvChange;
+
+    #[test]
+    fn grok_native_picker_selection_rejects_a_replacement_by_uuid() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let id = "77777777-7777-4777-8777-777777777777";
+        let group = root.path().join("workspace");
+        let backup = group.join(format!("{id}.backup"));
+        std::fs::create_dir_all(&backup)?;
+        let summary = serde_json::json!({"info":{"id":id,"cwd":"/workspace"}});
+        std::fs::write(backup.join("summary.json"), summary.to_string())?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::GrokAdapter::with_root(root.path()));
+        let shown = registry.find_native_session(Provider::Grok, id)?.unwrap();
+        let selection = super::session_picker::PickerSelection {
+            session: shown.session,
+            source_revision: shown.source_revision,
+            target: Provider::Grok.into(),
+            project_path: shown.project_path,
+            across_projects: false,
+            fork: true,
+            mode: None,
+            workspace_override: None,
+        };
+        super::verify_grok_native_selection(&registry, &selection)?;
+        let native = group.join(id);
+        std::fs::create_dir(&native)?;
+        std::fs::write(native.join("summary.json"), summary.to_string())?;
+        let error = super::verify_grok_native_selection(&registry, &selection).unwrap_err();
+        assert!(error.to_string().contains("changed before native launch"));
+        Ok(())
+    }
 
     #[test]
     fn picker_reads_the_rollout_only_when_its_workspace_receipt_is_missing_or_stale() {

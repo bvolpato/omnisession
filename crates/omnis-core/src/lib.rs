@@ -2666,26 +2666,35 @@ fn bounded_tool_input(input: Value, character_limit: usize) -> Option<Value> {
 }
 
 fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option<String> {
-    let output = match payload_value(payload, paths)? {
-        Value::String(text) => text.clone(),
-        // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|block| {
-                // Empty output is a real result, so block text skips the blank filter used for IDs.
-                block
-                    .as_str()
-                    .or_else(|| {
-                        payload_value(block, &[&["text"], &["content", "text"]])
-                            .and_then(Value::as_str)
+    let mut empty_output = None;
+    for path in paths {
+        let Some(value) = payload_value(payload, &[path]) else {
+            continue;
+        };
+        let (output, has_content) = match value {
+            Value::String(text) => (text.clone(), !text.is_empty()),
+            // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
+            Value::Array(blocks) if *path != ["rawOutput"] => {
+                let texts = blocks
+                    .iter()
+                    .map(|block| {
+                        // Empty output is a real result, so block text skips the blank filter used for IDs.
+                        block.as_str().or_else(|| {
+                            payload_value(block, &[&["text"], &["content", "text"]])
+                                .and_then(Value::as_str)
+                        })
                     })
-                    .map(str::to_owned)
-            })
-            .collect::<Option<Vec<_>>>()?
-            .join("\n"),
-        other => serde_json::to_string(other).ok()?,
-    };
-    Some(limits.bounded_tool_text(&output))
+                    .collect::<Option<Vec<_>>>()?;
+                (texts.join("\n"), texts.iter().any(|s| !s.is_empty()))
+            }
+            other => (serde_json::to_string(other).ok()?, true),
+        };
+        if has_content {
+            return Some(limits.bounded_tool_text(&output));
+        }
+        empty_output.get_or_insert(output);
+    }
+    empty_output.map(|output| limits.bounded_tool_text(&output))
 }
 
 fn validate_native_tools(items: &mut [&mut TrajectoryItem], source: Provider) {
@@ -8498,6 +8507,53 @@ mod tests {
             Some(TrajectoryTool::Pair { input, output, is_error: true, .. })
                 if input["path"] == "missing" && output == "file missing"
         ));
+    }
+
+    #[test]
+    fn native_tool_results_keep_readable_alternatives_to_empty_content() {
+        for (content, raw_output, expected) in [
+            (
+                json!([]),
+                json!([{"text":"marigold label","unit":"tests","value":73}]),
+                r#"[{"text":"marigold label","unit":"tests","value":73}]"#,
+            ),
+            (json!([]), json!([true, 7, ["a"]]), r#"[true,7,["a"]]"#),
+            (json!([]), json!([]), "[]"),
+            (json!([]), json!("marigold output"), "marigold output"),
+            (
+                json!([{"content":{"text":"preferred"}}]),
+                json!("alternate"),
+                "preferred",
+            ),
+            (
+                json!([{"content":{"text":""}},{"content":{"text":""}}]),
+                json!("raw"),
+                "raw",
+            ),
+            (
+                json!([{"content":{"text":""}},{"content":{"text":""}}]),
+                json!(null),
+                "\n",
+            ),
+            (json!([]), json!(null), ""),
+        ] {
+            let snapshot = snapshot_with_events(vec![
+                event(
+                    1,
+                    EventKind::ToolCalled,
+                    json!({"toolCallId":"a","title":"inspect"}),
+                ),
+                event(
+                    2,
+                    EventKind::ToolCompleted,
+                    json!({"toolCallId":"a","content":content,"rawOutput":raw_output}),
+                ),
+            ]);
+            let trajectory = import_trajectory(&snapshot);
+            assert!(
+                matches!(&trajectory.items[1].tool, Some(TrajectoryTool::Result { output, .. }) if output == expected)
+            );
+        }
     }
 
     #[test]

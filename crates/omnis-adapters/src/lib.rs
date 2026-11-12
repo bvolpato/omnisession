@@ -36,7 +36,7 @@ pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use cursor_identity::{
     cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
 };
-pub use grok::GrokAdapter;
+pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
@@ -184,6 +184,8 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Physical file whose ownership was checked independently of display metadata.
+    pub ownership_revision: Option<SourceRevision>,
     pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
     /// Exclusive event sequence at the first gap in an otherwise sequential read.
     pub verified_prefix_end: Option<u64>,
@@ -316,6 +318,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    ownership_revision: None,
                     verified_prefix_end: None,
                     database_aliases: std::sync::Arc::default(),
                     search_record_groups: Vec::new(),
@@ -333,6 +336,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        ownership_revision: None,
         verified_prefix_end: None,
         database_aliases: std::sync::Arc::default(),
         search_record_groups: Vec::new(),
@@ -442,6 +446,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error if the adapter cannot identify the source representation.
     fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
         Ok(NativeResumeSupport::Direct)
+    }
+
+    /// IDs with a conflicting or unreadable native source in the last discovery pass.
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
@@ -636,6 +645,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
