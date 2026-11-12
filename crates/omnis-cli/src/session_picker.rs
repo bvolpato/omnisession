@@ -4531,7 +4531,7 @@ mod tests {
             continuation: None,
             complete: false,
         };
-        for provider in [Provider::Pi, Provider::OhMyPi] {
+        for provider in [Provider::Pi, Provider::OhMyPi, Provider::Grok] {
             let mut native = session(provider, "selected", root, None);
             native.source_revision = Some(source);
             let mut state = PickerState::new(vec![native.clone()], root, None, true);

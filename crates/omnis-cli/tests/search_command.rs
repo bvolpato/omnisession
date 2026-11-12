@@ -558,6 +558,27 @@ fn write_grok_log_with_mixed_owners(
     drop(log);
 }
 
+fn check_bare_id_rejects_replacement(fixture: &Fixture, id: &str, other: &str, replacement: &Path) {
+    fs::create_dir(replacement).unwrap();
+    fs::write(
+        replacement.join("summary.json"),
+        json!({"info":{"id":other,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let rejected = fixture.command().args(["show", id]).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        result_sessions(&fixture.search_json(&[
+            "marjoramquartz",
+            "--cached",
+            "--provider",
+            "grok"
+        ]))
+        .is_empty()
+    );
+    fs::remove_dir_all(replacement).unwrap();
+}
+
 #[test]
 fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     use std::io::Write;
@@ -600,13 +621,17 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     assert!(show().status.success());
     assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
 
+    let other = "22222222-2222-4222-8222-222222222222";
+    check_bare_id_rejects_replacement(&fixture, id, other, &replacement);
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
+
     fs::create_dir(&replacement).unwrap();
     fs::copy(
         backup.join("summary.json"),
         replacement.join("summary.json"),
     )
     .unwrap();
-    let other = "22222222-2222-4222-8222-222222222222";
     write_grok_log_with_mixed_owners(&replacement, id, other, &update);
     index(false);
     assert!(!show().status.success());

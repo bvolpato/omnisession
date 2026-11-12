@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -107,21 +106,27 @@ struct CheckedUpdates {
     expected_updates: u64,
 }
 
-#[derive(Deserialize)]
-struct OwnerHeader {
-    params: Option<UpdateParams>,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UpdateOwnership {
+    Explicit,
+    Implicit,
+    Damaged,
 }
 
-#[derive(Deserialize)]
-struct UpdateParams {
-    #[serde(default, rename = "sessionId", deserialize_with = "present_owner")]
-    session_id: Option<String>,
-}
-
-fn present_owner<'de, D: serde::Deserializer<'de>>(
-    de: D,
-) -> std::result::Result<Option<String>, D::Error> {
-    String::deserialize(de).map(Some)
+fn update_ownership(record: &Value, session_id: &str) -> Result<UpdateOwnership> {
+    let Some(value) = record.pointer("/params/sessionId") else {
+        return Ok(UpdateOwnership::Implicit);
+    };
+    if value.as_str() == Some(session_id) {
+        return Ok(UpdateOwnership::Explicit);
+    }
+    if value
+        .as_str()
+        .is_some_and(|owner| Uuid::parse_str(owner).is_ok())
+    {
+        return Err(GrokHistoryError::ForeignOwner.into());
+    }
+    Ok(UpdateOwnership::Damaged)
 }
 
 impl GrokAdapter {
@@ -183,17 +188,10 @@ impl GrokAdapter {
             let Some(line) = line else {
                 return Ok(true);
             };
-            let Ok(header) = serde_json::from_slice::<OwnerHeader>(line) else {
-                // The transcript reader omits malformed JSON. A readable record still needs an owner.
-                return Ok(serde_json::from_slice::<Value>(line).is_err());
+            let Ok(record) = serde_json::from_slice::<Value>(line) else {
+                return Ok(true);
             };
-            let owner = header.params.and_then(|params| params.session_id);
-            if let Some(owner) = owner {
-                anyhow::ensure!(owner == session.id, GrokHistoryError::ForeignOwner);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+            Ok(update_ownership(&record, &session.id)? != UpdateOwnership::Implicit)
         });
         anyhow::ensure!(Self::updates_revision(summary) == Some(log), stale);
         let result = ownership
@@ -461,19 +459,19 @@ impl GrokAdapter {
         let mut omissions = JsonLineSkips::default();
         let log = provider_file(root, &directory.join("updates.jsonl"));
         if let Some(file) = &log {
+            let mut previous_owner_damaged = false;
             let mut push = |record: Value, gap: bool| -> Result<()> {
-                // Grok rekeys inherited ACP updates when it creates a native fork.
-                anyhow::ensure!(
-                    record
-                        .pointer("/params/sessionId")
-                        .is_none_or(|owner| owner.as_str() == Some(&session.id)),
-                    GrokHistoryError::ForeignOwner
-                );
                 read_any = true;
                 if is_update_record(&record) {
                     observed += 1;
                 }
-                updates.push_record(&mut builder, record, gap);
+                if update_ownership(&record, &session.id)? == UpdateOwnership::Damaged {
+                    updates.malformed_updates += 1;
+                    previous_owner_damaged = true;
+                } else {
+                    updates.push_record(&mut builder, record, gap || previous_owner_damaged);
+                    previous_owner_damaged = false;
+                }
                 Ok(())
             };
             if full {
@@ -600,10 +598,84 @@ fn can_fork_summary(id: &str, summary: &Value) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok())
         })
-        && summary
-            .get("num_messages")
-            .and_then(Value::as_u64)
-            .is_some()
+        && summary["num_messages"].is_u64()
+        && [
+            "generated_title",
+            "parent_session_id",
+            "grok_home",
+            "sandbox_profile",
+            "agent_id",
+            "attempt_id",
+            "session_kind",
+        ]
+        .iter()
+        .all(|key| optional_native_field(summary, key, Value::is_string))
+        && optional_native_field(summary, "forked_at", |value| {
+            value
+                .as_str()
+                .is_some_and(|time| DateTime::parse_from_rfc3339(time).is_ok())
+        })
+        && [
+            "num_chat_messages",
+            "chat_format_version",
+            "next_trace_turn",
+        ]
+        .iter()
+        .all(|key| summary.get(key).is_none_or(Value::is_u64))
+        && summary.get("git_remotes").is_none_or(|value| {
+            value
+                .as_array()
+                .is_some_and(|remotes| remotes.iter().all(Value::is_string))
+        })
+}
+
+fn optional_native_field(object: &Value, key: &str, valid: impl FnOnce(&Value) -> bool) -> bool {
+    object
+        .get(key)
+        .is_none_or(|value| value.is_null() || valid(value))
+}
+
+fn native_message_block(content: &Value) -> bool {
+    let annotations = &content["annotations"];
+    let valid_annotations = annotations.is_null()
+        || (annotations.is_object()
+            && optional_native_field(annotations, "audience", |value| {
+                value.as_array().is_some_and(|roles| {
+                    roles
+                        .iter()
+                        .all(|role| matches!(role.as_str(), Some("user" | "assistant")))
+                })
+            })
+            && optional_native_field(annotations, "priority", Value::is_number)
+            && optional_native_field(annotations, "lastModified", Value::is_string));
+    if !valid_annotations || !optional_native_field(content, "_meta", Value::is_object) {
+        return false;
+    }
+    match content["type"].as_str() {
+        Some("text") => content["text"].is_string(),
+        Some("image") => {
+            content["data"].is_string()
+                && content["mimeType"].is_string()
+                && optional_native_field(content, "uri", Value::is_string)
+        }
+        Some("audio") => content["data"].is_string() && content["mimeType"].is_string(),
+        Some("resource_link") => {
+            content["uri"].is_string()
+                && content["name"].is_string()
+                && ["title", "description", "mimeType"]
+                    .iter()
+                    .all(|key| optional_native_field(content, key, Value::is_string))
+                && optional_native_field(content, "size", Value::is_u64)
+        }
+        Some("resource") => {
+            let resource = &content["resource"];
+            resource["uri"].is_string()
+                && (resource["text"].is_string() || resource["blob"].is_string())
+                && optional_native_field(resource, "mimeType", Value::is_string)
+                && optional_native_field(resource, "_meta", Value::is_object)
+        }
+        _ => false,
+    }
 }
 
 // A native fork rekeys every update it copies. Check the source owners before handing it to Grok.
@@ -619,32 +691,37 @@ fn native_update_headers(
         let Ok(record) = serde_json::from_slice::<Value>(line) else {
             return Ok(false);
         };
-        if let Some(owner) = record.pointer("/params/sessionId") {
-            anyhow::ensure!(owner.as_str() == Some(id), GrokHistoryError::ForeignOwner);
+        if update_ownership(&record, id)? != UpdateOwnership::Explicit {
+            return Ok(false);
         }
-        let update = record.pointer("/params/update").unwrap_or(&record);
-        let kind = string_at(update, &[&["sessionUpdate"], &["type"], &["event"]]);
-        Ok(match kind {
-            Some(
-                "user_message_chunk"
-                | "agent_message_chunk"
-                | "agent_thought_chunk"
-                | "user"
-                | "user_message"
-                | "assistant"
-                | "assistant_message",
-            ) => {
-                let content = &update["content"];
-                match content["type"].as_str() {
-                    Some("text") => content["text"].is_string(),
-                    Some("image" | "audio") => {
-                        content["data"].is_string() && content["mimeType"].is_string()
-                    }
-                    _ => false,
-                }
+        let update = &record["params"]["update"];
+        if !optional_native_field(update, "_meta", Value::is_object) {
+            return Ok(false);
+        }
+        Ok(match update["sessionUpdate"].as_str() {
+            Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk") => {
+                optional_native_field(update, "messageId", Value::is_string)
+                    && native_message_block(&update["content"])
             }
-            Some(_) => true,
-            None => false,
+            Some("tool_call") => {
+                update["toolCallId"].is_string()
+                    && update["title"].is_string()
+                    && update.get("kind").is_none_or(Value::is_string)
+            }
+            Some("tool_call_update") => {
+                update["toolCallId"].is_string()
+                    && optional_native_field(update, "kind", Value::is_string)
+            }
+            Some("session_info_update") => {
+                optional_native_field(update, "title", Value::is_string)
+                    && optional_native_field(update, "updatedAt", Value::is_string)
+            }
+            Some("plan") => update["entries"].is_array(),
+            Some("current_mode_update") => update["currentModeId"].is_string(),
+            Some("available_commands_update") => update["availableCommands"].is_array(),
+            Some("config_option_update") => update["configOptions"].is_array(),
+            Some("usage_update") => update["used"].is_u64() && update["size"].is_u64(),
+            _ => false,
         })
     })?
     else {
@@ -782,8 +859,8 @@ impl GrokMetadata {
     fn source_revision(&self, path: &Path) -> SourceRevision {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
-        // The revision includes the projection that preserves gaps between message chunks.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v2");
+        // Invalidate cached projections when recovery changes which source records are visible.
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v3");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1147,7 +1224,7 @@ fn message_content(
     ]
     .into_iter()
     .flatten()
-    .find(|value| !value.is_null());
+    .find(|value| !value.is_null() && !value.as_array().is_some_and(Vec::is_empty));
     if let Some(content) = body {
         if let Some(blocks) = content.as_array() {
             for block in blocks {
@@ -1835,6 +1912,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_nested_message_content_preserves_the_assistant_occurrence() {
+        let root = tempfile::tempdir().unwrap();
+        let update = json!({"params":{"sessionId":SESSION_ID,"update":{
+            "sessionUpdate":"agent_message_chunk","messageId":"reply","message":{"content":[]}
+        }}});
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id": SESSION_ID, "num_messages":1}),
+            &[update],
+        );
+        let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        let snapshot = GrokAdapter::with_root(root.path())
+            .read_session(&session)
+            .unwrap();
+        let assistant = &snapshot.events[0];
+        assert_eq!(assistant.kind, EventKind::MessageAssistant);
+        assert_eq!(assistant.payload["message_id"], "reply");
+        assert_eq!(assistant.payload["content_unreadable"], true);
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
+    }
+
+    #[test]
     fn malformed_blocks_preserve_the_gap_and_opaque_evidence() {
         let root = tempfile::tempdir().expect("synthetic Grok root");
         let block = json!({"type": "text", "text": {"part": "opaque"}, "annotations": {"audience": ["user"]}});
@@ -1975,6 +2075,56 @@ mod tests {
                 .unwrap()
                 .source_complete
         );
+    }
+
+    #[test]
+    fn damaged_owners_leave_a_gap_between_verified_chunks() {
+        let root = tempfile::tempdir().unwrap();
+        let chunk = |owner: Value, text| {
+            json!({"params":{"sessionId":owner,"update":{
+                "sessionUpdate":"user_message_chunk","messageId":"ask","content":{"text":text}
+            }}})
+        };
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id":SESSION_ID,"num_messages":5}),
+            &[
+                chunk(json!(SESSION_ID), "north"),
+                chunk(Value::Null, "hidden"),
+                chunk(json!(7), "hidden"),
+                chunk(json!("broken-id"), "hidden"),
+                chunk(json!(SESSION_ID), "star"),
+            ],
+        );
+        let adapter = GrokAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        for budget in [0, u64::MAX] {
+            let read = adapter.index_session(&session, None, budget).unwrap();
+            assert_eq!(
+                read.snapshot.events[0].payload["text"],
+                "north\n[Source records omitted]\nstar"
+            );
+            assert!(
+                read.snapshot
+                    .events
+                    .iter()
+                    .any(|e| e.payload["malformed_updates"] == 3)
+            );
+            GrokAdapter::verify_update_owners(
+                &session,
+                read.native_session
+                    .as_ref()
+                    .unwrap()
+                    .source_path
+                    .as_deref()
+                    .unwrap(),
+                read.ownership_revision.unwrap(),
+                read.source_revision,
+                None,
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -2125,10 +2275,90 @@ mod tests {
     }
 
     #[test]
+    fn native_fork_preserves_resource_blocks_and_recovers_invalid_message_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("updates.jsonl");
+        let mut update = json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "visible reply"}});
+        for (message_id, content, expected) in [
+            (
+                json!(17),
+                update["content"].clone(),
+                NativeResumeSupport::ImportOnly,
+            ),
+            (
+                Value::Null,
+                update["content"].clone(),
+                NativeResumeSupport::Direct,
+            ),
+            (
+                json!("reply"),
+                json!({"type":"resource_link","uri":"file:///synthetic/item","name":"sample"}),
+                NativeResumeSupport::Direct,
+            ),
+            (
+                json!("reply"),
+                json!({"type":"resource","resource":{"uri":"file:///synthetic/item","text":"embedded"}}),
+                NativeResumeSupport::Direct,
+            ),
+            (
+                json!("reply"),
+                json!({"type":"resource_link","uri":"file:///synthetic/item"}),
+                NativeResumeSupport::ImportOnly,
+            ),
+        ] {
+            update["messageId"] = message_id;
+            update["content"] = content;
+            fs::write(
+                &log,
+                json!({"params": {"sessionId": SESSION_ID, "update": update}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                native_update_headers(&log, SESSION_ID, 1).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_fork_checks_tool_kind_on_calls_and_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("updates.jsonl");
+        for (tag, kind, expected) in [
+            ("tool_call", json!("custom"), NativeResumeSupport::Direct),
+            ("tool_call", json!(4), NativeResumeSupport::ImportOnly),
+            ("tool_call", Value::Null, NativeResumeSupport::ImportOnly),
+            (
+                "tool_call_update",
+                json!(4),
+                NativeResumeSupport::ImportOnly,
+            ),
+            ("tool_call_update", Value::Null, NativeResumeSupport::Direct),
+        ] {
+            let update =
+                json!({"sessionUpdate": tag, "toolCallId": "call", "title": "Read", "kind": kind});
+            fs::write(
+                &log,
+                json!({"params": {"sessionId": SESSION_ID, "update": update}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                native_update_headers(&log, SESSION_ID, 1).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn native_fork_requires_the_fields_read_by_grok() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let complete = json!({"info":{"id":SESSION_ID,"cwd":project},"session_summary":"Title","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","current_model_id":"synthetic","num_messages":0});
+        let mut titled = complete.clone();
+        titled["generated_title"] = json!({});
+        assert!(!can_fork_summary(SESSION_ID, &titled));
+        titled["generated_title"] = json!("A title");
+        assert!(can_fork_summary(SESSION_ID, &titled));
         let directory = write_session(root.path(), SESSION_ID, &complete, &[]);
         let native_group = root
             .path()

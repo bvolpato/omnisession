@@ -1422,8 +1422,9 @@ fn read_preview(
     if prefix_end == metadata.len() {
         return Ok(preview);
     }
-    if small && prefix_bytes != u64::MAX {
+    if small && metadata.len() > prefix_bytes {
         preview.sampled = true;
+        preview.suffix_len = 0;
         return Ok(preview);
     }
     if small {
@@ -3076,9 +3077,23 @@ mod tests {
         content.push_str("2\n");
         std::fs::write(&path, content).expect("short JSONL records");
 
-        let records = json_lines_preview(&path, 1).expect("sampled end records");
-        assert_eq!(records.len(), 2);
-        assert_eq!(records, [json!(1), json!(2)]);
+        for (prefix_bytes, expected, suffix_len) in [
+            (u64::MAX, vec![json!(1), json!(2)], 1),
+            (super::MAX_PREVIEW_TAIL_SIZE, vec![json!(1), json!(2)], 1),
+            (2, vec![json!(1)], 0),
+        ] {
+            let preview = super::json_lines_preview_with_omissions(
+                &path,
+                1,
+                prefix_bytes,
+                MAX_TRANSCRIPT_LINE_SIZE,
+                |_, _| super::WorkspaceGap::Other,
+            )
+            .expect("sampled end records");
+            assert!(preview.sampled);
+            assert_eq!(preview.records, expected);
+            assert_eq!(preview.suffix_len, suffix_len);
+        }
     }
 
     #[test]

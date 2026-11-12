@@ -2357,7 +2357,7 @@ mod tests {
             root.path().join("sessions"),
         ));
         let before = store.observe_selected_session(&session).unwrap();
-        fs::write(&updates, update("an-unrelated-session")).unwrap();
+        fs::write(&updates, update("00000000-1111-4222-8333-444444444444")).unwrap();
         let error = registry
             .index_session(&session, Some(&summary), u64::MAX)
             .err()

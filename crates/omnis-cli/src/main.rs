@@ -2726,6 +2726,15 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         match result {
             Ok(session) => matches.extend(session.map(|session| session.session)),
             Err(error) => {
+                if provider == Provider::Grok
+                    && let Err(cause) = search_index::reject_cached_grok_preflight(
+                        registry,
+                        &SessionRef::new(provider, selector),
+                        &error,
+                    )
+                {
+                    eprintln!("warning: local trajectory index refresh: {cause}");
+                }
                 codex_unavailable |= provider == Provider::Codex
                     && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(&error);
                 failures.push(format!("{provider}: {error}"));

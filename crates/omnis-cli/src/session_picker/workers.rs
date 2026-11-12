@@ -220,6 +220,7 @@ pub(super) fn spawn_search_index(
                 }
                 false
             };
+            let mut reported_failures = 0;
             match search_index::index_candidates(
                 &registry,
                 &store,
@@ -227,6 +228,10 @@ pub(super) fn spawn_search_index(
                 false,
                 &should_stop,
                 &mut |progress| {
+                    if progress.failed > reported_failures {
+                        reported_failures = progress.failed;
+                        refresh_preview_failures(&store, &sender, &preview_failures, |_| true);
+                    }
                     let _ = sender.send(PickerUpdate::Indexing(progress));
                 },
             ) {
@@ -267,7 +272,8 @@ fn refresh_preview_failures(
         return;
     };
     failures.retain(|session, failure| {
-        TrajectorySourceGuard::uses_file_time(session.provider)
+        (session.provider == Provider::Grok
+            || TrajectorySourceGuard::uses_file_time(session.provider))
             && failure.source_file.is_some()
             && failure.source_contents.is_some()
     });
@@ -823,6 +829,7 @@ fn grok_preview_update(
     store: Option<&Store>,
     sender: &Sender<PickerUpdate>,
     request: PreviewRequest,
+    preview_failures: &PreviewFailures,
 ) -> PickerUpdate {
     let PreviewRequest {
         key, source_path, ..
@@ -890,6 +897,11 @@ fn grok_preview_update(
             read.source_complete && !read.snapshot.events.iter().any(reports_incomplete_preview);
         PreviewValue::from_snapshot(&read.snapshot, key.continuation_after, complete)
     });
+    if let Some(store) = store {
+        refresh_preview_failures(store, sender, preview_failures, |known| {
+            matches!(value, PreviewValue::Unavailable) || known.contains_key(&key.session)
+        });
+    }
     PickerUpdate::Preview {
         key,
         value,
@@ -933,7 +945,13 @@ pub(super) fn spawn_preview_updates(
                 }
                 let cached_grok = request.cached && request.key.session.provider == Provider::Grok;
                 let update = if request.key.session.provider == Provider::Grok {
-                    grok_preview_update(&registry, store.as_ref(), &sender, request)
+                    grok_preview_update(
+                        &registry,
+                        store.as_ref(),
+                        &sender,
+                        request,
+                        &preview_failures,
+                    )
                 } else if request.key.session.provider == Provider::Codex {
                     codex_preview_update(&registry, store.as_ref(), &sender, request)
                 } else {
@@ -1409,6 +1427,35 @@ mod grok_preview_tests {
     use super::*;
     use omnis_ir::SessionRef;
     use omnis_store::{TrajectoryIndexState, TrajectorySourceGuard};
+
+    #[test]
+    fn picker_receives_grok_rejections_and_their_removal() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = Store::open(root.path().join("store.sqlite3"))?;
+        let session = SessionRef::new(Provider::Grok, "selected");
+        let failure = omnis_store::TrajectoryIndexFailure {
+            source_file: Some(uuid::Uuid::from_u128(1)),
+            source_contents: Some(uuid::Uuid::from_u128(2)),
+            source_updated_at: None,
+            source_time_precise: true,
+            document_version: omnis_core::search_document_version(Provider::Grok),
+        };
+        let observation = store.observe_selected_session(&session)?;
+        store.record_selected_trajectory_index_failure(&session, &failure, &observation)?;
+        let stored = store.trajectory_index_failure(&session)?.unwrap();
+        let known = PreviewFailures::default();
+        let (sender, updates) = mpsc::channel();
+        refresh_preview_failures(&store, &sender, &known, |_| true);
+        assert!(
+            matches!(updates.try_recv()?, PickerUpdate::PreviewFailures(current) if current.get(&session) == Some(&stored))
+        );
+        store.clear_observed_trajectory_index_failure(&session, &stored)?;
+        refresh_preview_failures(&store, &sender, &known, |_| true);
+        assert!(
+            matches!(updates.try_recv()?, PickerUpdate::PreviewFailures(current) if current.is_empty())
+        );
+        Ok(())
+    }
 
     #[test]
     fn picker_refreshes_a_complete_grok_document_after_its_plan_changes() -> Result<()> {
