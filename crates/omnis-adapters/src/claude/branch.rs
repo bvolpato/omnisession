@@ -689,80 +689,170 @@ impl Branch {
     pub(super) fn reselect_hidden(
         &mut self,
         id: Uuid,
-        record: &ClaudeRecord,
-        records: &HashMap<Uuid, ClaudeRecord>,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
         compactions: &Compactions,
-    ) -> Option<Parent> {
-        let node = record.branch.node?;
+    ) {
+        let record = &records[&id];
+        let Some(node) = record.branch.node else {
+            return;
+        };
         if !self.hidden_parents.contains_key(&node) || self.nodes[node].uuid != Some(id) {
-            return None;
+            return;
         }
         if let Some(summary) = self.latest_attachment_checkpoint(compactions)
             && compactions.precedes_cutoff(summary, record.order)
         {
-            if self.selected_summary() != Some(summary)
-                && compactions.contains(summary, id, records)
+            if compactions.contains(summary, id, records)
+                && !self.selected_retained_descendant(summary, node)
             {
                 self.select_retained_position(summary, id, record.branch);
             }
-            return None;
+            return;
         }
         if self
             .checked_copy_revision
             .insert(node, self.marker_revision)
             != Some(self.marker_revision)
             && self.marker_revision > 0
-            && let Some(updated) = self.current_copy_ancestry(node, records)
         {
-            let mut parent = record.branch;
-            parent.node = Some(updated);
-            parent.source = Some(updated);
-            self.observe_existing(parent, compactions);
-            return Some(parent);
+            self.refresh_copy_ancestry(node, records);
         }
-        self.observe_existing(record.branch, compactions);
-        None
+        self.observe_existing(records[&id].branch, compactions);
     }
 
-    fn current_copy_ancestry(
-        &mut self,
-        node: usize,
-        records: &HashMap<Uuid, ClaudeRecord>,
-    ) -> Option<usize> {
-        let mut path = vec![node];
+    fn selected_retained_descendant(&mut self, summary: usize, original: usize) -> bool {
+        if self.selected_summary() != Some(summary) {
+            return false;
+        }
+        self.index_parents();
+        let mut cursor = self.tip;
+        while let Some(node) = cursor {
+            if let Some(retained) = self.suffix_parents.get(&node) {
+                return retained
+                    .node
+                    .is_some_and(|node| self.copy_paths.distance(original, node).is_some());
+            }
+            if node == summary {
+                return true;
+            }
+            cursor = self.nodes[node].parent;
+        }
+        false
+    }
+
+    fn refresh_copy_ancestry(&mut self, node: usize, records: &mut HashMap<Uuid, ClaudeRecord>) {
         let mut child = node;
-        let mut visited = HashSet::from([node]);
-        let mut changed = false;
-        while let Some(previous) = self.nodes[child].parent {
+        let mut visited = HashSet::new();
+        let mut changes = HashMap::new();
+        while visited.insert(child) {
             if self.nodes[child].summary == Some(child) || self.suffix_parents.contains_key(&child)
             {
                 break;
             }
-            let Some(actual) = self.nodes[previous]
-                .uuid
-                .and_then(|id| records.get(&id)?.branch.node)
-            else {
+            let Some(record) = self.nodes[child].uuid.and_then(|id| records.get(&id)) else {
                 break;
             };
-            if !visited.insert(actual) {
-                return None;
+            let Some(actual) = record.parent.and_then(|id| records.get(&id)?.branch.node) else {
+                break;
+            };
+            if visited.contains(&actual) {
+                return;
             }
-            changed |= actual != previous;
-            path.push(actual);
+            if self.nodes[child].parent != Some(actual) {
+                changes.insert(child, actual);
+            }
             child = actual;
         }
-        if !changed {
-            return None;
+        if changes.is_empty() {
+            return;
         }
-        let mut parent = path.pop()?;
-        for child in path.into_iter().rev() {
-            parent = if self.nodes[child].parent == Some(parent) {
-                child
-            } else {
-                self.rebase_copy_node(child, parent)
+        self.reparent_copies(&changes, records);
+    }
+
+    fn reparent_copies(
+        &mut self,
+        changes: &HashMap<usize, usize>,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
+    ) {
+        let mut responses = HashMap::new();
+        for (&node, &parent) in changes {
+            let source = &self.nodes[node];
+            if let Some(response) = source.response.clone() {
+                responses.insert(
+                    (
+                        response,
+                        source.writer.clone(),
+                        source.turn,
+                        source.summary,
+                        source.parent,
+                    ),
+                    parent,
+                );
+            }
+        }
+        let mut remapped = HashMap::new();
+        for index in 0..self.nodes.len() {
+            let source = &self.nodes[index];
+            if source.summary == Some(index) || self.suffix_parents.contains_key(&index) {
+                continue;
+            }
+            let Some(uuid) = source.uuid else {
+                continue;
             };
+            if records
+                .get(&uuid)
+                .is_none_or(|record| record.branch.node != Some(index))
+            {
+                continue;
+            }
+            let parent = changes
+                .get(&index)
+                .copied()
+                .map(|p| *remapped.get(&p).unwrap_or(&p))
+                .or_else(|| source.parent.and_then(|p| remapped.get(&p).copied()))
+                .or_else(|| {
+                    source.response.as_ref().and_then(|r| {
+                        responses
+                            .get(&(
+                                r.clone(),
+                                source.writer.clone(),
+                                source.turn,
+                                source.summary,
+                                source.parent,
+                            ))
+                            .copied()
+                    })
+                });
+            if let Some(parent) = parent {
+                let updated = self.rebase_copy_node(index, parent);
+                remapped.insert(index, updated);
+            }
         }
-        Some(parent)
+        // A transparent record can share a conversation node with a different UUID.
+        for record in records.values_mut() {
+            if let Some(updated) = record
+                .branch
+                .node
+                .and_then(|index| remapped.get(&index).copied())
+            {
+                record.branch.node = Some(updated);
+                record.branch.missing_ancestor = self.nodes[updated].missing_ancestor;
+            }
+            if let Some(updated) = record
+                .branch
+                .source
+                .and_then(|index| remapped.get(&index).copied())
+            {
+                record.branch.source = Some(updated);
+            }
+        }
+        for &updated in remapped.values() {
+            if let Some(ToolSource::Record(issuer)) = self.tool_sources.get_mut(&updated)
+                && let Some(&current) = remapped.get(issuer)
+            {
+                *issuer = current;
+            }
+        }
     }
 
     fn rebase_copy_node(&mut self, child: usize, parent: usize) -> usize {
@@ -2879,9 +2969,9 @@ impl Branch {
                     continue;
                 }
                 let id = events[position].payload["tool_use_id"].as_str();
-                let unanswered = calls.unanswered(origin, id, &outcomes);
+                let prior = calls.prior_result(origin, id, &outcomes);
                 if selected {
-                    declared.observe(self, &calls, &mut results, position, (id, unanswered));
+                    declared.observe(self, &calls, &mut results, position, (id, &prior));
                 }
                 let Some(id) = id else {
                     transport = None;
@@ -2890,7 +2980,7 @@ impl Branch {
                 let ambiguous = |key| {
                     if selected {
                         unresolved.insert((key, epoch[index]), index);
-                        if source == ToolSource::Absent && unanswered {
+                        if source == ToolSource::Absent && prior.distinct(position, events) {
                             results.keep_recovery_only(position);
                         }
                     }
@@ -2965,7 +3055,8 @@ impl DeclaredResult<'_> {
         parent: Option<usize>,
     ) -> bool {
         branch.suffix_parents.contains_key(&self.index)
-            && matches!(self.source, ToolSource::Record(id) if id == call.node)
+            && (self.source == ToolSource::Absent
+                || matches!(self.source, ToolSource::Record(id) if id == call.node))
             && parent == Some(call.node)
     }
 
@@ -2975,7 +3066,7 @@ impl DeclaredResult<'_> {
         calls: &ToolCalls<'_>,
         results: &mut ToolResults,
         position: usize,
-        candidate: (Option<&str>, bool),
+        candidate: (Option<&str>, &PriorResult),
     ) {
         let missing = branch.missing_declared_call(
             self.source,
@@ -2983,7 +3074,7 @@ impl DeclaredResult<'_> {
             self.issuer,
             self.anchors,
             calls,
-            candidate,
+            (candidate.0, candidate.1.unanswered()),
         );
         results.observe_selected(
             position,
@@ -3162,18 +3253,47 @@ fn record_call<K: std::hash::Hash + Eq>(map: &mut HashMap<K, CallsWithId>, key: 
         .or_insert(CallsWithId::One(call));
 }
 
+enum PriorResult {
+    Unknown,
+    Unanswered,
+    Answered(Option<usize>),
+}
+
+impl PriorResult {
+    fn unanswered(&self) -> bool {
+        matches!(self, Self::Unanswered)
+    }
+    fn distinct(&self, position: usize, events: &[ClaudeEvent]) -> bool {
+        match self {
+            Self::Unknown => false,
+            Self::Unanswered | Self::Answered(None) => true,
+            Self::Answered(Some(prior)) => {
+                events[*prior].kind != events[position].kind
+                    || events[*prior].payload != events[position].payload
+            }
+        }
+    }
+}
+
 impl<'a> ToolCalls<'a> {
-    fn unanswered(
+    fn prior_result(
         &self,
         origin: Option<ResponseUnit<'a>>,
         id: Option<&'a str>,
         outcomes: &HashMap<(ToolCall, bool, Option<usize>), Outcome>,
-    ) -> bool {
-        origin
+    ) -> PriorResult {
+        let Some(call) = origin
             .zip(id)
             .and_then(|key| self.by_response.get(&key))
-            .and_then(|call| call.unique())
-            .is_some_and(|call| !outcomes.contains_key(&(call, false, None)))
+            .and_then(|c| c.unique())
+        else {
+            return PriorResult::Unknown;
+        };
+        outcomes
+            .get(&(call, false, None))
+            .map_or(PriorResult::Unanswered, |outcome| {
+                PriorResult::Answered(outcome.position)
+            })
     }
 
     fn observe(

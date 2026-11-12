@@ -416,6 +416,7 @@ impl RecordCopies {
                 })
             }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
+            Some(_) if is_turn_duration(record) => record.get("parentUuid").is_some(),
             Some(_) if Self::compares_link(role, record) => {
                 record.get("parentUuid").is_some_and(Value::is_null)
                     || record_uuid(record, "parentUuid")
@@ -1621,18 +1622,13 @@ impl ClaudeTranscript {
     }
 
     fn reselect_existing(&mut self, id: Uuid, record: &Value) {
-        let existing = &self.records[&id];
         if is_turn_duration(record) || is_meta_message(record) {
-            if let Some(parent) =
-                self.branch
-                    .reselect_hidden(id, existing, &self.records, &self.compactions)
-            {
-                self.records
-                    .get_mut(&id)
-                    .expect("copied record exists")
-                    .branch = parent;
-            }
-        } else if record["type"] != "system"
+            self.branch
+                .reselect_hidden(id, &mut self.records, &self.compactions);
+            return;
+        }
+        let existing = &self.records[&id];
+        if record["type"] != "system"
             && !existing.branch.transparent
             && !self
                 .branch
