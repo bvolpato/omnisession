@@ -250,7 +250,7 @@ impl WorkspaceProbe<'_> {
                     }
                 }
                 history.settings.observe(&session.session.id, &record);
-                history.push(&mut builder, &record)?;
+                history.push_recovered(&mut builder, &record, false, skipped.total())?;
                 if history
                     .records_seen
                     .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     ffi::OsStr,
     fs,
@@ -1599,12 +1599,14 @@ pub(crate) struct EventBuilder {
     events: Vec<OmniEvent>,
     preview: Option<EventPreview>,
     rollback_opener: Option<RollbackOpener>,
+    removed_mirrors: HashSet<u64>,
 }
 
 #[derive(Default)]
 struct RollbackOpener {
     full_read: bool,
     first_message: Option<(u64, Option<String>)>,
+    mirror_openers: Option<BTreeMap<u64, Option<String>>>,
     applied_rollback: bool,
     gap: bool,
     /// A repeated surviving opener cancels an earlier withdrawal of the same title.
@@ -1740,6 +1742,7 @@ impl EventBuilder {
             events: Vec::new(),
             preview: None,
             rollback_opener: None,
+            removed_mirrors: HashSet::new(),
         }
     }
 
@@ -1752,10 +1755,11 @@ impl EventBuilder {
     }
 
     pub(crate) fn select_preview(
-        &self,
+        &mut self,
         limit: usize,
         bytes_per_edge: usize,
     ) -> (VecDeque<PreviewEvent>, usize, u64) {
+        self.purge_removed_mirrors();
         let outline = &self
             .preview
             .as_ref()
@@ -1799,6 +1803,7 @@ impl EventBuilder {
     }
 
     pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
+        self.purge_removed_mirrors();
         self.preview = None;
         if self.events.len() != expected {
             return Err(anyhow!(
@@ -1817,6 +1822,7 @@ impl EventBuilder {
     }
 
     pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
+        self.purge_removed_mirrors();
         self.events.drain(..)
     }
 
@@ -1879,6 +1885,44 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn track_codex_mirror_openers(&mut self, enabled: bool) {
+        if let Some(opener) = &mut self.rollback_opener {
+            opener.mirror_openers = (enabled && opener.first_message.is_none()).then(BTreeMap::new);
+        }
+    }
+
+    pub(crate) fn remove_codex_mirror(&mut self, sequence: u64) {
+        self.removed_mirrors.insert(sequence);
+        if let Some(opener) = &mut self.rollback_opener
+            && let Some(candidates) = &mut opener.mirror_openers
+        {
+            candidates.remove(&sequence);
+            if opener
+                .first_message
+                .as_ref()
+                .is_some_and(|(pos, _)| *pos == sequence)
+            {
+                opener.first_message = candidates
+                    .first_key_value()
+                    .map(|(&pos, title)| (pos, title.clone()));
+            }
+        }
+    }
+
+    fn purge_removed_mirrors(&mut self) {
+        if self.removed_mirrors.is_empty() {
+            return;
+        }
+        self.events
+            .retain(|event| !self.removed_mirrors.contains(&event.sequence));
+        if let Some(preview) = &mut self.preview {
+            preview
+                .outline
+                .retain(|event| !self.removed_mirrors.contains(&event.sequence));
+        }
+        self.removed_mirrors.clear();
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
         if let Some(opener) = &mut self.rollback_opener
             && !opener.gap
@@ -1905,6 +1949,7 @@ impl EventBuilder {
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
+        self.purge_removed_mirrors();
         if self.events.len() <= limit {
             if self.provider == Provider::Codex {
                 self.push_codex_preview_prefix(self.checkpoint(), true, Some(timestamp));
@@ -2051,7 +2096,7 @@ impl EventBuilder {
         });
         let observe = self.rollback_opener.as_mut().filter(|opener| {
             !opener.gap
-                && opener.first_message.is_none()
+                && (opener.first_message.is_none() || opener.mirror_openers.is_some())
                 && matches!(kind, EventKind::MessageUser | EventKind::MessageAssistant)
         });
         if !retained && observe.is_none() {
@@ -2080,11 +2125,21 @@ impl EventBuilder {
             sensitivity: Sensitivity::Normal,
             replay_policy,
         };
-        if let Some(opener) = observe {
-            opener.first_message =
-                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event));
-            if let Some((_, Some(title))) = &opener.first_message {
-                opener.withdrawn.reissued(title);
+        if let Some(opener) = observe
+            && let Some((pos, title)) =
+                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event))
+        {
+            if let Some(candidates) = &mut opener.mirror_openers {
+                candidates.insert(pos, title.clone());
+                if candidates.len() > super::codex::MAX_CANONICAL_EVENTS {
+                    opener.mirror_openers = None;
+                }
+            }
+            if opener.first_message.is_none() {
+                if let Some(title) = &title {
+                    opener.withdrawn.reissued(title);
+                }
+                opener.first_message = Some((pos, title));
             }
         }
         if retained {
@@ -2101,6 +2156,7 @@ impl EventBuilder {
 
     /// Drops the oldest events above `limit` and returns how many were dropped.
     pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        self.purge_removed_mirrors();
         if let Some(preview) = &mut self.preview {
             let omitted = preview.outline.len().saturating_sub(limit);
             preview.outline.drain(..omitted);
@@ -2112,13 +2168,14 @@ impl EventBuilder {
     }
 
     pub(crate) fn snapshot(
-        self,
+        mut self,
         session: SessionRef,
         title: Option<String>,
         project_path: Option<PathBuf>,
         git_branch: Option<String>,
         captured_at: DateTime<Utc>,
     ) -> CanonicalSnapshot {
+        self.purge_removed_mirrors();
         let current_dir = project_path.unwrap_or_default();
         CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),

@@ -886,9 +886,24 @@ fn a_missing_subagent_ordinal_can_cover_reserved_positions() -> anyhow::Result<(
         fs::write(&preferred, &missing)?;
         check_parent_messages(root, &expected, false)?;
         fs::write(&archive, original.replace("local ask", "other ask"))?;
-        check_parent_messages(root, &["child"], true)?;
+        let direct = CodexAdapter::with_root(root)
+            .read_session(&SessionRef::new(Provider::Codex, PARENT))?;
+        let conversation = omnis_core::import_conversation(&direct);
+        let visible: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        let mut surviving = if has_next {
+            vec!["local reply"]
+        } else {
+            vec![]
+        };
+        assert_eq!(visible, surviving);
+        surviving.push("child");
+        check_parent_messages(root, &surviving, true)?;
         fs::remove_file(archive)?;
-        check_parent_messages(root, &["child"], true)?;
+        check_parent_messages(root, &surviving, true)?;
 
         // Even the largest legal reservation cannot reach this cutoff.
         child[0]["payload"]["history_base"]["end_ordinal_exclusive"] = (end + 1).into();
@@ -2194,10 +2209,10 @@ fn equal_display_text_cannot_corroborate_conflicting_native_images_or_ids() -> a
                     );
                     let first_visible = !same && (!damaged || completed);
                     let mut expected = Vec::new();
-                    if (!same && (!completed || damaged)) || count < 2 {
+                    if (!same && damaged) || count < 2 {
                         expected.push("A");
                     }
-                    if first_visible && (count == 0 || ((!completed || damaged) && count < 2)) {
+                    if first_visible && (count == 0 || (damaged && count < 2)) {
                         expected.push("image request");
                     }
                     if count == 0 {
@@ -2388,4 +2403,89 @@ fn media_turn_rows(order: &str, raw_media: &Value, event_fields: &Value) -> Vec<
         json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_complete","turn_id":"B"}}),
     );
     rows
+}
+
+#[test]
+fn a_clean_native_task_after_a_damaged_ancestor_row_uses_one_checkpoint() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let control =
+        |n, kind, id| json!({"ordinal":n,"type":"event_msg","payload":{"type":kind,"turn_id":id}});
+    let rows = [
+        header(PARENT, 0, None),
+        control(1, "task_started", "A"),
+        turn(2, "user", "earlier"),
+        json!({"ordinal":3,"type":"event_msg","payload":{"type":"token_count"}}),
+        control(4, "task_complete", "A"),
+        control(5, "task_started", "B"),
+        json!({"ordinal":6,"type":"event_msg","payload":{"type":"user_message","message":"first"}}),
+        turn(7, "user", "other raw submission"),
+        control(8, "turn_aborted", "B"),
+    ];
+    let parent = write(
+        home.path(),
+        "sessions",
+        PARENT,
+        PARENT,
+        "2026-01-01T00-00-00",
+        &rows,
+    );
+    fs::write(
+        parent,
+        encoded(&rows).replace("\"ordinal\":3,", "\"ordinaX\":3,"),
+    )?;
+    write(
+        home.path(),
+        "sessions",
+        CHILD,
+        CHILD,
+        "2026-01-01T00-00-00",
+        &[
+            header(CHILD, 9, Some(bookmark(PARENT, &rows))),
+            json!({"ordinal":10,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+            turn(11, "user", "leaf"),
+        ],
+    );
+    check_parent_messages(home.path(), &["earlier", "leaf"], true)?;
+    let preview = read(home.path(), true)?;
+    let conversation = omnis_core::import_conversation(&preview);
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        ["earlier", "leaf"]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_fork_keeps_its_own_rollback_boundary_after_an_open_parent_task() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let rows = [
+        header(PARENT, 0, None),
+        json!({"ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"open"}}),
+        json!({"ordinal":2,"type":"event_msg","payload":{"type":"user_message","message":"parent task"}}),
+    ];
+    write(
+        home.path(),
+        "sessions",
+        PARENT,
+        PARENT,
+        "2026-01-01T00-00-00",
+        &rows,
+    );
+    write(
+        home.path(),
+        "sessions",
+        CHILD,
+        CHILD,
+        "2026-01-01T00-00-00",
+        &[
+            header(CHILD, 3, Some(bookmark(PARENT, &rows))),
+            turn(4, "user", "withdrawn child request"),
+            json!({"ordinal":5,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+        ],
+    );
+    check_parent_messages(home.path(), &["parent task"], false)
 }

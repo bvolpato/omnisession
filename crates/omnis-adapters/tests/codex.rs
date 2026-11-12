@@ -2180,6 +2180,12 @@ fn native_task_pairs_out_of_order_submissions_and_withdraws_the_whole_task() -> 
     let saved = |id, text| event("user_message", json!({"client_id":id, "message":text}));
     for body in [
         vec![
+            raw("b", "other"),
+            raw("a", "same"),
+            saved("a", "same"),
+            saved("b", "other"),
+        ],
+        vec![
             saved("a", "same"),
             saved("b", "other"),
             raw("b", "other"),
@@ -2213,6 +2219,145 @@ fn native_task_pairs_out_of_order_submissions_and_withdraws_the_whole_task() -> 
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn rollback_counts_explicit_tasks_after_earlier_damage_and_interruption() -> anyhow::Result<()> {
+    for end in ["task_complete", "turn_aborted"] {
+        for assistant_only in [false, true] {
+            let mut records = vec![
+                "{malformed".to_owned(),
+                event("task_started", json!({"turn_id":"A"})).to_string(),
+                event("user_message", json!({"message":"earlier"})).to_string(),
+                event("task_complete", json!({"turn_id":"A"})).to_string(),
+                event("task_started", json!({"turn_id":"B"})).to_string(),
+                event("user_message", json!({"message":"first"})).to_string(),
+                message("user", "other raw submission").to_string(),
+                event(end, json!({"turn_id":"B"})).to_string(),
+            ];
+            if assistant_only {
+                records.extend([
+                    event("task_started", json!({"turn_id":"C"})).to_string(),
+                    message("assistant", "assistant only").to_string(),
+                    event(end, json!({"turn_id":"C"})).to_string(),
+                ]);
+            }
+            records.push(event("thread_rolled_back", json!({"num_turns":1})).to_string());
+            let expected = if assistant_only {
+                &["earlier", "first", "other raw submission"][..]
+            } else {
+                &["earlier"]
+            };
+            for preview in [false, true] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(records.clone(), preview)?),
+                    expected
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_image_mirrors_prefer_explicit_detail() -> anyhow::Result<()> {
+    let raw = |detail: Option<&str>| {
+        let mut row = message("user", "image");
+        row["payload"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_image","file_id":"img","detail":detail}));
+        row
+    };
+    let saved = |detail: Option<&str>| {
+        event(
+            "user_message",
+            json!({"message":"image","file_ids":["img"],"file_id_details":[detail]}),
+        )
+    };
+    for body in [
+        [
+            saved(Some("low")),
+            saved(None),
+            raw(Some("low")),
+            raw(Some("high")),
+        ],
+        [
+            saved(Some("low")),
+            saved(Some("high")),
+            raw(None),
+            raw(Some("high")),
+        ],
+    ] {
+        let mut rows = vec![event("task_started", json!({"turn_id":"turn"}))];
+        rows.extend(body);
+        rows.push(event("task_complete", json!({"turn_id":"turn"})));
+        assert_eq!(visible_text(&read_records(rows)?), ["image", "image"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_multipart_mirrors_preserve_event_text_and_unmatched_raw() -> anyhow::Result<()> {
+    let mut raw = message("user", "Next");
+    raw["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":" part"}));
+    for (saved, expected) in [
+        (Some("Next part"), vec!["Next part"]),
+        (Some("Next  part"), vec!["Next\n part", "Next  part"]),
+        (None, vec!["Next\n part"]),
+    ] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            raw.clone(),
+        ];
+        if let Some(saved) = saved {
+            rows.push(event("user_message", json!({"message":saved})));
+        }
+        rows.push(event("task_complete", json!({"turn_id":"turn"})));
+        for preview in [false, true] {
+            assert_eq!(
+                visible_text(&read_records_with_preview(rows.clone(), preview)?),
+                expected
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sampled_mirror_order_preserves_the_surviving_native_opener() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"older"})),
+        message("user", "Raw first"),
+        message("user", "Native first"),
+        event("user_message", json!({"message":"Native first"})),
+        event("user_message", json!({"message":"Raw first"})),
+        event("task_complete", json!({"turn_id":"older"})),
+    ];
+    rows.extend(std::iter::repeat_n(
+        json!({"type":"turn_context","payload":{"cwd":"/workspace","model":"fixture"}}),
+        1_100,
+    ));
+    rows.extend([
+        event("task_started", json!({"turn_id":"newer"})),
+        event("user_message", json!({"message":"withdrawn"})),
+        event("task_complete", json!({"turn_id":"newer"})),
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ]);
+    let (direct, sampled) = rollback_title_reads(&header, &rows, "")?;
+    assert!(sampled.snapshot.events.len() < direct.snapshot.events.len());
+    for read in [direct, sampled] {
+        assert_eq!(visible_text(&read.snapshot), ["Native first", "Raw first"]);
+        assert_eq!(
+            read.rollback_title,
+            omnis_adapters::RollbackTitle::Known(Some("Native first".into()))
+        );
     }
     Ok(())
 }

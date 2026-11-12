@@ -618,7 +618,20 @@ fn matches_request_receipt(request: &Value, completed: &Value) -> bool {
     };
     let mut saved = saved.iter().peekable();
     let is_image = |part: Option<&Value>| part.is_some_and(|p| p["type"] == "input_image");
-    for (index, part) in raw.iter().enumerate() {
+    let mut parts = raw.iter().enumerate();
+    while let Some((index, part)) = parts.next() {
+        if let Some(path) = super::local_audio_path(raw, index + 1) {
+            if saved
+                .next_if(|candidate| {
+                    candidate["type"] == "local_audio" && candidate["path"].as_str() == Some(path)
+                })
+                .is_none()
+            {
+                return false;
+            }
+            parts.nth(1);
+            continue;
+        }
         if saved
             .next_if(|candidate| same_input_part(part, candidate))
             .is_some()
@@ -1077,6 +1090,22 @@ impl Lineage {
         for (index, segment) in self.segments.iter().enumerate().skip(self.first_available) {
             let prefix = if damage.is_empty() {
                 read_prefix(segment, &mut |record, local| {
+                    if let InheritedRecord::Native(value) = &record
+                        && value["type"] == "event_msg"
+                        && matches!(
+                            value["payload"]["type"].as_str(),
+                            Some(
+                                "task_started"
+                                    | "turn_started"
+                                    | "task_complete"
+                                    | "turn_complete"
+                                    | "turn_aborted"
+                            )
+                        )
+                        && !owned_event(value, &segment.path)
+                    {
+                        return Ok(());
+                    }
                     visit(record, skipped + local, segment.recovery.is_some())
                 })
             } else {
@@ -1084,7 +1113,16 @@ impl Lineage {
                 read_prefix(segment, &mut |_, _| Ok(()))
             }?;
             match prefix {
-                PrefixRead::Complete(count) => skipped += count,
+                PrefixRead::Complete(count) => {
+                    skipped += count;
+                    if damage.is_empty() {
+                        visit(
+                            InheritedRecord::SegmentEnd(segment.position.end_ordinal_exclusive),
+                            skipped,
+                            segment.recovery.is_some(),
+                        )?;
+                    }
+                }
                 PrefixRead::Partial(reason, plan) => damage.push((index, reason, Some(plan))),
                 PrefixRead::Damaged(reason) => {
                     damage.push((index, reason, None));
@@ -1129,6 +1167,7 @@ fn access_denied(error: &anyhow::Error) -> bool {
 }
 
 pub(super) enum InheritedRecord {
+    SegmentEnd(u64),
     Native(Value),
     WithheldRequest { client_submission: bool },
     WithheldReply,
@@ -1623,11 +1662,10 @@ impl PrefixCursor {
             self.next = ordinal;
             self.max_reserved_gap = 0;
             let through_subagent_start = start.subagent.is_some_and(|cutoff| ordinal <= cutoff);
-            if self.damage == Some(MISSING_ORDINAL)
-                && inferred.is_none()
-                && start
-                    .subagent
-                    .is_some_and(|cutoff| cutoff.checked_add(1) == Some(ordinal))
+            let follows_subagent_start = start
+                .subagent
+                .is_some_and(|cutoff| cutoff.checked_add(1) == Some(ordinal));
+            if self.damage == Some(MISSING_ORDINAL) && inferred.is_none() && follows_subagent_start
             {
                 self.subagent_gap_placed = true;
             }
@@ -1639,7 +1677,8 @@ impl PrefixCursor {
                         && self.damage == Some(MISSING_ORDINAL)
                         && inferred.is_none()
                         && owned_event(record, &segment.path)
-                        && (request_text(record).is_some()
+                        && ((follows_subagent_start && message_role(record) == Some("assistant"))
+                            || request_text(record).is_some()
                             || is_non_turn_body(record)
                             || (recoverable_control(record, &segment.path)
                                 && !is_owned_rollback(record, &segment.path))))

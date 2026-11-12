@@ -54,7 +54,7 @@ const SCAN_DEPTH: usize = 5;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
-const MAX_CANONICAL_EVENTS: usize = 100_000;
+pub(super) const MAX_CANONICAL_EVENTS: usize = 100_000;
 const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;
 const MAX_TOOL_ARRAY_ITEMS: usize = 256;
 const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
@@ -1994,6 +1994,11 @@ impl CodexSession {
                            recovering: bool|
          -> Result<()> {
             let InheritedRecord::Native(record) = record else {
+                if let InheritedRecord::SegmentEnd(end) = record {
+                    history.end_segment(end, recovering);
+                    return Ok(());
+                }
+                history.native_start = None;
                 if matches!(record, InheritedRecord::WithheldWorkspace) {
                     withheld_workspaces += 1;
                     history.observe_workspace_gaps(inherited + withheld_workspaces);
@@ -2034,7 +2039,8 @@ impl CodexSession {
             history.push_recovered(
                 &mut builder,
                 &record,
-                recovering || skipped_before.total() > 0,
+                recovering,
+                skipped_before.total() + inherited,
             )?;
             if history
                 .records_seen
@@ -2410,7 +2416,7 @@ impl CodexSession {
             first_settings,
             first_title,
         ) = {
-            let (plan, history) = self.canonical_events_into(
+            let (mut plan, history) = self.canonical_events_into(
                 lineage,
                 builder,
                 CodexHistory::preview(),
@@ -2588,6 +2594,13 @@ struct TurnCheckpoint {
     tool_events: usize,
 }
 
+struct NativeTask {
+    id: String,
+    start: usize,
+    skipped: usize,
+    last_ordinal: Option<u64>,
+}
+
 struct CodexHistory {
     project_path: Option<PathBuf>,
     settings: workspace_check::WorkspaceSettings,
@@ -2603,7 +2616,7 @@ struct CodexHistory {
     pending_turn: Option<TurnCheckpoint>,
     seen_client_submission: Option<bool>,
     first_native_request: Option<u64>,
-    native_start: Option<(String, usize)>,
+    native_start: Option<NativeTask>,
     tool_events: usize,
     omitted_tool_events: usize,
     omitted_events: usize,
@@ -2690,7 +2703,7 @@ impl CodexHistory {
     }
 
     fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
-        self.push_recovered(builder, record, false)
+        self.push_recovered(builder, record, false, 0)
     }
 
     fn rollback(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
@@ -2720,6 +2733,7 @@ impl CodexHistory {
                 self.project_path = None;
                 self.workspace_record = None;
             }
+            self.native_start = None;
             self.last_visible = None;
             self.pending_turn = None;
             self.seen_client_submission = None;
@@ -2727,52 +2741,114 @@ impl CodexHistory {
         Ok(truncated)
     }
 
-    fn push_recovered(
-        &mut self,
-        builder: &mut EventBuilder,
-        record: &Value,
-        recovering: bool,
-    ) -> Result<Option<u64>> {
-        self.records_seen += 1;
-        let record_type = record.get("type").and_then(Value::as_str);
-        let event_type = (record_type == Some("event_msg"))
-            .then(|| string_at(record, &[&["payload", "type"]]))
-            .flatten();
-        if event_type == Some("thread_rolled_back") {
-            return self.rollback(builder, record);
+    fn end_segment(&mut self, end: u64, recovering: bool) {
+        if !recovering
+            || self
+                .native_start
+                .as_ref()
+                .is_some_and(|task| task.last_ordinal.and_then(|n| n.checked_add(1)) == Some(end))
+        {
+            self.finish_native_task();
         }
-        if matches!(event_type, Some("task_started" | "turn_started")) {
+        self.native_start = None;
+        self.pending_turn = None;
+        self.seen_client_submission = None;
+        self.last_visible = None;
+    }
+
+    fn finish_native_task(&mut self) {
+        let Some(task) = &self.native_start else {
+            return;
+        };
+        let first = self
+            .turns
+            .partition_point(|checkpoint| checkpoint.record < task.start);
+        if first == self.turns.len() {
+            if let Some(checkpoint) = self.pending_turn.take() {
+                self.turns.push(checkpoint);
+            }
+        } else if self.seen_client_submission == Some(true) {
+            for checkpoint in self.turns.iter_mut().skip(first + 1) {
+                checkpoint.collapsed = true;
+            }
+        }
+    }
+
+    fn observe_task_boundary(
+        &mut self,
+        builder: &EventBuilder,
+        record: &Value,
+        event_type: Option<&str>,
+        recovering: bool,
+        skipped: usize,
+    ) {
+        let start = matches!(event_type, Some("task_started" | "turn_started"));
+        let ordinal = record["ordinal"].as_u64();
+        if let Some(task) = &mut self.native_start {
+            let consecutive = task
+                .last_ordinal
+                .and_then(|n| n.checked_add(1))
+                .is_some_and(|n| Some(n) == ordinal);
+            if skipped != task.skipped || recovering && !consecutive {
+                self.native_start = None;
+            } else {
+                task.last_ordinal = ordinal;
+            }
+        }
+        if start {
+            self.finish_native_task();
             self.pending_turn = Some(self.checkpoint(builder));
             self.first_native_request = None;
             self.native_start = record["payload"]["turn_id"]
                 .as_str()
-                .filter(|id| !id.is_empty())
-                .map(|id| (id.to_owned(), self.records_seen));
+                .filter(|id| !id.is_empty() && (!recovering || ordinal.is_some()))
+                .map(|id| NativeTask {
+                    id: id.to_owned(),
+                    start: self.records_seen,
+                    skipped,
+                    last_ordinal: ordinal,
+                });
             self.seen_client_submission = self.native_start.as_ref().map(|_| false);
             self.last_visible = None;
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
-            if event_type != Some("turn_aborted")
-                && !recovering
-                && self.seen_client_submission == Some(true)
-                && let Some((id, start)) = self.native_start.take()
-                && record["payload"]["turn_id"] == id
+            if self
+                .native_start
+                .as_ref()
+                .is_some_and(|task| record["payload"]["turn_id"] == task.id)
             {
-                let first = self
-                    .turns
-                    .partition_point(|checkpoint| checkpoint.record < start);
-                for checkpoint in self.turns.iter_mut().skip(first + 1) {
-                    checkpoint.collapsed = true;
-                }
+                self.finish_native_task();
             }
+            self.native_start = None;
             self.pending_turn = None;
             self.seen_client_submission = None;
             self.last_visible = None;
         }
-        if recovering {
-            self.native_start = None;
+    }
+
+    fn push_recovered(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        recovering: bool,
+        skipped: usize,
+    ) -> Result<Option<u64>> {
+        self.records_seen += 1;
+        let record_type = record.get("type").and_then(Value::as_str);
+        let event_type = (record_type == Some("event_msg"))
+            .then(|| string_at(record, &[&["payload", "type"]]))
+            .flatten();
+        self.observe_task_boundary(builder, record, event_type, recovering, skipped);
+        if event_type == Some("thread_rolled_back") {
+            if record["payload"]["num_turns"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            {
+                self.finish_native_task();
+            }
+            return self.rollback(builder, record);
         }
         if record_type == Some("turn_context") {
             if self.pending_turn.is_none()
@@ -2922,8 +2998,12 @@ fn push_record(
                 match payload["type"].as_str() {
                     Some("task_started" | "turn_started") => {
                         *last_visible = payload["turn_id"].as_str().filter(|id| !id.is_empty()).map(|_| MirrorGroup::new(true));
+                        builder.track_codex_mirror_openers(last_visible.is_some());
                     }
-                    Some("task_complete" | "turn_complete" | "turn_aborted" | "thread_rolled_back") => *last_visible = None,
+                    Some("task_complete" | "turn_complete" | "turn_aborted" | "thread_rolled_back") => {
+                        *last_visible = None;
+                        builder.track_codex_mirror_openers(false);
+                    }
                     _ => {}
                 }
                 push_codex_session_metadata(builder, payload, timestamp, true);
@@ -2991,11 +3071,13 @@ fn push_codex_session_metadata(
 struct MirrorGroup {
     scoped: bool,
     next: usize,
-    order: BTreeMap<usize, (MediaDigest, bool)>,
-    last_text: Option<MediaDigest>,
+    order: BTreeMap<usize, bool>,
+    last_text: Option<(MediaDigest, Option<MediaDigest>)>,
     kind: EventKind,
-    pending: HashMap<(MediaDigest, bool), PendingMessages>,
+    pending: HashMap<bool, PendingMessages>,
     paired_position: Option<usize>,
+    native_position: Option<usize>,
+    reorder: bool,
 }
 
 enum MirrorObservation {
@@ -3013,6 +3095,8 @@ impl MirrorGroup {
             last_text: None,
             pending: HashMap::new(),
             paired_position: None,
+            native_position: None,
+            reorder: false,
         }
     }
 
@@ -3028,19 +3112,26 @@ impl MirrorGroup {
         position: Option<usize>,
     ) -> MirrorObservation {
         let group = slot.get_or_insert_with(|| Self::new(false));
-        if group.kind != message.kind || (!group.scoped && group.last_text != Some(message.text)) {
+        if group.kind != message.kind
+            || (!group.scoped
+                && !group
+                    .last_text
+                    .is_some_and(|(text, alternative)| message.matches_text(text, alternative)))
+        {
             group.pending.clear();
             group.order.clear();
         }
         group.kind.clone_from(&message.kind);
-        group.last_text = Some(message.text);
+        group.last_text = Some((message.text, message.alternative));
         group.paired_position = None;
-        let digest = message.text;
-        let opposite = (digest, !message.event);
+        group.reorder = false;
+        let opposite = !message.event;
         if let Some(candidates) = group.pending.get_mut(&opposite)
             && let Some(index) = candidates.matching(&message)
         {
-            let position = candidates.rows[&index].1;
+            let (candidate, prior) = &candidates.rows[&index];
+            let prefer_text = candidate.text != message.text && message.event;
+            let prior = *prior;
             if message.kind == EventKind::MessageUser {
                 candidates.remove(index);
                 group.order.remove(&index);
@@ -3048,14 +3139,21 @@ impl MirrorGroup {
                     group.pending.remove(&opposite);
                 }
             }
-            group.paired_position = position;
-            return MirrorObservation::Paired(position);
+            group.paired_position = prior;
+            if message.event && message.kind == EventKind::MessageUser && group.scoped {
+                group.reorder = prior < group.native_position || prefer_text;
+                group.native_position = if group.reorder { position } else { prior };
+            }
+            return MirrorObservation::Paired(prior);
         }
         if message.kind != EventKind::MessageUser {
             group.pending.clear();
             group.order.clear();
         }
-        let key = (digest, message.event);
+        if message.event && message.kind == EventKind::MessageUser && group.scoped {
+            group.native_position = position;
+        }
+        let key = message.event;
         group
             .pending
             .entry(key)
@@ -3084,9 +3182,11 @@ struct PendingMessages {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum MirrorKey {
+    Text(MediaDigest),
     Client(Option<MediaDigest>),
     Item(Option<MediaDigest>),
     Media(usize, MediaDigest),
+    Detail(usize, Option<MediaDigest>),
 }
 
 impl PendingMessages {
@@ -3113,20 +3213,43 @@ impl PendingMessages {
     }
 
     fn matching(&self, message: &VisibleMessage) -> Option<usize> {
-        let matches = |index: &usize| self.rows[index].0.mirrors(message);
-        let keys = message.lookup_keys(true).into_iter().min_by_key(|keys| {
+        let groups = message.lookup_keys(true);
+        let mut max = (0, 0, true);
+        for key in groups
+            .iter()
+            .filter_map(|keys| keys.first())
+            .filter(|key| self.indexes.contains_key(key))
+        {
+            match key {
+                MirrorKey::Client(Some(_)) | MirrorKey::Item(Some(_)) => max.0 += 1,
+                MirrorKey::Detail(_, Some(_)) => max.1 += 1,
+                _ => {}
+            }
+        }
+        let keys = groups.into_iter().min_by_key(|keys| {
             keys.iter()
                 .filter_map(|key| self.indexes.get(key))
                 .map(BTreeSet::len)
                 .sum::<usize>()
-        });
-        if let Some(keys) = keys {
-            keys.iter()
-                .filter_map(|key| self.indexes.get(key))
-                .find_map(|rows| rows.iter().rev().copied().find(matches))
-        } else {
-            self.rows.keys().rev().copied().find(matches)
+        })?;
+        let mut best = None;
+        let mut consider = |index: &usize| {
+            let candidate = &self.rows[index].0;
+            if candidate.mirrors(message) {
+                let score = candidate.specificity(message);
+                if best.is_none_or(|(prev, pos)| score > prev || (score == prev && *index < pos)) {
+                    best = Some((score, *index));
+                }
+                return score == max;
+            }
+            false
+        };
+        for rows in keys.iter().filter_map(|key| self.indexes.get(key)) {
+            if rows.iter().any(&mut consider) {
+                break;
+            }
         }
+        best.map(|(_, index)| index)
     }
 }
 
@@ -3134,6 +3257,7 @@ impl PendingMessages {
 struct VisibleMessage {
     kind: EventKind,
     text: MediaDigest,
+    alternative: Option<MediaDigest>,
     event: bool,
     item_id: Option<String>,
     client_id: Option<String>,
@@ -3224,9 +3348,27 @@ impl VisibleMessage {
         } else {
             None
         };
+        let alternative = if !event
+            && kind == EventKind::MessageUser
+            && payload["content"]
+                .as_array()
+                .is_some_and(|parts| parts.len() > 1)
+        {
+            let (parts, _) = message_parts(payload);
+            (parts.len() > 1).then(|| {
+                let mut hash = Sha256::new();
+                for part in parts {
+                    hash.update(part.as_bytes());
+                }
+                hash.finalize().into()
+            })
+        } else {
+            None
+        };
         Self {
             kind,
             text: media_digest(text),
+            alternative,
             event,
             item_id,
             client_id: payload["client_id"]
@@ -3238,7 +3380,12 @@ impl VisibleMessage {
     }
 
     fn lookup_keys(&self, matching: bool) -> Vec<Vec<MirrorKey>> {
-        let mut groups = Vec::new();
+        let mut groups = vec![
+            std::iter::once(self.text)
+                .chain(self.alternative)
+                .map(MirrorKey::Text)
+                .collect(),
+        ];
         if self.kind != EventKind::MessageUser {
             return groups;
         }
@@ -3256,6 +3403,16 @@ impl VisibleMessage {
             }
         }
         for (index, media) in self.media.iter().flatten().enumerate() {
+            if let MessageMedia::Image { detail, .. } = media {
+                let digest = detail.as_deref().map(media_digest);
+                if !matching || digest.is_some() {
+                    let mut keys = vec![MirrorKey::Detail(index, digest)];
+                    if matching {
+                        keys.push(MirrorKey::Detail(index, None));
+                    }
+                    groups.push(keys);
+                }
+            }
             let refs = match media {
                 MessageMedia::Image {
                     url, file, path, ..
@@ -3274,9 +3431,40 @@ impl VisibleMessage {
         groups
     }
 
+    fn specificity(&self, other: &Self) -> (usize, usize, bool) {
+        let ids = usize::from(self.item_id.is_some() && other.item_id.is_some())
+            + usize::from(self.client_id.is_some() && other.client_id.is_some());
+        let details = self
+            .media
+            .iter()
+            .flatten()
+            .zip(other.media.iter().flatten())
+            .filter(|(left, right)| {
+                matches!(
+                    (left, right),
+                    (
+                        MessageMedia::Image {
+                            detail: Some(_),
+                            ..
+                        },
+                        MessageMedia::Image {
+                            detail: Some(_),
+                            ..
+                        }
+                    )
+                )
+            })
+            .count();
+        (ids, details, self.text == other.text)
+    }
+
+    fn matches_text(&self, text: MediaDigest, alternative: Option<MediaDigest>) -> bool {
+        self.text == text || self.alternative == Some(text) || alternative == Some(self.text)
+    }
+
     fn mirrors(&self, other: &Self) -> bool {
         self.event != other.event
-            && self.text == other.text
+            && self.matches_text(other.text, other.alternative)
             && self.kind == other.kind
             && (self.kind != EventKind::MessageUser
                 || (self
@@ -3465,17 +3653,21 @@ fn push_message_text(
     last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let message = VisibleMessage::new(record, kind.clone(), text);
-    if matches!(
-        MirrorGroup::observe(
-            last_visible,
-            message,
-            usize::try_from(builder.checkpoint()).ok()
-        ),
-        MirrorObservation::Paired(_)
-    ) {
-        return false;
+    let observation = MirrorGroup::observe(
+        last_visible,
+        message,
+        usize::try_from(builder.checkpoint()).ok(),
+    );
+    let paired = matches!(observation, MirrorObservation::Paired(_));
+    if let MirrorObservation::Paired(position) = observation {
+        if !last_visible.as_ref().is_some_and(|group| group.reorder) || text.is_empty() {
+            return false;
+        }
+        if let Some(position) = position.and_then(|pos| u64::try_from(pos).ok()) {
+            builder.remove_codex_mirror(position);
+        }
     }
-    let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
+    let user_turn = !paired && kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
     }

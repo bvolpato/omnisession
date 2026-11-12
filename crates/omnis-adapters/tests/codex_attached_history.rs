@@ -895,6 +895,53 @@ fn valid_tool_catalog_preserves_the_attached_workspace() -> Result<()> {
     Ok(())
 }
 
+fn add_receipt_media(rows: &mut [Value], diff: &str) {
+    if diff.contains("image") || diff == "wrong detail" {
+        rows[4]["payload"]["content"].as_array_mut().unwrap().push(
+            json!({"type":"input_image","image_url":"data:image/png;base64,Yw==","detail":"high"}),
+        );
+        rows[5]["payload"]["item"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"image","image_url":"data:image/png;base64,Yw=="}));
+    }
+    if diff == "matching wrapped image" {
+        let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
+        parts.insert(1, json!({"type":"input_text","text":"<image>"}));
+        parts.push(json!({"type":"input_text","text":"</image>"}));
+    } else if diff == "matching uploaded audio" {
+        rows[4]["payload"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_audio","file_id":"audio-file"}));
+        rows[5]["payload"]["item"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"audio","file_id":"audio-file"}));
+    }
+    if diff.ends_with("local audio") {
+        let path = "/synthetic/voice memo.wav";
+        let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
+        parts.extend([
+            json!({"type":"input_text","text":format!(r#"<audio name=[Audio #1] path="{path}">"#)}),
+            json!({"type":"input_audio","audio_url":"data:audio/wav;base64,UklGRg=="}),
+            json!({"type":"input_text","text":"</audio>"}),
+        ]);
+        if diff == "incomplete local audio" {
+            parts.pop();
+        }
+        let saved = if diff == "wrong local audio" {
+            "/synthetic/other.wav"
+        } else {
+            path
+        };
+        rows[5]["payload"]["item"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"local_audio","path":saved}));
+    }
+}
+
 #[test]
 fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> {
     let home = tempfile::tempdir()?;
@@ -911,6 +958,9 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
         "matching image",
         "matching wrapped image",
         "matching uploaded audio",
+        "matching local audio",
+        "wrong local audio",
+        "incomplete local audio",
         "wrong image",
         "wrong detail",
         "ambiguous image",
@@ -921,27 +971,7 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
         "wrong text",
     ] {
         let mut rows = child.clone();
-        if diff.contains("image") || diff == "wrong detail" {
-            rows[4]["payload"]["content"].as_array_mut().unwrap().push(json!({"type":"input_image","image_url":"data:image/png;base64,Yw==","detail":"high"}));
-            rows[5]["payload"]["item"]["content"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"type":"image","image_url":"data:image/png;base64,Yw=="}));
-        }
-        if diff == "matching wrapped image" {
-            let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
-            parts.insert(1, json!({"type":"input_text","text":"<image>"}));
-            parts.push(json!({"type":"input_text","text":"</image>"}));
-        } else if diff == "matching uploaded audio" {
-            rows[4]["payload"]["content"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"type":"input_audio","file_id":"audio-file"}));
-            rows[5]["payload"]["item"]["content"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"type":"audio","file_id":"audio-file"}));
-        }
+        add_receipt_media(&mut rows, diff);
         let receipt = &mut rows[5]["payload"];
         match diff {
             "wrong image" => {
@@ -1261,10 +1291,14 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
             if !copied_rows {
                 rows.drain(1..3);
             }
+            let immediate_reply = !copied_rows && !foreign_anchor && !marker;
+            if immediate_reply {
+                rows.pop();
+            }
             if marker {
                 rows.push(json!({"type":"event_msg","ordinal":anchor+1,"payload":{"type":"task_started","turn_id":"local"}}));
             }
-            let ordinal = anchor + 1 + usize::from(marker);
+            let ordinal = anchor + usize::from(!immediate_reply) + usize::from(marker);
             let mut reply = message(ordinal, "local reply");
             reply["payload"]["role"] = json!("assistant");
             reply["payload"]["content"][0]["type"] = json!("output_text");
