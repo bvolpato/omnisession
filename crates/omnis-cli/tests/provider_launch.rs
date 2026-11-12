@@ -808,8 +808,11 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             )
             .expect("write synthetic Grok summary");
             let update = |kind: &str, text: &str| {
-                json!({"params": {"update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}}})
-                    .to_string()
+                json!({"params": {
+                    "sessionId": GROK_SOURCE_ID,
+                    "update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+                }})
+                .to_string()
             };
             fs::write(
                 session.join("updates.jsonl"),
