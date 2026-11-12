@@ -134,10 +134,14 @@ impl PlanReceipts {
         *first = Some(first.map_or(position, |prior| prior.min(position)));
     }
 
-    pub(super) fn rollback(&mut self, cut: u64) {
+    pub(super) fn rollback(&mut self, removed: impl Fn(u64) -> bool) {
         self.plans.retain(|_, plan| {
-            plan.proposal = plan.proposal.filter(|&position| position <= cut);
-            plan.display = plan.display.filter(|&position| position <= cut);
+            plan.proposal = plan
+                .proposal
+                .filter(|&position| position.checked_sub(1).is_none_or(|owner| !removed(owner)));
+            plan.display = plan
+                .display
+                .filter(|&position| position.checked_sub(1).is_none_or(|owner| !removed(owner)));
             plan.proposal.is_some() || plan.display.is_some()
         });
     }

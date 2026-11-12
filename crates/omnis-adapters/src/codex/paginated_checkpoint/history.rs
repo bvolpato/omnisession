@@ -122,6 +122,17 @@ impl CheckpointHistory {
             })
     }
 
+    /// Return retained public items in model order, with the token allowance of any partial copy.
+    pub(in super::super) fn legacy_retained_items(
+        &self,
+        ordinal: u64,
+    ) -> impl Iterator<Item = (super::LegacySource, Option<usize>)> + '_ {
+        self.active_legacy()
+            .filter(|window| window.ordinal == ordinal)
+            .into_iter()
+            .flat_map(LegacyWindow::retained_items)
+    }
+
     pub(in super::super) fn legacy_summary_active(&self, ordinal: u64) -> bool {
         self.active_legacy()
             .is_some_and(|window| window.summary_active(ordinal))

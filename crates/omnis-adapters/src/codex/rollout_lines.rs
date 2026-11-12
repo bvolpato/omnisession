@@ -10,6 +10,8 @@ mod realtime;
 pub(super) const TRANSCRIPT_SEGMENT: &str = "realtime_item.transcript_segment";
 pub(super) use events::{ROLLBACK_TAG, rollback_turns};
 
+pub(super) use events::classify as classify_event;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Admission {
     Complete,
@@ -238,7 +240,7 @@ impl RolloutLines {
         }
         let wire = match record["type"].as_str() {
             Some("response_item") => Wire::checked(checkpoint_wire::response_record(record)),
-            Some("event_msg") => events::classify(&record["payload"]),
+            Some("event_msg") => classify_event(&record["payload"]),
             Some("compacted") if checkpoint_mode.is_some() => Wire::Decoded,
             _ => Wire::Undetermined,
         };

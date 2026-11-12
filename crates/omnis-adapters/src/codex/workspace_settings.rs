@@ -5,6 +5,12 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
+pub(super) fn belongs_to(event: &Value, session: &str) -> bool {
+    event["thread_id"]
+        .as_str()
+        .is_some_and(|owner| super::workspace_check::same_thread(session, owner))
+}
+
 /// Returns the directory from the saved settings objects that Codex 0.167.1 can restore.
 pub(super) fn saved_directory(settings: &Value) -> Option<PathBuf> {
     let cwd = native_path(&settings["cwd"])?;

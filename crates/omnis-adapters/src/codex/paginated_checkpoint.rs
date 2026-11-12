@@ -17,6 +17,13 @@ pub(super) use legacy::{LegacyInput, LegacySource};
 pub(super) use turns::{CheckpointSelection, CheckpointTurns};
 
 type DigestKey = [u8; 32];
+pub(super) type PublicCopy = (u64, Option<DigestKey>);
+#[derive(Default)]
+pub(super) struct MatchedDisplays {
+    pub(super) items: HashMap<usize, PublicCopy>,
+    pub(super) plans: HashMap<usize, (u64, DigestKey)>,
+    pub(super) async_questions: HashMap<usize, (u64, DigestKey)>,
+}
 type CompletedPositions = HashMap<(super::CompletedKind, DigestKey, DigestKey), Option<u64>>;
 
 pub(super) struct EffectiveRollback {
@@ -61,7 +68,8 @@ impl PaginatedCheckpoint {
         history: &CodexHistory,
         builder: &mut EventBuilder,
         payload: &Value,
-    ) -> Option<Self> {
+    ) -> Option<(Self, MatchedDisplays)> {
+        let mut matched = MatchedDisplays::default();
         let items = payload["replacement_history"].as_array()?;
         let start = items.len().saturating_sub(MAX_CANONICAL_EVENTS);
         let metadata = payload["replacement_history_metadata"].as_array();
@@ -92,10 +100,8 @@ impl PaginatedCheckpoint {
                 continue;
             }
             if let Some((seq, spelling)) = answer_copies.get_plan(item) {
-                checkpoint.positions.entry(seq).or_default().push(Copy {
-                    index,
-                    answer: Some(spelling),
-                });
+                matched.plans.insert(index, (seq, spelling));
+                checkpoint.record_copy(index, seq, Some(spelling));
             }
             let witnessed = match item["role"].as_str() {
                 Some("user") => input_copies.get(item).map(|seq| (seq, None)),
@@ -115,11 +121,8 @@ impl PaginatedCheckpoint {
             }) else {
                 continue;
             };
-            checkpoint
-                .positions
-                .entry(seq)
-                .or_default()
-                .push(Copy { index, answer });
+            matched.items.insert(index, (seq, answer));
+            checkpoint.record_copy(index, seq, answer);
             if instruction && item["role"] == "user" {
                 if history
                     .paginated_inputs
@@ -139,30 +142,29 @@ impl PaginatedCheckpoint {
             metadata.map(Vec::as_slice),
             start,
         ) {
-            checkpoint.positions.entry(seq).or_default().push(Copy {
-                index,
-                answer: None,
-            });
+            matched.items.insert(index, (seq, None));
+            checkpoint.record_copy(index, seq, None);
             if let Some((question, spelling)) = async_display_copy(
                 &items[index],
                 history.paginated_answers.call_turn(seq, &aliases),
                 builder,
                 &completed,
             ) {
-                checkpoint
-                    .positions
-                    .entry(question)
-                    .or_default()
-                    .push(Copy {
-                        index,
-                        answer: Some(spelling),
-                    });
+                matched.async_questions.insert(index, (question, spelling));
+                checkpoint.record_copy(index, question, Some(spelling));
             }
             if let Some(call) = call {
                 checkpoint.linked_calls.insert(index, call);
             }
         }
-        Some(checkpoint)
+        Some((checkpoint, matched))
+    }
+
+    fn record_copy(&mut self, index: usize, sequence: u64, answer: Option<DigestKey>) {
+        self.positions
+            .entry(sequence)
+            .or_default()
+            .push(Copy { index, answer });
     }
 
     fn new(ordinal: u64, display_end: u64, items: &[Value], start: usize) -> Self {
@@ -245,18 +247,6 @@ impl PaginatedCheckpoint {
             });
         }
         effect
-    }
-
-    pub(super) fn display_end(&self) -> u64 {
-        self.display_end
-    }
-
-    pub(super) fn first_retained_index(&self, seq: u64) -> Option<usize> {
-        self.positions
-            .get(&seq)?
-            .iter()
-            .find(|copy| !self.item_withdrawn(copy.index))
-            .map(|copy| copy.index)
     }
 
     pub(super) fn source_ordinal(&self) -> u64 {

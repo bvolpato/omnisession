@@ -15,6 +15,40 @@ fn hook_request(texts: &[&str], metadata: Value) -> Value {
 const HOOK: &str = r#"<hook_prompt hook_run_id="run-a">Private &amp; more.</hook_prompt>"#;
 
 #[test]
+fn a_compacted_multipart_request_with_a_hook_keeps_its_original_turn() {
+    let mixed = hook_request(
+        &["first ", HOOK, "second"],
+        json!({"content_item_kinds":["user.text","hooks.additional_context","user.text"]}),
+    );
+    let hidden = hook_request(
+        &[HOOK],
+        json!({"content_item_kinds":["hooks.additional_context"]}),
+    );
+    let mut records = vec![
+        message("user", "keep"),
+        page_user("discard", "request", "first second"),
+        json!({"type":"compacted","payload":{"message":"","replacement_history":[mixed["payload"],hidden["payload"]]}}),
+    ];
+    let snapshot = read_records(records.clone()).unwrap();
+    let imported = omnis_core::import_conversation(&snapshot);
+    assert_eq!(
+        imported
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first \nsecond"]
+    );
+    records.push(event("thread_rolled_back", json!({"num_turns":1})));
+    for preview in [false, true] {
+        assert_eq!(
+            visible_text(&read_records_with_preview(records.clone(), preview).unwrap()),
+            ["keep"]
+        );
+    }
+}
+
+#[test]
 fn stop_hook_copies_do_not_reach_preview_transfer_or_rollback_history() {
     let raw = hook_request(
         &[

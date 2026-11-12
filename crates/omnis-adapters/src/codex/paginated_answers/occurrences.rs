@@ -52,15 +52,14 @@ fn raw_text(item: &Value) -> Option<Hash> {
 
 #[derive(Clone, Copy)]
 struct Raw {
+    reserved: Option<(u64, Option<chrono::DateTime<chrono::Utc>>)>,
     turn: Option<Hash>,
     id: Option<Hash>,
     wire: Option<Hash>,
     text: Option<Hash>,
     plan: Option<Hash>,
     ordinal: u64,
-    sequence: u64,
     window: u64,
-    removed: bool,
 }
 
 impl Raw {
@@ -72,15 +71,14 @@ impl Raw {
             .flatten()
             .map_or((wire, None), |(outer, plan)| (outer, Some(plan)));
         Self {
+            reserved: None,
             id: digest(&item["id"]),
             turn: digest(&item["internal_chat_message_metadata_passthrough"]["turn_id"]),
             wire,
             text,
             plan,
             ordinal,
-            sequence: 0,
             window: 0,
-            removed: false,
         }
     }
 
@@ -135,8 +133,15 @@ struct Group {
 }
 
 #[derive(Clone, Copy)]
+struct Witness {
+    index: usize,
+    ordinal: u64,
+    removed: bool,
+}
+
+#[derive(Clone, Copy)]
 enum Evidence {
-    Witness(Raw),
+    Witness(Witness),
     Unverified,
 }
 
@@ -214,20 +219,36 @@ impl<'a> Matches<'a> {
         }
     }
 
-    fn witness(&self, group: &Group) -> Option<Raw> {
-        let &(mut raw, ref position) = self.rows.get(group.kept.or(group.last)?)?;
-        raw.removed = position.removed;
-        Some(raw.normalized(self.aliases))
+    fn witness(&self, group: &Group) -> Option<Witness> {
+        let index = group.kept.or(group.last)?;
+        let (_, position) = &self.rows[index];
+        Some(Witness {
+            index,
+            ordinal: position.ordinal,
+            removed: position.removed,
+        })
+    }
+
+    fn raw(&self, witness: Witness) -> Raw {
+        self.rows[witness.index].0.normalized(self.aliases)
     }
 
     fn unique(&self, raw: Raw, shown: Shown) -> bool {
-        let key = match (shown.plan, raw.key(), raw.turn, raw.text) {
+        let group = match (shown.plan, raw.key(), raw.turn, raw.text) {
             (Some(plan), _, Some(turn), _) => Key::Text(true, turn, plan),
             (None, Some(id), _, Some(text)) => Key::Version(id, text),
+            (None, Some(id), _, None) => Key::Id(id),
             (None, None, Some(turn), Some(text)) => Key::Text(false, turn, text),
             _ => return false,
         };
-        self.groups.get(&key).is_some_and(|group| !group.several)
+        self.groups.get(&group).is_some_and(|group| !group.several)
+    }
+
+    fn projection_slot(&self, witness: Witness, shown: Shown) -> Option<u64> {
+        let raw = self.raw(witness);
+        let (slot, _) = raw.reserved?;
+        self.unique(raw, shown)
+            .then_some(slot + u64::from(shown.plan.is_some()))
     }
 
     fn identified(&self, shown: Shown, id: NativeId) -> Option<Evidence> {
@@ -308,14 +329,15 @@ impl<'a> Matches<'a> {
         let group = self.groups.get(&shown.text_key(turn))?;
         if !group.several
             && group.displays == 1
-            && let Some(raw) = self.witness(group)
+            && let Some(witness) = self.witness(group)
+            && let raw = self.raw(witness)
             && (self.replacement || raw.window == shown.window)
             && (shown.plan.is_some()
                 || raw
                     .key()
                     .is_none_or(|k| self.groups[&Key::Id(k)].displays == 0))
         {
-            return Some(Evidence::Witness(raw));
+            return Some(Evidence::Witness(witness));
         }
         (group.removed || self.unidentified_neighbor(shown, turn)).then_some(Evidence::Unverified)
     }
@@ -370,6 +392,54 @@ struct Ruling {
     copies: Vec<(Hash, u64, u64)>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PendingPlanSlot {
+    pub(super) ordinal: u64,
+    pub(super) sequence: u64,
+    pub(super) index: u64,
+    pub(super) plan: bool,
+}
+
+pub(in super::super) struct PendingPlanWindow {
+    pub(super) ordinal: u64,
+    rows: VecDeque<(Raw, Position)>,
+}
+
+impl PendingPlanWindow {
+    pub(super) fn read(ordinal: u64, items: &[Value], plan_mode: impl Fn(&Value) -> bool) -> Self {
+        Self {
+            ordinal,
+            rows: replacement_rows(items, plan_mode),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+fn replacement_rows(
+    items: &[Value],
+    plan_mode: impl Fn(&Value) -> bool,
+) -> VecDeque<(Raw, Position)> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_reply(item))
+        .map(|(index, item)| {
+            let ordinal = index as u64;
+            (
+                Raw::new(item, ordinal, plan_mode(item)),
+                Position {
+                    ordinal,
+                    order: None,
+                    removed: false,
+                },
+            )
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct AnswerOccurrences {
     model: VecDeque<(Raw, Position)>,
@@ -389,7 +459,7 @@ impl AnswerOccurrences {
         &mut self,
         record: &Value,
         ordinal: u64,
-        sequence: u64,
+        reserved: Option<u64>,
         plan_mode: bool,
         active_turn: Option<&str>,
     ) {
@@ -409,8 +479,9 @@ impl AnswerOccurrences {
             slot.insert(ordinal);
             self.expected_plans.insert(ordinal, turn);
         }
-        raw.sequence = sequence;
         raw.window = self.window;
+        raw.reserved =
+            reserved.map(|seq| (seq, super::super::parse_timestamp(record.get("timestamp"))));
         self.model.push_back((raw, Position::new(record, ordinal)));
     }
 
@@ -489,26 +560,158 @@ impl AnswerOccurrences {
             .chain(self.shown.values().copied())
     }
 
+    pub(super) fn archived(&self, seq: u64, digest: Hash) -> Option<&str> {
+        self.prior
+            .iter()
+            .rev()
+            .find(|(s, _)| s.seq == seq && s.text == digest)
+            .map(|(_, s)| s.as_str())
+    }
+
+    pub(super) fn project_revisions(
+        &self,
+        builder: &mut super::EventBuilder,
+        checkpoints: &CheckpointHistory,
+        end: u64,
+        projected: &mut BTreeMap<u64, Position>,
+    ) -> bool {
+        // The display keeps its first position. The model keeps each accepted reply in source order.
+        let mut events = BTreeMap::new();
+        for shown in self.shown.values().filter(|shown| shown.revised) {
+            let projection = self.project(shown.seq, checkpoints, None);
+            if projection.versions.is_empty() {
+                continue;
+            }
+            let mut older: Vec<&str> = Vec::new();
+            for version in projection.versions {
+                if let Some(text) = version.spelling
+                    && !older.contains(&text)
+                {
+                    older.push(text);
+                }
+                let (ordinal, sequence) = match version.anchor {
+                    ReplyAnchor::Source { ordinal, sequence } if sequence >= end => {
+                        (ordinal, sequence)
+                    }
+                    // The checkpoint writer already materialized these native entries in order.
+                    ReplyAnchor::Checkpoint | ReplyAnchor::Source { .. } => continue,
+                };
+                let Ok(index) = self
+                    .model
+                    .binary_search_by_key(&ordinal, |(raw, _)| raw.ordinal)
+                else {
+                    continue;
+                };
+                let (raw, position) = &self.model[index];
+                let Some(mut event) = builder.event_at_mut(shown.seq).cloned() else {
+                    continue;
+                };
+                let Some(text) = version.spelling.or_else(|| event.payload["text"].as_str()) else {
+                    continue;
+                };
+                event.sequence = sequence;
+                event.timestamp = raw.reserved.and_then(|(_, timestamp)| timestamp);
+                event.source.raw_record_type = Some("response_item.message".into());
+                event.payload =
+                    serde_json::json!({"text":text,"omnisession_codex_replacement":true});
+                events.insert(sequence, event);
+                projected.insert(
+                    sequence,
+                    Position {
+                        ordinal,
+                        order: position.order,
+                        removed: false,
+                    },
+                );
+            }
+            if let Some(display) = builder.event_at_mut(shown.seq) {
+                display.payload["omnisession_codex_positioned_reply"] = older.into();
+            }
+        }
+        let positioned = !events.is_empty();
+        builder.fill_reserved_sequences(events.into_values().collect());
+        positioned
+    }
+
+    pub(super) fn placement(
+        &self,
+        aliases: &TurnAliases,
+        positions: &mut BTreeMap<u64, u64>,
+        pending: bool,
+    ) -> HashMap<super::ScopedMessageId, Option<u64>> {
+        let matches = Matches::build(self, &self.model, aliases, false);
+        let mut published = HashMap::new();
+        let mut publish = |key: Scoped, seq| {
+            if pending {
+                published
+                    .entry((true, key.0, key.1))
+                    .and_modify(|prior| {
+                        if *prior != Some(seq) {
+                            *prior = None;
+                        }
+                    })
+                    .or_insert(Some(seq));
+            }
+        };
+        for &shown in self.shown.values() {
+            let scoped = scope(shown.key, aliases);
+            if shown.plan.is_none() {
+                publish(scoped, shown.seq);
+            }
+            positions.remove(&shown.seq);
+            if let Some(Evidence::Witness(witness)) = matches.find(shown)
+                && let raw = matches.raw(witness)
+                && matches.unique(raw, shown)
+            {
+                positions.insert(shown.seq, raw.ordinal);
+                if shown.plan.is_none()
+                    && let Some(key) = raw.turn.zip(raw.id)
+                {
+                    publish(key, shown.seq);
+                }
+            }
+        }
+        published
+    }
+
     pub(super) fn confirmed(
         &self,
         aliases: &TurnAliases,
         items: &[Value],
         plan_mode: impl Fn(&Value) -> bool,
     ) -> ConfirmedAnswers {
-        let source = Matches::build(self, &self.model, aliases, false);
-        let mut confirmed = ConfirmedAnswers {
-            aliases: aliases.clone(),
-            copies: Default::default(),
-        };
         let incomplete_ids = items.iter().any(|item| {
             is_reply(item)
                 && (!item["id"].is_string()
                     || !item["internal_chat_message_metadata_passthrough"]["turn_id"].is_string())
         });
+        self.confirmed_rows(aliases, incomplete_ids, None, || {
+            replacement_rows(items, plan_mode)
+        })
+    }
+
+    fn confirmed_rows<R: std::borrow::Borrow<VecDeque<(Raw, Position)>>>(
+        &self,
+        aliases: &TurnAliases,
+        incomplete_ids: bool,
+        pending_checkpoint: Option<u64>,
+        rows: impl FnOnce() -> R,
+    ) -> ConfirmedAnswers {
+        let source = Matches::build(self, &self.model, aliases, false);
+        let mut confirmed = ConfirmedAnswers {
+            aliases: aliases.clone(),
+            copies: Default::default(),
+        };
         let mut pending = Vec::new();
         for shown in self.versions() {
             match source.find(shown) {
-                Some(Evidence::Witness(raw)) => {
+                Some(Evidence::Witness(witness)) => {
+                    let raw = source.raw(witness);
+                    if pending_checkpoint
+                        .is_some_and(|ordinal| raw.ordinal > ordinal || !source.unique(raw, shown))
+                    {
+                        continue;
+                    }
                     confirmed.insert(raw, shown);
                     if incomplete_ids || raw.turn.is_none() || raw.id.is_none() {
                         pending.push((shown, Some(raw)));
@@ -520,23 +723,11 @@ impl AnswerOccurrences {
         }
         drop(source);
         if !pending.is_empty() {
-            let rows = items
-                .iter()
-                .filter(|item| is_reply(item))
-                .map(|item| {
-                    (
-                        Raw::new(item, 0, plan_mode(item)),
-                        Position {
-                            ordinal: 0,
-                            order: None,
-                            removed: false,
-                        },
-                    )
-                })
-                .collect();
-            let replacement = Matches::build(self, &rows, aliases, true);
+            let rows = rows();
+            let replacement = Matches::build(self, rows.borrow(), aliases, true);
             for (shown, source) in pending {
-                if let Some(Evidence::Witness(raw)) = replacement.find(shown)
+                if let Some(Evidence::Witness(witness)) = replacement.find(shown)
+                    && let raw = replacement.raw(witness)
                     && source.is_none_or(|s| {
                         s.wire == raw.wire
                             && s.id.zip(raw.id).is_none_or(|(a, b)| a == b)
@@ -548,6 +739,67 @@ impl AnswerOccurrences {
             }
         }
         confirmed
+    }
+
+    pub(super) fn resolve_plan_window(
+        &self,
+        window: &PendingPlanWindow,
+        slots: &[PendingPlanSlot],
+        builder: &mut super::EventBuilder,
+        aliases: &TurnAliases,
+        model_positions: &mut BTreeMap<u64, u64>,
+    ) {
+        let incomplete_ids = window
+            .rows
+            .iter()
+            .any(|(raw, _)| raw.turn.is_none() || raw.id.is_none());
+        let confirmed = self.confirmed_rows(aliases, incomplete_ids, Some(window.ordinal), || {
+            &window.rows
+        });
+        let matches = Matches::build(self, &window.rows, aliases, true);
+        let versions: HashMap<_, _> = self.versions().map(|s| ((s.seq, s.text), s)).collect();
+        for slot in slots.iter().filter(|slot| slot.ordinal == window.ordinal) {
+            let Ok(index) = window
+                .rows
+                .binary_search_by_key(&slot.index, |(raw, _)| raw.ordinal)
+            else {
+                continue;
+            };
+            let raw = window.rows[index].0.normalized(aliases);
+            let Some(version) = raw.version() else {
+                continue;
+            };
+            let Some((seq, digest)) = confirmed.copies[usize::from(slot.plan)]
+                .get(&version)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let Some(&shown) = versions.get(&(seq, digest)) else {
+                continue;
+            };
+            if shown.ordinal <= window.ordinal || !matches.unique(raw, shown) {
+                continue;
+            }
+            let Some(current) = builder
+                .event_at_mut(seq)
+                .and_then(|e| e.payload["text"].as_str())
+            else {
+                continue;
+            };
+            let Some(text) = (hash(current) == digest)
+                .then_some(current)
+                .or_else(|| self.archived(seq, digest))
+            else {
+                continue;
+            };
+            let text = text.to_owned();
+            if super::fill_pending_reply(builder, slot.sequence, text) {
+                let position = model_positions.entry(seq).or_default();
+                *position = (*position).max(window.ordinal);
+            }
+        }
     }
 
     pub(super) fn rollback(&mut self, ordinal: u64, order: Option<u64>) {
@@ -576,8 +828,8 @@ impl AnswerOccurrences {
                 && !raw.removed
             {
                 let ruling = rulings.entry(shown.seq).or_default();
-                if matches.unique(raw, *shown) {
-                    ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+                if let Some(slot) = matches.projection_slot(raw, *shown) {
+                    ruling.copies.push((shown.text, raw.ordinal, slot));
                 }
                 let prior = &mut ruling.prior;
                 if prior.is_none_or(|(_, ordinal)| ordinal <= raw.ordinal) {
@@ -596,11 +848,11 @@ impl AnswerOccurrences {
             let ruling = rulings.entry(seq).or_default();
             if let Evidence::Witness(raw) = evidence
                 && !raw.removed
-                && matches.unique(raw, shown)
+                && let Some(slot) = matches.projection_slot(raw, shown)
             {
-                ruling.position = Some((raw.ordinal, raw.sequence));
+                ruling.position = Some((raw.ordinal, slot));
                 if shown.revised {
-                    ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+                    ruling.copies.push((shown.text, raw.ordinal, slot));
                 }
             }
             ruling
@@ -675,15 +927,11 @@ impl AnswerOccurrences {
         }
         // The replacement can retain a previous spelling while a revised reply survives in the suffix.
         if let Some(checkpoint) = explicit {
-            projection
-                .versions
-                .extend(
-                    checkpoint
-                        .retained_answers(seq)
-                        .filter_map(|(index, text)| {
-                            self.version(shown, text, ReplyAnchor::Checkpoint { ordinal, index })
-                        }),
-                );
+            projection.versions.extend(
+                checkpoint
+                    .retained_answers(seq)
+                    .filter_map(|(_, text)| self.version(shown, text, ReplyAnchor::Checkpoint)),
+            );
         }
         if let Some(ruling) = ruling {
             projection.versions.extend(

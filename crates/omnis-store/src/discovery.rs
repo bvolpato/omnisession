@@ -80,10 +80,10 @@ impl Store {
                     let revision = metadata.source_revision.unwrap_or_default();
                     transaction.execute(
                         "INSERT INTO session_index_upgrade_sources(provider,reader_version,session_id,source_path)
-                         SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM session_trajectories
+                         SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM visible_trajectories
                              WHERE provider=?1 AND session_id=?3 AND (document_version>?2 OR (document_version=?2
                                AND (?5 IS NULL OR (source_file_id IS ?5 AND source_contents_id IS ?6)))))
-                         AND NOT EXISTS(SELECT 1 FROM trajectory_index_failures
+                         AND NOT EXISTS(SELECT 1 FROM scoped_trajectory_failures
                              WHERE provider=?1 AND session_id=?3 AND (document_version>?2 OR (document_version=?2
                                AND (?5 IS NULL OR (source_file_id IS ?5 AND source_contents_id IS ?6)))))",
                          params![provider.to_string(), version, metadata.session.id, path.to_str(),
@@ -136,8 +136,8 @@ impl Store {
         let mut statement = connection.prepare_cached(
             "SELECT doc.session_id, doc.source_file_id, doc.missing_ancestor_id, doc.source_contents_id
              FROM native_catalog_homes c
-             JOIN session_index catalog USING(provider,session_id)
-             JOIN session_trajectories doc ON doc.provider=c.provider AND doc.session_id=c.session_id AND doc.origin='native'
+             JOIN scoped_session_index catalog USING(provider,session_id)
+             JOIN visible_trajectories doc ON doc.provider=c.provider AND doc.session_id=c.session_id AND doc.origin='native'
              JOIN native_search_document_homes h ON h.trajectory_id=doc.id AND h.source_home=c.home
                AND h.source_file=doc.source_file_id AND h.verification=1
              JOIN antigravity_read_catalogs r ON r.trajectory_id=doc.id AND r.source_home=h.source_home AND r.source_file=h.source_file
@@ -196,7 +196,7 @@ impl Store {
         let sql = format!(
             "SELECT trajectories.session_id, trajectories.source_file_id, trajectories.missing_ancestor_id, {contents}
              FROM json_each(?1) AS picked
-             JOIN session_trajectories AS trajectories ON trajectories.provider=?2 AND trajectories.session_id=(picked.value ->> 0)
+             JOIN visible_trajectories AS trajectories ON trajectories.provider=?2 AND trajectories.session_id=(picked.value ->> 0)
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=trajectories.id AND origin.source_file=trajectories.source_file_id
              {gap_join}
              WHERE trajectories.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3 AND ((picked.value ->> 1) IS NULL OR hex(trajectories.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)))
@@ -235,14 +235,14 @@ impl Store {
              JOIN session_index_reader_checks lease USING(provider, reader_version)
              JOIN session_index_discovery_results result USING(provider,reader_version,attempt_id)
              JOIN native_catalog_homes origin USING(provider,session_id)
-             JOIN session_index catalog USING(provider,session_id)
+             JOIN scoped_session_index catalog USING(provider,session_id)
              WHERE pending.provider=?1 AND pending.reader_version=?2 AND lease.source_home=?3
                AND origin.home=lease.source_home AND origin.verified AND result.succeeded
-               AND NOT EXISTS(SELECT 1 FROM session_trajectories d WHERE d.provider=pending.provider
+               AND NOT EXISTS(SELECT 1 FROM visible_trajectories d WHERE d.provider=pending.provider
                               AND d.session_id=pending.session_id AND (d.document_version>pending.reader_version
                               OR (d.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
                                   OR (d.source_file_id IS catalog.source_file_id AND d.source_contents_id IS catalog.source_contents_id)))))
-               AND NOT EXISTS(SELECT 1 FROM trajectory_index_failures f WHERE f.provider=pending.provider
+               AND NOT EXISTS(SELECT 1 FROM scoped_trajectory_failures f WHERE f.provider=pending.provider
                               AND f.session_id=pending.session_id AND (f.document_version>pending.reader_version
                               OR (f.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
                                   OR (f.source_file_id IS catalog.source_file_id AND f.source_contents_id IS catalog.source_contents_id)))))"
@@ -303,7 +303,7 @@ pub(super) fn record_verified_document_home(
 ) -> Result<()> {
     transaction.prepare_cached(
         "INSERT INTO native_search_document_homes(trajectory_id,source_file,source_home,verification)
-         SELECT id,source_file_id,?5,1 FROM session_trajectories
+         SELECT id,source_file_id,?5,1 FROM visible_trajectories
          WHERE provider=?1 AND session_id=?2 AND origin='native'
            AND source_file_id=?3 AND source_contents_id IS ?4
          ON CONFLICT(trajectory_id) DO UPDATE SET source_file=excluded.source_file,
@@ -357,22 +357,81 @@ pub(super) fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Resu
             PRIMARY KEY(provider, reader_version, session_id),
             FOREIGN KEY(provider, reader_version) REFERENCES session_index_reader_checks(provider, reader_version) ON DELETE CASCADE
         ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS native_catalog_homes (
-                    provider TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    home BLOB NOT NULL,
-                    verified INTEGER NOT NULL DEFAULT 1,
-                    PRIMARY KEY (provider, session_id),
-                    FOREIGN KEY (provider, session_id) REFERENCES session_index (provider, session_id)
-                        ON DELETE CASCADE
-                ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS native_search_document_homes (
             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
             source_file BLOB NOT NULL,
             source_home BLOB NOT NULL,
             verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1)),
             declared_steps INTEGER CHECK(declared_steps >= 0)
-        );
+        );",
+        )
+        .map_err(database_error)?;
+    initialize_catalog_homes(transaction)?;
+    let (verified, steps): (bool, bool) = transaction.query_row(
+        "SELECT count(*) FILTER (WHERE name='verification'), count(*) FILTER (WHERE name='declared_steps')
+         FROM pragma_table_info('native_search_document_homes')", [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(database_error)?;
+    if !verified {
+        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1));").map_err(database_error)?;
+    }
+    if !steps {
+        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN declared_steps INTEGER CHECK(declared_steps >= 0);").map_err(database_error)?;
+    }
+    if !enrolled {
+        transaction.execute_batch(
+            "DELETE FROM session_index_discovery_results WHERE provider IN ('antigravity','antigravity-desktop');
+             DELETE FROM session_index_reader_checks WHERE provider IN ('antigravity','antigravity-desktop');"
+        ).map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn initialize_catalog_homes(transaction: &Transaction<'_>) -> Result<()> {
+    let legacy_home_key: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('native_catalog_homes') WHERE \"table\"='session_index')",
+        [], |row| row.get(0),
+    ).map_err(database_error)?;
+    if legacy_home_key {
+        transaction
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS forget_changed_catalog_home;
+             ALTER TABLE native_catalog_homes RENAME TO previous_native_catalog_homes;",
+            )
+            .map_err(database_error)?;
+    }
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_catalog_homes (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    home BLOB NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (provider, session_id)
+                ) WITHOUT ROWID;",
+        )
+        .map_err(database_error)?;
+    if legacy_home_key {
+        transaction
+            .execute_batch(
+                "INSERT INTO native_catalog_homes(provider,session_id,home,verified)
+             SELECT provider,session_id,home,verified FROM previous_native_catalog_homes;
+             DROP TABLE previous_native_catalog_homes;",
+            )
+            .map_err(database_error)?;
+    }
+    transaction
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS remove_discovery_home_after_catalog_delete
+        AFTER DELETE ON session_index WHEN OLD.provider IN ('antigravity','antigravity-desktop')
+        BEGIN
+            DELETE FROM native_catalog_homes WHERE provider=OLD.provider AND session_id=OLD.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS require_catalog_for_discovery_home
+        BEFORE INSERT ON native_catalog_homes
+        WHEN NOT EXISTS(SELECT 1 FROM session_index WHERE provider=NEW.provider AND session_id=NEW.session_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'missing discovery catalog row');
+        END;
         CREATE TRIGGER IF NOT EXISTS forget_changed_catalog_home
                 AFTER UPDATE ON session_index
                 WHEN NEW.provider IN ('antigravity', 'antigravity-desktop')
@@ -398,18 +457,5 @@ pub(super) fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Resu
                 END;",
         )
         .map_err(database_error)?;
-    let (verified, steps): (bool, bool) = transaction.query_row(
-        "SELECT count(*) FILTER (WHERE name='verification'), count(*) FILTER (WHERE name='declared_steps')
-         FROM pragma_table_info('native_search_document_homes')", [], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(database_error)?;
-    if !verified {
-        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1));").map_err(database_error)?;
-    }
-    if !steps {
-        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN declared_steps INTEGER CHECK(declared_steps >= 0);").map_err(database_error)?;
-    }
-    if !enrolled {
-        transaction.execute("DELETE FROM session_index_reader_checks WHERE provider IN ('antigravity','antigravity-desktop')", []).map_err(database_error)?;
-    }
     Ok(())
 }

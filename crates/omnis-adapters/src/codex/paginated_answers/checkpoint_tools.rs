@@ -165,11 +165,7 @@ impl PaginatedAnswers {
         let mut pending = HashMap::new();
         let mut receipts = HashMap::new();
         for (index, item) in items.iter().enumerate() {
-            // Codex decodes these legacy tool records as opaque Other items in a checkpoint.
-            if matches!(
-                item["type"].as_str(),
-                Some("computer_call" | "computer_call_output" | "local_shell_call_output")
-            ) {
+            if super::super::opaque_checkpoint_tool(item) {
                 continue;
             }
             let call = scoped_model_call_id(item, true);
