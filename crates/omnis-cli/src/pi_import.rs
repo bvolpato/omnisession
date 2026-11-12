@@ -37,7 +37,7 @@ pub struct PiImport {
     document: Vec<u8>,
     sessions_root: PathBuf,
     target_dir: PathBuf,
-    target_path: PathBuf,
+    pub(super) target_path: PathBuf,
     cwd: String,
 }
 
@@ -426,8 +426,8 @@ pub fn rollback(import: &PiImport) -> Result<()> {
 pub(super) struct ConfirmedPiFile {
     pub(super) session: SessionRef,
     pub(super) directory: PathBuf,
-    path: PathBuf,
-    revision: omnis_adapters::TranscriptRevision,
+    pub(super) path: PathBuf,
+    pub(super) revision: omnis_adapters::TranscriptRevision,
 }
 
 impl ConfirmedPiFile {

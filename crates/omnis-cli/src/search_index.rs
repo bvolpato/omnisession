@@ -611,7 +611,13 @@ impl PreparedIndex {
                 titles.push((self.session, title));
             }
         } else if self.title.is_some() {
-            titles.push((self.session, self.title));
+            let mut session = self.session;
+            if matches!(session.provider, Provider::Pi | Provider::OhMyPi)
+                && let Some(file) = self.source_path
+            {
+                session.id = crate::pi_copy_selector(&session.id, &file);
+            }
+            titles.push((session, self.title));
         }
     }
 

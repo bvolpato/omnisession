@@ -461,10 +461,8 @@ impl PickerState {
             return Ok(WorkspaceVerification::Ready);
         };
         let source = &entry.session.session;
-        let project_path = registry
-            .adapter(source.provider)?
-            .selected_workspace(&entry.session)
-            .with_context(|| {
+        let project_path =
+            selected_entry_workspace(registry, &entry.session).with_context(|| {
                 format!("Could not verify the workspace for session `{source}` by exact ID")
             })?;
         if source.provider == Provider::Claude && project_path.is_none() {
@@ -776,7 +774,10 @@ impl PickerState {
             let session = if let Some(directory) = &key.copy_directory {
                 SessionRef::new(
                     key.session.provider,
-                    crate::pi_copy_selector(&key.session.id, directory),
+                    crate::pi_copy_selector(
+                        &key.session.id,
+                        key.copy_path.as_deref().unwrap_or(directory),
+                    ),
                 )
             } else {
                 key.session.clone()
@@ -891,6 +892,7 @@ impl PickerState {
                     Some((
                         entry.session.session.clone(),
                         entry.session.project_path.clone()?,
+                        entry.session.source_path.clone(),
                     ))
                 })
                 .collect(),
@@ -1352,6 +1354,12 @@ fn cached_picker_entries(
         ))
     });
     sessions.extend(copies);
+    sessions.extend(
+        store
+            .unassigned_pi_sessions()?
+            .into_iter()
+            .map(workers::native_session),
+    );
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -1406,13 +1414,46 @@ fn picker_entry(
     PickerEntry::new(session, current, cached)
 }
 
+fn selected_entry_workspace(
+    registry: &AdapterRegistry,
+    entry: &NativeSession,
+) -> Result<Option<PathBuf>> {
+    let adapter = registry.adapter(entry.session.provider)?;
+    if matches!(entry.session.provider, Provider::Pi | Provider::OhMyPi)
+        && entry.source_path.is_none()
+    {
+        let directory = entry
+            .project_path
+            .clone()
+            .context("the cached Pi file is unverified")?;
+        let store = Store::open_default()?;
+        let key = store
+            .pi_copy_keys(&[(entry.session.clone(), directory, None)])?
+            .pop()
+            .flatten()
+            .context("the cached Pi file is unverified")?;
+        let reference = SessionRef::new(
+            entry.session.provider,
+            crate::pi_copy_selector(&entry.session.id, &key),
+        );
+        crate::resolve_pi_copy(registry, reference)?;
+        return Ok(adapter
+            .native_workspace(&entry.session)?
+            .and_then(|w| w.directory));
+    }
+    adapter.selected_workspace(entry)
+}
+
 fn picker_search_ref(session: &NativeSession) -> SessionRef {
     if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
         && let Some(path) = &session.project_path
     {
         return SessionRef::new(
             session.session.provider,
-            crate::pi_copy_selector(&session.session.id, path),
+            crate::pi_copy_selector(
+                &session.session.id,
+                session.source_path.as_deref().unwrap_or(path),
+            ),
         );
     }
     session.session.clone()
@@ -1460,7 +1501,7 @@ struct TrajectorySearchRequest {
     generation: u64,
     query: String,
     eligible_sessions: Vec<SessionRef>,
-    pi_rows: Vec<(SessionRef, PathBuf)>,
+    pi_rows: Vec<(SessionRef, PathBuf, Option<PathBuf>)>,
 }
 
 #[derive(Default)]
@@ -1636,7 +1677,12 @@ fn delete_selected_source(
 ) -> Result<()> {
     if let Some(file) = file {
         crate::pi_import::delete_confirmed(file)?;
-        Store::open_default()?.forget_pi_copy(&file.session, &file.directory)?;
+        Store::open_default()?.forget_pi_copy(
+            &file.session,
+            &file.path,
+            file.revision.key,
+            Some(&file.directory),
+        )?;
         Ok(())
     } else {
         crate::delete_native_session(registry, session, Some(workspace))

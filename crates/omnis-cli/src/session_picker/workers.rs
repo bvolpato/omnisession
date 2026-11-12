@@ -276,6 +276,7 @@ fn alias_cached_pi_titles(store: &Store, entries: &[PickerEntry]) {
             Some((
                 entry.session.session.clone(),
                 entry.session.project_path.clone()?,
+                entry.session.source_path.clone(),
             ))
         })
         .collect::<Vec<_>>();
@@ -283,8 +284,8 @@ fn alias_cached_pi_titles(store: &Store, entries: &[PickerEntry]) {
         let aliases = rows
             .into_iter()
             .zip(keys)
-            .filter_map(|((session, path), key)| {
-                let alias = crate::pi_copy_selector(&session.id, &path);
+            .filter_map(|((session, path, file), key)| {
+                let alias = crate::pi_copy_selector(&session.id, file.as_deref().unwrap_or(&path));
                 Some((session, key?, alias))
             })
             .collect::<Vec<_>>();
@@ -534,7 +535,7 @@ impl PickerPreviewRead {
             .or(key.updated_at)
             .unwrap_or(snapshot.captured_at);
         let guard = if matches!(key.session.provider, Provider::Pi | Provider::OhMyPi) {
-            crate::select_pi_snapshot(store, snapshot, self.revision)?;
+            crate::select_pi_snapshot(store, snapshot, self.revision, key.copy_path.clone())?;
             store.trajectory_write_guard(&key.session)?
         } else {
             self.guard
@@ -718,11 +719,14 @@ pub(super) fn spawn_trajectory_search_updates(
                         .pi_rows
                         .iter()
                         .zip(keys)
-                        .filter_map(|((session, path), key)| {
+                        .filter_map(|((session, path, file), key)| {
                             Some((
                                 session.clone(),
                                 key?,
-                                crate::pi_copy_selector(&session.id, path),
+                                crate::pi_copy_selector(
+                                    &session.id,
+                                    file.as_deref().unwrap_or(path),
+                                ),
                             ))
                         })
                         .collect::<Vec<_>>();
@@ -874,6 +878,6 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         updated_at: session.updated_at,
         updated_at_approximate: session.updated_at_approximate,
         event_count: session.event_count,
-        source_path: None,
+        source_path: session.source_path,
     }
 }

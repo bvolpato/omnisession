@@ -145,8 +145,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// # Errors
     ///
     /// Returns an error when the provider cannot select that workspace.
-    fn bind_workspace_copy(&self, _session: &SessionRef, _workspace: &Path) -> Result<()> {
+    fn bind_workspace_copy(
+        &self,
+        _session: &SessionRef,
+        _workspace: &Path,
+        _file: Option<&Path>,
+    ) -> Result<()> {
         anyhow::bail!("this provider does not support workspace-qualified sessions")
+    }
+
+    /// Returns the verified file selected for a native read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected file is ambiguous or unavailable.
+    fn selected_source(&self, _session: &SessionRef) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// Returns other physical copies found by an unscoped discovery pass.

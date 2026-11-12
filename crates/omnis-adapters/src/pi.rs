@@ -30,6 +30,8 @@ const PREVIEW_RECORDS: usize = 1_024;
 const MAX_HEADER_SCAN_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
 
+type BoundPiFiles = HashMap<String, (PathBuf, Option<PathBuf>)>;
+
 type ListedPiFiles = HashMap<String, (PathBuf, PathBuf)>;
 
 /// Read-only Pi coding-agent session adapter.
@@ -39,7 +41,7 @@ pub struct PiAdapter {
     sessions_root: Option<PathBuf>,
     listed_paths: Arc<Mutex<ListedPiFiles>>,
     workspace_copies: Arc<Mutex<Vec<NativeSession>>>,
-    bound_workspace: Arc<Mutex<HashMap<String, PathBuf>>>,
+    bound_workspace: Arc<Mutex<BoundPiFiles>>,
 }
 
 impl PiAdapter {
@@ -105,18 +107,16 @@ impl PiAdapter {
         for path in self.session_files() {
             if let Ok(header) = read_header(&path, self.provider)
                 && header.id == id
-                && bound
-                    .as_ref()
-                    .is_none_or(|workspace| workspace.as_os_str() == header.cwd.as_os_str())
+                && bound.as_ref().is_none_or(|workspace| {
+                    workspace.0.as_os_str() == header.cwd.as_os_str()
+                        && workspace.1.as_ref().is_none_or(|file| file == &path)
+                })
             {
-                if let Some((_, workspace)) = &found {
-                    anyhow::ensure!(
-                        workspace.as_os_str() == header.cwd.as_os_str(),
-                        "multiple Pi workspaces contain session `{id}`"
-                    );
-                } else {
-                    found = Some((path, header.cwd));
-                }
+                anyhow::ensure!(
+                    found.is_none(),
+                    "multiple Pi workspaces or files contain session `{id}`"
+                );
+                found = Some((path, header.cwd));
             }
         }
         Ok(found.map(|(path, _)| path))
@@ -1117,12 +1117,6 @@ impl ProviderAdapter for PiAdapter {
                 continue;
             }
             let seen = workspaces.entry(header.id.clone()).or_default();
-            if seen
-                .iter()
-                .any(|cwd| cwd.as_os_str() == header.cwd.as_os_str())
-            {
-                continue;
-            }
             let first = seen.is_empty();
             seen.push(header.cwd.clone());
             if first {
@@ -1166,7 +1160,7 @@ impl ProviderAdapter for PiAdapter {
             .project_path
             .as_deref()
             .context("Pi listing omitted its workspace")?;
-        self.bind_workspace_copy(&listed.session, directory)?;
+        self.bind_workspace_copy(&listed.session, directory, listed.source_path.as_deref())?;
         Ok(Some(directory.to_owned()))
     }
 
@@ -1180,11 +1174,23 @@ impl ProviderAdapter for PiAdapter {
         }))
     }
 
-    fn bind_workspace_copy(&self, session: &SessionRef, workspace: &Path) -> Result<()> {
+    fn selected_source(&self, session: &SessionRef) -> Result<Option<PathBuf>> {
+        self.exact_session(&session.id)
+    }
+
+    fn bind_workspace_copy(
+        &self,
+        session: &SessionRef,
+        workspace: &Path,
+        file: Option<&Path>,
+    ) -> Result<()> {
         self.bound_workspace
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(session.id.clone(), workspace.to_owned());
+            .insert(
+                session.id.clone(),
+                (workspace.to_owned(), file.map(Path::to_owned)),
+            );
         self.find_session(&session.id)
             .context("the selected Pi workspace copy is unavailable")?;
         Ok(())

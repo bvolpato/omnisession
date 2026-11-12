@@ -219,6 +219,7 @@ impl WorkspaceCatalog {
                 return;
             }
             let metadata = IndexedSession {
+                source_path: None,
                 session: SessionRef::new(Provider::Codex, raw.id.clone()),
                 title: raw.title.as_deref().map(omnis_core::redact_secrets),
                 project_path: directory.map(Path::to_path_buf),

@@ -440,6 +440,8 @@ pub struct HandoffRecord {
 /// Cached provider metadata used to render session discovery without transcript reads.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexedSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
     pub session: SessionRef,
     pub title: Option<String>,
     pub project_path: Option<PathBuf>,
@@ -655,6 +657,13 @@ impl Store {
         Ok(())
     }
 
+    /// Formats the public reference for a persisted Pi copy key.
+    #[must_use]
+    pub fn pi_copy_selector(id: &str, key: &Path) -> String {
+        let digest = Sha256::digest(key.as_os_str().as_encoded_bytes());
+        format!("{id}@workspace={}", hex::encode(digest))
+    }
+
     /// Returns recorded workspace keys for Pi native IDs.
     ///
     /// # Errors
@@ -682,7 +691,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error if the copy catalog cannot be read.
-    pub fn pi_copy_keys(&self, sessions: &[(SessionRef, PathBuf)]) -> Result<Vec<Option<PathBuf>>> {
+    pub fn pi_copy_keys(
+        &self,
+        sessions: &[(SessionRef, PathBuf, Option<PathBuf>)],
+    ) -> Result<Vec<Option<PathBuf>>> {
         if sessions.is_empty() {
             return Ok(Vec::new());
         }
@@ -691,11 +703,11 @@ impl Store {
         let db = self.connection.borrow();
         let mut query=db.prepare("WITH input AS MATERIALIZED (
             SELECT key, json_extract(value,'$[0].provider') AS provider,json_extract(value,'$[0].id') AS session_id,
-                   json_extract(value,'$[1]') AS path FROM json_each(?1))
+                   json_extract(value,'$[1]') AS path, json_extract(value,'$[2]') AS file FROM json_each(?1))
             SELECT coalesce((SELECT project FROM pi_search_copies c WHERE c.provider=i.provider AND c.session_id=i.session_id
-                  AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=i.path),
+                  AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=i.path AND json_extract(c.metadata,'$.source_path') IS i.file),
                  (SELECT p.project FROM pi_search_primary p JOIN session_index s USING(provider,session_id)
-                  WHERE p.provider=i.provider AND p.session_id=i.session_id AND s.project_path=i.path AND p.project<>''))
+                  WHERE p.provider=i.provider AND p.session_id=i.session_id AND i.file IS NULL AND s.project_path=i.path AND p.project<>'' AND NOT EXISTS(SELECT 1 FROM pi_search_copies x WHERE x.provider=i.provider AND x.session_id=i.session_id)))
             FROM input i ORDER BY i.key").map_err(database_error)?;
         query
             .query_map([inputs], |r| {
@@ -719,6 +731,24 @@ impl Store {
         self.connection.borrow().query_row("SELECT json_extract(metadata,'$.project_path') FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",params![session.provider.to_string(),session.id,key.to_str()], |row|row.get::<_,Option<String>>(0)).optional().map(|value|value.flatten().map(PathBuf::from)).map_err(database_error)
     }
 
+    /// Returns the recorded physical file for a copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be read.
+    pub fn pi_recorded_file(&self, session: &SessionRef, key: &Path) -> Result<Option<PathBuf>> {
+        self.connection.borrow().query_row("SELECT json_extract(metadata,'$.source_path') FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",params![session.provider.to_string(),session.id,key.to_str()], |row|row.get::<_,Option<String>>(0)).optional().map(|value|value.flatten().map(PathBuf::from)).map_err(database_error)
+    }
+
+    /// Reads the last verified transcript revision for a historical copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be read.
+    pub fn pi_recorded_revision(&self, session: &SessionRef, key: &Path) -> Result<Option<i64>> {
+        self.connection.borrow().query_row("SELECT t.source_revision FROM session_trajectories t JOIN pi_search_primary p ON p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id) WHERE p.provider=?1 AND p.session_id=?2 AND t.pi_workspace=CASE WHEN p.project=?3 THEN '' ELSE ?3 END",params![session.provider.to_string(),session.id,key.to_str()],|r|r.get(0)).optional().map(Option::flatten).map_err(database_error)
+    }
+
     /// Selects a physical search document under its workspace-qualified reference.
     ///
     /// # Errors
@@ -737,6 +767,21 @@ impl Store {
           JOIN session_trajectories t ON t.provider=input.provider AND t.session_id=CASE WHEN p.project=input.project THEN input.id ELSE input.id||char(0)||input.project END
             AND t.pi_workspace=CASE WHEN p.project=input.project THEN '' ELSE input.project END", [keys]).map_err(database_error)?;
         Ok(())
+    }
+
+    /// Exposes retained documents whose physical source is unknown for global search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be read.
+    pub fn unassigned_pi_sessions(&self) -> Result<Vec<IndexedSession>> {
+        let db = self.connection.borrow();
+        db.execute("INSERT OR REPLACE INTO pi_document_aliases SELECT t.id,t.session_id || '@unverified' FROM session_trajectories t JOIN pi_search_primary p USING(provider,session_id) WHERE p.project='' AND t.pi_workspace=''",[]).map_err(database_error)?;
+        let mut q=db.prepare("SELECT t.provider,t.session_id || '@unverified',t.derived_title,NULL,NULL,NULL,t.source_updated_at,1,0 FROM session_trajectories t JOIN pi_search_primary p USING(provider,session_id) WHERE p.project='' AND t.pi_workspace=''").map_err(database_error)?;
+        q.query_map([], indexed_session_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)
     }
 
     /// Reports preserved legacy Pi documents whose workspace is unknown.
@@ -812,7 +857,7 @@ impl Store {
             }
             let provider = session.session.provider.to_string();
             let id = &session.session.id;
-            let existing = tx.query_row("SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3",params![provider,id,session.project_path.as_deref().and_then(Path::to_str)],|row|row.get::<_,String>(0)).optional().map_err(database_error)?;
+            let existing = tx.query_row("SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3 AND (json_extract(metadata,'$.source_path') IS ?4 OR (json_extract(metadata,'$.source_path') IS NULL AND EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=?1 AND p.session_id=?2 WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2 AND t.source_revision=?5 AND t.pi_workspace=CASE WHEN p.project=pi_search_copies.project THEN '' ELSE pi_search_copies.project END))) ORDER BY json_extract(metadata,'$.source_path') IS NULL LIMIT 1",params![provider,id,session.project_path.as_deref().and_then(Path::to_str),session.source_path.as_deref().and_then(Path::to_str),revision],|row|row.get::<_,String>(0)).optional().map_err(database_error)?;
             let recorded = session
                 .project_path
                 .as_deref()
@@ -1684,32 +1729,61 @@ impl Store {
         transaction.commit().map_err(database_error)
     }
 
-    /// Removes the cached document for the confirmed Pi transcript's exact header directory.
+    /// Removes the cached document for the confirmed Pi file. A confirmed deletion also clears its active binding.
     ///
     /// # Errors
     ///
     /// Returns an error if the physical owner cannot be identified or the transaction fails.
-    pub fn forget_pi_copy(&self, session: &SessionRef, recorded: &Path) -> Result<()> {
-        if session.provider != Provider::Pi {
+    pub fn forget_pi_copy(
+        &self,
+        session: &SessionRef,
+        file: &Path,
+        revision: i64,
+        confirmed_directory: Option<&Path>,
+    ) -> Result<()> {
+        if !matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
             return Err(StoreError::InvalidSessionReference);
         }
         let mut db = self.connection.borrow_mut();
         let tx = immediate_transaction(&mut db)?;
         let provider = session.provider.to_string();
-        let path = recorded.to_str().ok_or(StoreError::InvalidWorkspaceRoot)?;
         let id = &session.id;
-        tx.execute("INSERT OR IGNORE INTO pi_retired_keys SELECT provider,session_id,project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3",params![provider,id,path]).map_err(database_error)?;
-        tx.execute("DELETE FROM session_trajectories AS t WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2
-            AND EXISTS(SELECT 1 FROM pi_search_copies c JOIN pi_search_primary p USING(provider,session_id)
-                WHERE c.provider=?1 AND c.session_id=?2 AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=?3
-                AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END)", params![provider,id,path]).map_err(database_error)?;
-        tx.execute("UPDATE pi_search_primary SET project='' WHERE provider=?1 AND session_id=?2 AND project IN (SELECT project FROM pi_retired_keys WHERE provider=?1 AND session_id=?2)",params![provider,id]).map_err(database_error)?;
-        tx.execute("DELETE FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3",params![provider,id,path]).map_err(database_error)?;
-        tx.execute(
-            "DELETE FROM session_index WHERE provider=?1 AND session_id=?2 AND project_path=?3",
-            params![provider, id, path],
-        )
-        .map_err(database_error)?;
+        let path = file.to_str().ok_or(StoreError::InvalidWorkspaceRoot)?;
+        let mut q=tx.prepare("SELECT c.project, json_extract(c.metadata,'$.project_path'), p.project=c.project FROM pi_search_copies c JOIN pi_search_primary p USING(provider,session_id) WHERE c.provider=?1 AND c.session_id=?2 AND json_valid(c.metadata) AND (json_extract(c.metadata,'$.source_path')=?3 OR (json_extract(c.metadata,'$.source_path') IS NULL AND EXISTS(SELECT 1 FROM session_trajectories t WHERE t.provider=c.provider AND coalesce(t.pi_native_id,t.session_id)=c.session_id AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END AND t.source_revision=?4)))").map_err(database_error)?;
+        let keys = q
+            .query_map(params![provider, id, path, revision], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?;
+        drop(q);
+        for (key, workspace, primary) in keys {
+            if confirmed_directory.is_some() {
+                tx.execute("UPDATE session_bindings SET is_current=0 WHERE provider=?1 AND session_id=?2 AND is_current=1",params![provider,Self::pi_copy_selector(id,Path::new(&key))]).map_err(database_error)?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO pi_retired_keys VALUES(?1,?2,?3)",
+                params![provider, id, key],
+            )
+            .map_err(database_error)?;
+            tx.execute("DELETE FROM session_trajectories WHERE provider=?1 AND coalesce(pi_native_id,session_id)=?2 AND pi_workspace=?3",params![provider,id,if primary {""}else{&key}]).map_err(database_error)?;
+            tx.execute("DELETE FROM trajectory_index_failures WHERE provider=?1 AND session_id=?2 AND pi_workspace=?3",params![provider,id,if primary {""}else{&key}]).map_err(database_error)?;
+            tx.execute("UPDATE pi_search_primary SET project='' WHERE provider=?1 AND session_id=?2 AND project=?3",params![provider,id,key]).map_err(database_error)?;
+            tx.execute(
+                "DELETE FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",
+                params![provider, id, key],
+            )
+            .map_err(database_error)?;
+            tx.execute("DELETE FROM session_index WHERE provider=?1 AND session_id=?2 AND project_path=?3 AND NOT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3)",params![provider,id,workspace]).map_err(database_error)?;
+        }
+        if let Some(directory) = confirmed_directory {
+            tx.execute("UPDATE session_bindings SET is_current=0 WHERE provider=?1 AND session_id=?2 AND is_current=1 AND NOT EXISTS(SELECT 1 FROM pi_search_copies c WHERE c.provider=?1 AND c.session_id=?2 AND (NOT json_valid(c.metadata) OR json_extract(c.metadata,'$.source_path') IS NOT NULL OR json_extract(c.metadata,'$.project_path') IS NOT ?3 OR EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id WHERE t.provider=c.provider AND coalesce(t.pi_native_id,t.session_id)=c.session_id AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END AND t.source_revision IS NOT NULL)))",params![provider,id,directory.to_str()]).map_err(database_error)?;
+        }
         tx.commit().map_err(database_error)
     }
 
@@ -4278,6 +4352,7 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     })?;
     let (project_path, git_branch) = indexed_workspace(row, 3, provider)?;
     Ok(IndexedSession {
+        source_path: None,
         session: SessionRef::new(provider, row.get::<_, String>(1)?),
         title: row.get(2)?,
         project_path,
@@ -4794,6 +4869,7 @@ mod tests {
         let now = Utc::now();
         for (workspace, word) in [(&primary, "bluepuffin"), (&restored, "goldrobin")] {
             record.project_path = Some(workspace.clone());
+            record.source_path = Some(workspace.join("session.jsonl"));
             store
                 .select_pi_workspaces(&[(workspace.clone(), record.clone(), None)])
                 .unwrap();
@@ -4824,7 +4900,14 @@ mod tests {
             );
         }
         assert!(reopened.forget_session(&record.session).is_err());
-        reopened.forget_pi_copy(&record.session, &restored).unwrap();
+        reopened
+            .forget_pi_copy(
+                &record.session,
+                &restored.join("session.jsonl"),
+                1,
+                Some(&restored),
+            )
+            .unwrap();
         assert!(reopened.cached_pi_copies(&restored).unwrap().is_empty());
         reopened.cached_pi_copies(&primary).unwrap();
         assert_eq!(
@@ -5133,6 +5216,45 @@ mod tests {
             cached[0].project_path.as_deref().map(Path::as_os_str),
             Some(Path::new("//host/repo").as_os_str())
         );
+    }
+
+    #[test]
+    fn removing_one_physical_pi_file_preserves_its_sibling_and_restores_the_binding() {
+        let db = tempdir().unwrap();
+        let workspace = db.path();
+        let store = Store::open(workspace.join("store.sqlite3")).unwrap();
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let mut entry = indexed_session(provider, "shared", "title");
+            entry.project_path = Some(workspace.to_owned());
+            let target = &entry.session.clone();
+            let task = store
+                .create_or_get_task(provider.to_string(), workspace)
+                .unwrap();
+            store.bind_session(task.id, "main", target).unwrap();
+            for (name, word) in [("a.jsonl", "goldrobin"), ("b.jsonl", "bluepuffin")] {
+                entry.source_path = Some(workspace.join(name));
+                store
+                    .select_pi_workspaces(&[(workspace.to_owned(), entry.clone(), None)])
+                    .unwrap();
+                store
+                    .upsert_session_trajectory(target, word, Utc::now(), true)
+                    .unwrap();
+            }
+            store
+                .forget_pi_copy(target, &workspace.join("b.jsonl"), 2, None)
+                .unwrap();
+            let docs = store.cached_all_pi_copies().unwrap();
+            let remaining = docs.iter().find(|row| &row.session == target).unwrap();
+            assert_eq!(
+                remaining.source_path.as_deref(),
+                Some(workspace.join("a.jsonl").as_path())
+            );
+            assert!(store.current_binding(task.id, "main").unwrap().is_some());
+            store
+                .forget_pi_copy(target, &workspace.join("a.jsonl"), 1, Some(workspace))
+                .unwrap();
+            assert!(store.current_binding(task.id, "main").unwrap().is_none());
+        }
     }
 
     #[test]
@@ -6991,6 +7113,7 @@ mod tests {
 
     fn indexed_session(provider: Provider, id: &str, title: &str) -> IndexedSession {
         IndexedSession {
+            source_path: None,
             session: SessionRef::new(provider, id),
             title: Some(title.to_owned()),
             project_path: Some(std::env::temp_dir().join("omnis-store-synthetic-project")),

@@ -1738,6 +1738,9 @@ impl RecordedLineage {
     fn undo(self, target: &SessionRef) -> Result<()> {
         let store = Store::open_default().context("opening OmniSession state")?;
         let Some((task_id, branch)) = self.task_binding else {
+            if matches!(target.provider, Provider::Pi | Provider::OhMyPi) {
+                return Ok(());
+            }
             return store
                 .forget_session(target)
                 .context("forgetting rolled-back session");
@@ -2457,7 +2460,7 @@ fn resume_via_pi_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install(name);
-    let rollback = || pi_import::rollback(import);
+    let rollback = || rollback_pi_import(import);
     if let Err(error) = materialize_pi_import(context.registry, import, binary) {
         let error = interrupt.materialization_failed(error, || {
             roll_back_published(context.registry, &import.target, rollback)
@@ -2926,6 +2929,18 @@ pub(super) fn materialize_cursor_import(
     }
 }
 
+fn rollback_pi_import(import: &pi_import::PiImport) -> Result<()> {
+    let revision = omnis_adapters::TranscriptRevision::read(&import.target_path)?;
+    pi_import::rollback(import)?;
+    Store::open_default()?.forget_pi_copy(
+        &import.target,
+        &import.target_path,
+        revision.key,
+        None,
+    )?;
+    Ok(())
+}
+
 pub(super) fn materialize_pi_import(
     registry: &AdapterRegistry,
     import: &pi_import::PiImport,
@@ -2952,7 +2967,7 @@ pub(super) fn materialize_pi_import(
         let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
             anyhow!("{name} import failed read-back verification ({details})"),
-            pi_import::rollback(import),
+            rollback_pi_import(import),
             name,
         ))
     }

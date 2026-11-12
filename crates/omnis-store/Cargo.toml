@@ -22,6 +22,7 @@ omnis-ir = { package = "omnisession-ir", version = "0.10.1", path = "../omnis-ir
 rusqlite = { workspace = true, features = ["functions"] }
 serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

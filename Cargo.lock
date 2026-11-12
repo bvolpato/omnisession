@@ -966,6 +966,7 @@ dependencies = [
  "chrono",
  "criterion",
  "directories",
+ "hex",
  "lz4_flex",
  "memchr",
  "omnisession-ir",
