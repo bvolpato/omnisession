@@ -23,8 +23,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus, GitState,
-    OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, TransferMode,
-    WorkspaceSnapshot,
+    OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+    SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT, SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
+    SEARCH_TRUNCATION_NOTICE, Sensitivity, TransferMode, WorkspaceSnapshot,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -43,12 +44,7 @@ const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
-const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
-// Tool payloads are mostly file contents and logs, so only their edges are searchable.
-const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
-const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
-const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 
@@ -56,8 +52,18 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::OhMyPi => 9,
+        Provider::Antigravity => 11,
+        Provider::OhMyPi | Provider::AntigravityDesktop => 9,
         Provider::Pi | Provider::Claude | Provider::Codex => 7,
+        _ => SEARCH_DOCUMENT_VERSION,
+    }
+}
+
+/// Version of the searchable content reconstructed from a saved bundle.
+#[must_use]
+pub const fn imported_search_document_version(provider: Provider) -> u32 {
+    match provider {
+        Provider::Pi | Provider::OhMyPi | Provider::Claude => search_document_version(provider),
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -839,27 +845,26 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
             None
         };
     }
-    if let Some(title) = snapshot
+    snapshot
         .title
         .as_deref()
         .filter(|title| !title.trim().is_empty())
-    {
-        return compact_search_title(title);
-    }
-    first_user_search_title(snapshot)
+        .map_or_else(|| session_history_title(snapshot), compact_search_title)
 }
 
 /// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
 #[must_use]
 pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
     if provider == Provider::Codex {
-        first_user_search_title(snapshot)
+        session_history_title(snapshot)
     } else {
         session_search_title(snapshot)
     }
 }
 
-fn first_user_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+/// Returns the first visible user turn as a search title when the provider has no catalog title.
+#[must_use]
+pub fn session_history_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     title_opener(visible_events(snapshot)).and_then(|(_, title)| title)
 }
 
@@ -1139,6 +1144,8 @@ pub struct SearchDocument {
     pub truncated: bool,
     pub source_complete: bool,
     pub source_byte_count: usize,
+    /// Antigravity search measurements before the document-wide text limit.
+    pub projection: Option<omnis_ir::SearchProjection>,
     pub indexed_byte_count: usize,
     pub truncation_strategy: SearchTruncationStrategy,
 }
@@ -1146,6 +1153,8 @@ pub struct SearchDocument {
 /// Coverage strategy used to bound one local full-text search document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchTruncationStrategy {
+    /// A bounded source read exceeded the provider file limit.
+    ProviderReadLimit,
     None,
     SourceIncomplete,
     EventHeadTail,
@@ -1160,6 +1169,7 @@ impl SearchTruncationStrategy {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProviderReadLimit => "provider_read_limit",
             Self::None => "none",
             Self::SourceIncomplete => "source_incomplete",
             Self::EventHeadTail => "event_head_tail",
@@ -1182,8 +1192,18 @@ impl SearchTruncationStrategy {
 /// UTF-8-safe byte edges so indexing an untrusted provider session remains bounded.
 #[must_use]
 pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocument {
+    trajectory_search_document_in_records(snapshot, &[])
+}
+
+/// Builds the search projection with the sequence ranges of multi-event native records.
+#[must_use]
+pub fn trajectory_search_document_in_records(
+    snapshot: &CanonicalSnapshot,
+    groups: &[std::ops::Range<u64>],
+) -> SearchDocument {
     trajectory_search_document_with_limits(
         snapshot,
+        groups,
         SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
         SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
     )
@@ -1191,44 +1211,183 @@ pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocumen
 
 fn trajectory_search_document_with_limits(
     snapshot: &CanonicalSnapshot,
+    groups: &[std::ops::Range<u64>],
     event_edge_limit: usize,
     document_edge_limit: usize,
 ) -> SearchDocument {
-    let mut retained = HeadTailText::new(document_edge_limit);
-    let mut source_byte_count = 0_usize;
-    let mut included_events = 0_usize;
-    let mut event_truncated = false;
-    let history = visible_history(snapshot);
-    let source_incomplete = history.source_incomplete();
+    let visible = visible_history(snapshot);
+    let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
+    builder.source_incomplete = visible.source_incomplete();
+    for event in visible.events {
+        let group = groups
+            .get(groups.partition_point(|range| range.end <= event.sequence))
+            .filter(|range| range.contains(&event.sequence));
+        builder.push_text(event, group.map_or(event.sequence, |range| range.start));
+    }
+    let mut document = builder.finish();
+    if matches!(
+        snapshot.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) && (1..=omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT + 1).contains(&snapshot.events.len())
+    {
+        let rows = snapshot.events.iter().filter(|event| {
+            event.source.raw_record_type.as_deref() != Some("omnisession.antigravity_step_limit")
+        });
+        let proof = rows
+            .map(|event| {
+                if event.source.provider != snapshot.session.provider
+                    || event.source.native_session_id != snapshot.session.id
+                {
+                    return None;
+                }
+                event.raw_blob_hash.as_ref()?.parse().ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|rows| rows.len() <= omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT);
+        let database_gap = snapshot.events.iter().any(|event| {
+            event.source.raw_record_type.as_deref() == Some("omnisession.antigravity_step_limit")
+                && reports_omitted_events(event)
+        });
+        if proof.is_some() || database_gap {
+            let projection = document.projection.get_or_insert_with(|| {
+                omnis_ir::SearchProjection::new(0, Sha256::new(), Sha256::new())
+            });
+            projection.database_steps = proof;
+            projection.database_gap = database_gap;
+        }
+    }
+    document
+}
 
-    for event in history.events {
-        let Some(event_text) = search_event_text(event, event_edge_limit) else {
-            continue;
-        };
-        if event_text.text.trim().is_empty() {
-            continue;
+/// Builds one bounded search document from canonical events in conversation order.
+pub struct SearchDocumentBuilder {
+    retained: HeadTailText,
+    last_record_time: Option<i64>,
+    projection_hashes: Option<(Sha256, Sha256, u64)>,
+    event_edge_limit: usize,
+    source_byte_count: usize,
+    has_text: bool,
+    event_truncated: bool,
+    source_incomplete: bool,
+}
+
+impl Default for SearchDocumentBuilder {
+    fn default() -> Self {
+        Self::with_limits(
+            SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
+            SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+        )
+    }
+}
+
+impl SearchDocumentBuilder {
+    const fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
+        Self {
+            retained: HeadTailText::new(document_edge_limit),
+            last_record_time: None,
+            projection_hashes: None,
+            event_edge_limit,
+            source_byte_count: 0,
+            has_text: false,
+            event_truncated: false,
+            source_incomplete: false,
         }
-        if included_events != 0 {
-            source_byte_count = source_byte_count.saturating_add(2);
-            retained.push("\n\n");
-        }
-        included_events = included_events.saturating_add(1);
-        source_byte_count = source_byte_count.saturating_add(event_text.source_byte_count);
-        event_truncated |= event_text.truncated;
-        retained.push(&event_text.text);
     }
 
-    let document_truncated = retained.truncated();
-    let text = retained.finish();
-    let truncation_strategy =
-        search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
-    SearchDocument {
-        indexed_byte_count: text.len(),
-        text,
-        truncated: truncation_strategy != SearchTruncationStrategy::None,
-        source_complete: !source_incomplete,
-        source_byte_count,
-        truncation_strategy,
+    /// Adds searchable text and records source omissions. Secret events are excluded.
+    pub fn push(&mut self, event: &OmniEvent) {
+        self.push_record_event(event, event.sequence);
+    }
+
+    /// Adds one event from the native record beginning at the supplied sequence.
+    pub fn push_record_event(&mut self, event: &OmniEvent, record: u64) {
+        if is_secret(event) {
+            return;
+        }
+        self.source_incomplete |= reports_omitted_events(event);
+        self.push_text(event, record);
+    }
+
+    fn push_text(&mut self, event: &OmniEvent, record: u64) {
+        let Some(text) = search_event_text(event, self.event_edge_limit) else {
+            return;
+        };
+        if text.text.trim().is_empty() {
+            return;
+        }
+        if !self.has_text
+            && matches!(
+                event.source.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            )
+        {
+            self.projection_hashes = Some((Sha256::new(), Sha256::new(), record));
+        }
+        if let Some((full, preceding, previous_record)) = &mut self.projection_hashes {
+            self.last_record_time = event.timestamp.and_then(|time| time.timestamp_nanos_opt());
+            if *previous_record != record {
+                preceding.clone_from(full);
+                *previous_record = record;
+            }
+            if self.has_text {
+                full.update(b"\n\n");
+            }
+            full.update(text.text.as_bytes());
+        }
+        if self.has_text {
+            self.source_byte_count = self.source_byte_count.saturating_add(2);
+            self.retained.push("\n\n");
+        }
+        self.has_text = true;
+        self.source_byte_count = self
+            .source_byte_count
+            .saturating_add(text.source_byte_count);
+        self.event_truncated |= text.truncated;
+        self.retained.push(&text.text);
+    }
+
+    /// Counts the searchable bytes observed before the document text limit.
+    #[must_use]
+    pub const fn source_byte_count(&self) -> usize {
+        self.source_byte_count
+    }
+
+    #[must_use]
+    pub const fn projected_byte_count(&self) -> usize {
+        self.retained.total_byte_count
+    }
+
+    /// Hashes the bounded text as it would appear in the search index at this point.
+    #[must_use]
+    pub fn indexed_text_hash(&self) -> [u8; 32] {
+        Sha256::digest(self.retained.clone().finish().as_bytes()).into()
+    }
+
+    /// Returns the redacted text and its coverage under the search limits.
+    #[must_use]
+    pub fn finish(self) -> SearchDocument {
+        let document_truncated = self.retained.truncated();
+        let projection = self.projection_hashes.map(|(full, preceding, _)| {
+            let mut projection =
+                omnis_ir::SearchProjection::new(self.retained.total_byte_count, full, preceding);
+            projection.last_record_time = self.last_record_time;
+            projection
+        });
+        let text = self.retained.finish();
+        let truncation_strategy = search_truncation_strategy(
+            self.source_incomplete,
+            self.event_truncated,
+            document_truncated,
+        );
+        SearchDocument {
+            projection,
+            indexed_byte_count: text.len(),
+            text,
+            truncated: truncation_strategy != SearchTruncationStrategy::None,
+            source_complete: !self.source_incomplete,
+            source_byte_count: self.source_byte_count,
+            truncation_strategy,
+        }
     }
 }
 
@@ -1348,6 +1507,7 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
     boundary
 }
 
+#[derive(Clone)]
 struct HeadTailText {
     head: String,
     head_byte_count: usize,
@@ -4495,6 +4655,17 @@ mod tests {
     };
 
     #[test]
+    fn native_antigravity_documents_upgrade_independently_of_imported_bundles() {
+        for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+            assert!(super::search_document_version(provider) > super::SEARCH_DOCUMENT_VERSION);
+            assert_eq!(
+                super::imported_search_document_version(provider),
+                super::SEARCH_DOCUMENT_VERSION
+            );
+        }
+    }
+
+    #[test]
     fn captures_clean_git_workspace_without_storing_remote_url() {
         let temp = TempDir::new().expect("temporary repository");
         let repo = temp.path();
@@ -6126,7 +6297,7 @@ mod tests {
             json!({"text": source.clone()}),
         )]);
 
-        let document = trajectory_search_document_with_limits(&snapshot, 48, 1_000);
+        let document = trajectory_search_document_with_limits(&snapshot, &[], 48, 1_000);
 
         assert!(document.text.starts_with("event-head-"));
         assert!(document.text.ends_with("-event-tail"));
@@ -6236,7 +6407,7 @@ mod tests {
             .collect();
 
         let document =
-            trajectory_search_document_with_limits(&snapshot_with_events(events), 128, 48);
+            trajectory_search_document_with_limits(&snapshot_with_events(events), &[], 128, 48);
 
         assert!(document.text.contains("event-1"));
         assert!(document.text.contains("event-8"));
@@ -6258,7 +6429,7 @@ mod tests {
             json!({"text": source.clone()}),
         )]);
 
-        let document = trajectory_search_document_with_limits(&snapshot, 32, 40);
+        let document = trajectory_search_document_with_limits(&snapshot, &[], 32, 40);
 
         assert!(document.text.starts_with("head-"));
         assert!(document.text.ends_with("-tail"));
