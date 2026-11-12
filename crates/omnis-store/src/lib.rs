@@ -332,7 +332,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
-      AND (excluded.provider NOT IN ('pi','omp') OR excluded.origin <> 'native'
+      AND (excluded.provider NOT IN ('pi','omp','codex') OR excluded.origin <> 'native'
            OR session_trajectories.origin <> 'native' OR (
                (excluded.source_file_id IS NOT NULL OR session_trajectories.source_file_id IS NULL)
                AND (excluded.source_file_id IS NULL OR session_trajectories.source_file_id IS NOT NULL
@@ -429,12 +429,12 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
             SELECT CASE WHEN replace_title THEN excluded.derived_title
                         ELSE session_trajectories.derived_title END,
                    CASE WHEN replace_title THEN excluded.derived_title_is_verified
-                            OR (excluded.derived_title IS NOT NULL AND session_trajectories.derived_title_is_verified
+                            OR (NOT upgrading_title AND excluded.derived_title IS NOT NULL AND session_trajectories.derived_title_is_verified
                                 AND excluded.source_file_id IS session_trajectories.source_file_id
                                 AND excluded.derived_title IS session_trajectories.derived_title)
                         ELSE session_trajectories.derived_title_is_verified END,
                    CASE WHEN NOT coalesce(replace_title, 0) THEN session_trajectories.derived_title_is_local_opener
-                        WHEN same_title AND session_trajectories.derived_title_is_verified AND (
+                        WHEN same_title AND NOT upgrading_title AND session_trajectories.derived_title_is_verified AND (
                              NOT excluded.derived_title_is_verified OR
                              (session_trajectories.derived_title_is_local_opener IS 0 AND ?22))
                           THEN session_trajectories.derived_title_is_local_opener
@@ -442,7 +442,8 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
             FROM (SELECT
                 excluded.source_file_id IS session_trajectories.source_file_id
                 AND excluded.derived_title IS NOT NULL AND excluded.derived_title IS session_trajectories.derived_title AS same_title,
-                CASE WHEN ?23 THEN session_trajectories.origin = 'native'
+                CASE WHEN upgrading_title THEN 1
+                     WHEN ?23 THEN session_trajectories.origin = 'native'
                           AND excluded.source_file_id = session_trajectories.source_file_id
                           AND ?21 = session_trajectories.derived_title AND session_trajectories.derived_title_is_local_opener IS NOT 0
                      WHEN ?22 AND excluded.source_file_id = session_trajectories.source_file_id
@@ -463,7 +464,10 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
                     AND NOT session_trajectories.derived_title_is_verified
                     AND session_trajectories.origin = 'native'
                     AND excluded.source_file_id = session_trajectories.source_file_id)
-                END AS replace_title)
+                END AS replace_title, upgrading_title
+                FROM (SELECT ?17 AND session_trajectories.origin = 'native' AND excluded.origin = 'native'
+                    AND session_trajectories.document_version < 7 AND excluded.document_version >= 7
+                    AND session_trajectories.derived_title_is_local_opener IS NOT 1 AS upgrading_title))
         )
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        excluded.document_version > session_trajectories.document_version
@@ -809,6 +813,12 @@ impl TrajectorySourceGuard {
         matches!(provider, Provider::Pi | Provider::OhMyPi)
     }
 
+    /// Whether an index read returns the selected native file and its revision.
+    #[must_use]
+    pub const fn verifies_search_file(provider: Provider) -> bool {
+        matches!(provider, Provider::Codex) || Self::uses_file_time(provider)
+    }
+
     /// Whether the stored document, catalog, or failure identifies another physical file for this session.
     #[must_use]
     pub fn has_competing_file(self, file: Option<Uuid>) -> bool {
@@ -951,6 +961,7 @@ pub struct TrajectoryIndexState {
 /// A derived title and the document revision that verified it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexedTitle {
+    pub document_version: u32,
     pub source_revision: SourceRevision,
     pub title: Option<String>,
     pub verified_at: Option<(u32, DateTime<Utc>)>,
@@ -1210,7 +1221,7 @@ fn validate_selected_catalog(
 ) -> Result<()> {
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
-        || !TrajectorySourceGuard::uses_file_time(session.provider)
+        || !TrajectorySourceGuard::verifies_search_file(session.provider)
         || !matches!(guard, TrajectorySourceGuard::Verified { .. })
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete
@@ -3223,6 +3234,7 @@ impl Store {
             titles.insert(
                 SessionRef::new(provider, session_id),
                 IndexedTitle {
+                    document_version: row.get(3).map_err(database_error)?,
                     source_revision: source_revision_from_row(row, 8).map_err(database_error)?,
                     title: row.get(2).map_err(database_error)?,
                     verified_at,
@@ -5868,6 +5880,7 @@ pub struct LegacyCodexOpenerCandidate {
 /// An indexed title and the physical source that supplied it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedTrajectoryTitle {
+    pub document_version: u32,
     pub verified_at: Option<(u32, DateTime<Utc>)>,
     pub cached_at: Option<DateTime<Utc>>,
     pub session: SessionRef,
@@ -6093,6 +6106,7 @@ fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTr
     let time = |fraction: u32| millis + chrono::Duration::nanoseconds(i64::from(fraction));
     let version = row.get(6)?;
     Ok(IndexedTrajectoryTitle {
+        document_version: version,
         verified_at: row
             .get::<_, Option<u32>>(7)?
             .map(|fraction| (version, time(fraction))),
@@ -10129,6 +10143,44 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn partial_codex_upgrade_replaces_a_legacy_display_name_with_the_observed_opener() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Codex, "named");
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(42)),
+            contents: Some(Uuid::from_u128(43)),
+            ..SourceRevision::default()
+        };
+        let old = TrajectoryDocument {
+            derived_title: Some("GUI name"),
+            title_is_verified: true,
+            ..rollout_document("older preview", Utc::now(), revision, false, 6)
+        };
+        save_observed_title(&store, &session, old);
+        let receipt = || store.indexed_trajectory_title(&session).unwrap().unwrap();
+        assert_eq!(receipt().document_version, 6);
+        let upgraded = TrajectoryDocument {
+            document_version: 7,
+            derived_title: Some("actual opening prompt"),
+            local_opener: LocalOpenerEvidence::Current,
+            ..old
+        };
+        assert_eq!(
+            save_observed_title(&store, &session, upgraded).as_deref(),
+            upgraded.derived_title
+        );
+        assert_eq!(receipt().document_version, 7);
+        let withdrawn = TrajectoryDocument {
+            derived_title: None,
+            withdrawn_title: upgraded.derived_title,
+            local_opener: LocalOpenerEvidence::Withdrawn,
+            ..upgraded
+        };
+        assert!(save_observed_title(&store, &session, withdrawn).is_none());
     }
 
     #[test]
