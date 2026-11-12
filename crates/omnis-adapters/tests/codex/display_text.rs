@@ -162,6 +162,36 @@ fn a_stamped_default_turn_keeps_literal_tags_during_a_different_plan_turn() {
 }
 
 #[test]
+fn compaction_preserves_the_recorded_model_replies_across_plan_modes() {
+    let literal = "<proposed_plan>\nexample\n</proposed_plan>";
+    let mut earlier = raw_assistant("default-reply", &[literal]);
+    earlier["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":"default"});
+    let plan_text = format!("Recorded.\n{literal}");
+    let mut planned = raw_assistant("plan-reply", &[&plan_text]);
+    planned["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":"plan"});
+    let rows = vec![
+        event("task_started", json!({"turn_id":"default"})),
+        event(
+            "task_started",
+            json!({"turn_id":"plan","collaboration_mode_kind":"plan"}),
+        ),
+        json!({"type":"compacted","payload":{"message":"","replacement_history":[earlier["payload"],planned["payload"]]}}),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
+        let imported = omnis_core::import_conversation(&snapshot);
+        assert_eq!(
+            imported
+                .messages
+                .iter()
+                .map(|m| m.text.trim())
+                .collect::<Vec<_>>(),
+            [literal, plan_text.as_str()]
+        );
+    }
+}
+
+#[test]
 fn a_plan_keeps_its_position_entire_text_and_separate_identity() {
     let body = "0123456789".repeat(5_000) + "end of plan";
     let plan =

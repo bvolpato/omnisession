@@ -261,11 +261,15 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
 #[test]
 fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let temporary = TempDir::new().expect("temporary directory");
+    let old = temporary.path().join("old");
+    let new = temporary.path().join("new");
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
     fs::write(
         sessions.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl")),
-        include_bytes!("fixtures/codex-session.jsonl"),
+        include_str!("fixtures/codex-session.jsonl")
+            .replace(r#""/workspace/old""#, &serde_json::to_string(&old).unwrap())
+            .replace(r#""/workspace/new""#, &serde_json::to_string(&new).unwrap()),
     )
     .expect("Codex fixture");
     fs::write(
@@ -287,9 +291,7 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     .expect("Codex index fixture");
 
     let adapter = CodexAdapter::with_root(temporary.path());
-    let discovered = adapter
-        .list_sessions(Some(Path::new("/workspace/old")))
-        .expect("Codex discovery");
+    let discovered = adapter.list_sessions(Some(&old)).expect("Codex discovery");
     assert_eq!(discovered.len(), 1);
     assert_eq!(discovered[0].title.as_deref(), Some("New title"));
     assert_eq!(discovered[0].event_count, 0);
@@ -297,7 +299,7 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let snapshot = adapter
         .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
         .expect("Codex read");
-    assert_eq!(snapshot.workspace.current_dir, Path::new("/workspace/new"));
+    assert_eq!(snapshot.workspace.current_dir, new);
     assert_eq!(snapshot.events.len(), 6);
     let omission = snapshot.events.last().expect("malformed row notice");
     assert_eq!(
@@ -305,6 +307,12 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         Some("omnisession.codex_malformed_records")
     );
     assert_eq!(omission.payload["malformed_records"], 1);
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| event.payload["workspace_unknown"] == true)
+    );
     assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
     assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);
@@ -389,51 +397,47 @@ fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
     let source = SessionRef::new(Provider::Codex, CODEX_ID);
+    let workspace = temporary.path().join("demo");
+    let other = temporary.path().join("other");
     let started_at = "2026-01-02T12:00:00Z"
         .parse::<DateTime<Utc>>()
         .expect("launch timestamp");
     let matching_id = "66666666-6666-4666-8666-666666666666";
 
     for (id, timestamp, cwd, agent_role, parent) in [
-        (
-            CODEX_ID,
-            "2026-01-02T11:59:59Z",
-            "/workspace/demo",
-            None,
-            None,
-        ),
+        (CODEX_ID, "2026-01-02T11:59:59Z", &workspace, None, None),
         (
             matching_id,
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             Some(CODEX_ID),
         ),
         (
             "55555555-5555-4555-8555-555555555555",
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             None,
         ),
         (
             "99999999-9999-4999-8999-999999999999",
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             Some(matching_id),
         ),
         (
             "77777777-7777-4777-8777-777777777777",
             "2026-01-02T12:00:02Z",
-            "/workspace/other",
+            &other,
             None,
             Some(CODEX_ID),
         ),
         (
             "88888888-8888-4888-8888-888888888888",
             "2026-01-02T12:00:03Z",
-            "/workspace/demo",
+            &workspace,
             Some("worker"),
             Some(CODEX_ID),
         ),
@@ -448,7 +452,7 @@ fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     }
 
     let candidates = CodexAdapter::with_root(temporary.path())
-        .fork_candidates_created_since(&source, Path::new("/workspace/demo"), started_at)
+        .fork_candidates_created_since(&source, &workspace, started_at)
         .expect("Codex fork discovery");
     assert_eq!(candidates, [SessionRef::new(Provider::Codex, matching_id)]);
 }

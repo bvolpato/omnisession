@@ -24,12 +24,22 @@ impl CodexAdapter {
             .flatten()
             .unwrap_or_default();
         let (listing, cached_header) = self.listing(true);
+        if listing.sessions.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let catalog = self.workspace_catalog.as_deref();
+        let observations = catalog
+            .map(super::WorkspaceCatalog::list)
+            .unwrap_or_default();
+        let indexed = catalog
+            .map(super::WorkspaceCatalog::indexed_sessions)
+            .unwrap_or_default();
         let mut sessions = Vec::new();
         let mut unknown = Vec::new();
         let mut matches = HashMap::<OsString, bool>::new();
         let mut in_project = |path: Option<&Path>| {
             project.is_none_or(|project| {
-                path.is_some_and(|path| {
+                path.filter(|path| path.is_absolute()).is_some_and(|path| {
                     if let Some(&found) = matches.get(path.as_os_str()) {
                         return found;
                     }
@@ -41,7 +51,13 @@ impl CodexAdapter {
         };
         for raw in &listing.sessions {
             let mut session = raw.native_session();
+            if let Some((catalog, observation)) = catalog.zip(observations.get(&raw.id)) {
+                catalog.apply(raw, &mut session, observation, project);
+            }
             let verified = session.apply_codex_workspace_index(&workspaces, cached_header);
+            if let Some((catalog, previous)) = catalog.zip(indexed.get(&raw.id)) {
+                catalog.refresh_replaced(self, raw, &session, previous);
+            }
             if in_project(session.project_path.as_deref()) {
                 sessions.push(session);
             } else if check_moves && !verified {
@@ -152,10 +168,10 @@ impl WorkspaceProbe {
             rollout_file::read_records(bytes.as_slice(), |mut record, skipped, terminated| {
                 history.observe_malformed(&mut malformed, skipped);
                 history.settings.observe_gaps(skipped);
-                history.settings.observe(&session.session.id, &record);
-                history
-                    .workspace
-                    .observe_gaps(skipped.workspace_gaps(), history.records_seen);
+                if !history.paginated || super::WorkspaceRecords::accepts(true, &record) {
+                    history.settings.observe(&session.session.id, &record);
+                }
+                history.observe_workspace_gaps(skipped.workspace_gaps(), builder.checkpoint());
                 if history.records_seen == 0 {
                     ensure!(
                         record["type"] == "session_meta"
@@ -179,9 +195,7 @@ impl WorkspaceProbe {
                 Ok(())
             })?;
         history.settings.observe_gaps(skipped);
-        history
-            .workspace
-            .observe_gaps(skipped.workspace_gaps(), history.records_seen);
+        history.observe_workspace_gaps(skipped.workspace_gaps(), builder.checkpoint());
         ensure!(
             !inherited
                 || history.settings.has_owned()

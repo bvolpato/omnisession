@@ -196,12 +196,16 @@ impl DisplayRevisions {
         builder: &mut EventBuilder,
         previous: Option<(u64, PreviousDisplay)>,
         input: Option<u64>,
-        owners: &HashMap<u64, u64>,
-    ) {
-        let (Some((sequence, previous)), Some(input)) = (previous, input) else {
-            return;
+        owner: impl FnOnce(u64) -> u64,
+    ) -> bool {
+        let Some((sequence, previous)) = previous else {
+            return false;
         };
-        let owner = owners.get(&sequence).copied().unwrap_or(sequence);
+        let was_displayed = previous.was_displayed_message();
+        let Some(input) = input else {
+            return was_displayed;
+        };
+        let owner = owner(sequence);
         if owner >= input {
             if let Some(history) = self.items.get_mut(&sequence) {
                 history.unknown = false;
@@ -209,6 +213,7 @@ impl DisplayRevisions {
         } else if let Some(event) = builder.event_at_mut(sequence) {
             self.save(sequence, input, owner, event, Some(previous));
         }
+        was_displayed
     }
 
     fn save(
@@ -284,12 +289,22 @@ impl DisplayRevisions {
         }
     }
 
-    pub(super) fn rollback(&mut self, builder: &mut EventBuilder, cut: u64) {
-        // A late item can target an older named turn after the current turn changed.
-        let mut retained = VecDeque::new();
+    pub(super) fn rollback(&mut self, builder: &mut EventBuilder, removed: impl Fn(u64) -> bool) {
+        let mut kept: VecDeque<Revision> = VecDeque::new();
         while let Some(change) = self.changes.pop_back() {
-            if change.input < cut {
-                retained.push_front(change);
+            if !removed(change.input) {
+                kept.push_front(change);
+                continue;
+            }
+            if let Some(newer) = kept
+                .iter_mut()
+                .find(|later| later.sequence == change.sequence)
+            {
+                // A retained later revision still describes the visible item. It now follows
+                // the state that preceded the removed revision.
+                self.bytes -= newer.bytes;
+                newer.bytes = change.bytes;
+                newer.previous = change.previous;
                 continue;
             }
             self.bytes -= change.bytes;
@@ -300,9 +315,9 @@ impl DisplayRevisions {
                 }
             }
         }
-        self.changes = retained;
+        self.changes = kept;
         for history in self.items.values_mut() {
-            if history.evicted_through.is_some_and(|at| at >= cut) {
+            if history.evicted_through.is_some_and(&removed) {
                 history.evicted_through = None;
                 history.unknown = true;
             }
@@ -409,8 +424,8 @@ mod tests {
             "event_msg.item_completed",
         )
         .unwrap();
-        history.observe_message(&mut builder, Some((0, previous)), Some(1), &HashMap::new());
-        history.rollback(&mut builder, 1);
+        history.observe_message(&mut builder, Some((0, previous)), Some(1), |seq| seq);
+        history.rollback(&mut builder, |seq| seq >= 1);
         history.finish(&mut builder);
         assert!(builder.event_at_mut(0).is_none());
         let notice = builder.event_at_mut(1).unwrap();
@@ -459,11 +474,11 @@ mod tests {
                 }
                 history.observe(&mut builder, 0, input, previous);
             }
-            history.rollback(&mut builder, 3);
+            history.rollback(&mut builder, |seq| seq >= 3);
             let retained = builder.event_at_mut(0).unwrap();
             assert_eq!(retained.kind, EventKind::ToolCompleted);
             assert_eq!(retained.payload["output"], if model { body } else { "two" });
-            history.rollback(&mut builder, 2);
+            history.rollback(&mut builder, |seq| seq >= 2);
             history.finish(&mut builder);
             if model {
                 let event = builder.event_at_mut(0).unwrap();

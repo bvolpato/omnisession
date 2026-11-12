@@ -1,4 +1,4 @@
-use super::{event, page_user, read_with_history_mode, turn_item, visible_text};
+use super::{event, page_user, read_with_history_mode, turn_item};
 use serde_json::{Value, json};
 
 fn model(turn: &str, id: &str, role: &str, text: &str) -> Value {
@@ -29,7 +29,7 @@ fn rollback() -> Value {
 fn check(rows: &[Value], displayed: &[&str], active: &[&str]) {
     for preview in [false, true] {
         let snapshot = read_with_history_mode(rows.to_vec(), preview, Some("paginated")).unwrap();
-        assert_eq!(visible_text(&snapshot), displayed);
+        assert_eq!(super::published_text(&snapshot), displayed);
         let import = omnis_core::import_conversation(&snapshot);
         assert_eq!(
             import
@@ -390,8 +390,20 @@ fn rollback_transfers_only_the_previously_displayed_surviving_reply_version() {
             page_user("turn", "later", "withdrawn request"),
             model("turn", "reply", "assistant", "withdrawn revised reply"),
             shown("turn", "reply", "withdrawn revised reply"),
-            rollback(),
         ]);
+        if with_checkpoint {
+            check(
+                &rows,
+                &["keep", "withdrawn revised reply", "withdrawn request"],
+                &[
+                    "keep",
+                    "original public reply",
+                    "withdrawn request",
+                    "withdrawn revised reply",
+                ],
+            );
+        }
+        rows.push(rollback());
         check(
             &rows,
             &["keep", "withdrawn revised reply", "withdrawn request"],
@@ -406,105 +418,130 @@ fn rollback_transfers_only_the_previously_displayed_surviving_reply_version() {
 }
 
 #[test]
-fn a_verified_post_compaction_reply_follows_its_request_only_in_active_history() {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Revision {
-        Published,
-        FirstPublication,
-        DisplayOnly,
-        AfterRollback,
-        Withdrawn,
+fn accepted_revisions_after_compaction_keep_their_model_positions() {
+    let first = model("turn", "first", "user", "first request");
+    let numbered = json!({"type":"compacted","payload":{"window_number":1,"message":"","replacement_history":[first["payload"]]}});
+    let legacy = json!({"type":"compacted","payload":{"message":"checkpoint summary"}});
+    for checkpoint in [numbered, legacy] {
+        let rows = vec![
+            start("turn"),
+            first.clone(),
+            page_user("turn", "first", "first request"),
+            checkpoint,
+            model("turn", "reply", "assistant", "first answer"),
+            shown("turn", "reply", "first answer"),
+            model("turn", "next", "user", "next request"),
+            page_user("turn", "next", "next request"),
+            model("turn", "reply", "assistant", "updated answer"),
+            shown("turn", "reply", "updated answer"),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                super::published_text(&snapshot),
+                ["first request", "updated answer", "next request"]
+            );
+            let indexed = omnis_core::trajectory_search_document(&snapshot).text;
+            assert_eq!(indexed.matches("first answer").count(), 1);
+            assert_eq!(indexed.matches("updated answer").count(), 1);
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let replies: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .filter(|text| !text.contains("checkpoint summary"))
+                .collect();
+            assert_eq!(
+                replies,
+                [
+                    "first request",
+                    "first answer",
+                    "next request",
+                    "updated answer"
+                ]
+            );
+        }
     }
-    use Revision::{AfterRollback, DisplayOnly, FirstPublication, Published, Withdrawn};
+}
 
-    let t = "turn";
-    let first = model(t, "first", "user", "request one");
-    let checkpoints = [
-        json!({"window_number":1,"message":"","replacement_history":[first["payload"]]}),
-        json!({"message":"source summary"}),
-    ];
-    for checkpoint in checkpoints {
-        for revision in [
-            Published,
-            FirstPublication,
-            DisplayOnly,
-            AfterRollback,
-            Withdrawn,
-        ] {
-            let mut rows = vec![
-                start(t),
-                first.clone(),
-                page_user(t, "first", "request one"),
-                model(t, "answer", "assistant", "original body"),
-            ];
-            let mut public = vec!["request one"];
-            if revision != FirstPublication {
-                rows.push(shown(t, "answer", "original body"));
-                public.push("revised answer");
-            }
-            rows.push(json!({"type":"compacted","payload":checkpoint}));
-            if revision == AfterRollback {
-                rows.extend([
-                    model(t, "removed", "user", "discarded steer"),
-                    page_user(t, "removed", "discarded steer"),
-                    rollback(),
-                ]);
-                public.push("discarded steer");
-            }
-            rows.extend([
-                model(t, "second", "user", "request two"),
-                page_user(t, "second", "request two"),
-            ]);
-            public.push("request two");
-            let revised = model(t, "answer", "assistant", "revised answer");
-            let display = shown(t, "answer", "revised answer");
-            match revision {
-                Published => rows.extend([display, revised]),
-                DisplayOnly => rows.push(display),
-                Withdrawn => rows.extend([revised, rollback(), display]),
-                FirstPublication | AfterRollback => rows.extend([revised, display]),
-            }
-            if revision == FirstPublication {
-                public.push("revised answer");
-            }
-
-            let mut expected = vec!["request one"];
-            if checkpoint["message"] == "source summary" {
-                expected.push("source summary");
-            }
-            if revision != Withdrawn {
-                expected.push("request two");
-            }
-            if !matches!(revision, DisplayOnly | Withdrawn) {
-                expected.push("revised answer");
-            }
-
-            for preview in [false, true] {
-                let snapshot =
-                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
-                assert_eq!(
-                    visible_text(&snapshot),
-                    public,
-                    "{revision:?}, preview={preview}"
-                );
-                if revision == FirstPublication {
-                    assert!(
-                        !serde_json::to_string(&snapshot)
-                            .unwrap()
-                            .contains("original body")
-                    );
-                }
-                let active = omnis_core::import_conversation(&snapshot);
-                let messages: Vec<_> = active
-                    .messages
-                    .iter()
-                    .map(|message| message.text.lines().last().unwrap())
-                    .collect();
-                assert_eq!(
-                    messages, expected,
-                    "{checkpoint}, {revision:?}, preview={preview}"
-                );
-            }
+#[test]
+fn a_delayed_display_keeps_the_verified_request_before_its_revised_answer() {
+    let first = model("turn", "first", "user", "first request");
+    let numbered = json!({"type":"compacted","payload":{"window_number":1,"message":"","replacement_history":[first["payload"]]}});
+    let legacy = json!({"type":"compacted","payload":{"message":"checkpoint summary"}});
+    let migrated_input = "msg_input_01948226-0000-7000-8000-000000000001";
+    for (checkpoint, model_id, public_id, image) in [
+        (numbered.clone(), "next", "next", false),
+        (legacy, migrated_input, "item-2", false),
+        (numbered, "image", "image", true),
+    ] {
+        let mut native = model("turn", model_id, "user", "next request");
+        let mut display = page_user("turn", public_id, "next request");
+        let request_text = if image {
+            native["payload"]["content"] =
+                json!([{"type":"input_image","file_id":"private-image-id"}]);
+            display["payload"]["item"]["content"] =
+                json!([{"type":"image","file_id":"private-image-id"}]);
+            "[1 image omitted]"
+        } else {
+            "next request"
+        };
+        let rows = vec![
+            start("turn"),
+            first.clone(),
+            page_user("turn", "first", "first request"),
+            model("turn", "reply", "assistant", "first answer"),
+            shown("turn", "reply", "first answer"),
+            checkpoint,
+            native,
+            model("turn", "sibling", "assistant", "separate answer"),
+            model("turn", "reply", "assistant", "updated answer"),
+            display,
+            shown("turn", "reply", "updated answer"),
+            shown("turn", "sibling", "separate answer"),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                super::published_text(&snapshot),
+                [
+                    "first request",
+                    "updated answer",
+                    request_text,
+                    "separate answer"
+                ]
+            );
+            let request = snapshot
+                .events
+                .iter()
+                .find(|event| event.payload["text"] == request_text)
+                .unwrap();
+            let reply = snapshot
+                .events
+                .iter()
+                .find(|event| {
+                    event.source.raw_record_type.as_deref() == Some("response_item.message")
+                        && event.payload["text"] == "updated answer"
+                })
+                .unwrap();
+            let anchor = &request.payload["omnisession_codex_checkpoint_position"];
+            let sibling = snapshot
+                .events
+                .iter()
+                .find(|event| event.payload["text"] == "separate answer")
+                .unwrap();
+            let sibling_anchor = &sibling.payload["omnisession_codex_checkpoint_position"];
+            assert_eq!(anchor[0].as_u64(), Some(reply.sequence - 1));
+            assert_eq!(anchor[0], sibling_anchor[0]);
+            assert!(anchor[1].as_u64().unwrap() < sibling_anchor[1].as_u64().unwrap());
+            assert!(request.sequence > reply.sequence);
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("private-image-id")
+            );
         }
     }
 }

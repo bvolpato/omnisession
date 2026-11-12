@@ -71,6 +71,67 @@ fn installed_claude_round_trips_isolated_synthetic_history() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_empty_replacement_can_materialize_only_a_recovery_pointer() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let source = fixture.write_codex_source();
+    let records = fs::read_to_string(&source).unwrap();
+    let meta = records.lines().next().unwrap();
+    let claude = fixture.root.join("claude-test-launcher");
+    fs::write(
+        &claude,
+        "#!/bin/sh\nprintf '%s\\n' '2.1.300 (Claude Code)'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+
+    for note in ["", "Recoverable synthetic context"] {
+        let boundary =
+            json!({"type":"compacted","payload":{"message":note,"replacement_history":[]}});
+        fs::write(&source, format!("{meta}\n{boundary}\n")).unwrap();
+        let output = fixture
+            .isolated_command()
+            .args([
+                "fork",
+                &format!("codex:{CODEX_SOURCE_ID}"),
+                "--in",
+                "claude",
+                "--materialize-only",
+            ])
+            .env("OMNI_CLAUDE_BIN", &claude)
+            .output()
+            .unwrap();
+        if note.is_empty() {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("no visible trajectory"));
+            assert!(
+                fs::read_dir(fixture.root.join("tmp"))
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("omnisession-handoff-"))
+            );
+            continue;
+        }
+        assert_success("claude", &output);
+        let target = materialized_target_ref(&output.stdout).expect("verified target");
+        let trajectory = import_trajectory(&fixture.snapshot(&target));
+        let [notice] = trajectory.items.as_slice() else {
+            panic!("expected only the recovery pointer")
+        };
+        assert_eq!(notice.kind, TrajectoryItemKind::Assistant);
+        assert!(notice.text.starts_with("[OmniSession recovery file]\n"));
+        let path = Path::new(notice.text.lines().last().unwrap());
+        assert!(path.starts_with(fixture.root.join("tmp")));
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        assert!(fs::read_to_string(path).unwrap().contains(note));
+    }
+}
+
 #[test]
 #[ignore = "requires OMNI_TEST_CODEX_BIN"]
 fn installed_codex_keeps_the_claude_reply_that_follows_a_compaction_summary() {

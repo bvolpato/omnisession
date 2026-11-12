@@ -57,6 +57,21 @@ pub(super) fn versions<'a>(
     snapshot: &CanonicalSnapshot,
     event: &'a OmniEvent,
 ) -> Option<&'a [Value]> {
+    reply_array(snapshot, event, "omnisession_codex_active_replies")
+}
+
+pub(super) fn positioned_spellings<'a>(
+    snapshot: &CanonicalSnapshot,
+    event: &'a OmniEvent,
+) -> Option<&'a [Value]> {
+    reply_array(snapshot, event, "omnisession_codex_positioned_reply")
+}
+
+fn reply_array<'a>(
+    snapshot: &CanonicalSnapshot,
+    event: &'a OmniEvent,
+    key: &str,
+) -> Option<&'a [Value]> {
     if snapshot.session.provider != Provider::Codex
         || event.source.provider != Provider::Codex
         || event.kind != EventKind::MessageAssistant
@@ -65,11 +80,7 @@ pub(super) fn versions<'a>(
     {
         return None;
     }
-    event
-        .payload
-        .get("omnisession_codex_active_replies")?
-        .as_array()
-        .map(Vec::as_slice)
+    event.payload.get(key)?.as_array().map(Vec::as_slice)
 }
 
 pub(super) fn previous_spellings<'a>(
@@ -88,6 +99,12 @@ pub(super) fn previous_spellings<'a>(
     restored_codex_answer(snapshot, event)
         .into_iter()
         .chain(versions)
+        .chain(
+            positioned_spellings(snapshot, event)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
         .filter(move |text| Some(*text) != current && !text.trim().is_empty() && seen.insert(*text))
 }
 
@@ -106,18 +123,23 @@ pub(super) fn active<'a>(
         event,
         spelling: restored_codex_answer(snapshot, event),
     };
-    if !events
-        .iter()
-        .any(|event| versions(snapshot, event).is_some())
-    {
+    if !events.iter().any(|event| {
+        versions(snapshot, event).is_some() || positioned_spellings(snapshot, event).is_some()
+    }) {
         return events
             .into_iter()
-            .filter(|event| has_active_codex_event(snapshot, event))
+            .filter(|event| {
+                positioned_spellings(snapshot, event).is_none()
+                    && has_active_codex_event(snapshot, event)
+            })
             .map(recorded)
             .collect();
     }
     let mut ordered = Vec::with_capacity(events.len());
     for event in events {
+        if positioned_spellings(snapshot, event).is_some() {
+            continue;
+        }
         if let Some(versions) = versions(snapshot, event) {
             for version in versions {
                 if let Some(order) = position(&version["position"]) {

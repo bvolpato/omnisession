@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -262,6 +262,14 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// Workspace evidence for a session whose active directory can change between turns.
+pub struct NativeWorkspace {
+    pub directory: Option<PathBuf>,
+    /// Directory the native client can safely infer when it opens the session.
+    pub startup_directory: Option<PathBuf>,
+    pub git: GitState,
+}
+
 /// State database settings that a Codex launch profile supplies.
 #[derive(Debug, Default)]
 pub struct CodexLaunchOverrides {
@@ -404,6 +412,15 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Reads the effective workspace when it can differ from the discovery metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot determine the effective directory.
+    fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+        Ok(None)
     }
 
     /// Describes whether the provider can continue the stored representation by its session ID.

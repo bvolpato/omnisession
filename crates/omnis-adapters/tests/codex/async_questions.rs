@@ -1,4 +1,6 @@
-use super::{event, message, page_user, read_with_history_mode, turn_item, visible_text};
+use super::{
+    event, message, page_user, published_text, read_with_history_mode, turn_item, visible_text,
+};
 use omnis_ir::EventKind;
 use serde_json::{Value, json};
 
@@ -115,21 +117,30 @@ fn an_async_question_survives_an_exact_checkpoint_copy_of_its_call() {
         if revised {
             rows.push(question("Later display"));
         }
-        let snap = read_with_history_mode(rows, false, Some("paginated")).unwrap();
-        let transcript = omnis_core::import_conversation(&snap);
-        assert_eq!(
-            transcript
+        rows.push(page_user("fresh", "new", "next request"));
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let expected_question = if revised {
+                "Later display"
+            } else {
+                "Which workspace?"
+            };
+            assert_eq!(
+                published_text(&snap),
+                ["first", expected_question, "next request"]
+            );
+            let active = omnis_core::import_conversation(&snap);
+            let messages: Vec<_> = active
                 .messages
                 .iter()
-                .any(|m| m.text == "Which workspace?"),
-            !altered
-        );
-        assert!(
-            !transcript
-                .messages
-                .iter()
-                .any(|m| m.text == "Later display" || m.text == "model-only suggestion")
-        );
+                .map(|message| message.text.as_str())
+                .collect();
+            if altered {
+                assert_eq!(messages, ["first", "next request"]);
+            } else {
+                assert_eq!(messages, ["first", "Which workspace?", "next request"]);
+            }
+        }
     }
 }
 
