@@ -441,6 +441,14 @@ impl CodexAdapter {
         Some(ObservedRollout::read(path)?.revision)
     }
 
+    fn header_is_current(path: &Path, previous: Option<SourceRevision>) -> bool {
+        previous.is_some_and(|old| {
+            old.contents.is_some()
+                && Self::index_file_revision(path)
+                    .is_some_and(|current| old.matches_file_contents(current))
+        })
+    }
+
     /// Checks a legacy search document against the currently selected rollout with bounded memory.
     ///
     /// # Errors
@@ -487,6 +495,9 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
                 rollback_title,
                 workspace_projection,
                 snapshot,
@@ -803,10 +814,7 @@ impl CodexAdapter {
                 && current_rollout::canonical_name(path)
                 && legacy.title_paths(id).iter().all(|&file| file == path)
                 && row.is_none_or(|row| row.ordinary_path_is(path))
-                && cached
-                    .source_revision
-                    .zip(Self::index_file_revision(path))
-                    .is_some_and(|(old, new)| old.matches_file_contents(new))
+                && Self::header_is_current(path, cached.source_revision)
             {
                 let indexed = || self.title_index().titles.get(id).cloned();
                 cached.title = match row {
@@ -832,7 +840,7 @@ impl CodexAdapter {
             if cached
                 .source_revision
                 .zip(current.observed_revision)
-                .is_some_and(|(old, new)| old.matches_file_contents(new))
+                .is_some_and(|(old, new)| old.contents.is_some() && old.matches_file_contents(new))
             {
                 cached.source_path = Some(current.path);
             } else {
@@ -863,18 +871,16 @@ impl CodexAdapter {
                         .listing
                         .legacy_revisions
                         .iter()
-                        .all(|(path, previous)| {
-                            previous.is_some() && Self::index_file_revision(path) == *previous
-                        })
+                        .all(|(path, previous)| Self::header_is_current(path, *previous))
                     && cached.listing.sessions.iter().all(|session| {
                         cached.listing.selected_files.contains_key(&session.id)
-                            || Self::index_file_revision(&session.path) == session.observed_revision
+                            || Self::header_is_current(&session.path, session.observed_revision)
                     })
                     && cached
                         .listing
                         .selected_files
                         .values()
-                        .all(|(path, revision)| Self::index_file_revision(path) == Some(*revision)))
+                        .all(|(path, revision)| Self::header_is_current(path, Some(*revision))))
             {
                 return (Arc::clone(&cached.listing), true);
             }
@@ -2344,6 +2350,9 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session,
             snapshot,
             rollback_title,
@@ -2411,6 +2420,9 @@ impl CodexSession {
         );
         let snapshot = self.snapshot(session, events, project, captured_at);
         Ok(IndexRead {
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session: None,
             workspace_projection,
             rollback_title,
@@ -3583,6 +3595,7 @@ impl CodexHistory {
         if !self.paginated {
             self.finish_legacy_outputs(builder);
         }
+        self.rollout_lines.finish_segment();
         self.report_unverified_history(builder);
         if self.paginated {
             self.annotate_model_window(builder, &answers);
@@ -3671,9 +3684,8 @@ impl CodexHistory {
         answers: &HashMap<u64, Option<Withdrawal>>,
     ) {
         builder.visit_events_mut(|event| {
-            if event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT) {
-                return;
-            }
+            let realtime =
+                event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT);
             if !matches!(
                 event.kind,
                 EventKind::MessageUser
@@ -3689,14 +3701,17 @@ impl CodexHistory {
             if self.compactions.contains(seq) {
                 return;
             }
-            let baseline = answers
-                .get(&seq)
-                .copied()
-                .unwrap_or_else(|| self.withdrawn.get(&seq).map(|&(status, _)| status));
-            let status = self
-                .compactions
-                .public_status(seq, self.event_request(seq), baseline);
-            let (status, prior) = if event.kind == EventKind::MessageAssistant {
+            let status = if realtime {
+                self.compactions.public_status(seq, None, None)
+            } else {
+                let baseline = answers
+                    .get(&seq)
+                    .copied()
+                    .unwrap_or_else(|| self.withdrawn.get(&seq).map(|&(status, _)| status));
+                self.compactions
+                    .public_status(seq, self.event_request(seq), baseline)
+            };
+            let (status, prior) = if event.kind == EventKind::MessageAssistant && !realtime {
                 let projection = self.paginated_answers.project_answer(
                     seq,
                     self.compactions.public_history(),
@@ -6538,7 +6553,7 @@ impl ProviderAdapter for CodexAdapter {
             .filter(|(id, prior)| {
                 let known = valid.and_then(|cached| cached.listing.selected_files.get(id.as_str()));
                 if let Some((path, selected)) = known
-                    && Self::index_file_revision(path) == Some(*selected)
+                    && Self::header_is_current(path, Some(*selected))
                 {
                     if prior
                         .and_then(|revision| revision.file)
@@ -6726,10 +6741,12 @@ impl ProviderAdapter for CodexAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<IndexRead> {
+        _prior: Option<crate::PriorSearchDocument>,
+    ) -> Result<crate::IndexedSearchDocument> {
         validate_provider(session, Provider::Codex)?;
         let native = self.require_rollout(&session.id, source_path)?.session;
         self.index_rollout(session, native, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

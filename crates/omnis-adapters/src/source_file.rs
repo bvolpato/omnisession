@@ -8,9 +8,13 @@ use omnis_ir::SourceRevision;
 use uuid::Uuid;
 
 /// File identity and metadata captured together for a selected provider transcript.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObservedSourceFile {
     pub(crate) revision: SourceRevision,
+    #[cfg(any(unix, windows))]
+    object: [u64; 2],
+    #[cfg(windows)]
+    len: u64,
     pub(crate) modified: Option<DateTime<Utc>>,
 }
 
@@ -48,10 +52,7 @@ impl ObservedSourceFile {
             .metadata()
             .ok()
             .and_then(|metadata| Self::from_open_file(canonical, file, &metadata));
-        ensure!(
-            after.is_some_and(|after| after.revision == self.revision),
-            "transcript changed during indexing"
-        );
+        ensure!(after == Some(self), "transcript changed during indexing");
         Ok(())
     }
 
@@ -64,10 +65,31 @@ impl ObservedSourceFile {
     ) -> Result<()> {
         self.ensure_handle_unchanged(canonical, file)?;
         ensure!(
-            Self::read(selected).is_some_and(|current| current.revision == self.revision),
+            Self::read(selected) == Some(self),
             "transcript changed during indexing"
         );
         Ok(())
+    }
+
+    pub(crate) fn revision_in_namespace(self, path: &Path) -> SourceRevision {
+        #[cfg(any(unix, windows))]
+        {
+            #[cfg(windows)]
+            if self.object[0] == u64::MAX {
+                return self.revision;
+            }
+            let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
+            let file = Uuid::new_v5(&namespace, self.object.map(u64::to_le_bytes).as_flattened());
+            SourceRevision {
+                file: Some(file),
+                ..self.revision
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            self.revision
+        }
     }
 
     pub(crate) fn from_metadata(
@@ -94,6 +116,11 @@ impl ObservedSourceFile {
         if !metadata.is_file() {
             return None;
         }
+        // A Windows writer can restore the last-write time after rewriting a file in place.
+        #[cfg(windows)]
+        let changed = winx::file::change_time(file)
+            .ok()
+            .filter(|ticks| *ticks > 0);
         #[cfg(unix)]
         let object = {
             use std::os::unix::fs::MetadataExt;
@@ -105,10 +132,21 @@ impl ObservedSourceFile {
         let file = path_id;
         let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
+            #[cfg(any(unix, windows))]
+            object,
+            #[cfg(windows)]
+            len: metadata.len(),
             modified,
             revision: SourceRevision {
+                legacy_file: None,
                 file: Some(file),
-                contents: contents_id(file, metadata, modified),
+                contents: contents_id(
+                    file,
+                    metadata,
+                    modified,
+                    #[cfg(windows)]
+                    changed,
+                ),
                 missing_ancestor: None,
             },
         })
@@ -120,6 +158,7 @@ fn contents_id(
     file: Uuid,
     metadata: &fs::Metadata,
     modified: Option<DateTime<Utc>>,
+    #[cfg(windows)] change_ticks: Option<i64>,
 ) -> Option<Uuid> {
     let modified = modified?;
     #[cfg(unix)]
@@ -127,7 +166,9 @@ fn contents_id(
         use std::os::unix::fs::MetadataExt;
         (metadata.ctime(), metadata.ctime_nsec())
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let changed = (change_ticks?, 0_i64);
+    #[cfg(not(any(unix, windows)))]
     let changed = {
         let created = DateTime::<Utc>::from(metadata.created().ok()?);
         (

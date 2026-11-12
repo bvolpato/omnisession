@@ -3,7 +3,10 @@ use rusqlite::{Connection, Transaction};
 use super::{Result, STORE_FORMAT, StoreError, database_error, immediate_transaction};
 
 /// Replaces the format 1 unique keys without changing the trajectory IDs that own FTS chunks.
-pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
+pub(super) fn initialize(
+    connection: &mut Connection,
+    prepare_receipts: fn(&Transaction<'_>) -> Result<()>,
+) -> Result<()> {
     let (foreign_keys, legacy_alter): (bool, bool) = connection
         .query_row(
             "SELECT foreign_keys, legacy_alter_table FROM pragma_foreign_keys, pragma_legacy_alter_table",
@@ -15,7 +18,7 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
     let result = connection
         .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
         .map_err(database_error)
-        .and_then(|()| migrate(connection));
+        .and_then(|()| migrate(connection, prepare_receipts));
     let restore_alter = connection.pragma_update(None, "legacy_alter_table", legacy_alter);
     let restore_keys = connection.pragma_update(None, "foreign_keys", foreign_keys);
     result
@@ -23,7 +26,10 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
         .and(restore_keys.map_err(database_error))
 }
 
-fn migrate(connection: &mut Connection) -> Result<()> {
+fn migrate(
+    connection: &mut Connection,
+    prepare_receipts: fn(&Transaction<'_>) -> Result<()>,
+) -> Result<()> {
     let transaction = immediate_transaction(connection)?;
     let version: i64 = transaction
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -34,6 +40,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     if version > STORE_FORMAT {
         return Err(StoreError::NewerStoreFormat);
     }
+    // Format 1 clients still use the old receipt keys if the parent-table swap rolls back.
+    prepare_receipts(&transaction)?;
     for (table, key) in [
         ("session_trajectories", "unique"),
         ("session_index", "primarykey"),
@@ -149,6 +157,10 @@ mod tests {
             "CREATE TABLE session_trajectories(id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
                  session_id TEXT NOT NULL, redacted_text TEXT NOT NULL, source_updated_at INTEGER NOT NULL,
                  complete INTEGER NOT NULL, indexed_at INTEGER NOT NULL, UNIQUE(provider,session_id));
+             CREATE TABLE desktop_search_receipts(provider,session_id,source_home,source_file,source_contents,content_hash,step_proof,
+                 PRIMARY KEY(session_id,source_home,source_file),
+                 FOREIGN KEY(provider,session_id) REFERENCES session_trajectories(provider,session_id) ON DELETE CASCADE);
+             INSERT INTO session_trajectories VALUES(42,'antigravity-desktop','desktop','',1,1,1);
              CREATE TABLE session_trajectory_codex_home(collision);"
         ).unwrap();
         setup
@@ -177,6 +189,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO session_trajectories SELECT * FROM session_trajectories WHERE id=41
              ON CONFLICT(provider,session_id) DO NOTHING;
+             INSERT INTO desktop_search_receipts VALUES('antigravity-desktop','desktop',X'01',zeroblob(16),zeroblob(16),zeroblob(32),X'');
              DROP TABLE session_trajectory_codex_home;",
         )
         .unwrap();
@@ -189,6 +202,18 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(format, STORE_FORMAT);
+        assert_eq!(
+            store
+                .connection
+                .borrow()
+                .query_row(
+                    "SELECT trajectory_id FROM desktop_search_receipts WHERE session_id='desktop'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            42
+        );
         assert_eq!(
             store
                 .search_session_trajectories("transitionalmarker", 5)
@@ -228,7 +253,7 @@ mod tests {
              INSERT INTO chunks VALUES(87,41,'preservedmarker');
              INSERT INTO trajectory_index_failures VALUES('codex','shared','home-a',X'11',X'0102');"
         ).unwrap();
-        initialize(&mut db).unwrap();
+        initialize(&mut db, |_| Ok(())).unwrap();
         let saved: (i64, i64, String, Option<String>) = db
             .query_row(
                 "SELECT w.rowid,t.protected_by_bundle,hex(t.source_contents_id),t.codex_home

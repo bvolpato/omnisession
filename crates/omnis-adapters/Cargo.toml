@@ -50,6 +50,7 @@ dunce.workspace = true
 known-folders.workspace = true
 winapi-util.workspace = true
 winreg.workspace = true
+winx.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }

@@ -323,7 +323,7 @@ impl IndependentItems {
         session: &CodexSession,
         reader: &mut BufReader<File>,
         limit: usize,
-        lines: RolloutLines,
+        mut lines: RolloutLines,
         end: u64,
     ) -> Result<EventBuilder> {
         let selected = select_edges(&self.items, limit, |item| item.bytes);
@@ -333,6 +333,7 @@ impl IndependentItems {
         let mut history = CodexHistory::new(None);
         history.paginated = true;
         history.items.tool_projection.paginated = true;
+        lines.finish_segment();
         let reported_loss = lines.invalid_messages > 0
             || lines.invalid_checkpoints > 0
             || lines.skipped > 0
