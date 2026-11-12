@@ -584,17 +584,24 @@ impl AttachmentPreamble {
                 Some("event_msg"),
                 Some(kind @ ("task_started" | "turn_started" | "item_started" | "item_completed")),
             ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
-                && (self.start.owns(payload)
-                    || matches!(kind, "task_started" | "turn_started")
-                        && payload.get("thread_id").is_none()) =>
+                && (if matches!(kind, "task_started" | "turn_started") {
+                    self.start.owner.is_some_and(|owner| {
+                        super::event_scope_matches(&record, &owner.to_string())
+                    })
+                } else {
+                    self.start.owns(payload)
+                }) =>
             {
                 let verified = request.as_ref().and_then(|request| {
                     (kind == "item_completed"
                         && previous_ordinal.is_some()
-                        && self
-                            .turn_hint
-                            .as_deref()
-                            .is_none_or(|id| payload["turn_id"] == id))
+                        && self.start.owner.is_some_and(|owner| {
+                            super::receipt_in_turn(
+                                &record,
+                                &owner.to_string(),
+                                self.turn_hint.as_deref(),
+                            )
+                        }))
                     .then(|| receipt_literal_parts(request, &record))
                     .flatten()
                 });
@@ -620,7 +627,13 @@ impl AttachmentPreamble {
             _ => {
                 self.gap = true;
                 self.start.incomplete = true;
-                self.turn_hint = payload["turn_id"].as_str().map(str::to_owned);
+                if self
+                    .start
+                    .owner
+                    .is_some_and(|owner| super::event_scope_matches(&record, &owner.to_string()))
+                {
+                    self.turn_hint = payload["turn_id"].as_str().map(str::to_owned);
+                }
             }
         }
         false
@@ -761,9 +774,9 @@ fn media_reference<'a>(
     part: &'a Value,
     url_field: &'static str,
 ) -> Option<(&'static str, &'a str)> {
-    match (part.get(url_field), part.get("file_id")) {
-        (Some(url), None) => Some((url_field, url.as_str().filter(|url| !url.is_empty())?)),
-        (None, Some(file)) => Some(("file_id", file.as_str().filter(|file| !file.is_empty())?)),
+    match (&part[url_field], &part["file_id"]) {
+        (url, Value::Null) => Some((url_field, url.as_str().filter(|url| !url.is_empty())?)),
+        (Value::Null, file) => Some(("file_id", file.as_str().filter(|file| !file.is_empty())?)),
         _ => None,
     }
 }
@@ -1064,6 +1077,10 @@ impl Lineage {
         read(self)
     }
 
+    pub(super) fn attached_leaf(&self) -> bool {
+        self.visible_leaf_start.attached.is_some()
+    }
+
     pub(super) fn project_leaf_request(&self, record: Value) -> Value {
         self.visible_leaf_start.project_request(record)
     }
@@ -1115,7 +1132,9 @@ impl Lineage {
             Ok(skipped)
         };
         if self.visible_leaf_start.ordinal().is_none() {
-            return read(&mut visit);
+            return read(&mut |row, mark, confirmed| {
+                visit(row, mark, confirmed && self.attached_leaf())
+            });
         }
         let mut unplaced = JsonLineSkips::default();
         let mut row = 0;
@@ -1125,7 +1144,7 @@ impl Lineage {
                 Some(true) => visit(
                     self.visible_leaf_start.project_request(record),
                     skipped.combined(unplaced),
-                    confirmed,
+                    confirmed && self.attached_leaf(),
                 )?,
                 Some(false) => {}
                 None => unplaced.observe_unplaced(unplaced_workspace_gap(&record, session)),
@@ -1330,7 +1349,17 @@ fn read_prefix(
     let mut projection = read_prefix_from(segment, &mut source, &mut |record, skipped| {
         if let InheritedRecord::Native(row) = record {
             receipts.observe_confirmed(row, skipped, |row, mark, confirmed| {
-                visit(InheritedRecord::request(row, confirmed), mark)
+                visit(
+                    InheritedRecord::request(
+                        row,
+                        confirmed
+                            && segment
+                                .visible_start
+                                .as_ref()
+                                .is_some_and(|start| start.attached.is_some()),
+                    ),
+                    mark,
+                )
             })
         } else {
             receipts.flush(|row, mark| visit(InheritedRecord::Native(row), mark))?;

@@ -1061,8 +1061,14 @@ fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_mid
 
 #[test]
 fn bounded_samples_keep_mirror_matches_within_contiguous_records() -> anyhow::Result<()> {
-    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID}});
-    let mut rows = vec![message("user", "head A"), message("user", "head B")];
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy","originator":"codex_cli_rs","cli_version":"0.167.1"}});
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"earlier"})),
+        event("user_message", json!({"message":"Earlier"})),
+        event("task_complete", json!({"turn_id":"earlier"})),
+        message("user", "head A"),
+        message("user", "head B"),
+    ];
     let padding = event("token_count", json!({"padding":"x".repeat(64 * 1024)}));
     rows.extend(std::iter::repeat_n(padding.clone(), 144));
     rows.extend([
@@ -1098,7 +1104,7 @@ fn bounded_samples_keep_mirror_matches_within_contiguous_records() -> anyhow::Re
         let read = adapter.index_session(&session, Some(&path), 16 * 1024 * 1024)?;
         assert_eq!(
             visible_text(&read.snapshot),
-            ["head A", "head B", "head B", "tail C"],
+            ["Earlier", "head A", "head B", "head B", "tail C"],
             "{extension}"
         );
         fs::remove_file(path)?;
@@ -2741,7 +2747,7 @@ fn native_receipt_disambiguates_literal_tags_from_local_media() -> anyhow::Resul
         let text = format!("Question\n{tag}\n{close}");
         raw["payload"]["content"].as_array_mut().unwrap().extend([
             json!({"type":"input_text","text":r#"<image name=[Image #2] path="fixture.png">"#}),
-            json!({"type":"input_image","image_url":"fixture-url","detail":"high"}),
+            json!({"type":"input_image","image_url":"fixture-url","file_id":null,"detail":"high"}),
             json!({"type":"input_text","text":"</image>"}),
         ]);
         let receipt = event(
@@ -2754,21 +2760,25 @@ fn native_receipt_disambiguates_literal_tags_from_local_media() -> anyhow::Resul
             "user_message",
             json!({"message":text,media:[url],"local_images":["fixture.png"]}),
         );
-        for foreign in [false, true] {
+        for (foreign, conflicting_reference) in [(false, false), (true, false), (false, true)] {
+            let mut request = raw.clone();
+            if conflicting_reference {
+                request["payload"]["content"][5]["file_id"] = json!("other-image");
+            }
             let mut completion = receipt.clone();
             if foreign {
                 completion["payload"]["thread_id"] = json!("elsewhere");
             }
             let rows = vec![
                 event("task_started", json!({"turn_id":"task"})),
-                raw.clone(),
+                request,
                 completion,
                 saved.clone(),
                 event("task_complete", json!({"turn_id":"task"})),
             ];
             for preview in [false, true] {
                 let snapshot = read_records_with_preview(rows.clone(), preview)?;
-                let expected = if foreign {
+                let expected = if foreign || conflicting_reference {
                     vec!["Question", text.as_str()]
                 } else {
                     vec![text.as_str()]
@@ -2776,7 +2786,7 @@ fn native_receipt_disambiguates_literal_tags_from_local_media() -> anyhow::Resul
                 assert_eq!(
                     visible_text(&snapshot),
                     expected,
-                    "{kind} foreign={foreign} preview={preview}"
+                    "{kind} foreign={foreign} conflicting_reference={conflicting_reference} preview={preview}"
                 );
             }
         }
@@ -2925,6 +2935,78 @@ fn implicit_saved_submissions_may_interleave_with_later_raw_requests() -> anyhow
                         visible_text(&read_records_with_preview(records.clone(), preview)?),
                         &saved_order[..saved_order.len() - count]
                     );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn implicit_receipts_preserve_the_order_and_membership_of_saved_events() -> anyhow::Result<()> {
+    for mask in 0..4 {
+        for saved in [vec!["B"], vec!["B", "A"]] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"older"})),
+                event("task_complete", json!({"turn_id":"old"})),
+            ];
+            for (i, id) in ["A", "B"].into_iter().enumerate() {
+                let mut raw = message("user", id);
+                raw["payload"]["id"] = json!(id);
+                rows.push(raw);
+                if mask & (1 << i) != 0 {
+                    rows.push(event("item_completed", json!({"thread_id":SESSION_ID,"turn_id":"implicit","item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":id}]}})));
+                }
+            }
+            for id in &saved {
+                rows.push(event("user_message", json!({"message":id,"item_id":id})));
+            }
+            for count in 0..=saved.len() {
+                let mut data = rows.clone();
+                data.push(event("thread_rolled_back", json!({"num_turns":count})));
+                let mut expected = vec!["older"];
+                expected.extend_from_slice(&saved[..saved.len() - count]);
+                for preview in [false, true] {
+                    assert_eq!(
+                        visible_text(&read_records_with_preview(data.clone(), preview)?),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_legacy_empty_tasks_count_but_unsubmitted_raws_do_not() -> anyhow::Result<()> {
+    for header in [
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace","history_mode":"legacy"}}),
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace","originator":"other-client","cli_version":"0.166.0"}}),
+    ] {
+        for named in [false, true] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"older"})),
+                event("task_complete", json!({"turn_id":"old"})),
+            ];
+            if named {
+                rows.push(event("task_started", json!({"turn_id":"new"})));
+            }
+            let mut raw = message("user", "unsubmitted");
+            raw["payload"]["id"] = json!("new-request");
+            rows.extend([raw,event("item_completed",json!({"thread_id":SESSION_ID,"turn_id":"new","item":{"type":"UserMessage","id":"new-request","content":[{"type":"text","text":"unsubmitted"}]}}))]);
+            if named {
+                rows.push(event("task_complete", json!({"turn_id":"new"})));
+            }
+            for count in [0, 1] {
+                let mut data = rows.clone();
+                data.push(event("thread_rolled_back", json!({"num_turns":count})));
+                let (full, sampled) = rollback_title_reads(&header, &data, "")?;
+                for snapshot in [full.snapshot, sampled.snapshot] {
+                    let expected: &[&str] = if named || count == 0 { &["older"] } else { &[] };
+                    assert_eq!(visible_text(&snapshot), expected);
                 }
             }
         }

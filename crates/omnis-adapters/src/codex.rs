@@ -1924,7 +1924,13 @@ impl CodexSession {
                     return Ok(false);
                 }
                 let record = lineage.project_leaf_request(record);
-                history.push_recovered(&mut builder, &record, false, 0, confirmed)?;
+                history.push_recovered(
+                    &mut builder,
+                    &record,
+                    false,
+                    0,
+                    confirmed && lineage.attached_leaf(),
+                )?;
                 drop(builder.drain_events());
                 if history
                     .records_seen
@@ -2517,6 +2523,7 @@ impl CodexSession {
             builder.track_rollback_opener(false);
             builder.note_rollback_history_gap();
         }
+        let complete = !preview.sampled && preview.omissions.total() == 0;
         let total = preview.records.len();
         let mut records = preview.records.into_iter();
         let mut start = 0;
@@ -2525,7 +2532,15 @@ impl CodexSession {
             let mut last_visible = None;
             let mut receipts = RequestReceipts::new(&self.id, true);
             let mut push = |record, (), confirmed| {
-                push_record(&mut builder, &record, &mut last_visible, confirmed);
+                push_record(
+                    &mut builder,
+                    &record,
+                    &mut last_visible,
+                    confirmed && matches!(self.history_base, HistoryBase::Attachment(_)),
+                );
+                if !complete && record["type"] == "session_meta" {
+                    builder.codex_saved_users = None;
+                }
                 Ok(())
             };
             for record in records.by_ref().take(end - start) {
@@ -3021,6 +3036,29 @@ fn push_record(
     last_visible: &mut Option<MirrorGroup>,
     confirmed: bool,
 ) -> bool {
+    let payload = &record["payload"];
+    if record["type"] == "session_meta" {
+        let declared = payload.get("history_mode").is_some();
+        let native_header = ["originator", "cli_version"]
+            .iter()
+            .all(|key| payload[key].as_str().is_some_and(|value| !value.is_empty()));
+        builder.codex_saved_users = (CodexHistoryMode::from_payload(payload)
+            == CodexHistoryMode::Legacy
+            && (declared || native_header))
+            .then_some(false);
+    } else if client_submission(record)
+        && string_at(payload, &[&["message"], &["text"]]).is_some()
+        && let Some(saved) = &mut builder.codex_saved_users
+    {
+        *saved = true;
+    }
+    if builder.codex_saved_users == Some(true)
+        && record["type"] == "response_item"
+        && payload["type"] == "message"
+        && payload["role"] == "user"
+    {
+        return false;
+    }
     if confirmed {
         MirrorGroup::finish_provisional_batch(last_visible);
     }
@@ -3146,7 +3184,7 @@ struct MirrorGroup {
     scoped: bool,
     next: usize,
     order: BTreeMap<usize, bool>,
-    provisional_requests: VecDeque<u64>,
+    provisional_requests: VecDeque<(usize, u64)>,
     confirmed_positions: BTreeSet<u64>,
     saved_batch: bool,
     batch_checkpoint: Option<u64>,
@@ -3211,7 +3249,8 @@ impl MirrorGroup {
                 if self.provisional_requests.len() == MAX_CANONICAL_EVENTS {
                     self.provisional_requests.pop_front();
                 }
-                self.provisional_requests.push_back(builder.checkpoint());
+                self.provisional_requests
+                    .push_back((self.next - 1, builder.checkpoint()));
             }
             return false;
         }
@@ -3224,9 +3263,19 @@ impl MirrorGroup {
             return false;
         }
         if paired && self.provisional_requests.len() > 1 {
-            self.batch_checkpoint = self.provisional_requests.front().copied();
-            for position in self.provisional_requests.drain(..) {
+            self.batch_checkpoint = self
+                .provisional_requests
+                .front()
+                .map(|&(_, position)| position);
+            for (index, position) in self.provisional_requests.drain(..) {
                 builder.remove_codex_mirror(position);
+                if let Some((_, emitted)) = self
+                    .pending
+                    .get_mut(&false)
+                    .and_then(|raw| raw.rows.get_mut(&index))
+                {
+                    *emitted = None;
+                }
             }
             self.saved_batch = true;
         }
@@ -3908,21 +3957,24 @@ fn push_message_text(
         group.provisional_requests.clear();
         group.saved_batch = false;
     }
-    let observation = MirrorGroup::observe(
-        last_visible,
-        message,
-        usize::try_from(builder.checkpoint()).ok(),
-    );
+    let suppressed =
+        !saved && request && last_visible.as_ref().is_some_and(|group| group.saved_batch);
+    let emitted = if suppressed || text.is_empty() {
+        None
+    } else {
+        usize::try_from(builder.checkpoint()).ok()
+    };
+    let observation = MirrorGroup::observe(last_visible, message, emitted);
     let paired = matches!(observation, MirrorObservation::Paired(_));
-    if !saved && !paired && request && last_visible.as_ref().is_some_and(|group| group.saved_batch)
-    {
+    if suppressed && !paired {
         return false;
     }
+    let missing_raw = saved && matches!(observation, MirrorObservation::Paired(None));
     let publish_saved = request
         && !text.is_empty()
-        && last_visible
-            .as_mut()
-            .is_some_and(|group| group.publish_implicit_request(builder, saved, paired));
+        && last_visible.as_mut().is_some_and(|group| {
+            group.publish_implicit_request(builder, saved, paired) || missing_raw
+        });
     if !publish_saved && let MirrorObservation::Paired(position) = observation {
         if !last_visible.as_ref().is_some_and(|group| group.reorder) || text.is_empty() {
             return false;
@@ -4017,6 +4069,28 @@ fn omitted_media_text(payload: &Value, images: usize) -> Option<String> {
     has_audio.then(|| "[audio omitted]".to_owned())
 }
 
+fn event_scope_matches(record: &Value, owner: &str) -> bool {
+    [record, &record["payload"]].iter().all(|object| {
+        object.get("thread_id").is_none_or(|id| {
+            id.as_str()
+                .is_some_and(|id| workspace_check::same_thread(owner, id))
+        })
+    }) && record
+        .get("turn_id")
+        .is_none_or(|id| id == &record["payload"]["turn_id"])
+}
+
+fn receipt_in_turn(record: &Value, owner: &str, active_turn: Option<&str>) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "event_msg"
+        && payload["type"] == "item_completed"
+        && payload["thread_id"].is_string()
+        && event_scope_matches(record, owner)
+        && payload["turn_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && active_turn.is_none_or(|active| active == id))
+}
+
 struct RequestReceipts<'a, M> {
     owner: &'a str,
     contiguous: bool,
@@ -4045,18 +4119,7 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
             let mut confirmed = false;
             if before == mark
                 && (self.contiguous || request["ordinal"].is_u64())
-                && record["type"] == "event_msg"
-                && payload["type"] == "item_completed"
-                && payload["thread_id"].as_str().is_some_and(|id| {
-                    !id.is_empty() && workspace_check::same_thread(self.owner, id)
-                })
-                && record.get("thread_id").is_none_or(|id| {
-                    id.as_str()
-                        .is_some_and(|id| workspace_check::same_thread(self.owner, id))
-                })
-                && payload["turn_id"].as_str().is_some_and(|id| {
-                    !id.is_empty() && self.turn.as_deref().is_none_or(|active| active == id)
-                })
+                && receipt_in_turn(&record, self.owner, self.turn.as_deref())
                 && let Some(parts) = history_base::receipt_literal_parts(&request, &record)
             {
                 history_base::project_literal_parts(&mut request, &parts);
@@ -4064,7 +4127,7 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
             }
             visit(request, before, confirmed)?;
         }
-        if record["type"] == "event_msg" {
+        if record["type"] == "event_msg" && event_scope_matches(&record, self.owner) {
             match payload["type"].as_str() {
                 Some("task_started" | "turn_started") => {
                     self.turn = payload["turn_id"].as_str().map(str::to_owned);

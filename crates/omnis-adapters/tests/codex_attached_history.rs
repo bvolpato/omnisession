@@ -975,6 +975,33 @@ fn add_receipt_media(rows: &mut [Value], diff: &str) {
     }
 }
 
+fn change_receipt_evidence(rows: &mut [Value], diff: &str) {
+    let receipt = &mut rows[5]["payload"];
+    match diff {
+        "matching after foreign start" => {
+            rows[1] = json!({"type":"event_msg","ordinal":3,"payload":{"type":"task_started","thread_id":PARENT,"turn_id":"parent-turn"}});
+        }
+        "matching after foreign outer start" => {
+            rows[1] = json!({"type":"event_msg","ordinal":3,"thread_id":PARENT,"payload":{"type":"task_started","turn_id":"parent-turn"}});
+        }
+        "conflicting receipt owner" => rows[5]["thread_id"] = json!(PARENT),
+        "conflicting receipt turn" => rows[5]["turn_id"] = json!("other-turn"),
+        "wrong image" => {
+            receipt["item"]["content"][1]["image_url"] = json!("data:image/png;base64,YQ==");
+        }
+        "wrong detail" => receipt["item"]["content"][1]["detail"] = json!("low"),
+        "ambiguous image" => receipt["item"]["content"][1]["file_id"] = json!("another-file"),
+        "wrong thread" => receipt["thread_id"] = json!(PARENT),
+        "missing thread" => {
+            receipt.as_object_mut().unwrap().remove("thread_id");
+        }
+        "wrong turn" => receipt["turn_id"] = json!("different-turn"),
+        "wrong id" => receipt["item"]["id"] = json!("different-item"),
+        "wrong text" => receipt["item"]["content"][0]["text"] = json!("different content"),
+        _ => {}
+    }
+}
+
 #[test]
 fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> {
     let home = tempfile::tempdir()?;
@@ -988,6 +1015,10 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
     child.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":7,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"child-turn","item":{"type":"UserMessage","id":"opening","content":[{"type":"text","text":"confirmed child opening"}]}}}));
     for diff in [
         "matching",
+        "matching after foreign start",
+        "matching after foreign outer start",
+        "conflicting receipt owner",
+        "conflicting receipt turn",
         "matching image",
         "matching wrapped image",
         "matching literal image",
@@ -1009,23 +1040,8 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
     ] {
         let mut rows = child.clone();
         add_receipt_media(&mut rows, diff);
-        let receipt = &mut rows[5]["payload"];
-        match diff {
-            "wrong image" => {
-                receipt["item"]["content"][1]["image_url"] = json!("data:image/png;base64,YQ==");
-            }
-            "wrong detail" => receipt["item"]["content"][1]["detail"] = json!("low"),
-            "ambiguous image" => receipt["item"]["content"][1]["file_id"] = json!("another-file"),
-            "wrong thread" => receipt["thread_id"] = json!(PARENT),
-            "missing thread" => {
-                receipt.as_object_mut().unwrap().remove("thread_id");
-            }
-            "wrong turn" => receipt["turn_id"] = json!("different-turn"),
-            "wrong id" => receipt["item"]["id"] = json!("different-item"),
-            "wrong text" => receipt["item"]["content"][0]["text"] = json!("different content"),
-            _ => {}
-        }
-        if diff.starts_with("matching") {
+        change_receipt_evidence(&mut rows, diff);
+        if diff.starts_with("matching") || diff.starts_with("conflicting receipt") {
             rows.push(message(8, "later child request"));
             rows.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":9,"payload":{"type":"user_message","message":"later child request"}}));
         } else {
@@ -1523,6 +1539,59 @@ fn a_fork_keeps_numbered_subagent_messages_after_recognized_unplaced_records() -
                 expected.push("leaf");
             }
             assert_eq!(texts, expected, "missing={missing}, gap={gap}, id={id}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_suppressed_raw_request_cannot_replace_a_receipt_confirmed_child_message() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let receipt = |n, id: &str| json!({"ordinal":n,"type":"event_msg","payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"child-turn","item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":id}]}}});
+    let raw = |n, id: &str| {
+        let mut r = message(n, id);
+        r["payload"]["id"] = json!(id);
+        r
+    };
+    let saved = |n, id: &str| json!({"ordinal":n,"type":"event_msg","payload":{"type":"user_message","item_id":id,"message":id}});
+    for multipart in [false, true] {
+        let mut rows = interrupted_fork(&dir)?;
+        rows.truncate(3);
+        let mut b = raw(10, "Bluebell");
+        if multipart {
+            b["payload"]["content"] =
+                json!([{"type":"input_text","text":"Blue"},{"type":"input_text","text":"bell"}]);
+        }
+        rows.extend([json!({"type":"event_msg","ordinal":5,"payload":{"type":"task_startec","turn_id":"child-turn"}}),raw(6,"opening"),receipt(7,"opening"),raw(8,"Apricot"),saved(9,"Apricot"),b,raw(11,"Cedar"),receipt(12,"Cedar"),saved(13,"Bluebell")]);
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, 14, Some(bookmark(CHILD, &rows)), false),
+                message(15, "leaf"),
+            ],
+        )?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [CHILD, REVERT] {
+            let session = SessionRef::new(Provider::Codex, id);
+            for snapshot in [
+                adapter.read_session(&session)?,
+                adapter.preview_session(&session)?,
+            ] {
+                let conversation = omnis_core::import_conversation(&snapshot);
+                let texts: Vec<_> = conversation
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect();
+                let mut expected = vec!["opening", "Apricot", "Cedar", "Bluebell"];
+                if id == REVERT {
+                    expected.push("leaf");
+                }
+                assert_eq!(texts, expected);
+            }
         }
     }
     Ok(())

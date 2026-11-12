@@ -1622,6 +1622,7 @@ pub(crate) struct EventBuilder {
     preview: Option<EventPreview>,
     rollback_opener: Option<RollbackOpener>,
     removed_mirrors: HashSet<u64>,
+    pub(crate) codex_saved_users: Option<bool>,
 }
 
 #[derive(Default)]
@@ -1775,6 +1776,7 @@ impl EventBuilder {
             preview: None,
             rollback_opener: None,
             removed_mirrors: HashSet::new(),
+            codex_saved_users: None,
         }
     }
 
