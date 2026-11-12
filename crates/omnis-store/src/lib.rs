@@ -1260,12 +1260,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             .map_err(database_error)
     }
 
-    fn should_publish(
-        &self,
-        transaction: &Transaction<'_>,
-        home: Option<&Path>,
-        published: &mut HashSet<i64>,
-    ) -> Result<bool> {
+    fn should_publish(&self, transaction: &Transaction<'_>, home: Option<&Path>) -> Result<bool> {
         let revision = self.document.source_revision;
         let guard = if matches!(self.guard, TrajectorySourceGuard::ObservedRevision(_)) {
             self.guard
@@ -1299,8 +1294,18 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         guard?;
-        if let Some(accept) = database_receipts::accept_gap(transaction, self, home, published)? {
-            return Ok(accept);
+        if self.verified_metadata.is_some()
+            && matches!(
+                self.session.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            )
+            && self.document.origin == SessionTrajectoryOrigin::Native
+            && home.is_some()
+            && revision.file.is_some()
+            && revision.contents.is_some()
+            && self.document.projection.is_some_and(|p| p.database_gap)
+        {
+            return Ok(true);
         }
         Ok(!self.retains_verified_antigravity_text(transaction, home)?)
     }
@@ -3224,7 +3229,7 @@ impl Store {
             .map_err(database_error)?;
         for write in prepared {
             let home = homes.get(&write.session.provider).map(PathBuf::as_path);
-            if !write.should_publish(&transaction, home, &mut published)? {
+            if !write.should_publish(&transaction, home)? {
                 continue;
             }
             let recovered = match write.legacy_sample_update(&transaction, home)? {
@@ -4057,6 +4062,7 @@ impl Store {
         ensure_source_time_columns(&transaction)?;
         initialize_source_revision_schema(&transaction)?;
         initialize_discovery_checks(&transaction)?;
+        database_receipts::promote_gap_projections(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -5653,21 +5659,13 @@ fn insert_trajectory_chunks(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
 ) -> Result<()> {
-    insert_trajectory_chunks_at(transaction, documents, 0)
-}
-
-fn insert_trajectory_chunks_at(
-    transaction: &Transaction<'_>,
-    documents: &[(i64, &str)],
-    first: i64,
-) -> Result<()> {
     rebuild_full_text_index_after_unreadable_chunk(transaction)?;
     let (mut rows, mut texts) = (Vec::new(), Vec::new());
     for (trajectory_id, text) in documents {
         for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
             let chunk_index =
                 i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
-            rows.push((*trajectory_id, first + chunk_index));
+            rows.push((*trajectory_id, chunk_index));
             texts.push(chunk);
         }
     }

@@ -242,6 +242,36 @@ fn state_json(environment: &TestEnvironment, state: &str, args: &[&str]) -> serd
     serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
 }
 
+fn check_moved_antigravity_catalog(env: &TestEnvironment, home: &Path, workspace: &Path) {
+    fs::create_dir(workspace).unwrap();
+    let path = workspace.to_string_lossy().replace('\\', "/");
+    let uri = format!("file:///{}", path.trim_start_matches('/'));
+    Connection::open(home.join("conversation_summaries.db"))
+        .unwrap()
+        .execute(
+            "UPDATE conversation_summaries SET title='Moved session',workspace_uris=?1",
+            [serde_json::json!([uri]).to_string()],
+        )
+        .unwrap();
+    let args = [
+        "search",
+        "nextreply",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+    ];
+    let live = state_json(env, "state", &args);
+    assert_eq!(live["results"][0]["coverage"], "preview");
+    let mut args = args.to_vec();
+    args.extend(["--cached", "--show-text"]);
+    let cached = state_json(env, "state", &args);
+    assert_eq!(cached["results"][0]["title"], "Moved session");
+    assert_eq!(
+        cached["results"][0]["project_path"],
+        workspace.to_str().unwrap()
+    );
+}
+
 #[test]
 fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
     for (provider, directory) in [
@@ -274,7 +304,11 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
              INSERT INTO steps VALUES (2,x'80'),(3,x'080fa2010b0a096e6578747265706c79');",
             )
             .unwrap();
-        assert_eq!(search("nextreply", false), "preview");
+        if provider == "antigravity" {
+            check_moved_antigravity_catalog(&env, &home, &root.path().join("moved"));
+        } else {
+            assert_eq!(search("nextreply", false), "preview");
+        }
         assert_eq!(search("nextreply", true), "preview");
         assert!(search("firstrepl", true).is_null());
         assert_eq!(search("changedxx", true), "preview");
@@ -1174,6 +1208,9 @@ fn search_reads_committed_antigravity_steps_from_the_wal() {
                 observed["results"][0]["coverage"], "preview",
                 "{provider} {observed}"
             );
+            let repeated = search("other");
+            assert_eq!(repeated["index"]["stale"], 0, "{provider} {repeated}");
+            assert_eq!(repeated["index"]["indexed"], 0, "{provider} {repeated}");
             fs::remove_file(&wal).unwrap();
             assert_eq!(
                 search("restored")["results"][0]["coverage"],

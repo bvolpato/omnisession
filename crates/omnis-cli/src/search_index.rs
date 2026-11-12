@@ -606,7 +606,48 @@ fn imported_document_versions(store: &Store) -> Result<HashMap<String, u32>> {
     Ok(versions)
 }
 
-fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+fn database_catalogs_needing_read(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: &[IndexCandidate],
+) -> anyhow::Result<HashSet<SessionRef>> {
+    let mut stale = HashSet::new();
+    for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+        let selected: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.session.provider == provider
+                    && candidate
+                        .source_path
+                        .as_ref()
+                        .is_some_and(|path| path.extension().is_some_and(|ext| ext == "db"))
+            })
+            .filter_map(|candidate| Some((candidate.catalog.as_ref()?, candidate.document_version)))
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+        let current = if let Ok(Some(home)) = registry.discovery_cache_home(provider) {
+            store.current_database_catalogs(provider, &home, &selected)?
+        } else {
+            HashSet::new()
+        };
+        stale.extend(
+            selected
+                .into_iter()
+                .filter(|(catalog, _)| !current.contains(&catalog.session))
+                .map(|(catalog, _)| catalog.session.clone()),
+        );
+    }
+    Ok(stale)
+}
+
+fn pending(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+) -> Result<Pending> {
     let imported_versions = if candidates
         .iter()
         .any(|candidate| candidate.session.provider == Provider::Imported)
@@ -625,7 +666,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         })
         .map(|candidate| candidate.session.provider)
         .collect();
-    let mut conflicts = HashSet::new();
+    let mut conflicts = database_catalogs_needing_read(registry, store, &candidates)?;
     for provider in providers {
         conflicts.extend(if provider == Provider::Codex {
             store.conflicting_codex_catalog_rows()?
@@ -717,7 +758,7 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    let pending = pending(store, candidates, false)?;
+    let pending = pending(registry, store, candidates, false)?;
     restore_cached_sources(registry, store, pending.recovered)?;
     Ok(pending.summary)
 }
@@ -855,7 +896,7 @@ pub(crate) fn index_candidates(
         recovered,
         mut hidden,
         mut summary,
-    } = pending(store, candidates, retry_failed)?;
+    } = pending(registry, store, candidates, retry_failed)?;
     hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
         titles: hidden,

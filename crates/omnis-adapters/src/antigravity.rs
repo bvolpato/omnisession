@@ -1245,7 +1245,7 @@ fn push_database_steps_with_limits(
         .connection
         .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
     let mut rows = statement.query([i64::try_from(limits.records)?])?;
-    let mut proofs = DatabaseProofs::default();
+    let mut aliases = omnis_ir::antigravity_receipts::DatabaseAliases::new();
     let mut retained = Vec::new();
     let mut position = 0;
     let mut decoded = 0;
@@ -1286,7 +1286,7 @@ fn push_database_steps_with_limits(
         if bytes <= remaining_history {
             remaining_history -= bytes;
             if let Some(index) = index {
-                proofs.record(builder, &mut event, index, payload);
+                record_database_proof(&mut aliases, builder, &mut event, index, &payload);
             }
             retained.push((position, index, event));
         }
@@ -1305,7 +1305,7 @@ fn push_database_steps_with_limits(
         oldest_ambiguous_row,
     );
     let coverage = DatabaseCoverage {
-        aliases: proofs.for_coverage(omitted),
+        aliases,
         verified_prefix_end: prefix_end,
         omitted,
     };
@@ -1376,55 +1376,23 @@ fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static st
     Ok(("idx", "idx DESC"))
 }
 
-struct DatabaseProofs {
-    rows: Vec<(
-        uuid::Uuid,
-        omnis_ir::antigravity_receipts::DatabaseStepAlias,
-    )>,
-    small_bytes: usize,
-    large_bytes: usize,
-}
-
-impl Default for DatabaseProofs {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            small_bytes: omnis_ir::antigravity_receipts::LEGACY_WIRE_BYTES,
-            large_bytes: omnis_ir::antigravity_receipts::LEGACY_LARGE_BYTES,
-        }
-    }
-}
-
-impl DatabaseProofs {
-    fn record(
-        &mut self,
-        builder: &EventBuilder,
-        event: &mut DatabaseStepEvent,
-        index: i64,
-        wire: Vec<u8>,
-    ) {
-        let opaque = event.replay_policy == ReplayPolicy::HistoricalOnly;
-        let namespace = builder.database_step_namespace(index, opaque);
-        let raw = uuid::Uuid::new_v5(&namespace, &wire);
-        event.hash = Some(raw);
-        if !opaque
-            && let Some(alias) = omnis_ir::antigravity_receipts::DatabaseStepAlias::from_wire(
-                namespace,
-                raw,
-                wire,
-                &mut self.small_bytes,
-                &mut self.large_bytes,
-            )
-        {
-            self.rows.push((raw, alias));
-        }
-    }
-
-    fn for_coverage(self, omitted: usize) -> omnis_ir::antigravity_receipts::DatabaseAliases {
-        self.rows
-            .into_iter()
-            .filter(|(raw, alias)| omitted > 0 || *raw != alias.canonical)
-            .collect()
+fn record_database_proof(
+    aliases: &mut omnis_ir::antigravity_receipts::DatabaseAliases,
+    builder: &EventBuilder,
+    event: &mut DatabaseStepEvent,
+    index: i64,
+    wire: &[u8],
+) {
+    let opaque = event.replay_policy == ReplayPolicy::HistoricalOnly;
+    let namespace = builder.database_step_namespace(index, opaque);
+    let raw = uuid::Uuid::new_v5(&namespace, wire);
+    event.hash = Some(raw);
+    if !opaque
+        && let Some(alias) =
+            omnis_ir::antigravity_receipts::DatabaseStepAlias::from_wire(namespace, raw, wire)
+        && alias.canonical != raw
+    {
+        aliases.insert(raw, alias);
     }
 }
 

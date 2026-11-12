@@ -8,17 +8,9 @@ pub type DatabaseAliases = BTreeMap<Uuid, DatabaseStepAlias>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseStepAlias {
     pub canonical: Uuid,
-    namespace: Uuid,
-    legacy_wire: Option<Vec<u8>>,
 }
 
-// These limits bound parsing per row and compatibility work per snapshot.
 const MAX_FIELDS: usize = 1024;
-const MAX_LAYOUTS: usize = 24;
-pub const LEGACY_WIRE_BYTES: usize = 4 * 1024 * 1024;
-pub const LEGACY_LARGE_BYTES: usize = 16 * 1024 * 1024;
-pub const LEGACY_HASH_BYTES: usize = 32 * 1024 * 1024;
-pub const LEGACY_HASH_LAYOUTS: usize = 8192;
 
 #[derive(Clone, Copy)]
 enum Schema {
@@ -38,14 +30,11 @@ enum Value<'a> {
 struct Field<'a> {
     tag: u32,
     prefix: &'a [u8],
-    span: std::ops::Range<usize>,
     value: Value<'a>,
 }
 
 struct Node<'a> {
     fields: Vec<Field<'a>>,
-    groups: Vec<std::ops::Range<usize>>,
-    layouts: usize,
     ordered: bool,
 }
 
@@ -91,18 +80,11 @@ impl Schema {
 }
 
 impl<'a> Node<'a> {
-    fn parse(
-        mut wire: &'a [u8],
-        schema: Schema,
-        remaining: &mut usize,
-        offset: usize,
-    ) -> Option<Self> {
-        let end = offset + wire.len();
+    fn parse(mut wire: &'a [u8], schema: Schema, remaining: &mut usize) -> Option<Self> {
         let mut fields = Vec::new();
         let mut ordered = true;
         let mut prior_tag = 0;
         let mut seen = 0u32;
-        let mut layouts = 1usize;
         while !wire.is_empty() {
             *remaining = remaining.checked_sub(1)?;
             let start = wire;
@@ -138,82 +120,29 @@ impl<'a> Node<'a> {
                 wire = rest;
                 (prefix, body)
             };
-            let span = end - start.len()..end - wire.len();
             let value = if let FieldType::Message(child) = child
-                && let Some(nested) = Self::parse(body, child, remaining, span.end - body.len())
+                && let Some(nested) = Self::parse(body, child, remaining)
             {
-                layouts = layouts.saturating_mul(nested.layouts);
                 ordered &= nested.ordered;
                 Value::Message(nested)
             } else {
                 // Keep unsupported child messages byte-for-byte when their enclosing fields move.
                 Value::Bytes(body)
             };
-            fields.push(Field {
-                tag,
-                prefix,
-                span,
-                value,
-            });
+            fields.push(Field { tag, prefix, value });
         }
         if !ordered {
             fields.sort_by_key(|field| field.tag);
         }
-        let mut groups = Vec::new();
-        let mut from = 0;
-        while from < fields.len() {
-            let end = from + fields[from..].partition_point(|f| f.tag == fields[from].tag);
-            groups.push(from..end);
-            layouts = layouts.saturating_mul(groups.len());
-            from = end;
-        }
-        Some(Self {
-            fields,
-            groups,
-            layouts,
-            ordered,
-        })
+        Some(Self { fields, ordered })
     }
 
-    fn adjacent_swaps(
-        &self,
-        visit: &mut impl FnMut(usize, usize, usize) -> std::ops::ControlFlow<bool>,
-    ) -> std::ops::ControlFlow<bool> {
-        // Native offsets preserve the observed order even after the parser sorts fields by tag.
-        let mut fields: Vec<_> = self.fields.iter().collect();
-        fields.sort_unstable_by_key(|field| field.span.start);
-        for pair in fields.windows(2) {
-            if pair[0].tag != pair[1].tag {
-                visit(pair[0].span.start, pair[0].span.end, pair[1].span.end)?;
-            }
-        }
-        for field in fields {
-            if let Value::Message(nested) = &field.value {
-                nested.adjacent_swaps(visit)?;
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-
-    // Rank zero emits sorted fields. Other ranks reproduce possible orders for older raw receipts.
-    fn write(&self, mut rank: usize, out: &mut Vec<u8>) {
-        let mut order = [0, 1, 2, 3];
-        let n = self.groups.len();
-        for i in 0..n {
-            let at = i + rank % (n - i);
-            rank /= n - i;
-            order[i..=at].rotate_right(1);
-        }
-        for &group in &order[..n] {
-            for f in &self.fields[self.groups[group].clone()] {
-                out.extend_from_slice(f.prefix);
-                match &f.value {
-                    Value::Bytes(body) => out.extend_from_slice(body),
-                    Value::Message(node) => {
-                        node.write(rank % node.layouts, out);
-                        rank /= node.layouts;
-                    }
-                }
+    fn write(&self, out: &mut Vec<u8>) {
+        for field in &self.fields {
+            out.extend_from_slice(field.prefix);
+            match &field.value {
+                Value::Bytes(body) => out.extend_from_slice(body),
+                Value::Message(node) => node.write(out),
             }
         }
     }
@@ -221,91 +150,17 @@ impl<'a> Node<'a> {
 
 impl DatabaseStepAlias {
     #[must_use]
-    pub fn from_wire(
-        namespace: Uuid,
-        raw: Uuid,
-        wire: Vec<u8>,
-        remaining: &mut usize,
-        large: &mut usize,
-    ) -> Option<Self> {
+    pub fn from_wire(namespace: Uuid, raw: Uuid, wire: &[u8]) -> Option<Self> {
         let mut fields = MAX_FIELDS;
-        let node = Node::parse(&wire, Schema::Step, &mut fields, 0)?;
-        if node.layouts == 1 {
-            return None;
-        }
-        let budget = if wire.len() > LEGACY_WIRE_BYTES && node.layouts == 2 {
-            large
-        } else {
-            remaining
-        };
-        let keep = wire.len() <= *budget;
-        if keep {
-            *budget -= wire.len();
-        }
+        let node = Node::parse(wire, Schema::Step, &mut fields)?;
         let canonical = if node.ordered {
             raw
         } else {
             let mut canonical = Vec::with_capacity(wire.len());
-            node.write(0, &mut canonical);
+            node.write(&mut canonical);
             Uuid::new_v5(&namespace, &canonical)
         };
-        let legacy_wire = keep.then_some(wire);
-        Some(Self {
-            canonical,
-            namespace,
-            legacy_wire,
-        })
-    }
-
-    #[must_use]
-    pub fn matches_legacy(&self, old: Uuid, bytes: &mut usize, layouts: &mut usize) -> bool {
-        let Some(wire) = &self.legacy_wire else {
-            return false;
-        };
-        if *layouts == 0 || wire.len() > *bytes {
-            return false;
-        }
-        let mut fields = MAX_FIELDS;
-        let Some(node) = Node::parse(wire, Schema::Step, &mut fields, 0) else {
-            return false;
-        };
-        let mut encoded = Vec::with_capacity(wire.len());
-        let mut attempts = MAX_LAYOUTS - 1;
-        if node.layouts > MAX_LAYOUTS {
-            let result = node.adjacent_swaps(&mut |start, middle, end| {
-                if attempts == 0 || *layouts == 0 || wire.len() > *bytes {
-                    return std::ops::ControlFlow::Break(false);
-                }
-                attempts -= 1;
-                *layouts -= 1;
-                *bytes -= wire.len();
-                encoded.clear();
-                encoded.extend_from_slice(&wire[..start]);
-                encoded.extend_from_slice(&wire[middle..end]);
-                encoded.extend_from_slice(&wire[start..middle]);
-                encoded.extend_from_slice(&wire[end..]);
-                if Uuid::new_v5(&self.namespace, &encoded) == old {
-                    return std::ops::ControlFlow::Break(true);
-                }
-                std::ops::ControlFlow::Continue(())
-            });
-            if let std::ops::ControlFlow::Break(matched) = result {
-                return matched;
-            }
-        }
-        for rank in 1..node.layouts.min(attempts + 1) {
-            if *layouts == 0 || wire.len() > *bytes {
-                break;
-            }
-            *layouts -= 1;
-            *bytes -= wire.len();
-            encoded.clear();
-            node.write(rank, &mut encoded);
-            if Uuid::new_v5(&self.namespace, &encoded) == old {
-                return true;
-            }
-        }
-        false
+        Some(Self { canonical })
     }
 }
 
@@ -315,13 +170,7 @@ mod tests {
 
     fn receipt(wire: &[u8]) -> Option<DatabaseStepAlias> {
         let namespace = Uuid::nil();
-        DatabaseStepAlias::from_wire(
-            namespace,
-            Uuid::new_v5(&namespace, wire),
-            wire.to_vec(),
-            &mut 1024,
-            &mut 0,
-        )
+        DatabaseStepAlias::from_wire(namespace, Uuid::new_v5(&namespace, wire), wire)
     }
 
     #[test]
@@ -331,9 +180,7 @@ mod tests {
         let first = receipt(&canonical).unwrap();
         let second = receipt(&reversed).unwrap();
         assert_eq!(first.canonical, second.canonical);
-        let old = Uuid::new_v5(&Uuid::nil(), &reversed);
-        assert!(!first.matches_legacy(old, &mut 0, &mut 10));
-        assert!(first.matches_legacy(old, &mut 1024, &mut 10));
+        assert_eq!(first.canonical, Uuid::new_v5(&Uuid::nil(), &canonical));
         for row in [
             &[8, 15, 8, 15, 162, 1, 0][..],
             &[8, 15, 154, 1, 0, 162, 1, 0],
@@ -359,18 +206,14 @@ mod tests {
     }
 
     #[test]
-    fn old_metadata_order_is_checked_before_exhausting_the_layout_budget() {
+    fn metadata_field_order_has_a_stable_receipt() {
         let first = [
             8, 15, 32, 1, 42, 6, 10, 2, 8, 1, 24, 2, 162, 1, 3, 10, 1, b'x',
         ];
         let second = [
             8, 15, 32, 1, 42, 6, 24, 2, 10, 2, 8, 1, 162, 1, 3, 10, 1, b'x',
         ];
-        assert!(receipt(&first).unwrap().matches_legacy(
-            Uuid::new_v5(&Uuid::nil(), &second),
-            &mut 1024,
-            &mut 5
-        ));
+        assert_eq!(receipt(&first), receipt(&second));
     }
 
     #[test]
@@ -382,10 +225,5 @@ mod tests {
             receipt(&first).unwrap().canonical,
             receipt(&reversed).unwrap().canonical
         );
-        assert!(!receipt(&first).unwrap().matches_legacy(
-            Uuid::new_v5(&Uuid::nil(), &reversed),
-            &mut 1024,
-            &mut 10
-        ));
     }
 }

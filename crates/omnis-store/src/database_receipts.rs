@@ -18,7 +18,12 @@ fn receipt_table(provider: Provider) -> Option<&'static str> {
 
 pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS antigravity_search_gaps (
+        "CREATE TABLE IF NOT EXISTS antigravity_read_catalogs (
+            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+            source_home BLOB NOT NULL, source_file BLOB NOT NULL, source_contents BLOB NOT NULL,
+            catalog_hash TEXT NOT NULL, document_version INTEGER NOT NULL, content_hash BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS antigravity_search_gaps (
             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
             source_home BLOB NOT NULL, source_file BLOB NOT NULL, indexed_contents BLOB NOT NULL,
             indexed_hash BLOB NOT NULL, observed_contents BLOB NOT NULL
@@ -67,7 +72,58 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read(
+pub(super) fn promote_gap_projections(tx: &Transaction<'_>) -> Result<()> {
+    let pending: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM antigravity_gap_projections)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if !pending {
+        return Ok(());
+    }
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE promoted_gap_documents AS
+         SELECT trajectories.id, active_projection.first_chunk, gap.observed_contents,
+                active_projection.content_hash,active_projection.source_byte_count,
+                active_projection.indexed_byte_count,active_projection.derived_title,
+                active_projection.source_updated_at,active_projection.document_version
+         FROM antigravity_gap_projections p
+         JOIN session_trajectories trajectories ON trajectories.id=p.trajectory_id
+         {}
+         WHERE active_projection.trajectory_id IS NOT NULL AND trajectories.origin='native'
+           AND trajectories.provider IN ('antigravity','antigravity-desktop');
+         CREATE UNIQUE INDEX temp.promoted_gap_ids ON promoted_gap_documents(id);
+         CREATE TEMP TABLE promoted_gap_chunks AS
+         SELECT d.id, c.chunk_index-d.first_chunk AS chunk_index, c.stored_text
+         FROM promoted_gap_documents d JOIN session_trajectory_chunk_rows c
+           ON c.trajectory_id=d.id AND c.chunk_index>=d.first_chunk;
+         DELETE FROM antigravity_search_gaps WHERE trajectory_id IN (
+             SELECT trajectory_id FROM antigravity_gap_projections
+         );
+         DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id IN (SELECT id FROM promoted_gap_documents);
+         INSERT INTO session_trajectory_chunk_rows (trajectory_id,chunk_index,stored_text)
+         SELECT id,chunk_index,stored_text FROM promoted_gap_chunks;
+         UPDATE session_trajectories AS doc SET
+             source_contents_id=d.observed_contents, content_hash=d.content_hash,
+             source_updated_at=d.source_updated_at,source_updated_submillis=0,
+             source_complete=0,complete=0,provider_limited=0,title_authoritative=0,
+             source_byte_count=d.source_byte_count,indexed_byte_count=d.indexed_byte_count,
+             truncation_strategy='source_incomplete',derived_title=d.derived_title,
+             document_version=d.document_version,projected_byte_count=NULL,
+             projected_prefix_hash=NULL,projected_record_prefix_hash=NULL,sampled_file_bytes=NULL,
+             fully_scanned_bytes=NULL,verified_record_time=NULL,recovered_anchor_bytes=NULL,
+             recovered_gap_start=NULL,observed_text_bytes=NULL,observed_text_hash=NULL
+         FROM promoted_gap_documents d WHERE doc.id=d.id;
+         DROP TABLE temp.promoted_gap_chunks;
+         DROP TABLE temp.promoted_gap_documents;",
+        crate::SEARCH_GAP_JOIN,
+    )).map_err(database_error)
+}
+
+#[cfg(test)]
+fn read(
     tx: &Transaction<'_>,
     session: &SessionRef,
     home: &[u8],
@@ -144,6 +200,94 @@ pub(crate) fn save(
     Ok(())
 }
 
+fn catalog_hash(metadata: &crate::IndexedSession) -> Result<String> {
+    let fields = serde_json::to_vec(&(
+        &metadata.title,
+        &metadata.project_path,
+        &metadata.git_branch,
+        metadata.created_at,
+        metadata.updated_at,
+        metadata.updated_at_approximate,
+        metadata.event_count,
+    ))
+    .map_err(|_| StoreError::InvalidSessionReference)?;
+    Ok(Uuid::new_v5(&Uuid::NAMESPACE_OID, &fields)
+        .simple()
+        .to_string())
+}
+
+fn record_catalog(
+    tx: &Transaction<'_>,
+    id: i64,
+    metadata: &crate::IndexedSession,
+    home: &std::path::Path,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO antigravity_read_catalogs
+         SELECT id,?1,source_file_id,source_contents_id,?2,document_version,content_hash FROM session_trajectories WHERE id=?3
+         ON CONFLICT(trajectory_id) DO UPDATE SET source_home=excluded.source_home, source_file=excluded.source_file,
+           source_contents=excluded.source_contents,catalog_hash=excluded.catalog_hash,document_version=excluded.document_version,content_hash=excluded.content_hash
+         WHERE (source_home,source_file,source_contents,catalog_hash,document_version,content_hash) IS NOT
+           (excluded.source_home,excluded.source_file,excluded.source_contents,excluded.catalog_hash,excluded.document_version,excluded.content_hash)",
+        params![home.as_os_str().as_encoded_bytes(), catalog_hash(metadata)?, id]
+    ).map_err(database_error)?;
+    Ok(())
+}
+
+impl crate::Store {
+    /// Returns database sessions whose verified read used this home, revision, catalog, and reader version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store or the catalog metadata cannot be read.
+    pub fn current_database_catalogs(
+        &self,
+        provider: Provider,
+        home: &std::path::Path,
+        candidates: &[(&crate::IndexedSession, u32)],
+    ) -> Result<std::collections::HashSet<SessionRef>> {
+        let mut selected = Vec::with_capacity(candidates.len());
+        for &(catalog, version) in candidates {
+            let Some(revision) = catalog.source_revision else {
+                continue;
+            };
+            if let (Some(file), Some(contents)) = (revision.file, revision.contents) {
+                selected.push((
+                    &catalog.session.id,
+                    file.simple().to_string(),
+                    contents.simple().to_string(),
+                    catalog_hash(catalog)?,
+                    version,
+                ));
+            }
+        }
+        let selected =
+            serde_json::to_string(&selected).map_err(|_| StoreError::InvalidSessionReference)?;
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare_cached(
+            "SELECT doc.session_id FROM json_each(?1) picked
+             JOIN session_trajectories doc ON doc.provider=?2 AND doc.session_id=(picked.value ->> 0)
+             JOIN antigravity_read_catalogs r ON r.trajectory_id=doc.id AND r.source_home=?3
+             JOIN native_search_document_homes h ON h.trajectory_id=doc.id AND h.verification=1 AND h.source_home=r.source_home AND h.source_file=r.source_file
+             WHERE r.source_file=doc.source_file_id AND r.source_contents=doc.source_contents_id AND r.document_version=doc.document_version AND r.content_hash=doc.content_hash
+               AND hex(r.source_file)=upper(picked.value ->> 1) AND hex(r.source_contents)=upper(picked.value ->> 2)
+               AND r.catalog_hash=(picked.value ->> 3) AND r.document_version=(picked.value ->> 4)"
+        ).map_err(database_error)?;
+        statement
+            .query_map(
+                params![
+                    selected,
+                    provider.to_string(),
+                    home.as_os_str().as_encoded_bytes()
+                ],
+                |row| Ok(SessionRef::new(provider, row.get::<_, String>(0)?)),
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+}
+
 pub(super) fn record_verified(
     tx: &Transaction<'_>,
     write: &crate::PreparedTrajectoryWrite<'_, '_>,
@@ -154,17 +298,21 @@ pub(super) fn record_verified(
     }
     let revision = write.document.source_revision;
     if let (Some(file), Some(contents)) = (revision.file, revision.contents) {
-        let matches: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM session_trajectories
-            WHERE provider=?1 AND session_id=?2 AND origin='native' AND source_file_id=?3 AND source_contents_id=?4 AND content_hash=?5)",
+        let stored = tx.query_row(
+            "SELECT id,document_version FROM session_trajectories
+             WHERE provider=?1 AND session_id=?2 AND origin='native' AND source_file_id=?3 AND source_contents_id=?4 AND content_hash=?5",
             params![write.session.provider.to_string(), write.session.id, file.as_bytes(), contents.as_bytes(), write.content_hash],
-            |row| row.get(0),
-        ).map_err(database_error)?;
-        if matches {
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?)),
+        ).optional().map_err(database_error)?;
+        if let Some((id, version)) = stored {
+            if version == write.document.document_version
+                && let Some(metadata) = write.verified_metadata
+            {
+                record_catalog(tx, id, metadata, home)?;
+            }
             tx.execute(
-                "DELETE FROM antigravity_search_gaps WHERE trajectory_id=(
-                SELECT id FROM session_trajectories WHERE provider=?1 AND session_id=?2)",
-                params![write.session.provider.to_string(), write.session.id],
+                "DELETE FROM antigravity_search_gaps WHERE trajectory_id=?1",
+                [id],
             )
             .map_err(database_error)?;
             let Some(projection) = write.document.projection else {
@@ -200,142 +348,6 @@ pub(super) fn record_verified(
         }
     }
     Ok(())
-}
-
-fn write_current_projection(
-    tx: &Transaction<'_>,
-    write: &crate::PreparedTrajectoryWrite<'_, '_>,
-    id: i64,
-) -> Result<bool> {
-    let doc = write.document;
-    let timestamp = doc.source_updated_at.timestamp_millis();
-    let same: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM antigravity_gap_projections WHERE trajectory_id=?1
-         AND content_hash=?2 AND source_byte_count=?3 AND indexed_byte_count=?4 AND document_version=?5
-         AND derived_title IS ?6 AND source_updated_at=?7)",
-        params![id, write.content_hash, write.source_byte_count, write.indexed_byte_count, doc.document_version, doc.derived_title,timestamp],
-        |row| row.get(0),
-    ).map_err(database_error)?;
-    if same {
-        return Ok(false);
-    }
-    tx.execute(
-        "DELETE FROM antigravity_gap_projections WHERE trajectory_id=?1",
-        [id],
-    )
-    .map_err(database_error)?;
-    let first: i64 = tx.query_row(
-        "SELECT coalesce(max(chunk_index)+1,0) FROM session_trajectory_chunk_rows WHERE trajectory_id=?1",
-        [id], |row|row.get(0),
-    ).map_err(database_error)?;
-    tx.execute(
-        "INSERT INTO antigravity_gap_projections (trajectory_id,first_chunk,source_byte_count,indexed_byte_count,
-          content_hash,document_version,derived_title,source_updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![id, first, write.source_byte_count, write.indexed_byte_count, write.content_hash, doc.document_version,doc.derived_title,timestamp],
-    ).map_err(database_error)?;
-    crate::insert_trajectory_chunks_at(tx, &[(id, doc.redacted_text)], first)?;
-    Ok(true)
-}
-
-pub(super) fn accept_gap(
-    tx: &Transaction<'_>,
-    write: &crate::PreparedTrajectoryWrite<'_, '_>,
-    home: Option<&std::path::Path>,
-    published: &mut std::collections::HashSet<i64>,
-) -> Result<Option<bool>> {
-    use crate::{SessionTrajectoryOrigin, optional_uuid, stored_projection_text};
-    let Some(projection) = write.document.projection.filter(|p| p.database_gap) else {
-        return Ok(None);
-    };
-    if write.document.origin != SessionTrajectoryOrigin::Native || write.verified_metadata.is_none()
-    {
-        return Ok(None);
-    }
-    let revision = write.document.source_revision;
-    if write.guard.matches_document_file(revision) != Some(true) {
-        return Ok(None);
-    }
-    let (Some(home), Some(file)) = (home, revision.file) else {
-        return Ok(Some(false));
-    };
-    let home = home.as_os_str().as_encoded_bytes();
-    let prior = tx.query_row(
-        "SELECT doc.id,doc.indexed_byte_count,doc.source_contents_id,doc.content_hash,doc.truncation_strategy
-        FROM session_trajectories doc JOIN native_search_document_homes receipt ON doc.id=receipt.trajectory_id AND doc.source_file_id=receipt.source_file
-        WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id=?3 AND receipt.verification=1 AND receipt.source_home=?4 AND doc.document_version<=?5",
-        params![write.session.provider.to_string(), write.session.id, file.as_bytes(), home,write.document.document_version],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, u32>(1)? as usize,
-                optional_uuid(row, 2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        },
-    ).optional().map_err(database_error)?;
-    let Some((id, len, Some(contents), hash, strategy)) = prior else {
-        return Ok(Some(false));
-    };
-    let mut decision = |accepted: bool| -> Result<Option<bool>> {
-        if !accepted && let Some(observed) = revision.contents {
-            let changed = tx.execute("INSERT INTO antigravity_search_gaps
-                (trajectory_id,source_home,source_file,indexed_contents,indexed_hash,observed_contents)
-                VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(trajectory_id) DO UPDATE SET
-                source_home=excluded.source_home,source_file=excluded.source_file,
-                indexed_contents=excluded.indexed_contents,indexed_hash=excluded.indexed_hash,
-                observed_contents=excluded.observed_contents
-                WHERE (source_home,source_file,indexed_contents,indexed_hash,observed_contents)
-                   IS NOT (excluded.source_home,excluded.source_file,excluded.indexed_contents,excluded.indexed_hash,excluded.observed_contents)",
-                params![id,home,file.as_bytes(),contents.as_bytes(),hash,observed.as_bytes()]
-            ).map_err(database_error)?;
-            if write_current_projection(tx, write, id)? || changed != 0 {
-                published.insert(id);
-            }
-        }
-        Ok(Some(accepted))
-    };
-    let Some(rows) = projection.database_steps.as_deref() else {
-        return decision(false);
-    };
-    if let Some(previous) = read(tx, write.session, home, file, contents, &hash)? {
-        let aliases = &projection.database_aliases;
-        let retains = |legacy: bool| {
-            let mut bytes = omnis_ir::antigravity_receipts::LEGACY_HASH_BYTES;
-            let mut layouts = omnis_ir::antigravity_receipts::LEGACY_HASH_LAYOUTS;
-            let mut incoming = rows.iter();
-            previous.iter().all(|old| {
-                incoming.any(|row| {
-                    row == old
-                        || aliases.get(row).is_some_and(|alias| {
-                            alias.canonical == *old
-                                || (legacy && alias.matches_legacy(*old, &mut bytes, &mut layouts))
-                        })
-                })
-            })
-        };
-        return decision(retains(false) || retains(true));
-    }
-    if hash == write.content_hash {
-        return Ok(Some(true));
-    }
-    if len > 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
-        || strategy.contains("document_head_tail")
-        || write
-            .document
-            .truncation_strategy
-            .contains("document_head_tail")
-    {
-        return decision(false);
-    }
-    let prior = stored_projection_text(tx, id, len)?;
-    decision(prior.is_some_and(|old| {
-        let mut observed = write.document.redacted_text.split("\n\n");
-        old.is_empty()
-            || old
-                .split("\n\n")
-                .all(|part| observed.any(|current| current == part))
-    }))
 }
 
 #[cfg(test)]
