@@ -345,7 +345,7 @@ fn config_string(value: &str) -> Result<String> {
     match value.parse::<toml::Value>() {
         Ok(toml::Value::String(s)) => Ok(s),
         Err(_) => Ok(value.to_owned()),
-        Ok(_) => bail!("Codex model provider override must be a string"),
+        Ok(_) => bail!("Codex configuration override must be a string"),
     }
 }
 

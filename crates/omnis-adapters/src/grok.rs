@@ -2445,6 +2445,7 @@ impl ProviderAdapter for GrokAdapter {
             )
         })?;
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             database_aliases: Arc::default(),
             verified_prefix_end: None,
             search_record_groups: Vec::new(),

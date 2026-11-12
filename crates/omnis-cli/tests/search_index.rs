@@ -169,6 +169,7 @@ fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure(
         .record_trajectory_index_failure(
             &session,
             &omnis_store::TrajectoryIndexFailure {
+                ancestor_revisions: Vec::new(),
                 source_updated_at: Some(old_time),
                 source_file: None,
                 source_contents: None,

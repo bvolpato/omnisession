@@ -21,6 +21,79 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn live_checks_retire_only_the_codex_rollout_that_sqlite_invalidated() {
+    let source = format!("codex:{CODEX_ID}");
+    for command in [
+        &["index", "--provider", "codex"][..],
+        &["show", &source],
+        &["show", CODEX_ID],
+        &["search", "Pagination", "--provider", "codex"],
+        &["search", "Pagination", "--provider", "codex", "--no-index"],
+    ] {
+        let fixture = Fixture::new();
+        let home = fixture.root.join("codex");
+        let day = home.join("sessions/2026/01/02");
+        let original = day.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"));
+        let selected = day.join("restored.jsonl");
+        fixture.index_codex();
+        let cached = |query: &str| {
+            result_sessions(&fixture.search_json(&[
+                query,
+                "--provider",
+                "codex",
+                "--cached",
+                "--all-projects",
+            ]))
+        };
+
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+            [CODEX_ID, selected.to_str().unwrap()],
+        )
+        .unwrap();
+        fs::remove_file(day.join(format!(
+            "rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(cached("Pagination"), [source.as_str()]);
+
+        let output = fixture
+            .command()
+            .arg("--json")
+            .args(command)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), command[0] != "show", "{command:?}");
+        if command[0] == "search" {
+            assert!(result_sessions(&serde_json::from_slice(&output.stdout).unwrap()).is_empty());
+        }
+        assert!(cached("Pagination").is_empty(), "{command:?}");
+        assert_eq!(cached("zebracorn"), [format!("codex:{OTHER_CODEX_ID}")]);
+
+        let restored = fs::read_to_string(&original)
+            .unwrap()
+            .replace("Pagination", "Cinnabar");
+        fs::write(&selected, restored).unwrap();
+        assert!(
+            fixture
+                .command()
+                .args(["show", &source])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(cached("Cinnabar"), [source.as_str()]);
+        assert!(cached("Pagination").is_empty());
+    }
+}
+
+#[test]
 fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
     for upgrade in [false, true] {
         let fixture = Fixture::new();
@@ -50,6 +123,7 @@ fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
                     &omnis_store::TrajectoryDocument {
                         projection: None,
                         source_revision: omnis_ir::SourceRevision::default(),
+                        ancestor_revisions: &[],
                         provider_limited: false,
                         title_authoritative: false,
                         title_is_verified: false,
@@ -1294,6 +1368,111 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
 }
 
 #[test]
+fn search_upgrades_an_unchanged_fork_indexed_with_only_its_local_messages() -> anyhow::Result<()> {
+    check_fork_search_upgrade(6, 0)
+}
+
+#[test]
+fn a_legacy_leaf_hash_cannot_replace_the_inherited_search_preview() -> anyhow::Result<()> {
+    check_fork_search_upgrade(4, 1025)
+}
+
+fn check_fork_search_upgrade(document_version: u32, padding_rows: u32) -> anyhow::Result<()> {
+    use omnis_ir::{Provider, SessionRef};
+    use omnis_store::{LocalOpenerEvidence, SessionTrajectoryOrigin, Store, TrajectoryDocument};
+    use std::io::{BufWriter, Write};
+
+    let fixture = Fixture::new();
+    let rollout = |id: &str| {
+        fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{id}.jsonl"
+        ))
+    };
+    let parent = rollout(OTHER_CODEX_ID);
+    let child = rollout(CODEX_ID);
+    let header = |id, ordinal| {
+        json!({"type":"session_meta","ordinal":ordinal,"payload":{
+            "id":id,"cwd":fixture.workspace,"history_mode":"paginated"
+        }})
+    };
+    let message = |ordinal, text: &str| {
+        json!({"type":"response_item","ordinal":ordinal,"payload":{
+            "type":"message","role":"assistant","content":[{"type":"output_text","text":text}]
+        }})
+    };
+    write_jsonl(
+        &parent,
+        &[header(OTHER_CODEX_ID, 0), message(1, "Inherited lapwing")],
+    );
+    if padding_rows > 0 {
+        // Put the inherited history beyond both the full-read budget and the preview event limit.
+        let mut writer = BufWriter::new(fs::OpenOptions::new().append(true).open(&parent)?);
+        let padding = " ".repeat(16 * 1024);
+        for ordinal in 2..2 + padding_rows {
+            let row = message(ordinal, &format!("Parent reply {ordinal}"));
+            writeln!(writer, "{row}{padding}")?;
+        }
+        writer.flush()?;
+    }
+    let cutoff = 2 + padding_rows;
+    let mut child_header = header(CODEX_ID, cutoff);
+    child_header["payload"]["history_base"] = json!({
+        "thread_id":OTHER_CODEX_ID,"end_byte_offset":parent.metadata()?.len(),"end_ordinal_exclusive":cutoff
+    });
+    let local_text = "Local kestrel";
+    write_jsonl(&child, &[child_header, message(cutoff + 1, local_text)]);
+
+    let session = SessionRef::new(Provider::Codex, CODEX_ID);
+    fs::create_dir_all(fixture.root.join("state"))?;
+    let store = Store::open(fixture.root.join("state/store.sqlite3"))?;
+    store.upsert_trajectory_document(
+        &session,
+        &TrajectoryDocument {
+            ancestor_revisions: &[],
+            redacted_text: local_text,
+            source_updated_at: child.metadata()?.modified()?.into(),
+            source_revision: if document_version == 4 {
+                omnis_ir::SourceRevision::default()
+            } else {
+                omnis_adapters::CodexAdapter::index_file_revision(&child).unwrap()
+            },
+            source_byte_count: local_text.len(),
+            projection: None,
+            indexed_byte_count: local_text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version,
+            derived_title: None,
+            withdrawn_title: None,
+            title_is_verified: false,
+            title_authoritative: false,
+            local_opener: LocalOpenerEvidence::Unknown,
+        },
+    )?;
+    let live = fixture.search_json(&["lapwing", "--all-projects", "--provider", "codex"]);
+    let child_ref = session.to_string();
+    let hit = live["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["session"] == child_ref);
+    let coverage = if padding_rows == 0 {
+        "complete"
+    } else {
+        "preview"
+    };
+    assert_eq!(
+        hit.and_then(|hit| hit["coverage"].as_str()),
+        Some(coverage),
+        "{live}"
+    );
+    assert_eq!(fixture.index_codex()["stale"], 0);
+    Ok(())
+}
+
+#[test]
 fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
     use omnis_ir::{Provider, SessionRef};
 
@@ -1347,6 +1526,203 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         result_sessions(&fixture.search_json(&["unchanged", "--cached", "--all-projects"])),
         [session.to_string()]
     );
+}
+
+fn listed_fork_workspace(fixture: &Fixture, project: &Path) -> Option<String> {
+    let output = fixture
+        .command()
+        .args(["--json", "list", "--provider", "codex", "--project"])
+        .arg(project)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session"]["id"] == CODEX_ID)
+        .map(|row| row["project_path"].as_str().unwrap().to_owned())
+}
+
+fn check_indexed_fork_workspace(fixture: &Fixture, project: &Path, child_ref: &str) {
+    assert_eq!(
+        listed_fork_workspace(fixture, project).as_deref(),
+        project.to_str()
+    );
+    assert!(listed_fork_workspace(fixture, &fixture.workspace).is_none());
+    let no_index = fixture.search_json(&[
+        "--no-index",
+        "--project",
+        project.to_str().unwrap(),
+        "inheritedworkspaceprobe",
+    ]);
+    assert_eq!(result_sessions(&no_index), [child_ref]);
+}
+
+#[test]
+fn project_search_follows_the_surviving_workspace_in_a_fork_prefix() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let path = |id| {
+        fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{id}.jsonl"
+        ))
+    };
+    let header = |id, ordinal| {
+        json!({"type":"session_meta","ordinal":ordinal,
+        "payload":{"id":id,"cwd":fixture.workspace,"history_mode":"paginated"}})
+    };
+    let folders = ["a", "b", "c"].map(|name| fixture.root.join(name));
+    for folder in &folders {
+        fs::create_dir(folder).unwrap();
+    }
+    let set_workspace = |folder: &Path| {
+        write_jsonl(
+            &path(OTHER_CODEX_ID),
+            &[
+                header(OTHER_CODEX_ID, 0),
+                json!({"type":"turn_context","ordinal":1,"payload":{"cwd":folder}}),
+            ],
+        );
+    };
+    let write_child = |cutoff| {
+        let mut child = header(CODEX_ID, cutoff);
+        child["payload"]["history_base"] = json!({"thread_id":OTHER_CODEX_ID,
+            "end_byte_offset":path(OTHER_CODEX_ID).metadata().unwrap().len(),"end_ordinal_exclusive":cutoff});
+        write_jsonl(
+            &path(CODEX_ID),
+            &[
+                child,
+                json!({"type":"event_msg","ordinal":cutoff+1,
+            "payload":{"type":"agent_message","message":"inheritedworkspaceprobe"}}),
+            ],
+        );
+    };
+    set_workspace(&folders[0]);
+    write_child(2);
+    let search = |folder: &Path| {
+        fixture.search_json(&[
+            "--provider",
+            "codex",
+            "--project",
+            folder.to_str().unwrap(),
+            "inheritedworkspaceprobe",
+        ])
+    };
+    let child_ref = format!("codex:{CODEX_ID}");
+    assert_eq!(result_sessions(&search(&folders[0])), [child_ref.as_str()]);
+    set_workspace(&folders[1]);
+    fixture.index_codex();
+    check_indexed_fork_workspace(&fixture, &folders[1], &child_ref);
+    let warm = search(&folders[1]);
+    assert_eq!(result_sessions(&warm), [child_ref.as_str()]);
+    assert_eq!(warm["index"]["indexed"], 0);
+    assert!(result_sessions(&search(&folders[0])).is_empty());
+    set_workspace(&folders[2]);
+    assert!(listed_fork_workspace(&fixture, &folders[1]).is_none());
+    assert_eq!(
+        listed_fork_workspace(&fixture, &folders[2]).as_deref(),
+        folders[2].to_str()
+    );
+    assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
+    assert!(result_sessions(&search(&folders[1])).is_empty());
+
+    // A cold project search has a bounded read budget for the entire ancestor prefix.
+    let mut parent = fs::OpenOptions::new()
+        .append(true)
+        .open(path(OTHER_CODEX_ID))
+        .unwrap();
+    let padding = " ".repeat(128 * 1024);
+    for ordinal in 2..35 {
+        writeln!(
+            parent,
+            "{}{padding}",
+            json!({"type":"event_msg","ordinal":ordinal,
+            "payload":{"type":"token_count"}})
+        )
+        .unwrap();
+    }
+    drop(parent);
+    write_child(35);
+    let bounded = search(&folders[2]);
+    assert!(result_sessions(&bounded).is_empty());
+    assert!(
+        bounded["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("could not check"))
+    );
+    fixture.index_codex();
+    assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
+
+    check_large_fork_leaf_settings(
+        &path(CODEX_ID),
+        &folders[1],
+        || write_child(35),
+        || search(&folders[1]),
+    );
+}
+
+fn check_large_fork_leaf_settings(
+    path: &Path,
+    target: &Path,
+    write_child: impl Fn(),
+    search: impl Fn() -> Value,
+) {
+    use std::io::Write;
+
+    let settings = |owner, model: Value| {
+        json!({"type":"event_msg","ordinal":37,"payload":{
+        "type":"thread_settings_applied","thread_id":owner,"thread_settings":{
+            "cwd":target,"model":model,"model_provider_id":"synthetic","approval_policy":"never",
+            "approvals_reviewer":"user","permission_profile":{"type":"disabled"},
+            "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}}}})
+    };
+    let started = json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"later"}});
+    let moved = json!({"type":"turn_context","payload":{"cwd":target}});
+    let prompt =
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"later turn"}});
+    let rollback =
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+    for (records, found) in [
+        (vec![settings(OTHER_CODEX_ID, json!("fixture"))], false),
+        (vec![settings(CODEX_ID, Value::Null)], false),
+        (
+            vec![started.clone(), moved, prompt.clone(), rollback.clone()],
+            false,
+        ),
+        (
+            vec![
+                started,
+                prompt,
+                settings(CODEX_ID, json!("fixture")),
+                rollback,
+            ],
+            true,
+        ),
+        (
+            vec![
+                settings(CODEX_ID, json!("fixture")),
+                settings(CODEX_ID, Value::Null),
+            ],
+            false,
+        ),
+    ] {
+        write_child();
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        for (index, mut event) in records.into_iter().enumerate() {
+            event["ordinal"] = json!(37 + index);
+            writeln!(file, "{event}").unwrap();
+        }
+        drop(file);
+        assert_eq!(
+            result_sessions(&search()).contains(&format!("codex:{CODEX_ID}")),
+            found
+        );
+    }
 }
 
 #[test]
@@ -2240,6 +2616,86 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
 }
 
 #[test]
+fn switching_the_selected_codex_rollout_refreshes_equal_time_search_results() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("codex");
+    let name = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let active = root.join("sessions/2026/01/02").join(&name);
+    write_codex_session(
+        &fixture.root,
+        CODEX_ID,
+        &fixture.workspace,
+        "Activebluejay",
+        "answer",
+    );
+    let archive = root.join("archived_sessions");
+    fs::create_dir(&archive).unwrap();
+    let archived = archive.join(&name);
+    let original = fs::read_to_string(&active).unwrap();
+    fs::write(&archived, original.replace("Activebluejay", "Archivejunco")).unwrap();
+    let timestamp = active.metadata().unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&archived)
+        .unwrap()
+        .set_modified(timestamp)
+        .unwrap();
+
+    let db = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        (CODEX_ID, active.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(fixture.index_codex()["failed"], 0);
+    let matches = |query: &str, cached: bool| {
+        let mut args = vec![query, "--provider", "codex"];
+        if cached {
+            args.push("--cached");
+        }
+        result_sessions(&fixture.search_json(&args))
+    };
+    let session = format!("codex:{CODEX_ID}");
+    assert_eq!(
+        matches("Activebluejay", false).as_slice(),
+        std::slice::from_ref(&session)
+    );
+
+    // A provider restore can select a different file without modifying either file's timestamp.
+    let select = |file: &Path| {
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            (file.to_str().unwrap(), CODEX_ID),
+        )
+        .unwrap();
+    };
+    select(&archived);
+    assert_eq!(
+        matches("Archivejunco", false).as_slice(),
+        std::slice::from_ref(&session)
+    );
+    assert!(matches("Activebluejay", true).is_empty());
+
+    select(&active);
+    let shown = fixture
+        .command()
+        .args(["--json", "show", &session])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert_eq!(matches("Activebluejay", true), [session]);
+    assert!(matches("Archivejunco", true).is_empty());
+}
+
+#[test]
 fn cached_search_keeps_other_providers_when_a_home_cannot_be_resolved() {
     let fixture = Fixture::new();
     let indexed = fixture
@@ -2895,6 +3351,7 @@ impl Fixture {
         let source = fs::read_to_string(&path).unwrap();
         let (header, conversation) = source.split_once('\n').unwrap();
         let mut header: Value = serde_json::from_str(header).unwrap();
+        header["ordinal"] = json!(4);
         header["payload"]["history_mode"] = json!("paginated");
         header["payload"]["history_base"] = json!({
             "thread_id": "019f0000-0000-7000-8000-000000000099",

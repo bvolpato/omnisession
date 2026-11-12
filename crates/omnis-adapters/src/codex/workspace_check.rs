@@ -8,13 +8,13 @@ use omnis_ir::{GitState, Provider, SessionRef, SourceRevision};
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::history_base::{HistoryBase, HistoryScope, Lineage};
 use super::{
     CodexAdapter, CodexSession, ObservedRollout, UNAVAILABLE_ANCESTRY, records_history_base,
     rollout_file,
 };
 use crate::support::{
-    BoundedLine, JsonLineLocation, JsonLineSkips, read_bounded_line_with_budget, string_at,
-    validate_provider,
+    BoundedLine, JsonLineLocation, JsonLineSkips, read_bounded_line_with_budget, validate_provider,
 };
 use crate::{CodexWorkspaceProjection, IndexRead};
 
@@ -98,6 +98,7 @@ pub(super) struct WorkspaceScan {
     pub(super) settings: WorkspaceSettings,
     pub(super) directory: Option<PathBuf>,
     pub(super) reconstruct_history: bool,
+    pub(super) saved_messages: usize,
     rolled_back: bool,
     inherited: bool,
     display_replay: super::DisplayReplay,
@@ -109,6 +110,7 @@ impl WorkspaceScan {
             settings: WorkspaceSettings::from_header(directory.map(Path::to_path_buf)),
             directory: directory.map(Path::to_path_buf),
             reconstruct_history: false,
+            saved_messages: 0,
             rolled_back: false,
             inherited: false,
             display_replay: super::DisplayReplay::default(),
@@ -124,6 +126,7 @@ impl WorkspaceScan {
 
     pub(super) fn observe(&mut self, session: &str, record: &Value) {
         self.reconstruct_history |= self.display_replay.observe(record);
+        self.saved_messages += usize::from(super::saved_message(record));
         self.settings.observe(session, record);
         if records_history_base(record) {
             self.inherited = true;
@@ -131,10 +134,10 @@ impl WorkspaceScan {
             self.rolled_back = false;
             self.reconstruct_history = true;
         } else if record["type"] == "turn_context" {
-            if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
-                self.directory = Some(PathBuf::from(cwd)).filter(|path| path.is_absolute());
-                self.rolled_back = false;
-            }
+            self.directory = super::history_base::replay_messages::turn_context_cwd(record)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            self.rolled_back = false;
         } else if super::encoded_rollback(record) {
             let turns = super::rollout_lines::rollback_turns(&record["payload"]);
             if self.settings.gaps.workspace_gaps() > 0 && turns.is_none() {
@@ -152,6 +155,12 @@ impl WorkspaceScan {
 
 impl IndexRead {
     pub(super) fn observe_inherited_workspace(&mut self, selected_path: &Path) -> Result<()> {
+        if matches!(
+            self.workspace_projection,
+            CodexWorkspaceProjection::Observed(_)
+        ) {
+            return Ok(());
+        }
         let session = &self.snapshot.session;
         if self.snapshot.events.iter().rev().any(|event| {
             event.source.raw_record_type.as_deref() == Some(UNAVAILABLE_ANCESTRY)
@@ -224,6 +233,21 @@ impl CodexAdapter {
 }
 
 impl CodexSession {
+    pub(super) fn visible_leaf(&self) -> Result<Lineage> {
+        let mut lineage = self.history_base.leaf_only(
+            &self.path,
+            HistoryScope::Visible,
+            self.subagent_history_start,
+        )?;
+        if matches!(
+            self.history_base,
+            HistoryBase::Prefix(_) | HistoryBase::Invalid | HistoryBase::InvalidAttachment
+        ) {
+            lineage.unavailable = Some("The rollout references earlier history that was not read.");
+        }
+        Ok(lineage)
+    }
+
     pub(super) fn effective_and_startup_directories(
         &self,
     ) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
@@ -239,8 +263,16 @@ impl CodexSession {
             } else {
                 self
             };
-            let (_, project, verified) = session.reconstructed_preview(rollout_file::LIMITS)?;
-            project.filter(|_| verified)
+            if session.needs_visible_projection() {
+                let (_, project, verified) =
+                    session.canonical_events_with(&session.visible_leaf()?, |visit| {
+                        rollout_file::visit_with_limits(&session.path, rollout_file::LIMITS, visit)
+                    })?;
+                project.filter(|_| verified)
+            } else {
+                let (_, project, verified) = session.reconstructed_preview(rollout_file::LIMITS)?;
+                project.filter(|_| verified)
+            }
         } else {
             workspace.directory
         };
@@ -252,13 +284,14 @@ impl CodexSession {
 
     pub(super) fn scan_workspace(&self, inspect_displays: bool) -> Result<WorkspaceScan> {
         let limits = rollout_file::LIMITS;
+        let lineage = self.visible_leaf()?;
         let mut remaining = limits.file_bytes;
         let plain = (!rollout_file::compressed(&self.path)).then_some(self.path.as_path());
         let mut reader = BufReader::new(rollout_file::open(&self.path)?);
         let mut line = Vec::new();
         let mut workspace = WorkspaceScan::new(self.project_path.as_deref());
         let mut skipped = JsonLineSkips::default();
-        for _ in 0..limits.records {
+        for row in 1..=limits.records {
             let Some((kind, bytes)) = read_bounded_line_with_budget(
                 &mut reader,
                 limits.line_bytes,
@@ -281,15 +314,30 @@ impl CodexSession {
                     inspect_displays && !workspace.reconstruct_history,
                 ) {
                     rollout_file::WorkspaceRecord::Other => continue,
+                    rollout_file::WorkspaceRecord::SavedMessage => {
+                        workspace.saved_messages += 1;
+                        continue;
+                    }
                     rollout_file::WorkspaceRecord::Compacted => {
                         workspace.reconstruct_history = true;
                         continue;
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
-                        if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                            if self.history_mode != super::CodexHistoryMode::Paginated
-                                || super::records_history_base(&record)
-                                || super::WorkspaceRecords::accepts(true, &record)
+                        if let Ok(record) = serde_json::from_slice::<Value>(&line)
+                            .map(super::saved_message::project)
+                            && let Some(visible) = lineage.leaf_row_visibility(&record, row)
+                        {
+                            if !visible {
+                                if record["type"] == "event_msg"
+                                    && record["payload"]["type"] == "thread_settings_applied"
+                                {
+                                    workspace.settings.startup = None;
+                                }
+                            } else if (record["type"] != "session_meta"
+                                || lineage.unavailable.is_some())
+                                && (self.history_mode != super::CodexHistoryMode::Paginated
+                                    || super::records_history_base(&record)
+                                    || super::WorkspaceRecords::accepts(true, &record))
                             {
                                 workspace.observe(&self.id, &record);
                             }

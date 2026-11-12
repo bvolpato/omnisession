@@ -154,6 +154,7 @@ fn full_index_read(
             .read_full_index_at(session, None)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            ancestor_revisions: Vec::new(),
             ownership_revision: None,
             native_session: None,
             verified_prefix_end: None,
@@ -184,13 +185,13 @@ impl IndexedSessionReader for AdapterRegistry {
         });
         let mut read = full_index_read(self, session, expected).inspect_err(|error| {
             if let Ok((store, observed)) = &cache {
-                record_selected_read_error(self, store, session, observed, error);
+                record_selected_read_failure(self, store, session, observed, error);
             }
         })?;
         if session.provider == Provider::Grok
             && let Ok((store, observed)) = &cache
         {
-            search_index::check_grok_preview(store, &read, observed.failure).inspect_err(
+            search_index::check_grok_preview(store, &read, observed.failure.as_ref()).inspect_err(
                 |error| {
                     let _ =
                         search_index::record_grok_rejection(self, store, session, observed, error);
@@ -294,7 +295,7 @@ fn select_pi_index(store: &Store, registry: &AdapterRegistry, session: &SessionR
     Ok(())
 }
 
-fn record_selected_read_error(
+fn record_selected_read_failure(
     registry: &AdapterRegistry,
     store: &Store,
     session: &SessionRef,
@@ -621,12 +622,52 @@ fn projected_repository_match(
 #[derive(Clone, Copy)]
 enum SearchDocumentTarget<'a> {
     Session(&'a SessionRef),
-    VisibleNative(&'a NativeSession),
     Selected(
         &'a IndexedSession,
         &'a omnis_store::SelectedSessionObservation,
         Option<&'a str>,
     ),
+}
+
+impl<'a> SearchDocumentTarget<'a> {
+    fn write(
+        self,
+        store: &Store,
+        document: omnis_store::TrajectoryDocument<'_>,
+        guard: TrajectorySourceGuard,
+        workspace: impl FnOnce() -> Option<omnis_store::CodexWorkspaceUpdate>,
+        native_name: Option<&NativeSessionName>,
+    ) -> Result<&'a SessionRef> {
+        let session = match self {
+            SearchDocumentTarget::Session(session) => {
+                store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
+                session
+            }
+            SearchDocumentTarget::Selected(selected, observed, _)
+                if selected.session.provider == Provider::Grok =>
+            {
+                store.upsert_selected_session_document_with_workspace(
+                    selected,
+                    observed,
+                    document,
+                    workspace().as_ref(),
+                )?;
+                &selected.session
+            }
+            SearchDocumentTarget::Selected(selected, observed, prior_assignment) => {
+                store.upsert_selected_session_document_with_selected_name(
+                    selected,
+                    observed,
+                    document,
+                    workspace().as_ref(),
+                    native_name,
+                    prior_assignment,
+                )?;
+                &selected.session
+            }
+        };
+        Ok(session)
+    }
 }
 
 impl<'a> From<&'a SessionRef> for SearchDocumentTarget<'a> {
@@ -652,11 +693,13 @@ fn store_search_document<'a>(
     let target = target.into();
     let provider = match target {
         SearchDocumentTarget::Session(session) => session.provider,
-        SearchDocumentTarget::VisibleNative(native) => native.session.provider,
         SearchDocumentTarget::Selected(selected, _, _) => selected.session.provider,
     };
     let (snapshot, read, native_name, name_observed) = match input {
         SearchDocumentInput::Read(read, name) => {
+            if let Some(registry) = native_registry {
+                search_index::confirm_index_ancestors(registry, &read.ancestor_revisions)?;
+            }
             let observed =
                 search_index::verified_name_coverage(name, read.native_session.as_ref())?;
             (&read.snapshot, Some(read), name, observed)
@@ -690,6 +733,7 @@ fn store_search_document<'a>(
         SessionTrajectoryOrigin::ImportedBundle
     };
     let document = omnis_store::TrajectoryDocument {
+        ancestor_revisions: read.map_or(&[], |r| r.ancestor_revisions.as_slice()),
         redacted_text: &document.text,
         source_updated_at: snapshot.captured_at,
         projection: document.projection.as_ref(),
@@ -719,62 +763,24 @@ fn store_search_document<'a>(
             workspace_projection,
         )
     };
-    persist_search_document(
+    let session = target.write(
         store,
-        target,
         document,
         guard,
         workspace,
         native_name.filter(|_| name_observed),
-    )
-}
-
-fn persist_search_document(
-    store: &Store,
-    target: SearchDocumentTarget<'_>,
-    document: omnis_store::TrajectoryDocument<'_>,
-    guard: TrajectorySourceGuard,
-    workspace: impl FnOnce() -> Option<omnis_store::CodexWorkspaceUpdate>,
-    observed_name: Option<&NativeSessionName>,
-) -> Result<Option<IndexedTrajectoryTitle>> {
-    let session = match target {
-        SearchDocumentTarget::Session(session) => {
-            store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
-            session
-        }
-        SearchDocumentTarget::VisibleNative(native) => {
-            store.upsert_observed_trajectory_documents_with_workspaces(&[(
-                &native.session,
-                document,
-                guard,
-                workspace().as_ref(),
-            )])?;
-            &native.session
-        }
-        SearchDocumentTarget::Selected(selected, observed, _)
-            if selected.session.provider == Provider::Grok =>
-        {
-            store.upsert_selected_session_document_with_workspace(
-                selected,
-                observed,
-                document,
-                workspace().as_ref(),
-            )?;
-            &selected.session
-        }
-        SearchDocumentTarget::Selected(selected, observed, prior_assignment) => {
-            store.upsert_selected_session_document_with_selected_name(
-                selected,
-                observed,
-                document,
-                workspace().as_ref(),
-                observed_name,
-                prior_assignment,
-            )?;
-            &selected.session
-        }
-    };
-    Ok(store.indexed_trajectory_title(session)?)
+    )?;
+    let receipt = store.indexed_trajectory_title(session)?;
+    if source_revision.file.is_some()
+        && receipt.as_ref().is_some_and(|receipt| {
+            !receipt
+                .source_revision
+                .matches_file_contents(source_revision)
+        })
+    {
+        return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
+    }
+    Ok(receipt)
 }
 
 /// Stores a versioned search document and returns whether the store rewrote it.
@@ -825,6 +831,7 @@ fn store_verified_search_document(
     let document = read.search_document();
     let derived_title = search_index::indexed_title(session, snapshot, read.verified_prefix_end);
     let document = omnis_store::TrajectoryDocument {
+        ancestor_revisions: read.ancestor_revisions.as_slice(),
         redacted_text: &document.text,
         source_updated_at,
         source_revision,
@@ -1481,6 +1488,17 @@ fn remove_confirmed_unavailable(
     Ok(())
 }
 
+fn remove_unavailable_session(
+    registry: &AdapterRegistry,
+    store: &Store,
+    session: &SessionRef,
+) -> Result<()> {
+    if let Some(prior) = store.indexed_session(session)? {
+        remove_confirmed_unavailable(registry.adapter(Provider::Codex)?, store, vec![prior])?;
+    }
+    Ok(())
+}
+
 fn cache_provider_discovery(
     registry: &AdapterRegistry,
     store: &Store,
@@ -1950,21 +1968,55 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         .filter_map(|session| selected_search_trajectory(session, args.cached))
         .collect();
     scope_search_trajectories(registry, &store, &mut eligible)?;
+    let changed_ancestors = if !args.cached
+        && (args.no_index || index.failed > 0 || index.failed_skipped > 0 || index.stopped)
+    {
+        let candidates = search_index::ordered_candidates(&sessions, None);
+        search_index::changed_codex_ancestors(registry, &store, &candidates)?
+    } else {
+        HashSet::new()
+    };
+    eligible.retain(|row| {
+        row.session.provider != Provider::Codex || !changed_ancestors.contains(&row.session.id)
+    });
     let mut titles = resolve_search_titles(&mut sessions, titles, args.cached, &eligible);
     if !live_names.is_empty() {
         apply_live_search_titles(&store, &mut sessions, live_names, &mut titles)?;
     }
+    titles.retain(|session, _| {
+        session.provider != Provider::Codex || !changed_ancestors.contains(&session.id)
+    });
     let (hits, has_more) =
         rank_search_hits(&store, &query, &sessions, &titles, args.limit, &eligible)?;
+    print_search_results(
+        &query,
+        args,
+        &index,
+        &hits,
+        has_more,
+        &warnings,
+        json_output,
+    )
+}
+
+fn print_search_results(
+    query: &str,
+    args: &SearchArgs,
+    index: &search_index::IndexSummary,
+    hits: &[SearchHit<'_>],
+    has_more: bool,
+    warnings: &[String],
+    json_output: bool,
+) -> Result<()> {
     if json_output {
         let mut value = search_json(
-            &query,
-            &index,
+            query,
+            index,
             args.no_index || args.cached,
-            &hits,
+            hits,
             has_more,
             args.show_text,
-            &warnings,
+            warnings,
         );
         if args.cached {
             value["cached"] = json!(true);
@@ -1973,16 +2025,16 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         return write_search_output(&format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
     write_search_output(&search_text(
-        &query,
-        &hits,
+        query,
+        hits,
         has_more,
         args.show_text,
         search_output_width(),
     ))?;
     for warning in warnings {
-        eprintln!("warning: {}", safe_terminal_line(&warning));
+        eprintln!("warning: {}", safe_terminal_line(warning));
     }
-    report_pending_search(args.no_index, &index);
+    report_pending_search(args.no_index, index);
     Ok(())
 }
 
@@ -2638,6 +2690,7 @@ fn read_search_snapshot(
         let updated_at = snapshot.captured_at;
         return Ok((
             omnis_adapters::IndexRead {
+                ancestor_revisions: Vec::new(),
                 ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
@@ -2671,6 +2724,7 @@ fn read_search_snapshot(
             adapter.read_full_index_at(session, path)?
         } else {
             omnis_adapters::IndexRead {
+                ancestor_revisions: Vec::new(),
                 ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
@@ -3717,16 +3771,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         let session = SessionRef::new(Provider::Codex, selector);
         let cleanup = Store::open_default()
             .map_err(anyhow::Error::from)
-            .and_then(|store| {
-                if let Some(prior) = store.indexed_session(&session)? {
-                    remove_confirmed_unavailable(
-                        registry.adapter(Provider::Codex)?,
-                        &store,
-                        vec![prior],
-                    )?;
-                }
-                Ok(())
-            });
+            .and_then(|store| remove_unavailable_session(registry, &store, &session));
         if let Err(error) = cleanup {
             eprintln!("warning: local trajectory index write: {error}");
         }
@@ -3912,7 +3957,7 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
         let plan = registry.launch_plan(
             &source,
             &LaunchTarget {
-                cwd: Some(project),
+                cwd: Some(project.clone()),
                 fork: false,
                 prompt: None,
             },
@@ -3920,13 +3965,20 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
         check_launcher_starts(target, &plan)?;
         if target.provider == Provider::Codex {
             let mut plan = target.launch_with_mode(plan, &mode_args)?;
-            transfer::verify_codex_launch(
+            if transfer::verify_codex_launch(
                 registry.adapter(Provider::Codex)?,
                 target,
                 &source,
                 &source,
                 &mut plan,
-            )?;
+            )
+            .is_err()
+            {
+                return transfer::launch_fidelity(
+                    target,
+                    inspect_transfer_report(registry, snapshot, target, matches, &project)?,
+                );
+            }
         }
         return transfer::launch_fidelity(
             target,

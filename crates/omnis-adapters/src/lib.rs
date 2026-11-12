@@ -183,8 +183,10 @@ impl CodexWorkspaceProjection {
     }
 }
 
-/// A search indexing read and whether it covered the full provider source.
+/// A canonical snapshot and the source state observed while building it.
 pub struct IndexRead {
+    /// Physical ancestor rollout IDs and the inventory revisions observed during this projection.
+    pub ancestor_revisions: Vec<(uuid::Uuid, uuid::Uuid)>,
     /// Physical file whose ownership was checked independently of display metadata.
     pub ownership_revision: Option<SourceRevision>,
     pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
@@ -198,12 +200,17 @@ pub struct IndexRead {
     pub rollback_title: RollbackTitle,
     /// The workspace projection belongs to this read's source revision.
     pub workspace_projection: CodexWorkspaceProjection,
-    pub source_complete: bool,
     /// A provider limit made a full read impossible, even without an indexer byte budget.
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+    /// True when the read retained all available canonical events. The snapshot can still report missing history.
+    pub source_complete: bool,
 }
+
+/// Reads a session with the source selection shared by one indexing pass.
+pub type IndexSessionReader<'a> =
+    dyn Fn(&SessionRef, Option<&Path>, u64) -> Result<IndexRead> + Send + Sync + 'a;
 
 /// Search text previously indexed from the same physical transcript.
 #[derive(Clone, Copy)]
@@ -319,6 +326,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    ancestor_revisions: Vec::new(),
                     ownership_revision: None,
                     verified_prefix_end: None,
                     database_aliases: std::sync::Arc::default(),
@@ -337,6 +345,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        ancestor_revisions: Vec::new(),
         ownership_revision: None,
         verified_prefix_end: None,
         database_aliases: std::sync::Arc::default(),
@@ -531,7 +540,7 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
-    /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
+    /// Resolves the local Codex database directory for a continuation. An existing ID must select the displayed session there.
     ///
     /// # Errors
     ///
@@ -723,6 +732,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
@@ -759,6 +769,42 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<CanonicalSnapshot> {
         self.preview_session(session)
+    }
+
+    /// Prepares one reader for the given native session IDs. An adapter can pin its selected
+    /// source paths for this pass. The caller drops the reader before the next pass.
+    fn index_batch(&self, _ids: &[&str]) -> Option<Box<IndexSessionReader<'_>>> {
+        None
+    }
+
+    /// Prepares a batch reader for search. Discovery supplies names for the listed sessions.
+    fn index_search_batch(
+        &self,
+        ids: &[&str],
+        _listed: &HashSet<&str>,
+    ) -> Option<Box<IndexSessionReader<'_>>> {
+        self.index_batch(ids)
+    }
+
+    fn apply_verified_workspace(
+        &self,
+        _session: &mut NativeSession,
+        _index: &omnis_store::CodexWorkspaceIndex,
+    ) -> bool {
+        false
+    }
+
+    /// Observes the current physical copies of each ancestor used to index a descendant.
+    fn index_ancestor_revisions(
+        &self,
+        _ids: &HashSet<uuid::Uuid>,
+    ) -> HashMap<uuid::Uuid, uuid::Uuid> {
+        HashMap::new()
+    }
+
+    /// Finds previously missing sources that can now contribute to a new index read.
+    fn available_index_sources(&self, _ids: &HashSet<uuid::Uuid>) -> HashSet<uuid::Uuid> {
+        HashSet::new()
     }
 
     /// Returns the transcript file when discovery uses its modification time for search freshness.

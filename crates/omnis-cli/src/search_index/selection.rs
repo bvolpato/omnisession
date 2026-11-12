@@ -61,7 +61,7 @@ impl<'a> FileSelections<'a> {
         Ok(())
     }
 
-    pub(super) fn selected(&mut self, check: FileCheck<'_>) -> omnis_store::Result<bool> {
+    pub(super) fn selected(&mut self, check: &FileCheck<'_>) -> omnis_store::Result<bool> {
         self.observe(check.session.provider)?;
         let inventory = self.inventories[&check.session.provider]
             .as_ref()
@@ -92,7 +92,7 @@ impl<'a> FileSelections<'a> {
             .selected_session_at(&session.id, path)
     }
 
-    fn provider_selects(&self, check: FileCheck<'_>) -> bool {
+    fn provider_selects(&self, check: &FileCheck<'_>) -> bool {
         check.path.is_some_and(|path| {
             self.registry
                 .adapter(check.session.provider)
@@ -182,7 +182,7 @@ impl<'a> FileSelections<'a> {
                 return false;
             }
             if check.requires_catalog() {
-                return self.provider_selects(**check);
+                return self.provider_selects(check);
             }
             if !check.guard.has_competing_file(revision.file) {
                 return check
@@ -191,7 +191,7 @@ impl<'a> FileSelections<'a> {
                     .is_some_and(|current| current.matches_file_contents(revision));
             }
             if matches!(self.inventories.get(&session.provider), Some(Ok(None))) {
-                return self.provider_selects(**check);
+                return self.provider_selects(check);
             }
             let selected = validated.get_or_init(|| {
                 let mut selected = HashSet::new();

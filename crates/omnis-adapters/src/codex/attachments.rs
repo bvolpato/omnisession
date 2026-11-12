@@ -364,6 +364,10 @@ fn local_path(content: &[Value], index: usize) -> Option<&str> {
     .then_some(path)
 }
 
+pub(super) fn is_diagnostic(text: &str) -> bool {
+    diagnostic_path(text).is_some()
+}
+
 // The protocol converts a failed local attachment into a separate input text part.
 fn diagnostic_path(text: &str) -> Option<(u8, &str)> {
     for (prefix, delimiter, kind) in [

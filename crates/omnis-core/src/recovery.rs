@@ -15,9 +15,12 @@ use super::{
     visible_events,
 };
 
-/// Returns whether a bounded import or a compaction boundary leaves out recoverable history.
+/// A recovery file records available history and explains context the target cannot receive.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
+    if super::model_context_notices(snapshot).next().is_some() {
+        return true;
+    }
     if import_truncated || has_recoverable_codex_rollback(snapshot) {
         return snapshot
             .events
@@ -178,6 +181,9 @@ pub fn write_recovery_handoff(
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
+    }
+    for notice in super::model_context_notices(snapshot) {
+        writeln!(output, "{notice}\n")?;
     }
     if context.uncertain {
         writeln!(output, "{UNCERTAIN_COMPACTION}\n")?;

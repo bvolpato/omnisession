@@ -1479,16 +1479,29 @@ fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config()
     let plan = codex_plan(&fixture, &fork);
     assert_eq!(plan["fidelity"]["mode"], "native_fork");
     assert_codex_argv(&plan, &[], "fork", &alternate);
+    assert!(codex_run(&fixture, &original).status.success());
     select_alternate_rollout(&alternate, &other);
-    let check_declined = |args: &[&str]| {
-        let output = codex_run(&fixture, args);
-        assert!(!output.status.success());
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("different or unverified rollout"), "{error}");
-        assert!(error.contains(&format!("omni handoff {source}")), "{error}");
+    let check_restore = || {
+        assert_eq!(
+            codex_plan(&fixture, &fork)["fidelity"]["mode"],
+            "native_materialization"
+        );
     };
-    check_declined(&fork);
-    check_declined(&original);
+    check_restore();
+    let rejected = codex_run(&fixture, &original);
+    assert!(!rejected.status.success());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("different or unverified rollout"), "{error}");
+    assert!(
+        error.contains(&format!("omni fork {source} --in routed")),
+        "{error}"
+    );
+
+    let materialize = [&fork[..], &["--materialize-only"]].concat();
+    assert_eq!(
+        codex_plan(&fixture, &materialize)["fidelity"]["mode"],
+        "native_materialization"
+    );
 
     fs::write(
         fixture.root.join("codex/work.config.toml"),
@@ -1496,7 +1509,7 @@ fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config()
     )
     .unwrap();
     fixture.write_profiles("[profiles.routed]\nagent = 'codex'\nargs = ['--profile', 'work']\n");
-    check_declined(&fork);
+    check_restore();
 
     let nested = fixture.workspace.join("subdirectory");
     fs::create_dir(&nested).unwrap();
@@ -1533,7 +1546,7 @@ fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config()
                 "{assignment}"
             );
         } else {
-            check_declined(&fork);
+            check_restore();
         }
     }
 }

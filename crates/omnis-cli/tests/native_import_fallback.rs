@@ -909,38 +909,139 @@ fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_la
     if !tools_available() {
         return;
     }
-    let fixture = Fixture::new();
-    let profile = fixture.root.join("state/profiles.toml");
-    fs::write(
-        &profile,
-        "[profiles.local]\nagent = 'codex'\nargs = ['-c', 'projects={}']\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
-    let source = format!("claude:{SOURCE_ID}");
-    let mut args = strings(&["fork", &source, "--in", "local"]);
-    let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
-    let declined = fixture.run(&args, &faithful);
-    assert!(!declined.status.success());
-    assert!(
-        declined.stderr.contains(&format!("omni handoff {source}")),
-        "{}",
-        declined.stderr
-    );
-    assert!(
-        fixture
-            .rpc_log()
-            .contains(&format!("thread/delete {THREAD_ID}"))
-    );
-    assert!(!fixture.generated_rollout().exists());
-    assert_eq!(fixture.launch_arguments(), None);
+    for provider in ["codex", "claude"] {
+        let fixture = Fixture::new();
+        let profile = fixture.root.join("state/profiles.toml");
+        fs::write(
+            &profile,
+            "[profiles.local]\nagent = 'codex'\nargs = ['-c', 'projects={}']\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+        write_codex_source(&fixture, &fixture.root.join("codex/sessions"));
+        let source = format!("{provider}:{SOURCE_ID}");
+        let mut args = strings(&["fork", &source, "--in", "local"]);
+        let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
+        let declined = fixture.run(&args, &faithful);
+        assert!(!declined.status.success());
+        let diagnostic = if provider == "codex" {
+            "cannot verify the local Codex configuration for the handoff file".to_owned()
+        } else {
+            format!("omni handoff {source}")
+        };
+        assert!(declined.stderr.contains(&diagnostic), "{}", declined.stderr);
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/delete {THREAD_ID}"))
+        );
+        assert!(!fixture.generated_rollout().exists());
+        assert_eq!(fixture.launch_arguments(), None);
 
-    args.push("--materialize-only".to_owned());
-    let created = fixture.run(&args, &[faithful[0], ("CODEX_HOME", "../codex")]);
-    assert!(created.status.success(), "{}", created.stderr);
-    assert!(fixture.generated_rollout().is_file());
-    assert_eq!(fixture.launch_arguments(), None);
+        args.push("--materialize-only".to_owned());
+        let created = fixture.run(&args, &[faithful[0], ("CODEX_HOME", "../codex")]);
+        assert!(created.status.success(), "{}", created.stderr);
+        assert!(
+            fs::read_to_string(fixture.generated_rollout())
+                .unwrap()
+                .contains(SOURCE_QUESTION)
+        );
+        assert_eq!(fixture.launch_arguments(), None);
+    }
+}
+
+fn write_codex_source(fixture: &Fixture, directory: &Path) -> (PathBuf, String) {
+    fs::create_dir_all(directory).unwrap();
+    let path = directory.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
+    let history = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    );
+    fs::write(&path, &history).unwrap();
+    (path, history)
+}
+
+#[test]
+fn unverified_codex_fork_starts_a_handoff_only_after_rolling_back_the_copy() {
+    if !tools_available() {
+        return;
+    }
+    for rollback in ["success", "reject", "hang"] {
+        let fixture = Fixture::new();
+        let home = fixture.root.join("codex");
+        let alternate = fixture.root.join("other-state");
+        let sessions = home.join("sessions/2026/01/01");
+        fs::create_dir(&alternate).unwrap();
+        let (path, history) = write_codex_source(&fixture, &sessions);
+        let profile = fixture.root.join("state/profiles.toml");
+        fs::write(
+            &profile,
+            format!(
+                "[profiles.local]\nagent='codex'\n[profiles.local.env]\nCODEX_SQLITE_HOME={}\n",
+                json!(alternate)
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+        // The destination selects different rollouts for both the source and the imported copy.
+        for (directory, hour) in [(&home, "00"), (&alternate, "01")] {
+            let db = rusqlite::Connection::open(directory.join("state_5.sqlite")).unwrap();
+            db.execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+            )
+            .unwrap();
+            for id in [SOURCE_ID, THREAD_ID] {
+                let rollout = sessions.join(format!("rollout-2026-01-01T{hour}-00-00-{id}.jsonl"));
+                if directory == &alternate {
+                    fs::write(
+                        &rollout,
+                        json!({"type":"session_meta","payload":{"id":id,"cwd":fixture.workspace}})
+                            .to_string(),
+                    )
+                    .unwrap();
+                }
+                db.execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+                    (id, rollout.to_str().unwrap()),
+                )
+                .unwrap();
+            }
+        }
+        let mut environment = broken("FAKE_CODEX_DELETE", rollback);
+        environment.extend([
+            ("FAKE_CODEX_VERSION", "0.167.1"),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_LOG_LAUNCH", "1"),
+        ]);
+        let source = format!("codex:{SOURCE_ID}");
+        let run = fixture.run(&strings(&["fork", &source, "--in", "local"]), &environment);
+        let calls = fixture.rpc_log();
+        let deletion = format!("thread/delete {THREAD_ID}");
+        assert_eq!(fs::read_to_string(path).unwrap(), history);
+        if rollback == "success" {
+            assert!(run.status.success(), "{}", run.stderr);
+            assert!(
+                calls.ends_with(&[deletion, "launch".to_owned()]),
+                "{calls:?}"
+            );
+            assert!(!fixture.generated_rollout().exists());
+            let handoff = fs::read_to_string(fixture.capture.join("handoff.md")).unwrap();
+            assert!(handoff.contains(SOURCE_QUESTION));
+        } else {
+            assert!(!run.status.success());
+            assert!(
+                run.stderr.contains("rollback also failed"),
+                "{}",
+                run.stderr
+            );
+            assert_eq!(calls.last(), Some(&deletion));
+            assert!(fixture.generated_rollout().exists());
+            assert_eq!(fixture.launch_arguments(), None);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1306,14 +1407,7 @@ fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
     }
     let fixture = Fixture::new();
     let archive = fixture.root.join("codex/archived_sessions");
-    fs::create_dir_all(&archive).unwrap();
-    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
-    let history = format!(
-        "{}\n{}\n",
-        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
-        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
-    );
-    fs::write(&source, &history).unwrap();
+    let (source, history) = write_codex_source(&fixture, &archive);
     let reference = format!("codex:{SOURCE_ID}");
 
     for option in ["--dry-run", "--materialize-only"] {

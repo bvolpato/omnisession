@@ -1170,7 +1170,6 @@ dependencies = [
  "rustix",
  "same-file",
  "serde",
-
  "serde_json",
  "serde_json_lenient",
  "sha2",

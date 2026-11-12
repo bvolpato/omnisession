@@ -1075,7 +1075,7 @@ fn grok_preview_update(
     let read = read_picker_preview(registry, &key, source_path.as_deref(), guard, || {})
         .and_then(|read| {
             if let Some((store, observed)) = &writer {
-                search_index::check_grok_preview(store, &read, observed.failure)?;
+                search_index::check_grok_preview(store, &read, observed.failure.as_ref())?;
             }
             Ok(read)
         })
@@ -1371,9 +1371,7 @@ fn record_preview(
     let mut selection = None;
     if let Some(name) = known_name {
         let name = name.as_deref().map(omnis_core::redact_secrets);
-        if let Some((row, observation)) = prior
-            && (row.title.is_some() || name.is_some() || name != previous_name)
-        {
+        if let Some((row, observation)) = prior {
             anyhow::ensure!(
                 row.title == name
                     || row.title == previous_name
@@ -1390,9 +1388,7 @@ fn record_preview(
         });
     } else if session.provider == Provider::Codex {
         if let Some((row, observation)) = prior {
-            if row.title.is_some() {
-                selection = Some((row.clone(), observation, None));
-            }
+            selection = Some((row.clone(), observation, None));
             read.snapshot.title.clone_from(&row.title);
         } else if observed.is_none() {
             read.snapshot.title.clone_from(&previous_name);
@@ -1409,21 +1405,14 @@ fn record_preview(
             name_observation.as_ref(),
             Some(observation),
         );
-        if (!name_observed && selected.title.is_some())
-            || observation.legacy_codex_name_candidate(&selected)
-        {
-            selection = Some((selected, observation, history));
-        }
+        selection = Some((selected, observation, history));
     }
     if let Some(writer) = writer {
         let target = match selection.as_ref() {
             Some((selected, observation, history)) => {
                 crate::SearchDocumentTarget::Selected(selected, observation, history.as_deref())
             }
-            None => native.map_or(
-                crate::SearchDocumentTarget::Session(session),
-                crate::SearchDocumentTarget::VisibleNative,
-            ),
+            None => crate::SearchDocumentTarget::Session(session),
         };
         metadata.indexed_title =
             writer.publish(registry, target, read, name_observation.as_ref())?;
@@ -1439,7 +1428,7 @@ fn record_preview(
     Ok(metadata)
 }
 
-fn preview_update(
+pub(super) fn preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
     request: PreviewRequest,
@@ -2314,11 +2303,12 @@ mod tests {
         read.native_session = None;
         read.source_revision = SourceRevision::default();
         let store = Store::open(temporary.path().join("index.sqlite3"))?;
-        store.upsert_session_trajectory(
+        store.upsert_trajectory_document(
             &source,
-            "local response",
-            read.snapshot.captured_at - chrono::Duration::days(1),
-            true,
+            &crate::session_picker::tests::codex_search_document(
+                "local response",
+                read.snapshot.captured_at - chrono::Duration::days(1),
+            ),
         )?;
         let original = store.trajectory_index_state(&source)?;
         let imported = crate::imported_session_ref(uuid::Uuid::new_v4());
@@ -2395,6 +2385,7 @@ mod grok_preview_tests {
         let store = Store::open(root.path().join("store.sqlite3"))?;
         let session = SessionRef::new(Provider::Grok, "selected");
         let failure = omnis_store::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
             source_file: Some(uuid::Uuid::from_u128(1)),
             source_contents: Some(uuid::Uuid::from_u128(2)),
             source_updated_at: None,
@@ -2445,6 +2436,7 @@ mod grok_preview_tests {
             continuation_after: None,
         };
         let guard = TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
+            ancestor_stamp: None,
             source_complete: true,
             source_byte_count: 0,
             source_revision: prior.source_revision,

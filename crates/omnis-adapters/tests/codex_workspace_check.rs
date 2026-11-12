@@ -37,6 +37,10 @@ fn selected_workspace_retains_only_known_directories_across_encodings() -> Resul
         let path = temp.path().join(format!("rollout-{ID}.{extension}"));
         let mut cases = vec![(harmless.to_owned(), Some(next.as_path()))];
         for torn in [
+            r#"{"type":"turn_context","payload":{}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":7}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":""}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"bad\u0000path"}}"#,
             r#"{"type":"turn_context","payload":"#,
             r#"{"type":"turn_co"#,
             r#"{"type":"t"#,
@@ -373,7 +377,8 @@ fn a_missing_prefix_requires_a_surviving_local_directory_for_native_routing() ->
         let read = adapter.index_session(&session, Some(&path), u64::MAX)?;
         assert_eq!(
             read.workspace_projection,
-            CodexWorkspaceProjection::Observed(effective_dir)
+            CodexWorkspaceProjection::Observed(effective_dir),
+            "{tail}"
         );
         if effective.is_none() {
             assert_eq!(read.snapshot.workspace.current_dir, creation);
@@ -389,6 +394,58 @@ fn a_missing_prefix_requires_a_surviving_local_directory_for_native_routing() ->
             read.workspace_projection,
             CodexWorkspaceProjection::Observed(directory)
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn routing_and_project_search_use_only_visible_subagent_directories() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let sessions = root.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&sessions)?;
+    let path = sessions.join(format!("rollout-2026-01-02T00-00-00-{ID}.jsonl"));
+    let session = SessionRef::new(Provider::Codex, ID);
+    let creation = root.path().join("creation");
+    let copied = root.path().join("copied");
+    let local = root.path().join("local");
+    for directory in [&creation, &copied, &local] {
+        fs::create_dir(directory)?;
+    }
+    let settings = json!({"timestamp":"2026-01-01T00:00:00Z","ordinal":1,"type":"event_msg","payload":{
+        "type":"thread_settings_applied","thread_id":ID,"thread_settings":{
+            "cwd":copied,"model":"fixture","model_provider_id":"synthetic","approval_policy":"never",
+            "approvals_reviewer":"user","permission_profile":{"type":"disabled"},
+            "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}
+        }
+    }});
+    let turn = |ordinal: u64, cwd: &Path| json!({"timestamp":"2026-01-01T00:00:00Z","ordinal":ordinal,"type":"turn_context","payload":{"cwd":cwd}});
+    let moved = turn(4, &local);
+    let user = json!({"timestamp":"2026-01-01T00:00:00Z","ordinal":5,"type":"event_msg","payload":{"type":"user_message","message":"local request"}});
+    let rollback = json!({"timestamp":"2026-01-01T00:00:00Z","ordinal":6,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+    for mode in ["history_mode", "history_mxde"] {
+        let header = json!({"timestamp":"2026-01-01T00:00:00Z","ordinal":0,"type":"session_meta","payload":{
+            "id":ID,"cwd":creation,(mode):"paginated","subagent_history_start_ordinal":4
+        }});
+        for (tail, expected) in [
+            (String::new(), &creation),
+            (moved.to_string(), &local),
+            (format!("{moved}\n{user}\n{rollback}"), &creation),
+        ] {
+            let revision = write_rollout(
+                &path,
+                &format!("{header}\n{settings}\n{}\n{tail}\n", turn(2, &copied)),
+            )?;
+            let (effective, startup) = CodexAdapter::rollout_workspaces(&session, &path, revision)?;
+            assert_eq!(effective.as_ref(), Some(expected), "{mode} {tail}");
+            assert!(startup.is_none());
+            let adapter = CodexAdapter::with_root(root.path());
+            assert!(adapter.project_search_candidates(&copied)?.0.is_empty());
+            let (found, _) = adapter.project_search_candidates(&local)?;
+            assert_eq!(
+                found.iter().any(|row| row.session == session),
+                expected == &local
+            );
+        }
     }
     Ok(())
 }

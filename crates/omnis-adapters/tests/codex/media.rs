@@ -96,7 +96,16 @@ fn multipart_model_text_matches_concatenated_display_text_across_media() {
     for source in [plain_model, model] {
         for other in [&display, &legacy] {
             for (first, second) in [(&source, other), (other, &source)] {
-                let mut records = vec![message("user", "keep this"), first.clone(), second.clone()];
+                let mut records = if other == &legacy {
+                    vec![
+                        event("task_started", json!({"turn_id":"earlier"})),
+                        event("user_message", json!({"message":"keep this"})),
+                        event("task_complete", json!({"turn_id":"earlier"})),
+                    ]
+                } else {
+                    vec![message("user", "keep this")]
+                };
+                records.extend([first.clone(), second.clone()]);
                 let snapshot = read_records(records.clone()).unwrap();
                 assert_eq!(visible_text(&snapshot), ["keep this", "inspect both"]);
                 records.push(event("thread_rolled_back", json!({"num_turns":1})));
