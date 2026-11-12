@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -600,15 +601,53 @@ struct CumulativeText {
     offset: usize,
     marker_index: usize,
     text: String,
-    markers: Vec<(usize, Value)>,
+    markers: Vec<(usize, Rc<Value>)>,
+}
+
+impl CumulativeText {
+    fn carry_missing_markers(mut self, next: &mut Self) {
+        if self.markers.is_empty() {
+            return;
+        }
+        let mut repeated = HashMap::new();
+        for (_, block) in &next.markers {
+            *repeated.entry(Rc::as_ptr(block)).or_insert(0_usize) += 1;
+        }
+        self.markers.retain(|(_, block)| {
+            let count = repeated.entry(Rc::as_ptr(block)).or_default();
+            if *count == 0 {
+                true
+            } else {
+                *count -= 1;
+                false
+            }
+        });
+        self.offset = 0;
+        self.marker_index = next.markers.len();
+        self.place_markers(&next.text, &mut next.markers);
+    }
+
+    fn place_markers(self, text: &str, markers: &mut Vec<(usize, Rc<Value>)>) {
+        if self.markers.is_empty() {
+            return;
+        }
+        let start = text.find(&self.text);
+        markers.splice(
+            self.marker_index..self.marker_index,
+            self.markers
+                .into_iter()
+                .map(|(offset, block)| (start.map_or(self.offset, |start| start + offset), block)),
+        );
+    }
 }
 
 struct PendingMessage {
     kind: EventKind,
     text: String,
-    content: Vec<Value>,
-    alternate_content: Vec<(usize, Vec<Value>)>,
-    alternate_markers: Vec<(usize, Value)>,
+    content: Vec<Rc<Value>>,
+    alternate_content: Vec<(usize, Vec<Rc<Value>>)>,
+    alternate_markers: Vec<(usize, Rc<Value>)>,
+    retained_blocks: HashMap<Rc<Value>, BlockOccurrences>,
     content_unreadable: bool,
     content_limited: bool,
     cumulative_text: Option<CumulativeText>,
@@ -784,6 +823,7 @@ struct NativeMessageGroup {
     native_id: Option<String>,
     attachments: HashMap<[u8; 32], (usize, usize)>,
     canonical_text: Sha256,
+    copied_text: HashSet<[u8; 32]>,
     required_text: HashSet<[u8; 32]>,
     has_chunk: bool,
     has_fallback: bool,
@@ -854,6 +894,14 @@ impl NativeMessageGroup {
             let canonical = &update["content"];
             if let Some(text) = block_text(canonical).filter(|text| !text.is_empty()) {
                 self.canonical_text.update(text.as_bytes());
+                let prefix = self.canonical_text.clone().finalize().into();
+                let chunk = Sha256::digest(text.as_bytes()).into();
+                for digest in [prefix, chunk] {
+                    self.required_text.remove(&digest);
+                    if self.copied_text.len() < MAX_GROK_PRESERVED_RECORDS {
+                        self.copied_text.insert(digest);
+                    }
+                }
             }
             if attachment_block(canonical) {
                 self.attachments
@@ -893,7 +941,10 @@ impl NativeMessageGroup {
                         }
                     }
                     if has_text {
-                        self.required_text.insert(alternate.finalize().into());
+                        let digest = alternate.finalize().into();
+                        if !self.copied_text.contains(&digest) {
+                            self.required_text.insert(digest);
+                        }
                     } else if occurrences.is_empty() {
                         return false;
                     }
@@ -1117,7 +1168,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v13");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v14");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1224,6 +1275,12 @@ struct GrokUpdateProcessor {
     unsupported_text_records: usize,
     possible_message_records: usize,
     malformed_updates: usize,
+}
+
+#[derive(Default)]
+struct BlockOccurrences {
+    canonical: usize,
+    retained: usize,
 }
 
 struct GrokPreservationBudget {
@@ -1369,10 +1426,20 @@ impl GrokUpdateProcessor {
             return;
         }
         let message_id = grok_message_id(update).map(str::to_owned);
+        let mut retained_blocks = self
+            .pending
+            .as_mut()
+            .filter(|pending| pending.kind == kind && pending.message_id == message_id)
+            .map(|pending| std::mem::take(&mut pending.retained_blocks))
+            .unwrap_or_default();
         let omitted_before = self.preservation.omitted_events;
         let mut alternate_markers = Vec::new();
-        let (mut text, content, content_unreadable, mut has_source_text) =
-            message_content(update, &mut self.preservation, &mut alternate_markers);
+        let (mut text, content, content_unreadable, mut has_source_text) = read_message_content(
+            update,
+            &mut self.preservation,
+            &mut alternate_markers,
+            &mut retained_blocks,
+        );
         let cumulative_text = if has_source_text && cumulative_fallback(update).is_some() {
             has_source_text = false;
             Some(CumulativeText {
@@ -1395,6 +1462,13 @@ impl GrokUpdateProcessor {
                     pending.text.push_str("\n[Source records omitted]\n");
                 }
                 if let Some(mut fallback) = cumulative_text {
+                    if let Some(previous) = pending.cumulative_text.take() {
+                        if !pending.has_source_text && previous.offset == pending.text.len() {
+                            previous.carry_missing_markers(&mut fallback);
+                        } else {
+                            previous.place_markers(&pending.text, &mut pending.alternate_markers);
+                        }
+                    }
                     fallback.offset = pending.text.len();
                     fallback.marker_index = pending.alternate_markers.len();
                     pending.cumulative_text = Some(fallback);
@@ -1408,6 +1482,7 @@ impl GrokUpdateProcessor {
                 );
                 pending.text.push_str(&text);
                 pending.content.extend(content);
+                pending.retained_blocks = retained_blocks;
                 pending.alternate_content.extend(
                     alternate
                         .drain(..)
@@ -1422,6 +1497,7 @@ impl GrokUpdateProcessor {
                     kind,
                     text,
                     alternate_markers,
+                    retained_blocks,
                     alternate_content: alternate
                         .into_iter()
                         .map(|view| (content.len(), view))
@@ -1608,18 +1684,152 @@ fn cumulative_fallback(update: &Value) -> Option<&Value> {
     })
 }
 
+fn readable_body_bytes(body: &Value) -> impl Iterator<Item = u8> + '_ {
+    message_blocks(body)
+        .iter()
+        .filter_map(block_text)
+        .flat_map(str::bytes)
+}
+
+fn uncertain_alternate_block(block: &Value) -> bool {
+    if !matches!(classify_message_block(block), MessageBlock::Malformed(_)) {
+        return false;
+    }
+    partial_attachment_block(block)
+        || block
+            .get("text")
+            .is_some_and(|value| !value.is_null() && value != "")
+        || block.as_object().is_some_and(|object| {
+            !object.is_empty() && !object.contains_key("type") && !object.contains_key("text")
+        })
+}
+
+struct UpdateBlockRetention<'a, 'b> {
+    budget: &'b mut GrokPreservationBudget,
+    retained: &'b mut HashMap<Rc<Value>, BlockOccurrences>,
+    primary: HashMap<&'a Value, usize>,
+    occurrences: HashMap<&'a Value, usize>,
+}
+
+impl<'a> UpdateBlockRetention<'a, '_> {
+    fn retain(&mut self, block: &'a Value) -> Option<Rc<Value>> {
+        let occurrence = self.occurrences.entry(block).or_default();
+        *occurrence += 1;
+        let canonical = *occurrence <= self.primary.get(block).copied().unwrap_or(0);
+        if let Some((value, counts)) = self.retained.get_key_value(block) {
+            let value = Rc::clone(value);
+            let required = if canonical {
+                counts.canonical + 1
+            } else {
+                *occurrence
+            };
+            if required > counts.retained && !self.budget.retain(block) {
+                return None;
+            }
+            let counts = self.retained.get_mut(block).expect("retained block");
+            counts.canonical += usize::from(canonical);
+            counts.retained = counts.retained.max(required);
+            return Some(value);
+        }
+        if !self.budget.retain(block) {
+            return None;
+        }
+        let value = Rc::new(block.clone());
+        self.retained.insert(
+            Rc::clone(&value),
+            BlockOccurrences {
+                canonical: usize::from(canonical),
+                retained: 1,
+            },
+        );
+        Some(value)
+    }
+}
+
+#[cfg(test)]
 fn message_content(
     update: &Value,
     preservation: &mut GrokPreservationBudget,
-    alternate_markers: &mut Vec<(usize, Value)>,
+    markers: &mut Vec<(usize, Rc<Value>)>,
 ) -> (String, Vec<Value>, bool, bool) {
+    let (text, blocks, partial, has_text) =
+        read_message_content(update, preservation, markers, &mut HashMap::new());
+    (
+        text,
+        blocks.into_iter().map(Rc::unwrap_or_clone).collect(),
+        partial,
+        has_text,
+    )
+}
+
+fn historical_block(block: &Value) -> bool {
+    !block.is_null() && !matches!(classify_message_block(block), MessageBlock::Text(_))
+}
+
+fn retain_alternate_blocks<'a>(
+    update: &'a Value,
+    content: &'a Value,
+    retention: &mut UpdateBlockRetention<'a, '_>,
+    historical_content: &mut Vec<Rc<Value>>,
+) -> bool {
+    let mut content_unreadable = false;
+    let mut seen = HashMap::new();
+    for block in message_blocks(content)
+        .iter()
+        .filter(|block| historical_block(block))
+    {
+        *seen.entry(block).or_insert(0usize) += 1;
+    }
+    for alternate in message_bodies(update).filter(|value| !std::ptr::eq(*value, content)) {
+        let blocks = message_blocks(alternate);
+        let conflicting_text = blocks.iter().any(malformed_message_block)
+            && blocks
+                .iter()
+                .any(|block| block_text(block).is_some_and(|text| !text.is_empty()))
+            && readable_body_bytes(alternate).ne(readable_body_bytes(content));
+        content_unreadable |= conflicting_text;
+        let mut occurrences = HashMap::new();
+        for block in blocks.iter().filter(|block| {
+            historical_block(block)
+                || (conflicting_text && block_text(block).is_some_and(|text| !text.is_empty()))
+        }) {
+            let count = occurrences.entry(block).or_insert(0usize);
+            *count += 1;
+            let retained = seen.entry(block).or_default();
+            if *count > *retained {
+                *retained = *count;
+                content_unreadable |= uncertain_alternate_block(block);
+                if let Some(retained) = retention.retain(block) {
+                    historical_content.push(retained);
+                }
+            }
+        }
+    }
+    content_unreadable
+}
+
+fn read_message_content(
+    update: &Value,
+    preservation: &mut GrokPreservationBudget,
+    alternate_markers: &mut Vec<(usize, Rc<Value>)>,
+    retained: &mut HashMap<Rc<Value>, BlockOccurrences>,
+) -> (String, Vec<Rc<Value>>, bool, bool) {
+    let mut primary = HashMap::new();
+    if let Some(body) = message_bodies(update).next() {
+        for block in message_blocks(body) {
+            *primary.entry(block).or_default() += 1;
+        }
+    }
+    let mut retention = UpdateBlockRetention {
+        budget: preservation,
+        retained,
+        primary,
+        occurrences: HashMap::new(),
+    };
     let mut has_source_text = false;
     let mut text = String::new();
     let mut historical_content = Vec::new();
     let mut content_unreadable = false;
-    let historical_block = |block: &Value| {
-        !block.is_null() && !matches!(classify_message_block(block), MessageBlock::Text(_))
-    };
     let body = message_body(update)
         .or_else(|| {
             message_bodies(update).find(|value| message_blocks(value).iter().any(historical_block))
@@ -1650,59 +1860,31 @@ fn message_content(
                     text.push_str("\n[Source message content unreadable]\n");
                 }
                 MessageBlock::Attachment => {
-                    if !preservation.retain(block) {
+                    let Some(retained) = retention.retain(block) else {
                         const OMITTED: &str = "\n[Source attachment omitted by collection limit]\n";
                         if !text.ends_with(OMITTED) {
                             text.push_str(OMITTED);
                         }
                         continue;
-                    }
+                    };
                     if deferred {
-                        alternate_markers.push((text.len(), block.clone()));
+                        alternate_markers.push((text.len(), Rc::clone(&retained)));
                     } else {
                         if !text.is_empty() {
                             text.push('\n');
                         }
                         text.push_str(attachment_notice(block));
                     }
-                    historical_content.push(block.clone());
+                    historical_content.push(retained);
                     continue;
                 }
             }
-            if preservation.retain(block) {
-                historical_content.push(block.clone());
+            if let Some(retained) = retention.retain(block) {
+                historical_content.push(retained);
             }
         }
-        let mut seen = HashMap::new();
-        for block in message_blocks(content)
-            .iter()
-            .filter(|block| historical_block(block))
-        {
-            *seen.entry(block).or_insert(0usize) += 1;
-        }
-        for alternate in message_bodies(update).filter(|value| !std::ptr::eq(*value, content)) {
-            let mut occurrences = HashMap::new();
-            for block in message_blocks(alternate)
-                .iter()
-                .filter(|block| historical_block(block))
-            {
-                let count = occurrences.entry(block).or_insert(0usize);
-                *count += 1;
-                let retained = seen.entry(block).or_default();
-                if *count > *retained {
-                    *retained = *count;
-                    content_unreadable |= partial_attachment_block(block)
-                        || matches!(classify_message_block(block), MessageBlock::Malformed(Some(text)) if !text.is_empty())
-                        || (matches!(classify_message_block(block), MessageBlock::Malformed(_))
-                            && block
-                                .get("text")
-                                .is_some_and(|text| !text.is_string() && !text.is_null()));
-                    if preservation.retain(block) {
-                        historical_content.push(block.clone());
-                    }
-                }
-            }
-        }
+        content_unreadable |=
+            retain_alternate_blocks(update, content, &mut retention, &mut historical_content);
     } else {
         content_unreadable = true;
         text.push_str("\n[Source message content unreadable]\n");
@@ -1809,7 +1991,10 @@ fn push_grok_state(builder: &mut EventBuilder, directory: &Path) {
     }
 }
 
-fn split_message_evidence(update: &Value, content: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
+fn split_message_evidence(
+    update: &Value,
+    content: Vec<Rc<Value>>,
+) -> (Vec<Rc<Value>>, Vec<Vec<Rc<Value>>>) {
     if content.is_empty() {
         return (content, Vec::new());
     }
@@ -1822,21 +2007,19 @@ fn split_message_evidence(update: &Value, content: Vec<Value>) -> (Vec<Value>, V
     }
     let mut retained = HashMap::new();
     for block in &content {
-        *retained.entry(block).or_insert(0usize) += 1;
+        let (_, count) = retained.entry(block.as_ref()).or_insert((block, 0usize));
+        *count += 1;
     }
     let collect = |body: &Value| {
         let mut occurrences = HashMap::new();
         message_blocks(body)
             .iter()
-            .filter(|block| {
-                let Some(limit) = retained.get(*block) else {
-                    return false;
-                };
-                let count = occurrences.entry(*block).or_insert(0usize);
+            .filter_map(|block| {
+                let (value, limit) = retained.get(block)?;
+                let count = occurrences.entry(block).or_insert(0usize);
                 *count += 1;
-                *count <= *limit
+                (*count <= *limit).then(|| Rc::clone(value))
             })
-            .cloned()
             .collect::<Vec<_>>()
     };
     (
@@ -1848,11 +2031,14 @@ fn split_message_evidence(update: &Value, content: Vec<Value>) -> (Vec<Value>, V
     )
 }
 
-fn reconcile_message_evidence(chunks: Vec<Value>, views: &[(usize, Vec<Value>)]) -> Vec<Value> {
+fn reconcile_message_evidence<T: Eq + std::hash::Hash + Clone>(
+    chunks: Vec<T>,
+    views: &[(usize, Vec<T>)],
+) -> Vec<T> {
     if views.is_empty() {
         return chunks;
     }
-    let mut positions = HashMap::<&Value, Vec<usize>>::new();
+    let mut positions = HashMap::<&T, Vec<usize>>::new();
     for (index, block) in chunks.iter().enumerate() {
         positions.entry(block).or_default().push(index);
     }
@@ -1909,20 +2095,22 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let mut text = pending.text;
     let mut additions = Vec::new();
     let mut markers = pending.alternate_markers;
-    if !pending.has_source_text
-        && let Some(fallback) = pending.cumulative_text
-    {
-        text.insert_str(fallback.offset, &fallback.text);
-        for (offset, _) in &mut markers[fallback.marker_index..] {
-            *offset += fallback.text.len();
+    if let Some(fallback) = pending.cumulative_text {
+        if pending.has_source_text {
+            fallback.place_markers(&text, &mut markers);
+        } else {
+            text.insert_str(fallback.offset, &fallback.text);
+            for (offset, _) in &mut markers[fallback.marker_index..] {
+                *offset += fallback.text.len();
+            }
+            markers.splice(
+                fallback.marker_index..fallback.marker_index,
+                fallback
+                    .markers
+                    .into_iter()
+                    .map(|(offset, block)| (offset + fallback.offset, block)),
+            );
         }
-        markers.splice(
-            fallback.marker_index..fallback.marker_index,
-            fallback
-                .markers
-                .into_iter()
-                .map(|(offset, block)| (offset + fallback.offset, block)),
-        );
     }
     let mut canonical = HashMap::new();
     if !markers.is_empty() {
@@ -1977,7 +2165,7 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
         .filter(|block| attachment_block(block))
         .count();
     if !content.is_empty() {
-        payload["content"] = Value::Array(content);
+        payload["content"] = Value::Array(content.into_iter().map(Rc::unwrap_or_clone).collect());
     }
     let replay_policy = if pending.kind == EventKind::ReasoningSummary {
         ReplayPolicy::HistoricalOnly
@@ -2257,11 +2445,11 @@ impl ProviderAdapter for GrokAdapter {
             )
         })?;
         Ok(IndexRead {
+            database_aliases: Arc::default(),
+            verified_prefix_end: None,
+            search_record_groups: Vec::new(),
             provider_limited,
             ownership_revision,
-            verified_prefix_end: None,
-            database_aliases: std::sync::Arc::default(),
-            search_record_groups: Vec::new(),
             snapshot,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,
@@ -2616,6 +2804,8 @@ mod tests {
         cumulative["message"] = json!({"content":[resource]});
         let mut caption = cumulative.clone();
         caption["message"]["content"] = json!([resource, {"type":"text","text":"caption"}]);
+        let mut trailing = caption.clone();
+        trailing["message"]["content"] = json!([{"type":"text","text":"caption"}, resource]);
         let notice = attachment_notice(&resource);
         for (updates, expected) in [
             (
@@ -2631,6 +2821,28 @@ mod tests {
                 vec![chunk(resource.clone()), caption.clone()],
                 format!("{notice}caption"),
             ),
+            (
+                vec![
+                    chunk(json!({"type":"text","text":"caption"})),
+                    caption.clone(),
+                ],
+                format!("{notice}caption"),
+            ),
+            (
+                vec![
+                    caption.clone(),
+                    chunk(json!({"type":"text","text":"caption"})),
+                ],
+                format!("{notice}caption"),
+            ),
+            (
+                vec![
+                    chunk(json!({"type":"text","text":"caption"})),
+                    trailing.clone(),
+                ],
+                format!("caption{notice}"),
+            ),
+            (vec![trailing.clone(), trailing], format!("caption{notice}")),
             (vec![caption], format!("{notice}caption")),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -2659,6 +2871,32 @@ mod tests {
                 view
             );
         }
+    }
+
+    #[test]
+    fn damaged_alternate_keeps_conflicting_raw_text() {
+        let raw = json!({"type":"text","text":"other","annotations":{"priority":0.5}});
+        let damaged = json!({"type":"text"});
+        let update =
+            json!({"content":{"type":"text","text":"answer"},"message":{"content":[raw,damaged]}});
+        let (visible, retained, partial, _) = message_content(
+            &update,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
+        assert_eq!(visible, "answer");
+        assert_eq!(retained, [raw, damaged]);
+        assert!(partial);
+        let unknown = json!({"parts":["other"]});
+        let update = json!({"content":"answer","message":{"text":unknown}});
+        let (visible, retained, partial, _) = message_content(
+            &update,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
+        assert_eq!(visible, "answer");
+        assert_eq!(retained, [unknown]);
+        assert!(partial);
     }
 
     #[test]
@@ -2769,6 +3007,26 @@ mod tests {
                 omnis_core::import_conversation(&snapshot).truncated,
                 partial
             );
+        }
+    }
+
+    #[test]
+    fn delayed_cumulative_text_matches_copied_chunks_and_prefixes() {
+        let chunk = |text| json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":text}});
+        for (view, direct) in [
+            ("copper", true),
+            ("finch", true),
+            ("copperfinch", true),
+            ("copp", false),
+            ("unmatched", false),
+        ] {
+            let mut group = NativeMessageGroup::default();
+            let mut alias = chunk("");
+            alias["message"] = json!({"content":[view, {"type":"text"}]});
+            for update in [chunk("copper"), chunk("finch"), chunk("end"), alias] {
+                assert!(group.observe(&update));
+            }
+            assert_eq!(!group.needs_fallback(), direct);
         }
     }
 
@@ -3816,6 +4074,44 @@ mod tests {
                 .expect("state preview")
                 .events
         );
+    }
+
+    #[test]
+    fn cumulative_views_charge_the_maximum_retained_occurrences() {
+        let mut builder = EventBuilder::new(Provider::Grok, SESSION_ID);
+        let mut processor = GrokUpdateProcessor::default();
+        processor.preservation.records_left = 3;
+        let block = json!({"type":"image","mimeType":"image/png","data":"YQ=="});
+        let primary = |id: &str| json!({"sessionUpdate":"agent_message_chunk","messageId":id,"content":block});
+        let view = json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":""},"message":{"content":[block,block]}});
+        for record in [
+            primary("a"),
+            view.clone(),
+            view,
+            primary("a"),
+            primary("b"),
+            primary("c"),
+        ] {
+            processor.push_record(&mut builder, record, false);
+        }
+        processor.finish(&mut builder);
+        let snapshot = builder.snapshot(
+            SessionRef::new(Provider::Grok, SESSION_ID),
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        let messages: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::MessageAssistant)
+            .map(|event| &event.payload)
+            .collect();
+        assert_eq!(messages[0]["content"], json!([block, block]));
+        assert_eq!(messages[1]["content"], json!([block]));
+        assert_eq!(messages[2]["content_limited"], true);
+        assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
     }
 
     #[test]
