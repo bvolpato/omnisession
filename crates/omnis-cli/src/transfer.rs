@@ -315,7 +315,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
     resume(
         registry,
         &ResumeArgs {
-            source: Some(source.to_string()),
+            source: Some(args.source.clone()),
             target: Some(target),
             source_provider: None,
             all_projects: false,

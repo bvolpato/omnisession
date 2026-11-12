@@ -528,21 +528,15 @@ fn cached_search_sessions(
         .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
     {
         let copies = if args.all_projects {
-            let mut copies = Vec::new();
-            let projects: HashSet<_> = store
-                .duplicate_pi_projects()?
-                .into_values()
-                .flatten()
-                .collect();
-            for copy_project in projects {
-                copies.extend(store.cached_pi_copies(&copy_project)?);
-            }
-            copies
+            store.cached_all_pi_copies()?
         } else {
             store.cached_pi_copies(&pi_workspace_key(project))?
         };
-        let keys = copies.iter().map(|s| &s.session).collect::<HashSet<_>>();
-        indexed.retain(|s| !keys.contains(&s.session));
+        let keys = copies
+            .iter()
+            .map(|s| (&s.session, &s.project_path))
+            .collect::<HashSet<_>>();
+        indexed.retain(|s| !keys.contains(&(&s.session, &s.project_path)));
         indexed.extend(
             copies
                 .into_iter()
@@ -618,12 +612,13 @@ fn select_pi_search_copies(
             sessions.extend(copies);
         }
     }
-    let duplicates = store.duplicate_pi_projects()?;
     for session in sessions {
-        if duplicates.contains_key(&session.session)
+        if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
             && let Some(path) = &session.project_path
         {
-            let workspace = pi_workspace_key(path);
+            let Some(workspace) = store.pi_copy_key(&session.session, path)? else {
+                continue;
+            };
             let id = pi_copy_selector(&session.session.id, &workspace);
             store.alias_pi_document(&session.session, &workspace, &id)?;
             session.session.id = id;
@@ -1972,12 +1967,24 @@ fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Resul
     if let Some(id) = &qualified {
         session.id.clone_from(id);
     }
-    let projects = Store::open_default()?.duplicate_pi_projects()?;
-    if let Some(projects) = projects.get(&session) {
+    let catalog = Store::open_default().and_then(|store| Ok((store.pi_projects(&session)?, store)));
+    let (projects, store) = match catalog {
+        Ok(value) => value,
+        Err(_) if qualified.is_none() => return Ok(session),
+        Err(error) => return Err(error.into()),
+    };
+    if !projects.is_empty() {
+        if qualified.is_none() && projects.len() == 1 && !projects[0].as_os_str().is_empty() {
+            return Ok(session);
+        }
         let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;
-        registry
-            .adapter(session.provider)?
-            .bind_workspace_copy(&session, workspace)?;
+        registry.adapter(session.provider)?.bind_workspace_copy(
+            &session,
+            store
+                .pi_recorded_directory(&session, workspace)?
+                .as_deref()
+                .unwrap_or(workspace),
+        )?;
     } else if qualified.is_some() {
         bail!("the selected Pi workspace copy is unavailable");
     }
@@ -2532,6 +2539,8 @@ fn validate_session_workspace(
     session: &SessionRef,
     project: &Path,
 ) -> Result<()> {
+    let selected = resolve_pi_copy(registry, session.clone())?;
+    let session = &selected;
     let snapshot = registry
         .read_session_indexed(session)
         .with_context(|| format!("validating `{session}`"))?;

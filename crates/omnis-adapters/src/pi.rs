@@ -1157,6 +1157,16 @@ impl ProviderAdapter for PiAdapter {
         Ok(sessions)
     }
 
+    fn native_workspace(&self, session: &SessionRef) -> Result<Option<crate::NativeWorkspace>> {
+        let path = self.find_session(&session.id)?;
+        let header = read_header(&path, self.provider)?;
+        Ok(Some(crate::NativeWorkspace {
+            directory: Some(header.cwd.clone()),
+            startup_directory: Some(header.cwd),
+            git: omnis_ir::GitState::default(),
+        }))
+    }
+
     fn bind_workspace_copy(&self, session: &SessionRef, workspace: &Path) -> Result<()> {
         self.bound_workspace
             .lock()
