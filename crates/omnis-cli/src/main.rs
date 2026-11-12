@@ -537,9 +537,11 @@ fn cached_search_sessions(
         let copies = store.cached_all_pi_copies()?;
         let keys = copies
             .iter()
-            .map(|s| (&s.session, &s.project_path))
+            .map(|s| (&s.session, s.project_path.as_deref().map(Path::as_os_str)))
             .collect::<HashSet<_>>();
-        indexed.retain(|s| !keys.contains(&(&s.session, &s.project_path)));
+        indexed.retain(|s| {
+            !keys.contains(&(&s.session, s.project_path.as_deref().map(Path::as_os_str)))
+        });
         indexed.extend(
             copies
                 .into_iter()
@@ -2032,7 +2034,13 @@ fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Resul
         Err(error) => return Err(error.into()),
     };
     if !projects.is_empty() {
-        if qualified.is_none() && projects.len() == 1 {
+        if qualified.is_none()
+            && projects
+                .iter()
+                .filter(|key| !key.as_os_str().is_empty())
+                .count()
+                <= 1
+        {
             return Ok(session);
         }
         let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;
@@ -3441,16 +3449,7 @@ fn delete_native_session(
             let binary = resolved_provider_binary(Provider::Antigravity)?;
             Some(antigravity_import::delete_session(session, &binary)?)
         }
-        Provider::Pi => {
-            pi_import::delete_session(
-                session,
-                native
-                    .source_path
-                    .as_deref()
-                    .context("Pi session discovery omitted source path")?,
-            )?;
-            None
-        }
+        Provider::Pi => bail!("Pi deletion requires a confirmed physical transcript"),
         Provider::CursorCli => {
             cursor_import::delete_session(
                 session,

@@ -619,7 +619,29 @@ impl PickerState {
             return;
         }
         let key = self.preview_key(&entry.session);
+        let pi_file = if entry.session.session.provider == Provider::Pi {
+            let confirmed = entry
+                .session
+                .source_path
+                .as_deref()
+                .zip(entry.session.project_path.as_deref())
+                .context("the Pi file is unavailable; refresh and select it again")
+                .and_then(|(path, cwd)| {
+                    crate::pi_import::ConfirmedPiFile::capture(&entry.session.session, path, cwd)
+                });
+            match confirmed {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    self.notice = Some(safe_terminal_line(&error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let dialog = DeleteDialog {
+            pi_file,
+            row_key: entry.key.clone(),
             session: entry.session.session.clone(),
             title: display_title(&entry.session, self.previews.get(&key)),
             workspace: entry.session.project_path.clone(),
@@ -630,12 +652,11 @@ impl PickerState {
         self.notice = None;
     }
 
-    fn remove_session(&mut self, session: &SessionRef) {
-        let key = session.to_string();
-        self.deleted_sessions.insert(key.clone());
+    fn remove_session(&mut self, session: &SessionRef, key: &str) {
+        self.deleted_sessions.insert(key.to_owned());
         self.entries.retain(|entry| entry.key != key);
-        self.trajectory_matches.remove(&key);
-        self.trajectory_match_order.remove(&key);
+        self.trajectory_matches.remove(key);
+        self.trajectory_match_order.remove(key);
         self.trajectory_matches_generation = self.trajectory_matches_generation.wrapping_add(1);
         self.preview_window
             .retain(|preview| preview.session != *session);
@@ -752,7 +773,15 @@ impl PickerState {
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
-            self.remember_derived_titles(vec![(key.session.clone(), Some(title))]);
+            let session = if let Some(directory) = &key.copy_directory {
+                SessionRef::new(
+                    key.session.provider,
+                    crate::pi_copy_selector(&key.session.id, directory),
+                )
+            } else {
+                key.session.clone()
+            };
+            self.remember_derived_titles(vec![(session, Some(title))]);
         }
     }
 
@@ -1556,16 +1585,15 @@ pub(super) fn pick_session(
                 };
                 dialog.phase = DeletePhase::Deleting;
                 let session = dialog.session.clone();
-                let workspace = dialog
-                    .workspace
-                    .as_deref()
-                    .filter(|path| path.is_dir())
-                    .unwrap_or(current_project)
-                    .to_path_buf();
+                let pi_file = dialog.pi_file.clone();
+                let row_key = dialog.row_key.clone();
+                let workspace = dialog.workspace_or(current_project);
                 render_state.render(&state, target, &warnings, pending.len())?;
-                match crate::delete_native_session(registry, &session, Some(&workspace)) {
+                let deletion =
+                    delete_selected_source(registry, &session, &workspace, pi_file.as_ref());
+                match deletion {
                     Ok(()) => {
-                        state.remove_session(&session);
+                        state.remove_session(&session, &row_key);
                         state.delete_dialog = None;
                         state.notice = Some(format!("Deleted source session {session}"));
                     }
@@ -1597,6 +1625,21 @@ pub(super) fn pick_session(
                 dirty = true;
             }
         }
+    }
+}
+
+fn delete_selected_source(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    workspace: &Path,
+    file: Option<&crate::pi_import::ConfirmedPiFile>,
+) -> Result<()> {
+    if let Some(file) = file {
+        crate::pi_import::delete_confirmed(file)?;
+        Store::open_default()?.forget_pi_copy(&file.session, &file.directory)?;
+        Ok(())
+    } else {
+        crate::delete_native_session(registry, session, Some(workspace))
     }
 }
 
@@ -3921,7 +3964,7 @@ mod tests {
         state.selected = 1;
         state.selection_touched = true;
 
-        state.remove_session(&deleted);
+        state.remove_session(&deleted, &deleted.to_string());
 
         assert_eq!(
             state

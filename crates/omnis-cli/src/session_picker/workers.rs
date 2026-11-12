@@ -263,6 +263,35 @@ pub(super) fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(parsed)
 }
 
+fn alias_cached_pi_titles(store: &Store, entries: &[PickerEntry]) {
+    let rows = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.session.session.provider,
+                Provider::Pi | Provider::OhMyPi
+            )
+        })
+        .filter_map(|entry| {
+            Some((
+                entry.session.session.clone(),
+                entry.session.project_path.clone()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if let Ok(keys) = store.pi_copy_keys(&rows) {
+        let aliases = rows
+            .into_iter()
+            .zip(keys)
+            .filter_map(|((session, path), key)| {
+                let alias = crate::pi_copy_selector(&session.id, &path);
+                Some((session, key?, alias))
+            })
+            .collect::<Vec<_>>();
+        let _ = store.alias_pi_documents(&aliases);
+    }
+}
+
 pub(super) fn spawn_cache_updates(
     registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
@@ -288,6 +317,9 @@ pub(super) fn spawn_cache_updates(
             }
             Err(error) => Err(error.to_string()),
         };
+        if let Ok(entries) = &cached {
+            alias_cached_pi_titles(&store, entries);
+        }
         let cache_loaded = cached.is_ok();
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;
@@ -448,7 +480,10 @@ pub(super) fn spawn_provider_update(
                 if sender
                     .send(PickerUpdate::Discovered(DiscoveryUpdate {
                         provider,
-                        result: Ok((entries, complete)),
+                        result: Ok((
+                            entries,
+                            complete && !matches!(provider, Provider::Pi | Provider::OhMyPi),
+                        )),
                     }))
                     .is_ok()
                     && index_sender

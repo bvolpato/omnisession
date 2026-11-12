@@ -422,12 +422,49 @@ pub fn rollback(import: &PiImport) -> Result<()> {
 }
 
 /// Deletes one selected Pi session using Pi's native exact-file semantics.
-pub fn delete_session(session: &SessionRef, source_path: &Path) -> Result<()> {
-    ensure_no_active_pi_process()?;
-    delete_session_at(session, source_path, &sessions_root()?)
+#[derive(Clone)]
+pub(super) struct ConfirmedPiFile {
+    pub(super) session: SessionRef,
+    pub(super) directory: PathBuf,
+    path: PathBuf,
+    revision: omnis_adapters::TranscriptRevision,
 }
 
-fn delete_session_at(session: &SessionRef, source_path: &Path, root: &Path) -> Result<()> {
+impl ConfirmedPiFile {
+    pub(super) fn capture(session: &SessionRef, path: &Path, directory: &Path) -> Result<Self> {
+        let revision = omnis_adapters::TranscriptRevision::read(path)?;
+        let confirmed = Self {
+            session: session.clone(),
+            path: path.to_owned(),
+            directory: directory.to_owned(),
+            revision,
+        };
+        confirmed.verify()?;
+        Ok(confirmed)
+    }
+
+    fn verify(&self) -> Result<()> {
+        let (id, directory) =
+            pi_header_identity(&self.path)?.context("Pi transcript has no session header")?;
+        anyhow::ensure!(
+            self.session.provider == Provider::Pi
+                && self.session.id == id
+                && self.directory.as_os_str() == directory.as_os_str()
+                && self.revision == omnis_adapters::TranscriptRevision::read(&self.path)?,
+            "the selected Pi transcript changed; select it again"
+        );
+        Ok(())
+    }
+}
+
+pub(super) fn delete_confirmed(file: &ConfirmedPiFile) -> Result<()> {
+    ensure_no_active_pi_process()?;
+    delete_session_at(file, &sessions_root()?)
+}
+
+fn delete_session_at(file: &ConfirmedPiFile, root: &Path) -> Result<()> {
+    let session = &file.session;
+    let source_path = &file.path;
     if session.provider != Provider::Pi || session.id.is_empty() {
         bail!("refusing Pi deletion with invalid session identity");
     }
@@ -444,10 +481,12 @@ fn delete_session_at(session: &SessionRef, source_path: &Path, root: &Path) -> R
     if parent.parent() != Some(root.as_path()) || !source_path.starts_with(&root) {
         bail!("refusing Pi deletion outside direct workspace session directory");
     }
-    if pi_header_id(&source_path)?.as_deref() != Some(session.id.as_str()) {
-        bail!("Pi session file identity changed before deletion");
-    }
+    file.verify()?;
     fs::remove_file(&source_path).context("deleting selected Pi session file")?;
+    anyhow::ensure!(
+        matches!(fs::symlink_metadata(&source_path),Err(ref error) if error.kind()==std::io::ErrorKind::NotFound),
+        "the selected Pi file is still present after deletion"
+    );
     sync_directory(parent).context("syncing Pi session directory after deletion")?;
     if fs::read_dir(parent)?.next().is_none() {
         fs::remove_dir(parent).context("removing empty Pi workspace session directory")?;
@@ -464,7 +503,7 @@ fn safe_directory(path: &Path, name: &str) -> Result<PathBuf> {
     fs::canonicalize(path).with_context(|| format!("canonicalizing {name}"))
 }
 
-fn pi_header_id(path: &Path) -> Result<Option<String>> {
+fn pi_header_identity(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut scanned = 0_u64;
@@ -488,7 +527,11 @@ fn pi_header_id(path: &Path) -> Result<Option<String>> {
         {
             bail!("Pi session file does not contain supported v{PI_SESSION_VERSION} header");
         }
-        return Ok(record.get("id").and_then(Value::as_str).map(str::to_owned));
+        return Ok(record
+            .get("id")
+            .and_then(Value::as_str)
+            .zip(record.get("cwd").and_then(Value::as_str))
+            .map(|(id, cwd)| (id.to_owned(), PathBuf::from(cwd))));
     }
     bail!("Pi session file has no valid header within safe scan limit")
 }
@@ -1019,6 +1062,32 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_checks_the_selected_file_directory_and_revision() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = SessionRef::new(Provider::Pi, "shared");
+        let write = |name: &str, directory: &str| {
+            let path = fixture.path().join(name);
+            fs::write(
+                &path,
+                serde_json::to_vec(
+                    &json!({"type":"session","version":3,"id":"shared","cwd":directory}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        };
+        let first = write("first.jsonl", "A");
+        let second = write("second.jsonl", "B");
+        let target = ConfirmedPiFile::capture(&id, &second, Path::new("B")).unwrap();
+        assert_eq!(target.path, second);
+        assert!(ConfirmedPiFile::capture(&id, &first, Path::new("B")).is_err());
+        write("second.jsonl", "A");
+        assert!(target.verify().is_err());
+        assert!(first.exists() && second.exists());
+    }
+
+    #[test]
     fn deletes_only_exact_selected_pi_session() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let workspace = temporary.path().join("workspace");
@@ -1029,8 +1098,16 @@ mod tests {
         materialize_records(&selected).expect("materialize selected");
         materialize_records(&sibling).expect("materialize sibling");
 
-        delete_session_at(&selected.target, &selected.target_path, &root)
-            .expect("delete selected Pi session");
+        delete_session_at(
+            &ConfirmedPiFile::capture(
+                &selected.target,
+                &selected.target_path,
+                &fs::canonicalize(&workspace).unwrap(),
+            )
+            .unwrap(),
+            &root,
+        )
+        .expect("delete selected Pi session");
 
         assert!(!selected.target_path.exists());
         assert!(sibling.target_path.exists());

@@ -41,7 +41,8 @@ const DATABASE_FILE_NAME: &str = "store.sqlite3";
 /// Format 6 reconciles legacy Pi copy ownership with successful and failed index observations.
 /// Format 7 indexes physical Pi copies and includes scoped documents recovered without a primary.
 /// Format 8 quarantines conflicting legacy ownership evidence without deleting trajectory rows.
-const STORE_FORMAT: i64 = 8;
+/// Format 9 retains legacy Pi listing metadata separately from native source ownership.
+const STORE_FORMAT: i64 = 9;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -821,7 +822,7 @@ impl Store {
             let project = if let Some(key) = existing {
                 key
             } else {
-                let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3)",params![provider,id,recorded],|row|row.get(0)).map_err(database_error)?;
+                let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3 UNION ALL SELECT 1 FROM pi_retired_keys WHERE provider=?1 AND session_id=?2 AND project=?3)",params![provider,id,recorded],|row|row.get(0)).map_err(database_error)?;
                 if occupied {
                     format!("copy/{}", Uuid::new_v4())
                 } else {
@@ -1683,6 +1684,35 @@ impl Store {
         transaction.commit().map_err(database_error)
     }
 
+    /// Removes the cached document for the confirmed Pi transcript's exact header directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the physical owner cannot be identified or the transaction fails.
+    pub fn forget_pi_copy(&self, session: &SessionRef, recorded: &Path) -> Result<()> {
+        if session.provider != Provider::Pi {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        let mut db = self.connection.borrow_mut();
+        let tx = immediate_transaction(&mut db)?;
+        let provider = session.provider.to_string();
+        let path = recorded.to_str().ok_or(StoreError::InvalidWorkspaceRoot)?;
+        let id = &session.id;
+        tx.execute("INSERT OR IGNORE INTO pi_retired_keys SELECT provider,session_id,project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3",params![provider,id,path]).map_err(database_error)?;
+        tx.execute("DELETE FROM session_trajectories AS t WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2
+            AND EXISTS(SELECT 1 FROM pi_search_copies c JOIN pi_search_primary p USING(provider,session_id)
+                WHERE c.provider=?1 AND c.session_id=?2 AND json_valid(c.metadata) AND json_extract(c.metadata,'$.project_path')=?3
+                AND t.pi_workspace=CASE WHEN p.project=c.project THEN '' ELSE c.project END)", params![provider,id,path]).map_err(database_error)?;
+        tx.execute("UPDATE pi_search_primary SET project='' WHERE provider=?1 AND session_id=?2 AND project IN (SELECT project FROM pi_retired_keys WHERE provider=?1 AND session_id=?2)",params![provider,id]).map_err(database_error)?;
+        tx.execute("DELETE FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3",params![provider,id,path]).map_err(database_error)?;
+        tx.execute(
+            "DELETE FROM session_index WHERE provider=?1 AND session_id=?2 AND project_path=?3",
+            params![provider, id, path],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)
+    }
+
     /// Removes cached metadata and redacted search content for one native session.
     ///
     /// Current routing bindings to the session are deactivated. Native provider data,
@@ -1696,6 +1726,9 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider = session.provider.to_string();
+        if matches!(session.provider,Provider::Pi|Provider::OhMyPi) && transaction.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 UNION ALL SELECT 1 FROM session_trajectories WHERE provider=?1 AND coalesce(pi_native_id,session_id)=?2)",params![provider,session.id],|row|row.get::<_,bool>(0)).map_err(database_error)? {
+            return Err(StoreError::InvalidSessionReference);
+        }
         remove_codex_workspace(&transaction, session, self.codex_home.as_deref())?;
         transaction
             .execute(
@@ -1775,9 +1808,9 @@ impl Store {
             .map(|binding| binding.session);
         let provider = session.provider.to_string();
         for statement in [
-            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2
+            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2 AND provider NOT IN ('pi','omp')
                  AND (provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home))",
-            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2 AND provider NOT IN ('pi','omp')
                  AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))",
             "UPDATE session_bindings SET is_current = 0
              WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
@@ -3340,15 +3373,43 @@ fn upgrade_trajectory_keys(connection: &mut Connection, format: i64) -> Result<(
     if format < 7 {
         initialize_pi_document_lookup(connection)?;
     }
-    if format < STORE_FORMAT {
+    if format < 8 {
         let tx = immediate_transaction(connection)?;
         tx.execute("UPDATE pi_search_primary AS p SET project='' WHERE EXISTS (SELECT 1 FROM trajectory_index_failures failed JOIN trajectory_index_failures scoped USING(provider,session_id)
             WHERE failed.provider=p.provider AND failed.session_id=p.session_id AND failed.pi_workspace='' AND scoped.pi_workspace<>'' AND scoped.pi_workspace=p.project)",[]).map_err(database_error)?;
-        tx.pragma_update(None, "user_version", STORE_FORMAT)
+        tx.pragma_update(None, "user_version", 8)
             .map_err(database_error)?;
         tx.commit().map_err(database_error)?;
     }
+    if format < STORE_FORMAT {
+        preserve_pi_list_observations(connection)?;
+    }
     Ok(())
+}
+
+fn preserve_pi_list_observations(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS pi_retired_keys(provider TEXT NOT NULL,session_id TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(provider,session_id,project))").map_err(database_error)?;
+    tx.execute("UPDATE pi_search_primary AS p SET project='' WHERE EXISTS(SELECT 1 FROM session_trajectories t WHERE t.provider=p.provider AND t.session_id=p.session_id AND t.pi_workspace='' AND t.source_revision IS NULL)",[]).map_err(database_error)?;
+    let sessions = {
+        let mut rows=tx.prepare("SELECT provider,session_id,title,project_path,git_branch,created_at,updated_at,updated_at_approximate,event_count FROM session_index WHERE provider IN ('pi','omp') AND project_path IS NOT NULL").map_err(database_error)?;
+        rows.query_map([], indexed_session_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?
+    };
+    for session in sessions {
+        let metadata = serde_json::to_string(&session).map_err(|_| StoreError::CorruptStore)?;
+        let path = session
+            .project_path
+            .as_deref()
+            .and_then(Path::to_str)
+            .ok_or(StoreError::InvalidWorkspaceRoot)?;
+        tx.execute("INSERT OR IGNORE INTO pi_search_copies SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3)",params![session.session.provider.to_string(),session.session.id,path,metadata]).map_err(database_error)?;
+    }
+    tx.pragma_update(None, "user_version", STORE_FORMAT)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
 }
 
 fn initialize_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
@@ -4762,6 +4823,16 @@ mod tests {
                     .is_empty()
             );
         }
+        assert!(reopened.forget_session(&record.session).is_err());
+        reopened.forget_pi_copy(&record.session, &restored).unwrap();
+        assert!(reopened.cached_pi_copies(&restored).unwrap().is_empty());
+        reopened.cached_pi_copies(&primary).unwrap();
+        assert_eq!(
+            reopened
+                .search_session_trajectories("bluepuffin", 5)
+                .unwrap(),
+            [record.session]
+        );
     }
 
     #[test]
