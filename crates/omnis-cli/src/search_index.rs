@@ -1784,7 +1784,9 @@ fn prepare_session(
         database_step_proof: source.database_step_proof(&snapshot),
         source,
         source_complete,
-        provider_limited,
+        provider_limited: provider_limited
+            || (session.provider != Provider::Imported
+                && AntigravityAdapter::has_omitted_stored_steps(&snapshot)),
         source_revision,
         title,
         native_name,

@@ -63,19 +63,13 @@ impl AntigravityAdapter {
                 return None;
             }
             if event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD) {
-                let missing = event.payload["declared_steps"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_sub(event.payload["stored_steps"].as_u64().unwrap_or(0));
-                if event.payload["omitted_events"].as_u64().unwrap_or(0) > missing {
-                    return None;
-                }
-            } else {
-                if steps.len() == MAX_DATABASE_STEPS {
-                    return None;
-                }
-                steps.push(event.raw_blob_hash.as_ref()?.parse().ok()?);
+                // The notice describes omitted rows and has no native row fingerprint.
+                continue;
             }
+            if steps.len() == MAX_DATABASE_STEPS {
+                return None;
+            }
+            steps.push(event.raw_blob_hash.as_ref()?.parse().ok()?);
         }
         Some(steps)
     }
@@ -104,20 +98,23 @@ impl AntigravityAdapter {
     /// Returns whether a native database read detected missing steps or an unverified WAL.
     #[must_use]
     pub fn has_missing_database_steps(snapshot: &CanonicalSnapshot) -> bool {
-        snapshot.events.last().is_some_and(|event| {
-            matches!(
-                event.source.provider,
-                Provider::Antigravity | Provider::AntigravityDesktop
-            ) && event.kind == EventKind::ProviderEvent
-                && event.replay_policy == ReplayPolicy::HistoricalOnly
-                && event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD)
-                && (event.payload["native_history_unverified"] == true
-                    || event
-                        .payload
-                        .get("stored_steps")
-                        .and_then(Value::as_u64)
-                        .zip(event.payload.get("declared_steps").and_then(Value::as_u64))
-                        .is_some_and(|(stored, declared)| stored < declared))
+        database_notices(snapshot).any(|notice| {
+            notice["native_history_unverified"] == true
+                || notice["omitted_events"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        })
+    }
+
+    /// Returns whether any rows present in SQLite were omitted from the snapshot.
+    #[must_use]
+    pub fn has_omitted_stored_steps(snapshot: &CanonicalSnapshot) -> bool {
+        database_notices(snapshot).any(|notice| {
+            let missing = notice["declared_steps"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(notice["stored_steps"].as_u64().unwrap_or(0));
+            notice["omitted_events"].as_u64().unwrap_or(0) > missing
         })
     }
 
@@ -220,6 +217,22 @@ impl AntigravityAdapter {
         }
         Ok(snapshot)
     }
+}
+
+fn database_notices(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &Value> {
+    snapshot
+        .events
+        .iter()
+        .rev()
+        .take_while(|event| {
+            matches!(
+                event.source.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            ) && event.kind == EventKind::ProviderEvent
+                && event.replay_policy == ReplayPolicy::HistoricalOnly
+                && event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD)
+        })
+        .map(|event| &event.payload)
 }
 
 impl Default for AntigravityAdapter {
@@ -1560,6 +1573,9 @@ mod tests {
                 super::AntigravityAdapter::has_missing_database_steps(&snapshot),
                 declared > decoded
             );
+            assert!(!super::AntigravityAdapter::has_omitted_stored_steps(
+                &snapshot
+            ));
             if declared > decoded {
                 assert_eq!(
                     snapshot.events.last().unwrap().payload,
@@ -1598,6 +1614,8 @@ mod tests {
         let visible_bytes = crate::support::estimated_event_bytes(
             &serde_json::json!({"text":"Synthetic visible history"}),
         );
+        let session = SessionRef::new(Provider::Antigravity, "synthetic");
+        let mut observed = Vec::new();
         for (limits, omitted) in [
             (
                 super::DatabaseReadLimits {
@@ -1629,10 +1647,7 @@ mod tests {
                 2,
             ),
         ] {
-            let mut builder = EventBuilder::new(
-                Provider::Antigravity,
-                "11111111-1111-4111-8111-111111111111",
-            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
             let decoded = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
@@ -1642,24 +1657,25 @@ mod tests {
             )
             .unwrap();
             assert!(decoded > 0);
-            let snapshot = builder.snapshot(
-                SessionRef::new(
-                    Provider::Antigravity,
-                    "11111111-1111-4111-8111-111111111111",
-                ),
-                None,
-                None,
-                None,
-                Utc::now(),
-            );
+            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
             assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
             assert_eq!(
                 snapshot.events[0].payload["text"],
                 "Synthetic visible history"
             );
+            let proof = super::AntigravityAdapter::database_step_proof(&snapshot).unwrap();
+            if observed.is_empty() {
+                observed = proof.clone();
+                assert_eq!(observed.len(), 2);
+                assert_ne!(observed[0], observed[1]);
+            }
+            assert_eq!(proof, observed[..3 - omitted]);
+            assert!(super::AntigravityAdapter::has_omitted_stored_steps(
+                &snapshot
+            ));
             let notice = snapshot.events.last().unwrap();
             assert_eq!(notice.payload["omitted_events"], omitted);
-            assert!(!super::AntigravityAdapter::has_missing_database_steps(
+            assert!(super::AntigravityAdapter::has_missing_database_steps(
                 &snapshot
             ));
             assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
@@ -1775,6 +1791,15 @@ mod tests {
                 )
                 .unwrap(),
             wire
+        );
+        assert!(!super::AntigravityAdapter::has_missing_database_steps(
+            &snapshot
+        ));
+        assert_eq!(
+            super::AntigravityAdapter::database_step_proof(&snapshot)
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(snapshot.events[1].payload["unsupported_text_records"], 1);
         assert!(omnis_core::import_conversation(&snapshot).truncated);

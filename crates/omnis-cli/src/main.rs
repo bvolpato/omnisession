@@ -152,13 +152,15 @@ fn complete_snapshot_read(
 ) -> omnis_adapters::IndexRead {
     let source_complete = provider == Provider::Imported
         || !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot);
+    let provider_limited = provider != Provider::Imported
+        && omnis_adapters::AntigravityAdapter::has_omitted_stored_steps(&snapshot);
     omnis_adapters::IndexRead {
         native_session: None,
         snapshot,
         rollback_title: omnis_adapters::RollbackTitle::Unknown,
         workspace_projection: CodexWorkspaceProjection::Unchecked,
         source_complete,
-        provider_limited: false,
+        provider_limited,
         source_revision: SourceRevision::default(),
     }
 }
@@ -353,6 +355,8 @@ fn store_observed_search_document(
         source.origin,
     );
     document.database_step_proof = database_step_proof.as_deref();
+    document.provider_limited = session.provider != Provider::Imported
+        && omnis_adapters::AntigravityAdapter::has_omitted_stored_steps(snapshot);
     if let Some(locator) = locator {
         return store.upsert_imported_session_document(locator, &document);
     }

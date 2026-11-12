@@ -178,6 +178,22 @@ impl PriorCoverage {
             _ => None,
         };
         let incoming = write.document.database_step_proof;
+        if has_gap
+            && home.is_some()
+            && write.document.provider_limited
+            && self
+                .version
+                .is_some_and(|version| version < write.document.document_version)
+            && self.contents.is_some()
+            && self.contents == write.document.source_revision.contents
+            && hash == write.content_hash
+            && incoming.is_some()
+            && prior_steps
+                .as_deref()
+                .is_none_or(|previous| Some(previous) == incoming)
+        {
+            return Ok(PartialWrite::Replace);
+        }
         let fixed_version = match write.session.provider {
             crate::Provider::Antigravity => 11,
             crate::Provider::AntigravityDesktop => 12,

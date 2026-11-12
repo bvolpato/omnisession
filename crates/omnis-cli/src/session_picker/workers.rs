@@ -968,9 +968,11 @@ fn read_picker_preview(
                 .unwrap_or_default(),
             workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            provider_limited: omnis_adapters::AntigravityAdapter::has_omitted_stored_steps(
+                &snapshot,
+            ),
             snapshot,
             source_complete,
-            provider_limited: false,
         },
         source,
     ))
