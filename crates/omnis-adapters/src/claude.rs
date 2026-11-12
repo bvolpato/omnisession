@@ -415,10 +415,6 @@ impl RecordCopies {
                     compactions.by_id.contains_key(&id) && !duplicates.contains(&id)
                 })
             }
-            Some("user" | "assistant") if is_meta_message(record) => {
-                record.get("parentUuid").is_some_and(Value::is_null)
-                    || record_uuid(record, "parentUuid").is_some_and(|id| !duplicates.contains(&id))
-            }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
             Some(_) if Self::compares_link(role, record) => {
                 record.get("parentUuid").is_some_and(Value::is_null)
@@ -1624,6 +1620,30 @@ impl ClaudeTranscript {
         }
     }
 
+    fn reselect_existing(&mut self, id: Uuid, record: &Value) {
+        let existing = &self.records[&id];
+        if is_turn_duration(record) || is_meta_message(record) {
+            if let Some(parent) =
+                self.branch
+                    .reselect_hidden(id, existing, &self.records, &self.compactions)
+            {
+                self.records
+                    .get_mut(&id)
+                    .expect("copied record exists")
+                    .branch = parent;
+            }
+        } else if record["type"] != "system"
+            && !existing.branch.transparent
+            && !self
+                .branch
+                .selected_summary()
+                .is_some_and(|summary| self.compactions.precedes_cutoff(summary, existing.order))
+        {
+            self.branch
+                .observe_existing(existing.branch, &self.compactions);
+        }
+    }
+
     fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
         let main_record = is_main_record(record);
         let id = record_uuid(record, "uuid");
@@ -1655,19 +1675,7 @@ impl ClaudeTranscript {
                 ) {
                     restored_order = Some(self.records[&id].order);
                 } else {
-                    let existing = &self.records[&id];
-                    if is_turn_duration(record) || is_meta_message(record) {
-                        self.branch
-                            .reselect_hidden(id, existing, &self.records, &self.compactions);
-                    } else if record["type"] != "system"
-                        && !existing.branch.transparent
-                        && !self.branch.selected_summary().is_some_and(|summary| {
-                            self.compactions.precedes_cutoff(summary, existing.order)
-                        })
-                    {
-                        self.branch
-                            .observe_existing(existing.branch, &self.compactions);
-                    }
+                    self.reselect_existing(id, record);
                     return;
                 }
             }
