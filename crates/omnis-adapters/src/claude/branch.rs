@@ -704,7 +704,14 @@ impl Branch {
             && compactions.precedes_cutoff(summary, record.order)
         {
             if compactions.contains(summary, id, records)
-                && !self.selected_retained_descendant(summary, node)
+                && !self.selected_retained_descendant(
+                    summary,
+                    node,
+                    compactions
+                        .by_summary
+                        .get(&summary)
+                        .is_some_and(|header| header.retained_tail == Some(id)),
+                )
             {
                 self.select_retained_position(summary, id, record.branch);
             }
@@ -721,7 +728,12 @@ impl Branch {
         self.observe_existing(records[&id].branch, compactions);
     }
 
-    fn selected_retained_descendant(&mut self, summary: usize, original: usize) -> bool {
+    fn selected_retained_descendant(
+        &mut self,
+        summary: usize,
+        original: usize,
+        tail: bool,
+    ) -> bool {
         if self.selected_summary() != Some(summary) {
             return false;
         }
@@ -732,7 +744,7 @@ impl Branch {
                 return retained.node.is_some_and(|node| {
                     self.copy_paths
                         .distance(original, node)
-                        .is_some_and(|n| n > 0)
+                        .is_some_and(|n| n > 0 || tail)
                 });
             }
             if node == summary {
@@ -751,18 +763,70 @@ impl Branch {
         let mut visited = HashSet::new();
         loop {
             let record = records.get(&uuid)?;
-            let node = record.branch.node?;
             if !record.branch.transparent
-                || self.nodes[node].uuid == Some(uuid)
-                || self.nodes[node].summary.is_some()
+                || record.branch.node.is_some_and(|node| {
+                    self.nodes[node].uuid == Some(uuid) || self.nodes[node].summary == Some(node)
+                })
             {
-                return Some(node);
+                return record.branch.node;
             }
             if !visited.insert(uuid) {
                 return None;
             }
             uuid = record.parent?;
         }
+    }
+
+    pub(super) fn reconnect_hidden_children(
+        &mut self,
+        uuid: Uuid,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
+        compactions: &Compactions,
+    ) {
+        let parent = records[&uuid].branch;
+        let Some(node) = parent.node else {
+            return;
+        };
+        let mut changes = HashMap::new();
+        for (&id, record) in records.iter() {
+            if record.parent == Some(uuid)
+                && let Some(child) = record.branch.node
+                && self.nodes[child].uuid == Some(id)
+                && self.nodes[child].parent != Some(node)
+            {
+                changes.insert(child, node);
+            }
+        }
+        if !changes.is_empty() {
+            self.reparent_copies(&changes, records);
+            self.observe_existing(parent, compactions);
+        }
+    }
+
+    pub(super) fn recover_hidden_parent(
+        &self,
+        id: Uuid,
+        parent: Option<Uuid>,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
+    ) -> bool {
+        let Some(parent) = parent else {
+            return false;
+        };
+        let Some(node) = self.raw_copy_parent(parent, records) else {
+            return false;
+        };
+        if self.nodes[node].missing_ancestor || self.nodes[node].uuid == Some(id) {
+            return false;
+        }
+        let Some(record) = records.get_mut(&parent) else {
+            return false;
+        };
+        if record.branch.missing_ancestor && record.branch.transparent {
+            record.branch.node = Some(node);
+            record.branch.source = Some(node);
+            record.branch.missing_ancestor = false;
+        }
+        true
     }
 
     fn refresh_copy_ancestry(&mut self, node: usize, records: &mut HashMap<Uuid, ClaudeRecord>) {
@@ -2992,6 +3056,28 @@ impl Branch {
                     && (anchors[call.node].is_some() || original)))
     }
 
+    fn declared_result<'a>(
+        &self,
+        index: usize,
+        anchors: &'a [Option<usize>],
+        transports: &HashMap<usize, usize>,
+        retained_links: &HashSet<usize>,
+    ) -> DeclaredResult<'a> {
+        let issuer = self
+            .issuing_parent(index)
+            .map(|parent| transports.get(&parent).copied().unwrap_or(parent));
+        DeclaredResult {
+            retained: self.suffix_parents.contains_key(&index)
+                || self.nodes[index]
+                    .parent
+                    .is_some_and(|p| retained_links.contains(&p)),
+            source: self.tool_source(index),
+            index,
+            issuer,
+            anchors,
+        }
+    }
+
     /// Resolve outcomes against the calls that already existed when Claude wrote each result.
     fn parallel_results(
         &self,
@@ -3006,6 +3092,7 @@ impl Branch {
         let mut results = ToolResults::default();
         let mut outcomes = HashMap::<_, Outcome>::new();
         let mut transports = HashMap::new();
+        let mut retained_links = HashSet::new();
         let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             let hidden = self.hidden_parents.contains_key(&index);
@@ -3015,20 +3102,12 @@ impl Branch {
             }
             let partial = active[index] && rewind.results_only(index);
             let selected = active[index] && !partial;
-            let parent = self.issuing_parent(index);
-            let source = self.tool_source(index);
-            let issuer = parent.map(|p| *transports.get(&p).unwrap_or(&p));
-            let declared = DeclaredResult {
-                source,
-                index,
-                issuer,
-                anchors,
-            };
-            let call_parent = self.call_parent(parent);
-            let origin = issuer.and_then(|p| self.response_unit(p));
+            let declared = self.declared_result(index, anchors, &transports, &retained_links);
+            let call_parent = self.call_parent(self.issuing_parent(index));
+            let origin = declared.issuer.and_then(|p| self.response_unit(p));
             // A verified outcome can link the next parallel result to its original response.
             // An ordinary user message supplies no such evidence.
-            let mut transport = issuer.filter(|_| origin.is_some());
+            let mut transport = declared.issuer.filter(|_| origin.is_some());
             for position in node.events.clone() {
                 // A withdrawn row contributes only individually verified outcomes.
                 if partial {
@@ -3038,7 +3117,7 @@ impl Branch {
                     continue;
                 }
                 let id = events[position].payload["tool_use_id"].as_str();
-                let prior = calls.prior_result(origin, node, id, &outcomes);
+                let prior = calls.prior_result(origin, id, &outcomes);
                 if selected {
                     declared.observe(self, &calls, &mut results, position, (id, &prior));
                 }
@@ -3049,13 +3128,15 @@ impl Branch {
                 let ambiguous = |key| {
                     if selected {
                         unresolved.insert((key, epoch[index]), index);
-                        if source == ToolSource::Absent && prior.distinct(position, events) {
+                        if declared.source == ToolSource::Absent
+                            && calls.distinct_result(key, &prior, position, events)
+                        {
                             results.keep_recovery_only(position);
                         }
                     }
                 };
                 let Some((call, mut priority)) =
-                    calls.resolve(self, call_parent, source, node, id, ambiguous)
+                    calls.resolve(self, call_parent, declared.source, node, id, ambiguous)
                 else {
                     transport = None;
                     continue;
@@ -3076,12 +3157,15 @@ impl Branch {
                     );
                 let repeated = available && call.repeated && selected && active[call.node];
                 if !paired && !retained && !repeated {
-                    if selected && declared.returned_to_removed_call(self, call, call_parent) {
+                    if selected && declared.returned_to_removed_call(self, call) {
                         results.keep_recovery_only(position);
                     } else if active[index] && priority == ResultSource::Linked {
                         results.withhold(position);
                     }
                     continue;
+                }
+                if paired && selected {
+                    calls.record_output(&self.nodes[call.node], id, &events[position]);
                 }
                 if selected {
                     results.withhold(position);
@@ -3095,12 +3179,13 @@ impl Branch {
                     .and_modify(|outcome| outcome.consider(priority, position, events))
                     .or_insert(Outcome::new(priority, position));
             }
-            if let Some(issuer) = transport
-                && ((hidden && self.turn(issuer) == node.turn)
-                    || events[node.events.clone()].iter().any(is_tool_outcome))
-            {
-                transports.insert(index, issuer);
-            }
+            declared.finish_transport(
+                self,
+                events,
+                transport,
+                &mut transports,
+                &mut retained_links,
+            );
         }
         results.ambiguous_selected =
             self.has_ambiguous_selected_result(&unresolved, events, anchors, epoch, rewind);
@@ -3110,6 +3195,7 @@ impl Branch {
 }
 
 struct DeclaredResult<'a> {
+    retained: bool,
     source: ToolSource,
     index: usize,
     issuer: Option<usize>,
@@ -3117,25 +3203,33 @@ struct DeclaredResult<'a> {
 }
 
 impl DeclaredResult<'_> {
-    fn returned_to_removed_call(
+    fn finish_transport(
         &self,
         branch: &Branch,
-        call: ToolCall,
-        parent: Option<usize>,
-    ) -> bool {
-        let mut cursor = self.index;
-        while !branch.suffix_parents.contains_key(&cursor) {
-            let Some(parent) = branch.nodes[cursor]
-                .parent
-                .filter(|p| branch.hidden_parents.contains_key(p))
-            else {
-                return false;
-            };
-            cursor = parent;
+        events: &[ClaudeEvent],
+        transport: Option<usize>,
+        transports: &mut HashMap<usize, usize>,
+        retained_links: &mut HashSet<usize>,
+    ) {
+        let index = self.index;
+        let node = &branch.nodes[index];
+        let hidden = branch.hidden_parents.contains_key(&index);
+        let carries_result = events[node.events.clone()].iter().any(is_tool_outcome);
+        if self.retained && (hidden || carries_result) {
+            retained_links.insert(index);
         }
-        (self.source == ToolSource::Absent
-            || matches!(self.source, ToolSource::Record(id) if id == call.node))
-            && parent == Some(call.node)
+        if let Some(issuer) = transport
+            && ((hidden && branch.turn(issuer) == node.turn) || carries_result)
+        {
+            transports.insert(index, issuer);
+        }
+    }
+
+    fn returned_to_removed_call(&self, branch: &Branch, call: ToolCall) -> bool {
+        self.retained
+            && (self.source == ToolSource::Absent
+                || matches!(self.source, ToolSource::Record(id) if id == call.node))
+            && branch.call_parent(self.issuer) == Some(call.node)
     }
 
     fn observe(
@@ -3313,6 +3407,7 @@ type CandidateCall<'a> = ScopedCall<'a, CandidateOwner<'a>>;
 
 #[derive(Default)]
 struct ToolCalls<'a> {
+    recorded: HashMap<CandidateCall<'a>, HashSet<(bool, &'a Value)>>,
     by_record: HashMap<(usize, &'a str), CallsWithId>,
     by_response: HashMap<(ResponseUnit<'a>, &'a str), CallsWithId>,
     by_scope: HashMap<ScopedCall<'a, usize>, CallsWithId>,
@@ -3354,10 +3449,36 @@ impl PriorResult {
 }
 
 impl<'a> ToolCalls<'a> {
+    fn record_output(&mut self, node: &'a Node, id: &'a str, event: &'a ClaudeEvent) {
+        let key = (
+            node.writer.as_deref(),
+            CandidateOwner::Turn(node.turn),
+            node.summary,
+            id,
+        );
+        self.recorded
+            .entry(key)
+            .or_default()
+            .insert((event.kind == EventKind::ToolFailed, &event.payload));
+    }
+
+    fn distinct_result(
+        &self,
+        key: CandidateCall<'a>,
+        prior: &PriorResult,
+        position: usize,
+        events: &'a [ClaudeEvent],
+    ) -> bool {
+        let event = &events[position];
+        self.recorded.get(&key).map_or_else(
+            || prior.distinct(position, events),
+            |results| !results.contains(&(event.kind == EventKind::ToolFailed, &event.payload)),
+        )
+    }
+
     fn prior_result(
         &self,
         origin: Option<ResponseUnit<'a>>,
-        node: &'a Node,
         id: Option<&'a str>,
         outcomes: &HashMap<(ToolCall, bool, Option<usize>), Outcome>,
     ) -> PriorResult {
@@ -3366,15 +3487,7 @@ impl<'a> ToolCalls<'a> {
             .and_then(|key| self.by_response.get(&key))
             .and_then(|c| c.unique())
         else {
-            let prior = id
-                .and_then(|id| {
-                    self.by_scope
-                        .get(&(node.writer.as_deref(), node.turn, node.summary, id))
-                })
-                .and_then(|c| outcomes.get(&(c.last(), false, None)));
-            return prior.map_or(PriorResult::Unknown, |result| {
-                PriorResult::Answered(result.position)
-            });
+            return PriorResult::Unknown;
         };
         outcomes
             .get(&(call, false, None))

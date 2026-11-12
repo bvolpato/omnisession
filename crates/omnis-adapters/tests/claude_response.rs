@@ -5497,3 +5497,221 @@ fn a_distinct_result_for_a_reused_tool_id_survives_an_intervening_call() {
         }
     }
 }
+
+#[test]
+fn copying_the_last_retained_hidden_row_keeps_its_new_exchange() {
+    for retained_tail in [false, true] {
+        let hidden = meta_user(3, 2);
+        let mut rows = vec![
+            message(1, 0, "user", json!("Original task")),
+            message(2, 1, "assistant", json!("Retained answer")),
+            hidden.clone(),
+        ];
+        if !retained_tail {
+            rows.push(message(4, 3, "user", json!("Retained follow-up")));
+        }
+        rows.extend(if retained_tail {
+            compaction(6, 3, &[2, 3])
+        } else {
+            compaction(6, 4, &[2, 3, 4])
+        });
+        rows.extend([
+            message(8, 3, "user", json!("New request")),
+            message(9, 8, "assistant", json!("New answer")),
+            hidden,
+        ]);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let expected: &[&str] = if retained_tail {
+                &["Summary 6", "Retained answer", "New request", "New answer"]
+            } else {
+                &["Summary 6", "Retained answer"]
+            };
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Retained answer"));
+                for marker in ["New request", "New answer"] {
+                    assert_eq!(text.contains(marker), retained_tail);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn progress_after_a_compaction_uses_the_replacement_request() {
+    let hidden = meta_user(12, 11);
+    let mut rows = vec![
+        message(1, 0, "user", json!("Initial task")),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    rows.extend(compaction(6, 2, &[2]));
+    rows.extend([
+        message(10, 2, "user", json!("Superseded request")),
+        opaque(11, 10, "progress"),
+        hidden.clone(),
+        message(10, 2, "user", json!("Replacement request")),
+        hidden,
+        message(13, 12, "assistant", json!("Latest answer")),
+    ]);
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert_eq!(
+            handoff_messages(&import_trajectory(&snapshot)),
+            [
+                "Summary 6",
+                "Retained reply",
+                "Replacement request",
+                "Latest answer"
+            ]
+        );
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            for marker in ["Retained reply", "Replacement request", "Latest answer"] {
+                assert!(text.contains(marker));
+            }
+            assert!(!text.contains("Superseded request"));
+        }
+    }
+}
+
+#[test]
+fn reconnecting_a_duration_keeps_its_existing_reply() {
+    let duration = turn_duration(2, 1);
+    let mut parent = message(1, 0, "user", json!("Known request"));
+    parent["timestamp"] = json!("2026-01-01T00:00:01Z");
+    let mut later = parent.clone();
+    later["timestamp"] = json!("2026-01-01T00:00:02Z");
+    let rows = [
+        duration.clone(),
+        message(3, 2, "assistant", json!("Known reply")),
+        parent,
+        later,
+        duration,
+    ];
+    check_selected_messages(&rows, &["Known request", "Known reply"], &[]);
+}
+
+#[test]
+fn a_progress_parent_that_arrives_late_reconnects_its_hidden_child() {
+    let hidden = meta_user(3, 2);
+    let rows = [
+        opaque(2, 1, "progress"),
+        hidden.clone(),
+        message(1, 0, "user", json!("Known request")),
+        hidden,
+        message(4, 3, "assistant", json!("Known reply")),
+    ];
+    check_selected_messages(&rows, &["Known request", "Known reply"], &[]);
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert!(!import_trajectory(&snapshot).truncated);
+        assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+    }
+}
+
+#[test]
+fn both_late_outputs_survive_when_their_compacted_results_are_split() {
+    for split in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read files")),
+            file_calls(2, 1, "file.txt", &["x", "y"]),
+            meta_user(3, 2),
+        ];
+        rows.extend(compaction(6, 3, &[3]));
+        rows.push(meta_user(8, 3));
+        let mut first = linked_result(9, 8, 2, "x", "First late output");
+        if split {
+            rows.extend([first, linked_result(10, 9, 2, "y", "Second late output")]);
+        } else {
+            first["message"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(result("y", "Second late output", false));
+            rows.push(first);
+        }
+        rows.push(message(
+            11,
+            if split { 10 } else { 9 },
+            "assistant",
+            json!("Done"),
+        ));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert!(tool_outcomes(&snapshot).is_empty());
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                for marker in ["First late output", "Second late output", "Done"] {
+                    assert!(text.contains(marker), "{marker}, split={split}");
+                }
+            }
+        }
+    }
+}
+
+fn check_distinct_output_with_intervening_call(completed: bool, mixed: bool) {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Read files")),
+        file_calls(2, 1, "one.txt", &["x"]),
+        linked_result(3, 2, 2, "x", "First output"),
+        file_calls(4, 3, "two.txt", &["x"]),
+    ];
+    if completed {
+        rows.push(linked_result(5, 4, 4, "x", "Second output"));
+    }
+    rows.extend([
+        file_calls(6, if completed { 5 } else { 4 }, "three.txt", &["z"]),
+        linked_result(7, 6, 6, "z", "Third output"),
+    ]);
+    let mut content = vec![result("x", "Distinct output", false)];
+    if mixed {
+        content.push(json!({"type":"text","text":"New request"}));
+    }
+    rows.extend([
+        message(8, 7, "user", json!(content)),
+        message(9, 8, "assistant", json!("Done")),
+    ]);
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let outputs = tool_outcomes(&snapshot);
+        for marker in ["First output", "Third output"] {
+            assert!(outputs.iter().any(|(text, _)| text == marker));
+        }
+        assert_eq!(
+            outputs.iter().any(|(text, _)| text == "Second output"),
+            completed
+        );
+        assert!(!outputs.iter().any(|(text, _)| text == "Distinct output"));
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            assert_eq!(text.contains("New request"), mixed);
+            assert_eq!(text.contains("Second output"), completed);
+            for marker in ["First output", "Third output", "Distinct output"] {
+                assert!(text.contains(marker), "{marker}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mixed_user_result_keeps_its_distinct_documentary_output() {
+    for mixed in [false, true] {
+        check_distinct_output_with_intervening_call(true, mixed);
+    }
+}
+
+#[test]
+fn an_unanswered_reused_call_keeps_its_distinct_documentary_output() {
+    for completed in [true, false] {
+        check_distinct_output_with_intervening_call(completed, false);
+    }
+}

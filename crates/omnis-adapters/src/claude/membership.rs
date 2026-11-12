@@ -244,6 +244,9 @@ impl NodeBlock {
                 .partition_point(|&(_, i)| paths.walk_order((i, false), (node, leave)).is_lt())
         };
         let (mut start, mut end) = (boundary(false), boundary(true));
+        if start < end && self.newest[start].1 == node {
+            start += 1;
+        }
         if start == end {
             return None;
         }

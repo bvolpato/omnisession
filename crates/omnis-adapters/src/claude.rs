@@ -469,20 +469,6 @@ impl RecordCopies {
             && self.missing_parent(Some(parent), records) != Some(missing)
     }
 
-    fn found_duration_parent(
-        &self,
-        id: Uuid,
-        parent: Option<Uuid>,
-        records: &HashMap<Uuid, ClaudeRecord>,
-    ) -> bool {
-        parent.is_some_and(|parent| {
-            self.missing.get(&id) == Some(&parent)
-                && records
-                    .get(&parent)
-                    .is_some_and(|record| record.branch.node.is_some())
-        })
-    }
-
     fn observe(
         &mut self,
         id: Uuid,
@@ -1654,6 +1640,26 @@ impl ClaudeTranscript {
         }
     }
 
+    fn reconnects_copy(&mut self, id: Uuid, parent: Option<Uuid>, record: &Value) -> bool {
+        if (is_meta_message(record) || is_turn_duration(record))
+            && self
+                .record_copies
+                .missing
+                .get(&id)
+                .is_some_and(|gap| self.records.contains_key(gap))
+            && self
+                .branch
+                .recover_hidden_parent(id, parent, &mut self.records)
+        {
+            if let Some(parent) = parent {
+                self.record_copies.missing.remove(&parent);
+            }
+            return true;
+        }
+        self.record_copies
+            .reconnects(id, parent, &self.records, &self.duplicate_records)
+    }
+
     fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
         let main_record = is_main_record(record);
         let id = record_uuid(record, "uuid");
@@ -1677,16 +1683,7 @@ impl ClaudeTranscript {
                 .record_copies
                 .observe(id, signature, &mut self.records, &mut self.branch)
             {
-                if self.record_copies.reconnects(
-                    id,
-                    causal_parent,
-                    &self.records,
-                    &self.duplicate_records,
-                ) || (is_turn_duration(record)
-                    && self
-                        .record_copies
-                        .found_duration_parent(id, causal_parent, &self.records))
-                {
+                if self.reconnects_copy(id, causal_parent, record) {
                     restored_order = Some(self.records[&id].order);
                 } else {
                     self.reselect_existing(id, record);
@@ -1739,6 +1736,10 @@ impl ClaudeTranscript {
                 events: start..self.events.len(),
             };
             self.save_record(id, definition, raw, causal_parent, restored_order.is_some());
+            if restored_order.is_some() && (is_turn_duration(record) || is_meta_message(record)) {
+                self.branch
+                    .reconnect_hidden_children(id, &mut self.records, &self.compactions);
+            }
         }
     }
 
