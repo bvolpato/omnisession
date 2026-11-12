@@ -1484,6 +1484,7 @@ mod grok_preview_tests {
         let guard = TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
             source_complete: true,
             source_revision: prior.source_revision,
+            legacy_tail_receipt: None,
             source_updated_at: prior.snapshot.captured_at,
             document_version: omnis_core::search_document_version(Provider::Grok),
             source_time_precise: true,
