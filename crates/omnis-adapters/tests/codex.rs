@@ -2245,7 +2245,7 @@ fn check_legacy_owners(file: &str) -> anyhow::Result<()> {
             "First assigned opener",
         ),
         (
-            "55555555-5555-4555-8555-555555555555",
+            "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF",
             "02",
             "Second assigned opener",
         ),
@@ -2276,6 +2276,7 @@ fn check_legacy_owners(file: &str) -> anyhow::Result<()> {
         adapter.refresh_session_titles(&mut cached);
         for ((id, _, _), name) in threads.into_iter().zip(expected) {
             for rows in [&listed, &cached, &reused] {
+                assert_eq!(rows.len(), threads.len());
                 assert_eq!(
                     rows.iter()
                         .find(|row| row.session.id == id)

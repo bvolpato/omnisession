@@ -64,10 +64,20 @@ struct CodexFileScan {
 
 #[derive(Default)]
 struct LegacyPaths<'a> {
-    by_id: HashMap<String, Vec<&'a Path>>,
+    native_ids: HashSet<String>,
+    by_id: HashMap<Uuid, Vec<&'a Path>>,
     identified: HashSet<&'a Path>,
     revisions: Vec<(PathBuf, Option<SourceRevision>)>,
     unidentified: HashMap<&'a Path, Vec<&'a Path>>,
+}
+
+impl<'a> LegacyPaths<'a> {
+    fn owned_paths(&self, id: &str) -> &[&'a Path] {
+        Uuid::parse_str(id)
+            .ok()
+            .and_then(|owner| self.by_id.get(&owner))
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 impl CodexFileScan {
@@ -93,9 +103,11 @@ impl CodexFileScan {
                 .as_ref()
                 .is_some_and(|root| live_rollout_path(home, root, path))
                 && let Ok(Some(session)) = listed_session(path, cache.as_deref_mut())
+                && let Ok(owner) = Uuid::parse_str(&session.id)
             {
                 // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
-                legacy.by_id.entry(session.id).or_default().push(path);
+                legacy.native_ids.insert(session.id);
+                legacy.by_id.entry(owner).or_default().push(path);
                 legacy.identified.insert(path);
                 legacy
                     .revisions
@@ -111,8 +123,8 @@ impl CodexFileScan {
     fn thread_ids<'a>(&'a self, legacy: &'a LegacyPaths<'_>) -> impl Iterator<Item = &'a String> {
         self.candidates.keys().chain(
             legacy
-                .by_id
-                .keys()
+                .native_ids
+                .iter()
                 .filter(|id| !self.candidates.contains_key(*id)),
         )
     }
@@ -158,7 +170,7 @@ impl CodexFileScan {
         let mut paths: Vec<_> = self
             .paths(&session.id)
             .filter(|path| !legacy.identified.contains(path))
-            .chain(legacy.by_id.get(&session.id).into_iter().flatten().copied())
+            .chain(legacy.owned_paths(&session.id).iter().copied())
             .map(Path::to_owned)
             .collect();
         if selected.from_registry {
@@ -229,11 +241,11 @@ fn select_rollout<'a>(
                 let Some((thread, file)) = current_rollout::ids(path) else {
                     continue;
                 };
-                if !session.id.eq_ignore_ascii_case(thread) {
+                if session.id != thread {
                     // A suffix on a manual filename can name an unrelated thread.
                     continue;
                 }
-                let dual = !thread.eq_ignore_ascii_case(file);
+                let dual = thread != file;
                 return Some(SelectedRollout {
                     session,
                     shadowed: shadowed || dual,
@@ -734,10 +746,7 @@ impl CodexAdapter {
             let row = rows.get(id);
             if let Some(path) = scan.unique_path(id)
                 && current_rollout::canonical_name(path)
-                && legacy
-                    .by_id
-                    .get(id)
-                    .is_none_or(|files| files.iter().all(|&file| file == path))
+                && legacy.owned_paths(id).iter().all(|&file| file == path)
                 && row.is_none_or(|row| row.ordinary_path_is(path))
                 && cached
                     .source_revision
@@ -868,7 +877,7 @@ impl CodexAdapter {
                 }
             };
             if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
-                && (scan.unique_path(id).is_none() || legacy.by_id.contains_key(id))
+                && (scan.unique_path(id).is_none() || !legacy.owned_paths(id).is_empty())
             {
                 requires_scan = true;
             }
@@ -876,10 +885,7 @@ impl CodexAdapter {
                 self.selected_title(&selected, row, || scan.index_paths(&selected, &legacy));
             let mut session = selected.session;
             if current_rollout::ids(&session.path).is_none()
-                && legacy
-                    .by_id
-                    .get(id)
-                    .is_some_and(|files| files.contains(&session.path.as_path()))
+                && legacy.owned_paths(id).contains(&session.path.as_path())
             {
                 invalid.without_metadata -= 1;
             }
@@ -1244,7 +1250,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
         return Ok(cached
             .header
             .clone()
-            .and_then(|header| CodexSession::from_header(path, header, observed)));
+            .map(|header| CodexSession::from_header(path, header, observed)));
     }
     let session = CodexSession::parse_with_observation(path, observed)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
@@ -1578,7 +1584,7 @@ fn collect_jsonl(
 }
 
 fn path_uuid(path: &Path) -> Option<String> {
-    current_rollout::ids(path).map(|(thread, _)| thread.to_ascii_lowercase())
+    current_rollout::ids(path).map(|(thread, _)| thread.to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1688,15 +1694,14 @@ impl CodexSession {
         }
         let payload = record.get("payload")?;
         let id = string_at(payload, &[&["id"], &["session_id"]])?;
-        let id = Uuid::parse_str(id).ok()?;
-        if current_rollout::ids(&path)
-            .is_some_and(|(thread, _)| Uuid::parse_str(thread).ok() != Some(id))
+        Uuid::parse_str(id).ok()?;
+        if current_rollout::ids(&path).is_some_and(|(thread, _)| thread != id)
             && current_rollout::canonical_name(&path)
         {
             return None;
         }
         Some(Self {
-            id: id.to_string(),
+            id: id.to_owned(),
             forked_from_id: string_at(payload, &[&["forked_from_id"]])
                 .and_then(|parent| Uuid::parse_str(parent).ok()),
             title: None,
@@ -1722,9 +1727,9 @@ impl CodexSession {
         })
     }
 
-    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Option<Self> {
-        Some(Self {
-            id: Uuid::parse_str(&header.id).ok()?.to_string(),
+    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Self {
+        Self {
+            id: header.id,
             forked_from_id: header.forked_from_id,
             title: None,
             path: path.to_path_buf(),
@@ -1736,7 +1741,7 @@ impl CodexSession {
             is_subagent: header.is_subagent,
             created_at: header.created_at,
             updated_at: observed.modified,
-        })
+        }
     }
 
     fn header(&self) -> RolloutHeader {
