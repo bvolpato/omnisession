@@ -43,6 +43,30 @@ fn codex_sqlite_override(root: &std::path::Path) -> String {
 
 #[cfg(unix)]
 #[test]
+fn bare_fork_refuses_conflicting_grok_sources_and_a_matching_codex_session() {
+    let fixture = Fixture::new();
+    let grok = fixture.root.join("grok");
+    for workspace in ["one", "two"] {
+        let source = grok.join("sessions").join(workspace).join(SOURCE_ID);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("summary.json"),
+            json!({"info": {"id": SOURCE_ID, "cwd": fixture.workspace}}).to_string(),
+        )
+        .unwrap();
+    }
+    let output = fixture
+        .command()
+        .env("GROK_HOME", grok)
+        .args(["fork", SOURCE_ID, "--in", "grok", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is ambiguous"));
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
     let fixture = Fixture::new();
     let subdirectory = fixture.workspace.join("nested");

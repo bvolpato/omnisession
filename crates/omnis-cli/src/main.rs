@@ -2771,6 +2771,16 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
                 {
                     eprintln!("warning: local trajectory index refresh: {cause}");
                 }
+                if error
+                    .downcast_ref::<omnis_adapters::GrokReadRejection>()
+                    .is_some_and(omnis_adapters::GrokReadRejection::has_conflicting_summaries)
+                {
+                    bail!(
+                        "session ID `{}` is ambiguous ({}); use provider:id",
+                        safe_terminal_line(selector),
+                        safe_terminal_line(&error.to_string())
+                    );
+                }
                 codex_unavailable |= provider == Provider::Codex
                     && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(&error);
                 failures.push(format!("{provider}: {error}"));

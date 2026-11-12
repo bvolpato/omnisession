@@ -48,6 +48,7 @@ pub struct GrokReadRejection {
 
 #[derive(Debug)]
 enum GrokHistoryError {
+    ConflictingSummaries(String),
     ForeignOwner,
     Missing(String),
 }
@@ -55,6 +56,10 @@ enum GrokHistoryError {
 impl std::fmt::Display for GrokHistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ConflictingSummaries(id) => write!(
+                f,
+                "multiple Grok summaries match session `{id}` in different directories"
+            ),
             Self::ForeignOwner => f.write_str("Grok updates contain a different session ID"),
             Self::Missing(id) => write!(
                 f,
@@ -85,6 +90,16 @@ fn checked_history_error(
         cause,
     }
     .into()
+}
+
+impl GrokReadRejection {
+    #[must_use]
+    pub fn has_conflicting_summaries(&self) -> bool {
+        matches!(
+            self.cause.downcast_ref::<GrokHistoryError>(),
+            Some(GrokHistoryError::ConflictingSummaries(_))
+        )
+    }
 }
 
 impl std::fmt::Display for GrokReadRejection {
@@ -278,7 +293,7 @@ impl GrokAdapter {
         });
         let first = candidates.next();
         if candidates.next().is_some() {
-            anyhow::bail!("multiple Grok summaries match session `{id}` in different directories");
+            return Err(GrokHistoryError::ConflictingSummaries(id.to_owned()).into());
         }
         Ok(first)
     }
@@ -586,6 +601,7 @@ struct PendingMessage {
     text: String,
     content: Vec<Value>,
     alternate_content: Vec<(usize, Vec<Value>)>,
+    alternate_markers: Vec<(usize, Value)>,
     content_unreadable: bool,
     cumulative_text: Option<(usize, String)>,
     has_source_text: bool,
@@ -635,13 +651,12 @@ fn can_fork_summary(id: &str, summary: &Value) -> bool {
                 .as_str()
                 .is_some_and(|time| DateTime::parse_from_rfc3339(time).is_ok())
         })
-        && [
-            "num_chat_messages",
-            "chat_format_version",
-            "next_trace_turn",
-        ]
-        .iter()
-        .all(|key| summary.get(key).is_none_or(Value::is_u64))
+        && summary
+            .get("chat_format_version")
+            .is_none_or(|version| version.as_u64().is_some_and(|v| u8::try_from(v).is_ok()))
+        && ["num_chat_messages", "next_trace_turn"]
+            .iter()
+            .all(|key| summary.get(key).is_none_or(Value::is_u64))
         && summary.get("git_remotes").is_none_or(|value| {
             value
                 .as_array()
@@ -765,7 +780,11 @@ struct NativeMessageGroup {
 }
 
 fn redundant_damaged_text(body: &Value, canonical: &Value) -> bool {
-    let Some(mut remaining) = block_text(canonical).filter(|text| !text.is_empty()) else {
+    let mut remaining = if let Some(text) = block_text(canonical).filter(|text| !text.is_empty()) {
+        text
+    } else if attachment_block(canonical) && message_blocks(body).contains(canonical) {
+        ""
+    } else {
         return false;
     };
     for block in message_blocks(body) {
@@ -982,7 +1001,7 @@ fn unique_summary(id: &str, paths: Vec<PathBuf>) -> Result<Option<(Value, PathBu
         .filter_map(|path| matching_summary(id, path));
     let first = matching.next();
     if matching.next().is_some() {
-        anyhow::bail!("multiple Grok summaries match session `{id}` in different directories");
+        return Err(GrokHistoryError::ConflictingSummaries(id.to_owned()).into());
     }
     Ok(first)
 }
@@ -1066,7 +1085,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v11");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v12");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1171,6 +1190,7 @@ struct GrokUpdateProcessor {
     pending: Option<PendingMessage>,
     preservation: GrokPreservationBudget,
     unsupported_text_records: usize,
+    possible_message_records: usize,
     malformed_updates: usize,
 }
 
@@ -1280,6 +1300,9 @@ impl GrokUpdateProcessor {
                 self.malformed_updates = self.malformed_updates.saturating_add(1);
             } else if kind == EventKind::ProviderEvent && update_type != "tool_call_update" {
                 self.unsupported_text_records = self.unsupported_text_records.saturating_add(1);
+                if !matches!(update_type, "session_info_update" | "usage_update") {
+                    self.possible_message_records = self.possible_message_records.saturating_add(1);
+                }
             }
             let mut update = update;
             if kind == EventKind::PlanUpdated
@@ -1315,8 +1338,9 @@ impl GrokUpdateProcessor {
         }
         let message_id = grok_message_id(update).map(str::to_owned);
         let omitted_before = self.preservation.omitted_events;
+        let mut alternate_markers = Vec::new();
         let (mut text, content, content_unreadable, mut has_source_text) =
-            message_content(update, &mut self.preservation);
+            message_content(update, &mut self.preservation, &mut alternate_markers);
         let cumulative_text = if has_source_text && cumulative_fallback(update).is_some() {
             has_source_text = false;
             Some(std::mem::take(&mut text))
@@ -1343,6 +1367,12 @@ impl GrokUpdateProcessor {
                     pending.cumulative_text = Some((pending.text.len(), text));
                 }
                 pending.has_source_text |= has_source_text;
+                let offset = pending.text.len();
+                pending.alternate_markers.extend(
+                    alternate_markers
+                        .into_iter()
+                        .map(|(pos, block)| (pos + offset, block)),
+                );
                 pending.text.push_str(&text);
                 pending.content.extend(content);
                 pending.alternate_content.extend(
@@ -1357,6 +1387,7 @@ impl GrokUpdateProcessor {
                 self.pending = Some(PendingMessage {
                     kind,
                     text,
+                    alternate_markers,
                     alternate_content: alternate
                         .into_iter()
                         .map(|view| (content.len(), view))
@@ -1391,6 +1422,7 @@ impl GrokUpdateProcessor {
         if unsupported_text_records > 0 {
             builder.push(EventKind::ProviderEvent,
                 json!({"unsupported_text_records": unsupported_text_records,
+                    "possible_message_records": std::mem::take(&mut self.possible_message_records),
                     "raw_records_preserved": true,
                     "reason": "Unknown Grok updates remain historical metadata; their text cannot be transferred safely"}),
                 None, ReplayPolicy::HistoricalOnly,
@@ -1470,9 +1502,7 @@ fn classify_message_block(block: &Value) -> MessageBlock<'_> {
         Some("image" | "audio" | "resource_link" | "resource") => {
             let has_image_uri = block["type"] == "image"
                 && block["uri"].as_str().is_some_and(|uri| !uri.is_empty());
-            let empty_media = matches!(block["type"].as_str(), Some("image" | "audio"))
-                && block["data"] == ""
-                && !has_image_uri;
+            let empty_media = block["type"] == "image" && block["data"] == "" && !has_image_uri;
             if native_message_block(block) && !empty_media {
                 MessageBlock::Attachment
             } else {
@@ -1546,6 +1576,7 @@ fn cumulative_fallback(update: &Value) -> Option<&Value> {
 fn message_content(
     update: &Value,
     preservation: &mut GrokPreservationBudget,
+    alternate_markers: &mut Vec<(usize, Value)>,
 ) -> (String, Vec<Value>, bool, bool) {
     let mut has_source_text = false;
     let mut text = String::new();
@@ -1564,6 +1595,12 @@ fn message_content(
                 .filter(|block| block["type"] == "text" && block["text"] == "")
         });
     if let Some(content) = body {
+        let deferred = message_bodies(update)
+            .next()
+            .is_some_and(|primary| !std::ptr::eq(primary, content))
+            && !message_blocks(content)
+                .iter()
+                .any(|block| block_text(block).is_some_and(|text| !text.is_empty()));
         for block in message_blocks(content) {
             match classify_message_block(block) {
                 MessageBlock::Text(chunk) => {
@@ -1584,18 +1621,14 @@ fn message_content(
                     if !preservation.retain(block) {
                         continue;
                     }
-                    if !text.is_empty() {
-                        text.push('\n');
+                    if deferred {
+                        alternate_markers.push((text.len(), block.clone()));
+                    } else {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(attachment_notice(block));
                     }
-                    text.push_str(match block["type"].as_str() {
-                        Some("image") => {
-                            "[Source image attachment preserved as historical metadata]"
-                        }
-                        Some("audio") => {
-                            "[Source audio attachment preserved as historical metadata]"
-                        }
-                        _ => "[Source nontext content preserved as historical metadata]",
-                    });
                     historical_content.push(block.clone());
                     continue;
                 }
@@ -1622,7 +1655,8 @@ fn message_content(
                 let retained = seen.entry(block).or_default();
                 if *count > *retained {
                     *retained = *count;
-                    content_unreadable |= partial_attachment_block(block);
+                    content_unreadable |= partial_attachment_block(block)
+                        || matches!(classify_message_block(block), MessageBlock::Malformed(Some(text)) if !text.is_empty());
                     if preservation.retain(block) {
                         historical_content.push(block.clone());
                     }
@@ -1820,15 +1854,56 @@ fn reconcile_message_evidence(chunks: Vec<Value>, views: &[(usize, Vec<Value>)])
     result
 }
 
+fn attachment_notice(block: &Value) -> &'static str {
+    match block["type"].as_str() {
+        Some("image") => "[Source image attachment preserved as historical metadata]",
+        Some("audio") => "[Source audio attachment preserved as historical metadata]",
+        _ => "[Source nontext content preserved as historical metadata]",
+    }
+}
+
 fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage>) {
     let Some(pending) = pending.take() else {
         return;
     };
     let mut text = pending.text;
+    let mut additions = Vec::new();
     if !pending.has_source_text
         && let Some((offset, fallback)) = pending.cumulative_text
     {
-        text.insert_str(offset, &fallback);
+        additions.push((offset, fallback));
+    }
+    let mut canonical = HashMap::new();
+    if !pending.alternate_markers.is_empty() {
+        for block in &pending.content {
+            *canonical.entry(block.clone()).or_insert(0usize) += 1;
+        }
+    }
+    let content = reconcile_message_evidence(pending.content, &pending.alternate_content);
+    if !pending.alternate_markers.is_empty() {
+        let mut available = HashMap::new();
+        for block in &content {
+            *available.entry(block).or_insert(0usize) += 1;
+        }
+        for (offset, block) in &pending.alternate_markers {
+            let used = canonical.entry(block.clone()).or_default();
+            if *used < available.get(block).copied().unwrap_or_default() {
+                additions.push((*offset, attachment_notice(block).to_owned()));
+                *used += 1;
+            }
+        }
+    }
+    if !additions.is_empty() {
+        additions.sort_by_key(|(offset, _)| *offset);
+        let mut rendered = String::with_capacity(text.len());
+        let mut start = 0;
+        for (offset, addition) in additions {
+            rendered.push_str(&text[start..offset]);
+            rendered.push_str(&addition);
+            start = offset;
+        }
+        rendered.push_str(&text[start..]);
+        text = rendered;
     }
     let mut payload = json!({ "text": text });
     if pending.content_unreadable {
@@ -1837,7 +1912,6 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
             payload["message_id"] = Value::String(id);
         }
     }
-    let content = reconcile_message_evidence(pending.content, &pending.alternate_content);
     let opaque = content
         .iter()
         .filter(|block| matches!(classify_message_block(block), MessageBlock::Opaque))
@@ -2444,20 +2518,48 @@ mod tests {
         let descriptor = json!({"type":"image","data":"YWJj"});
         let empty_text = json!({"type":"text","text":""});
         let body = json!({"content":empty_text,"message":{"content":[descriptor]}});
-        let (text, retained, partial, _) =
-            message_content(&body, &mut GrokPreservationBudget::default());
+        let (text, retained, partial, _) = message_content(
+            &body,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
         assert!(partial);
         assert!(text.contains("content unreadable"));
         assert_eq!(retained, [descriptor]);
         let descriptor = json!({"type":"image","mimeType":"image/png","text":""});
         let body = json!({"content":descriptor,"message":{"text":"recovered reply"}});
-        let (text, retained, partial, _) =
-            message_content(&body, &mut GrokPreservationBudget::default());
+        let (text, retained, partial, _) = message_content(
+            &body,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
         assert!(partial);
         assert_eq!(text, "recovered reply");
         assert_eq!(retained, [descriptor]);
         let image = json!({"type":"image","data":"","mimeType":"image/png","uri":"file:///synthetic/image"});
         assert!(native_message_content(&json!({"content":image})));
+    }
+
+    #[test]
+    fn repeated_attachment_view_has_one_rendered_notice() {
+        let resource = json!({"type":"resource","resource":{"uri":"fixture:r","text":"data"}});
+        let chunk = |content: Value| json!({"sessionUpdate":"agent_message_chunk","messageId":"reply","content":content});
+        let mut cumulative = chunk(json!({"type":"text","text":""}));
+        cumulative["message"] = json!({"content":[resource]});
+        for updates in [
+            vec![chunk(resource.clone()), cumulative.clone()],
+            vec![cumulative.clone(), chunk(resource.clone())],
+            vec![cumulative],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_session(root.path(), SESSION_ID, &json!({"id":SESSION_ID}), &updates);
+            let snapshot = GrokAdapter::with_root(root.path())
+                .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+                .unwrap();
+            let message = &snapshot.events[0].payload;
+            assert_eq!(message["text"], attachment_notice(&resource));
+            assert_eq!(message["content"], json!([resource]));
+        }
     }
 
     #[test]
@@ -2482,16 +2584,22 @@ mod tests {
         let mime = json!({"type":"image","mimeType":"image/png","text":""});
         let data = json!({"type":"image","data":"YWJj"});
         let update = json!({"content":mime,"message":{"content":[mime,data]}});
-        let (_, retained, partial, _) =
-            message_content(&update, &mut GrokPreservationBudget::default());
+        let (_, retained, partial, _) = message_content(
+            &update,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
         assert!(partial);
         assert_eq!(retained, [mime, data]);
         let resource =
             json!({"type":"resource","resource":{"uri":"fixture:item","text":"embedded"}});
         let update = json!({"content":{"type":"text","text":""},"text":"reply",
             "message":{"content":[{"type":"text","text":"reply"},resource]}});
-        let (text, retained, _, _) =
-            message_content(&update, &mut GrokPreservationBudget::default());
+        let (text, retained, _, _) = message_content(
+            &update,
+            &mut GrokPreservationBudget::default(),
+            &mut Vec::new(),
+        );
         assert_eq!(text, "reply");
         assert_eq!(retained, [resource]);
     }
@@ -2580,6 +2688,21 @@ mod tests {
                 partial
             );
         }
+    }
+
+    #[test]
+    fn native_fork_keeps_repeated_resources_and_empty_audio() {
+        let resource =
+            json!({"type":"resource","resource":{"uri":"file:///sample","text":"contents"}});
+        let audio = json!({"type":"audio","data":"","mimeType":"audio/wav"});
+        assert!(attachment_block(&audio));
+        assert!(!attachment_block(
+            &json!({"type":"audio","data":7,"mimeType":"audio/wav"})
+        ));
+        let repeated = json!([resource, {"type":"text"}]);
+        assert!(redundant_damaged_text(&repeated, &resource));
+        let extra_text = json!([resource, {"type":"text"}, "additional"]);
+        assert!(!redundant_damaged_text(&extra_text, &resource));
     }
 
     #[test]
@@ -3265,16 +3388,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_fork_requires_the_fields_read_by_grok() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let complete = json!({"info":{"id":SESSION_ID,"cwd":project},"session_summary":"Title","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","current_model_id":"synthetic","num_messages":0});
+    fn check_native_summary_fields(complete: &Value) {
+        for (version, valid) in [(255, true), (256, false)] {
+            let mut summary = complete.clone();
+            summary["chat_format_version"] = json!(version);
+            assert_eq!(can_fork_summary(SESSION_ID, &summary), valid);
+        }
         let mut titled = complete.clone();
         titled["generated_title"] = json!({});
         assert!(!can_fork_summary(SESSION_ID, &titled));
         titled["generated_title"] = json!("A title");
         assert!(can_fork_summary(SESSION_ID, &titled));
+    }
+
+    #[test]
+    fn native_fork_requires_the_fields_read_by_grok() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let complete = json!({"info":{"id":SESSION_ID,"cwd":project},"session_summary":"Title","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","current_model_id":"synthetic","num_messages":0});
+        check_native_summary_fields(&complete);
         let directory = write_session(root.path(), SESSION_ID, &complete, &[]);
         let native_group = root
             .path()
@@ -3581,6 +3713,7 @@ mod tests {
         let mut processor = GrokUpdateProcessor {
             pending: None,
             unsupported_text_records: 0,
+            possible_message_records: 0,
             malformed_updates: 0,
             preservation: GrokPreservationBudget {
                 bytes_left: 2_048,
@@ -3644,6 +3777,7 @@ mod tests {
         let mut processor = GrokUpdateProcessor {
             pending: None,
             unsupported_text_records: 0,
+            possible_message_records: 0,
             malformed_updates: 0,
             preservation: GrokPreservationBudget {
                 bytes_left: 64 * 1024,

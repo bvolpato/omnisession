@@ -810,6 +810,11 @@ fn codex_preview_update(
 
 fn reports_incomplete_preview(event: &omnis_ir::OmniEvent) -> bool {
     if event.source.provider == Provider::Grok {
+        if event.source.raw_record_type.as_deref() == Some("omnisession.unsupported_history") {
+            return event.payload["possible_message_records"]
+                .as_u64()
+                .is_some_and(|count| count > 0);
+        }
         return matches!(
             event.source.raw_record_type.as_deref(),
             Some(
@@ -1428,6 +1433,47 @@ mod grok_preview_tests {
     use super::*;
     use omnis_ir::SessionRef;
     use omnis_store::{TrajectoryIndexState, TrajectorySourceGuard};
+
+    #[test]
+    fn grok_preview_qualifies_message_counts_for_unclassified_updates() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let id = "11111111-2222-4333-8444-555555555555";
+        let directory = root.path().join("sessions").join(id);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("summary.json"),
+            serde_json::json!({"id":id,"num_messages":1}).to_string(),
+        )?;
+        let adapter = GrokAdapter::with_root(root.path());
+        for (update, uncertain) in [
+            (
+                serde_json::json!({"sessionUpdate":"future_message_chunk","data":{"text":"Example"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"session_info_update","title":"Example"}),
+                false,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"usage_update","used":1,"size":10}),
+                false,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"user_message_chunk","content":{"type":"image","mimeType":"image/png","data":"aGVsbG8="}}),
+                false,
+            ),
+        ] {
+            std::fs::write(directory.join("updates.jsonl"), update.to_string())?;
+            let read = adapter.index_session(&SessionRef::new(Provider::Grok, id), None, 0)?;
+            assert!(read.source_complete);
+            assert_eq!(
+                read.snapshot.events.iter().any(reports_incomplete_preview),
+                uncertain,
+                "{update}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn picker_receives_grok_rejections_and_their_removal() -> Result<()> {
