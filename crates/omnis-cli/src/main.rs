@@ -184,8 +184,8 @@ impl IndexedSessionReader for AdapterRegistry {
         let snapshot = &mut read.snapshot;
         match cache {
             Ok((store, observation)) => {
-                let retained_name = read.native_session.as_ref().and_then(|native| {
-                    retained_snapshot_name(
+                let unresolved_name = read.native_session.as_ref().is_some_and(|native| {
+                    observe_snapshot_name_source(
                         &store,
                         native,
                         read.source_revision,
@@ -193,7 +193,7 @@ impl IndexedSessionReader for AdapterRegistry {
                     )
                     .unwrap_or_else(|error| {
                         eprintln!("warning: local session title unavailable: {error}");
-                        None
+                        false
                     })
                 });
                 let prior = observation.state;
@@ -223,8 +223,29 @@ impl IndexedSessionReader for AdapterRegistry {
                     Some(self),
                     search_index::source_guard(session.provider, prior.as_ref()),
                 ) {
-                    Ok(_) if read.snapshot.title.is_none() => read.snapshot.title = retained_name,
-                    Ok(_) => {}
+                    Ok(_) if unresolved_name => {
+                        match store.retained_codex_name(session, read.source_revision) {
+                            Ok(Some(name)) => read.snapshot.title = Some(name),
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("warning: local session title unavailable: {error}");
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(name @ NativeSessionName::Named(_)) = name_observation.as_ref()
+                            && let Some(native) = &read.native_session
+                            && name.confirms(native.title.as_deref())
+                            && let Err(error) = search_index::observe_codex_name_source(
+                                &store,
+                                native,
+                                read.source_revision,
+                                Some(name),
+                            )
+                        {
+                            eprintln!("warning: local session title unavailable: {error}");
+                        }
+                    }
                     Err(error) => {
                         if name_observation == Some(NativeSessionName::Unknown) {
                             read.snapshot.title = None;
@@ -239,24 +260,23 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
-fn retained_snapshot_name(
+fn observe_snapshot_name_source(
     store: &Store,
     native: &NativeSession,
     revision: SourceRevision,
     name: Option<&NativeSessionName>,
-) -> Result<Option<String>> {
+) -> Result<bool> {
     if !native
         .source_revision
         .is_some_and(|selected| selected.matches_file_contents(revision))
     {
-        return Ok(None);
+        return Ok(false);
     }
-    let confirmed = search_index::verified_name_coverage(name, Some(native))?;
+    if name != Some(&NativeSessionName::Unknown) || native.title.is_some() {
+        return Ok(false);
+    }
     search_index::observe_codex_name_source(store, native, revision, name)?;
-    if !confirmed && name == Some(&NativeSessionName::Unknown) {
-        return Ok(store.retained_codex_name(&native.session, revision)?);
-    }
-    Ok(None)
+    Ok(true)
 }
 
 fn selected_read_metadata(

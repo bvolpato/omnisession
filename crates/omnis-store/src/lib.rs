@@ -3185,13 +3185,15 @@ impl Store {
         if session.provider != Provider::Codex {
             return Ok(None);
         }
-        self.connection.borrow().query_row("SELECT title FROM (
+        self.connection.borrow().query_row("SELECT full_name FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+            AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS NOT NULL
+            UNION ALL SELECT title FROM (
             SELECT title,source_file_id,source_contents_id,codex_home FROM codex_inactive_pending_names
              WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
                AND codex_home=(SELECT home FROM current_codex_home) AND evidence='provider_name'
             UNION ALL SELECT title,source_file_id,source_contents_id,codex_home FROM codex_pending_catalog_titles
              WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1) AND evidence='provider_name')
-            WHERE codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2 AND source_contents_id=?3 LIMIT 1",
+            WHERE length(title)<240 AND codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2 AND source_contents_id=?3 LIMIT 1",
             params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)],|r|r.get(0)).optional().map_err(database_error)
     }
 
@@ -3204,17 +3206,19 @@ impl Store {
         &self,
         session: &SessionRef,
         revision: SourceRevision,
+        name: &str,
     ) -> Result<bool> {
         self.connection
             .borrow()
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM codex_name_source_prefixes
                 WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
-                  AND source_file_id=?2 AND source_contents_id=?3)",
+                  AND source_file_id=?2 AND source_contents_id=?3 AND full_name=?4)",
                 params![
                     session.id,
                     revision.file.map(Uuid::into_bytes),
-                    revision.contents.map(Uuid::into_bytes)
+                    revision.contents.map(Uuid::into_bytes),
+                    omnis_core::redact_secrets(name)
                 ],
                 |r| r.get(0),
             )
@@ -3230,17 +3234,20 @@ impl Store {
         &self,
         session: &SessionRef,
         revision: SourceRevision,
+        name: &str,
         bytes: u64,
         digest: [u8; 32],
     ) -> Result<()> {
         if let (Provider::Codex, Some(file), Some(contents)) =
             (session.provider, revision.file, revision.contents)
         {
-            self.connection.borrow().execute("INSERT INTO codex_name_source_prefixes
-              SELECT ?1,home,?2,?3,?4,?5 FROM current_codex_home WHERE home IS NOT NULL
+            self.connection.borrow().execute("INSERT INTO codex_name_source_prefixes(session_id,codex_home,source_file_id,source_contents_id,source_bytes,digest,full_name)
+              SELECT ?1,home,?2,?3,?4,?5,?6 FROM current_codex_home h WHERE EXISTS (
+                SELECT 1 FROM session_index i WHERE i.provider='codex' AND i.session_id=?1 AND i.codex_home=h.home
+                  AND i.source_file_id=?2 AND i.source_contents_id=?3 AND i.title=?6 AND NOT i.codex_legacy_name)
               ON CONFLICT(session_id,codex_home) DO UPDATE SET source_file_id=excluded.source_file_id,
-              source_contents_id=excluded.source_contents_id,source_bytes=excluded.source_bytes,digest=excluded.digest",
-              params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(bytes).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
+              source_contents_id=excluded.source_contents_id,source_bytes=excluded.source_bytes,digest=excluded.digest,full_name=excluded.full_name",
+              params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(bytes).map_err(|_| StoreError::InvalidSessionReference)?,digest,omnis_core::redact_secrets(name)]).map_err(database_error)?;
         }
         Ok(())
     }
@@ -3258,13 +3265,23 @@ impl Store {
         if session.provider != Provider::Codex {
             return Ok(None);
         }
-        self.connection.borrow().query_row("SELECT b.source_bytes FROM codex_name_source_prefixes b
-             JOIN session_trajectories t ON t.provider='codex' AND t.session_id=b.session_id
-             JOIN codex_inactive_pending_names n ON n.trajectory_id=t.id AND n.codex_home=b.codex_home
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT b.source_bytes FROM codex_name_source_prefixes b
              WHERE b.session_id=?1 AND b.codex_home=(SELECT home FROM current_codex_home)
-             AND n.evidence='provider_name' AND n.source_file_id=b.source_file_id AND n.source_contents_id=b.source_contents_id
+             AND b.full_name IS NOT NULL AND b.source_bytes>0
              AND b.source_file_id=?2 AND b.source_contents_id<>?3",
-             params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)],|r|r.get::<_,u32>(0)).optional().map_err(database_error).map(|size|size.map(u64::from))
+                params![
+                    session.id,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+                |r| r.get::<_, u32>(0),
+            )
+            .optional()
+            .map_err(database_error)
+            .map(|size| size.map(u64::from))
     }
 
     /// Advances a saved assignment when the old file's entire byte sequence is still its prefix.
@@ -3284,27 +3301,31 @@ impl Store {
         else {
             return Ok(());
         };
-        if prior.0 == 0 || current.is_some_and(|(length, _)| length <= prior.0) {
+        if prior.0 == 0 || current.is_some_and(|(length, _)| length < prior.0) {
             return Ok(());
         }
         let mut connection = self.connection.borrow_mut();
         let tx = immediate_transaction(&mut connection)?;
-        let changed=tx.execute("UPDATE codex_inactive_pending_names AS n SET source_contents_id=?3
-            FROM codex_name_source_prefixes b WHERE b.session_id=?1 AND b.codex_home=(SELECT home FROM current_codex_home)
-            AND b.source_file_id=?2 AND b.source_contents_id<>?3 AND b.source_bytes=?4 AND b.digest=?5
-            AND n.trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
-            AND n.codex_home=b.codex_home AND n.evidence='provider_name'
-            AND n.source_file_id=b.source_file_id AND n.source_contents_id=b.source_contents_id",
-            params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(prior.0).map_err(|_| StoreError::InvalidSessionReference)?,prior.1]).map_err(database_error)?;
-        if changed != 0 {
-            if let Some((length, digest)) = current {
-                tx.execute("UPDATE codex_name_source_prefixes SET source_contents_id=?2,source_bytes=?3,digest=?4
-                       WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
-                       params![session.id,contents.into_bytes(),i64::try_from(length).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
-            } else {
-                tx.execute("DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
-                    [&session.id]).map_err(database_error)?;
+        let length = i64::try_from(prior.0).map_err(|_| StoreError::InvalidSessionReference)?;
+        let previous = tx.query_row("SELECT source_contents_id FROM codex_name_source_prefixes WHERE session_id=?1
+            AND codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2 AND source_contents_id<>?3
+            AND source_bytes=?4 AND digest=?5 AND full_name IS NOT NULL",
+            params![session.id,file.into_bytes(),contents.into_bytes(),length,prior.1],|r|r.get::<_,[u8;16]>(0)).optional().map_err(database_error)?;
+        if let Some(previous) = previous {
+            for table in [
+                "codex_inactive_pending_names",
+                "codex_pending_catalog_titles",
+            ] {
+                tx.execute(&format!("UPDATE {table} SET source_contents_id=?3
+                    WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
+                    AND codex_home=(SELECT home FROM current_codex_home) AND evidence='provider_name'
+                    AND source_file_id=?2 AND source_contents_id=?4"),
+                    params![session.id,file.into_bytes(),contents.into_bytes(),previous]).map_err(database_error)?;
             }
+            let (length, digest) = current.unwrap_or((0, [0; 32]));
+            tx.execute("UPDATE codex_name_source_prefixes SET source_contents_id=?2,source_bytes=?3,digest=?4
+                WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+                params![session.id,contents.into_bytes(),i64::try_from(length).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
         }
         tx.commit().map_err(database_error)
     }
@@ -5135,7 +5156,7 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
             );
             CREATE TABLE IF NOT EXISTS codex_name_source_prefixes (
                 session_id TEXT NOT NULL,codex_home TEXT NOT NULL,source_file_id BLOB NOT NULL,
-                source_contents_id BLOB NOT NULL,source_bytes INTEGER NOT NULL,digest BLOB NOT NULL,
+                source_contents_id BLOB NOT NULL,source_bytes INTEGER NOT NULL,digest BLOB NOT NULL,full_name TEXT,
                 PRIMARY KEY(session_id,codex_home)
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS codex_inactive_pending_names (
@@ -6257,6 +6278,7 @@ impl SelectedMetadata<'_> {
             withdraw_other_home_name(transaction, self.selected, false)?;
         }
         if self.name_observed {
+            discard_superseded_name_source(transaction, self.selected)?;
             resolve_pending_catalog_title(transaction, self.selected, false)?;
         }
         Ok(())
@@ -6643,7 +6665,11 @@ impl PreparedTrajectoryWrite<'_, '_> {
     }
 }
 
-const INACTIVE_HOME_TITLE: &str = "SELECT n.title FROM codex_inactive_pending_names n
+const INACTIVE_HOME_TITLE: &str = "SELECT omnis_compact_search_title(b.full_name) FROM codex_name_source_prefixes b
+    WHERE trajectories.provider='codex' AND trajectories.origin='native' AND b.session_id=trajectories.session_id
+      AND b.codex_home=(SELECT home FROM current_codex_home) AND b.source_file_id=trajectories.source_file_id
+      AND b.source_contents_id=trajectories.source_contents_id AND b.full_name IS NOT NULL
+    UNION ALL SELECT n.title FROM codex_inactive_pending_names n
     WHERE trajectories.provider='codex' AND trajectories.origin='native' AND n.trajectory_id=trajectories.id
       AND n.codex_home=(SELECT home FROM current_codex_home) AND n.source_file_id=trajectories.source_file_id
       AND n.source_contents_id=trajectories.source_contents_id";
@@ -7408,6 +7434,9 @@ fn reconcile_codex_catalog(
             current.get(id).copied()
         };
         let mut row = incoming_row.clone();
+        if row.title.is_some() || names_complete {
+            discard_superseded_name_source(transaction, &row)?;
+        }
         select_pending_name(
             transaction,
             &row.session,
@@ -7619,6 +7648,16 @@ fn pending_codex_catalog_title(
          WHERE t.provider='codex' AND t.session_id=?1 AND p.codex_home=(SELECT home FROM current_codex_home)",
         [&session.id], |row| row.get(0),
     ).optional().map_err(database_error)
+}
+
+fn discard_superseded_name_source(
+    transaction: &Transaction<'_>,
+    row: &IndexedSession,
+) -> Result<()> {
+    transaction.execute("DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+                AND (?2 IS NULL OR full_name IS NOT ?2 OR source_file_id IS NOT ?3)",
+                params![row.session.id,row.title.as_deref().map(omnis_core::redact_secrets),row.source_revision.and_then(|r|r.file).map(Uuid::into_bytes)]).map_err(database_error)?;
+    Ok(())
 }
 
 fn select_pending_name(
@@ -7839,6 +7878,10 @@ fn record_session_check(connection: &Connection, key: &str, checked_at: i64) -> 
 
 /// Older catalogs could lose the source of a verified title during an append.
 fn migrate_pending_catalog_names(transaction: &Transaction<'_>) -> Result<()> {
+    if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('codex_name_source_prefixes') WHERE name='full_name')",
+        [], |row|row.get::<_,bool>(0)).map_err(database_error)? {
+        transaction.execute_batch("ALTER TABLE codex_name_source_prefixes ADD COLUMN full_name TEXT").map_err(database_error)?;
+    }
     let has_evidence: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('codex_pending_catalog_titles') WHERE name='evidence')",
         [], |row| row.get(0),
@@ -14013,7 +14056,7 @@ mod tests {
         outer.upsert_indexed_session(&row).unwrap();
         let original = doc.source_revision;
         outer
-            .record_codex_name_source(&row.session, original, 10, [1; 32])
+            .record_codex_name_source(&row.session, original, "Old label", 10, [1; 32])
             .unwrap();
         row.title = None;
         let refresh = |store: &Store, row: &IndexedSession, complete| {
@@ -14082,6 +14125,9 @@ mod tests {
         );
         row.source_revision = Some(oversized);
         refresh(&outer, &row, true);
+        outer
+            .record_codex_name_source(&row.session, oversized, "Old label", 12, [2; 32])
+            .unwrap();
         assert_eq!(
             outer.retained_codex_name(&row.session, oversized).unwrap(),
             None

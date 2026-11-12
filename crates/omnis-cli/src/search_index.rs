@@ -37,7 +37,7 @@ use omnis_store::{
 use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
-pub(crate) const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const FULL_READ_SOURCE_BYTES: u64 = omnis_adapters::CodexAdapter::FULL_READ_SOURCE_BYTES;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Most threads that read and redact sessions while the calling thread writes the index.
 const MAX_PREPARE_WORKERS: usize = 8;
@@ -488,22 +488,24 @@ fn verify_cached_codex_name(
     store: &Store,
     candidate: &IndexCandidate,
 ) -> Result<()> {
-    if candidate
-        .metadata
-        .as_ref()
-        .is_some_and(|row| row.title.is_none())
-        && let Some(path) = candidate.source_path.as_deref()
-        && let Some(bytes) =
-            store.codex_name_prefix_length(&candidate.session, candidate.source_revision)?
-        && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Unknown)
-    {
-        verify_codex_name_prefix(
-            store,
-            &candidate.session,
-            path,
-            candidate.source_revision,
-            bytes,
-        )?;
+    if let (Some(row), Some(path)) = (&candidate.metadata, candidate.source_path.as_deref()) {
+        let needs_observation = if let Some(name) = row.title.as_deref() {
+            !store.has_codex_name_source(&candidate.session, candidate.source_revision, name)?
+        } else {
+            store
+                .codex_name_prefix_length(&candidate.session, candidate.source_revision)?
+                .is_some()
+        };
+        if needs_observation {
+            let name = native_codex_name(registry, &candidate.session)?;
+            verify_codex_name_source(
+                store,
+                &candidate.session,
+                path,
+                candidate.source_revision,
+                name.as_ref(),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1419,12 +1421,19 @@ fn verify_codex_name_source(
 ) -> Result<()> {
     use omnis_adapters::CodexAdapter;
     match name {
-        Some(NativeSessionName::Named(_)) => {
-            if !store.has_codex_name_source(session, revision)?
-                && let Some((bytes, digest)) =
-                    CodexAdapter::rollout_prefix_hash(path, revision, None)
-            {
-                store.record_codex_name_source(session, revision, bytes, digest)?;
+        Some(NativeSessionName::Named(name)) => {
+            if !store.has_codex_name_source(session, revision, name)? {
+                let receipt =
+                    CodexAdapter::rollout_prefix_hash(path, revision, None).or_else(|| {
+                        (path.metadata().ok()?.len() > FULL_READ_SOURCE_BYTES
+                            && CodexAdapter::index_file_revision(path)?
+                                .matches_file_contents(revision))
+                        .then_some((0, [0; 32]))
+                    });
+                let Some((bytes, digest)) = receipt else {
+                    return Ok(());
+                };
+                store.record_codex_name_source(session, revision, name, bytes, digest)?;
             }
         }
         Some(NativeSessionName::Unknown) => {

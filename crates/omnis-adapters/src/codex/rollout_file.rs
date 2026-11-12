@@ -35,11 +35,11 @@ pub(super) fn jsonl_file_name(path: &Path) -> Option<&Path> {
     (plain.extension()? == "jsonl").then_some(plain)
 }
 
-const TITLE_PREFIX_LIMIT: u64 = 8 * 1024 * 1024;
-
 impl super::CodexAdapter {
-    /// Hashes all raw bytes of a verified rollout, or its exact former length after an append.
-    /// Returns no evidence if the requested prefix exceeds 8 MiB or the file changes during the read.
+    pub const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+    /// Hashes a verified rollout through its current or previously recorded length.
+    /// Returns no evidence if the requested prefix exceeds the full-read budget or the file changes during the read.
     #[must_use]
     pub fn rollout_prefix_hash(
         path: &Path,
@@ -63,8 +63,8 @@ impl super::CodexAdapter {
         let length = bytes.unwrap_or(metadata.len());
         if source.physical_identity.is_none()
             || !expected.matches_file_contents(source.revision)
-            || !(1..=TITLE_PREFIX_LIMIT).contains(&length)
-            || bytes.is_some_and(|prior| prior >= metadata.len())
+            || !(1..=Self::FULL_READ_SOURCE_BYTES).contains(&length)
+            || length > metadata.len()
         {
             return None;
         }
@@ -312,7 +312,7 @@ pub(super) fn sample(
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
     // Indexing normally supplies 16 MiB. Keep a larger caller budget from forcing a huge buffer.
-    let budget = budget.min(16 * 1024 * 1024);
+    let budget = budget.min(super::CodexAdapter::FULL_READ_SOURCE_BYTES);
     reader.by_ref().take(budget + 1).read_to_end(&mut prefix)?;
     if u64::try_from(prefix.len())? <= budget {
         return Ok(Sample::Complete(prefix));
@@ -390,9 +390,20 @@ mod tests {
         let prior = revision();
         let receipt = capture(None).unwrap();
         assert_eq!(receipt.1.as_slice(), &Sha256::digest(&original)[..]);
-        assert!(capture(Some(receipt.0)).is_none());
         let mut file = fs::OpenOptions::new().write(true).open(&path)?;
-        file.set_len(TITLE_PREFIX_LIMIT + 1)?;
+        file.set_modified(file.metadata()?.modified()? + std::time::Duration::from_secs(2))?;
+        assert_eq!(capture(Some(receipt.0)), Some(receipt));
+        assert!(capture(Some(receipt.0 + 1)).is_none());
+        file.write_all(b"z")?;
+        assert_ne!(capture(Some(receipt.0)).unwrap().1, receipt.1);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(b"a")?;
+        let budget = 16 * 1024 * 1024;
+        file.set_len(budget)?;
+        let at_limit = capture(None).unwrap();
+        assert_eq!(at_limit.0, budget);
+        file.set_len(budget + 1)?;
+        assert_eq!(capture(Some(budget)), Some(at_limit));
         assert!(capture(None).is_none());
         assert!(CodexAdapter::rollout_prefix_hash(&path, prior, Some(receipt.0)).is_none());
         assert_eq!(capture(Some(receipt.0)), Some(receipt));

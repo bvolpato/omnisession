@@ -73,7 +73,7 @@ fn returning_home_recovers_its_verified_title_for_show_and_handoff() {
         assert!(output.status.success(), "{}", stderr(&output));
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
-    let title = "Verified outer name";
+    let title = format!("{}verified tag", "Cobalt ".repeat(41));
     let sidecar = outer.join("session_index.jsonl");
     let assignment = json!({"id":SESSION_ID, "thread_name":title});
     fs::write(&sidecar, format!("{assignment}\n")).unwrap();
@@ -91,22 +91,34 @@ fn returning_home_recovers_its_verified_title_for_show_and_handoff() {
             ],
         )
     };
+    let append_reply = || {
+        let reply = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"Additional verified reply"}]}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{reply}"
+        )
+        .unwrap();
+    };
+    append_reply();
+    assert_eq!(run(&outer, &["show", &session])["title"], title);
+    append_reply();
+    let check_handoff = || {
+        let handoff = run(&outer, &["handoff", &session]);
+        let document = fs::read_to_string(handoff["output"].as_str().unwrap()).unwrap();
+        assert!(document.contains(&title));
+        assert!(document.contains("Additional verified reply"));
+    };
+    check_handoff();
     visit_inner();
-    let handoff = run(&outer, &["handoff", &session]);
-    let document = fs::read_to_string(handoff["output"].as_str().unwrap()).unwrap();
-    assert!(document.contains(title));
-    assert!(document.contains(FINAL_PROMPT));
+    check_handoff();
 
     visit_inner();
-    let reply = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
-        "content":[{"type":"output_text","text":"Additional verified reply"}]}});
-    writeln!(
-        fs::OpenOptions::new().append(true).open(&source).unwrap(),
-        "{reply}"
-    )
-    .unwrap();
+    append_reply();
     assert_eq!(run(&outer, &["show", &session])["title"], title);
     fs::write(&sidecar, "").unwrap();
+    assert!(run(&outer, &["show", &session])["title"].is_null());
+    fs::write(&sidecar, "{").unwrap();
     assert!(run(&outer, &["show", &session])["title"].is_null());
 }
 
