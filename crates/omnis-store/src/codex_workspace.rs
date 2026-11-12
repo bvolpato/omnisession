@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     DATABASE_FILE_NAME, PreparedTrajectoryWrite, Result, SessionTrajectoryOrigin, StoreError,
-    TrajectorySourceGuard, database_error, reject_symlink, state_root,
+    TrajectorySourceGuard, active_codex_home, database_error, reject_symlink, state_root,
 };
 
 const UNCERTAIN_LEGACY_SOURCE: &str =
@@ -79,9 +79,7 @@ impl CodexWorkspace {
     ///
     /// Returns an error if the workspace index cannot be read.
     pub fn discovery_index(file: Option<Uuid>) -> Result<CodexWorkspaceIndex> {
-        let mut connection = open_index()?;
-        let transaction = connection.transaction().map_err(database_error)?;
-        Self::discovery_index_from(&transaction, file)
+        with_index(|connection| Self::discovery_index_from(connection, file))
     }
 
     pub(super) fn discovery_index_from(
@@ -107,7 +105,7 @@ impl CodexWorkspace {
         }
         let pending_rows = pending_queries.join(" UNION ");
         let workspace_rows = if settings_checked {
-            format!(" UNION ALL SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0
+            format!(" UNION ALL SELECT w.trajectory_id,w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0
                 FROM codex_indexed_workspaces w
                 WHERE NOT EXISTS(SELECT 1 FROM pending p WHERE p.trajectory_id=w.trajectory_id
                     AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id)
@@ -116,8 +114,11 @@ impl CodexWorkspace {
             String::new()
         };
         let sql = format!(
-            "WITH pending AS ({pending_rows})
-            SELECT source_file_id,source_contents_id,NULL,NULL,1 FROM pending{workspace_rows}"
+            "WITH pending AS ({pending_rows}), observations AS (
+                SELECT trajectory_id,source_file_id,source_contents_id,NULL AS project_path,NULL AS git_branch,1 AS pending
+                FROM pending{workspace_rows})
+             SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,w.pending
+             FROM observations w JOIN visible_trajectories t ON t.id=w.trajectory_id"
         );
         let filter = file.map(Uuid::into_bytes);
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
@@ -145,21 +146,22 @@ impl CodexWorkspace {
     ///
     /// Returns an error if the search catalog cannot be read.
     pub fn refresh_hints() -> Result<HashMap<Uuid, Self>> {
-        let connection = open_index()?;
         let sql = "SELECT t.source_file_id,t.source_contents_id,c.project_path,c.git_branch
-             FROM session_trajectories t JOIN session_index c USING(provider,session_id)
+             FROM visible_trajectories t JOIN scoped_session_index c USING(provider,session_id)
              WHERE t.provider='codex' AND t.origin='native' AND t.source_complete=1
                AND t.document_version < ?1 AND c.project_path IS NOT NULL
                AND c.source_file_id=t.source_file_id AND c.source_contents_id=t.source_contents_id";
-        let mut statement = connection.prepare(sql).map_err(database_error)?;
-        statement
-            .query_map(
-                [omnis_core::search_document_version(Provider::Codex)],
-                workspace_row,
-            )
-            .map_err(database_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(database_error)
+        with_index(|connection| {
+            let mut statement = connection.prepare(sql).map_err(database_error)?;
+            statement
+                .query_map(
+                    [omnis_core::search_document_version(Provider::Codex)],
+                    workspace_row,
+                )
+                .map_err(database_error)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(database_error)
+        })
     }
 
     pub(super) fn record(
@@ -187,7 +189,7 @@ impl CodexWorkspace {
             .into_bytes();
         let saved = transaction.execute(
             "INSERT INTO codex_indexed_workspaces(trajectory_id,source_file_id,source_contents_id,project_path,git_branch)
-             SELECT id,source_file_id,source_contents_id,?4,?5 FROM session_trajectories
+             SELECT id,source_file_id,source_contents_id,?4,?5 FROM visible_trajectories
              WHERE provider='codex' AND session_id=?1 AND origin='native'
                AND source_file_id=?2 AND source_contents_id IS ?3 AND content_hash=?6
                AND (NOT ?7 OR source_complete)
@@ -203,7 +205,7 @@ impl CodexWorkspace {
                 && self.source_revision == revision
                 && transaction.query_row(
                     "SELECT EXISTS (
-                         SELECT 1 FROM session_trajectories t JOIN codex_indexed_workspaces w ON w.trajectory_id=t.id
+                         SELECT 1 FROM visible_trajectories t JOIN codex_indexed_workspaces w ON w.trajectory_id=t.id
                          WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native' AND t.source_complete
                            AND t.source_file_id=?2 AND t.source_contents_id=?3
                            AND w.source_file_id=t.source_file_id AND w.source_contents_id=t.source_contents_id
@@ -220,12 +222,13 @@ impl CodexWorkspace {
         }
         transaction.execute(
             "DELETE FROM codex_workspace_rechecks WHERE source_file_id=?1 AND source_contents_id=?2
-             AND trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?3)",
+             AND trajectory_id=(SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?3)",
             params![file, contents, session.id],
         ).map_err(database_error)?;
         transaction.execute(
             "UPDATE session_index SET project_path=?4,git_branch=?5
              WHERE provider='codex' AND session_id=?1 AND source_file_id=?2 AND source_contents_id IS ?3
+               AND codex_home=(SELECT home FROM current_codex_home)
                AND (project_path IS NOT ?4 OR git_branch IS NOT ?5)",
             params![session.id, file, contents, project_path,self.git_branch],
         ).map_err(database_error)?;
@@ -233,12 +236,31 @@ impl CodexWorkspace {
     }
 }
 
-fn open_index() -> Result<Connection> {
+fn with_index<T>(read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     let root = state_root()?;
     reject_symlink(&root)?;
     let path = root.join(DATABASE_FILE_NAME);
     reject_symlink(&path)?;
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(database_error)
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(database_error)?;
+    let snapshot = connection.transaction().map_err(database_error)?;
+    let format: i64 = snapshot
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(database_error)?;
+    if format > crate::STORE_FORMAT {
+        return Err(StoreError::NewerStoreFormat);
+    }
+    if format < 2 {
+        snapshot
+            .execute_batch(
+                "CREATE TEMP VIEW visible_trajectories AS SELECT * FROM main.session_trajectories;
+                 CREATE TEMP VIEW scoped_session_index AS SELECT * FROM main.session_index;",
+            )
+            .map_err(database_error)?;
+    } else {
+        crate::initialize_trajectory_scope(&snapshot, active_codex_home().as_deref())?;
+    }
+    read(&snapshot)
 }
 
 fn workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Uuid, CodexWorkspace)> {
@@ -276,18 +298,43 @@ pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
             [], |row| row.get(0),
         )
         .map_err(database_error)?;
+    let unique_file: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_index_list('codex_indexed_workspaces') WHERE origin='u')",
+            [], |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if unique_file {
+        transaction
+            .execute_batch(
+                "ALTER TABLE codex_indexed_workspaces RENAME TO previous_codex_indexed_workspaces",
+            )
+            .map_err(database_error)?;
+    }
+    if !exists || unique_file {
+        transaction.execute_batch(
+            "CREATE TABLE codex_indexed_workspaces (
+                trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+                source_file_id BLOB NOT NULL CHECK(length(source_file_id)=16),
+                source_contents_id BLOB NOT NULL CHECK(length(source_contents_id)=16),
+                project_path TEXT, git_branch TEXT
+             );
+             CREATE INDEX codex_indexed_workspace_file ON codex_indexed_workspaces(source_file_id);",
+        ).map_err(database_error)?;
+    }
+    if unique_file {
+        // Reindexing a format 1 document gives the same physical file a new, home-scoped owner.
+        transaction.execute_batch(
+            "INSERT INTO codex_indexed_workspaces SELECT * FROM previous_codex_indexed_workspaces;
+             DROP TABLE previous_codex_indexed_workspaces;",
+        ).map_err(database_error)?;
+    }
     if !exists {
         // Version 5 could cache either the creation directory or a later turn's directory.
         // Re-read the selected source once, even if discovery currently points at another copy.
         transaction
         .execute_batch(
-            "CREATE TABLE codex_indexed_workspaces (
-            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
-            source_file_id BLOB NOT NULL UNIQUE CHECK(length(source_file_id)=16),
-            source_contents_id BLOB NOT NULL CHECK(length(source_contents_id)=16),
-            project_path TEXT, git_branch TEXT
-        );
-        UPDATE session_trajectories AS t SET document_version=4
+            "UPDATE session_trajectories AS t SET document_version=4
         WHERE t.document_version=5 AND t.provider='codex' AND t.origin='native' AND t.source_complete
           AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL;",
         )
@@ -330,10 +377,11 @@ fn schedule_legacy_workspace_rechecks(transaction: &Transaction<'_>) -> Result<(
              WHERE p.trajectory_id=w.trajectory_id AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id);
          UPDATE session_index AS c SET project_path=NULL,git_branch=NULL WHERE c.provider='codex' AND EXISTS (
              SELECT 1 FROM codex_workspace_rechecks p JOIN session_trajectories t ON t.id=p.trajectory_id
-             WHERE t.session_id=c.session_id AND p.source_file_id=c.source_file_id AND p.source_contents_id=c.source_contents_id);
+             WHERE t.session_id=c.session_id AND t.codex_home IS c.codex_home
+               AND p.source_file_id=c.source_file_id AND p.source_contents_id=c.source_contents_id);
          UPDATE trajectory_index_failures AS f SET document_version=5 WHERE f.provider='codex' AND f.document_version=6 AND EXISTS (
              SELECT 1 FROM codex_workspace_rechecks p JOIN session_trajectories t ON t.id=p.trajectory_id
-             WHERE t.session_id=f.session_id AND t.source_updated_at IS f.source_updated_at
+             WHERE t.session_id=f.session_id AND t.codex_home IS f.codex_home AND t.source_updated_at IS f.source_updated_at
              AND t.source_file_id=f.source_file_id AND t.source_contents_id=f.source_contents_id
              AND p.source_file_id=f.source_file_id AND p.source_contents_id=f.source_contents_id);
          UPDATE session_trajectories AS t SET document_version=5 WHERE t.provider='codex' AND t.origin='native'
@@ -357,10 +405,52 @@ pub(super) fn recheck_legacy_projections(transaction: &Transaction<'_>) -> Resul
                    AND {stamped} AND {UNCERTAIN_LEGACY_SOURCE});
              UPDATE trajectory_index_failures AS f SET document_version=5
              WHERE f.provider='codex' AND f.document_version=6 AND EXISTS (
-                 SELECT 1 FROM session_trajectories t WHERE t.session_id=f.session_id
+                 SELECT 1 FROM session_trajectories t WHERE t.session_id=f.session_id AND t.codex_home IS f.codex_home
                    AND t.source_file_id=f.source_file_id AND t.source_contents_id=f.source_contents_id
                    AND t.source_updated_at IS f.source_updated_at AND {affected});
              UPDATE session_trajectories AS t SET document_version=5 WHERE {affected};"
         ))
         .map_err(database_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Store, tests::publish_workspace_fixture};
+
+    #[test]
+    fn reindexing_the_same_file_preserves_its_unowned_workspace_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let store = Store::open(&path).unwrap();
+        publish_workspace_fixture(&store);
+        store.connection.borrow().execute_batch(
+            "ALTER TABLE codex_indexed_workspaces RENAME TO current_workspaces;
+             CREATE TABLE codex_indexed_workspaces (
+                 trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+                 source_file_id BLOB NOT NULL UNIQUE,source_contents_id BLOB NOT NULL,project_path TEXT,git_branch TEXT);
+             INSERT INTO codex_indexed_workspaces SELECT trajectory_id,source_file_id,source_contents_id,'old receipt',NULL FROM current_workspaces;
+             DROP TABLE current_workspaces;
+             UPDATE session_trajectories SET codex_home=NULL;
+             UPDATE session_index SET codex_home=NULL;",
+        ).unwrap();
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let (_, workspace, _) = publish_workspace_fixture(&store);
+        let connection = store.connection.borrow();
+        let refreshed = super::CodexWorkspace::discovery_index_from(
+            &connection,
+            workspace.source_revision.file,
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed.verified[&workspace.source_revision.file.unwrap()].project_path,
+            workspace.project_path
+        );
+        let legacy: String = connection.query_row(
+            "SELECT w.project_path FROM codex_indexed_workspaces w JOIN session_trajectories t ON t.id=w.trajectory_id WHERE t.codex_home IS NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(legacy, "old receipt");
+    }
 }

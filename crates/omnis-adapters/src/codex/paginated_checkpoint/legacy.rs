@@ -158,6 +158,16 @@ impl LegacyWindow {
             .collect()
     }
 
+    pub(super) fn retained_items(
+        &self,
+    ) -> impl Iterator<Item = (LegacySource, Option<usize>)> + '_ {
+        self.users.iter().filter_map(|input| {
+            let source = input.source?;
+            (self.display.get(&source) == Some(&None))
+                .then_some((source, input.partial.then_some(input.tokens)))
+        })
+    }
+
     pub(super) fn summary_active(&self, ordinal: u64) -> bool {
         let source = LegacySource::Summary(ordinal);
         (ordinal == self.ordinal && self.summary)

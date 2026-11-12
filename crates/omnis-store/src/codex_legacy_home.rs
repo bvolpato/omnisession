@@ -17,9 +17,10 @@ const CANDIDATES: &str = "SELECT c.provider,c.session_id,c.title,c.project_path,
     c.indexed_at,CASE WHEN d.id IS NOT NULL THEN json_array(d.id,d.source_updated_at,d.indexed_at,
         hex(d.content_hash),hex(d.source_file_id),hex(d.source_contents_id),d.document_version) END
     FROM session_index c LEFT JOIN session_trajectories d ON d.provider=c.provider AND d.session_id=c.session_id
+      AND d.origin='native' AND d.codex_home IS NULL
     WHERE c.provider='codex' AND c.codex_home IS NULL AND c.updated_at IS NOT NULL AND NOT c.updated_at_approximate
       AND c.source_file_id IS NOT NULL AND c.source_contents_id IS NOT NULL
-      AND (d.id IS NULL OR (d.origin='native' AND d.source_file_id IS c.source_file_id))";
+      AND (d.id IS NULL OR d.source_file_id IS c.source_file_id)";
 
 #[derive(PartialEq)]
 struct Candidate {
@@ -84,10 +85,18 @@ fn assign_confirmed_homes(
     let mut current = transaction
         .prepare(&format!("{CANDIDATES} AND c.session_id=?1"))
         .map_err(database_error)?;
+    let mut assign_document = transaction
+        .prepare(
+            "UPDATE session_trajectories SET codex_home=?2
+             WHERE provider='codex' AND session_id=?1 AND origin='native' AND codex_home IS NULL",
+        )
+        .map_err(database_error)?;
     let mut assign = transaction
         .prepare(
             "UPDATE session_index SET codex_home=?2, codex_legacy_name=?3
-         WHERE provider='codex' AND session_id=?1 AND codex_home IS NULL",
+         WHERE provider='codex' AND session_id=?1 AND codex_home IS NULL
+           AND NOT EXISTS(SELECT 1 FROM session_index WHERE provider='codex' AND session_id=?1 AND codex_home=?2)
+           AND NOT EXISTS(SELECT 1 FROM session_trajectories WHERE provider='codex' AND session_id=?1 AND origin='native' AND codex_home=?2)",
         )
         .map_err(database_error)?;
     for prior in observations {
@@ -99,9 +108,14 @@ fn assign_confirmed_homes(
             .map_err(database_error)?;
         if row.as_ref() == Some(prior) {
             let unverified_name = prior.document.is_none() && prior.metadata.title.is_some();
-            assign
+            let assigned = assign
                 .execute(params![id, home, unverified_name])
                 .map_err(database_error)?;
+            if assigned == 1 && prior.document.is_some() {
+                assign_document
+                    .execute(params![id, home])
+                    .map_err(database_error)?;
+            }
         }
     }
     Ok(())

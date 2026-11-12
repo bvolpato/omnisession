@@ -28,6 +28,8 @@ mod paginated_answers;
 mod paginated_instructions;
 #[path = "codex/paginated_visibility.rs"]
 mod paginated_visibility;
+#[path = "codex/plan_occurrences.rs"]
+mod plan_occurrences;
 #[path = "codex/rollout_lines.rs"]
 mod rollout_lines;
 #[path = "codex/steered_inputs.rs"]
@@ -38,6 +40,47 @@ mod tool_outcomes;
 mod turn_ownership;
 
 const SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
+
+#[test]
+fn a_duplicate_with_the_wrong_header_cannot_supply_the_recorded_provider() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let active = temporary.path().join("sessions");
+    let archive = temporary.path().join("archived_sessions");
+    fs::create_dir(&active)?;
+    fs::create_dir(&archive)?;
+    let name = format!("rollout-{SESSION_ID}.jsonl");
+    let write_rollout = |directory: &Path, id: &str, provider: &str| {
+        let record = json!({"type":"session_meta","payload":{"id":id,"model_provider":provider}});
+        let reply = message("assistant", provider);
+        fs::write(directory.join(&name), format!("{record}\n{reply}\n"))
+    };
+    write_rollout(&active, "55555555-5555-4555-8555-555555555555", "other")?;
+    write_rollout(&archive, SESSION_ID, "saved")?;
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let source = adapter.find_native_session(SESSION_ID)?.unwrap();
+    assert_eq!(
+        source.source_path.as_deref().unwrap().canonicalize()?,
+        archive.join(&name).canonicalize()?
+    );
+    assert_eq!(
+        adapter.recorded_model_provider(SESSION_ID)?.as_deref(),
+        Some("saved")
+    );
+    let indexed = adapter.index_session(&source.session, Some(&active.join(&name)), u64::MAX)?;
+    assert_eq!(indexed.snapshot.session, source.session);
+    assert_eq!(visible_text(&indexed.snapshot), ["saved"]);
+    assert_eq!(
+        Some(indexed.source_revision),
+        CodexAdapter::index_file_revision(&archive.join(&name))
+    );
+    assert!(
+        !adapter
+            .index_session(&source.session, None, 1)?
+            .source_complete
+    );
+    assert_eq!(adapter.list_sessions(None)?, [source]);
+    Ok(())
+}
 
 fn read_records(records: Vec<Value>) -> anyhow::Result<CanonicalSnapshot> {
     read_records_with_preview(records, false)
@@ -62,7 +105,7 @@ fn read_with_history_mode(
         .join(format!("sessions/rollout-{SESSION_ID}.jsonl"));
     let mut header = json!({
         "type": "session_meta",
-        "payload": {"id": SESSION_ID, "cwd": "/workspace/original"},
+        "payload": {"id": SESSION_ID, "cwd": std::env::temp_dir(), "git":{"branch":"original"}},
     });
     if let Some(mode) = mode {
         header["payload"]["history_mode"] = mode.into();
@@ -115,6 +158,15 @@ fn event(kind: &str, payload: Value) -> Value {
     json!({"type": "event_msg", "payload": payload})
 }
 
+fn published_text(snapshot: &omnis_ir::CanonicalSnapshot) -> Vec<&str> {
+    snapshot
+        .events
+        .iter()
+        .filter(|e| e.source.raw_record_type.as_deref() == Some("event_msg.item_completed"))
+        .filter_map(|e| e.payload["text"].as_str())
+        .collect()
+}
+
 fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
     snapshot
         .events
@@ -142,12 +194,12 @@ fn migrated_codex_messages_survive_full_reads_and_previews() {
         let snapshot = read_records_with_preview(
             vec![
                 request.clone(),
-                completed(&json!({"type":"Reasoning","id":"private","raw_content":["private reasoning"]})),
-                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"private hook context"}]})),
+                completed(&json!({"type":"Reasoning","id":"fixture-private-id","raw_content":["fixture-private-reasoning"]})),
+                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"fixture-private-hook"}]})),
                 answer.clone(),
                 message("assistant", "The entry expired."),
                 completed(&json!({"type":"AgentMessage","id":"item-3","content":[{"type":"Text","text":"The entry expired."}]})),
-                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"private-image.png"}]})),
+                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"fixture-private-image.png"}]})),
             ],
             preview,
         ).unwrap();
@@ -161,7 +213,7 @@ fn migrated_codex_messages_survive_full_reads_and_previews() {
             ]
         );
         let encoded = serde_json::to_string(&snapshot).unwrap();
-        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("fixture-private-"));
     }
 }
 
@@ -179,14 +231,15 @@ fn rollback_counts_a_paginated_multipart_request_and_its_mirror_once() {
         (&model_request, &display_request),
         (&display_request, &model_request),
     ] {
-        let snapshot = read_records(vec![
-            message("user", "keep this"),
-            first.clone(),
-            second.clone(),
-            event("thread_rolled_back", json!({"num_turns":1})),
-        ])
-        .unwrap();
-        assert_eq!(visible_text(&snapshot), ["keep this"]);
+        for compacted in [false, true] {
+            let mut records = vec![message("user", "keep this"), first.clone(), second.clone()];
+            if compacted {
+                records.push(json!({"type":"compacted","payload":{"message":"",
+                    "replacement_history":[model_request["payload"]]}}));
+            }
+            records.push(event("thread_rolled_back", json!({"num_turns":1})));
+            assert_eq!(visible_text(&read_records(records).unwrap()), ["keep this"]);
+        }
     }
 }
 
@@ -290,6 +343,376 @@ fn paginated_command_and_model_output_preserve_one_result_in_either_order() {
             omnis_ir::ReplayPolicy::HistoricalOnly
         );
     }
+}
+
+#[test]
+fn native_startup_and_source_directory_respect_settings_ownership() {
+    use std::io::Write as _;
+
+    let id = "019ab000-0000-7000-8000-000000000020";
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let mut file = fs::File::create(sessions.join(format!("rollout-{id}.jsonl"))).unwrap();
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, id);
+    let check = |effective: Option<&str>, startup: Option<&str>| {
+        let recorded = adapter.native_workspace(&session).unwrap().unwrap();
+        assert_eq!(
+            recorded.startup_directory.as_deref(),
+            startup.map(Path::new)
+        );
+        assert_eq!(recorded.directory.as_deref(), effective.map(Path::new));
+        for snapshot in [
+            adapter.read_session(&session),
+            adapter.preview_session(&session),
+        ] {
+            assert_eq!(
+                snapshot.unwrap().workspace.current_dir,
+                Path::new(effective.unwrap_or_default())
+            );
+        }
+    };
+    let creation = home.path().join("creation");
+    let saved = home.path().join("saved");
+    let a = creation.to_str().unwrap();
+    let b = saved.to_str().unwrap();
+    let turn = json!({"type":"turn_context","payload":{"cwd":a}});
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":id,"cwd":a}})
+    )
+    .unwrap();
+    check(Some(a), Some(a));
+    writeln!(
+        file,
+        "{}",
+        settings(Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), b)
+    )
+    .unwrap();
+    writeln!(file, "{}", settings(None, b)).unwrap();
+    check(Some(a), None);
+    writeln!(
+        file,
+        "{}",
+        event(
+            "thread_settings_applied",
+            json!({"thread_id":id,"thread_settings":{"cwd":b}})
+        )
+    )
+    .unwrap();
+    let mut malformed = settings(Some(id), b);
+    malformed["payload"]["thread_settings"]["approval_policy"] = json!("unknown-policy");
+    writeln!(file, "{malformed}").unwrap();
+    check(None, None);
+    let mut managed = settings(Some(id), b);
+    managed["payload"]["thread_settings"]["permission_profile"] = json!({
+        "type":"managed","file_system":{"type":"restricted","entries":[
+            {"path":{"type":"path","path":b},"access":"write"}]},"network":"restricted"
+    });
+    let mut malformed = managed.clone();
+    malformed["payload"]["thread_settings"]["runtime_workspace_roots"] = json!([{"path":b}]);
+    writeln!(file, "{malformed}").unwrap();
+    check(None, None);
+    writeln!(file, "{managed}").unwrap();
+    writeln!(file, "{turn}").unwrap();
+    check(Some(b), None);
+
+    writeln!(
+        file,
+        "{}",
+        message("assistant", &"x".repeat(5 * 1024 * 1024))
+    )
+    .unwrap();
+    writeln!(file, "{turn}").unwrap();
+    check(Some(b), None);
+    writeln!(file, "{}", settings(Some(id), a)).unwrap();
+    check(Some(a), None);
+    writeln!(file, " \t").unwrap();
+    check(Some(a), None);
+    writeln!(file, r#"{{"type":"#).unwrap();
+    check(None, None);
+    let equivalent_id = id.replace('-', "").to_ascii_uppercase();
+    writeln!(file, "{}", settings(Some(&equivalent_id), b)).unwrap();
+    check(Some(b), None);
+}
+
+#[test]
+fn marked_workspace_settings_follow_the_cold_reader() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let file = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let creation_path = home.path().join("creation");
+    let saved_path = home.path().join("saved");
+    let creation = creation_path.to_str().unwrap();
+    let moved = saved_path.to_str().unwrap();
+    let header = json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","ordinal":0,
+        "payload":{"id":SESSION_ID,"cwd":creation,"history_mode":"paginated"}});
+    let mut original = settings(Some(SESSION_ID), creation);
+    original["timestamp"] = header["timestamp"].clone();
+    original["ordinal"] = 7.into();
+    for (timestamp, ordinal, newline, expected) in [
+        (json!(null), json!(8), "\n", creation),
+        (json!("opaque"), json!("8"), "\n", creation),
+        (json!("opaque"), json!(2), "\n", moved),
+        (header["timestamp"].clone(), json!(8), "", moved),
+    ] {
+        let mut next = settings(Some(SESSION_ID), moved);
+        next["timestamp"] = timestamp;
+        next["ordinal"] = ordinal;
+        fs::write(&file, format!("{header}\n{original}\n{next}{newline}")).unwrap();
+        assert_eq!(
+            adapter
+                .native_workspace(&session)
+                .unwrap()
+                .unwrap()
+                .directory
+                .as_deref(),
+            Some(Path::new(expected))
+        );
+        for snapshot in [
+            adapter.read_session(&session),
+            adapter.preview_session(&session),
+        ] {
+            assert_eq!(snapshot.unwrap().workspace.current_dir, Path::new(expected));
+        }
+    }
+}
+
+fn settings(owner: Option<&str>, cwd: &str) -> Value {
+    event(
+        "thread_settings_applied",
+        json!({"thread_id":owner,"thread_settings":{
+            "cwd":cwd,"model":"fixture","model_provider_id":"synthetic","approval_policy":"never",
+            "approvals_reviewer":"user","permission_profile":{"type":"disabled"},
+            "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}
+        }}),
+    )
+}
+
+#[test]
+fn damaged_workspace_records_clear_routes_until_later_evidence() {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let initial = home.path();
+    let later = initial.join("later");
+    let check = |directory: Option<&Path>| {
+        assert_eq!(
+            adapter
+                .native_workspace(&session)
+                .unwrap()
+                .unwrap()
+                .directory
+                .as_deref(),
+            directory
+        );
+        let full = adapter.read_session(&session).unwrap();
+        let preview = adapter.preview_session(&session).unwrap();
+        for snapshot in [&full, &preview] {
+            assert_eq!(
+                snapshot.workspace.current_dir,
+                directory.unwrap_or(Path::new(""))
+            );
+            assert_eq!(visible_text(snapshot), ["surviving answer"]);
+        }
+        assert_eq!(
+            full.events
+                .iter()
+                .any(|event| event.payload["workspace_unknown"] == true),
+            directory.is_none()
+        );
+    };
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":initial}})
+    )
+    .unwrap();
+    writeln!(file, "{}", message("assistant", "surviving answer")).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"turn_context"#
+    )
+    .unwrap();
+    check(Some(initial));
+    writeln!(file, r#"{{"type":"turn_context","payload":"#).unwrap();
+    check(None);
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":&later}})
+    )
+    .unwrap();
+    check(Some(&later));
+    writeln!(
+        file,
+        r#"{{"type":"event_msg","payload":{{"type":"thread_settings_applied","thread_settings":"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":initial.join("unverified")}})
+    )
+    .unwrap();
+    check(None);
+}
+
+#[test]
+fn legacy_rollback_only_restores_directory_evidence_after_a_gap() {
+    let work = tempfile::tempdir().unwrap();
+    let survivor = work.path().join("survivor");
+    let turn = |id: &str, cwd: &Path| {
+        [
+            event("task_started", json!({"turn_id": id})),
+            json!({"type":"turn_context","payload":{"turn_id":id,"cwd":cwd}}),
+            message("user", id),
+            event("task_complete", json!({"turn_id":id})),
+        ]
+        .map(|r| r.to_string())
+    };
+    let rollback = |count| event("thread_rolled_back", json!({"num_turns":count})).to_string();
+    let mut records = Vec::from(turn("old", work.path()));
+    records.push(r#"{"type":"turn_context","payload":"#.to_owned());
+    records.extend(turn("first", &survivor));
+    records.extend(turn("second", &work.path().join("withdrawn")));
+    records.push(rollback(1));
+    for preview in [false, true] {
+        assert_eq!(
+            read_records_with_preview(records.clone(), preview)
+                .unwrap()
+                .workspace
+                .current_dir,
+            survivor
+        );
+    }
+    records.extend([
+        rollback(2),
+        event("task_started", json!({"turn_id":"fresh"})).to_string(),
+        message("user", "request without new directory").to_string(),
+        event("task_complete", json!({"turn_id":"fresh"})).to_string(),
+        rollback(1),
+    ]);
+    for preview in [false, true] {
+        assert!(
+            read_records_with_preview(records.clone(), preview)
+                .unwrap()
+                .workspace
+                .current_dir
+                .as_os_str()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn changed_turn_directory_does_not_inherit_creation_git() {
+    let padding = json!({"type":"event_msg","payload":{"note":"x".repeat(2_048)}}).to_string();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let context = json!({"type":"turn_context","payload":{"cwd":elsewhere.path()}})
+        .to_string()
+        .replace("turn_context", r"turn_\u0063ontext");
+    let records: Vec<_> = std::iter::repeat_n(padding.as_str(), 1_025)
+        .chain([context.as_str()])
+        .chain(std::iter::repeat_n(padding.as_str(), 1_025))
+        .collect();
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        assert_eq!(snapshot.workspace.root, elsewhere.path());
+        assert_eq!(snapshot.workspace.git, omnis_ir::GitState::default());
+    }
+}
+
+#[test]
+fn unreadable_workspace_changes_require_a_later_complete_turn_directory() {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join("recovered");
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":home.path()}})
+    )
+    .unwrap();
+    writeln!(file, "{}", json!({"type":"turn_context","payload":{"cwd":home.path().join("unreadable"),"padding":"x".repeat(16*1024*1024)}})).unwrap();
+    writeln!(file, "{}", message("assistant", "A recent reply")).unwrap();
+
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let preview = adapter.preview_session(&session).unwrap();
+    assert_eq!(visible_text(&preview), ["A recent reply"]);
+    assert!(preview.workspace.root.as_os_str().is_empty());
+    assert!(
+        adapter
+            .read_session(&session)
+            .unwrap()
+            .workspace
+            .root
+            .as_os_str()
+            .is_empty()
+    );
+    assert!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .is_none()
+    );
+
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":directory}})
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns": 0}))
+    )
+    .unwrap();
+    assert_eq!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .as_deref(),
+        Some(directory.as_path())
+    );
+    assert_eq!(
+        adapter.preview_session(&session).unwrap().workspace.root,
+        directory
+    );
+    writeln!(
+        file,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns": "unknown"}))
+    )
+    .unwrap();
+    assert!(
+        adapter
+            .native_workspace(&session)
+            .unwrap()
+            .unwrap()
+            .directory
+            .is_none()
+    );
 }
 
 #[test]
@@ -495,7 +918,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
             json!({
                 "timestamp": "2026-11-01T02:24:47Z",
                 "type": "session_meta",
-                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli", "forked_from_id": SOURCE}
+                "payload": {"id": CHILD, "cwd": temporary.path(), "source": "cli", "forked_from_id": SOURCE}
             })
             .to_string(),
         )
@@ -504,7 +927,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
         let candidates = CodexAdapter::with_root(temporary.path())
             .fork_candidates_created_since(
                 &SessionRef::new(Provider::Codex, SOURCE),
-                Path::new("/workspace/original"),
+                temporary.path(),
                 "2026-11-01T02:24:00Z".parse().expect("start time"),
             )
             .expect("fork candidates");
@@ -561,12 +984,12 @@ fn codex_listing_skips_guardian_subagent_threads() {
 fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
     let snapshot = read_records(vec![
         event("user_message", json!({"message": "keep this request"})),
-        json!({"type": "turn_context", "payload": {"cwd": "/workspace/original"}}),
+        json!({"type": "turn_context", "payload": {"cwd": std::env::temp_dir()}}),
         message("user", "keep this request"),
         message("assistant", "keep this answer"),
         event("task_complete", json!({"turn_id": "kept"})),
         event("task_started", json!({"turn_id": "discarded"})),
-        json!({"type": "turn_context", "payload": {"cwd": "/workspace/discarded", "model": "discarded-model"}}),
+        json!({"type": "turn_context", "payload": {"cwd": std::env::temp_dir().join("discarded"), "model": "discarded-model"}}),
         event("user_message", json!({"message": "discard this request"})),
         message("user", "discard this request"),
         json!({"type": "response_item", "payload": {"type": "function_call", "name": "discarded-tool", "arguments": "{}"}}),
@@ -585,10 +1008,7 @@ fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
             "replacement answer"
         ]
     );
-    assert_eq!(
-        snapshot.workspace.current_dir.to_str(),
-        Some("/workspace/original")
-    );
+    assert_eq!(snapshot.workspace.current_dir, std::env::temp_dir());
     assert!(
         !serde_json::to_string(&snapshot)
             .unwrap()
@@ -635,6 +1055,179 @@ fn codex_rollback_crossing_compaction_does_not_resurrect_discarded_output() {
     assert_eq!(
         visible_text(&snapshot),
         ["surviving request", "surviving answer"]
+    );
+}
+
+#[test]
+fn codex_replacement_history_keeps_the_summary_once_in_context() {
+    let mut summary = message("user", "Documented decision")["payload"].clone();
+    summary["internal_chat_message_metadata_passthrough"] =
+        json!({"content_item_kinds": ["compaction.summary"]});
+    let records = vec![
+        message("user", "Original request"),
+        message("assistant", "Detail for the recovery file"),
+        json!({"type":"compacted","payload":{
+            "message": "Documented decision",
+            "replacement_history": [
+                message("developer", "Hidden developer setup")["payload"],
+                message("user", "Retained request")["payload"],
+                summary,
+                message("assistant", "Retained answer")["payload"],
+            ],
+        }}),
+        message("user", "New request"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert!(!conversation.truncated);
+        let messages = &conversation.messages;
+        let retained = messages
+            .iter()
+            .position(|m| m.text == "Retained request")
+            .unwrap();
+        assert_eq!(
+            messages[retained + 1].role,
+            omnis_core::HandoffRole::Assistant
+        );
+        assert!(messages[retained + 1].text.contains("Documented decision"));
+        assert_eq!(messages[retained + 2].text, "Retained answer");
+        assert_eq!(messages[retained + 3].text, "New request");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.text.contains("Documented decision"))
+                .count(),
+            1
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.text.contains("Detail for the recovery file"))
+        );
+        assert!(omnis_core::needs_recovery_handoff(&snapshot, false));
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("Hidden developer setup")
+        );
+    }
+}
+
+#[test]
+fn codex_opaque_compaction_reports_missing_context() {
+    let snapshot = read_records(vec![
+        message("user", "Old request"),
+        json!({"type":"compacted","payload":{
+            "message": "Documentary note", "replacement_history": [
+                {"type":"compaction","encrypted_content":"unreadable-ciphertext"},
+                message("user", "Retained request")["payload"],
+            ],
+        }}),
+    ])
+    .unwrap();
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert!(conversation.truncated);
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|message| message.text.contains("Documentary note"))
+    );
+    assert_eq!(
+        conversation.messages.last().unwrap().text,
+        "Retained request"
+    );
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|m| m.text == "Old request")
+    );
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("unreadable-ciphertext")
+    );
+}
+
+#[test]
+fn explicit_replacements_exclude_documentary_summaries_from_the_active_handoff() {
+    for (items, expected) in [
+        (vec![], vec!["Fresh request"]),
+        (
+            vec![message("user", "Retained request")["payload"].clone()],
+            vec!["Retained request", "Fresh request"],
+        ),
+    ] {
+        let snapshot=read_records(vec![
+            json!({"type":"compacted","payload":{"message":"Documentary note","replacement_history":items}}),
+            message("user","Fresh request"),
+        ]).unwrap();
+        let conversation = omnis_core::import_conversation(&snapshot);
+        let trajectory = omnis_core::import_trajectory(&snapshot);
+        assert!(!conversation.truncated && !trajectory.truncated);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            trajectory
+                .items
+                .iter()
+                .map(|i| i.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!omnis_core::render_semantic_handoff(&snapshot).contains("Documentary note"));
+        let report = omnis_core::build_native_materialization_report_for_snapshot(
+            &snapshot,
+            Provider::Claude,
+            true,
+            false,
+            0,
+            0,
+        );
+        assert_eq!(
+            report.entries[0].status,
+            omnis_ir::FidelityStatus::Preserved
+        );
+        assert!(omnis_core::needs_recovery_handoff(&snapshot, false));
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        assert!(
+            String::from_utf8(recovery)
+                .unwrap()
+                .contains("Documentary note")
+        );
+        assert!(
+            omnis_core::trajectory_search_document(&snapshot)
+                .text
+                .contains("Documentary note")
+        );
+    }
+}
+
+#[test]
+fn codex_checkpoint_only_rollback_preserves_completed_turns() {
+    let snapshot = read_records(vec![
+        json!({"type":"compacted","payload":{"message":"Previous context","replacement_history":[
+            message("user", "Retained request")["payload"],
+            message("assistant", "Retained reply")["payload"],
+            message("user", "Discarded request")["payload"],
+            message("assistant", "Discarded reply")["payload"],
+        ]}}),
+        event("thread_rolled_back", json!({"num_turns": 1})),
+        message("user", "Replacement request"),
+    ])
+    .unwrap();
+    assert_eq!(
+        visible_text(&snapshot),
+        ["Retained request", "Retained reply", "Replacement request"]
     );
 }
 
@@ -1410,6 +2003,174 @@ fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     assert!(visible_text(&snapshot).is_empty());
 }
 
+#[test]
+fn partial_checkpoint_rollback_removes_only_discarded_requests() {
+    let checkpoint = json!({"type":"compacted","payload":{"message":"","replacement_history":[
+        message("user", "Kept request")["payload"],
+        message("assistant", "Kept reply")["payload"],
+        message("user", "Discarded request")["payload"],
+        message("assistant", "Discarded reply")["payload"],
+    ]}});
+    for original in [
+        vec![event("task_started", json!({"turn_id": "pending"}))],
+        vec![json!({"type":"turn_context","payload":{"cwd":"/workspace/pending"}})],
+        vec![message("user", "Kept request")],
+        vec![message("user", "Discarded request")],
+    ] {
+        let mut records = original;
+        records.extend([
+            checkpoint.clone(),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ]);
+        let snapshot = read_records(records.clone()).unwrap();
+        let active = omnis_core::import_conversation(&snapshot);
+        assert!(active.messages.iter().any(|m| m.text == "Kept request"));
+        assert!(active.messages.iter().any(|m| m.text == "Kept reply"));
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("Discarded")
+        );
+        records.extend([
+            event("thread_rolled_back", json!({"num_turns":1})),
+            message("user", "Fresh request"),
+        ]);
+        assert_eq!(
+            visible_text(&read_records(records).unwrap()),
+            ["Fresh request"]
+        );
+    }
+}
+
+#[test]
+fn legacy_compaction_keeps_real_requests_and_plain_prior_summaries_in_native_order() {
+    let snapshot = read_records(vec![
+        message("user", "Initial request"),
+        message("assistant", "Original reply"),
+        message(
+            "user",
+            "<environment_context>Local setup</environment_context>",
+        ),
+        json!({"type":"compacted","payload":{"message":"First summary"}}),
+        message("user", "Follow-up request"),
+        event("user_message", json!({"message":"Follow-up request"})),
+        json!({"type":"compacted","payload":{"message":"Latest summary"}}),
+        message("assistant", "Final reply"),
+    ])
+    .unwrap();
+    let active = omnis_core::import_conversation(&snapshot);
+    let trajectory = omnis_core::import_trajectory(&snapshot);
+    for texts in [
+        active
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        trajectory.items.iter().map(|i| i.text.as_str()).collect(),
+    ] {
+        let visible: Vec<_> = texts
+            .into_iter()
+            .filter(|t| !t.contains("Codex replaced"))
+            .map(|t| t.lines().last().unwrap())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "Initial request",
+                "First summary",
+                "Follow-up request",
+                "Latest summary",
+                "Final reply"
+            ]
+        );
+    }
+    assert!(!active.truncated);
+    assert!(!trajectory.truncated);
+}
+
+#[test]
+fn repeated_legacy_compactions_apply_the_native_user_budget_only_to_the_active_window() {
+    let long = format!("start{}end", "界".repeat(30_000));
+    let checkpoint = json!({"type":"compacted","payload":{"message":"Current summary"}});
+    let mut records = vec![
+        message("user", "Older request"),
+        message("user", &long),
+        message("user", "Last request"),
+    ];
+    records.extend(std::iter::repeat_n(checkpoint, 8));
+    let snapshot = read_records(records).unwrap();
+    let replayed = snapshot
+        .events
+        .iter()
+        .filter(|e| e.source.raw_record_type.as_deref() == Some("compacted.user"))
+        .map(|e| e.payload["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let [trimmed, latest] = replayed.as_slice() else {
+        panic!("expected only the active projected requests")
+    };
+    assert!(trimmed.starts_with("start") && trimmed.ends_with("end"));
+    assert!(trimmed.contains("tokens truncated") && trimmed.len() <= 80_032);
+    assert_eq!(*latest, "Last request");
+    assert!(
+        snapshot
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+}
+
+#[test]
+fn a_request_with_the_summary_text_keeps_its_role() {
+    let ordinary = message("user", "Identical text")["payload"].clone();
+    let mut tagged = ordinary.clone();
+    tagged["internal_chat_message_metadata_passthrough"] =
+        json!({"content_item_kinds":["compaction.summary"]});
+    for (replacement, roles) in [
+        (
+            vec![tagged, ordinary.clone()],
+            [EventKind::MessageAssistant, EventKind::MessageUser],
+        ),
+        (
+            vec![ordinary.clone(), ordinary],
+            [EventKind::MessageUser, EventKind::MessageUser],
+        ),
+    ] {
+        let snapshot = read_records(vec![json!({"type":"compacted","payload":{"message":"Identical text", "replacement_history":replacement}})]).unwrap();
+        let observed: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| e.payload["text"] == "Identical text")
+            .map(|e| e.kind.clone())
+            .collect();
+        assert_eq!(observed, roles);
+    }
+}
+
+#[test]
+fn rollback_of_a_natively_shortened_replacement_removes_its_original_turn() {
+    let quoted_notice = "Earlier output said …2 tokens truncated…";
+    let prefix = format!(
+        "{quoted_notice}{}",
+        "a".repeat(40_000 - quoted_notice.len())
+    );
+    let suffix = "z".repeat(40_000);
+    let original = format!("{prefix}lost{suffix}");
+    let checkpoint = json!({"type":"compacted","payload":{"message":"A summary","replacement_history":[{
+        "type":"message","role":"user","content":[
+            {"type":"input_text","text":prefix},
+            {"type":"input_text","text":"…1 tokens truncated…"},
+            {"type":"input_text","text":suffix}
+        ]
+    }]}});
+    let snapshot = read_records(vec![
+        message("user", &original),
+        checkpoint,
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ])
+    .unwrap();
+    assert!(visible_text(&snapshot).is_empty());
+}
+
 fn turn_item(turn: &str, item: &Value) -> Value {
     event(
         "item_completed",
@@ -1480,14 +2241,19 @@ fn paginated_rollback_preserves_late_command_results_from_surviving_turns() {
         assert_eq!(results, ["late result"]);
         let mut rows = records.clone();
         rows.push(event("thread_rolled_back", json!({"num_turns":1})));
-        let snapshot = read_records_with_preview(rows, preview).unwrap();
-        let [notice] = snapshot.events.as_slice() else {
-            panic!("expected only the notice for the unconfirmed legacy input");
-        };
-        assert!(omnis_core::reports_omitted_events(notice));
-        assert_eq!(
-            notice.source.raw_record_type.as_deref(),
-            Some("omnisession.codex_legacy_rollback")
+        let empty = read_records_with_preview(rows, preview).unwrap();
+        assert!(
+            empty
+                .events
+                .iter()
+                .all(|e| e.source.raw_record_type.as_deref()
+                    == Some("omnisession.codex_legacy_rollback"))
+        );
+        assert!(
+            empty
+                .events
+                .iter()
+                .any(|e| e.payload["native_history_unverified"] == true)
         );
     }
 }
@@ -1533,6 +2299,59 @@ fn paginated_item_updates_keep_the_original_position_and_turn() {
             ["first request", "updated answer", "separate answer"]
         );
     }
+}
+
+#[test]
+fn partial_compaction_keeps_a_late_completion_until_its_named_turn_is_rolled_back() {
+    let command = |turn, output| {
+        turn_item(
+            turn,
+            &json!({
+                "type":"CommandExecution","id":"command","command":["example"],"cwd":"file:///workspace",
+                "parsed_cmd":[],"source":"agent","aggregated_output":output,"status":"completed","exit_code":0,
+            }),
+        )
+    };
+    let mut records = vec![
+        event("task_started", json!({"turn_id":"first"})),
+        page_user("first", "item-1", "Keep first"),
+        message("user", "Keep first"),
+        event("task_complete", json!({"turn_id":"first"})),
+        json!({"type":"compacted","payload":{"message":"","replacement_history":[
+            message("user","Keep first")["payload"],
+            message("user","Discard second")["payload"],
+        ]}}),
+        event("task_started", json!({"turn_id":"third"})),
+        page_user("third", "item-3", "Discard third"),
+        command("first", "Late result for first"),
+        command("third", "Result for third"),
+        event("thread_rolled_back", json!({"num_turns":2})),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        let active = omnis_core::import_conversation(&snapshot);
+        assert!(active.messages.iter().any(|m| m.text == "Keep first"));
+        assert!(
+            !visible_text(&snapshot)
+                .iter()
+                .any(|m| m.starts_with("Discard"))
+        );
+        let results: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter_map(|e| e.payload["output"].as_str())
+            .collect();
+        assert_eq!(results, ["Late result for first"]);
+    }
+    records.push(event("thread_rolled_back", json!({"num_turns":1})));
+    let snapshot = read_records(records).unwrap();
+    assert!(visible_text(&snapshot).is_empty());
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|e| e.kind == EventKind::CommandExecuted)
+    );
 }
 
 fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
@@ -1655,8 +2474,11 @@ fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
         fs::create_dir(&folder).unwrap();
         let path = folder.join(format!("rollout-{SESSION_ID}.{codec}"));
         let session = SessionRef::new(Provider::Codex, SESSION_ID);
-        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/creation","git":{"branch":"creation"}}});
-        let turn = |cwd| json!({"type":"turn_context","payload":{"cwd":cwd}});
+        let creation = home.path().join("creation");
+        let moved_dir = home.path().join("moved");
+        let recovered_dir = home.path().join("recovered");
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":creation,"git":{"branch":"creation"}}});
+        let turn = |cwd: &Path| json!({"type":"turn_context","payload":{"cwd":cwd}});
         for (damaged, ambiguous) in [
             (r#"{"type":"turn_context","payload":"#, true),
             (r#"{"type":"turn_co"#, true),
@@ -1679,11 +2501,11 @@ fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
             for (moved, recovered) in [(false, false), (true, false), (true, true)] {
                 let mut body = format!("{header}\n{}\n", message("user", "preserved request"));
                 if moved {
-                    writeln!(body, "{}", turn("/moved")).unwrap();
+                    writeln!(body, "{}", turn(&moved_dir)).unwrap();
                 }
                 body.push_str(damaged);
                 if recovered {
-                    writeln!(body, "\n{}", turn("/recovered")).unwrap();
+                    writeln!(body, "\n{}", turn(&recovered_dir)).unwrap();
                 }
                 let bytes = codec.strip_prefix("jsonl.").map_or_else(
                     || body.as_bytes().to_vec(),
@@ -1693,13 +2515,13 @@ fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
                 let adapter = CodexAdapter::with_root(home.path());
                 let unknown = ambiguous && !recovered;
                 let expected = if unknown {
-                    ""
+                    Path::new("")
                 } else if recovered {
-                    "/recovered"
+                    recovered_dir.as_path()
                 } else if moved {
-                    "/moved"
+                    moved_dir.as_path()
                 } else {
-                    "/creation"
+                    creation.as_path()
                 };
                 for snapshot in [
                     adapter.read_session(&session).unwrap(),
@@ -1710,14 +2532,13 @@ fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
                         .snapshot,
                 ] {
                     assert_eq!(
-                        snapshot.workspace.current_dir,
-                        Path::new(expected),
+                        snapshot.workspace.current_dir, expected,
                         "{codec}, {damaged}"
                     );
-                    assert_eq!(snapshot.workspace.root, Path::new(expected));
+                    assert_eq!(snapshot.workspace.root, expected);
                     assert_eq!(
                         snapshot.workspace.git.branch.as_deref(),
-                        (expected == "/creation").then_some("creation")
+                        (expected == creation).then_some("creation")
                     );
                     assert_eq!(
                         snapshot
@@ -2039,12 +2860,13 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
     let mut writer =
         zstd::stream::write::Encoder::new(fs::File::create(&path).unwrap(), 1).unwrap();
-    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic","cli_version":"v".repeat(32 * 1024)}});
+    let surviving_dir = temporary.path().join("surviving");
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":temporary.path(),"cli_version":"v".repeat(32 * 1024)}});
     writeln!(writer, "{header}").unwrap();
     writeln!(
         writer,
         "{}",
-        json!({"type":"turn_context","payload":{"cwd":"/synthetic/surviving"}})
+        json!({"type":"turn_context","payload":{"cwd":surviving_dir}})
     )
     .unwrap();
     writeln!(writer, "{}", message("user", "surviving head")).unwrap();
@@ -2064,7 +2886,7 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     let discarded = message("user", &format!("discarded {}", "d".repeat(128 * 1024))).to_string();
     let path_component = "a/".repeat(16 * 1024);
     for index in 0..160 {
-        let cwd = format!("/synthetic/{index}/{path_component}");
+        let cwd = temporary.path().join(format!("{index}/{path_component}"));
         writeln!(
             writer,
             "{}",
@@ -2093,7 +2915,7 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
     assert!(!text.contains(&"middle outside both edges"));
     assert_eq!(
         read.workspace_projection,
-        omnis_adapters::CodexWorkspaceProjection::Observed(Some("/synthetic/surviving".into()))
+        omnis_adapters::CodexWorkspaceProjection::Observed(Some(surviving_dir.clone()))
     );
     assert!(text.iter().all(|message| !message.starts_with("discarded")));
     assert!(omnis_core::session_message_prefix_is_known(
@@ -2109,10 +2931,7 @@ fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges
         .map(String::len)
         .sum();
     assert!(text_bytes + metadata_bytes <= 8 * 1024 * 1024);
-    assert_eq!(
-        read.snapshot.workspace.root,
-        Path::new("/synthetic/surviving")
-    );
+    assert_eq!(read.snapshot.workspace.root, surviving_dir);
     assert!(!read.source_complete);
     assert!(omnis_core::import_conversation(&read.snapshot).truncated);
 }
@@ -2726,13 +3545,15 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
     let home = tempfile::tempdir()?;
     let sessions = home.path().join("sessions");
     fs::create_dir(&sessions)?;
-    let rollout = |name: &str, project: &str| -> anyhow::Result<_> {
+    let one = home.path().join("one");
+    let two = home.path().join("two");
+    let rollout = |name: &str, project: &Path| -> anyhow::Result<_> {
         let path = sessions.join(format!("rollout-{name}-{SESSION_ID}.jsonl"));
         let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":project}});
         fs::write(&path, format!("{header}\n"))?;
         Ok(path.canonicalize()?)
     };
-    let original = rollout("2026-10-02T00-00-00", "/one")?;
+    let original = rollout("2026-10-02T00-00-00", &one)?;
     fs::write(
         home.path().join("session_index.jsonl"),
         json!({"id":SESSION_ID,"thread_name":"Original name"}).to_string(),
@@ -2744,8 +3565,8 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
     let mut warm = CodexAdapter::with_root(home.path()).list_sessions(None)?;
     assert_eq!(warm[0].title.as_deref(), Some("Original name"));
     warm[0].source_path = None;
-    let duplicate = rollout("2026-10-01T00-00-00", "/two")?;
-    let check = |expected_path: &Path, project: &str, title: Option<&str>| -> anyhow::Result<()> {
+    let duplicate = rollout("2026-10-01T00-00-00", &two)?;
+    let check = |expected_path: &Path, project: &Path, title: Option<&str>| -> anyhow::Result<()> {
         let adapter = CodexAdapter::with_root(home.path());
         assert_eq!(adapter.list_sessions(None)?[0].title.as_deref(), title);
         let mut cached = warm.clone();
@@ -2753,7 +3574,7 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         assert_eq!(cached[0].title.as_deref(), title);
         let preview = adapter.preview_session(&cached[0].session)?;
         assert_eq!(preview.title, cached[0].title);
-        assert_eq!(preview.workspace.current_dir, Path::new(project));
+        assert_eq!(preview.workspace.current_dir, project);
         assert_eq!(
             cached[0].project_path.as_ref(),
             Some(&preview.workspace.current_dir)
@@ -2778,31 +3599,31 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         adapter.observed_listed_names(&listed).get(SESSION_ID),
         Some(&omnis_adapters::NativeSessionName::Absent)
     );
-    check(&original, "/one", None)?;
+    check(&original, &one, None)?;
     let state = home.path().join("alternate");
     fs::create_dir(&state)?;
     fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
     let db = rusqlite::Connection::open(state.join("state_5.sqlite"))?;
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
-    check(&original, "/one", None)?;
+    check(&original, &one, None)?;
     db.execute(
         "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,'Private opener','Private opener')",
         rusqlite::params![SESSION_ID, original.to_str()],
     )?;
-    check(&original, "/one", None)?;
+    check(&original, &one, None)?;
     db.execute(
         "UPDATE threads SET history_mode='paginated', name='SQLite original name'",
         [],
     )?;
-    for (path, project) in [(&original, "/one"), (&duplicate, "/two")] {
+    for (path, project) in [(&original, &one), (&duplicate, &two)] {
         fs::write(path, json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":project,"history_mode":"paginated"}}).to_string())?;
     }
-    check(&original, "/one", Some("SQLite original name"))?;
+    check(&original, &one, Some("SQLite original name"))?;
     db.execute(
         "UPDATE threads SET rollout_path=?1, name='SQLite second name'",
         [duplicate.to_str()],
     )?;
-    check(&duplicate, "/two", Some("SQLite second name"))?;
+    check(&duplicate, &two, Some("SQLite second name"))?;
     drop(db);
     fs::remove_file(state.join("state_5.sqlite"))?;
     fs::remove_file(duplicate)?;
@@ -2817,7 +3638,7 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
     assert_eq!(warm[0].title.as_deref(), Some("Original name"));
     let preview = adapter.preview_session(&warm[0].session)?;
     assert_eq!(preview.title, warm[0].title);
-    assert_eq!(preview.workspace.current_dir, Path::new("/one"));
+    assert_eq!(preview.workspace.current_dir, one);
     Ok(())
 }
 
@@ -2856,7 +3677,8 @@ fn cached_picker_reads_an_appended_reply_from_the_same_rollout() -> anyhow::Resu
 fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     let file = format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl");
-    let write = |directory: &str, project: &str, replies: &[&str]| -> anyhow::Result<_> {
+    let active_project = home.path().join("active");
+    let write = |directory: &str, project: &Path, replies: &[&str]| -> anyhow::Result<_> {
         let dir = home.path().join(directory);
         fs::create_dir(&dir)?;
         let path = dir.join(&file);
@@ -2869,26 +3691,30 @@ fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<
         fs::write(&path, text)?;
         Ok(path)
     };
-    let active = write("sessions", "/active", &["First reply", "Final reply"])?;
+    let active = write("sessions", &active_project, &["First reply", "Final reply"])?;
     let mut cached = CodexAdapter::with_root(home.path()).list_sessions(None)?;
     cached[0].source_path = None;
     fs::OpenOptions::new()
         .write(true)
         .open(&active)?
         .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
-    write("archived_sessions", "/archive", &["First reply"])?;
+    write(
+        "archived_sessions",
+        &home.path().join("archive"),
+        &["First reply"],
+    )?;
     let adapter = CodexAdapter::with_root(home.path());
     let listed = adapter.list_sessions(None)?;
     adapter.refresh_session_titles(&mut cached);
     for row in [&listed[0], &cached[0]] {
         assert_eq!(row.source_path.as_ref(), Some(&active));
-        assert_eq!(row.project_path.as_deref(), Some(Path::new("/active")));
+        assert_eq!(row.project_path.as_deref(), Some(active_project.as_path()));
     }
     for snapshot in [
         adapter.read_session(&cached[0].session)?,
         adapter.preview_session(&cached[0].session)?,
     ] {
-        assert_eq!(snapshot.workspace.current_dir, Path::new("/active"));
+        assert_eq!(snapshot.workspace.current_dir, active_project);
         assert!(serde_json::to_string(&snapshot.events)?.contains("Final reply"));
     }
     Ok(())
@@ -2897,7 +3723,8 @@ fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<
 #[test]
 fn index_reads_bind_revision_and_budget_to_the_selected_rollout() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
-    let create = |directory: &str, project: &str, reply: &str| -> anyhow::Result<_> {
+    let active_project = home.path().join("active");
+    let create = |directory: &str, project: &Path, reply: &str| -> anyhow::Result<_> {
         let dir = home.path().join(directory);
         fs::create_dir(&dir)?;
         let path = dir.join(format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl"));
@@ -2906,14 +3733,18 @@ fn index_reads_bind_revision_and_budget_to_the_selected_rollout() -> anyhow::Res
         fs::write(&path, format!("{meta}\n{msg}\n"))?;
         Ok(path)
     };
-    let archived = create("archived_sessions", "/archive", "Obsolete response")?;
+    let archived = create(
+        "archived_sessions",
+        &home.path().join("archive"),
+        "Obsolete response",
+    )?;
     let adapter = CodexAdapter::with_root(home.path());
     let session = SessionRef::new(Provider::Codex, SESSION_ID);
     let first = adapter.list_sessions(None)?;
     assert_eq!(first[0].source_path.as_ref(), Some(&archived));
     let original = adapter.read_full_index_at(&session, None)?;
     assert_eq!(Some(original.source_revision), first[0].source_revision);
-    let active = create("sessions", "/active", "Current response")?;
+    let active = create("sessions", &active_project, "Current response")?;
     let revision = omnis_adapters::source_file_revision(&active).unwrap();
     assert_ne!(revision.file, original.source_revision.file);
     for hint in [None, Some(archived.as_path())] {
@@ -2925,7 +3756,7 @@ fn index_reads_bind_revision_and_budget_to_the_selected_rollout() -> anyhow::Res
             assert_eq!(read.source_revision, revision);
             assert_eq!(meta.source_revision, Some(revision));
             assert_eq!(meta.source_path.as_ref(), Some(&active));
-            assert_eq!(meta.project_path.as_deref(), Some(Path::new("/active")));
+            assert_eq!(meta.project_path.as_deref(), Some(active_project.as_path()));
             assert_eq!(meta.updated_at, Some(read.snapshot.captured_at));
             assert_eq!(read.source_complete, complete);
             assert!(!read.provider_limited);

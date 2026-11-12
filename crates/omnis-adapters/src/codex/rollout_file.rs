@@ -20,9 +20,9 @@ use super::workspace_check::{WorkspaceScan, same_thread};
 use super::workspace_damage::{self, DamagedWorkspace};
 use crate::support::WorkspaceGap;
 use crate::support::{
-    JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-    MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
-    visit_json_reader,
+    JsonLineLocation, JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE,
+    MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE,
+    json_lines_prefix, visit_json_reader, visit_json_reader_with_locations,
 };
 
 pub(super) const SAMPLE_RECORDS: usize = 1_024;
@@ -197,14 +197,19 @@ pub(super) fn visit_with_limits(
     limits: JsonLinesLimits,
     visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records_with_limits(open(path)?, limits, visit)
+    read_records_with_limits(
+        open(path)?,
+        limits,
+        (!compressed(path)).then_some(path),
+        visit,
+    )
 }
 
 pub(super) fn visit(
     path: &Path,
     visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records(open(path)?, visit)
+    visit_with_limits(path, LIMITS, visit)
 }
 
 /// Returns whether every nonblank record could be read and the visitor accepted it.
@@ -229,19 +234,28 @@ pub(super) fn read_records(
     reader: impl Read,
     visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records_with_limits(reader, LIMITS, visit)
+    read_records_with_limits(reader, LIMITS, None, visit)
 }
 
 fn read_records_with_limits(
     reader: impl Read,
     limits: JsonLinesLimits,
+    plain: Option<&Path>,
     mut visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     let session = OnceCell::<Option<String>>::new();
-    visit_json_reader(
+    visit_json_reader_with_locations(
         &mut BufReader::new(reader),
         limits,
-        |line, oversized| workspace_gap(line, oversized, session.get().and_then(Option::as_deref)),
+        |location, line, oversized| {
+            workspace_gap_at(
+                plain,
+                location,
+                line,
+                oversized,
+                session.get().and_then(Option::as_deref),
+            )
+        },
         |location, record, skipped_before| {
             session.get_or_init(|| {
                 (record["type"] == "session_meta")
@@ -279,12 +293,43 @@ pub(super) fn workspace_record_candidate(line: &[u8], oversized: bool) -> Worksp
     workspace_gap(line, oversized, None)
 }
 
+pub(super) fn workspace_gap_at(
+    plain: Option<&Path>,
+    location: JsonLineLocation,
+    line: &[u8],
+    oversized: bool,
+    session: Option<&str>,
+) -> Result<WorkspaceGap> {
+    let kind = gap_kind(line, oversized);
+    if oversized
+        && kind == Some(DamagedWorkspace::Unclassified)
+        && let Some(path) = plain
+        && !super::oversized_settings_marker(path, &[location])?
+    {
+        // This row could have changed the turn directory but did not contain saved settings.
+        return Ok(WorkspaceGap::TurnOrRollback);
+    }
+    Ok(classify_gap(kind, line, oversized, session))
+}
+
 pub(super) fn workspace_gap(line: &[u8], oversized: bool, session: Option<&str>) -> WorkspaceGap {
-    let kind = if oversized {
+    classify_gap(gap_kind(line, oversized), line, oversized, session)
+}
+
+fn gap_kind(line: &[u8], oversized: bool) -> Option<DamagedWorkspace> {
+    if oversized {
         workspace_damage::oversized_workspace_record(line)
     } else {
         workspace_damage::damaged_workspace_record(line)
-    };
+    }
+}
+
+fn classify_gap(
+    kind: Option<DamagedWorkspace>,
+    line: &[u8],
+    oversized: bool,
+    session: Option<&str>,
+) -> WorkspaceGap {
     match kind {
         Some(DamagedWorkspace::TurnOrRollback) => WorkspaceGap::TurnOrRollback,
         Some(DamagedWorkspace::PossibleSettings) => {

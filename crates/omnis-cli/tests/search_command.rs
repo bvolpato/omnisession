@@ -8,6 +8,11 @@ use std::{
 
 use serde_json::{Value, json};
 
+#[path = "search_command/codex_home.rs"]
+mod codex_home;
+#[path = "search_command/duplicate_rollouts.rs"]
+mod duplicate_rollouts;
+
 const STAMP: &str = "2026-01-02T00:00:00Z";
 const CLAUDE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CODEX_ID: &str = "019f0000-0000-7000-8000-000000000001";
@@ -395,7 +400,7 @@ fn scoped_search_can_recheck_a_stamped_full_document_beyond_the_cold_probe_limit
     );
     let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
     for valid_stamp in [true, false] {
-        // Recreate the version-5 catalog that preceded the verified-workspace table.
+        // Version 5 stored the workspace in the catalog without a separate observation.
         assert_eq!(
             db.execute(
                 "UPDATE session_trajectories SET document_version=5 WHERE provider='codex' AND session_id=?1 AND source_complete=1",
@@ -403,8 +408,11 @@ fn scoped_search_can_recheck_a_stamped_full_document_beyond_the_cold_probe_limit
             ).unwrap(),
             1
         );
-        db.execute("DROP TABLE codex_indexed_workspaces", [])
-            .unwrap();
+        db.execute_batch(
+            "DROP TABLE codex_indexed_workspaces;
+             DROP TABLE codex_workspace_observations;",
+        )
+        .unwrap();
         if !valid_stamp {
             db.execute("UPDATE session_index SET source_contents_id=randomblob(16) WHERE provider='codex' AND session_id=?1",[CODEX_ID]).unwrap();
         }
@@ -674,42 +682,40 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
 #[test]
 fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
     use omnis_ir::{Provider, SessionRef};
-    use omnis_store::{SessionTrajectoryOrigin, Store, TrajectoryDocument};
 
     let fixture = Fixture::new();
     fixture.add_missing_ancestor();
+    write_codex_session(
+        &fixture.root,
+        OTHER_CODEX_ID,
+        &fixture.workspace,
+        "Previously indexed request",
+        "Superseded fixture content",
+    );
     fixture.index_codex();
     let session = SessionRef::new(Provider::Codex, CODEX_ID);
-    let store = Store::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    let state = store.trajectory_index_state(&session).unwrap().unwrap();
-    let obsolete = "Superseded fixture content";
-    store
-        .upsert_trajectory_document(
-            &session,
-            &TrajectoryDocument {
-                redacted_text: obsolete,
-                projection: None,
-                source_updated_at: state.source_updated_at,
-                source_revision: state.source_revision,
-                source_byte_count: obsolete.len(),
-                indexed_byte_count: obsolete.len(),
-                truncation_strategy: "none",
-                source_complete: true,
-                origin: SessionTrajectoryOrigin::Native,
-                document_version: state.document_version,
-                provider_limited: false,
-                derived_title: None,
-                withdrawn_title: None,
-                title_is_verified: false,
-                title_authoritative: true,
-                local_opener: omnis_store::LocalOpenerEvidence::Unknown,
-            },
+    // Give the obsolete document the selected rollout's genuine source receipt.
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE session_trajectories SET codex_home=NULL WHERE provider='codex' AND session_id=?1",
+        [CODEX_ID],
+    )
+    .unwrap();
+    let changed = db
+        .execute(
+            "UPDATE session_trajectories SET (session_id, source_updated_at, source_updated_submillis,
+                 source_file_id, source_contents_id, missing_ancestor_id) = (
+                 SELECT session_id, source_updated_at, source_updated_submillis, source_file_id,
+                        source_contents_id, missing_ancestor_id FROM session_trajectories
+                 WHERE provider='codex' AND session_id=?1 AND codex_home IS NULL)
+             WHERE provider='codex' AND session_id=?2",
+            [CODEX_ID, OTHER_CODEX_ID],
         )
         .unwrap();
-    assert_eq!(
-        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"])),
-        [session.to_string()]
-    );
+    assert_eq!(changed, 1);
+    let stale = fixture.search_json(&["Superseded", "--cached", "--all-projects"]);
+    assert_eq!(result_sessions(&stale), [session.to_string()]);
+    assert_eq!(stale["results"][0]["match"], "conversation");
     assert!(
         fixture
             .command()
@@ -1174,13 +1180,15 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
     }
 
     // An interrupted pass can persist the new catalog row before it records a read failure.
-    let store = omnis_store::Store::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    store
-        .clear_trajectory_index_failure(&omnis_ir::SessionRef::new(
-            omnis_ir::Provider::Codex,
-            CODEX_ID,
-        ))
-        .unwrap();
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    let home = fs::canonicalize(fixture.root.join("codex")).unwrap();
+    assert_eq!(
+        db.execute(
+            "DELETE FROM trajectory_index_failures WHERE provider='codex' AND session_id=?1 AND codex_home=?2",
+            rusqlite::params![CODEX_ID, home.to_str().unwrap()],
+        ).unwrap(),
+        1
+    );
     assert!(result_sessions(&search("Pagination", &["--cached"])).is_empty());
     assert!(result_sessions(&search("backoff", &["--cached"])).is_empty());
 

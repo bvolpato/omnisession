@@ -433,13 +433,15 @@ pub(super) struct InputPosition {
 
 impl InputPosition {
     pub(super) fn user(record: &Value, ordinal: u64) -> Option<Self> {
-        let payload = &record["payload"];
-        (record["type"] == "response_item"
-            && payload["role"] == "user"
-            && model_instruction(payload))
-        .then(|| Self {
+        (record["type"] == "response_item")
+            .then(|| Self::user_item(&record["payload"], &record["metadata"], ordinal))
+            .flatten()
+    }
+
+    pub(super) fn user_item(payload: &Value, metadata: &Value, ordinal: u64) -> Option<Self> {
+        (payload["role"] == "user" && model_instruction(payload)).then(|| Self {
             ordinal,
-            order: super::model_cut::input_order(&record["metadata"]),
+            order: super::model_cut::input_order(metadata),
         })
     }
 }
