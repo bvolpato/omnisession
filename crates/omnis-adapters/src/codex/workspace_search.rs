@@ -146,41 +146,48 @@ impl WorkspaceProbe {
         }
         let mut history = CodexHistory::new(None);
         let mut builder = EventBuilder::new(Provider::Codex, &session.session.id);
-        builder.plan_preview(None);
         let mut inherited = false;
-        let skipped = rollout_file::read_records(bytes.as_slice(), |record, skipped| {
-            history.settings.observe_gaps(skipped);
-            history.settings.observe(&session.session.id, &record);
-            history.observe_workspace_gaps(skipped.workspace_gaps());
-            if history.records_seen == 0 {
-                ensure!(
-                    record["type"] == "session_meta"
-                        && string_at(&record["payload"], &[&["id"], &["session_id"]])
-                            == Some(session.session.id.as_str()),
-                    "Codex rollout header changed"
-                );
-                inherited = records_history_base(&record);
-                if !inherited && skipped.workspace_gaps() == 0 {
-                    history.project_path =
-                        string_at(&record["payload"], &[&["cwd"]]).map(PathBuf::from);
+        let mut malformed = 0;
+        let skipped =
+            rollout_file::read_records(bytes.as_slice(), |mut record, skipped, terminated| {
+                history.observe_malformed(&mut malformed, skipped);
+                history.settings.observe_gaps(skipped);
+                history.settings.observe(&session.session.id, &record);
+                history
+                    .workspace
+                    .observe_gaps(skipped.workspace_gaps(), history.records_seen);
+                if history.records_seen == 0 {
+                    ensure!(
+                        record["type"] == "session_meta"
+                            && string_at(&record["payload"], &[&["id"], &["session_id"]])
+                                == Some(session.session.id.as_str()),
+                        "Codex rollout header changed"
+                    );
+                    inherited = records_history_base(&record);
+                    if !inherited && skipped.workspace_gaps() == 0 {
+                        history.workspace.path =
+                            string_at(&record["payload"], &[&["cwd"]]).map(PathBuf::from);
+                    }
                 }
-            }
-            history.push(&mut builder, &record)?;
-            if history
-                .records_seen
-                .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
-            {
-                history.compact(&mut builder);
-            }
-            Ok(())
-        })?;
+                history.push(&mut builder, &mut record, terminated)?;
+                if history
+                    .records_seen
+                    .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
+                {
+                    history.compact(&mut builder);
+                }
+                Ok(())
+            })?;
         history.settings.observe_gaps(skipped);
-        history.observe_workspace_gaps(skipped.workspace_gaps());
+        history
+            .workspace
+            .observe_gaps(skipped.workspace_gaps(), history.records_seen);
         ensure!(
             !inherited
                 || history.settings.has_owned()
                 || history
-                    .workspace_record
+                    .workspace
+                    .record
                     .is_some_and(|position| position > 1),
             "inherited workspace may be unavailable"
         );
@@ -192,6 +199,6 @@ impl WorkspaceProbe {
                         .is_some_and(|actual| actual.matches_file_contents(expected))),
             "Codex rollout changed during workspace search"
         );
-        Ok(history.settings.directory(history.project_path))
+        Ok(history.settings.directory(history.workspace.path))
     }
 }

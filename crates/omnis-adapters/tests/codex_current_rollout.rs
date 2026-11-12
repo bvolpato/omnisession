@@ -10,19 +10,21 @@ const REPLACEMENT: &str = "22222222-2222-4222-8222-222222222222";
 const UNRELATED: &str = "33333333-3333-4333-8333-333333333333";
 const LATEST: &str = "44444444-4444-4444-8444-444444444444";
 
+const TIME: &str = "2026-01-01T00:00:00.000Z";
+
 fn header(ordinal: u64, base: Option<&Value>) -> Value {
-    json!({"ordinal":ordinal,"type":"session_meta","payload":{
+    json!({"timestamp":TIME,"ordinal":ordinal,"type":"session_meta","payload":{
         "id":THREAD,"cwd":"/workspace","history_mode":"paginated","history_base":base
     }})
 }
 
 fn rollout(header: &Value, text: &str) -> String {
     let ordinal = header["ordinal"].as_u64().unwrap();
-    let raw = json!({"ordinal":ordinal+1,"type":"response_item","payload":{
+    let raw = json!({"timestamp":TIME,"ordinal":ordinal+1,"type":"response_item","payload":{
         "type":"message","role":"assistant","id":"answer",
         "content":[{"type":"output_text","text":text}]
     }});
-    let displayed = json!({"ordinal":ordinal+2,"type":"event_msg","payload":{
+    let displayed = json!({"timestamp":TIME,"ordinal":ordinal+2,"type":"event_msg","payload":{
         "type":"item_completed","thread_id":THREAD,"turn_id":"turn-one",
         "item":{"type":"AgentMessage","id":"answer","content":[{"type":"Text","text":text}]}
     }});
@@ -174,25 +176,42 @@ fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<
     let path = home.path().join(format!(
         "rollout-2026-01-01T01-00-00-{THREAD}_{REPLACEMENT}.jsonl"
     ));
-    let opener = json!({"ordinal":1, "type":"response_item", "payload":{
-        "type":"message","id":"request","role":"user","content":[{"type":"input_text","text":"former opener"}]
-    }});
-    let display = json!({"ordinal":2, "type":"event_msg","payload":{
-        "type":"item_completed","thread_id":THREAD,"turn_id":"turn-one",
-        "item":{"type":"UserMessage","id":"request","content":[{"type":"text","text":"former opener"}]}
-    }});
-    let rollback = json!({"ordinal":3, "type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
-    fs::write(
-        &path,
-        format!("{}\n{opener}\n{display}\n{rollback}\n", header(0, None)),
-    )?;
     let session = SessionRef::new(Provider::Codex, THREAD);
+    let physical = SessionRef::new(Provider::Codex, REPLACEMENT);
+    let mut rows = vec![
+        header(0, None),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-one"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"request","role":"user",
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn-one"},
+            "content":[{"type":"input_text","text":"former opener"}]}}),
+        json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":THREAD,"turn_id":"turn-one",
+            "item":{"type":"UserMessage","id":"request","content":[{"type":"text","text":"former opener"}]}}}),
+        json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-one"}}),
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+    ];
+    let mut earlier_display = rows[3].clone();
+    earlier_display["payload"]["item"]["content"][0]["text"] = "draft opener".into();
+    rows.insert(3, earlier_display);
+    let mut document = String::new();
+    for (index, row) in rows.iter_mut().enumerate() {
+        row["ordinal"] = index.into();
+        row["timestamp"] = TIME.into();
+        document.push_str(&row.to_string());
+        document.push('\n');
+    }
+    fs::write(&path, document)?;
     let revision = CodexAdapter::index_file_revision(&path).unwrap();
     assert!(CodexAdapter::rollout_withdrew_search_title(
         &path,
         &session,
         revision,
         "former opener"
+    )?);
+    assert!(!CodexAdapter::rollout_withdrew_search_title(
+        &path,
+        &session,
+        revision,
+        "draft opener"
     )?);
     assert!(!CodexAdapter::verify_legacy_local_opener(
         &path,
@@ -201,7 +220,6 @@ fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<
         "former opener",
         false
     )?);
-    let physical = SessionRef::new(Provider::Codex, REPLACEMENT);
     assert!(
         CodexAdapter::rollout_withdrew_search_title(&path, &physical, revision, "former opener")
             .is_err()
