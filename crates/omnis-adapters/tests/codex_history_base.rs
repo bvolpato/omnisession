@@ -2194,10 +2194,10 @@ fn equal_display_text_cannot_corroborate_conflicting_native_images_or_ids() -> a
                     );
                     let first_visible = !same && (!damaged || completed);
                     let mut expected = Vec::new();
-                    if !same || count < 2 {
+                    if (!same && (!completed || damaged)) || count < 2 {
                         expected.push("A");
                     }
-                    if first_visible && count < 2 {
+                    if first_visible && (count == 0 || ((!completed || damaged) && count < 2)) {
                         expected.push("image request");
                     }
                     if count == 0 {
@@ -2280,7 +2280,8 @@ fn typed_media_mirrors_are_consumed_once_in_either_wire_order() -> anyhow::Resul
         ),
     ] {
         for (order, requests) in [
-            ("RE", 1usize),
+            ("EE", 2usize),
+            ("RE", 1),
             ("ER", 1),
             ("REE", 2),
             ("ERR", 2),
@@ -2323,13 +2324,16 @@ fn typed_media_mirrors_are_consumed_once_in_either_wire_order() -> anyhow::Resul
                         ],
                     );
                     let mut expected = Vec::new();
-                    if count <= requests {
+                    let checkpoints: usize = if order == "ERR" && damaged { 2 } else { 1 };
+                    if count <= checkpoints {
                         expected.push("older");
                     }
-                    expected.extend(std::iter::repeat_n(
-                        "media request",
-                        requests.saturating_sub(count),
-                    ));
+                    let retained = if count == 0 {
+                        requests
+                    } else {
+                        checkpoints.saturating_sub(count)
+                    };
+                    expected.extend(std::iter::repeat_n("media request", retained));
                     expected.push("leaf");
                     check_parent_messages(home.path(), &expected, damaged)?;
                     let snapshot = read(home.path(), true)?;
@@ -2354,6 +2358,7 @@ fn media_turn_rows(order: &str, raw_media: &Value, event_fields: &Value) -> Vec<
         turn(1, "user", "older"),
         json!({"ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"B"}}),
     ];
+    let mut submission = 0;
     for kind in order.chars() {
         let n = rows.len() as u64;
         let mut record = if kind == 'R' {
@@ -2367,6 +2372,10 @@ fn media_turn_rows(order: &str, raw_media: &Value, event_fields: &Value) -> Vec<
             json!({"ordinal":n,"type":"event_msg","payload":{"type":"user_message","message":"media request"}})
         };
         if kind == 'E' {
+            if order != "EE" {
+                submission += 1;
+                record["payload"]["client_id"] = json!(format!("submission-{submission}"));
+            }
             record["payload"]
                 .as_object_mut()
                 .unwrap()

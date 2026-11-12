@@ -34,6 +34,10 @@ fn selected_workspace_retains_only_known_directories_across_encodings() -> Resul
         let path = temp.path().join(format!("rollout-{ID}.{extension}"));
         let mut cases = vec![(harmless.to_owned(), Some("next"))];
         for torn in [
+            r#"{"type":"turn_context","payload":{}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":7}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":""}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"bad\u0000path"}}"#,
             r#"{"type":"turn_context","payload":"#,
             r#"{"type":"turn_co"#,
             r#"{"type":"t"#,

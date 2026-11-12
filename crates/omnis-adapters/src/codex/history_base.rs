@@ -1070,13 +1070,15 @@ impl Lineage {
 
     pub(super) fn visit(
         &self,
-        mut visit: impl FnMut(InheritedRecord, usize) -> Result<()>,
+        mut visit: impl FnMut(InheritedRecord, usize, bool) -> Result<()>,
     ) -> Result<usize> {
         let mut skipped = 0;
         let mut damage = Vec::new();
         for (index, segment) in self.segments.iter().enumerate().skip(self.first_available) {
             let prefix = if damage.is_empty() {
-                read_prefix(segment, &mut |record, local| visit(record, skipped + local))
+                read_prefix(segment, &mut |record, local| {
+                    visit(record, skipped + local, segment.recovery.is_some())
+                })
             } else {
                 // Check every newer bookmark in this pass. Multiple damaged sources need one retry.
                 read_prefix(segment, &mut |_, _| Ok(()))
@@ -1333,7 +1335,7 @@ impl SequenceEvidence {
     fn observe_turn(&mut self, path: &Path, record: &Value, row: usize, numbered: bool) {
         let payload = &record["payload"];
         if is_owned_turn_start(record, path) {
-            self.last_request = None;
+            self.last_request = Some(super::MirrorGroup::new(true));
             self.turn = payload["turn_id"]
                 .as_str()
                 .map(|id| (row, id.to_owned(), numbered));
@@ -1360,14 +1362,14 @@ impl SequenceEvidence {
         }
         if self.turn.is_some() && message_role(record).is_some() {
             if let Some(message) = request_text(record) {
-                self.observe_request(record, row, numbered, message);
+                self.observe_request(record, row, numbered, &message);
             } else {
-                self.last_request = None;
+                super::MirrorGroup::barrier(&mut self.last_request);
             }
         }
     }
 
-    fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: String) {
+    fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: &str) {
         let identity = super::VisibleMessage::new(record, omnis_ir::EventKind::MessageUser, text);
         if let super::MirrorObservation::Paired(prior) = super::MirrorGroup::observe(
             &mut self.last_request,
@@ -1450,8 +1452,10 @@ fn request_text(record: &Value) -> Option<String> {
         }
         _ => return None,
     };
-    if text.is_empty() && images > 0 {
-        return Some(super::omitted_images_text(images));
+    if text.is_empty()
+        && let Some(placeholder) = super::omitted_media_text(payload, images)
+    {
+        return Some(placeholder);
     }
     (!super::is_contextual_user_text(&text)).then_some(text)
 }
@@ -1570,7 +1574,7 @@ struct PrefixCursor {
     malformed: bool,
     damage: Option<&'static str>,
     damaged_preamble_settings: bool,
-    resume_on_subagent_request: bool,
+    subagent_gap_placed: bool,
     evidence: SequenceEvidence,
 }
 
@@ -1582,7 +1586,7 @@ impl PrefixCursor {
             malformed: false,
             damage: None,
             damaged_preamble_settings: false,
-            resume_on_subagent_request: false,
+            subagent_gap_placed: false,
             evidence: SequenceEvidence::default(),
         }
     }
@@ -1625,23 +1629,26 @@ impl PrefixCursor {
                     .subagent
                     .is_some_and(|cutoff| cutoff.checked_add(1) == Some(ordinal))
             {
-                self.resume_on_subagent_request = true;
+                self.subagent_gap_placed = true;
             }
             if !hidden
                 && segment.recovery.is_some()
                 && (self.damage.is_some() || inferred.is_some())
                 && (through_subagent_start
-                    || (self.resume_on_subagent_request
+                    || (self.subagent_gap_placed
                         && self.damage == Some(MISSING_ORDINAL)
                         && inferred.is_none()
                         && owned_event(record, &segment.path)
-                        && request_text(record).is_some())
+                        && (request_text(record).is_some()
+                            || is_non_turn_body(record)
+                            || (recoverable_control(record, &segment.path)
+                                && !is_owned_rollback(record, &segment.path))))
                     || ((is_owned_turn_start(record, &segment.path)
                         || (self.damaged_preamble_settings && !preamble))
                         && start.ordinal().is_none_or(|begin| ordinal >= begin)))
             {
                 self.damage = None;
-                self.resume_on_subagent_request = false;
+                self.subagent_gap_placed = false;
                 self.damaged_preamble_settings = false;
             }
             if !hidden
@@ -1653,7 +1660,7 @@ impl PrefixCursor {
                         && plan.withheld_mirrors.binary_search(&row).is_err()
                 })
             {
-                self.resume_on_subagent_request = start.subagent == Some(ordinal);
+                self.subagent_gap_placed = start.subagent == Some(ordinal);
                 self.damage = Some(MISSING_ORDINAL);
             }
             if !hidden && self.damage.is_none() {
@@ -1661,7 +1668,7 @@ impl PrefixCursor {
             }
         } else {
             if !hidden {
-                self.resume_on_subagent_request = false;
+                self.subagent_gap_placed = false;
                 self.damaged_preamble_settings = preamble && start.owned_settings(record);
                 self.damage = Some(MISSING_ORDINAL);
             }

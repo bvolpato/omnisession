@@ -334,13 +334,13 @@ fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
 }
 
 #[test]
-fn codex_rollback_counts_multipart_and_repeated_requests_once_per_message() {
+fn codex_rollback_counts_an_unfinished_native_task_with_two_mirrored_requests_once() {
     let mut multipart = message("user", "first part");
     multipart["payload"]["content"]
         .as_array_mut()
         .unwrap()
         .push(json!({"type": "input_text", "text": "second part"}));
-    let snapshot = read_records(vec![
+    let rows = vec![
         message("user", "same request"),
         event("task_complete", json!({"turn_id": "first"})),
         event("task_started", json!({"turn_id": "second"})),
@@ -351,10 +351,20 @@ fn codex_rollback_counts_multipart_and_repeated_requests_once_per_message() {
             "user_message",
             json!({"message": "first part\nsecond part"}),
         ),
-        event("thread_rolled_back", json!({"num_turns": 2})),
-    ])
-    .expect("rollback count");
-    assert_eq!(visible_text(&snapshot), ["same request"]);
+    ];
+    for (count, expected) in [
+        (
+            0,
+            &["same request", "same request", "first part\nsecond part"][..],
+        ),
+        (1, &["same request"]),
+        (2, &[]),
+    ] {
+        let mut records = rows.clone();
+        records.push(event("thread_rolled_back", json!({"num_turns":count})));
+        let snapshot = read_records(records).expect("rollback count");
+        assert_eq!(visible_text(&snapshot), expected);
+    }
 }
 
 #[test]
@@ -2114,4 +2124,95 @@ fn local_wrapper_positions_follow_the_event_local_image_list() {
             assert_eq!(visible_text(&snapshot).len(), if mirrored { 1 } else { 2 });
         }
     }
+}
+
+#[test]
+fn local_audio_pairs_by_the_framed_path_and_preserves_literal_text() -> anyhow::Result<()> {
+    let path = r"C:\synthetic\voice memo.wav";
+    let opening = format!(r#"<audio name=[Audio #1] path="{path}">"#);
+    let parts = json!([
+        {"type":"input_text","text":"voice memo"},
+        {"type":"input_text","text":opening},
+        {"type":"input_audio","audio_url":"data:audio/wav;base64,UklGRg=="},
+        {"type":"input_text","text":"</audio>"}
+    ]);
+    let raw =
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":parts}});
+    for (saved_path, expected) in [(path, 1), ("/synthetic/other.wav", 2)] {
+        let saved = event(
+            "user_message",
+            json!({"message":"voice memo","local_audio":[saved_path]}),
+        );
+        for rows in [[raw.clone(), saved.clone()], [saved, raw.clone()]] {
+            assert_eq!(
+                visible_text(&read_records(rows.into())?),
+                vec!["voice memo"; expected]
+            );
+        }
+    }
+    let mut audio_only = raw;
+    audio_only["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    let saved = event("user_message", json!({"message":"","local_audio":[path]}));
+    assert_eq!(
+        visible_text(&read_records(vec![audio_only, saved])?),
+        vec!["[audio omitted]"]
+    );
+    let literal = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+        {"type":"input_text","text":opening},{"type":"input_text","text":"</audio>"}
+    ]}});
+    assert_eq!(
+        visible_text(&read_records(vec![literal])?),
+        vec![format!("{opening}\n</audio>")]
+    );
+    Ok(())
+}
+
+#[test]
+fn native_task_pairs_out_of_order_submissions_and_withdraws_the_whole_task() -> anyhow::Result<()> {
+    let raw = |id, text| {
+        let mut record = message("user", text);
+        record["payload"]["client_id"] = json!(id);
+        record
+    };
+    let saved = |id, text| event("user_message", json!({"client_id":id, "message":text}));
+    for body in [
+        vec![
+            saved("a", "same"),
+            saved("b", "other"),
+            raw("b", "other"),
+            raw("a", "same"),
+        ],
+        vec![
+            raw("a", "same"),
+            saved("a", "same"),
+            raw("b", "other"),
+            saved("b", "other"),
+        ],
+    ] {
+        for (count, expected) in [
+            (0, &["same", "same", "other"][..]),
+            (1, &["same"]),
+            (2, &[]),
+        ] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"older"})),
+                saved("a", "same"),
+                event("task_complete", json!({"turn_id":"older"})),
+                event("task_started", json!({"turn_id":"newer"})),
+            ];
+            rows.extend(body.clone());
+            rows.push(event("task_complete", json!({"turn_id":"newer"})));
+            rows.push(event("thread_rolled_back", json!({"num_turns":count})));
+            for preview in [true, false] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(rows.clone(), preview)?),
+                    expected
+                );
+            }
+        }
+    }
+    Ok(())
 }

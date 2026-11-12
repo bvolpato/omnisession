@@ -1235,13 +1235,14 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
     let home = tempfile::tempdir()?;
     let dir = home.path().join("sessions");
     for marker in [false, true] {
-        for (cutoff, anchor, copied_rows) in [
-            (3, 4, false),
-            (3, 4, true),
-            (5, 4, true),
-            (5, 5, true),
-            (5, 6, true),
-            (2, 4, true),
+        for (cutoff, anchor, copied_rows, foreign_anchor) in [
+            (3, 4, false, false),
+            (3, 4, false, true),
+            (3, 4, true, false),
+            (5, 4, true, false),
+            (5, 5, true, false),
+            (5, 6, true, false),
+            (2, 4, true, false),
         ] {
             let mut meta = header(PARENT, 0, None, false);
             meta["payload"]["subagent_history_start_ordinal"] = json!(cutoff);
@@ -1254,6 +1255,9 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
                 copied,
                 json!({"type":"event_msg","ordinal":anchor,"payload":{"type":"token_count"}}),
             ];
+            if foreign_anchor {
+                rows.last_mut().unwrap()["payload"]["thread_id"] = json!(REVERT);
+            }
             if !copied_rows {
                 rows.drain(1..3);
             }
@@ -1261,11 +1265,11 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
                 rows.push(json!({"type":"event_msg","ordinal":anchor+1,"payload":{"type":"task_started","turn_id":"local"}}));
             }
             let ordinal = anchor + 1 + usize::from(marker);
-            rows.push(message(ordinal, "local request"));
-            let mut reply = message(ordinal + 1, "local reply");
+            let mut reply = message(ordinal, "local reply");
             reply["payload"]["role"] = json!("assistant");
             reply["payload"]["content"][0]["type"] = json!("output_text");
             rows.push(reply);
+            rows.push(message(ordinal + 1, "local request"));
             write(&dir, &format!("2026-01-01T00-00-00-{PARENT}"), &rows)?;
             write(
                 &dir,
@@ -1285,7 +1289,7 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
                         .iter()
                         .map(|m| m.text.as_str())
                         .collect::<Vec<_>>(),
-                    ["local request", "local reply"]
+                    ["local reply", "local request"]
                 );
             }
             let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, REVERT))?;
@@ -1295,8 +1299,10 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
                 .iter()
                 .map(|m| m.text.as_str())
                 .collect();
-            let expected = if marker || anchor <= cutoff + 1 {
-                vec!["local request", "local reply", "leaf request"]
+            let expected = if foreign_anchor && !marker {
+                vec!["local request", "leaf request"]
+            } else if marker || anchor <= cutoff + 1 {
+                vec!["local reply", "local request", "leaf request"]
             } else {
                 vec!["leaf request"]
             };

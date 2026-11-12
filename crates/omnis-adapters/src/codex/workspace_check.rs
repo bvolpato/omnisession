@@ -14,7 +14,7 @@ use super::{
     rollout_file,
 };
 use crate::support::{
-    BoundedLine, JsonLineSkips, read_bounded_line_with_budget, string_at, validate_provider,
+    BoundedLine, JsonLineSkips, read_bounded_line_with_budget, validate_provider,
 };
 use crate::{CodexWorkspaceProjection, IndexRead};
 
@@ -125,10 +125,8 @@ impl WorkspaceScan {
             self.rolled_back = false;
             self.reconstruct_history = true;
         } else if record["type"] == "turn_context" {
-            if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
-                self.directory = Some(PathBuf::from(cwd));
-                self.rolled_back = false;
-            }
+            self.directory = super::turn_context_cwd(record).map(PathBuf::from);
+            self.rolled_back = false;
         } else if record["type"] == "event_msg" && record["payload"]["type"] == "thread_rolled_back"
         {
             let count = record["payload"]["num_turns"]
