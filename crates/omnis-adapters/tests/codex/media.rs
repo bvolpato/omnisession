@@ -220,6 +220,37 @@ fn failed_attachment_matches_beside_a_successful_local_attachment() {
 }
 
 #[test]
+fn a_message_only_checkpoint_restores_one_request_for_a_legacy_upload() {
+    let caption = "inspect the upload";
+    let model = model_request(&json!([
+        {"type":"input_text","text":caption},
+        {"type":"input_text","text":"<image name=[Image #1] path=\"local-only.png\">"},
+        {"type":"input_image","file_id":"upload-id"},
+        {"type":"input_text","text":"</image>"}
+    ]));
+    let shown = event(
+        "user_message",
+        json!({"message":caption,"file_ids":["upload-id"]}),
+    );
+    let summary = json!({"type":"compacted","payload":{"message":"A source summary."}});
+    for preview in [false, true] {
+        let source =
+            read_records_with_preview(vec![model.clone(), shown.clone(), summary.clone()], preview)
+                .unwrap();
+        let active = omnis_core::import_conversation(&source);
+        let users: Vec<_> = active
+            .messages
+            .iter()
+            .filter(|row| row.role == omnis_core::HandoffRole::User)
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(users, [caption]);
+        let published = serde_json::to_string(&source).unwrap();
+        assert!(!published.contains("upload-id") && !published.contains("local-only.png"));
+    }
+}
+
+#[test]
 fn a_rolled_back_migrated_attachment_keeps_only_the_native_display() {
     let turn = "01948226-0000-7001-8000-000000000001";
     let id = "msg_input_01948226-0000-7003-8000-000000000003";
@@ -323,7 +354,7 @@ fn a_checkpoint_must_retain_the_same_attachment_under_its_original_or_migrated_i
                 Some("paginated"),
             )
             .unwrap();
-            assert_eq!(visible_text(&snapshot), ["read the image"]);
+            assert_eq!(super::published_text(&snapshot), ["read the image"]);
             assert_eq!(
                 omnis_core::import_conversation(&snapshot).messages.len(),
                 usize::from(active)
@@ -332,17 +363,20 @@ fn a_checkpoint_must_retain_the_same_attachment_under_its_original_or_migrated_i
     }
 }
 
-fn with_selection(shown: &Value, part: Value, media: bool) -> Value {
-    let mut item = shown.clone();
+fn display_with_selection(display: &Value, selection: Value, keep_media: bool) -> Value {
+    let mut item = display.clone();
     let parts = item["payload"]["item"]["content"].as_array_mut().unwrap();
-    if !media {
+    if !keep_media {
         parts.pop();
     }
-    parts.push(part);
+    parts.push(selection);
     item
 }
 
-fn assert_compacted_caption(source: &[Value], shown: &Value, expected: &str, active: bool) {
+const CAPTION: &str = "read the chart";
+const IMAGE_ID: &str = "private-image";
+
+fn check_compacted_caption(source: &[Value], shown: &Value, expected: &str, active: bool) {
     for selected in [false, true] {
         let mut rows = source.to_vec();
         rows.push(shown.clone());
@@ -355,17 +389,20 @@ fn assert_compacted_caption(source: &[Value], shown: &Value, expected: &str, act
             let snapshot =
                 read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
             let imported = omnis_core::import_conversation(&snapshot);
-            let users: Vec<_> = imported
-                .messages
-                .iter()
-                .filter(|m| m.role == omnis_core::HandoffRole::User)
-                .map(|m| m.text.as_str())
-                .collect();
-            assert_eq!(users, active.then_some(expected).as_slice());
+            assert_eq!(imported.messages.iter().any(|m| m.text == expected), active);
             let serialized = serde_json::to_string(&snapshot).unwrap();
-            assert!(
-                !serialized.contains("private-image") && !serialized.contains("private-selector")
-            );
+            assert!(!serialized.contains(IMAGE_ID) && !serialized.contains("private-selector"));
+            if expected.is_empty() {
+                assert!(published_text(&snapshot).is_empty());
+                assert!(imported.truncated);
+            } else if expected == CAPTION {
+                assert!(published_text(&snapshot).contains(&CAPTION));
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                let recovery = String::from_utf8(recovery).unwrap();
+                assert!(recovery.contains(CAPTION));
+                assert!(!recovery.contains(IMAGE_ID) && !recovery.contains("private-selector"));
+            }
         }
     }
 }
@@ -389,10 +426,11 @@ fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
         row["payload"]["turn_id"] = turn.into();
         row
     };
-    let caption = "read the chart";
-    let image = "private-image";
+    let caption = CAPTION;
+    let image = IMAGE_ID;
     let original = model(caption, image);
     let published = display(caption, image);
+    let selected = |part, media| display_with_selection(&published, part, media);
     let skill = json!({"type":"skill", "name":"fixture", "path":"private-selector/SKILL.md"});
     let mention = json!({"type":"mention", "name":"fixture", "path":"app://private-selector"});
     let mut plain = original.clone();
@@ -406,36 +444,30 @@ fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
         (vec![original.clone()], published.clone(), caption, true),
         (
             vec![original.clone()],
-            with_selection(&published, skill.clone(), true),
+            selected(skill.clone(), true),
             caption,
             true,
         ),
         (
             vec![original.clone()],
-            with_selection(&published, mention.clone(), true),
+            selected(mention.clone(), true),
             caption,
             true,
         ),
-        (
-            vec![plain],
-            with_selection(&published, skill, false),
-            caption,
-            true,
-        ),
+        (vec![plain], selected(skill, false), caption, true),
         (
             vec![original.clone()],
-            with_selection(&published, json!({"type":"mention","name":"fixture"}), true),
-            caption,
+            selected(json!({"type":"mention","name":"fixture"}), true),
+            "",
             false,
         ),
         (
             vec![original.clone()],
-            with_selection(
-                &published,
+            selected(
                 json!({"type":"unknown","name":"fixture","path":"unknown"}),
                 true,
             ),
-            caption,
+            "",
             false,
         ),
         (
@@ -470,7 +502,58 @@ fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
             false,
         ),
     ] {
-        assert_compacted_caption(&source, &shown, expected, active);
+        check_compacted_caption(&source, &shown, expected, active);
+    }
+}
+
+#[test]
+fn a_framed_image_caption_survives_a_damaged_revision_and_a_later_summary() {
+    let turn = "image-turn";
+    let mut model = model_request(&json!([
+        {"type":"input_text","text":CAPTION},
+        {"type":"input_text","text":"<image name=[Image #1] path=\"unpublished.png\">"},
+        {"type":"input_image","file_id":IMAGE_ID},
+        {"type":"input_text","text":"</image>"}
+    ]));
+    model["payload"]["id"] = "request".into();
+    model["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+    let published = turn_item(
+        turn,
+        &json!({"type":"UserMessage","id":"request","content":[
+            {"type":"text","text":CAPTION}, {"type":"image","file_id":IMAGE_ID}
+        ]}),
+    );
+    let broken = turn_item(
+        turn,
+        &json!({"type":"UserMessage","id":"request","content":[
+            {"type":"text","text":"damaged edit"}, {"type":"image"}
+        ]}),
+    );
+    let checkpoint = json!({"type":"compacted","payload":{
+        "message":"","window_number":1,"replacement_history":[model["payload"]]
+    }});
+    let mut rows = vec![model, published, checkpoint, broken];
+    for final_summary in [false, true] {
+        if final_summary {
+            rows.push(json!({"type":"compacted","payload":{"message":"A source summary."}}));
+        }
+        for preview in [false, true] {
+            let source = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(published_text(&source), [CAPTION]);
+            let active = omnis_core::import_conversation(&source);
+            assert_eq!(
+                active.messages.first().map(|m| m.text.as_str()),
+                Some(CAPTION)
+            );
+            assert!(active.truncated);
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&source, &mut recovery).unwrap();
+            let recovered = String::from_utf8(recovery).unwrap();
+            assert!(recovered.contains(CAPTION));
+            for private in [IMAGE_ID, "unpublished.png", "damaged edit"] {
+                assert!(!recovered.contains(private));
+            }
+        }
     }
 }
 

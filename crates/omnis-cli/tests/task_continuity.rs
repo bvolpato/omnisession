@@ -40,6 +40,15 @@ fn command(root: &Path, workspace: &Path) -> Command {
     command
 }
 
+fn inspect_workspace(root: &Path, directory: &Path, source: &str) -> Command {
+    let mut cli = command(root, directory);
+    let launcher = std::env::current_exe().unwrap();
+    cli.env("OMNI_CODEX_BIN", &launcher)
+        .env("OMNI_CLAUDE_BIN", launcher)
+        .args(["--json", "inspect", source]);
+    cli
+}
+
 fn write_synthetic_claude(root: &Path, workspace: &Path) {
     let projects = root.join("claude/projects/synthetic");
     fs::create_dir_all(workspace).unwrap();
@@ -264,6 +273,61 @@ fn binding_an_imported_session_to_an_existing_chat_keeps_only_binding_history() 
 }
 
 #[test]
+fn codex_keeps_its_relative_store_when_launching_in_the_recorded_subdirectory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let repo = root.join("repo");
+    let member = repo.join("member");
+    let home = repo.join(".fixture-codex");
+    let sessions = home.join("sessions");
+    fs::create_dir_all(&member).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    workspace_git(&repo, &["init", "--quiet"]);
+    let recorded = omnis_core::canonicalize_path(&member).unwrap();
+    fs::write(
+        sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")),
+        json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":recorded}}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("state")).unwrap();
+    fs::write(
+        root.join("state/profiles.toml"),
+        "[profiles.configured]\nagent = \"codex\"\n[profiles.configured.env]\nFIXTURE_OPTION = \"configured\"\n",
+    )
+    .unwrap();
+
+    let session = format!("codex:{SESSION_ID}");
+    let selected = omnis_core::canonicalize_path(&home).unwrap();
+    for (verb, profile) in [("resume", "codex"), ("fork", "configured")] {
+        let mut cli = command(root, &repo);
+        cli.env("CODEX_HOME", ".fixture-codex").args([
+            "--json",
+            verb,
+            &session,
+            "--in",
+            profile,
+            "--dry-run",
+        ]);
+        if verb == "resume" {
+            cli.arg("--no-fork");
+        }
+        let plan = successful_json(&mut cli);
+        assert_eq!(plan["launch"]["cwd"], json!(recorded));
+        let env = plan["launch"]["env"].as_array().unwrap();
+        let planned_home = env.iter().find(|e| e["name"] == "CODEX_HOME").unwrap();
+        let planned_home = Path::new(planned_home["value"].as_str().unwrap());
+        assert!(planned_home.is_absolute());
+        assert_eq!(
+            omnis_core::canonicalize_path(planned_home).unwrap(),
+            selected
+        );
+        if profile == "configured" {
+            assert!(env.contains(&json!({"name":"FIXTURE_OPTION","value":"configured"})));
+        }
+    }
+}
+
+#[test]
 fn same_provider_fork_can_use_the_current_workspace_after_the_old_one_moves() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -288,34 +352,738 @@ fn same_provider_fork_can_use_the_current_workspace_after_the_old_one_moves() {
 }
 
 #[test]
-fn native_export_carries_repository_identity_for_relocated_continuation() {
+fn codex_native_launch_uses_the_surviving_turn_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let workspace = root.join("source");
-    let relocated = root.join("relocated");
-    fs::create_dir_all(&workspace).unwrap();
+    let initial = root.join("initial");
+    let moved = root.join("moved");
+    let sessions = root.join("codex/sessions");
+    for dir in [&initial, &moved, &sessions] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl"));
+    let mut records = vec![
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":initial,
+            "git":{"commit_hash":"0000000000000000000000000000000000000000"}}}),
+    ];
+    for (directory, message) in [(&initial, "Original turn"), (&moved, "Moved turn")] {
+        records.push(json!({"type":"event_msg","payload":{"type":"task_started"}}));
+        records.push(json!({"type":"turn_context","payload":{"cwd":directory}}));
+        records
+            .push(json!({"type":"event_msg","payload":{"type":"user_message","message":message}}));
+    }
+    let write = |records: &[Value]| {
+        let lines = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout, lines).unwrap();
+    };
+    let source = format!("codex:{SESSION_ID}");
+    let check_launch = |directory: &Path, expected: bool, cold_needs_cd: bool| {
+        let check_plan = |verb: &str, set_cwd: bool| {
+            let mut cli = command(root, directory);
+            cli.args(["--json", verb, &source, "--in", "codex", "--dry-run"]);
+            if verb == "resume" {
+                cli.arg("--no-fork");
+            }
+            let plan = successful_json(&mut cli);
+            assert_eq!(
+                plan["launch"]["cwd"],
+                json!(omnis_core::canonicalize_path(directory).unwrap())
+            );
+            let args = plan["launch"]["args"].as_array().unwrap();
+            assert!(args.iter().any(|arg| arg == verb), "{plan}");
+            assert_eq!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--cd" && pair[1] == "."),
+                set_cwd,
+                "{plan}"
+            );
+            assert_eq!(plan["fidelity"]["repository_matches"], expected);
+        };
+        check_plan("resume", cold_needs_cd);
+        let inspected = successful_json(&mut inspect_workspace(root, directory, &source));
+        assert_eq!(inspected["repository_matches"], expected);
+        // Inspection caches the effective directory. The cache does not establish the native startup directory.
+        check_plan("fork", true);
+    };
+    write(&records);
+    check_launch(&moved, true, true);
+    check_codex_profile_directory(root, &moved, &source);
+    let wrong = command(root, &initial)
+        .args(["--json", "fork", &source, "--in", "codex", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("differs from current"));
+    records.push(json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}));
+    write(&records);
+    check_launch(&initial, false, false);
+
+    records[0]["payload"].as_object_mut().unwrap().remove("cwd");
+    records.truncate(1);
+    write(&records);
+    let forced = successful_json(command(root, &moved).args([
+        "--json",
+        "fork",
+        &source,
+        "--in",
+        "codex",
+        "--allow-workspace-mismatch",
+        "--dry-run",
+    ]));
+    let flags = forced["launch"]["args"].as_array().unwrap();
+    assert!(
+        flags
+            .windows(2)
+            .any(|pair| pair[0] == "--cd" && pair[1] == ".")
+    );
+}
+
+fn check_codex_profile_directory(root: &Path, selected: &Path, source: &str) {
+    workspace_git(selected, &["init", "--quiet"]);
+    fs::create_dir(selected.join("somewhere")).unwrap();
+    fs::write(
+        root.join("state/profiles.toml"),
+        r#"[profiles.configured]
+agent = "codex"
+args = ["--cd=somewhere"]
+[profiles.wrapper]
+agent = "codex"
+program = "${SYNTHETIC_WRAPPER}"
+args = ["codex"]
+[profiles.noninteractive]
+agent = "codex"
+args = ["exec"]
+"#,
+    )
+    .unwrap();
+    let args_for = |profile| {
+        let plan = successful_json(
+            command(root, selected)
+                .env("SYNTHETIC_WRAPPER", std::env::current_exe().unwrap())
+                .args(["--json", "fork", source, "--in", profile, "--dry-run"]),
+        );
+        plan["launch"]["args"].clone()
+    };
+    let sqlite = format!("sqlite_home={}", json!(root.join("codex")));
+    assert_eq!(
+        args_for("configured"),
+        json!(["--cd=somewhere", "-c", sqlite, "fork", SESSION_ID])
+    );
+    assert_eq!(
+        args_for("wrapper"),
+        json!(["codex", "--cd", ".", "-c", sqlite, "fork", SESSION_ID])
+    );
+    let exec = successful_json(command(root, selected).args([
+        "--json",
+        "resume",
+        source,
+        "--in",
+        "noninteractive",
+        "--no-fork",
+        "--dry-run",
+    ]));
+    assert_eq!(
+        exec["launch"]["args"],
+        json!(["exec", "--cd", ".", "-c", sqlite, "resume", SESSION_ID])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_same_size_in_place_rewrite_invalidates_a_large_native_workspace() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let original = root.join("alpha");
+    let replacement = root.join("bravo");
+    let sessions = root.join("codex/sessions");
+    for path in [&original, &replacement, &sessions] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut file =
+        fs::File::create(sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")))
+            .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original}})
+    )
+    .unwrap();
+    writeln!(file, "{}", json!({"type":"response_item","payload":{"type":"function_call_output","output":"x".repeat(5 * 1024 * 1024)}})).unwrap();
+    let turn = |path| json!({"type":"turn_context","payload":{"cwd": path}});
+    let position = file.stream_position().unwrap();
+    writeln!(file, "{}", turn(&original)).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
+    let source = format!("codex:{SESSION_ID}");
+    let launch = |cwd: &Path| {
+        successful_json(command(root, cwd).args([
+            "--json",
+            "resume",
+            &source,
+            "--in",
+            "codex",
+            "--no-fork",
+            "--dry-run",
+        ]))
+    };
+    assert_eq!(launch(&original)["fidelity"]["repository_matches"], true);
+    file.seek(SeekFrom::Start(position)).unwrap();
+    writeln!(file, "{}", turn(&replacement)).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let plan = launch(&replacement);
+    assert_eq!(plan["fidelity"]["repository_matches"], true);
+    assert_eq!(
+        plan["launch"]["args"],
+        json!([
+            "--cd",
+            ".",
+            "-c",
+            format!("sqlite_home={}", json!(root.join("codex"))),
+            "resume",
+            SESSION_ID
+        ])
+    );
+}
+
+#[test]
+fn equal_size_rewrite_with_restored_mtime_invalidates_the_observed_project() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let initial = root.join("initial");
+    let alternate_header = root.join("startup");
+    let previous = root.join("alpha");
+    let current = root.join("bravo");
+    let sessions = root.join("codex/sessions");
+    for directory in [&initial, &alternate_header, &previous, &current, &sessions] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let rollout = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
+    let write = |creation: &Path, directory: &Path| {
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":creation}}),
+            json!({"type":"turn_context","payload":{"cwd":directory}}),
+        ];
+        fs::write(&rollout, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        let file = fs::File::options().write(true).open(&rollout).unwrap();
+        file.set_modified(timestamp).unwrap();
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), timestamp);
+        file.metadata().unwrap().len()
+    };
+    let source = format!("codex:{SESSION_ID}");
+    let list = |directory: &Path| {
+        let result = successful_json(command(root, directory).args([
+            "--json",
+            "list",
+            "--provider",
+            "codex",
+        ]));
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["project_path"].clone())
+            .collect::<Vec<_>>()
+    };
+    let length = write(&alternate_header, &previous);
+    assert_eq!(list(&alternate_header), [json!(alternate_header)]);
+    assert_eq!(write(&initial, &previous), length);
+    assert!(list(&alternate_header).is_empty());
+    assert_eq!(list(&initial), [json!(initial)]);
+    successful_json(command(root, &initial).args(["--json", "show", &source]));
+    assert_eq!(list(&previous), [json!(previous)]);
+    assert_eq!(write(&initial, &current), length);
+    assert!(list(&previous).is_empty());
+    successful_json(command(root, &initial).args(["--json", "index", "--provider", "codex"]));
+    assert_eq!(list(&current), [json!(current)]);
+    assert!(list(&initial).is_empty());
+
+    assert_eq!(write(&initial, &previous), length);
+    successful_json(command(root, &initial).args(["--json", "show", &source]));
+    assert_eq!(list(&previous), [json!(previous)]);
+    assert!(list(&current).is_empty());
+}
+
+#[test]
+fn codex_source_reads_update_project_discovery_and_search() {
+    for show_first in [true, false] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let original = root.join("first");
+        let moved = root.join("moved");
+        let sessions = root.join("codex/sessions");
+        for directory in [&original, &moved, &sessions] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let rollout = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let write_rollout = |path: &Path, destination: &Path, reply: &str| {
+            let rows = [
+                json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original,
+                    "git":{"branch":"original-only"}}}),
+                json!({"type":"turn_context","payload":{"cwd":destination}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic request"}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":reply}}),
+            ];
+            fs::write(path, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        };
+        write_rollout(&rollout, &moved, "Synthetic pinecone");
+        let source = format!("codex:{SESSION_ID}");
+        if show_first {
+            successful_json(command(root, &moved).args(["--json", "show", &source]));
+        } else {
+            successful_json(command(root, &moved).args(["--json", "index", "--provider", "codex"]));
+        }
+        let list = |project: &Path| {
+            successful_json(command(root, project).args(["--json", "list", "--provider", "codex"]))
+        };
+        let search = |project: &Path, mode: &str| {
+            successful_json(command(root, project).args([
+                "--json",
+                "search",
+                "pinecone",
+                "--provider",
+                "codex",
+                mode,
+            ]))
+        };
+        let listed = list(&moved);
+        assert_eq!(
+            listed["sessions"][0]["session"]["id"], SESSION_ID,
+            "{listed}"
+        );
+        assert_eq!(listed["sessions"][0]["project_path"], json!(moved));
+        assert!(listed["sessions"][0]["git_branch"].is_null());
+        assert!(list(&original)["sessions"].as_array().unwrap().is_empty());
+        for mode in ["--cached", "--no-index"] {
+            let found = search(&moved, mode);
+            assert_eq!(found["results"][0]["session"], source, "{found}");
+            assert_eq!(found["results"][0]["match"], "conversation");
+            assert!(
+                search(&original, mode)["results"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let replacement = sessions.join("replacement");
+        let modified = fs::metadata(&rollout).unwrap().modified().unwrap();
+        write_rollout(&replacement, &original, "Synthetic oakfruit");
+        assert_eq!(
+            fs::metadata(&rollout).unwrap().len(),
+            fs::metadata(&replacement).unwrap().len()
+        );
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(replacement, &rollout).unwrap();
+        assert!(list(&moved)["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            list(&original)["sessions"][0]["git_branch"],
+            "original-only"
+        );
+        assert!(
+            search(&moved, "--cached")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        successful_json(command(root, &original).args(["--json", "show", &source]));
+        assert!(
+            search(&original, "--cached")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let refreshed = successful_json(
+            command(root, &original).args(["--json", "search", "oakfruit", "--cached"]),
+        );
+        assert_eq!(refreshed["results"][0]["session"], source, "{refreshed}");
+    }
+}
+
+#[test]
+fn codex_search_does_not_pair_one_homes_text_with_another_homes_workspace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let original = root.join("initial");
+    fs::create_dir(&original).unwrap();
+    let homes = [root.join("codex-a"), root.join("codex-b")];
+    let projects = [root.join("alpha"), root.join("bravo")];
+    let markers = ["amberfalcon", "cobaltraven"];
+    let source = format!("codex:{SESSION_ID}");
+    for (i, home) in homes.iter().enumerate() {
+        fs::create_dir(&projects[i]).unwrap();
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let source = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original}}),
+            json!({"type":"turn_context","payload":{"cwd":projects[i]}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic request"}}),
+            json!({"type":"event_msg","payload":{"type":"agent_message","message":markers[i]}}),
+        ];
+        fs::write(&source, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000),
+            ))
+            .unwrap();
+    }
+    let run = |i: usize, args: &[&str]| {
+        successful_json(
+            command(root, &projects[i])
+                .env("CODEX_HOME", &homes[i])
+                .arg("--json")
+                .args(args),
+        )
+    };
+    for active in [0, 1, 0] {
+        run(active, &["index", "--provider", "codex"]);
+        for i in 0..2 {
+            let foreign = run(
+                i,
+                &[
+                    "search",
+                    markers[1 - i],
+                    "--provider",
+                    "codex",
+                    "--cached",
+                    "--show-text",
+                ],
+            );
+            assert!(
+                foreign["results"].as_array().unwrap().is_empty(),
+                "{foreign}"
+            );
+        }
+        let own = run(
+            active,
+            &["search", markers[active], "--provider", "codex", "--cached"],
+        );
+        assert_eq!(own["results"][0]["session"], source, "{own}");
+        assert_eq!(own["results"][0]["project_path"], json!(projects[active]));
+    }
+}
+
+fn workspace_git(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn check_profile_worktree_identity(root: &Path, workspace: &Path, source: &str) {
+    let other = root.join("other-worktree");
+    workspace_git(
+        workspace,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            other.to_str().unwrap(),
+        ],
+    );
+    let profiles = root.join("state/profiles.toml");
+    fs::write(
+        &profiles,
+        "[profiles.checkout]\nagent = \"codex\"\nargs = [\"-C\", \"${PROFILE_WORKTREE}\"]\n",
+    )
+    .unwrap();
+    // The launcher probe receives `-C <directory> --help`. Git accepts that profile syntax.
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))
+        .find(|path| path.is_absolute() && path.is_file())
+        .expect("Git executable used to create the worktrees");
+    let inspect = |from: &Path, to: &Path| {
+        let mut cli = inspect_workspace(root, from, source);
+        successful_json(
+            cli.env("OMNI_CODEX_BIN", &git)
+                .env("PROFILE_WORKTREE", to)
+                .args(["--target", "checkout"]),
+        )
+    };
+    let fork = |from: &Path, to: &Path| {
+        let mut cli = command(root, from);
+        cli.env("PROFILE_WORKTREE", to).args([
+            "--json",
+            "fork",
+            source,
+            "--in",
+            "checkout",
+            "--dry-run",
+        ]);
+        cli
+    };
+
+    assert_eq!(inspect(workspace, &other)["repository_matches"], false);
+    let rejected = fork(workspace, &other).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--allow-workspace-mismatch"));
+    let allowed = successful_json(fork(workspace, &other).arg("--allow-workspace-mismatch"));
+    assert_eq!(allowed["fidelity"]["repository_matches"], false);
+    assert_eq!(
+        allowed["launch"]["cwd"],
+        json!(omnis_core::canonicalize_path(workspace).unwrap())
+    );
+
+    let returned = successful_json(fork(&other, workspace).arg("--allow-workspace-mismatch"));
+    assert_eq!(returned["fidelity"]["repository_matches"], true);
+    let subdir = workspace.join("profile-subdir");
+    fs::create_dir(&subdir).unwrap();
+    let same = successful_json(&mut fork(workspace, Path::new("profile-subdir")));
+    assert_eq!(same["fidelity"]["repository_matches"], true);
+    assert_eq!(inspect(workspace, &subdir)["repository_matches"], true);
+}
+
+#[test]
+fn codex_repository_matches_its_recorded_remote_and_commit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let git = |args: &[&str]| workspace_git(&workspace, args);
+    let origin = "https://example.invalid/recorded.git";
+    git(&["init", "--quiet"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://reader@example.invalid/recorded.git",
+    ]);
+    let commit = [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "fixture",
+    ];
+    git(&commit);
+    let head = git(&["rev-parse", "HEAD"]);
+    let sessions = root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let record = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":workspace,
+        "git":{"commit_hash":head,"repository_url":origin}}});
+    let request = json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Synthetic request"}});
+    fs::write(
+        sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")),
+        format!("{record}\n{request}\n"),
+    )
+    .unwrap();
+    let source = format!("codex:{SESSION_ID}");
+    let check = |directory: &Path, reference: &str, expected| {
+        let inspected = successful_json(&mut inspect_workspace(root, directory, reference));
+        let fork = successful_json(command(root, directory).args([
+            "--json",
+            "fork",
+            reference,
+            "--in",
+            "codex",
+            "--dry-run",
+        ]));
+        assert_eq!(inspected["repository_matches"], expected);
+        assert_eq!(fork["fidelity"]["repository_matches"], expected);
+    };
+    check(&workspace, &source, true);
+    check_profile_worktree_identity(root, &workspace, &source);
+    git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.invalid/other.git",
+    ]);
+    check(&workspace, &source, false);
+    let bundle_file = root.join("export.json");
+    successful_json(command(root, &workspace).args([
+        "--json",
+        "export",
+        &source,
+        "--output",
+        bundle_file.to_str().unwrap(),
+    ]));
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(&bundle_file).unwrap()).unwrap();
+    assert_eq!(
+        bundle.snapshot.workspace.git.remote_fingerprint,
+        Some(omnis_core::fingerprint(origin.as_bytes()))
+    );
+    assert_eq!(
+        bundle.snapshot.workspace.git.head.as_deref(),
+        Some(head.as_str())
+    );
+    git(&["remote", "set-url", "origin", origin]);
+    git(&commit);
+    check(&workspace, &source, false);
+    let imported = format!("imported:{}", bundle.manifest.bundle_id);
+    successful_json(command(root, &workspace).args([
+        "--json",
+        "import",
+        bundle_file.to_str().unwrap(),
+    ]));
+    let moved = root.join("moved");
+    fs::rename(&workspace, &moved).unwrap();
+    check(&moved, &imported, false);
+    workspace_git(&moved, &["checkout", "--quiet", "--detach", &head]);
+    check(&moved, &imported, true);
+}
+
+#[test]
+fn project_queries_keep_relative_codex_workspaces_in_global_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let original = root.join("original");
+    let unrelated = root.join("unrelated");
+    let sessions = root.join("codex/sessions");
+    for dir in [&original, &unrelated, &sessions] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let source = format!("codex:{SESSION_ID}");
+    let file = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    for cwd in [".", ""] {
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original,"git":{"branch":"creation"}}}),
+            json!({"type":"turn_context","payload":{"cwd":cwd}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"A synthetic silverleaf question"}}),
+        ];
+        fs::write(&file, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        let show = successful_json(command(root, &original).args(["--json", "show", &source]));
+        assert_eq!(show["workspace"]["current_dir"], "");
+        successful_json(command(root, &original).args(["--json", "index", "--provider", "codex"]));
+        for (args, key) in [
+            (&["--json", "list", "--provider", "codex"][..], "sessions"),
+            (
+                &["--json", "search", "silverleaf", "--cached"][..],
+                "results",
+            ),
+        ] {
+            for project in [&unrelated, &original] {
+                assert!(
+                    successful_json(command(root, project).args(args))[key]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let global =
+                successful_json(command(root, &unrelated).args(args).arg("--all-projects"));
+            let hits = global[key].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{global}");
+            assert!(hits[0]["project_path"].is_null(), "{global}");
+        }
+    }
+}
+
+#[test]
+fn a_relative_codex_turn_directory_cannot_identify_a_native_or_imported_workspace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let caller = root.join("caller");
+    fs::create_dir(&caller).unwrap();
     for args in [
-        vec!["init", "--quiet"],
-        vec![
+        &["init", "--quiet"][..],
+        &[
             "remote",
             "add",
             "origin",
-            "https://example.invalid/acme/continuity.git",
+            "https://example.invalid/caller.git",
         ],
     ] {
         assert!(
             Command::new("git")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG_COUNT")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .current_dir(&workspace)
+                .current_dir(&caller)
                 .args(args)
                 .status()
                 .unwrap()
                 .success()
         );
     }
+    let sessions = root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl"));
+    let header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":root.join("creation")}});
+    let turn = json!({"type":"turn_context","payload":{"cwd":"."}});
+    let request = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic request"}]}});
+    fs::write(&path, format!("{header}\n{turn}\n{request}\n")).unwrap();
+    let native = format!("codex:{SESSION_ID}");
+    let check = |reference: &str| {
+        for target in ["codex", "claude"] {
+            let mut fork = command(root, &caller);
+            fork.args(["--json", "fork", reference, "--in", target, "--dry-run"]);
+            let blocked = fork.output().unwrap();
+            assert!(!blocked.status.success());
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch")
+            );
+            let allowed = successful_json(fork.arg("--allow-workspace-mismatch"));
+            assert_eq!(allowed["fidelity"]["repository_matches"], false);
+            let inspect = successful_json(
+                inspect_workspace(root, &caller, reference).args(["--target", target]),
+            );
+            assert_eq!(inspect["repository_matches"], false);
+        }
+    };
+    check(&native);
+    let file = root.join("export.json");
+    successful_json(command(root, &caller).args([
+        "--json",
+        "export",
+        &native,
+        "--output",
+        file.to_str().unwrap(),
+    ]));
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert!(bundle.snapshot.workspace.git.remote_fingerprint.is_none());
+    successful_json(command(root, &caller).args(["--json", "import", file.to_str().unwrap()]));
+    fs::remove_file(path).unwrap();
+    check(&format!("imported:{}", bundle.manifest.bundle_id));
+}
+
+#[test]
+fn native_export_carries_repository_identity_for_relocated_continuation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("source");
+    let relocated = root.join("relocated");
+    fs::create_dir_all(&workspace).unwrap();
+    workspace_git(&workspace, &["init", "--quiet"]);
+    workspace_git(
+        &workspace,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/acme/continuity.git",
+        ],
+    );
     let sessions = root.join("codex/sessions/2026/01/01");
     fs::create_dir_all(&sessions).unwrap();
     fs::write(sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")), format!("{}\n{}\n",

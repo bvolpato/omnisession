@@ -185,6 +185,24 @@ fn an_unstamped_model_result_before_a_new_generated_turn_rolls_back_with_its_dis
         (&EventKind::ToolCompleted, "old output"),
         (&EventKind::ToolCompleted, "new output"),
     ];
+    // Force both calls and their results out of the retained tool window before rollback.
+    let mut pruned = rows.clone();
+    pruned.extend((0..1_050).map(|i| {
+        let mut raw = model_result("discarded");
+        raw["payload"]["call_id"] = format!("discarded-{i}").into();
+        raw
+    }));
+    for expected in [Some(2), None] {
+        pruned.push(event("thread_rolled_back", json!({"num_turns":1})));
+        let snapshot = read_records_with_preview(pruned.clone(), false).unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .find_map(|e| e.payload["omitted_tool_events"].as_u64()),
+            expected
+        );
+    }
     for expected in [&both[..], &both[..1], &both[..0]] {
         for preview in [false, true] {
             let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
@@ -595,6 +613,12 @@ fn checkpoint_tools_require_the_same_call_and_result_and_follow_the_call_cutoff(
     // The result precedes the steer on disk. With matching acceptance orders its call still withdraws it.
     for (items, rollback, expected_calls, expected_results) in [
         (vec![call.clone(), result.clone()], false, 1, 1),
+        (
+            vec![call.clone(), result.clone(), call.clone(), result.clone()],
+            false,
+            1,
+            1,
+        ),
         (vec![call.clone(), other_result], false, 1, 0),
         (vec![other_call, result.clone()], false, 0, 0),
         (vec![result.clone()], false, 0, 0),
@@ -662,7 +686,10 @@ fn checkpoint_tool_results_with_a_reused_call_id_follow_the_scoped_call() {
         let active: Vec<_> = snapshot
             .events
             .iter()
-            .filter(|e| matches!(e.kind, EventKind::ToolCalled | EventKind::ToolCompleted))
+            .filter(|e| {
+                !omnis_core::is_codex_replacement_event(e)
+                    && matches!(e.kind, EventKind::ToolCalled | EventKind::ToolCompleted)
+            })
             .map(|e| e.payload.get("omnisession_codex_checkpoint").is_none())
             .collect();
         assert_eq!(active, expected, "checkpoint has turn stamp: {stamp}");

@@ -26,8 +26,8 @@ use omnis_adapters::{
     RollbackTitle,
 };
 use omnis_core::{
-    SearchDocument, imported_search_document_version, indexed_search_title,
-    search_document_version, trajectory_search_document, workspace_paths_match,
+    SearchDocument, SessionWorkspaceMatcher, imported_search_document_version,
+    indexed_search_title, search_document_version, trajectory_search_document,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -487,20 +487,15 @@ pub(crate) fn ordered_candidates(
     sessions: &[NativeSession],
     current_project: Option<&Path>,
 ) -> Vec<IndexCandidate> {
-    let mut workspace_matches = HashMap::<&Path, bool>::new();
+    let mut matcher = current_project.map(SessionWorkspaceMatcher::new);
     let mut ordered = sessions
         .iter()
         .filter_map(|session| {
             let candidate = IndexCandidate::from_session(session)?;
-            let current = if let (Some(project), Some(path)) =
-                (current_project, session.project_path.as_deref())
-            {
-                *workspace_matches
-                    .entry(path)
-                    .or_insert_with(|| workspace_paths_match(path, project))
-            } else {
-                false
-            };
+            let current = matcher
+                .as_mut()
+                .zip(session.project_path.as_deref())
+                .is_some_and(|(matcher, path)| matcher.matches(session.session.provider, path));
             Some((Reverse(current), Reverse(candidate.updated_at), candidate))
         })
         .collect::<Vec<_>>();

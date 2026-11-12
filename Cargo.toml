@@ -55,6 +55,8 @@ walkdir = "2.5"
 wait-timeout = "0.2"
 winapi-util = "0.1.11"
 winreg = "0.56"
+# Later versions removed the safe file change-time query.
+winx = "0.22"
 zstd = { version = "0.13", default-features = false }
 
 [workspace.lints.rust]

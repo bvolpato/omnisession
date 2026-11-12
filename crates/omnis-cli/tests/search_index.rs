@@ -1311,6 +1311,13 @@ fn list_leads_with_the_assigned_codex_name_and_keeps_unnamed_sessions_metadata_o
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
+    for previous_version in [5, omnis_core::SEARCH_DOCUMENT_VERSION - 1] {
+        check_opencode_search_upgrade(previous_version);
+    }
+}
+
+#[cfg(unix)]
+fn check_opencode_search_upgrade(previous_version: u32) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempdir().unwrap();
@@ -1339,7 +1346,10 @@ esac
         .unwrap();
     let database = Connection::open(index).unwrap();
     database
-        .execute("UPDATE session_trajectories SET document_version = 4", [])
+        .execute(
+            "UPDATE session_trajectories SET document_version = ?1",
+            [previous_version],
+        )
         .unwrap();
     let matches = || {
         store
@@ -1581,14 +1591,19 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     let temporary_directory = tempdir().expect("temporary directory");
     let workspace = temporary_directory.path().join("current-workspace");
     let other_workspace = temporary_directory.path().join("other-workspace");
-    initialize_git_workspace(&workspace, "https://example.invalid/acme/project.git");
+    let codex_source = temporary_directory.path().join("recorded-source");
+    initialize_git_workspace(&codex_source, "https://example.invalid/acme/project.git");
+    initialize_git_workspace(
+        &workspace,
+        "https://reader@example.invalid/acme/project.git",
+    );
     initialize_git_workspace(
         &other_workspace,
         "https://example.invalid/acme/different.git",
     );
     let environment = TestEnvironment::new(temporary_directory.path(), workspace.clone());
     let mut snapshot = synthetic_snapshot();
-    snapshot.workspace = capture_workspace(&workspace).expect("capture source repository");
+    snapshot.workspace = capture_workspace(&codex_source).expect("capture source repository");
     let missing_workspace = temporary_directory.path().join("relocated-source");
     snapshot.workspace.root.clone_from(&missing_workspace);
     snapshot
@@ -1674,28 +1689,110 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     assert!(String::from_utf8_lossy(&existing.stderr).contains("belongs to"));
 }
 
+#[test]
+fn relocated_relative_ssh_import_requires_the_recorded_commit() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source");
+    let moved = temp.path().join("moved");
+    let other = temp.path().join("other");
+    let bare = "host.invalid:project.git";
+    initialize_git_workspace(&source, bare);
+    git(
+        &source,
+        &["commit", "--allow-empty", "-qm", "recorded commit"],
+    );
+    let mut snapshot = synthetic_snapshot();
+    snapshot.workspace = capture_workspace(&source).unwrap();
+    let bundle = PortableBundle {
+        manifest: BundleManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            bundle_id: Uuid::from_u128(13),
+            created_at: snapshot.captured_at,
+            source: snapshot.session.clone(),
+            event_count: snapshot.events.len(),
+            redactions: Vec::new(),
+        },
+        snapshot,
+        fidelity: None,
+    };
+    fs::rename(&source, &moved).unwrap();
+    git(
+        &moved,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "first@host.invalid:project.git",
+        ],
+    );
+    git(&moved, &["commit", "--allow-empty", "-qm", "later commit"]);
+    initialize_git_workspace(&other, "second@host.invalid:project.git");
+    git(
+        &other,
+        &["commit", "--allow-empty", "-qm", "unrelated commit"],
+    );
+    let environment = TestEnvironment::new(temp.path(), moved.clone());
+    let path = temp.path().join("bundle.json");
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    assert_import_succeeds(&environment, &path, "relative SSH import");
+    let bind = |cwd: &Path, task: &str| {
+        environment
+            .command()
+            .current_dir(cwd)
+            .args([
+                "task",
+                "start",
+                task,
+                "--from",
+                &format!("imported:{}", bundle.manifest.bundle_id),
+            ])
+            .output()
+            .unwrap()
+    };
+    let accepted = bind(&moved, "moved");
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    for remote in ["second@host.invalid:project.git", bare] {
+        git(&other, &["remote", "set-url", "origin", remote]);
+        let rejected = bind(&other, "unrelated");
+        assert!(
+            !rejected.status.success(),
+            "accepted unrelated checkout via {remote}"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("belongs to"));
+    }
+}
+
 fn initialize_git_workspace(path: &Path, remote: &str) {
     fs::create_dir_all(path).expect("create Git workspace");
-    let initialized = Command::new("git")
+    git(path, &["init", "--quiet"]);
+    git(path, &["remote", "add", "origin", remote]);
+}
+
+fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
-        .args(["init", "--quiet"])
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
         .current_dir(path)
         .output()
-        .expect("initialize Git workspace");
-    assert!(initialized.status.success());
-    let remote = Command::new("git")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .args(["remote", "add", "origin", remote])
-        .current_dir(path)
-        .output()
-        .expect("configure Git remote");
-    assert!(remote.status.success());
+        .expect("run Git in synthetic workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

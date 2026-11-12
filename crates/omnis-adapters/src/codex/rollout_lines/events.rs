@@ -189,7 +189,7 @@ fn name_event_fields(payload: &mut Value) -> bool {
     parts.len() >= min && super::name_fields(payload, fields)
 }
 
-pub(super) fn classify(payload: &Value) -> Wire {
+pub(in super::super) fn classify(payload: &Value) -> Wire {
     let get = |name: &str| payload.get(name);
     let optional =
         |name, check: fn(&Value) -> bool| get(name).is_none_or(|v| v.is_null() || check(v));

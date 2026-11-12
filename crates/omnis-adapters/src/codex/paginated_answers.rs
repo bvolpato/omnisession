@@ -1,26 +1,27 @@
 //! Match paginated replies and documentary tool items to the native model window.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use omnis_ir::{EventKind, ReplayPolicy};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::MAX_CANONICAL_EVENTS;
-use super::message_mirrors::ScopedMessageId;
+use super::message_mirrors::{MessageIdentity, ScopedMessageId};
 use super::paginated_rollback::Withdrawal;
+use super::{EventBuilder, MAX_CANONICAL_EVENTS};
 
 type TurnAliases = HashMap<[u8; 32], [u8; 32]>;
 
 mod checkpoint_tools;
 mod occurrences;
-use occurrences::{AnswerOccurrences, ConfirmedAnswers};
+use occurrences::{AnswerOccurrences, ConfirmedAnswers, PendingPlanSlot, PendingPlanWindow};
 
 fn resolved(aliases: &TurnAliases, (role, turn, id): ScopedMessageId) -> ScopedMessageId {
     (role, aliases.get(&turn).copied().unwrap_or(turn), id)
 }
 
 pub(super) enum ReplyAnchor {
-    Checkpoint { ordinal: u64, index: usize },
+    Checkpoint,
     // The raw response precedes the next canonical event at this sequence.
     Source { ordinal: u64, sequence: u64 },
 }
@@ -119,13 +120,27 @@ struct ModelTool {
     output: bool,
 }
 
+struct PendingReplacement {
+    key: ScopedMessageId,
+    digest: [u8; 32],
+    multipart: Option<[u8; 32]>,
+    ordinal: u64,
+}
+
 #[derive(Default)]
 pub(super) struct PaginatedAnswers {
     answers: AnswerOccurrences,
+    projected_revisions: BTreeMap<u64, Position>,
     tools: BTreeMap<u64, ModelTool>,
     tool_displays: BTreeMap<u64, (ToolId, Option<[u8; 32]>)>,
     removed_calls: HashMap<ScopedMessageId, CallCopies>,
     call_scopes: HashMap<([u8; 32], Option<bool>), CallCopies>,
+    // Completed matches survive a physical file boundary. Unpaired IDs do not.
+    model_positions: BTreeMap<u64, u64>,
+    pending_replacements: BTreeMap<u64, PendingReplacement>,
+    pending_plan_slots: Vec<PendingPlanSlot>,
+    plan_windows: VecDeque<(PendingPlanWindow, Vec<PendingPlanSlot>)>,
+    plan_window_rows: usize,
     aliases: TurnAliases,
 }
 
@@ -137,22 +152,199 @@ impl PaginatedAnswers {
         self.removed_calls.clear();
         self.call_scopes.clear();
         self.aliases.clear();
+        self.pending_replacements.clear();
+        self.pending_plan_slots.clear();
+        self.plan_windows.clear();
+        self.plan_window_rows = 0;
     }
 
     pub(super) fn resolve_turns(&mut self, aliases: TurnAliases) {
         self.aliases = aliases;
     }
 
+    pub(super) fn pending_replacement(
+        &mut self,
+        sequence: u64,
+        item: &Value,
+        text: &str,
+        ordinal: u64,
+    ) {
+        let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str();
+        let id = item["id"].as_str();
+        if let Some(key) = MessageIdentity::new(turn, id, false).scoped(true) {
+            let multipart = item["content"]
+                .as_array()
+                .filter(|parts| parts.len() > 1)
+                .map(|parts| {
+                    let mut digest = Sha256::new();
+                    for part in super::message_parts(parts, |_, _| true) {
+                        digest.update(part);
+                    }
+                    digest.finalize().into()
+                });
+            self.pending_replacements.insert(
+                sequence,
+                PendingReplacement {
+                    key,
+                    digest: Sha256::digest(text).into(),
+                    multipart,
+                    ordinal,
+                },
+            );
+        }
+    }
+
+    pub(super) fn pending_replacement_plan(
+        &mut self,
+        sequence: u64,
+        native_index: usize,
+        item: &Value,
+        ordinal: u64,
+        is_plan_part: bool,
+    ) {
+        if native_index < MAX_CANONICAL_EVENTS
+            && self.pending_plan_slots.len() < 2 * MAX_CANONICAL_EVENTS
+            && item["type"] == "message"
+            && item["role"] == "assistant"
+        {
+            self.pending_plan_slots.push(PendingPlanSlot {
+                ordinal,
+                sequence,
+                index: native_index as u64,
+                plan: is_plan_part,
+            });
+        }
+    }
+
+    pub(super) fn pending_plan_window(
+        &self,
+        ordinal: u64,
+        items: &[Value],
+        plan_mode: impl Fn(&Value) -> bool,
+    ) -> Option<PendingPlanWindow> {
+        (!self.pending_plan_slots.is_empty() && items.len() <= MAX_CANONICAL_EVENTS)
+            .then(|| PendingPlanWindow::read(ordinal, items, plan_mode))
+    }
+
+    pub(super) fn store_plan_window(&mut self, window: Option<PendingPlanWindow>) {
+        let slots = std::mem::take(&mut self.pending_plan_slots);
+        if let Some(window) = window.filter(|window| window.len() > 0) {
+            self.plan_window_rows += window.len();
+            self.plan_windows.push_back((window, slots));
+            while self.plan_window_rows > MAX_CANONICAL_EVENTS {
+                let (old, _) = self
+                    .plan_windows
+                    .pop_front()
+                    .expect("retained plan rows belong to a window");
+                self.plan_window_rows -= old.len();
+            }
+        }
+    }
+
+    /// Resolve a file's model positions before matching starts on the next physical file.
+    pub(super) fn resolve_positions(&mut self, builder: &mut EventBuilder, ordinal: u64) {
+        let published = self.answers.placement(
+            &self.aliases,
+            &mut self.model_positions,
+            !self.pending_replacements.is_empty(),
+        );
+        for (sequence, pending) in std::mem::take(&mut self.pending_replacements) {
+            let Some(&display) = published
+                .get(&resolved(&self.aliases, pending.key))
+                .and_then(Option::as_ref)
+                .filter(|&&i| i > sequence)
+            else {
+                continue;
+            };
+            let Some(text) = builder
+                .event_at_mut(display)
+                .and_then(|e| e.payload["text"].as_str())
+            else {
+                continue;
+            };
+            let digest = Sha256::digest(text).into();
+            if digest != pending.digest && pending.multipart != Some(digest) {
+                continue;
+            }
+            let text = text.to_owned();
+            if fill_pending_reply(builder, sequence, text) {
+                let origin = self.model_positions.entry(display).or_default();
+                *origin = (*origin).max(pending.ordinal);
+            }
+        }
+        if let Some((window, slots)) = self.plan_windows.iter().find(|(w, _)| w.ordinal == ordinal)
+        {
+            self.answers.resolve_plan_window(
+                window,
+                slots,
+                builder,
+                &self.aliases,
+                &mut self.model_positions,
+            );
+        }
+    }
+
+    pub(super) fn project_revisions(
+        &mut self,
+        builder: &mut EventBuilder,
+        checkpoints: &super::paginated_checkpoint::CheckpointHistory,
+        inputs: &super::paginated_rollback::PaginatedRollback,
+        after: u64,
+        end: u64,
+    ) {
+        if !self
+            .answers
+            .project_revisions(builder, checkpoints, end, &mut self.projected_revisions)
+        {
+            return;
+        }
+        // Confirmed model occurrences can precede the corresponding public completions.
+        let users = inputs.confirmed_suffix_positions(after, &self.aliases);
+        builder.visit_events_mut(|event| {
+            let sequence = event.sequence;
+            if sequence < end
+                || event.source.raw_record_type.as_deref() != Some("event_msg.item_completed")
+            {
+                return;
+            }
+            let position = match event.kind {
+                EventKind::MessageUser => users.get(&sequence).copied(),
+                EventKind::MessageAssistant
+                    if event.payload["omnisession_codex_positioned_reply"].is_null() =>
+                {
+                    self.answers.surviving_position(sequence, after)
+                }
+                _ => None,
+            };
+            if let Some((ordinal, slot)) = position.filter(|(_, slot)| *slot >= end) {
+                event.payload["omnisession_codex_checkpoint_position"] =
+                    serde_json::json!([slot, ordinal, 0]);
+            }
+        });
+    }
+
+    pub(super) fn finish_checkpoint(&mut self, builder: &mut EventBuilder, ordinal: u64, end: u64) {
+        self.resolve_positions(builder, ordinal);
+        // A match at the checkpoint ordinal is already present in the recorded replacement.
+        for (&seq, &position) in self.model_positions.range(end..) {
+            if position <= ordinal
+                && let Some(event) = builder.event_at_mut(seq)
+            {
+                event.payload["omnisession_codex_before_compaction"] = true.into();
+            }
+        }
+    }
+
     pub(super) fn model(
         &mut self,
         record: &Value,
         ordinal: u64,
-        sequence: u64,
+        reserved: Option<u64>,
         plan_mode: bool,
         active_turn: Option<&str>,
     ) {
         self.answers
-            .model(record, ordinal, sequence, plan_mode, active_turn);
+            .model(record, ordinal, reserved, plan_mode, active_turn);
     }
 
     pub(super) fn end_response(&mut self, turn: &str) {
@@ -179,6 +371,10 @@ impl PaginatedAnswers {
         }
     }
 
+    pub(super) fn public_spelling(&self, sequence: u64, digest: [u8; 32]) -> Option<&str> {
+        self.answers.archived(sequence, digest)
+    }
+
     pub(super) fn confirmed_answer_copies(
         &self,
         aliases: &TurnAliases,
@@ -188,15 +384,8 @@ impl PaginatedAnswers {
         self.answers.confirmed(aliases, items, plan_mode)
     }
 
-    pub(super) fn finish_answers(
-        &mut self,
-        aliases: &TurnAliases,
-    ) -> HashMap<u64, Option<Withdrawal>> {
-        self.answers.rulings(aliases)
-    }
-
-    pub(super) fn surviving_position(&self, sequence: u64, after: u64) -> Option<(u64, u64)> {
-        self.answers.surviving_position(sequence, after)
+    pub(super) fn finish_answers(&mut self) -> HashMap<u64, Option<Withdrawal>> {
+        self.answers.rulings(&self.aliases)
     }
 
     pub(super) fn project_answer(
@@ -348,6 +537,10 @@ impl PaginatedAnswers {
     ) -> HashMap<u64, Option<Withdrawal>> {
         self.answers.rollback(boundary_ordinal, order);
         let mut marked = HashMap::new();
+        for (&sequence, position) in &mut self.projected_revisions {
+            position.rollback(boundary_ordinal, order);
+            marked.insert(sequence, position.removed.then_some(Withdrawal::Confirmed));
+        }
         self.removed_calls.clear();
         self.call_scopes.clear();
         for tool in self.tools.values_mut() {
@@ -377,8 +570,35 @@ impl PaginatedAnswers {
     }
 
     pub(super) fn discard_before(&mut self, first_sequence: u64) {
+        self.model_positions = self.model_positions.split_off(&first_sequence);
+        self.pending_replacements = self.pending_replacements.split_off(&first_sequence);
+        while self.plan_windows.front().is_some_and(|(_, slots)| {
+            slots
+                .last()
+                .is_some_and(|slot| slot.sequence < first_sequence)
+        }) {
+            let (old, _) = self.plan_windows.pop_front().expect("window was present");
+            self.plan_window_rows -= old.len();
+        }
         self.answers.discard_before(first_sequence);
         self.tools = self.tools.split_off(&first_sequence);
+        self.projected_revisions = self.projected_revisions.split_off(&first_sequence);
         self.tool_displays = self.tool_displays.split_off(&first_sequence);
     }
+}
+
+fn fill_pending_reply(builder: &mut EventBuilder, sequence: u64, text: String) -> bool {
+    let Some(slot) = builder.event_at_mut(sequence) else {
+        return false;
+    };
+    let mut payload = serde_json::json!({"omnisession_codex_replacement":true});
+    payload["text"] = Value::String(text);
+    if let Some(status) = slot.payload.get("omnisession_codex_rollback") {
+        payload["omnisession_codex_rollback"] = status.clone();
+    }
+    slot.kind = EventKind::MessageAssistant;
+    slot.replay_policy = ReplayPolicy::Contextual;
+    slot.source.raw_record_type = Some("response_item.message".to_owned());
+    slot.payload = payload;
+    true
 }

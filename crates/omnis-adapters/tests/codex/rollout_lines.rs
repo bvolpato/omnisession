@@ -122,7 +122,7 @@ fn an_unpublished_ordinal_still_updates_the_native_model_checkpoint_if_it_decode
     records.extend([first, second, invalid]);
     for preview in [false, true] {
         let snap = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
-        assert_eq!(visible_text(&snap), ["request", "answer"]);
+        assert_eq!(published_text(&snap), ["request", "answer"]);
         let conversation = omnis_core::import_conversation(&snap);
         assert_eq!(conversation.messages.len(), 1);
         assert_eq!(conversation.messages[0].text, "answer");
@@ -201,6 +201,48 @@ fn a_trailing_documentary_record_can_reveal_a_missing_display_position() {
                 expected.is_some()
             );
         }
+    }
+}
+
+#[test]
+fn a_bounded_preview_preserves_terminal_gap_evidence() {
+    for (tail, gap, omitted, available) in [
+        (
+            event("token_count", json!({"rate_limits":{"limit_id":"fixture"}})),
+            Some(true),
+            0,
+            true,
+        ),
+        (
+            event("token_count", json!({"rate_limits":{"primary":{}}})),
+            None,
+            1,
+            true,
+        ),
+        (event("future_event", json!({})), Some(false), 0, false),
+    ] {
+        let mut rows = vec![stamped(page_user("turn", "user", "kept request"), 1)];
+        for ordinal in [2, 3] {
+            let mut raw = message("user", "model only");
+            raw["payload"]["padding"] = "x".repeat(8 * 1024 * 1024).into();
+            rows.push(stamped(raw, ordinal));
+        }
+        rows.push(stamped(tail, 5));
+        let snapshot = read_with_history_mode(rows, true, Some("paginated")).unwrap();
+        let expected: &[&str] = if available { &["kept request"] } else { &[] };
+        assert_eq!(visible_text(&snapshot), expected);
+        let notice = |kind| {
+            snapshot
+                .events
+                .iter()
+                .find(|event| event.source.raw_record_type.as_deref() == Some(kind))
+        };
+        let receipt = &notice("omnisession.codex_rollout_line").unwrap().payload;
+        assert_eq!(receipt["omitted_events"], omitted);
+        assert_eq!(receipt["contested_ordinal"], false);
+        assert_eq!(receipt["ordinal_gap"], gap == Some(true));
+        assert_eq!(receipt["possible_ordinal_gap"], gap == Some(false));
+        assert_eq!(notice("omnisession.preview_limit").is_some(), !available);
     }
 }
 
