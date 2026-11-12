@@ -207,7 +207,8 @@ fn read_gap_links(
             let parent = match record.parent_uuid {
                 GapParent::Explicit(parent) => parent,
                 GapParent::Missing
-                    if record.kind == Some("progress")
+                    if (record.is_meta && record.uuid.is_none())
+                        || record.kind == Some("progress")
                         || (record.kind == Some("system")
                             && record.subtype == Some("turn_duration")) =>
                 {

@@ -1213,6 +1213,188 @@ fn a_copy_of_a_hidden_user_displaced_by_compaction_preserves_the_new_request() {
 }
 
 #[test]
+fn a_copy_of_a_retained_hidden_record_reselects_its_checkpoint() {
+    let hidden = meta_user(4, 2);
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Retained reply")),
+        hidden.clone(),
+    ];
+    rows.extend(compaction(6, 2, &[2, 4]));
+    rows.push(message(8, 0, "user", json!("Independent task")));
+    for copied in [false, true] {
+        if copied {
+            rows.push(hidden.clone());
+        }
+        let expected: &[&str] = if copied {
+            &["Summary 6", "Retained reply"]
+        } else {
+            &["Independent task"]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert_eq!(text.contains("Retained reply"), copied);
+                assert_eq!(text.contains("Independent task"), !copied);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_copy_of_a_hidden_record_uses_the_current_definition_of_its_parent() {
+    let hidden = meta_user(4, 1);
+    for replaced in [false, true] {
+        let mut rows = vec![message(1, 0, "user", json!("Old request")), hidden.clone()];
+        if replaced {
+            rows.push(message(1, 0, "user", json!("New request")));
+        }
+        rows.extend([
+            hidden.clone(),
+            message(5, 4, "assistant", json!("Known reply")),
+        ]);
+        let (selected, old) = if replaced {
+            ("New request", "Old request")
+        } else {
+            ("Old request", "New request")
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                [selected, "Known reply"]
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains(selected) && !text.contains(old));
+            }
+        }
+    }
+}
+
+fn file_calls(id: u128, parent: u128, file: &str, ids: &[&str]) -> Value {
+    let calls = ids
+        .iter()
+        .map(|id| {
+            let mut item = call(id);
+            item["input"] = json!({"file_path":file});
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut row = block(id, parent, file, json!(calls));
+    row["message"]["id"] = json!(format!("response-{id}"));
+    row
+}
+
+#[test]
+fn a_hidden_row_after_a_tool_result_cannot_disambiguate_a_reused_call_id() {
+    for via_meta in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read files")),
+            file_calls(2, 1, "first.txt", &["x"]),
+            file_calls(3, 2, "second.txt", &["x", "bridge"]),
+            linked_result(4, 3, 3, "bridge", "Bridge output"),
+        ];
+        if via_meta {
+            rows.push(meta_user(5, 4));
+        }
+        rows.push(message(
+            6,
+            if via_meta { 5 } else { 4 },
+            "user",
+            json!([result("x", "Disputed output", false)]),
+        ));
+        rows.push(message(7, 6, "assistant", json!("Done")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert!(
+                tool_outcomes(&snapshot)
+                    .iter()
+                    .all(|(output, _)| output != "Disputed output")
+            );
+            assert!(import_trajectory(&snapshot).truncated);
+        }
+    }
+}
+
+#[test]
+fn an_observed_result_with_a_conflicting_assistant_stays_documentary() {
+    for issuer in [3, 2] {
+        let rows = [
+            message(1, 0, "user", json!("Read files")),
+            file_calls(2, 1, "left.txt", &["left"]),
+            file_calls(3, 2, "right.txt", &["right"]),
+            meta_user(4, 3),
+            linked_result(5, 4, issuer, "right", "Observed right output"),
+            message(6, 5, "assistant", json!("Done")),
+        ];
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert!(
+                active
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("Observed right output"))
+            );
+            if issuer == 2 {
+                assert!(active.truncated);
+                assert!(tool_outcomes(&snapshot).is_empty());
+            }
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Observed right output"));
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unidentified_hidden_user_in_a_preview_gap_preserves_the_linked_exchange() {
+    for present in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Known request")),
+            message(2, 1, "assistant", json!("Known reply")),
+        ];
+        if present {
+            let mut hidden = meta_user(3, 2);
+            let fields = hidden.as_object_mut().unwrap();
+            fields.remove("parentUuid");
+            fields.remove("uuid");
+            rows.push(hidden);
+        } else {
+            rows.push(json!({"type":"progress"}));
+        }
+        put_between_preview_windows(&mut rows, 2);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                ["Known request", "Known reply"]
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(
+                    text.contains("Known request")
+                        && text.contains("Known reply")
+                        && !text.contains("Internal meta text")
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_hidden_tool_parent_cannot_verify_a_conflicting_declared_issuer() {
     for conflict in [false, true] {
         let mut first = call("lookup");

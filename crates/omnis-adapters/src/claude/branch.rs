@@ -631,7 +631,7 @@ pub(super) struct Branch {
     pub(super) clock: CheckpointClock,
     pub(super) detached_events: HashMap<usize, Detached>,
     pub(super) eventless_detachment: Option<Detached>,
-    hidden_nodes: HashSet<usize>,
+    hidden_parents: HashMap<usize, Option<usize>>,
     opaque_records: Vec<OpaqueRecord>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
@@ -688,17 +688,49 @@ impl Branch {
         &mut self,
         id: Uuid,
         record: &ClaudeRecord,
+        records: &HashMap<Uuid, ClaudeRecord>,
         compactions: &Compactions,
     ) {
-        if let Some(node) = record.branch.node
-            && self.hidden_nodes.contains(&node)
-            && self.nodes[node].uuid == Some(id)
-            && !self
-                .latest_attachment_checkpoint(compactions)
-                .is_some_and(|s| compactions.precedes_cutoff(s, record.order))
-        {
-            self.observe_existing(record.branch, compactions);
+        let Some(node) = record.branch.node else {
+            return;
+        };
+        if !self.hidden_parents.contains_key(&node) || self.nodes[node].uuid != Some(id) {
+            return;
         }
+        if let Some(summary) = self.latest_attachment_checkpoint(compactions)
+            && compactions.precedes_cutoff(summary, record.order)
+        {
+            if compactions.contains(summary, id, records) {
+                self.select_retained_position(summary, id, record.branch);
+            }
+            return;
+        }
+        self.observe_existing(record.branch, compactions);
+    }
+
+    fn select_retained_position(&mut self, summary: usize, uuid: Uuid, original: Parent) {
+        let index = self.nodes.len();
+        self.nodes.push(Node {
+            uuid: Some(uuid),
+            parent: Some(summary),
+            summary: Some(summary),
+            turn: self.turn(summary),
+            missing_ancestor: self.nodes[summary].missing_ancestor,
+            ..Node::default()
+        });
+        self.nodes[summary].has_children = true;
+        self.forked |= self.tip != Some(summary);
+        self.suffix_parents.insert(
+            index,
+            RetainedParent {
+                uuid,
+                node: original.node,
+                source: original.source,
+            },
+        );
+        self.tip = Some(index);
+        self.active_rejection = self.unverified_retention();
+        self.select_retention();
     }
 
     pub(super) fn observe_existing(&mut self, parent: Parent, compactions: &Compactions) {
@@ -1409,7 +1441,8 @@ impl Branch {
             missing_ancestor: parent.missing_ancestor,
         };
         if hidden && let Some(uuid) = super::record_uuid(record, "uuid") {
-            self.hidden_nodes.insert(index);
+            let visible_parent = self.call_parent(self.issuing_parent(index));
+            self.hidden_parents.insert(index, visible_parent);
             selected.opaque = parent.opaque;
             selected.transparent = true;
             self.record_opaque(&mut selected, record, uuid, compactions, None);
@@ -2617,6 +2650,7 @@ impl Branch {
         calls: &ToolCalls<'_>,
         id: Option<&str>,
     ) -> bool {
+        let physical_parent = self.call_parent(self.issuing_parent(result));
         let result = &self.nodes[result];
         let issuer = match source {
             ToolSource::Missing | ToolSource::Unresolved => return true,
@@ -2655,6 +2689,15 @@ impl Branch {
         }
         let declared = self.response_unit(issuer);
         let parent = carrier.and_then(|node| self.response_unit(node));
+        if physical_parent == carrier
+            && anchors[issuer].is_some()
+            && declared != parent
+            && id.is_some_and(|id| {
+                parent.is_some_and(|unit| calls.by_response.contains_key(&(unit, id)))
+            })
+        {
+            return true;
+        }
         // A retained result can outlive its issuer. Its original response still
         // distinguishes a missing block from an abandoned retry.
         if anchors[issuer].is_none()
@@ -2671,14 +2714,13 @@ impl Branch {
         })
     }
 
-    fn call_parent(&self, parent: Option<usize>, issuer: Option<usize>) -> Option<usize> {
-        // A hidden record carries the assistant parent's identity. A tool result can
-        // instead precede another parallel result explicitly naming a different assistant.
-        if parent.is_some_and(|p| self.hidden_nodes.contains(&p)) {
-            issuer
-        } else {
-            parent
-        }
+    fn call_parent(&self, parent: Option<usize>) -> Option<usize> {
+        parent.and_then(|node| {
+            self.hidden_parents
+                .get(&node)
+                .copied()
+                .unwrap_or(Some(node))
+        })
     }
 
     /// Resolve outcomes against the calls that already existed when Claude wrote each result.
@@ -2697,7 +2739,7 @@ impl Branch {
         let mut transports = HashMap::new();
         let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
-            let hidden = self.hidden_nodes.contains(&index);
+            let hidden = self.hidden_parents.contains_key(&index);
             if !node.user && !hidden {
                 calls.observe(index, self, anchors[index].is_some(), rewind, events);
                 continue;
@@ -2707,7 +2749,7 @@ impl Branch {
             let parent = self.issuing_parent(index);
             let source = self.tool_source(index);
             let issuer = parent.map(|p| *transports.get(&p).unwrap_or(&p));
-            let call_parent = self.call_parent(parent, issuer);
+            let call_parent = self.call_parent(parent);
             let origin = issuer.and_then(|p| self.response_unit(p));
             // A verified outcome can link the next parallel result to its original response.
             // An ordinary user message supplies no such evidence.

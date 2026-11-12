@@ -415,6 +415,10 @@ impl RecordCopies {
                     compactions.by_id.contains_key(&id) && !duplicates.contains(&id)
                 })
             }
+            Some("user" | "assistant") if is_meta_message(record) => {
+                record.get("parentUuid").is_some_and(Value::is_null)
+                    || record_uuid(record, "parentUuid").is_some_and(|id| !duplicates.contains(&id))
+            }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
             Some(_) if Self::compares_link(role, record) => {
                 record.get("parentUuid").is_some_and(Value::is_null)
@@ -1653,7 +1657,8 @@ impl ClaudeTranscript {
                 } else {
                     let existing = &self.records[&id];
                     if is_turn_duration(record) || is_meta_message(record) {
-                        self.branch.reselect_hidden(id, existing, &self.compactions);
+                        self.branch
+                            .reselect_hidden(id, existing, &self.records, &self.compactions);
                     } else if record["type"] != "system"
                         && !existing.branch.transparent
                         && !self.branch.selected_summary().is_some_and(|summary| {
