@@ -47,20 +47,22 @@ pub(super) fn saved_directory(settings: &Value) -> Option<PathBuf> {
         && settings
             .get("disabled_plugin_ids")
             .is_none_or(|v| all(v, Value::is_string));
-    valid.then(|| {
-        // Codex resolves parent components before the filesystem follows symlinks.
-        let mut directory = PathBuf::new();
-        for component in cwd.components() {
-            match component {
-                Component::ParentDir => {
-                    directory.pop();
-                }
-                Component::CurDir => {}
-                _ => directory.push(component.as_os_str()),
+    valid.then(|| normalized_directory(cwd))
+}
+
+/// Codex resolves parent components before the filesystem follows symbolic links.
+pub(super) fn normalized_directory(path: &Path) -> PathBuf {
+    let mut directory = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                directory.pop();
             }
+            Component::CurDir => {}
+            _ => directory.push(component.as_os_str()),
         }
-        directory
-    })
+    }
+    directory
 }
 
 fn optional(value: &Value, valid: impl FnOnce(&Value) -> bool) -> bool {

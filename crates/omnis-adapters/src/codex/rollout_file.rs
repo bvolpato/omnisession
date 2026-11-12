@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 
+use super::CodexHistoryMode;
 use super::workspace_check::{WorkspaceScan, same_thread};
 use super::workspace_damage::{self, DamagedWorkspace};
 use crate::support::WorkspaceGap;
@@ -90,14 +91,14 @@ pub(super) const LEGACY_PROJECTION_LIMITS: JsonLinesLimits = JsonLinesLimits {
 pub(super) fn visit_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records_with_limits(open(path)?, limits, visit)
 }
 
 pub(super) fn visit(
     path: &Path,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records(open(path)?, visit)
 }
@@ -105,15 +106,15 @@ pub(super) fn visit(
 /// Returns whether every nonblank record could be read and the visitor accepted it.
 pub(super) fn visit_all_records(
     path: &Path,
-    mut visit: impl FnMut(Value) -> Result<bool>,
+    mut visit: impl FnMut(Value, bool) -> Result<bool>,
 ) -> Result<bool> {
     let mut accepted = true;
     let (omissions, _) = visit_json_reader(
         &mut BufReader::new(open(path)?),
         LIMITS,
         workspace_record_candidate,
-        |_, record, _| {
-            accepted &= visit(record)?;
+        |location, record, _| {
+            accepted &= visit(record, location.terminated)?;
             Ok(())
         },
     )?;
@@ -122,7 +123,7 @@ pub(super) fn visit_all_records(
 
 pub(super) fn read_records(
     reader: impl Read,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records_with_limits(reader, LIMITS, visit)
 }
@@ -130,14 +131,14 @@ pub(super) fn read_records(
 fn read_records_with_limits(
     reader: impl Read,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    mut visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     let session = OnceCell::<Option<String>>::new();
     visit_json_reader(
         &mut BufReader::new(reader),
         limits,
         |line, oversized| workspace_gap(line, oversized, session.get().and_then(Option::as_deref)),
-        |_, record, skipped_before| {
+        |location, record, skipped_before| {
             session.get_or_init(|| {
                 (record["type"] == "session_meta")
                     .then(|| {
@@ -146,7 +147,7 @@ fn read_records_with_limits(
                     .flatten()
                     .map(str::to_owned)
             });
-            visit(record, skipped_before)
+            visit(record, skipped_before, location.terminated)
         },
     )
     .map(|(omissions, _)| omissions)
@@ -200,12 +201,13 @@ pub(super) fn workspace_gap(line: &[u8], oversized: bool, session: Option<&str>)
     }
 }
 
-pub(super) fn workspace_record_kind(line: &[u8]) -> WorkspaceRecord {
+pub(super) fn workspace_record_kind(line: &[u8], inspect_displays: bool) -> WorkspaceRecord {
     if !line.trim_ascii_start().starts_with(b"{") {
         return WorkspaceRecord::Other;
     }
     match string_field(line, "type").as_deref() {
         Some("compacted") => WorkspaceRecord::Compacted,
+        Some("response_item" | "event_msg") if inspect_displays => WorkspaceRecord::Candidate,
         None | Some("turn_context" | "session_meta") => WorkspaceRecord::Candidate,
         Some("event_msg")
             if matches!(
@@ -256,6 +258,7 @@ pub(super) fn sample(
     budget: u64,
     creation_directory: Option<&Path>,
     session: &str,
+    history_mode: CodexHistoryMode,
 ) -> Result<Sample> {
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
@@ -264,6 +267,9 @@ pub(super) fn sample(
     reader.by_ref().take(budget + 1).read_to_end(&mut prefix)?;
     if u64::try_from(prefix.len())? <= budget {
         return Ok(Sample::Complete(prefix));
+    }
+    if history_mode != CodexHistoryMode::Legacy {
+        return Ok(Sample::Reconstruct);
     }
     let mut head = Vec::new();
     let mut tail = VecDeque::new();
@@ -276,7 +282,7 @@ pub(super) fn sample(
         |loc, record, skipped| {
             count += 1;
             workspace.settings.observe_gaps(skipped);
-            workspace.observe(session, &record)?;
+            workspace.observe(session, &record);
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push(record);
             } else {

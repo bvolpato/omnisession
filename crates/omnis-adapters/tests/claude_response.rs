@@ -6324,41 +6324,53 @@ fn an_older_follow_up_cannot_select_a_tied_duration_reply() {
 
 #[test]
 fn a_trailing_duration_under_the_request_keeps_its_completed_exchange() {
-    let hidden = meta_user(3, 2);
-    let mut rows = retained_hidden_tail(&hidden);
-    rows.extend([
-        message(8, 3, "user", json!("Current request")),
-        message(9, 8, "assistant", json!("Current answer")),
-        turn_duration(10, 8),
-        hidden,
-    ]);
-    check_copied_tail(&rows, true, &[]);
+    for (request_parent, duration_parent, copied, keep) in
+        [(3, 8, true, true), (3, 8, false, true), (2, 3, true, false)]
+    {
+        let hidden = meta_user(3, 2);
+        let mut rows = retained_hidden_tail(&hidden);
+        rows.extend([
+            message(8, request_parent, "user", json!("Current request")),
+            message(9, 8, "assistant", json!("Current answer")),
+            turn_duration(10, duration_parent),
+        ]);
+        if copied {
+            rows.push(hidden);
+        }
+        check_copied_tail(&rows, keep, &[]);
+    }
 }
 
 #[test]
-fn a_hidden_user_sibling_forks_the_retained_tails_new_exchange() {
-    let hidden = meta_user(3, 2);
-    let mut rows = retained_hidden_tail(&hidden);
-    rows.extend([
-        message(8, 3, "user", json!("Current request")),
-        meta_user(9, 8),
-        message(10, 8, "assistant", json!("Current answer")),
-        hidden,
-    ]);
-    check_copied_tail(&rows, false, &[]);
+fn a_hidden_sibling_forks_the_retained_tails_new_exchange() {
+    for assistant in [false, true] {
+        let hidden = meta_user(3, 2);
+        let mut rows = retained_hidden_tail(&hidden);
+        rows.push(message(8, 3, "user", json!("Current request")));
+        let answer = message(10, 8, "assistant", json!("Current answer"));
+        if assistant {
+            let mut sibling = message(9, 8, "assistant", json!("Hidden reply"));
+            sibling["isMeta"] = json!(true);
+            rows.extend([answer, sibling]);
+        } else {
+            rows.extend([meta_user(9, 8), answer]);
+        }
+        rows.push(hidden);
+        check_copied_tail(&rows, false, &["Hidden reply"]);
+    }
 }
 
 #[test]
 fn an_unknown_result_naming_the_issuer_cannot_hide_the_next_known_output() {
-    for declared in [false, true] {
+    for issuer in [None, Some(2), Some(99)] {
         let mut rows = vec![
             message(1, 0, "user", json!("Read file")),
             file_calls(2, 1, "file.txt", &["y"]),
             meta_user(3, 2),
         ];
         rows.extend(compaction(6, 3, &[3]));
-        let mut unknown = linked_result(9, 8, 2, "unknown", "Unknown output");
-        if !declared {
+        let mut unknown = linked_result(9, 8, issuer.unwrap_or(2), "unknown", "Unknown output");
+        if issuer.is_none() {
             unknown
                 .as_object_mut()
                 .unwrap()
@@ -6399,4 +6411,47 @@ fn a_repaired_duration_uses_its_own_timestamp_for_pending_replies() {
             check_selected_messages(&rows, &["Known request"], &["Known reply"]);
         }
     }
+}
+
+#[test]
+fn parallel_calls_keep_the_first_verified_output_for_each_id() {
+    let rows = [
+        message(1, 0, "user", json!("Read files")),
+        file_calls(2, 1, "file.txt", &["a", "b"]),
+        linked_result(3, 2, 2, "a", "Output A"),
+        linked_result(4, 3, 2, "b", "First output B"),
+        linked_result(5, 4, 2, "b", "Second output B"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert_eq!(
+            tool_outcomes(&snapshot),
+            [("Output A".into(), false), ("First output B".into(), false)]
+        );
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            for marker in ["Output A", "First output B", "Second output B"] {
+                assert!(text.contains(marker));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_repaired_reply_cannot_promote_its_older_follow_up() {
+    let duration = at_second(turn_duration(2, 1), 5);
+    let rows = [
+        duration.clone(),
+        at_second(message(3, 2, "assistant", json!("Known reply")), 6),
+        at_second(message(4, 3, "user", json!("Older follow-up")), 4),
+        at_second(message(1, 0, "user", json!("Known request")), 2),
+        duration,
+    ];
+    check_selected_messages(
+        &rows,
+        &["Known request", "Known reply"],
+        &["Older follow-up"],
+    );
 }

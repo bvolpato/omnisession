@@ -93,8 +93,26 @@ struct Node {
     response: Option<ResponseId>,
     turn: usize,
     writer: Option<String>,
-    user: bool,
+    role: ConversationRole,
     missing_ancestor: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ConversationRole {
+    User,
+    Assistant,
+    #[default]
+    Other,
+}
+
+impl ConversationRole {
+    fn from_role(role: Option<&str>) -> Self {
+        match role {
+            Some("user") => Self::User,
+            Some("assistant") => Self::Assistant,
+            _ => Self::Other,
+        }
+    }
 }
 
 type ResponseKey<'a> = (&'a ResponseId, Option<&'a str>, usize, Option<usize>);
@@ -285,7 +303,7 @@ impl RetainedBranch<'_> {
             let selected_response = self
                 .response_to(node)
                 .is_some_and(|unit| kept_responses.contains(&unit));
-            if self.branch.nodes[node].user {
+            if self.branch.nodes[node].role == ConversationRole::User {
                 // Validate each result block against the retained calls. The rest of the
                 // user record and its descendants stay behind the cutoff.
                 if self.events[self.branch.nodes[node].events.clone()]
@@ -346,7 +364,7 @@ impl RetainedBranch<'_> {
 
     fn keeps_ancestors(&self, index: usize) -> bool {
         let node = &self.branch.nodes[index];
-        !node.user
+        node.role != ConversationRole::User
             || self.events[node.events.clone()]
                 .iter()
                 .any(|event| !is_tool_outcome(event))
@@ -426,13 +444,15 @@ impl RetainedBranch<'_> {
                 protected.push(index);
                 break;
             }
-            if node.user && self.events[node.events.clone()].iter().any(is_tool_outcome) {
+            if node.role == ConversationRole::User
+                && self.events[node.events.clone()].iter().any(is_tool_outcome)
+            {
                 // An outcome can follow another user turn while answering the original
                 // call. Its position does not establish ownership of its ancestors.
                 outcomes.push(index);
             }
             if !belongs {
-                if !node.user
+                if node.role != ConversationRole::User
                     && issuing.is_some_and(|source| {
                         source.turn == node.turn
                             && source.writer == node.writer
@@ -469,7 +489,7 @@ impl RetainedBranch<'_> {
     // A tool result can link to any block in a response. Ordinary user text starts another turn.
     fn response_node(&self, index: usize) -> Option<usize> {
         let node = &self.branch.nodes[index];
-        if !node.user {
+        if node.role != ConversationRole::User {
             return self.branch.response_unit(index).map(|_| index);
         }
         let parent = self.branch.issuing_parent(index);
@@ -809,8 +829,7 @@ impl Branch {
         for index in state.indexed..self.nodes.len() {
             let node = &self.nodes[index];
             if node.summary != Some(summary)
-                || (!node.user
-                    && (node.events.is_empty() || self.hidden_parents.contains_key(&index)))
+                || node.role == ConversationRole::Other
                 || node.uuid.is_some_and(|id| {
                     records
                         .get(&id)
@@ -837,16 +856,7 @@ impl Branch {
         let Some(tip) = self.tip else {
             return false;
         };
-        if self.copy_paths.distance(leaf, tip).is_some() {
-            return true;
-        }
-        if self.hidden_parents.contains_key(&tip) && !self.nodes[tip].user {
-            self.tip = Some(leaf);
-            self.active_rejection = self.unverified_retention();
-            self.select_retention();
-            return true;
-        }
-        false
+        self.copy_paths.distance(leaf, tip).is_some()
     }
 
     fn raw_copy_parent(
@@ -937,7 +947,10 @@ impl Branch {
                 }
             }
             if let Some((_, _, id)) = latest {
-                self.observe_existing(records[&id].branch, compactions);
+                self.select_existing_leaf(
+                    records[&id].branch.node.expect("ranked node"),
+                    compactions,
+                );
             }
         }
     }
@@ -1232,6 +1245,10 @@ impl Branch {
         } else {
             node
         };
+        self.select_existing_leaf(leaf, compactions);
+    }
+
+    fn select_existing_leaf(&mut self, leaf: usize, compactions: &Compactions) {
         // A copy can reselect an alternative reply from a turn named by a rejected checkpoint.
         let candidate = self.copy_checkpoint();
         self.copied_rejection = candidate.map(|checkpoint| CopiedRejection {
@@ -1766,7 +1783,7 @@ impl Branch {
         let mut archive = inherited;
         if let Some(copy) = self.copied_rejection {
             let affected = parent.source.is_some_and(|source| {
-                let scope = if self.nodes[source].user {
+                let scope = if self.nodes[source].role == ConversationRole::User {
                     RejectionScope::Source(source)
                 } else {
                     RejectionScope::Turn(self.turn(source))
@@ -1901,12 +1918,30 @@ impl Branch {
                 .then(|| response_id(record))
                 .flatten(),
             writer: record["agentId"].as_str().map(str::to_owned),
-            user: role == Some("user"),
+            role: ConversationRole::from_role(role),
             missing_ancestor: parent.missing_ancestor,
         });
         self.continue_rejection(index, parent.unverified, result_only, compactions);
-        self.tip = Some(index);
+        self.tip = self
+            .completed_duration_reply(record, previous, parent)
+            .or(Some(index));
         self.selected_record(index, parent, record, selects_parent, compactions)
+    }
+
+    fn completed_duration_reply(
+        &self,
+        record: &Value,
+        previous: Parent,
+        parent: Parent,
+    ) -> Option<usize> {
+        previous.node.filter(|&tip| {
+            let reply = &self.nodes[tip];
+            super::is_turn_duration(record)
+                && reply.role == ConversationRole::Assistant
+                && reply.parent.is_some()
+                && reply.parent == parent.node
+                && !self.hidden_parents.contains_key(&tip)
+        })
     }
 
     fn selected_record(
@@ -2052,7 +2087,7 @@ impl Branch {
                         .filter(|&source| {
                             let assistant = &self.nodes[source];
                             !record.branch.transparent
-                                && !assistant.user
+                                && assistant.role != ConversationRole::User
                                 && assistant.events == record.events
                         })
                         .map_or(ToolSource::Unresolved, ToolSource::Record)
@@ -2542,7 +2577,7 @@ impl Branch {
         let mut anchors = vec![None; self.nodes.len()];
         for &node in retained {
             active[node] = true;
-            if !self.nodes[node].user {
+            if self.nodes[node].role != ConversationRole::User {
                 anchors[node] = Some(node);
             }
         }
@@ -2618,7 +2653,7 @@ impl Branch {
     ) -> HashMap<usize, RetainedCallQueries<'a>> {
         let mut queries = HashMap::<_, RetainedCallQueries>::new();
         let Some(last) = self.nodes.iter().rposition(|node| {
-            node.user
+            node.role == ConversationRole::User
                 && node.summary.is_some()
                 && events[node.events.clone()].iter().any(|event| {
                     matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
@@ -2629,11 +2664,11 @@ impl Branch {
         let mut calls = ToolCalls::default();
         let no_retention = Rewind::default();
         for (index, node) in self.nodes[..=last].iter().enumerate() {
-            if !node.user {
+            if node.role != ConversationRole::User {
                 calls.observe(index, self, false, &no_retention, events);
                 continue;
             }
-            let Some(summary) = node.summary.filter(|_| node.user) else {
+            let Some(summary) = node.summary.filter(|_| node.role == ConversationRole::User) else {
                 continue;
             };
             let parent = self.issuing_parent(index);
@@ -2759,7 +2794,7 @@ impl Branch {
 
     fn response_unit(&self, index: usize) -> Option<ResponseUnit<'_>> {
         let node = &self.nodes[index];
-        if node.user || node.summary == Some(index) {
+        if node.role == ConversationRole::User || node.summary == Some(index) {
             return None;
         }
         if let Some(key) = node.response_key(node.summary) {
@@ -2901,7 +2936,7 @@ impl Branch {
                         .filter(|&owner| active[index] || can_recover(index, owner))
                 } else {
                     // A tool result can identify its assistant parent even without a message ID.
-                    (!node.user && active[index]).then_some(index)
+                    (node.role != ConversationRole::User && active[index]).then_some(index)
                 }
             })
             .collect();
@@ -3269,7 +3304,7 @@ impl Branch {
         let mut retained_links = HashSet::new();
         for (index, node) in self.nodes.iter().enumerate() {
             let hidden = self.hidden_parents.contains_key(&index);
-            if !node.user && !hidden {
+            if node.role != ConversationRole::User && !hidden {
                 found
                     .calls
                     .observe(index, self, anchors[index].is_some(), rewind, events);
@@ -3306,7 +3341,7 @@ impl Branch {
                             continue;
                         }
                         MatchedOutput::Unresolved => {
-                            if declared.retained_issuer(self).is_some() {
+                            if declared.carries_documentary_issuer(self) {
                                 documentary_transport = declared.issuer;
                             }
                             transport = None;
@@ -3342,7 +3377,9 @@ impl Branch {
                         call,
                         priority,
                         paired,
-                        direct: call_parent == Some(call.node),
+                        direct: call_parent == Some(call.node)
+                            || (original_parent
+                                && declared.source == ToolSource::Record(call.node)),
                         epoch: epoch[index],
                     },
                     selected.then_some(declared.source),
@@ -3535,6 +3572,11 @@ impl DeclaredResult<'_> {
         {
             transports.insert(index, issuer);
         }
+    }
+
+    fn carries_documentary_issuer(&self, branch: &Branch) -> bool {
+        self.retained_issuer(branch).is_some()
+            || (self.retained && self.source == ToolSource::Missing)
     }
 
     fn retained_issuer(&self, branch: &Branch) -> Option<usize> {
