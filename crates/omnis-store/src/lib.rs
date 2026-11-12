@@ -3289,7 +3289,7 @@ impl Store {
             .map(|size| size.map(u64::from))
     }
 
-    /// Advances a saved assignment when the old file's entire byte sequence is still its prefix.
+    /// Advances a saved assignment when its bound bytes still match the selected file.
     ///
     /// # Errors
     ///
@@ -3306,7 +3306,7 @@ impl Store {
         else {
             return Ok(());
         };
-        if prior.0 == 0 || current.is_some_and(|(length, _)| length < prior.0) {
+        if prior.0 == 0 || current.is_some_and(|(length, _)| length == 0) {
             return Ok(());
         }
         let mut connection = self.connection.borrow_mut();
@@ -4216,8 +4216,14 @@ impl Store {
         let _snapshot = connection.unchecked_transaction().map_err(database_error)?;
         let mut inventory = self.observe_codex_catalog_inventory()?;
         let mut statement = connection.prepare_cached(
-            "SELECT session_id,source_file_id,source_contents_id,full_name FROM codex_name_source_prefixes
-             WHERE codex_home=(SELECT home FROM current_codex_home)"
+            "SELECT session_id,source_file_id,source_contents_id,full_name,NULL,NULL,0 FROM codex_name_source_prefixes
+             WHERE codex_home=(SELECT home FROM current_codex_home)
+             UNION ALL SELECT t.session_id,p.source_file_id,p.source_contents_id,p.title,p.trajectory_id,p.evidence,0
+             FROM codex_pending_catalog_titles p JOIN session_trajectories t ON t.id=p.trajectory_id
+             WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home) AND p.evidence<>'unattributed'
+             UNION ALL SELECT t.session_id,p.source_file_id,p.source_contents_id,p.title,p.trajectory_id,p.evidence,1
+             FROM codex_inactive_pending_names p JOIN session_trajectories t ON t.id=p.trajectory_id
+             WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home)"
         ).map_err(database_error)?;
         inventory.saved_names = statement
             .query_map([], |row| {
@@ -4226,6 +4232,16 @@ impl Store {
                     file: row.get(1)?,
                     contents: row.get(2)?,
                     name: row.get(3)?,
+                    projection: row
+                        .get::<_, Option<i64>>(4)?
+                        .map(|id| -> rusqlite::Result<_> {
+                            Ok(SavedNameProjection {
+                                trajectory: id,
+                                evidence: row.get(5)?,
+                                inactive: row.get(6)?,
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .map_err(database_error)?
@@ -6441,6 +6457,18 @@ impl PreparedTrajectoryWrite<'_, '_> {
         {
             metadata.reconcile_name(transaction)?;
         }
+        if native && observed {
+            transaction.execute("UPDATE session_trajectories AS t SET derived_title=NULL,
+                derived_title_is_verified=0,derived_title_is_local_opener=NULL
+                FROM codex_name_source_prefixes b WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native'
+                AND b.session_id=t.session_id AND b.codex_home=(SELECT home FROM current_codex_home)
+                AND b.source_file_id=?2 AND t.source_file_id=b.source_file_id
+                AND b.source_contents_id=t.source_contents_id AND b.source_contents_id<>?3
+                AND t.derived_title_is_local_opener IS NOT 1 AND t.derived_title=omnis_compact_search_title(b.full_name)
+                AND (EXISTS (SELECT 1 FROM codex_pending_catalog_titles p WHERE p.trajectory_id=t.id AND p.codex_home=b.codex_home)
+                  OR EXISTS (SELECT 1 FROM session_index i WHERE i.provider=t.provider AND i.session_id=t.session_id AND i.codex_home=b.codex_home))",
+                params![self.session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)]).map_err(database_error)?;
+        }
         let title = self.title_evidence(transaction, observed)?;
         let trajectory_id = transaction
             .prepare_cached(UPSERT_CODEX_PARENT_SQL)
@@ -7069,21 +7097,34 @@ struct SavedCodexName {
     file: [u8; 16],
     contents: [u8; 16],
     name: Option<String>,
+    projection: Option<SavedNameProjection>,
+}
+
+struct SavedNameProjection {
+    trajectory: i64,
+    evidence: String,
+    inactive: bool,
 }
 
 impl CodexCatalogInventory {
-    /// Compares the saved assignments with a complete native name index from the same listing.
-    pub fn observe_complete_name_index(&mut self, assigned: &HashMap<String, String>) {
+    /// Compares each saved assignment with a readable native assignment for that ID.
+    /// A complete index also confirms that omitted IDs have no name.
+    pub fn observe_name_assignments(&mut self, assigned: &HashMap<String, String>, complete: bool) {
         self.withdrawn_names = self
             .saved_names
             .drain(..)
             .filter(|saved| {
-                assigned.get(&saved.id).is_none_or(|name| {
-                    saved
-                        .name
-                        .as_ref()
-                        .is_some_and(|old| *old != omnis_core::redact_secrets(name))
-                })
+                let Some(name) = assigned.get(&saved.id) else {
+                    return complete;
+                };
+                let Some(old) = saved.name.as_deref() else {
+                    return false;
+                };
+                if saved.projection.is_some() {
+                    omnis_core::compact_search_title(name).as_deref() != Some(old)
+                } else {
+                    omnis_core::redact_secrets(name) != old
+                }
             })
             .collect();
     }
@@ -7557,9 +7598,7 @@ fn reconcile_codex_catalog(
         }
     }
     if complete {
-        if names_complete {
-            withdraw_unlisted_names(transaction, names.withdrawn_names, &seen)?;
-        }
+        withdraw_unlisted_names(transaction, names.withdrawn_names, &seen)?;
         for (id, prior) in current {
             if observed.get(id).copied() != Some(&prior.metadata) {
                 return Err(StoreError::TrajectorySourceChanged);
@@ -7582,13 +7621,40 @@ fn withdraw_unlisted_names(
          AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS ?4"
     ).map_err(database_error)?;
     for saved in withdrawn_names {
-        if !listed.contains(saved.id.as_str()) {
+        if listed.contains(saved.id.as_str()) {
+            continue;
+        }
+        if let Some(projection) = &saved.projection {
+            projection.withdraw(transaction, saved)?;
+        } else {
             remove
                 .execute(params![saved.id, saved.file, saved.contents, saved.name])
                 .map_err(database_error)?;
         }
     }
     Ok(())
+}
+
+impl SavedNameProjection {
+    fn withdraw(&self, transaction: &Transaction<'_>, saved: &SavedCodexName) -> Result<()> {
+        let table = if self.inactive {
+            "codex_inactive_pending_names"
+        } else {
+            "codex_pending_catalog_titles"
+        };
+        let removed = transaction.prepare_cached(&format!(
+            "DELETE FROM {table} WHERE trajectory_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+             AND source_file_id=?2 AND source_contents_id=?3 AND title=?4 AND evidence=?5"
+        )).map_err(database_error)?.execute(params![self.trajectory,saved.file,saved.contents,saved.name,self.evidence]).map_err(database_error)?;
+        if removed != 0 && !self.inactive {
+            transaction.prepare_cached(
+                "UPDATE session_trajectories SET derived_title=NULL,derived_title_is_verified=0,derived_title_is_local_opener=NULL,document_version=0
+                 WHERE id=?1 AND origin='native' AND source_file_id=?2 AND source_contents_id=?3
+                 AND derived_title=?4 AND derived_title_is_local_opener IS NOT 1"
+            ).map_err(database_error)?.execute(params![self.trajectory,saved.file,saved.contents,saved.name]).map_err(database_error)?;
+        }
+        Ok(())
+    }
 }
 
 fn reconcile_unowned_name(
@@ -7992,6 +8058,25 @@ fn migrate_pending_catalog_names(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn withdraw_unproven_codex_name_rewrites(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "UPDATE session_trajectories AS t SET document_version=0, derived_title=NULL,
+            derived_title_is_verified=0, derived_title_is_local_opener=NULL
+         FROM codex_pending_catalog_titles p JOIN codex_name_source_prefixes b
+           ON b.codex_home=p.codex_home AND b.source_file_id=p.source_file_id
+            AND b.source_contents_id<>p.source_contents_id
+         WHERE t.id=p.trajectory_id AND t.provider='codex' AND t.session_id=b.session_id AND t.origin='native'
+           AND t.source_contents_id=p.source_contents_id AND t.source_file_id=p.source_file_id
+           AND t.derived_title_is_local_opener IS 0 AND t.derived_title=p.title
+           AND p.evidence='provider_name' AND p.title=omnis_compact_search_title(b.full_name);
+         DELETE FROM codex_inactive_pending_names AS n WHERE n.evidence='provider_name' AND EXISTS (
+           SELECT 1 FROM session_trajectories t JOIN codex_name_source_prefixes b ON b.session_id=t.session_id
+           WHERE t.id=n.trajectory_id AND t.provider='codex' AND b.codex_home=n.codex_home
+             AND b.source_file_id=n.source_file_id AND b.source_contents_id<>n.source_contents_id
+             AND n.title=omnis_compact_search_title(b.full_name));"
+    ).map_err(database_error)
+}
+
 /// Legacy writers could retain a guessed title even after a full read with no user message.
 fn migrate_legacy_codex_titles(transaction: &Transaction<'_>) -> Result<()> {
     transaction
@@ -8028,6 +8113,9 @@ fn migrate_legacy_codex_titles(transaction: &Transaction<'_>) -> Result<()> {
                 HAVING count(DISTINCT title)=1)
              WHERE full_name IS NULL AND source_bytes>0 AND length(digest)=32;"
         ).map_err(database_error)?;
+    }
+    if mark("recheck_unproven_codex_name_rewrites")? != 0 {
+        withdraw_unproven_codex_name_rewrites(transaction)?;
     }
     // Keep the old version only when the next read can verify the saved projection.
     let legacy_version = "CASE WHEN doc.source_complete AND doc.source_file_id IS NULL

@@ -538,6 +538,52 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
 }
 
 #[test]
+fn missing_rollout_names_follow_the_last_readable_assignment_in_their_home() {
+    let name = json!({"id":CODEX_ID,"thread_name":"Violet Quokka"}).to_string();
+    let renamed = json!({"id":CODEX_ID,"thread_name":"Copper Fennel"}).to_string();
+    for (absent_index, retained) in [
+        (String::new(), false),
+        (format!("{{\n{renamed}\n"), false),
+        ("{".into(), true),
+    ] {
+        let fixture = Fixture::new();
+        let codex = fixture.root.join("codex");
+        let parked = fixture.root.join("parked");
+        let inner = codex.join("sessions/nested");
+        fs::rename(codex.join("sessions"), &parked).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::rename(&parked, inner.join("sessions")).unwrap();
+        let sidecar = codex.join("session_index.jsonl");
+        fs::write(&sidecar, &name).unwrap();
+        fixture.index_codex();
+        let args = ["Violet Quokka", "--provider", "codex"];
+        assert!(!result_sessions(&fixture.search_json(&args)).is_empty());
+
+        fs::write(&sidecar, "{").unwrap();
+        let switched = fixture
+            .command()
+            .env("CODEX_HOME", &inner)
+            .args(["--json", "search"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(switched.status.success());
+        assert!(result_sessions(&serde_json::from_slice(&switched.stdout).unwrap()).is_empty());
+        fs::rename(&inner, &parked).unwrap();
+        fs::write(&sidecar, absent_index).unwrap();
+        fixture.index_codex();
+        fs::write(&sidecar, "{").unwrap();
+        fs::rename(&parked, &inner).unwrap();
+        for flags in [args.to_vec(), [&args[..], &["--cached"]].concat()] {
+            assert_eq!(
+                !result_sessions(&fixture.search_json(&flags)).is_empty(),
+                retained
+            );
+        }
+    }
+}
+
+#[test]
 fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     use omnis_ir::{Provider, SessionRef};
 
@@ -961,11 +1007,11 @@ fn an_incomplete_name_index_preserves_a_provider_name_but_updates_an_inferred_fo
         let path = codex.join(format!(
             "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
         ));
-        let write_fork = |opening, reply| {
+        let write_fork = |parent, opening, reply| {
             write_jsonl(
                 &path,
                 &[
-                    json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"forked_from_id":OTHER_CODEX_ID}}),
+                    json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"forked_from_id":parent}}),
                     json!({"type":"event_msg","payload":{"type":"user_message","message":opening}}),
                     json!({"type":"event_msg","payload":{"type":"agent_message","message":reply}}),
                 ],
@@ -975,7 +1021,7 @@ fn an_incomplete_name_index_preserves_a_provider_name_but_updates_an_inferred_fo
             fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
                 ["results"][0]["title"].clone()
         };
-        write_fork("Opening copied request", "Initial answer");
+        write_fork(OTHER_CODEX_ID, "Opening copied request", "Initial answer");
         fixture.index_codex();
         assert_eq!(
             cached_title(CODEX_ID),
@@ -983,12 +1029,26 @@ fn an_incomplete_name_index_preserves_a_provider_name_but_updates_an_inferred_fo
         );
 
         fs::write(&catalog, "{").unwrap();
-        write_fork("Updated copied request", "Copperwren answer");
+        write_fork(
+            OTHER_CODEX_ID,
+            "Updated copied request",
+            "Copperwren answer",
+        );
         fixture.index_codex();
         assert_eq!(
             cached_title("Copperwren"),
             provider_name.unwrap_or("Updated copied request")
         );
+
+        if provider_name.is_some() {
+            write_fork(
+                "019ccd00-0000-7000-8000-000000000778",
+                "Updated copied request",
+                "Copperwren answer",
+            );
+            fixture.index_codex();
+            assert_eq!(cached_title("Copperwren"), "Updated copied request");
+        }
 
         fs::write(catalog, "").unwrap();
         fixture.index_codex();

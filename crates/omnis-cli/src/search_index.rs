@@ -1424,8 +1424,8 @@ fn verify_codex_name_source(
     match name {
         Some(NativeSessionName::Named(name)) => {
             if !store.has_codex_name_source(session, revision, name)? {
-                let receipt =
-                    CodexAdapter::rollout_prefix_hash(path, revision, None).or_else(|| {
+                let receipt = CodexAdapter::rollout_name_anchor(path, revision, &session.id)
+                    .or_else(|| {
                         (path.metadata().ok()?.len() > FULL_READ_SOURCE_BYTES
                             && CodexAdapter::index_file_revision(path)?
                                 .matches_file_contents(revision))
@@ -1456,7 +1456,7 @@ fn verify_codex_name_prefix(
 ) -> Result<()> {
     use omnis_adapters::CodexAdapter;
     if let Some(prior) = CodexAdapter::rollout_prefix_hash(path, revision, Some(bytes)) {
-        let current = CodexAdapter::rollout_prefix_hash(path, revision, None);
+        let current = CodexAdapter::rollout_name_anchor(path, revision, &session.id);
         store.verify_codex_name_append(session, revision, prior, current)?;
     }
     Ok(())

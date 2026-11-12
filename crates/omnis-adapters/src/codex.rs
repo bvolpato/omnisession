@@ -2762,19 +2762,21 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn session_titles_are_complete(&self) -> bool {
-        self.complete_session_names().is_some()
+        self.observed_session_names()
+            .is_some_and(|observed| observed.complete)
     }
 
-    fn complete_session_names(&self) -> Option<Arc<HashMap<String, String>>> {
+    fn observed_session_names(&self) -> Option<crate::ObservedSessionNames> {
         let current = self.title_index();
-        (current.complete
-            && self
-                .listing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current)))
-        .then(|| Arc::clone(&current.titles))
+        self.listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current))
+            .then(|| crate::ObservedSessionNames {
+                names: Arc::clone(&current.titles),
+                complete: current.complete,
+            })
     }
 
     fn native_session_name(&self, id: &str) -> NativeSessionName {

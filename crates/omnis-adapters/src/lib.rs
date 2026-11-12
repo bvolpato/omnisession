@@ -77,6 +77,14 @@ pub enum NativeSessionName {
     Unknown,
 }
 
+/// Name assignments that still agree with the native index used for a listing.
+pub struct ObservedSessionNames {
+    /// Confirmed assignments, including readable rows after the last damaged row.
+    pub names: std::sync::Arc<HashMap<String, String>>,
+    /// Whether an omitted ID confirms that the thread has no assignment.
+    pub complete: bool,
+}
+
 impl NativeSessionName {
     /// Checks whether the observed name agrees with the session metadata.
     #[must_use]
@@ -437,8 +445,9 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
-    /// Returns the complete native name index used by the last listing, including absent rollouts.
-    fn complete_session_names(&self) -> Option<std::sync::Arc<HashMap<String, String>>> {
+    /// Returns the individually confirmed assignments in the name index used for discovery.
+    /// Only a complete index also confirms that omitted IDs have no assignment.
+    fn observed_session_names(&self) -> Option<ObservedSessionNames> {
         None
     }
 

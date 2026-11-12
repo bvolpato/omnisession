@@ -4,7 +4,7 @@ use std::{
     cell::OnceCell,
     collections::VecDeque,
     fs::{self, File},
-    io::{BufRead, BufReader, Cursor, Read},
+    io::{BufRead, BufReader, Cursor, Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -46,6 +46,25 @@ impl super::CodexAdapter {
         expected: SourceRevision,
         bytes: Option<u64>,
     ) -> Option<(u64, [u8; 32])> {
+        Self::hash_name_source(path, expected, bytes, None)
+    }
+
+    /// Binds the name to the complete ordinary rollout or the original metadata of a native fork.
+    #[must_use]
+    pub fn rollout_name_anchor(
+        path: &Path,
+        expected: SourceRevision,
+        session_id: &str,
+    ) -> Option<(u64, [u8; 32])> {
+        Self::hash_name_source(path, expected, None, Some(session_id))
+    }
+
+    fn hash_name_source(
+        path: &Path,
+        expected: SourceRevision,
+        bytes: Option<u64>,
+        session_id: Option<&str>,
+    ) -> Option<(u64, [u8; 32])> {
         jsonl_file_name(path)?;
         if expected.contents.is_none()
             || omnis_core::may_reach_network(path)
@@ -57,15 +76,26 @@ impl super::CodexAdapter {
         if omnis_core::may_reach_network(&canonical) {
             return None;
         }
-        let file = File::open(&canonical).ok()?;
+        let mut file = File::open(&canonical).ok()?;
         let metadata = file.metadata().ok()?;
         let source = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)?;
-        let length = bytes.unwrap_or(metadata.len());
-        if source.physical_identity.is_none()
-            || !expected.matches_file_contents(source.revision)
-            || !(1..=Self::FULL_READ_SOURCE_BYTES).contains(&length)
-            || length > metadata.len()
+        if source.physical_identity.is_none() || !expected.matches_file_contents(source.revision) {
+            return None;
+        }
+        if let Some(id) = session_id
+            && !compressed(path)
         {
+            if let Some(header) = fork_name_header(&file, path, id, expected) {
+                source.ensure_unchanged(&canonical, path, &file).ok()?;
+                return Some((
+                    u64::try_from(header.len()).ok()?,
+                    Sha256::digest(header).into(),
+                ));
+            }
+            file.rewind().ok()?;
+        }
+        let length = bytes.unwrap_or(metadata.len());
+        if !(1..=Self::FULL_READ_SOURCE_BYTES).contains(&length) || length > metadata.len() {
             return None;
         }
         let mut reader = (&file).take(length);
@@ -81,6 +111,29 @@ impl super::CodexAdapter {
         source.ensure_unchanged(&canonical, path, &file).ok()?;
         Some((length, hash.finalize().into()))
     }
+}
+
+fn fork_name_header(
+    file: &File,
+    path: &Path,
+    id: &str,
+    revision: SourceRevision,
+) -> Option<Vec<u8>> {
+    let mut header = Vec::new();
+    BufReader::new(file.take(MAX_TRANSCRIPT_LINE_SIZE))
+        .read_until(b'\n', &mut header)
+        .ok()?;
+    if !header.ends_with(b"\n") {
+        return None;
+    }
+    let record = serde_json::from_slice(&header).ok()?;
+    let observed = super::ObservedRollout::read(path)?;
+    if !revision.matches_file_contents(observed.revision) {
+        return None;
+    }
+    let session = super::CodexSession::parse_metadata_record(path.to_owned(), &record, observed)?;
+    let parent = session.forked_from_id?;
+    (same_thread(&session.id, id) && !same_thread(&parent.to_string(), id)).then_some(header)
 }
 
 pub(super) fn compressed(path: &Path) -> bool {

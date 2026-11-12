@@ -593,8 +593,9 @@ pub(super) fn spawn_provider_update(
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
                     let names = observed.and_then(|mut inventory| {
                         let adapter = registry.adapter(provider).ok()?;
-                        if complete && let Some(assignments) = adapter.complete_session_names() {
-                            inventory.observe_complete_name_index(&assignments);
+                        if complete && let Some(assignments) = adapter.observed_session_names() {
+                            inventory
+                                .observe_name_assignments(&assignments.names, assignments.complete);
                         }
                         let unavailable =
                             unavailable_catalog_rows(adapter, &sessions, &inventory, &sender);

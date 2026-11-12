@@ -1111,8 +1111,8 @@ fn cache_discovered_codex_sessions(
     let names_complete = adapter.session_titles_are_complete();
     let prior_names = prior_codex_assignments(adapter, sessions, inventory, names_complete);
     if !project_search {
-        if complete && let Some(assignments) = adapter.complete_session_names() {
-            inventory.observe_complete_name_index(&assignments);
+        if complete && let Some(assignments) = adapter.observed_session_names() {
+            inventory.observe_name_assignments(&assignments.names, assignments.complete);
         }
         store.refresh_codex_catalog_with_name_history(
             &indexed,
