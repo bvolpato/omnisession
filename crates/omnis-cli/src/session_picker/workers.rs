@@ -37,6 +37,7 @@ pub(super) struct DiscoveryUpdate {
 
 pub(super) struct CatalogNames {
     pub(super) inventory: omnis_store::CodexCatalogInventory,
+    pub(super) unavailable: Vec<IndexedSession>,
     pub(super) prior_assignments: std::collections::HashMap<String, String>,
     pub(super) complete: bool,
 }
@@ -69,6 +70,7 @@ impl SessionCacheUpdate {
                     &names.inventory,
                     &names.prior_assignments,
                 )?;
+                store.remove_unavailable_codex_sessions(&names.unavailable)?;
             }
             return Ok(());
         }
@@ -526,6 +528,44 @@ pub(super) fn spawn_index_writer(
     });
 }
 
+fn unavailable_catalog_rows(
+    adapter: &dyn ProviderAdapter,
+    listed: &[NativeSession],
+    inventory: &omnis_store::CodexCatalogInventory,
+    sender: &Sender<PickerUpdate>,
+) -> Vec<IndexedSession> {
+    if adapter.discovery_is_complete() {
+        return Vec::new();
+    }
+    let listed: HashSet<_> = listed.iter().map(|native| &native.session).collect();
+    let omitted: Vec<_> = inventory
+        .observed
+        .iter()
+        .filter(|row| !listed.contains(&row.session))
+        .collect();
+    if omitted.is_empty() {
+        return Vec::new();
+    }
+    let sources = omitted
+        .iter()
+        .map(|row| (row.session.id.clone(), row.source_revision))
+        .collect::<Vec<_>>();
+    let unavailable = match adapter.unavailable_codex_rollouts(&sources) {
+        Ok(unavailable) => unavailable,
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "Codex selected rollouts: {error}"
+            )));
+            return Vec::new();
+        }
+    };
+    omitted
+        .into_iter()
+        .filter(|row| unavailable.contains(&row.session.id))
+        .cloned()
+        .collect()
+}
+
 pub(super) fn spawn_provider_update(
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
@@ -553,12 +593,15 @@ pub(super) fn spawn_provider_update(
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
                     let names = observed.and_then(|inventory| {
                         let adapter = registry.adapter(provider).ok()?;
+                        let unavailable =
+                            unavailable_catalog_rows(adapter, &sessions, &inventory, &sender);
                         let complete = adapter.session_titles_are_complete();
                         let prior_assignments = crate::prior_codex_assignments(
                             adapter, &sessions, &inventory, complete,
                         );
                         Some(Arc::new(CatalogNames {
                             inventory,
+                            unavailable,
                             prior_assignments,
                             complete,
                         }))
@@ -1467,7 +1510,15 @@ pub(super) fn receive_updates(
                         if update.provider == Provider::Codex {
                             state.reconcile_discovered_names(&mut entries, update.names.as_deref());
                         }
-                        state.replace_provider_entries(update.provider, entries, update.complete);
+                        state.replace_provider_entries(
+                            update.provider,
+                            entries,
+                            update.complete,
+                            update
+                                .names
+                                .as_ref()
+                                .map_or(&[], |names| names.unavailable.as_slice()),
+                        );
                     }
                     Err(error) => {
                         record_picker_warning(warnings, format!("{}: {error}", update.provider));

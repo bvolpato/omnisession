@@ -477,6 +477,7 @@ impl PickerState {
             provider,
             picker_entries(sessions, current_project, cached),
             true,
+            &[],
         );
     }
 
@@ -485,14 +486,29 @@ impl PickerState {
         provider: Provider,
         mut entries: Vec<PickerEntry>,
         complete: bool,
+        unavailable: &[IndexedSession],
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         self.forget_replaced_sources(&entries);
         if provider == Provider::Codex && !complete {
             let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
-            self.entries
-                .retain(|entry| !observed.contains(entry.key.as_str()));
+            let unavailable: HashMap<_, _> = unavailable
+                .iter()
+                .map(|row| (&row.session, row.source_revision.map(preview_revision)))
+                .collect();
+            self.entries.retain(|entry| {
+                if unavailable.get(&entry.session.session)
+                    == Some(&entry.session.source_revision.map(preview_revision))
+                {
+                    self.indexed_titles.remove(&entry.key);
+                    self.preview_titles.remove(&entry.key);
+                    self.trajectory_matches.remove(&entry.key);
+                    self.previews.remove_session(&entry.session.session);
+                    return false;
+                }
+                !observed.contains(entry.key.as_str())
+            });
         } else {
             self.entries
                 .retain(|entry| entry.session.session.provider != provider);
@@ -3399,6 +3415,7 @@ mod tests {
                 retry: None,
                 names: Some(std::sync::Arc::new(workers::CatalogNames {
                     inventory: store.observe_codex_catalog_inventory().unwrap(),
+                    unavailable: Vec::new(),
                     prior_assignments: HashMap::new(),
                     complete: true,
                 })),
@@ -4615,15 +4632,36 @@ mod tests {
     }
 
     #[test]
-    fn an_unseen_cached_codex_session_needs_complete_discovery_for_removal() {
+    fn partial_codex_discovery_removes_only_the_confirmed_unavailable_revision() {
         let project = Path::new("/workspace");
         let cached = session(Provider::Codex, "unseen", project, Some("Cached session"));
+        let unavailable = session(Provider::Codex, "unavailable", project, Some("Retired"));
+        let mut restored = session(Provider::Codex, "restored", project, Some("Restored"));
+        let prior = workers::indexed_session(&restored);
+        restored.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let confirmed = [workers::indexed_session(&unavailable), prior];
         let found = session(Provider::Codex, "found", project, Some("Fresh session"));
-        let mut state = PickerState::new(vec![cached], project, None, true);
+        let mut state = PickerState::new(
+            vec![cached.clone(), unavailable, restored.clone()],
+            project,
+            None,
+            true,
+        );
         let found_entries = || picker_entries(vec![found.clone()], project, false);
-        state.replace_provider_entries(Provider::Codex, found_entries(), false);
-        assert_eq!(state.entries.len(), 2);
-        state.replace_provider_entries(Provider::Codex, found_entries(), true);
+        state.replace_provider_entries(Provider::Codex, found_entries(), false, &confirmed);
+        let visible: HashSet<_> = state
+            .entries
+            .iter()
+            .map(|entry| &entry.session.session)
+            .collect();
+        assert_eq!(
+            visible,
+            HashSet::from([&cached.session, &restored.session, &found.session])
+        );
+        state.replace_provider_entries(Provider::Codex, found_entries(), true, &[]);
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].session.session, found.session);
     }
