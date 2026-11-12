@@ -117,15 +117,18 @@ fn update_ownership(record: &Value, session_id: &str) -> Result<UpdateOwnership>
     let Some(object) = record.as_object() else {
         return Ok(UpdateOwnership::Damaged);
     };
-    if object.is_empty()
-        || (object.len() == 1
-            && object
-                .get("params")
-                .is_some_and(|params| params.as_object().is_none_or(serde_json::Map::is_empty)))
-    {
-        return Ok(UpdateOwnership::Damaged);
-    }
     let Some(value) = record.pointer("/params/sessionId") else {
+        let empty_params = object
+            .get("params")
+            .is_some_and(|params| params.as_object().is_none_or(serde_json::Map::is_empty));
+        let empty_update = record["method"] == "session/update"
+            && record
+                .pointer("/params/update")
+                .and_then(Value::as_object)
+                .is_none_or(serde_json::Map::is_empty);
+        if object.is_empty() || (object.len() == 1 && empty_params) || empty_update {
+            return Ok(UpdateOwnership::Damaged);
+        }
         return Ok(UpdateOwnership::Implicit);
     };
     if value.as_str() == Some(session_id) {
@@ -665,9 +668,7 @@ fn native_message_block(content: &Value) -> bool {
         return false;
     }
     match content["type"].as_str() {
-        Some("text") => content["text"]
-            .as_str()
-            .is_some_and(|text| !text.is_empty()),
+        Some("text") => content["text"].is_string(),
         Some("image") => {
             content["data"].is_string()
                 && content["mimeType"].is_string()
@@ -691,6 +692,18 @@ fn native_message_block(content: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn native_tool_locations(value: &Value) -> bool {
+    value.as_array().is_some_and(|locations| {
+        locations.iter().all(|location| {
+            location["path"].is_string()
+                && optional_native_field(location, "line", |line| {
+                    line.as_u64().is_some_and(|n| u32::try_from(n).is_ok())
+                })
+                && optional_native_field(location, "_meta", Value::is_object)
+        })
+    })
 }
 
 fn native_tool_status(value: &Value) -> bool {
@@ -726,17 +739,20 @@ fn native_update_headers(
             Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk") => {
                 optional_native_field(update, "messageId", Value::is_string)
                     && native_message_block(&update["content"])
+                    && (update["content"]["text"] != "" || message_body(update).is_none())
             }
             Some("tool_call") => {
                 update["toolCallId"].is_string()
                     && update["title"].is_string()
                     && update.get("kind").is_none_or(Value::is_string)
                     && update.get("status").is_none_or(native_tool_status)
+                    && update.get("locations").is_none_or(native_tool_locations)
             }
             Some("tool_call_update") => {
                 update["toolCallId"].is_string()
                     && optional_native_field(update, "kind", Value::is_string)
                     && optional_native_field(update, "status", native_tool_status)
+                    && optional_native_field(update, "locations", native_tool_locations)
                     && optional_native_field(update, "title", Value::is_string)
             }
             Some("session_info_update") => {
@@ -897,7 +913,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v4");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v5");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1089,15 +1105,7 @@ impl GrokUpdateProcessor {
             string_at(&update, &[&["sessionUpdate"], &["type"], &["event"]]).map(str::to_owned)
         };
         let update_type = raw_type.as_deref().unwrap_or("");
-        let message_kind = match update_type {
-            "user_message_chunk" | "user" | "user_message" => Some(EventKind::MessageUser),
-            "agent_message_chunk" | "assistant" | "assistant_message" => {
-                Some(EventKind::MessageAssistant)
-            }
-            "agent_thought_chunk" => Some(EventKind::ReasoningSummary),
-            _ => None,
-        };
-        if let Some(kind) = message_kind {
+        if let Some(kind) = message_kind(update_type) {
             if kind == EventKind::ReasoningSummary && !self.preservation.retain(&update) {
                 flush_message(builder, &mut self.pending);
                 return;
@@ -1107,8 +1115,13 @@ impl GrokUpdateProcessor {
                 &[&["messageId"], &["message_id"], &["message", "id"]],
             )
             .map(str::to_owned);
+            let omitted_before = self.preservation.omitted_events;
             let (text, content, content_unreadable) =
                 message_content(&update, &mut self.preservation);
+            if text.is_empty() && self.preservation.omitted_events > omitted_before {
+                flush_message(builder, &mut self.pending);
+                return;
+            }
             if content_unreadable {
                 self.malformed_updates = self.malformed_updates.saturating_add(1);
             }
@@ -1196,6 +1209,17 @@ impl GrokUpdateProcessor {
     }
 }
 
+fn message_kind(update_type: &str) -> Option<EventKind> {
+    match update_type {
+        "user_message_chunk" | "user" | "user_message" => Some(EventKind::MessageUser),
+        "agent_message_chunk" | "assistant" | "assistant_message" => {
+            Some(EventKind::MessageAssistant)
+        }
+        "agent_thought_chunk" => Some(EventKind::ReasoningSummary),
+        _ => None,
+    }
+}
+
 fn nonmessage_kind(update_type: &str, status: Option<&str>) -> Option<EventKind> {
     match update_type {
         "tool_call" | "tool_use" => Some(EventKind::ToolCalled),
@@ -1222,6 +1246,38 @@ fn nonmessage_kind(update_type: &str, status: Option<&str>) -> Option<EventKind>
     }
 }
 
+fn message_bodies(update: &Value) -> impl Iterator<Item = &Value> {
+    [
+        update.get("content"),
+        update.get("text"),
+        update.pointer("/message/content"),
+        update.pointer("/message/text"),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+fn message_blocks(value: &Value) -> &[Value] {
+    value
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(value), Vec::as_slice)
+}
+
+fn malformed_text_block(block: &Value) -> bool {
+    block["type"] == "text" && !block["text"].is_string()
+}
+
+fn message_body(update: &Value) -> Option<&Value> {
+    let contributes = |block: &Value| {
+        if let Some(text) = block.as_str().or_else(|| block["text"].as_str()) {
+            !text.is_empty()
+        } else {
+            !block.is_null() && !malformed_text_block(block)
+        }
+    };
+    message_bodies(update).find(|value| message_blocks(value).iter().any(contributes))
+}
+
 fn message_content(
     update: &Value,
     preservation: &mut GrokPreservationBudget,
@@ -1229,6 +1285,26 @@ fn message_content(
     let mut text = String::new();
     let mut historical_content = Vec::new();
     let mut content_unreadable = false;
+    let body = message_body(update).or_else(|| {
+        message_bodies(update).find(|value| {
+            let canonical_empty = update.get("content").is_some_and(|block| {
+                std::ptr::eq(block, *value) && block["type"] == "text" && block["text"] == ""
+            });
+            canonical_empty || message_blocks(value).iter().any(malformed_text_block)
+        })
+    });
+    if let Some(body) = body {
+        for value in message_bodies(update).take_while(|value| !std::ptr::eq(*value, body)) {
+            for block in message_blocks(value)
+                .iter()
+                .filter(|block| malformed_text_block(block))
+            {
+                if preservation.retain(block) {
+                    historical_content.push(block.clone());
+                }
+            }
+        }
+    }
     let mut push = |block: &Value| {
         if let Some(chunk) = block
             .as_str()
@@ -1253,29 +1329,9 @@ fn message_content(
             historical_content.push(block.clone());
         }
     };
-    let empty_text = |block: &Value| block.as_str().or_else(|| block["text"].as_str()) == Some("");
-    let body = [
-        update.get("content"),
-        update.get("text"),
-        update.pointer("/message/content"),
-        update.pointer("/message/text"),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|value| {
-        !value.is_null()
-            && !empty_text(value)
-            && !value
-                .as_array()
-                .is_some_and(|blocks| blocks.iter().all(empty_text))
-    });
     if let Some(content) = body {
-        if let Some(blocks) = content.as_array() {
-            for block in blocks {
-                push(block);
-            }
-        } else {
-            push(content);
+        for block in message_blocks(content) {
+            push(block);
         }
     } else {
         push(&Value::Null);
@@ -1381,37 +1437,36 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let Some(pending) = pending.take() else {
         return;
     };
-    if !pending.text.is_empty() {
-        let mut payload = json!({ "text": pending.text });
-        if pending.content_unreadable {
-            payload["content_unreadable"] = Value::Bool(true);
-            if let Some(id) = pending.message_id {
-                payload["message_id"] = Value::String(id);
-            }
+    let mut payload = json!({ "text": pending.text });
+    if pending.content_unreadable {
+        payload["content_unreadable"] = Value::Bool(true);
+        if let Some(id) = pending.message_id {
+            payload["message_id"] = Value::String(id);
         }
-        let nontext_blocks = pending
-            .content
-            .iter()
-            .filter(|block| block["type"] != "text")
-            .count();
-        if !pending.content.is_empty() {
-            payload["content"] = Value::Array(pending.content);
-        }
-        let replay_policy = if pending.kind == EventKind::ReasoningSummary {
-            ReplayPolicy::HistoricalOnly
-        } else {
-            ReplayPolicy::Contextual
-        };
+    }
+    let nontext_blocks = pending
+        .content
+        .iter()
+        .filter(|block| block["type"] != "text")
+        .count();
+    if !pending.content.is_empty() {
+        payload["content"] = Value::Array(pending.content);
+    }
+    let replay_policy = if pending.kind == EventKind::ReasoningSummary {
+        ReplayPolicy::HistoricalOnly
+    } else {
+        ReplayPolicy::Contextual
+    };
+    builder.push(
+        pending.kind,
+        payload,
+        pending.timestamp,
+        replay_policy,
+        pending.raw_type,
+        None,
+    );
+    if nontext_blocks > 0 {
         builder.push(
-            pending.kind,
-            payload,
-            pending.timestamp,
-            replay_policy,
-            pending.raw_type,
-            None,
-        );
-        if nontext_blocks > 0 {
-            builder.push(
                 EventKind::ProviderEvent,
                 json!({
                     "omitted_events": nontext_blocks,
@@ -1423,7 +1478,6 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
                 Some("omnisession.unsupported_content".to_owned()),
                 None,
             );
-        }
     }
 }
 
@@ -1985,6 +2039,11 @@ mod tests {
         let empty = json!([{"type":"text","text":""}]);
         for (message, expected, partial) in [
             (
+                json!({"content":[{"type":"text"}],"text":"recovered reply"}),
+                "recovered reply",
+                false,
+            ),
+            (
                 json!({"content":empty,"text":"fallback reply"}),
                 "fallback reply",
                 false,
@@ -2017,6 +2076,28 @@ mod tests {
                 partial
             );
         }
+    }
+
+    #[test]
+    fn canonical_empty_chunk_keeps_the_contiguous_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let updates = ["copper", "", "finch"].map(|text|
+            json!({"method":"session/update","params":{"sessionId":SESSION_ID,"update":{
+                "sessionUpdate":"agent_message_chunk","messageId":"reply","content":{"type":"text","text":text}
+            }}})
+        );
+        write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"info":{"id":SESSION_ID}, "num_messages":3}),
+            &updates,
+        );
+        let adapter = GrokAdapter::with_root(root.path());
+        let snapshot = adapter
+            .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+            .unwrap();
+        assert_eq!(snapshot.events[0].payload["text"], "copperfinch");
+        assert!(!omnis_core::import_conversation(&snapshot).truncated);
     }
 
     #[test]
@@ -2174,7 +2255,7 @@ mod tests {
         write_session(
             root.path(),
             id,
-            &json!({"id":id,"num_messages":8}),
+            &json!({"id":id,"num_messages":10}),
             &[
                 chunk(json!(id), "north"),
                 chunk(Value::Null, "hidden"),
@@ -2183,6 +2264,8 @@ mod tests {
                 Value::Null,
                 json!({}),
                 json!({"params":7}),
+                json!({"method":"session/update","params":null}),
+                json!({"method":"session/update","params":{"update":{}}}),
                 chunk(json!(id.to_ascii_uppercase()), "star"),
             ],
         );
@@ -2198,7 +2281,7 @@ mod tests {
                 read.snapshot
                     .events
                     .iter()
-                    .any(|e| e.payload["malformed_updates"] == 6)
+                    .any(|e| e.payload["malformed_updates"] == 8)
             );
             GrokAdapter::verify_update_owners(
                 &session,
@@ -2435,6 +2518,34 @@ mod tests {
                 native_update_headers(&log, SESSION_ID, 1).unwrap(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn native_fork_checks_locations_on_tool_calls_and_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("updates.jsonl");
+        for tag in ["tool_call", "tool_call_update"] {
+            for (locations, direct) in [
+                (Value::Null, tag == "tool_call_update"),
+                (json!([{"path":"file","line":1}]), true),
+                (json!([{"path":"file","line":null}]), true),
+                (json!([{"path":"file","line":"broken"}]), false),
+                (json!([{"path":"file","line":4_294_967_296_u64}]), false),
+                (json!([{"line":1}]), false),
+            ] {
+                let update = json!({"sessionUpdate":tag,"toolCallId":"call","title":"Read","locations":locations});
+                fs::write(
+                    &log,
+                    json!({"params":{"sessionId":SESSION_ID,"update":update}}).to_string(),
+                )
+                .unwrap();
+                assert_eq!(
+                    native_update_headers(&log, SESSION_ID, 1).unwrap()
+                        == NativeResumeSupport::Direct,
+                    direct
+                );
+            }
         }
     }
 
