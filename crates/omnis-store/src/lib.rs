@@ -3249,20 +3249,7 @@ impl Store {
         if session.provider != Provider::Codex {
             return Ok(false);
         }
-        self.connection
-            .borrow()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM codex_gui_catalog_sources WHERE session_id=?1
-             AND codex_home=(SELECT home FROM current_codex_home)
-             AND source_file_id=?2 AND source_contents_id=?3)",
-                params![
-                    session.id,
-                    revision.file.map(Uuid::into_bytes),
-                    revision.contents.map(Uuid::into_bytes)
-                ],
-                |row| row.get(0),
-            )
-            .map_err(database_error)
+        gui_name_for_revision(&self.connection.borrow(), session, revision)
     }
 
     /// Reads verified opening messages for the requested current Codex rollout revisions.
@@ -3955,7 +3942,35 @@ impl Store {
         let transaction = connection.transaction().map_err(database_error)?;
         let state = cached_trajectory_state(&transaction, session)?;
         let (metadata, untrusted) = selected_catalog_rows(&transaction, session)?;
+        let catalog_gui_name = match metadata
+            .as_ref()
+            .and_then(|row| row.metadata.source_revision)
+        {
+            Some(revision) if session.provider == Provider::Codex => {
+                gui_name_for_revision(&transaction, session, revision)?
+            }
+            _ => false,
+        };
+        let ordinary_name_confirmed = if !catalog_gui_name
+            && let Some(row) = metadata.as_ref().map(|row| &row.metadata)
+            && let (Some(name), Some(revision)) = (&row.title, row.source_revision)
+            && session.provider == Provider::Codex
+        {
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM codex_name_source_prefixes b
+                WHERE b.session_id=?1 AND b.codex_home=(SELECT home FROM current_codex_home)
+                 AND b.source_file_id=?2 AND b.source_contents_id=?3 AND b.full_name=?4)
+                OR EXISTS(SELECT 1 FROM session_trajectories t WHERE t.provider='codex' AND t.session_id=?1
+                 AND t.origin='native' AND t.document_version<7 AND t.derived_title_is_verified
+                 AND t.derived_title_is_local_opener IS 0 AND t.derived_title=omnis_compact_search_title(?4)
+                 AND t.source_file_id=?2 AND t.source_contents_id=?3)",
+                params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes),name],
+                |row| row.get::<_,bool>(0)).map_err(database_error)?
+        } else {
+            false
+        };
         let observation = SelectedSessionObservation {
+            catalog_gui_name,
+            ordinary_name_confirmed,
             state,
             metadata: metadata.map(|row| row.metadata),
             untrusted,
@@ -4371,9 +4386,17 @@ impl Store {
              UNION ALL SELECT t.session_id,p.source_file_id,p.source_contents_id,p.title,p.trajectory_id,p.evidence,1
              FROM codex_inactive_pending_names p JOIN session_trajectories t ON t.id=p.trajectory_id
              WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home)
-             UNION ALL SELECT session_id,source_file_id,source_contents_id,title,NULL,NULL,2 FROM session_index
+             UNION ALL SELECT session_id,source_file_id,source_contents_id,title,NULL,NULL,2 FROM session_index i
              WHERE provider='codex' AND codex_home=(SELECT home FROM current_codex_home) AND NOT codex_legacy_name
-             AND source_file_id IS NOT NULL AND source_contents_id IS NOT NULL"
+             AND source_file_id IS NOT NULL AND source_contents_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM codex_gui_catalog_sources g WHERE g.session_id=i.session_id
+                 AND g.codex_home=i.codex_home AND g.source_file_id=i.source_file_id
+                 AND g.source_contents_id=i.source_contents_id)
+             AND (i.title IS NULL OR NOT EXISTS (SELECT 1 FROM session_trajectories t WHERE t.provider='codex'
+                 AND t.session_id=i.session_id AND t.origin='native' AND t.source_file_id=i.source_file_id
+                 AND t.document_version>=7) OR EXISTS (
+                   SELECT 1 FROM codex_name_source_prefixes b WHERE b.session_id=i.session_id AND b.codex_home=i.codex_home
+                     AND b.source_file_id=i.source_file_id AND b.source_contents_id=i.source_contents_id AND b.full_name=i.title))"
         ).map_err(database_error)?;
         inventory.saved_names = statement
             .query_map([], |row| {
@@ -4465,7 +4488,7 @@ impl Store {
                 observed,
                 complete: names_complete,
                 prior_assignments: &HashMap::new(),
-                gui_names: &HashMap::new(),
+                selected_names: &HashMap::new(),
                 unstamped_documents: None,
                 unlisted_name_changes: &[],
             },
@@ -4485,7 +4508,7 @@ impl Store {
         inventory: &CodexCatalogInventory,
         prior_assignments: &HashMap<String, String>,
     ) -> Result<()> {
-        self.refresh_codex_catalog_with_gui_names(
+        self.refresh_codex_catalog_with_selected_names(
             sessions,
             complete,
             names_complete,
@@ -4500,14 +4523,14 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error if the catalog changed during discovery.
-    pub fn refresh_codex_catalog_with_gui_names(
+    pub fn refresh_codex_catalog_with_selected_names(
         &self,
         sessions: &[IndexedSession],
         complete: bool,
         names_complete: bool,
         inventory: &CodexCatalogInventory,
         prior_assignments: &HashMap<String, String>,
-        gui_names: &HashMap<String, Option<String>>,
+        selected_names: &HashMap<String, omnis_core::NativeSessionName>,
     ) -> Result<()> {
         self.persist_codex_catalog(
             sessions,
@@ -4516,7 +4539,7 @@ impl Store {
                 observed: &inventory.observed,
                 complete: names_complete,
                 prior_assignments,
-                gui_names,
+                selected_names,
                 unstamped_documents: Some(&inventory.unstamped_documents),
                 unlisted_name_changes: &inventory.unlisted_name_changes,
             },
@@ -4571,12 +4594,17 @@ impl Store {
         observed: &[IndexedSession],
         prior_assignments: &HashMap<String, String>,
     ) -> Result<()> {
-        self.merge_codex_search_catalog_with_gui_names(
+        self.persist_codex_catalog_rows(
             sessions,
-            names_complete,
-            observed,
-            prior_assignments,
-            &HashMap::new(),
+            CatalogScope::Search,
+            Some(CatalogNameObservations {
+                observed,
+                complete: names_complete,
+                prior_assignments,
+                selected_names: &HashMap::new(),
+                unstamped_documents: None,
+                unlisted_name_changes: &[],
+            }),
         )
     }
 
@@ -4585,24 +4613,24 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error if the catalog changed during discovery.
-    pub fn merge_codex_search_catalog_with_gui_names(
+    pub fn merge_codex_search_catalog_with_selected_names(
         &self,
         sessions: &[IndexedSession],
         names_complete: bool,
-        observed: &[IndexedSession],
+        inventory: &CodexCatalogInventory,
         prior_assignments: &HashMap<String, String>,
-        gui_names: &HashMap<String, Option<String>>,
+        selected_names: &HashMap<String, omnis_core::NativeSessionName>,
     ) -> Result<()> {
         self.persist_codex_catalog_rows(
             sessions,
             CatalogScope::Search,
             Some(CatalogNameObservations {
-                observed,
+                observed: &inventory.observed,
                 complete: names_complete,
                 prior_assignments,
-                gui_names,
+                selected_names,
                 unstamped_documents: None,
-                unlisted_name_changes: &[],
+                unlisted_name_changes: &inventory.unlisted_name_changes,
             }),
         )
     }
@@ -4672,6 +4700,36 @@ impl Store {
         name_observed: bool,
         prior_assignment: Option<&str>,
     ) -> Result<()> {
+        let name = name_observed.then(|| match &selected.title {
+            Some(name) => omnis_core::NativeSessionName::Named(name.clone()),
+            None => omnis_core::NativeSessionName::Absent,
+        });
+        self.upsert_selected_session_document_with_selected_name(
+            selected,
+            observation,
+            document,
+            workspace,
+            name.as_ref(),
+            prior_assignment,
+        )
+    }
+
+    /// Publishes the selected document and the source that established its name in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected source or catalog changed during the read.
+    pub fn upsert_selected_session_document_with_selected_name(
+        &self,
+        selected: &IndexedSession,
+        observation: &SelectedSessionObservation,
+        document: TrajectoryDocument<'_>,
+        workspace: Option<&CodexWorkspaceUpdate>,
+        name: Option<&omnis_core::NativeSessionName>,
+        prior_assignment: Option<&str>,
+    ) -> Result<()> {
+        let name_observed =
+            name.is_some_and(|n| !matches!(n, omnis_core::NativeSessionName::Unknown));
         if !selected
             .source_revision
             .is_some_and(|revision| revision.matches_file_contents(document.source_revision))
@@ -4716,6 +4774,7 @@ impl Store {
                 selected: &selected,
                 observation,
                 name_observed,
+                gui: matches!(name, Some(omnis_core::NativeSessionName::Gui(_))),
             }),
             &[],
         )
@@ -6545,10 +6604,20 @@ struct SelectedMetadata<'a> {
     selected: &'a IndexedSession,
     observation: &'a SelectedSessionObservation,
     name_observed: bool,
+    gui: bool,
 }
 
 impl SelectedMetadata<'_> {
     fn reconcile_name(self, transaction: &Transaction<'_>) -> Result<()> {
+        if self.gui {
+            record_gui_catalog_source(transaction, self.selected)?;
+            return Ok(());
+        }
+        if self.observation.catalog_gui_name {
+            transaction.execute("DELETE FROM codex_gui_catalog_sources WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+                [&self.selected.session.id]).map_err(database_error)?;
+            return Ok(());
+        }
         if self.selected.title.is_none()
             && let Some(prior) = self.observation.metadata.as_ref()
         {
@@ -6604,6 +6673,9 @@ impl SelectedMetadata<'_> {
 
 /// The document and catalog state before an explicit selected-source read.
 pub struct SelectedSessionObservation {
+    /// The previous catalog title came from the GUI thread selected for this revision.
+    catalog_gui_name: bool,
+    ordinary_name_confirmed: bool,
     pub state: Option<TrajectoryIndexState>,
     pub metadata: Option<IndexedSession>,
     pub failure: Option<TrajectoryIndexFailure>,
@@ -7413,7 +7485,7 @@ struct CatalogNameObservations<'a> {
     observed: &'a [IndexedSession],
     complete: bool,
     prior_assignments: &'a HashMap<String, String>,
-    gui_names: &'a HashMap<String, Option<String>>,
+    selected_names: &'a HashMap<String, omnis_core::NativeSessionName>,
     unstamped_documents: Option<&'a HashMap<SessionRef, String>>,
     unlisted_name_changes: &'a [NameAssignmentChange],
 }
@@ -7433,9 +7505,19 @@ struct UntrustedCatalogRow {
 }
 
 impl SelectedSessionObservation {
+    /// Returns a catalog name that an ordinary source receipt or a pre-GUI projection confirmed.
+    #[must_use]
+    pub fn confirmed_ordinary_name(&self) -> Option<&str> {
+        self.ordinary_name_confirmed.then_some(())?;
+        self.metadata.as_ref()?.title.as_deref()
+    }
+
     /// Returns the catalog name for this rollout before its first document has been indexed.
     #[must_use]
     pub fn unindexed_codex_name(&self, selected: &IndexedSession) -> Option<&str> {
+        if self.catalog_gui_name {
+            return None;
+        }
         unindexed_codex_name(self.metadata.as_ref()?, selected, self.state)
     }
 
@@ -7797,13 +7879,19 @@ fn reconcile_codex_catalog(
         if raw_old != observed_old && raw_old != Some(&row) {
             return Err(StoreError::TrajectorySourceChanged);
         }
-        let gui = names.gui_names.get(id).is_some_and(|title| {
-            title.as_deref().map(omnis_core::redact_secrets) == row.title
-                && row
-                    .source_revision
-                    .is_some_and(|r| r.file.is_some() && r.contents.is_some())
+        let selected_name = names.selected_names.get(id).filter(|name| {
+            row.source_revision
+                .is_some_and(|r| r.file.is_some() && r.contents.is_some())
+                && match name {
+                    omnis_core::NativeSessionName::Gui(value) => {
+                        value.as_deref().map(omnis_core::redact_secrets) == row.title
+                    }
+                    omnis_core::NativeSessionName::Absent => row.title.is_none(),
+                    _ => false,
+                }
         });
-        let names_complete = names.complete || gui;
+        let gui = matches!(selected_name, Some(omnis_core::NativeSessionName::Gui(_)));
+        let names_complete = names.complete || selected_name.is_some();
         if row.title.is_some() || names_complete {
             discard_superseded_name_source(transaction, &row)?;
         }
@@ -7817,7 +7905,15 @@ fn reconcile_codex_catalog(
         if gui {
             record_gui_catalog_source(transaction, &row)?;
         } else {
-            reconcile_ordinary_catalog_name(transaction, &mut row, prior, names)?;
+            reconcile_ordinary_catalog_name(
+                transaction,
+                &mut row,
+                prior,
+                CatalogNameObservations {
+                    complete: names_complete,
+                    ..names
+                },
+            )?;
         }
         if prior.is_none_or(|prior| prior.needs_update(observed_old, &row)) {
             changes.updated.push(row);
@@ -7894,6 +7990,26 @@ fn reconcile_ordinary_catalog_name(
     Ok(())
 }
 
+fn gui_name_for_revision(
+    connection: &Connection,
+    session: &SessionRef,
+    revision: SourceRevision,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_gui_catalog_sources WHERE session_id=?1
+         AND codex_home=(SELECT home FROM current_codex_home)
+         AND source_file_id=?2 AND source_contents_id=?3)",
+            params![
+                session.id,
+                revision.file.map(Uuid::into_bytes),
+                revision.contents.map(Uuid::into_bytes)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
 fn record_gui_catalog_source(connection: &Connection, row: &IndexedSession) -> Result<()> {
     let revision = row.source_revision.unwrap_or_default();
     let file = revision.file.map(Uuid::into_bytes);
@@ -7938,7 +8054,11 @@ fn reconcile_unlisted_names(
 ) -> Result<()> {
     for change in changes {
         let saved = &change.saved;
-        if listed.contains(saved.id.as_str()) {
+        if listed.contains(saved.id.as_str()) || transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_gui_catalog_sources WHERE codex_home=(SELECT home FROM current_codex_home)
+             AND session_id=?1 AND source_file_id=?2 AND source_contents_id=?3)",
+            params![saved.id,saved.file,saved.contents], |row| row.get::<_,bool>(0),
+        ).map_err(database_error)? {
             continue;
         }
         let updated = match &saved.source {

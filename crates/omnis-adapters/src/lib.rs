@@ -66,18 +66,7 @@ pub struct ProviderInstallation {
     pub data_root: Option<PathBuf>,
 }
 
-/// The provider name established by the latest readable name index.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum NativeSessionName {
-    Named(String),
-    /// The selected SQLite thread owns this name or explicitly has no GUI name.
-    Gui(Option<String>),
-    /// A complete name index has no assignment for this session.
-    Absent,
-    /// The available index cannot establish this session's current name.
-    #[default]
-    Unknown,
-}
+pub use omnis_core::NativeSessionName;
 
 /// Name assignments that still agree with the native index used for a listing.
 pub struct ObservedSessionNames {
@@ -85,26 +74,6 @@ pub struct ObservedSessionNames {
     pub names: std::sync::Arc<HashMap<String, String>>,
     /// Whether an omitted ID confirms that the thread has no assignment.
     pub complete: bool,
-}
-
-impl NativeSessionName {
-    fn into_title(self) -> Option<String> {
-        match self {
-            Self::Named(title) | Self::Gui(Some(title)) => Some(title),
-            Self::Gui(None) | Self::Absent | Self::Unknown => None,
-        }
-    }
-
-    /// Checks whether the observed name agrees with the session metadata.
-    #[must_use]
-    pub fn confirms(&self, expected: Option<&str>) -> bool {
-        match self {
-            Self::Named(current) => expected == Some(current.as_str()),
-            Self::Gui(current) => current.as_deref() == expected,
-            Self::Absent => expected.is_none(),
-            Self::Unknown => false,
-        }
-    }
 }
 
 /// Metadata returned by session discovery. Transcript content is intentionally absent.
@@ -471,8 +440,11 @@ pub trait ProviderAdapter: Send + Sync {
         HashMap::new()
     }
 
-    /// Returns GUI assignments and clears that match the selected sessions.
-    fn gui_session_names(&self, sessions: &[NativeSession]) -> HashMap<String, Option<String>> {
+    /// Returns name assignments and clears confirmed for the selected paths and file revisions.
+    fn observed_listed_names(
+        &self,
+        sessions: &[NativeSession],
+    ) -> HashMap<String, NativeSessionName> {
         let requested: Vec<_> = sessions
             .iter()
             .filter(|s| s.session.provider == Provider::Codex)
@@ -490,10 +462,23 @@ pub trait ProviderAdapter: Send + Sync {
             .filter(|session| session.session.provider == Provider::Codex)
             .filter_map(|session| {
                 let id = &session.session.id;
-                let NativeSessionName::Gui(name) = names.remove(id)? else {
-                    return None;
-                };
-                (session.title == name).then(|| (id.clone(), name))
+                let name = names.remove(id)?;
+                name.confirms(session.title.as_deref())
+                    .then(|| (id.clone(), name))
+            })
+            .collect()
+    }
+
+    /// Returns GUI assignments and clears that match the selected sessions.
+    fn gui_session_names(&self, sessions: &[NativeSession]) -> HashMap<String, Option<String>> {
+        self.observed_listed_names(sessions)
+            .into_iter()
+            .filter_map(|(id, name)| {
+                if let NativeSessionName::Gui(title) = name {
+                    Some((id, title))
+                } else {
+                    None
+                }
             })
             .collect()
     }

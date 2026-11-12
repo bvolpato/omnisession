@@ -316,7 +316,7 @@ fn selected_read_metadata(
             _ => None,
         };
         selected.title = previous
-            .and_then(|old| old.title.as_deref())
+            .and_then(|_| observed?.confirmed_ordinary_name())
             .or(unindexed_name)
             .or_else(|| history.as_ref().map(|prior| prior.stored))
             .map(str::to_owned);
@@ -640,12 +640,12 @@ fn store_search_document<'a>(
                 source_complete,
                 workspace_projection,
             );
-            store.upsert_selected_session_document_with_name_history(
+            store.upsert_selected_session_document_with_selected_name(
                 selected,
                 observed,
                 document,
                 workspace.as_ref(),
-                name_observed,
+                native_name.filter(|_| name_observed),
                 prior_assignment,
             )?;
             &selected.session
@@ -924,18 +924,6 @@ impl<'a> DiscoveryUse<'a> {
         }
     }
 
-    fn codex_inventory(
-        self,
-        store: &Store,
-        project: Option<&Path>,
-    ) -> omnis_store::Result<omnis_store::CodexCatalogInventory> {
-        if matches!(self, Self::Index(_)) && project.is_none() {
-            store.observe_codex_catalog_for_refresh()
-        } else {
-            store.observe_codex_catalog_inventory()
-        }
-    }
-
     fn candidate_project(self, project: Option<&Path>) -> Option<&Path> {
         project.filter(|_| {
             matches!(
@@ -959,6 +947,17 @@ fn discover_search_sessions(
         .list_search_sessions_with_notes(project)
 }
 
+fn codex_discovery_inventory(
+    store: &Store,
+    project: Option<&Path>,
+) -> omnis_store::Result<omnis_store::CodexCatalogInventory> {
+    if project.is_none() {
+        store.observe_codex_catalog_for_refresh()
+    } else {
+        store.observe_codex_catalog_inventory()
+    }
+}
+
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
 fn discover_sessions(
     registry: &AdapterRegistry,
@@ -980,8 +979,7 @@ fn discover_sessions(
     let mut observed_codex = cache
         .filter(|_| providers.contains(&Provider::Codex))
         .and_then(|store| {
-            purpose
-                .codex_inventory(store, project)
+            codex_discovery_inventory(store, project)
                 .inspect_err(|error| warnings.push(format!("codex session cache: {error}")))
                 .ok()
         });
@@ -1117,18 +1115,20 @@ fn cache_discovered_codex_sessions(
     };
     let names_complete = adapter.session_titles_are_complete();
     let prior_names = prior_codex_assignments(adapter, sessions, inventory, names_complete);
-    let gui_names = adapter.gui_session_names(sessions);
+    let selected_names = adapter.observed_listed_names(sessions);
+    if project.is_none()
+        && let Some(assignments) = adapter.observed_session_names()
+    {
+        inventory.observe_name_assignments(&assignments.names, assignments.complete);
+    }
     if !project_search {
-        if let Some(assignments) = adapter.observed_session_names() {
-            inventory.observe_name_assignments(&assignments.names, assignments.complete);
-        }
-        store.refresh_codex_catalog_with_gui_names(
+        store.refresh_codex_catalog_with_selected_names(
             &indexed,
             complete,
             names_complete,
             inventory,
             &prior_names,
-            &gui_names,
+            &selected_names,
         )?;
         if !complete && project.is_none() {
             remove_unavailable_search_sessions(
@@ -1140,12 +1140,12 @@ fn cache_discovered_codex_sessions(
         }
         return Ok(());
     }
-    let merged = store.merge_codex_search_catalog_with_gui_names(
+    let merged = store.merge_codex_search_catalog_with_selected_names(
         &indexed,
         names_complete,
-        &inventory.observed,
+        inventory,
         &prior_names,
-        &gui_names,
+        &selected_names,
     );
     if matches!(
         merged,
@@ -1432,19 +1432,19 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let store = Store::open_default().context("opening OmniSession state")?;
-    let (mut sessions, mut warnings, cached_titles, live_gui_names) = if args.cached {
+    let (mut sessions, mut warnings, cached_titles, live_names) = if args.cached {
         let (sessions, warnings, titles) = cached_search_sessions(&store, args, &project)?;
         (sessions, warnings, Some(titles), HashMap::new())
     } else {
         let (sessions, warnings) = live_search_sessions(registry, &store, args, &project);
-        let gui_names = if args.no_index && args.provider.is_none_or(|p| p == Provider::Codex) {
+        let names = if args.no_index && args.provider.is_none_or(|p| p == Provider::Codex) {
             registry
                 .adapter(Provider::Codex)?
-                .gui_session_names(&sessions)
+                .observed_listed_names(&sessions)
         } else {
             HashMap::new()
         };
-        (sessions, warnings, None, gui_names)
+        (sessions, warnings, None, names)
     };
     if args.cached {
         warnings.push(
@@ -1476,8 +1476,8 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         None => store.trajectory_titles_with_sources()?,
     };
     let mut titles = resolve_search_titles(&mut sessions, titles, args.cached);
-    if !live_gui_names.is_empty() {
-        apply_live_gui_search_titles(&store, &mut sessions, live_gui_names, &mut titles)?;
+    if !live_names.is_empty() {
+        apply_live_search_titles(&store, &mut sessions, live_names, &mut titles)?;
     }
     let (hits, has_more) =
         rank_search_hits(&store, &query, &sessions, &titles, args.limit, args.cached)?;
@@ -1633,28 +1633,49 @@ fn resolve_search_titles(
         .collect()
 }
 
-fn apply_live_gui_search_titles(
+fn apply_live_search_titles(
     store: &Store,
     sessions: &mut [NativeSession],
-    mut gui_names: HashMap<String, Option<String>>,
+    mut names: HashMap<String, NativeSessionName>,
     titles: &mut HashMap<SessionRef, String>,
 ) -> Result<()> {
-    let mut selected = Vec::with_capacity(gui_names.len());
+    let mut selected = Vec::new();
     for session in sessions {
-        if session.session.provider == Provider::Codex
-            && let Some(name) = gui_names.remove(&session.session.id)
-        {
+        if session.session.provider != Provider::Codex {
+            continue;
+        }
+        let Some(name) = names.remove(&session.session.id) else {
+            continue;
+        };
+        let Some(revision) = session.source_revision else {
+            continue;
+        };
+        if let NativeSessionName::Gui(name) = name {
             session.title = name;
-            titles.remove(&session.session);
-            if let Some(revision) = session.source_revision {
-                selected.push((session.session.id.clone(), revision));
+        } else {
+            let Some(indexed) = titles.get(&session.session) else {
+                continue;
+            };
+            if !name.confirms(session.title.as_deref())
+                || session.title.as_ref() == Some(indexed)
+                || !store
+                    .retained_codex_name(&session.session, revision)?
+                    .is_some_and(|prior| matches_previous_name(indexed, &prior))
+            {
+                continue;
             }
         }
+        titles.remove(&session.session);
+        selected.push((session.session.id.clone(), revision));
     }
     for (id, opener) in store.codex_local_openers(&selected)? {
         titles.insert(SessionRef::new(Provider::Codex, id), opener);
     }
     Ok(())
+}
+
+fn matches_previous_name(title: &str, prior: &str) -> bool {
+    title == prior || omnis_core::compact_search_title(prior).as_deref() == Some(title)
 }
 
 fn omp_title_is_current(

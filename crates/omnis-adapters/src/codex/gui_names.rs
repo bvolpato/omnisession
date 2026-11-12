@@ -66,12 +66,4 @@ impl StateName {
             None => Self::Index,
         }
     }
-
-    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
-        match self {
-            Self::Index | Self::CorroboratedIndex => indexed(),
-            Self::Gui(name) => name.clone(),
-            Self::Guardian(name) => indexed().or_else(|| Some(name.clone())),
-        }
-    }
 }

@@ -140,6 +140,39 @@ fn gaps_in_the_name_index_warn_without_hiding_rollouts_or_later_names() {
 }
 
 #[test]
+fn failed_sqlite_discovery_preserves_independent_name_observations() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    fs::write(
+        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        header.to_string(),
+    )?;
+    fs::write(
+        home.path().join("state_5.sqlite"),
+        b"unreadable sqlite contents",
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let sidecar = home.path().join("session_index.jsonl");
+    let renamed = json!({"id":SESSION_ID,"thread_name":"Latest name"});
+    for (contents, complete, name) in [
+        (String::new(), true, None),
+        (format!("{{\n{renamed}\n"), false, Some("Latest name")),
+    ] {
+        fs::write(&sidecar, contents)?;
+        assert!(adapter.list_sessions(None)?.is_empty());
+        assert!(!adapter.discovery_is_complete());
+        let observed = adapter
+            .observed_session_names()
+            .expect("sidecar read before SQLite");
+        assert_eq!(observed.complete, complete);
+        assert_eq!(observed.names.get(SESSION_ID).map(String::as_str), name);
+    }
+    Ok(())
+}
+
+#[test]
 #[cfg(any(unix, windows))]
 fn earlier_names_corroborate_only_rollouts_with_one_possible_home() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
@@ -2243,6 +2276,20 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         );
         Ok(())
     };
+    fs::write(
+        home.path().join("session_index.jsonl"),
+        format!(
+            "{{\n{}\n",
+            json!({"id":SESSION_ID,"thread_name":"Original name"})
+        ),
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert!(!adapter.session_titles_are_complete());
+    assert_eq!(
+        adapter.observed_listed_names(&listed).get(SESSION_ID),
+        Some(&omnis_adapters::NativeSessionName::Absent)
+    );
     check(&original, "/one", None)?;
     let state = home.path().join("alternate");
     fs::create_dir(&state)?;

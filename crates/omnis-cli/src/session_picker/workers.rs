@@ -39,7 +39,7 @@ pub(super) struct CatalogNames {
     pub(super) inventory: omnis_store::CodexCatalogInventory,
     pub(super) unavailable: Vec<IndexedSession>,
     pub(super) prior_assignments: std::collections::HashMap<String, String>,
-    pub(super) gui_names: std::collections::HashMap<String, Option<String>>,
+    pub(super) selected_names: std::collections::HashMap<String, omnis_adapters::NativeSessionName>,
     pub(super) complete: bool,
 }
 
@@ -64,13 +64,13 @@ impl SessionCacheUpdate {
     pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
         if self.catalog.provider == Provider::Codex {
             if let Some(names) = self.names {
-                store.refresh_codex_catalog_with_gui_names(
+                store.refresh_codex_catalog_with_selected_names(
                     &self.catalog.sessions,
                     self.catalog.complete,
                     names.complete,
                     &names.inventory,
                     &names.prior_assignments,
-                    &names.gui_names,
+                    &names.selected_names,
                 )?;
                 store.remove_unavailable_codex_sessions(&names.unavailable)?;
             }
@@ -584,7 +584,7 @@ fn codex_catalog_names(
         inventory,
         unavailable,
         prior_assignments,
-        gui_names: adapter.gui_session_names(sessions),
+        selected_names: adapter.observed_listed_names(sessions),
         complete,
     })
 }

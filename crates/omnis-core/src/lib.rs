@@ -50,6 +50,41 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
+/// The provider name established by the latest readable name index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NativeSessionName {
+    Named(String),
+    /// The selected SQLite thread owns this name or explicitly has no GUI name.
+    Gui(Option<String>),
+    /// A complete name index has no assignment for this session.
+    Absent,
+    /// The available index cannot establish this session's current name.
+    #[default]
+    Unknown,
+}
+
+impl NativeSessionName {
+    /// Returns the observed assigned name, if present.
+    #[must_use]
+    pub fn into_title(self) -> Option<String> {
+        match self {
+            Self::Named(title) | Self::Gui(Some(title)) => Some(title),
+            Self::Gui(None) | Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    /// Checks whether the observed name agrees with the session metadata.
+    #[must_use]
+    pub fn confirms(&self, expected: Option<&str>) -> bool {
+        match self {
+            Self::Named(current) => expected == Some(current.as_str()),
+            Self::Gui(current) => current.as_deref() == expected,
+            Self::Absent => expected.is_none(),
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 

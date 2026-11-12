@@ -144,6 +144,7 @@ struct PickerEntry {
     session: NativeSession,
     current_workspace: bool,
     listed_title: Option<String>,
+    retired_names: Vec<String>,
     fields: SearchFields,
     cached: bool,
 }
@@ -151,6 +152,12 @@ struct PickerEntry {
 impl PickerEntry {
     fn provider_name(&self) -> Option<&str> {
         self.listed_title.as_deref()
+    }
+
+    fn retire_previous_name(&mut self, name: &str) {
+        if self.provider_name() != Some(name) && !self.retired_names.iter().any(|old| old == name) {
+            self.retired_names.push(name.to_owned());
+        }
     }
 
     fn source_revision(&self) -> Option<SourceRevision> {
@@ -613,18 +620,16 @@ impl PickerState {
                 entry.session.title = old_name.map(str::to_owned);
                 entry.fields = SearchFields::new(&entry.session, None);
             }
-            if old_name != entry.provider_name()
-                && old_name.is_some_and(|old_name| {
-                    self.indexed_titles
-                        .get(&entry.key)
-                        .is_some_and(|(source, title)| {
-                            *source == revision
-                                && omnis_core::compact_search_title(old_name).as_ref()
-                                    == Some(title)
-                        })
-                })
+            if let Some(current) = current {
+                entry.retired_names.clone_from(&current.retired_names);
+            }
+            if names
+                .and_then(|names| names.selected_names.get(&entry.session.session.id))
+                .is_some_and(|name| name.confirms(entry.provider_name()))
             {
-                self.indexed_titles.remove(&entry.key);
+                for prior in [old_name, observed_name].into_iter().flatten() {
+                    entry.retire_previous_name(prior);
+                }
             }
         }
     }
@@ -958,6 +963,9 @@ impl PickerState {
         let entry = &mut self.entries[index];
         entry.listed_title.clone_from(&change.current);
         entry.session.title = change.current;
+        if let Some(previous) = change.previous {
+            entry.retire_previous_name(&previous);
+        }
         self.refresh_entry_title(index);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.restore_selection(selected);
@@ -993,7 +1001,13 @@ impl PickerState {
                 entry.session.session.provider != Provider::Codex
                     || entry.source_revision().unwrap_or_default() == *revision
             })
-            .map(|(_, title)| title.as_str());
+            .map(|(_, title)| title.as_str())
+            .filter(|title| {
+                !entry
+                    .retired_names
+                    .iter()
+                    .any(|old| crate::matches_previous_name(title, old))
+            });
         let preview = self
             .preview_titles
             .get(&entry.key)
@@ -1748,7 +1762,7 @@ struct CachedPickerEntries {
 }
 
 fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
+    let (sessions, mut titles) = store.cached_picker_sessions_with_titles()?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -1764,7 +1778,23 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             session
         })
         .collect::<Vec<_>>();
-    omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+    let observed = omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+    let mut retired = HashMap::new();
+    if !observed.is_empty() {
+        let mut effective = titles
+            .iter()
+            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
+            .collect();
+        crate::apply_live_search_titles(store, &mut sessions, observed, &mut effective)?;
+        for receipt in &mut titles {
+            let current = effective.remove(&receipt.session);
+            if current != receipt.title
+                && let Some(previous) = std::mem::replace(&mut receipt.title, current)
+            {
+                retired.insert(receipt.session.clone(), previous);
+            }
+        }
+    }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -1772,7 +1802,12 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
         if session.session.provider != Provider::Imported {
-            entries.push(picker_entry(session, &mut paths, true));
+            let previous = retired.remove(&session.session);
+            let mut entry = picker_entry(session, &mut paths, true);
+            if let Some(previous) = previous {
+                entry.retire_previous_name(&previous);
+            }
+            entries.push(entry);
             continue;
         }
         let current = match imports.matches(&session.session, session.project_path.as_deref()) {
@@ -1829,6 +1864,7 @@ impl PickerEntry {
             key: session.session.to_string(),
             current_workspace,
             listed_title: session.title.clone(),
+            retired_names: Vec::new(),
             fields: SearchFields::new(&session, None),
             session,
             cached,
@@ -3421,7 +3457,7 @@ mod tests {
                     inventory: store.observe_codex_catalog_inventory().unwrap(),
                     unavailable: Vec::new(),
                     prior_assignments: HashMap::new(),
-                    gui_names: HashMap::new(),
+                    selected_names: HashMap::new(),
                     complete: true,
                 })),
             }
@@ -4515,6 +4551,14 @@ mod tests {
             contents: Some(uuid::Uuid::from_u128(2)),
             ..Default::default()
         });
+        let old_title = IndexedTrajectoryTitle {
+            session: native.session.clone(),
+            title: native.title.clone(),
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            source_revision: native.source_revision.unwrap(),
+            verified_at: None,
+            cached_at: native.updated_at,
+        };
         let mut state = PickerState::new(vec![native], project, None, true);
         let key = state.preview_key(&state.entries[0]);
         let name = |previous: &str, current: &str| ProviderNameChange {
@@ -4524,6 +4568,7 @@ mod tests {
         let changed = name("Amber Heron", "Violet Quokka");
         assert!(state.accepts_provider_name(&key, &changed));
         state.remember_provider_name(&key, changed);
+        state.remember_source_titles([old_title]);
         assert!(!state.accepts_provider_name(&key, &name("Amber Heron", "Amber Heron")));
         state.query = "amberheron".to_owned();
         assert!(state.visible_indices().is_empty());

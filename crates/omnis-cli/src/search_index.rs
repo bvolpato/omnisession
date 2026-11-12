@@ -1075,23 +1075,22 @@ fn publish_selected_read(
         if name_observed {
             return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
         }
-        metadata.title.clone_from(&current.title);
-        retained = metadata
-            .title
-            .as_deref()
-            .and_then(omnis_core::compact_search_title);
-        document.derived_title = retained.as_deref();
-        document.title_authoritative = retained.is_some();
-        document.title_is_verified = retained.is_some();
-        document.local_opener = LocalOpenerEvidence::Unknown;
-        document.withdrawn_title = None;
+        if let Some(name) = observation.confirmed_ordinary_name() {
+            metadata.title = Some(name.to_owned());
+            retained = omnis_core::compact_search_title(name);
+            document.derived_title = retained.as_deref();
+            document.title_authoritative = retained.is_some();
+            document.title_is_verified = retained.is_some();
+            document.local_opener = LocalOpenerEvidence::Unknown;
+            document.withdrawn_title = None;
+        }
     }
-    store.upsert_selected_session_document_with_name_history(
+    store.upsert_selected_session_document_with_selected_name(
         &metadata,
         observation,
         document,
         read.workspace.as_ref(),
-        name_observed,
+        read.native_name.as_ref().filter(|_| name_observed),
         history.as_ref().map(|prior| prior.assignment.as_str()),
     )?;
     Ok(store.indexed_trajectory_title(&read.candidate.session)?)

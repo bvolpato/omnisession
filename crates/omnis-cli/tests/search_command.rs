@@ -541,11 +541,23 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
 fn missing_rollout_names_follow_the_last_readable_assignment_in_their_home() {
     let name = json!({"id":CODEX_ID,"thread_name":"Violet Quokka"}).to_string();
     let renamed = json!({"id":CODEX_ID,"thread_name":"Copper Fennel"}).to_string();
-    for (absent_index, expected, partial) in [
-        (String::new(), None, false),
-        (String::new(), None, true),
-        (format!("{{\n{renamed}\n"), Some("Copper Fennel"), false),
-        ("{".into(), Some("Violet Quokka"), false),
+    for (absent_index, expected, partial, search) in [
+        (String::new(), None, false, false),
+        (String::new(), None, false, true),
+        (String::new(), None, true, false),
+        (
+            format!("{{\n{renamed}\n"),
+            Some("Copper Fennel"),
+            false,
+            false,
+        ),
+        (
+            format!("{{\n{renamed}\n"),
+            Some("Copper Fennel"),
+            false,
+            true,
+        ),
+        ("{".into(), Some("Violet Quokka"), false, false),
     ] {
         let fixture = Fixture::new();
         let codex = fixture.root.join("codex");
@@ -576,7 +588,11 @@ fn missing_rollout_names_follow_the_last_readable_assignment_in_their_home() {
         }
         fs::rename(&inner, &parked).unwrap();
         fs::write(&sidecar, absent_index).unwrap();
-        fixture.index_codex();
+        if search {
+            fixture.search_json(&["Violet Quokka", "--provider", "codex", "--all-projects"]);
+        } else {
+            fixture.index_codex();
+        }
         fs::write(&sidecar, "{").unwrap();
         fs::rename(&parked, &inner).unwrap();
         if partial {

@@ -261,10 +261,6 @@ fn same_index_filename(a: &Path, b: &Path) -> bool {
 }
 
 impl CurrentRollout {
-    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
-        self.name.title(indexed)
-    }
-
     pub(super) fn observed_name(
         &self,
         indexed: impl FnOnce() -> crate::NativeSessionName,
@@ -874,7 +870,13 @@ mod tests {
         for (rows, marker) in [(before, "before"), (after, "after")] {
             for id in [THREAD, NEXT] {
                 assert_eq!(rows[id].path, PathBuf::from(format!("{marker}.jsonl")));
-                assert_eq!(rows[id].name.title(|| None).as_deref(), Some(marker));
+                assert_eq!(
+                    rows[id]
+                        .observed_name(|| crate::NativeSessionName::Unknown)
+                        .into_title()
+                        .as_deref(),
+                    Some(marker)
+                );
             }
         }
         drop(writer);

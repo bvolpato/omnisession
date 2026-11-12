@@ -859,15 +859,19 @@ impl CodexAdapter {
     }
 
     /// Refreshes cached names and metadata from the currently selected rollouts.
-    pub fn refresh_session_titles(&self, sessions: &mut [NativeSession]) {
+    pub fn refresh_session_titles(
+        &self,
+        sessions: &mut [NativeSession],
+    ) -> HashMap<String, NativeSessionName> {
+        let mut names = HashMap::new();
         if !sessions
             .iter()
             .any(|s| s.session.provider == Provider::Codex)
         {
-            return;
+            return names;
         }
         let Some(home) = self.codex_home.as_deref() else {
-            return;
+            return names;
         };
         let (scan, _) = self.current_session_scan();
         let ids = sessions
@@ -897,11 +901,16 @@ impl CodexAdapter {
                     .zip(Self::index_file_revision(path))
                     .is_some_and(|(old, new)| old.matches_file_contents(new))
             {
-                let indexed = || index.titles.get(id).cloned();
-                cached.title = match row {
-                    Some(row) => row.title(indexed),
-                    None => indexed(),
+                let indexed = || match index.titles.get(id) {
+                    Some(title) => NativeSessionName::Named(title.clone()),
+                    None if index.complete => NativeSessionName::Absent,
+                    None => NativeSessionName::Unknown,
                 };
+                let name = row.map_or_else(indexed, |row| row.observed_name(indexed));
+                if name != NativeSessionName::Unknown {
+                    names.insert(id.to_owned(), name.clone());
+                }
+                cached.title = name.into_title();
                 cached.source_path = Some(path.to_owned());
                 continue;
             }
@@ -915,11 +924,12 @@ impl CodexAdapter {
                 cached.title = None;
                 continue;
             };
-            let title = self
-                .selected_name(&selected, row, &index, || {
-                    scan.index_paths(&selected, &legacy)
-                })
-                .into_title();
+            let name = self.selected_name(&selected, row, &index, || {
+                scan.index_paths(&selected, &legacy)
+            });
+            if name != NativeSessionName::Unknown {
+                names.insert(id.to_owned(), name.clone());
+            }
             let current = selected.session;
             if cached
                 .source_revision
@@ -930,8 +940,9 @@ impl CodexAdapter {
             } else {
                 *cached = current.native_session();
             }
-            cached.title = title;
+            cached.title = name.into_title();
         }
+        names
     }
 
     fn listing(&self, refresh: bool) -> (Arc<CodexListing>, bool) {
@@ -1003,6 +1014,8 @@ impl CodexAdapter {
                         "Codex could not verify the current rollouts: {}.",
                         compact_discovery_error(&anyhow!("{error:#}"))
                     )],
+                    scan,
+                    names: title_index,
                     requires_scan: true,
                     ..CodexListing::default()
                 };
