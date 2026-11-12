@@ -1,7 +1,7 @@
 mod json_tail;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     ffi::OsStr,
@@ -40,8 +40,8 @@ const MAX_PREVIEW_VALIDATION_BYTES: u64 = 2 * MAX_STREAMED_TRANSCRIPT_LINE_SIZE;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
-const MAX_DISCOVERED_FILES: usize = 10_000;
-const MAX_DISCOVERY_ENTRIES: usize = 200_000;
+pub(crate) const MAX_DISCOVERED_FILES: usize = 10_000;
+pub(crate) const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 // Snapshots copy the database and WAL to private temporary storage, so this bounds disk use, not
 // memory. It matches the streamed transcript budget. `OMNI_SNAPSHOT_MAX_BYTES` overrides it.
@@ -522,7 +522,25 @@ pub(crate) fn store_is_missing(path: &Path) -> bool {
 #[derive(Debug)]
 pub(crate) struct SqliteSnapshot {
     pub(crate) connection: Connection,
-    _directory: TempDir,
+    directory: TempDir,
+    verified_wal: OnceCell<Result<(), String>>,
+}
+
+impl SqliteSnapshot {
+    /// Call after the query finishes so SQLite can report its recovered commit boundary.
+    pub(crate) fn verify_wal(&self) -> Result<()> {
+        let verified = self.verified_wal.get_or_init(|| {
+            crate::sqlite_wal::verify(
+                &self.connection,
+                &self.directory.path().join("snapshot.sqlite-wal"),
+            )
+            .map_err(|error| error.to_string())
+        });
+        verified
+            .as_ref()
+            .copied()
+            .map_err(|message| crate::UnverifiedSqliteWal(message.clone()).into())
+    }
 }
 
 /// Bounds for the private copy a `SQLite` snapshot makes.
@@ -537,7 +555,7 @@ struct SnapshotLimits {
 impl SnapshotLimits {
     fn from_environment() -> Result<Self> {
         Ok(Self {
-            max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
+            max_bytes: sqlite_snapshot_byte_limit()?,
             free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
         })
     }
@@ -552,6 +570,16 @@ pub(super) struct SnapshotFileStamp {
 }
 
 impl SnapshotFileStamp {
+    pub(super) fn changed_at(&self) -> DateTime<Utc> {
+        if let Some((_, _, seconds, nanos)) = self.unix_identity
+            && let Ok(nanos) = u32::try_from(nanos)
+            && let Some(time) = DateTime::from_timestamp(seconds, nanos)
+        {
+            return time;
+        }
+        self.modified.into()
+    }
+
     pub(crate) fn revision(&self, namespace: Uuid) -> Uuid {
         let modified = DateTime::<Utc>::from(self.modified);
         let mut hash = Sha256::new();
@@ -975,6 +1003,15 @@ impl SqliteSnapshotCache {
         database: &Path,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        self.read_snapshot(root, database, |snapshot| read(&snapshot.connection))
+    }
+
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        root: &Path,
+        database: &Path,
+        read: impl FnOnce(&SqliteSnapshot) -> Result<T>,
+    ) -> Result<T> {
         self.read_using(root, database, false, read)
     }
 
@@ -985,7 +1022,7 @@ impl SqliteSnapshotCache {
         database: &Path,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        self.read_using(root, database, true, read)
+        self.read_using(root, database, true, |snapshot| read(&snapshot.connection))
     }
 
     fn read_using<T>(
@@ -993,14 +1030,14 @@ impl SqliteSnapshotCache {
         root: &Path,
         database: &Path,
         stamped: bool,
-        read: impl FnOnce(&Connection) -> Result<T>,
+        read: impl FnOnce(&SqliteSnapshot) -> Result<T>,
     ) -> Result<T> {
         let database = provider_file(root, database)
             .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
         let limits = SnapshotLimits::from_environment()?;
         // Unix change time detects same-size rewrites that preserve modification time.
         if !cfg!(unix) && !stamped {
-            return read(&sqlite_snapshot_with_limits(root, &database, limits)?.connection);
+            return read(&sqlite_snapshot_with_limits(root, &database, limits)?);
         }
         let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..3 {
@@ -1013,7 +1050,7 @@ impl SqliteSnapshotCache {
                         && cached.stamped == stamped
                 })
             {
-                return read(&snapshot.snapshot.connection);
+                return read(&snapshot.snapshot);
             }
             *cached = None;
             let live_prefix = if stamped && let Some(wal) = &stamp.wal {
@@ -1042,14 +1079,14 @@ impl SqliteSnapshotCache {
             if stamp != SnapshotStamp::read(root, &database, limits.max_bytes, stamped)? {
                 if live_prefix.is_some() {
                     // A later lookup must observe commits appended after this private snapshot.
-                    return read(&snapshot.connection);
+                    return read(&snapshot);
                 }
                 continue;
             }
             if !cacheable {
-                return read(&snapshot.connection);
+                return read(&snapshot);
             }
-            let result = read(&snapshot.connection);
+            let result = read(&snapshot);
             *cached = Some(CachedSnapshot {
                 database,
                 stamp,
@@ -1063,6 +1100,10 @@ impl SqliteSnapshotCache {
 }
 
 /// Parses the snapshot bound setting. An invalid value fails closed instead of falling back.
+pub(super) fn sqlite_snapshot_byte_limit() -> Result<u64> {
+    snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())
+}
+
 fn snapshot_max_bytes(value: Option<&OsStr>) -> Result<u64> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES);
@@ -1166,7 +1207,8 @@ fn open_snapshot(directory: TempDir) -> Result<Option<SqliteSnapshot>> {
     connection.pragma_update(None, "query_only", "ON")?;
     Ok(Some(SqliteSnapshot {
         connection,
-        _directory: directory,
+        directory,
+        verified_wal: OnceCell::new(),
     }))
 }
 
@@ -1496,13 +1538,24 @@ impl JsonLinesLimits {
     }
 }
 
-/// Streams transcript records and returns how many oversized records were skipped.
-pub(crate) fn visit_json_lines(
+pub(crate) fn visit_json_lines_with_omissions(
     path: &Path,
     file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
-) -> Result<usize> {
-    visit_json_lines_with_tail(path, file_limit, JsonLineTail::SkipMalformed, visit)
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "provider path is not a file");
+    if metadata.len() > file_limit {
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
+    }
+    visit_json_reader(
+        &mut BufReader::new(file),
+        JsonLinesLimits::streamed(file_limit),
+        |_, _| WorkspaceGap::Other,
+        |_, record, _| visit(record),
+    )
+    .map(|(omissions, _)| omissions)
 }
 
 pub(crate) fn visit_json_lines_with_tail(
@@ -1527,7 +1580,7 @@ pub(crate) struct JsonLineLocation {
 ///
 /// The caller can seek within the same file handle to reread only selected records after it has
 /// collected compact index metadata. The regular file, file-size, record-count, and line-size
-/// limits match `visit_json_lines`.
+/// limits match `visit_json_lines_with_tail`.
 pub(crate) fn visit_json_lines_with_offsets(
     reader: &mut BufReader<File>,
     file_limit: u64,
@@ -1746,7 +1799,7 @@ pub(crate) fn omitted_images_text(count: usize) -> String {
     }
 }
 
-pub(crate) fn visit_json_lines_with_omissions(
+pub(crate) fn visit_json_lines_with_gaps(
     path: &Path,
     file_limit: u64,
     mut visit: impl FnMut(Value, bool) -> Result<()>,
@@ -3751,6 +3804,21 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn contains_database_steps(&self, expected: &[Uuid]) -> bool {
+        let mut records = self.events.iter().filter(|event| {
+            event.source.raw_record_type.as_deref() != Some(crate::antigravity::STEP_LIMIT_RECORD)
+        });
+        expected.iter().all(|id| {
+            records.any(|event| {
+                event
+                    .raw_blob_hash
+                    .as_deref()
+                    .and_then(|hash| Uuid::parse_str(hash).ok())
+                    == Some(*id)
+            })
+        })
+    }
+
     pub(crate) fn database_step_namespace(&self, index: i64, opaque: bool) -> Uuid {
         let mut key = [0; 9];
         key[..8].copy_from_slice(&index.to_be_bytes());
@@ -4065,6 +4133,75 @@ mod tests {
         let records =
             super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete).unwrap();
         assert_eq!(records, [json!(42), json!(43)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_home_keeps_the_physical_target_during_an_outage() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let volume = root.join("volume");
+        let physical = volume.join("native");
+        fs::create_dir_all(physical.join("child")).unwrap();
+        let aliases = root.join("aliases");
+        fs::create_dir(&aliases).unwrap();
+        let link = aliases.join("selected");
+        symlink("../volume/native", &link).unwrap();
+        let configured = root.join("configured");
+        symlink("aliases/selected", &configured).unwrap();
+        let home = |path: &Path| super::discovery_home(Some(path)).unwrap().unwrap();
+
+        let check = || {
+            assert_eq!(home(&physical), physical);
+            assert_eq!(home(&configured), physical);
+            assert_eq!(home(&configured.join("child")), physical.join("child"));
+        };
+        let offline = root.join("offline");
+        check();
+        fs::rename(&volume, &offline).unwrap();
+        check();
+        fs::rename(&offline, &volume).unwrap();
+        check();
+        let replacement = root.join("restored/another-home");
+        fs::remove_file(&link).unwrap();
+        symlink(&replacement, &link).unwrap();
+        assert_eq!(home(&configured), replacement);
+        fs::create_dir_all(&replacement).unwrap();
+        assert_eq!(home(&configured), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_home_propagates_filesystem_errors() {
+        use std::{
+            fs,
+            io::ErrorKind,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        let cycle = root.join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        let file = root.join("file");
+        fs::write(&file, []).unwrap();
+        for invalid in [&cycle, &file.join("child")] {
+            let expected = invalid.canonicalize().unwrap_err();
+            let actual = super::discovery_home(Some(invalid)).unwrap_err();
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+        }
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        let child = private.join("missing");
+        let expected = child.canonicalize().unwrap_err().kind();
+        let actual = super::discovery_home(Some(&child));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        if expected == ErrorKind::PermissionDenied {
+            assert_eq!(actual.unwrap_err().kind(), expected);
+        }
     }
 
     #[cfg(unix)]

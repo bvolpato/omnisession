@@ -119,6 +119,16 @@ impl<'a> FileSelections<'a> {
         checks: &[FileCheck<'_>],
         documents: impl ExactSizeIterator<Item = omnis_store::SelectedTrajectoryDocument<'s, 'd>>,
     ) -> omnis_store::Result<usize> {
+        self.write_documents_checked(store, checks, documents, |_, _| true)
+    }
+
+    pub(crate) fn write_documents_checked<'s, 'd>(
+        &mut self,
+        store: &omnis_store::Store,
+        checks: &[FileCheck<'_>],
+        documents: impl ExactSizeIterator<Item = omnis_store::SelectedTrajectoryDocument<'s, 'd>>,
+        verify_read: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> omnis_store::Result<usize> {
         let registry = self.registry;
         let mut homes = HashMap::new();
         for check in checks.iter().filter(|check| check.requires_catalog()) {
@@ -139,7 +149,8 @@ impl<'a> FileSelections<'a> {
                 documents,
                 &homes,
                 |session, revision| {
-                    verify(session, revision)
+                    verify_read(session, revision)
+                        && verify(session, revision)
                         && homes.get(&session.provider).is_none_or(|home| {
                             registry
                                 .discovery_cache_home(session.provider)

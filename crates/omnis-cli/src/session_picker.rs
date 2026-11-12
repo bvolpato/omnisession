@@ -39,6 +39,7 @@ use omnis_store::{
     SessionTrajectorySearchPage, Store, TrajectorySelection, TrajectorySourceGuard,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use uuid::Uuid;
 
 use crate::{
     DELETE_PROVIDERS, PROVIDERS, ResumeArgs,
@@ -49,6 +50,7 @@ use crate::{
 };
 
 mod dialog;
+mod discovery_watch;
 mod render;
 mod theme;
 mod workers;
@@ -164,7 +166,30 @@ struct PickerEntry {
     cached: bool,
 }
 
+const fn uses_strict_preview_failures(provider: Provider) -> bool {
+    matches!(provider, Provider::Grok) || TrajectorySourceGuard::uses_guarded_catalog(provider)
+}
+
 impl PickerEntry {
+    fn index_candidate(&self) -> Option<IndexCandidate> {
+        if matches!(
+            self.session.session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) && self.session.title != self.listed_title
+        {
+            let mut listed = self.session.clone();
+            listed.title.clone_from(&self.listed_title);
+            return IndexCandidate::from_session(&listed);
+        }
+        IndexCandidate::from_session(&self.session)
+    }
+
+    fn source_file(&self) -> Option<Uuid> {
+        self.session
+            .source_revision
+            .and_then(|revision| revision.file)
+    }
+
     fn provider_name(&self) -> Option<&str> {
         self.listed_title.as_deref()
     }
@@ -237,6 +262,8 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
+    native_homes: HashMap<Provider, PathBuf>,
+    pending_native_titles: HashMap<SessionRef, Uuid>,
     indexed_titles: HashMap<String, (SourceRevision, String)>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
     derived_titles: HashMap<String, omnis_store::IndexedTitle>,
@@ -328,6 +355,8 @@ impl PickerState {
             selected: 0,
             selection_touched: false,
             visible_cache: RefCell::new(None),
+            native_homes: HashMap::new(),
+            pending_native_titles: HashMap::new(),
             derived_titles: HashMap::new(),
             indexed_titles: HashMap::new(),
             preview_titles: HashMap::new(),
@@ -535,10 +564,11 @@ impl PickerState {
         };
         self.previews.remove_session(&updated.session);
         self.preview_deadline = Some(Instant::now() + PREVIEW_DEBOUNCE);
-        self.replace_provider_entries(
+        self.update_provider_entries(
             updated.session.provider,
             picker_entries(vec![updated], current_project, true),
             false,
+            &[],
             &[],
         );
         bail!(
@@ -560,25 +590,64 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
-        self.replace_provider_entries(
+        self.update_provider_entries(
             provider,
             picker_entries(sessions, current_project, cached),
             true,
             &[],
+            &[],
         );
     }
 
-    fn replace_provider_entries(
+    fn update_provider_entries(
         &mut self,
         provider: Provider,
         mut entries: Vec<PickerEntry>,
         complete: bool,
+        archived_ids: &[String],
         unavailable: &[IndexedSession],
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
-        self.forget_replaced_sources(&entries);
-        if complete {
+        if has_scoped_home(provider) {
+            for new in &entries {
+                let previous = self
+                    .entry_positions
+                    .get(&new.key)
+                    .map(|&i| &self.entries[i]);
+                if let Some(file) = new.source_file()
+                    && previous.and_then(PickerEntry::source_file) != Some(file)
+                {
+                    self.indexed_titles.remove(&new.key);
+                    self.pending_native_titles
+                        .insert(new.session.session.clone(), file);
+                }
+                if previous.is_some_and(|old| self.preview_key(old) != self.preview_key(new)) {
+                    self.previews.remove_session(&new.session.session);
+                    self.preview_titles.remove(&new.key);
+                }
+            }
+        } else {
+            self.forget_replaced_sources(&entries);
+        }
+        if matches!(provider, Provider::Antigravity | Provider::AntigravityIde) && !complete {
+            let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
+            let archived: HashSet<_> = archived_ids.iter().map(String::as_str).collect();
+            self.entries.retain_mut(|entry| {
+                if entry.session.session.provider != provider {
+                    return true;
+                }
+                if observed.contains(entry.key.as_str())
+                    || archived.contains(entry.session.session.id.as_str())
+                {
+                    return false;
+                }
+                entry.cached = true;
+                entry.session.source_path = None;
+                entry.session.source_revision = None;
+                true
+            });
+        } else if complete {
             self.entries
                 .retain(|entry| entry.session.session.provider != provider);
         } else {
@@ -1010,7 +1079,7 @@ impl PickerState {
             }
             if matches!(key.source, Some(PreviewSource::Workspace(_))) {
                 self.entries[index].session.source_revision = Some(revision);
-                key.source = Some(PreviewSource::File(revision));
+                *key = self.preview_key(&self.entries[index]);
             }
         }
         let selected = self.selected_entry().map(|entry| entry.key.clone());
@@ -1164,7 +1233,7 @@ impl PickerState {
             && let Some(revision) = read_revision
         {
             self.entries[index].session.source_revision = Some(revision);
-            key.source = Some(PreviewSource::File(revision));
+            key = self.preview_key(&self.entries[index]);
             self.query_changed();
         }
         if key
@@ -1238,7 +1307,7 @@ impl PickerState {
         let mut changed = false;
         for (session, record) in titles {
             let key = self.matching_title_key(&session, record.source_revision);
-            if session.provider == Provider::Codex {
+            if !uses_strict_preview_failures(session.provider) {
                 if let Some(&index) = self.entry_positions.get(&key)
                     && self.update_indexed_title(
                         index,
@@ -1349,7 +1418,7 @@ impl PickerState {
             current
                 .into_iter()
                 .chain(other)
-                .filter_map(|entry| IndexCandidate::from_session(&entry.session))
+                .filter_map(PickerEntry::index_candidate)
                 .collect(),
         )
     }
@@ -1393,6 +1462,7 @@ impl PickerState {
         Some(TrajectorySearchRequest {
             generation: self.trajectory_search_generation,
             query: self.query.clone(),
+            homes: self.native_homes.clone(),
             pi_rows: self
                 .entries
                 .iter()
@@ -1416,19 +1486,18 @@ impl PickerState {
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
                 .filter_map(|(_, entry)| {
-                    if entry.session.session.provider == Provider::Codex {
-                        Some(TrajectorySelection {
-                            session: entry.session.session.clone(),
-                            source: Some(entry.source_revision().unwrap_or_default()),
-                        })
-                    } else {
-                        crate::selected_search_trajectory(&entry.session, entry.cached).map(
-                            |mut row| {
-                                row.session = picker_search_ref(&entry.session);
-                                row
-                            },
-                        )
+                    if !entry.cached && crate::has_empty_cli_history(&entry.session) {
+                        return None;
                     }
+                    let selection = TrajectorySelection {
+                        session: picker_search_ref(&entry.session),
+                        source: if entry.session.session.provider == Provider::Codex {
+                            Some(entry.source_revision().unwrap_or_default())
+                        } else {
+                            crate::selected_search_source(&entry.session, entry.cached)
+                        },
+                    };
+                    Some((selection, entry.source_file()))
                 })
                 .collect(),
         })
@@ -1507,8 +1576,11 @@ impl PickerState {
     }
 
     fn preview_key(&self, entry: &PickerEntry) -> PreviewKey {
+        let session = &entry.session;
+        let native_summary =
+            IndexCandidate::summary_path(session.session.provider, session.source_path.as_deref());
         PreviewKey {
-            session: entry.session.session.clone(),
+            session: session.session.clone(),
             copy_path: matches!(
                 entry.session.session.provider,
                 Provider::Pi | Provider::OhMyPi
@@ -1530,7 +1602,7 @@ impl PickerState {
                 )
             {
                 Some(PreviewSource::Workspace(entry.session.project_path.clone()))
-            } else if TrajectorySourceGuard::uses_file_time(entry.session.session.provider) {
+            } else if TrajectorySourceGuard::uses_guarded_catalog(entry.session.session.provider) {
                 Some(entry.session.source_revision.map_or_else(
                     || PreviewSource::Workspace(entry.session.project_path.clone()),
                     PreviewSource::File,
@@ -1538,8 +1610,26 @@ impl PickerState {
             } else {
                 entry.session.source_path.clone().map(PreviewSource::Path)
             },
-            updated_at: entry.session.updated_at,
-            continuation_after: self.lineage.continuation_after(&entry.session.session),
+            native_home: self.native_homes.get(&session.session.provider).cloned(),
+            source_revision: if session.session.provider == Provider::Codex {
+                None
+            } else {
+                session.source_revision
+            },
+            catalog: (session.session.provider == Provider::Antigravity).then(|| CatalogPreview {
+                title: entry.listed_title.clone(),
+                workspace: session
+                    .project_path
+                    .as_ref()
+                    .map(|path| path.as_os_str().to_owned()),
+            }),
+            updated_at: if native_summary && session.updated_at_approximate {
+                None
+            } else {
+                session.updated_at
+            },
+            native_summary,
+            continuation_after: self.lineage.continuation_after(&session.session),
         }
     }
 
@@ -1619,6 +1709,12 @@ impl PickerState {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CatalogPreview {
+    title: Option<String>,
+    workspace: Option<std::ffi::OsString>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum PreviewSource {
     File(SourceRevision),
     Workspace(Option<PathBuf>),
@@ -1644,8 +1740,12 @@ struct PreviewKey {
     copy_path: Option<PathBuf>,
     copy_directory: Option<PathBuf>,
     session: SessionRef,
+    native_home: Option<PathBuf>,
+    source_revision: Option<omnis_ir::SourceRevision>,
+    catalog: Option<CatalogPreview>,
     source: Option<PreviewSource>,
     updated_at: Option<DateTime<Utc>>,
+    native_summary: bool,
     continuation_after: Option<DateTime<Utc>>,
 }
 
@@ -2000,49 +2100,27 @@ fn add_cached_pi_entries(store: &Store, sessions: &mut Vec<NativeSession>) -> Re
     Ok(())
 }
 
-fn retain_current_antigravity_titles(
-    registry: &AdapterRegistry,
+fn cached_picker_entries(
     store: &Store,
-    titles: &mut Vec<omnis_store::IndexedTrajectoryTitle>,
-    warnings: &mut Vec<String>,
-) {
-    let mut eligible: Vec<_> = titles
-        .iter()
-        .filter(|row| {
-            matches!(
-                row.session.provider,
-                Provider::Antigravity | Provider::AntigravityDesktop
+    current_project: &Path,
+    antigravity_home: Option<&Path>,
+    desktop_home: Option<&Path>,
+    ide_home: Option<&Path>,
+) -> Result<CachedPickerEntries> {
+    let desktop_ids = desktop_home
+        .map(|home| {
+            store.published_desktop_session_ids(
+                omnis_core::search_document_version(Provider::AntigravityDesktop),
+                home,
             )
         })
-        .map(|row| TrajectorySelection {
-            session: row.session.clone(),
-            source: None,
-        })
-        .collect();
-    if let Err(error) = crate::scope_search_trajectories(registry, store, &mut eligible) {
-        eligible.clear();
-        workers::record_picker_warning(warnings, format!("Antigravity cached titles: {error:#}"));
-    }
-    let revisions: HashMap<_, _> = eligible
-        .into_iter()
-        .filter_map(|row| Some((row.session, row.source?)))
-        .collect();
-    titles.retain(|row| {
-        !matches!(
-            row.session.provider,
-            Provider::Antigravity | Provider::AntigravityDesktop
-        ) || revisions
-            .get(&row.session)
-            .is_some_and(|revision| revision.matches_file_contents(row.source_revision))
-    });
-}
-
-fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let registry = AdapterRegistry::with_local_adapters();
-    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
-    let (sessions, mut titles, mut warnings) =
-        crate::scope_cached_native_catalog(&registry, store, None, false, sessions, titles)?;
-    retain_current_antigravity_titles(&registry, store, &mut titles, &mut warnings);
+        .transpose()?
+        .flatten();
+    let (sessions, mut titles) = store.cached_picker_sessions_with_titles_for_native_homes(
+        antigravity_home,
+        desktop_home,
+        ide_home,
+    )?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -2050,6 +2128,12 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
         .collect();
     let mut sessions = sessions
         .into_iter()
+        .filter(|row| {
+            row.session.provider != Provider::AntigravityDesktop
+                || desktop_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&row.session.id))
+        })
         .map(workers::native_session)
         .map(|mut session| {
             if session.source_revision.is_none() {
@@ -2078,6 +2162,7 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
     }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
+    let mut warnings = Vec::new();
     let mut paths = SessionWorkspaceMatcher::new(current_project);
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
@@ -2223,10 +2308,21 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
     (!head.is_empty()).then(|| format!("detached @ {}", short_id(head)))
 }
 
+const NATIVE_HOME_PROVIDERS: [Provider; 3] = [
+    Provider::Antigravity,
+    Provider::AntigravityDesktop,
+    Provider::AntigravityIde,
+];
+
+fn has_scoped_home(provider: Provider) -> bool {
+    NATIVE_HOME_PROVIDERS.contains(&provider)
+}
+
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
-    eligible_sessions: Vec<TrajectorySelection>,
+    homes: HashMap<Provider, PathBuf>,
+    eligible_sessions: Vec<(TrajectorySelection, Option<Uuid>)>,
     pi_rows: Vec<(SessionRef, PathBuf, Option<PathBuf>)>,
 }
 
@@ -2618,7 +2714,13 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
         changed = true;
     }
     if let Some(candidates) = state.due_index_request() {
-        let _ = workers.search_index_sender.send(candidates);
+        let _ = workers
+            .search_index_sender
+            .send(workers::PickerIndexRequest {
+                candidates,
+                homes: state.native_homes.clone(),
+                pending_titles: state.pending_native_titles.clone(),
+            });
     }
     if let Some(request) = state.due_trajectory_search_request() {
         changed = true;
@@ -3824,6 +3926,11 @@ mod tests {
     ) -> omnis_store::TrajectoryDocument<'_> {
         omnis_store::TrajectoryDocument {
             ancestor_revisions: &[],
+            database_step_proof: None,
+            database_wal_commits: None,
+            database_summary_revision: None,
+            desktop_projection: None,
+            legacy_utf8_text: None,
             projection: None,
             redacted_text: text,
             source_updated_at: updated_at,
@@ -3868,17 +3975,18 @@ mod tests {
                 .expect("seed search history");
             observed.title = Some("Updated observed title".to_owned());
 
-            workers::SessionCacheUpdate {
-                catalog: crate::DiscoveredCatalog::new(
-                    Provider::Codex,
-                    None,
-                    std::slice::from_ref(&observed),
-                    complete,
-                    false,
-                    workers::indexed_session,
-                ),
-                reply: None,
-                retry: None,
+            workers::SessionCacheUpdate::Listed {
+                database_alias_counts: HashMap::new(),
+                archived_ids: Vec::new(),
+                provider: Provider::Codex,
+                sessions: vec![workers::indexed_session(&observed)],
+                scope: if complete {
+                    omnis_store::DiscoveryScope::CompleteProvider
+                } else {
+                    omnis_store::DiscoveryScope::PartialProvider
+                },
+                attempt: None,
+                publication: None,
                 names: Some(std::sync::Arc::new(workers::CatalogNames {
                     inventory: store.observe_codex_catalog_inventory().unwrap(),
                     unavailable: Vec::new(),
@@ -3930,6 +4038,7 @@ mod tests {
         store.record_trajectory_index_failure(
             &SessionRef::new(Provider::Pi, id),
             &omnis_store::TrajectoryIndexFailure {
+                native_summary: false,
                 ancestor_revisions: Vec::new(),
                 source_file: revision.file,
                 source_contents: revision.contents,
@@ -4030,8 +4139,8 @@ mod tests {
             updates
                 .send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider: Provider::Pi,
-                    result,
-                    complete: true,
+                    result: result.map(|entries| (entries, true)),
+                    archived_ids: Vec::new(),
                     names: None,
                 }))
                 .expect("return discovered entries");
@@ -4098,6 +4207,31 @@ mod tests {
     }
 
     #[test]
+    fn imported_indexing_reads_from_the_supplied_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle = picker_bundle(omnis_core::capture_workspace(temporary.path()).unwrap());
+        let store = Store::open(temporary.path().join("index.sqlite")).unwrap();
+        store.save_bundle(&bundle).unwrap();
+        let imported = crate::imported_session_ref(bundle.manifest.bundle_id);
+        let imported_session = session(Provider::Imported, &imported.id, temporary.path(), None);
+        let candidate = IndexCandidate::from_session(&imported_session).unwrap();
+        let summary = crate::search_index::index_candidates(
+            &AdapterRegistry::new(),
+            &store,
+            vec![candidate],
+            false,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!((summary.indexed, summary.failed), (1, 0));
+        assert_eq!(
+            store.trajectory_title(&imported).unwrap(),
+            bundle.snapshot.title
+        );
+    }
+
+    #[test]
     fn relocated_imported_bundle_is_visible_without_a_workspace_prompt() {
         let temporary = tempfile::tempdir().expect("temporary workspace");
         let mut workspace = picker_workspace(temporary.path());
@@ -4113,7 +4247,7 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, &project).expect("cached entries");
+        } = cached_picker_entries(&store, &project, None, None, None).expect("cached entries");
         let mut state = PickerState::new(Vec::new(), &project, None, false);
         state.replace_all_entries(entries);
 
@@ -4139,6 +4273,39 @@ mod tests {
             store.indexed_sessions().unwrap()[0].project_path.as_deref(),
             Some(original.as_path())
         );
+    }
+
+    #[test]
+    fn offline_picker_uses_the_selected_ide_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let store = Store::open(root.join("index.sqlite")).unwrap();
+        let home_a = root.join("ide-a");
+        let home_b = root.join("ide-b");
+        let provider = Provider::AntigravityIde;
+        let native = session(provider, "observed", root, Some("IDE home A"));
+        let legacy = session(provider, "legacy", root, Some("Offline metadata"));
+        store
+            .upsert_indexed_session(&workers::indexed_session(&legacy))
+            .unwrap();
+        store
+            .cache_discovered_sessions(
+                provider,
+                &[workers::indexed_session(&native)],
+                omnis_store::DiscoveryScope::PartialProvider,
+                Some(&home_a),
+            )
+            .unwrap();
+        let entries = |home: &Path| {
+            cached_picker_entries(&store, root, None, None, Some(home))
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| entry.session.session.id)
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(entries(&home_a), HashSet::from(["observed".to_owned()]));
+        assert!(entries(&home_b).is_empty());
     }
 
     #[test]
@@ -4182,7 +4349,8 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, &workspace.root).expect("cached entries");
+        } = cached_picker_entries(&store, &workspace.root, None, None, None)
+            .expect("cached entries");
         assert!(warnings.is_empty());
         assert_eq!(entries.len(), 4);
         assert!(entries.iter().all(|entry| !entry.current_workspace));
@@ -4213,7 +4381,8 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, temporary.path()).expect("cached entries");
+        } = cached_picker_entries(&store, temporary.path(), None, None, None)
+            .expect("cached entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(&missing_id));
@@ -4817,6 +4986,50 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_claude_preview_keeps_the_indexed_opener() {
+        let project = Path::new("/workspace");
+        let native = session(Provider::Claude, "example", project, None);
+        let id = native.session.clone();
+        let mut state = PickerState::new(vec![native], project, None, false);
+        state.remember_derived_titles([(
+            id,
+            omnis_store::IndexedTitle {
+                title: Some("Original request".to_owned()),
+                ..Default::default()
+            },
+        )]);
+        let key = state.preview_key(&state.entries[0]);
+        let mut sample = synthetic_preview("Later assistant response");
+        sample.first.as_mut().unwrap().role = HandoffRole::Assistant;
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::Preview {
+                key: Box::new(key.clone()),
+                value: PreviewValue::Ready {
+                    preview: Box::new(sample),
+                    continuation: None,
+                    complete: false,
+                    source_provider: Provider::Claude,
+                    can_use_first_title: true,
+                    message_count_is_complete: false,
+                },
+                metadata: Box::default(),
+            })
+            .unwrap();
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            project,
+        );
+        assert_eq!(
+            display_title(&state.entries[0], state.previews.get(&key)),
+            "Original request"
+        );
+    }
+
+    #[test]
     fn preview_titles_become_searchable() {
         let current = fixture_workspace();
         let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -4939,7 +5152,7 @@ mod tests {
         picker.refresh_preview_window(1);
         picker.preview_deadline = Some(Instant::now());
         let request = picker.due_preview_request().unwrap().pop().unwrap();
-        let read = workers::read_picker_preview(
+        let read = workers::read_codex_picker_preview(
             &worker,
             &request.key,
             request.source_path.as_deref(),
@@ -4959,11 +5172,12 @@ mod tests {
         drop(restored);
         let (refresh, notifications) = mpsc::sync_channel(1);
         assert!(
-            workers::read_picker_preview(&worker, &request.key, Some(path), None, || {}).is_err()
+            workers::read_codex_picker_preview(&worker, &request.key, Some(path), None, || {})
+                .is_err()
         );
         assert!(notifications.try_recv().is_err());
         assert!(
-            workers::read_picker_preview(&worker, &request.key, Some(path), None, || refresh
+            workers::read_codex_picker_preview(&worker, &request.key, Some(path), None, || refresh
                 .try_send(())
                 .unwrap())
             .is_err()
@@ -4997,7 +5211,7 @@ mod tests {
         };
         let (refresh, notifications) = mpsc::sync_channel(1);
         assert!(
-            workers::read_picker_preview(
+            workers::read_codex_picker_preview(
                 &registry,
                 &request(&home.path().join("old")),
                 None,
@@ -5008,9 +5222,9 @@ mod tests {
         );
         notifications.try_recv()?;
         assert!(
-            workers::read_picker_preview(&registry, &request(&current), None, None, || refresh
-                .try_send(())
-                .unwrap())?
+            workers::read_codex_picker_preview(&registry, &request(&current), None, None, || {
+                refresh.try_send(()).unwrap();
+            })?
             .source_revision
             .file
             .is_some()
@@ -5179,7 +5393,7 @@ mod tests {
             true,
         );
         let found_entries = || picker_entries(vec![found.clone()], project, false);
-        state.replace_provider_entries(Provider::Codex, found_entries(), false, &confirmed);
+        state.update_provider_entries(Provider::Codex, found_entries(), false, &[], &confirmed);
         let visible: HashSet<_> = state
             .entries
             .iter()
@@ -5189,7 +5403,7 @@ mod tests {
             visible,
             HashSet::from([&cached.session, &restored.session, &found.session])
         );
-        state.replace_provider_entries(Provider::Codex, found_entries(), true, &[]);
+        state.update_provider_entries(Provider::Codex, found_entries(), true, &[], &[]);
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].session.session, found.session);
     }
@@ -5252,7 +5466,7 @@ mod tests {
                 .context("listed rollout")
         };
         let read_preview = |key: &PreviewKey| {
-            workers::read_picker_preview(&registry, key, Some(&rollout), None, || {})
+            workers::read_codex_picker_preview(&registry, key, Some(&rollout), None, || {})
         };
         let mut state = PickerState::new(vec![selected()?], home.path(), None, true);
         let key = state.preview_key(&state.entries[0]);
@@ -5509,10 +5723,13 @@ mod tests {
                 .due_trajectory_search_request()
                 .unwrap()
                 .eligible_sessions,
-            vec![TrajectorySelection {
-                session: picker_search_ref(&listed),
-                source: Some(current)
-            }]
+            vec![(
+                TrajectorySelection {
+                    session: picker_search_ref(&listed),
+                    source: Some(current)
+                },
+                current.file
+            )]
         );
     }
 
@@ -5525,14 +5742,7 @@ mod tests {
             None,
             false,
         );
-        let key = PreviewKey {
-            copy_path: None,
-            copy_directory: None,
-            session: state.entries[0].session.session.clone(),
-            source: None,
-            updated_at: None,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0]);
         state.remember_derived_titles([(
             key.session.clone(),
             omnis_store::IndexedTitle {
@@ -5593,6 +5803,26 @@ mod tests {
         assert!(state.due_index_request().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn picker_distinguishes_network_and_local_workspace_spellings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let local = temporary.path();
+        let network = PathBuf::from(format!("/{}", local.display()));
+        for current in [local.to_path_buf(), local.join(".")] {
+            let entries = normalized_picker_entries(
+                vec![
+                    session(Provider::Codex, "local", local, None),
+                    session(Provider::Codex, "network", &network, None),
+                ],
+                &current,
+                false,
+            );
+            assert!(entries[0].current_workspace);
+            assert!(!entries[1].current_workspace);
+        }
+    }
+
     #[test]
     fn header_shows_conversation_indexing_progress() {
         let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
@@ -5637,6 +5867,7 @@ mod tests {
             source_contents: source.contents,
             source_updated_at: None,
             source_time_precise: true,
+            native_summary: false,
             document_version: 7,
         };
         let ready = || PreviewValue::Ready {
@@ -6434,14 +6665,117 @@ mod tests {
     }
 
     #[test]
+    fn changing_antigravity_history_at_the_same_time_requests_a_fresh_preview() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Antigravity, "session", project, None);
+        native.source_path = Some(project.join("transcript.jsonl"));
+        let mut state = PickerState::new(vec![native.clone()], project, None, false);
+        let original = omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let restored = omnis_ir::SourceRevision {
+            contents: Some(uuid::Uuid::new_v4()),
+            ..original
+        };
+        for (source, revision, changed) in [
+            ("transcript.jsonl", Some(original), true),
+            ("transcript.jsonl", Some(original), false),
+            ("transcript.jsonl", Some(restored), true),
+            ("transcript.jsonl", Some(original), true),
+            ("transcript.jsonl", None, true),
+            ("transcript.jsonl", None, false),
+            ("conversation_summaries.db", None, true),
+            ("transcript.jsonl", None, true),
+        ] {
+            state.refresh_preview_window(1);
+            let key = state.preview_key(&state.entries[0]);
+            state.previews.insert(key, PreviewValue::Unavailable, &[]);
+            native.source_path = Some(project.join(source));
+            native.source_revision = revision;
+            state.replace_provider(Provider::Antigravity, vec![native.clone()], project, false);
+            state.refresh_preview_window(1);
+            state.preview_deadline = Some(Instant::now());
+            assert_eq!(
+                state.due_preview_request().map(|requests| requests
+                    .into_iter()
+                    .map(|request| request.key)
+                    .collect::<Vec<_>>()),
+                changed.then(|| vec![state.preview_key(&state.entries[0])])
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_previews_and_indexing_follow_listed_catalog_edits() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Antigravity, "session", project, Some("A"));
+        native.source_path = Some(project.join("transcript.jsonl"));
+        native.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native.clone()], project, None, true);
+        state.remember_source_titles([IndexedTrajectoryTitle {
+            session: native.session.clone(),
+            source_revision: native.source_revision.unwrap(),
+            document_version: omnis_core::search_document_version(native.session.provider),
+            verified_at: None,
+            cached_at: None,
+            title: Some("Body title".to_owned()),
+        }]);
+        for (title, workspace, changed) in [
+            (Some("B"), project, true),
+            (Some("B"), project, false),
+            (Some("A"), project, true),
+            (None, project, true),
+            (None, project, false),
+            (None, Path::new("/moved"), true),
+        ] {
+            let previous = state.preview_key(&state.entries[0]);
+            state
+                .previews
+                .insert(previous, PreviewValue::Unavailable, &[]);
+            native.title = title.map(str::to_owned);
+            native.project_path = Some(workspace.to_owned());
+            state.replace_provider(Provider::Antigravity, vec![native.clone()], project, false);
+            state.refresh_preview_window(1);
+            state.preview_deadline = Some(Instant::now());
+            let selected = &state.entries[0];
+            assert_eq!(
+                selected.session.title.as_deref(),
+                title.or(Some("Body title"))
+            );
+            assert_eq!(
+                selected.index_candidate(),
+                IndexCandidate::from_session(&native)
+            );
+            let expected = changed.then(|| vec![state.preview_key(selected)]);
+            let actual = state.due_preview_request().map(|requests| {
+                requests
+                    .into_iter()
+                    .map(|request| request.key)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn preview_cache_keeps_every_active_viewport_entry() {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 copy_path: None,
                 copy_directory: None,
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                source_revision: None,
+                native_home: None,
+                catalog: None,
                 source: None,
                 updated_at: None,
+                native_summary: false,
                 continuation_after: None,
             })
             .collect::<Vec<_>>();
@@ -6455,8 +6789,12 @@ mod tests {
                 copy_path: None,
                 copy_directory: None,
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                source_revision: None,
+                native_home: None,
+                catalog: None,
                 source: None,
                 updated_at: None,
+                native_summary: false,
                 continuation_after: None,
             },
             PreviewValue::Unavailable,
@@ -7162,6 +7500,90 @@ mod tests {
     }
 
     #[test]
+    fn native_search_and_queued_titles_follow_the_selected_source() {
+        for provider in [Provider::Antigravity, Provider::AntigravityIde] {
+            check_native_search_and_queued_titles(provider);
+        }
+    }
+
+    fn check_native_search_and_queued_titles(provider: Provider) {
+        let project = Path::new("/workspace");
+        let mut native = session(provider, "shared", project, None);
+        let file = Uuid::new_v4();
+        native.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(file),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native.clone()], project, Some(provider), false);
+        let (sender, receiver) = mpsc::channel();
+        let homes = HashMap::from([(provider, PathBuf::from("/home-a"))]);
+        sender
+            .send(PickerUpdate::NativeHomes(homes.clone()))
+            .unwrap();
+        sender
+            .send(PickerUpdate::NativeTitles(vec![
+                (
+                    native.session.clone(),
+                    Some(file),
+                    Some("Local title".to_owned()),
+                ),
+                (
+                    native.session.clone(),
+                    Some(Uuid::new_v4()),
+                    Some("Foreign title".to_owned()),
+                ),
+            ]))
+            .unwrap();
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            project,
+        );
+        assert_eq!(
+            state.selected_entry().unwrap().session.title.as_deref(),
+            Some("Local title")
+        );
+        let preview = state.preview_key(&state.entries[0]);
+        assert_eq!(preview.native_home.as_deref(), Some(Path::new("/home-a")));
+        state.query = "foreign".to_owned();
+        state.query_changed();
+        assert!(state.visible_indices().is_empty());
+        state.trajectory_search_deadline = Some(Instant::now());
+        let request = state.due_trajectory_search_request().unwrap();
+        assert_eq!(request.homes, homes);
+        assert_eq!(
+            request.eligible_sessions,
+            [(
+                TrajectorySelection {
+                    session: native.session.clone(),
+                    source: if provider == Provider::Antigravity {
+                        native.source_revision
+                    } else {
+                        None
+                    }
+                },
+                Some(file)
+            )]
+        );
+        state.update_provider_entries(provider, Vec::new(), false, &[], &[]);
+        state.trajectory_search_deadline = Some(Instant::now());
+        let offline = state.due_trajectory_search_request().unwrap();
+        assert_eq!(offline.homes, homes);
+        assert_eq!(
+            offline.eligible_sessions,
+            [(
+                TrajectorySelection {
+                    session: native.session,
+                    source: None
+                },
+                None
+            )]
+        );
+    }
+
+    #[test]
     fn trajectory_search_request_snapshots_workspace_and_provider_eligibility() {
         let current = &fixture_workspace().join("current");
         let mut state = PickerState::new(
@@ -7190,7 +7612,7 @@ mod tests {
             current_request
                 .eligible_sessions
                 .into_iter()
-                .map(|selection| selection.session)
+                .map(|(selection, _)| selection.session)
                 .collect::<Vec<_>>(),
             vec![SessionRef::new(Provider::Codex, "current-codex")]
         );
@@ -7202,7 +7624,11 @@ mod tests {
             .due_trajectory_search_request()
             .expect("all-projects request");
         assert_eq!(
-            all_projects_request.eligible_sessions,
+            all_projects_request
+                .eligible_sessions
+                .into_iter()
+                .map(|(selection, _)| selection)
+                .collect::<Vec<_>>(),
             vec![
                 TrajectorySelection {
                     session: SessionRef::new(Provider::Codex, "current-codex"),
@@ -7487,9 +7913,9 @@ mod tests {
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                archived_ids: Vec::new(),
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
-                complete: false,
                 names: None,
             }))
             .expect("send failure");
@@ -7531,18 +7957,21 @@ mod tests {
             .expect("send cache");
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                archived_ids: Vec::new(),
                 provider: Provider::Claude,
-                complete: true,
                 names: None,
-                result: Ok(picker_entries(
-                    vec![session(
-                        Provider::Claude,
-                        "fresh",
+                result: Ok((
+                    picker_entries(
+                        vec![session(
+                            Provider::Claude,
+                            "fresh",
+                            current,
+                            Some("Fresh session"),
+                        )],
                         current,
-                        Some("Fresh session"),
-                    )],
-                    current,
-                    false,
+                        false,
+                    ),
+                    true,
                 )),
             }))
             .expect("send success");
@@ -7560,6 +7989,99 @@ mod tests {
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].key, "claude:fresh");
         assert!(!state.entries[0].cached);
+    }
+
+    #[test]
+    fn partial_antigravity_discovery_preserves_cached_workspace_rows() {
+        let provider = Provider::Antigravity;
+        let current = Path::new("/workspace");
+        let other = Path::new("/other");
+        let omitted = session(provider, "omitted", current, Some("Retained title"));
+        let mut observed = session(provider, "observed", current, Some("Old title"));
+        let mut state = PickerState::new(
+            vec![omitted.clone(), observed.clone()],
+            current,
+            Some(provider),
+            false,
+        );
+
+        observed.project_path = Some(other.to_owned());
+        observed.title = Some("New title".into());
+        observed.source_path = Some(other.join("transcript.jsonl"));
+        observed.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![observed.clone()], current, false),
+            false,
+            &[],
+            &[],
+        );
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state.selected_entry().unwrap().session.session,
+            omitted.session
+        );
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), 2);
+        let live = &state.entries[state.entry_positions[&observed.session.to_string()]];
+        assert!(!live.cached);
+        assert_eq!(live.session.title, observed.title);
+        state.index_deadline = Some(Instant::now());
+        let candidates = state.due_index_request().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session, observed.session);
+
+        state.remove_session(&omitted.session, &picker_search_ref(&omitted).to_string());
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![omitted], current, false),
+            false,
+            &[],
+            &[],
+        );
+        assert_eq!(state.visible_indices().len(), 1);
+        let retained = state.selected_entry().unwrap();
+        assert_eq!(retained.session.session, observed.session);
+        assert!(retained.cached);
+        assert!(retained.session.source_path.is_none());
+        state.index_deadline = Some(Instant::now());
+        assert!(state.due_index_request().unwrap().is_empty());
+        state.update_provider_entries(provider, Vec::new(), true, &[], &[]);
+        assert!(state.visible_indices().is_empty());
+    }
+
+    #[test]
+    fn partial_ide_listing_removes_only_confirmed_archives() {
+        let project = Path::new("/workspace");
+        let provider = Provider::AntigravityIde;
+        let records =
+            ["archived", "unverified", "missing"].map(|id| session(provider, id, project, None));
+        let mut state = PickerState::new(records.to_vec(), project, Some(provider), false);
+        state.update_provider_entries(provider, Vec::new(), false, &["archived".to_owned()], &[]);
+        assert!(state.entries.iter().all(|row| row.cached));
+        let ids = state
+            .entries
+            .iter()
+            .map(|row| row.session.session.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids, HashSet::from(["unverified", "missing"]));
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![records[0].clone()], project, false),
+            false,
+            &[],
+            &[],
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|row| row.session.session.id == "archived" && !row.cached)
+        );
     }
 
     #[test]

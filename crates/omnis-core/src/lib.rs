@@ -2,6 +2,8 @@
 
 mod codex_replies;
 mod cursor_workspace;
+mod desktop_projection;
+mod legacy_utf8_projection;
 mod recovery;
 mod remote;
 
@@ -11,6 +13,8 @@ pub use cursor_workspace::{
     SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
     local_cursor_workspace_path, resolve_local_path, session_workspace_matches,
 };
+pub use desktop_projection::DesktopProjection;
+pub use legacy_utf8_projection::LegacyUtf8Projection;
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 pub use remote::RemoteFingerprints;
 
@@ -103,10 +107,10 @@ const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 59;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity | Provider::AntigravityDesktop | Provider::OhMyPi | Provider::Pi => {
-            11
-        }
-        Provider::Claude => 12,
+        Provider::Antigravity => 13,
+        Provider::AntigravityDesktop => 15,
+        Provider::AntigravityIde | Provider::Claude => 12,
+        Provider::OhMyPi | Provider::Pi => 11,
         Provider::Codex => CODEX_SEARCH_DOCUMENT_VERSION,
         _ => SEARCH_DOCUMENT_VERSION,
     }
@@ -1484,6 +1488,8 @@ pub fn first_user_message_after(
 /// Redacted, bounded text suitable for a local full-text session index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchDocument {
+    pub desktop_projection: Option<DesktopProjection>,
+    pub legacy_utf8_text: Option<LegacyUtf8Projection>,
     pub text: String,
     pub truncated: bool,
     pub source_complete: bool,
@@ -1562,6 +1568,23 @@ fn trajectory_search_document_with_limits(
     let visible = visible_history(snapshot);
     let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
     builder.source_incomplete = visible.source_incomplete();
+    let database_provider = matches!(
+        snapshot.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) || (snapshot.session.provider == Provider::AntigravityIde
+        && snapshot
+            .events
+            .first()
+            .is_some_and(|event| event.source.provider == Provider::AntigravityDesktop));
+    builder.legacy =
+        legacy_utf8_projection::LegacyRenderer::new(builder.source_incomplete && database_provider);
+    builder.desktop_projection = if database_provider {
+        Some(DesktopProjection::new(document_edge_limit))
+    } else if has_unreadable_ide_log_records(snapshot) {
+        Some(DesktopProjection::ide_log(document_edge_limit))
+    } else {
+        None
+    };
     let claude_summary = (snapshot.session.provider == Provider::Claude
         && visible
             .events
@@ -1615,6 +1638,11 @@ fn trajectory_search_document_with_limits(
             });
             projection.database_steps = proof;
             projection.database_gap = database_gap;
+            projection.database_history_unverified = snapshot.events.iter().any(|event| {
+                event.source.raw_record_type.as_deref()
+                    == Some("omnisession.antigravity_step_limit")
+                    && event.payload["native_history_unverified"].as_bool() == Some(true)
+            });
         }
     }
     document
@@ -1622,6 +1650,8 @@ fn trajectory_search_document_with_limits(
 
 /// Builds one bounded search document from canonical events in conversation order.
 pub struct SearchDocumentBuilder {
+    legacy: legacy_utf8_projection::LegacyRenderer,
+    desktop_projection: Option<DesktopProjection>,
     retained: HeadTailText,
     last_record_time: Option<i64>,
     projection_hashes: Option<(Sha256, Sha256, u64)>,
@@ -1642,8 +1672,10 @@ impl Default for SearchDocumentBuilder {
 }
 
 impl SearchDocumentBuilder {
-    const fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
+    fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
         Self {
+            legacy: legacy_utf8_projection::LegacyRenderer::new(false),
+            desktop_projection: None,
             retained: HeadTailText::new(document_edge_limit),
             last_record_time: None,
             projection_hashes: None,
@@ -1670,12 +1702,36 @@ impl SearchDocumentBuilder {
     }
 
     fn push_text(&mut self, event: &OmniEvent, record: u64, snapshot: Option<&CanonicalSnapshot>) {
+        let before = self.retained.total_byte_count;
+        let separate = self.has_text;
+        self.push_searchable_text(event, record, snapshot);
+        let after = self.retained.total_byte_count;
+        let start = if after > before && separate {
+            before + 2
+        } else {
+            before
+        };
+        if let Some(projection) = &mut self.desktop_projection
+            && !projection.record(event, start..after, self.source_byte_count)
+        {
+            self.desktop_projection = None;
+        }
+    }
+
+    fn push_searchable_text(
+        &mut self,
+        event: &OmniEvent,
+        record: u64,
+        snapshot: Option<&CanonicalSnapshot>,
+    ) {
         let Some(text) = search_event_text(snapshot, event, self.event_edge_limit) else {
             return;
         };
         if text.text.trim().is_empty() {
             return;
         }
+        self.legacy
+            .observe(&self.retained, self.has_text, self.source_byte_count, &text);
         if !self.has_text
             && matches!(
                 event.source.provider,
@@ -1734,6 +1790,7 @@ impl SearchDocumentBuilder {
             projection.last_record_time = self.last_record_time;
             projection
         });
+        let edge_limit = self.retained.edge_limit;
         let text = self.retained.finish();
         let truncation_strategy = search_truncation_strategy(
             self.source_incomplete,
@@ -1741,6 +1798,10 @@ impl SearchDocumentBuilder {
             document_truncated,
         );
         SearchDocument {
+            desktop_projection: self.desktop_projection,
+            legacy_utf8_text: self
+                .legacy
+                .finish(&text, self.source_byte_count, edge_limit),
             projection,
             indexed_byte_count: text.len(),
             text,
@@ -1931,7 +1992,6 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
 #[derive(Clone)]
 struct HeadTailText {
     head: String,
-    head_byte_count: usize,
     tail: VecDeque<String>,
     tail_byte_count: usize,
     edge_limit: usize,
@@ -1942,7 +2002,6 @@ impl HeadTailText {
     const fn new(edge_limit: usize) -> Self {
         Self {
             head: String::new(),
-            head_byte_count: 0,
             tail: VecDeque::new(),
             tail_byte_count: 0,
             edge_limit,
@@ -1951,12 +2010,22 @@ impl HeadTailText {
     }
 
     fn push(&mut self, value: &str) {
+        self.push_with_head_budget(
+            value,
+            self.edge_limit.saturating_sub(self.total_byte_count),
+            false,
+        );
+    }
+
+    fn push_legacy(&mut self, value: &str) {
+        self.push_with_head_budget(value, self.edge_limit - self.head.len(), true);
+    }
+
+    fn push_with_head_budget(&mut self, value: &str, head_remaining: usize, legacy: bool) {
         self.total_byte_count = self.total_byte_count.saturating_add(value.len());
-        let head_remaining = self.edge_limit.saturating_sub(self.head_byte_count);
         let head_bytes = utf8_prefix_boundary(value, head_remaining);
         if head_bytes != 0 {
             self.head.push_str(&value[..head_bytes]);
-            self.head_byte_count += head_bytes;
         }
         if head_bytes == value.len() {
             return;
@@ -1965,7 +2034,13 @@ impl HeadTailText {
         let remainder_byte_count = remainder.len();
         self.tail.push_back(remainder);
         self.tail_byte_count += remainder_byte_count;
-        self.trim_tail();
+        // Corrected projections let the tail use bytes left over by a split UTF-8 character.
+        let tail_limit = if legacy {
+            self.edge_limit
+        } else {
+            self.edge_limit.saturating_mul(2) - self.head.len()
+        };
+        self.trim_tail(tail_limit);
     }
 
     fn truncated(&self) -> bool {
@@ -2000,9 +2075,9 @@ impl HeadTailText {
         text
     }
 
-    fn trim_tail(&mut self) {
-        while self.tail_byte_count > self.edge_limit {
-            let excess = self.tail_byte_count - self.edge_limit;
+    fn trim_tail(&mut self, tail_limit: usize) {
+        while self.tail_byte_count > tail_limit {
+            let excess = self.tail_byte_count - tail_limit;
             let Some(front) = self.tail.pop_front() else {
                 self.tail_byte_count = 0;
                 return;
@@ -4214,6 +4289,27 @@ fn codex_import_events(
 
 fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
+}
+
+/// Returns whether a standalone Antigravity IDE transcript read omitted records.
+#[must_use]
+pub fn has_unreadable_ide_log_records(snapshot: &CanonicalSnapshot) -> bool {
+    snapshot.session.provider == Provider::AntigravityIde
+        && snapshot.events.iter().rev().take(2).any(|event| {
+            event.source.provider == Provider::AntigravityIde
+                && event.kind == EventKind::ProviderEvent
+                && event.replay_policy == ReplayPolicy::HistoricalOnly
+                && matches!(
+                    event.source.raw_record_type.as_deref(),
+                    Some(
+                        "omnisession.antigravity_ide_unverified_history"
+                            | "omnisession.record_size_limit"
+                    )
+                )
+                && event.payload["omitted_events"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        })
 }
 
 /// Returns whether the provider adapter reported incomplete history.
@@ -7780,6 +7876,262 @@ mod tests {
             SearchTruncationStrategy::DocumentHeadTail
         );
         assert!(document.source_byte_count > document.indexed_byte_count);
+    }
+
+    #[test]
+    fn desktop_restore_checks_each_previously_indexed_row_at_the_document_edges() {
+        let project = |rows: &[(u64, Option<&str>)]| {
+            let events = rows
+                .iter()
+                .enumerate()
+                .map(|(sequence, (id, text))| {
+                    let mut row = event(
+                        u64::try_from(sequence).unwrap(),
+                        if text.is_some() {
+                            EventKind::MessageUser
+                        } else {
+                            EventKind::ProviderEvent
+                        },
+                        json!({"text": text}),
+                    );
+                    row.source.provider = Provider::AntigravityDesktop;
+                    if text.is_none() {
+                        row.replay_policy = ReplayPolicy::HistoricalOnly;
+                    }
+                    row.raw_blob_hash = Some(Uuid::from_u128(u128::from(*id)).to_string());
+                    row
+                })
+                .collect();
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::AntigravityDesktop;
+            trajectory_search_document_with_limits(&snapshot, &[], 1024, 64)
+        };
+        let head = (1, Some("old🦀 🦀old\n\nduplicate"));
+        let opaque = (2, None);
+        let tail = (3, Some("duplicate\n\nold🦀 tail"));
+        let ids = [1, 2, 3].map(Uuid::from_u128);
+        let previous = project(&[head, opaque, tail]);
+        let inserted = "🦀".repeat(40);
+        let middle = (4, Some(inserted.as_str()));
+        let with_middle = project(&[head, opaque, middle, tail]);
+        assert_eq!(
+            with_middle.truncation_strategy,
+            SearchTruncationStrategy::DocumentHeadTail
+        );
+        assert!(with_middle.desktop_projection.as_ref().unwrap().retains(
+            &ids,
+            &previous.text,
+            &with_middle.text
+        ));
+        let after_tail = project(&[head, opaque, tail, middle]);
+        assert!(!after_tail.desktop_projection.as_ref().unwrap().retains(
+            &ids,
+            &previous.text,
+            &after_tail.text
+        ));
+        let old_ids = [1, 2, 4, 3].map(Uuid::from_u128);
+        let with_another_opaque = project(&[head, opaque, (6, None), middle, tail]);
+        assert!(
+            with_another_opaque
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .retains(&old_ids, &with_middle.text, &with_another_opaque.text,)
+        );
+        assert!(
+            with_another_opaque
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .same_visible_rows(&old_ids)
+        );
+        let after_restore = project(&[head, opaque, (5, Some("new")), middle, tail]);
+        assert!(
+            !after_restore
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .same_visible_rows(&old_ids)
+        );
+        assert!(!after_restore.desktop_projection.as_ref().unwrap().retains(
+            &old_ids,
+            &with_middle.text,
+            &after_restore.text
+        ));
+    }
+
+    fn historical_projection(texts: &[&str], edge: usize) -> super::SearchDocument {
+        let mut events: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(sequence, text)| {
+                event(
+                    u64::try_from(sequence).unwrap(),
+                    EventKind::MessageAssistant,
+                    json!({"text":text}),
+                )
+            })
+            .collect();
+        events.push(event(
+            100,
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1}),
+        ));
+        let mut snapshot = snapshot_with_events(events);
+        snapshot.session.provider = Provider::Antigravity;
+        trajectory_search_document_with_limits(&snapshot, &[], 4096, edge)
+    }
+
+    #[test]
+    fn historical_projection_keeps_alternative_row_matches() {
+        let project = historical_projection;
+        let crossing = format!("🦀{} goldfinch", "a".repeat(24));
+        let repeated = "Build passed\n\nNext task";
+        let repeated_head = "p".repeat(56 - repeated.len() - 2);
+        let saved = project(&[repeated, &repeated_head, &crossing, "bluebird"], 60);
+        let saved_text = saved
+            .legacy_utf8_text
+            .as_ref()
+            .unwrap()
+            .historical_text()
+            .unwrap();
+        for (restored, expected) in [(repeated, true), ("Build passed\n\nNew task", false)] {
+            let restored = project(
+                &[
+                    "Build passed",
+                    restored,
+                    &repeated_head,
+                    &crossing,
+                    "bluebird",
+                ],
+                60,
+            );
+            assert_eq!(
+                restored
+                    .legacy_utf8_text
+                    .as_ref()
+                    .unwrap()
+                    .retains_legacy_utf8_rows(saved.source_byte_count, saved_text, &restored.text),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn historical_search_projection_matches_the_old_utf8_split_before_and_after_the_cap() {
+        let project = historical_projection;
+        let head = "p".repeat(56);
+        let crossing = format!("🦀{} goldfinch", "a".repeat(24));
+        let prior = project(&[&head, &crossing, "bluebird"], 60);
+        let expected_prior = format!("{head}\n\n\n\n{crossing}bluebird");
+        assert_eq!(
+            prior
+                .legacy_utf8_text
+                .as_ref()
+                .and_then(super::LegacyUtf8Projection::historical_text),
+            Some(expected_prior.as_str())
+        );
+        let appended = project(&[&head, &crossing, "bluebird", "new"], 60);
+        let legacy = appended.legacy_utf8_text.as_ref().unwrap();
+        assert!(legacy.retains_legacy_utf8_rows(
+            prior.source_byte_count,
+            &expected_prior,
+            &appended.text
+        ));
+        assert!(!legacy.retains_legacy_utf8_rows(
+            prior.source_byte_count - 1,
+            &expected_prior,
+            &appended.text
+        ));
+        assert!(!legacy.retains_legacy_utf8_rows(
+            prior.source_byte_count,
+            "goldfinchbluebird",
+            &appended.text
+        ));
+        let inserted = project(&[&head, &crossing, "mid", "bluebird", "tail"], 60);
+        assert!(
+            inserted
+                .legacy_utf8_text
+                .as_ref()
+                .unwrap()
+                .retains_legacy_utf8_rows(prior.source_byte_count, &expected_prior, &inserted.text)
+        );
+        let shifted = project(&["more", &head, &crossing, "bluebird"], 60);
+        let shifted_rows = shifted.legacy_utf8_text.as_ref().unwrap();
+        assert!(shifted_rows.historical_text().is_none());
+        assert!(shifted_rows.retains_legacy_utf8_rows(
+            prior.source_byte_count,
+            &expected_prior,
+            &shifted.text
+        ));
+        let changed = project(&[&head, &crossing, "mid", "bluebirdX", "tail"], 60);
+        assert!(
+            !changed
+                .legacy_utf8_text
+                .as_ref()
+                .unwrap()
+                .retains_legacy_utf8_rows(prior.source_byte_count, &expected_prior, &changed.text)
+        );
+        for bytes in [120, 121, 125] {
+            let last = "t".repeat(bytes - prior.source_byte_count - 2);
+            let doc = project(&[&head, &crossing, "bluebird", &last], 60);
+            assert_eq!(doc.source_byte_count, bytes);
+            let expected = super::head_tail_text(&format!("{expected_prior}\n\n{last}"), 60).0;
+            let rendered = doc.legacy_utf8_text.as_ref().unwrap();
+            assert_eq!(rendered.historical_text(), Some(expected.as_str()));
+            assert!(rendered.retains_legacy_utf8_rows(bytes, &expected, &doc.text));
+            assert_eq!(
+                rendered.retains_legacy_utf8_rows(
+                    prior.source_byte_count,
+                    &expected_prior,
+                    &doc.text
+                ),
+                bytes == 120
+            );
+        }
+
+        let exact = project(&["abcde🦀1234567"], 8);
+        assert_eq!(
+            exact
+                .legacy_utf8_text
+                .as_ref()
+                .and_then(super::LegacyUtf8Projection::historical_text),
+            Some("abcde1234567")
+        );
+        let ascii = project(&["abcdeABCD1234567"], 8);
+        assert!(ascii.legacy_utf8_text.is_none());
+    }
+
+    #[test]
+    fn streaming_search_text_preserves_utf8_and_separators_across_pushes() {
+        let exact = "abcde🦀1234567";
+        let mut stream = super::HeadTailText::new(exact.len() / 2);
+        stream.push(exact);
+        assert_eq!(stream.finish(), exact);
+
+        let parts = [
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "🦀goldfinch",
+            "\n\n",
+            "bluebird",
+            "\n\n",
+            "中🦀",
+        ];
+        let whole = parts.concat();
+        for limit in 0..=whole.len() {
+            let (expected, truncated) = super::head_tail_text(&whole, limit);
+            for chunks in [
+                parts.to_vec(),
+                whole.split_inclusive(|_: char| true).collect(),
+            ] {
+                let mut stream = super::HeadTailText::new(limit);
+                for piece in chunks {
+                    stream.push(piece);
+                }
+                assert_eq!(stream.truncated(), truncated);
+                assert_eq!(stream.finish(), expected, "edge limit {limit}");
+            }
+        }
     }
 
     #[test]

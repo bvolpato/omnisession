@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
@@ -21,17 +21,18 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::{
-    AntigravityDesktopAdapter, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
-    ProviderInstallation,
+    AntigravityDesktopAdapter, LaunchPlan, LaunchTarget, NativeListing, NativeSession,
+    ProviderAdapter, ProviderInstallation, SearchSourceObservation,
     antigravity::{antigravity_user_request, proto_timestamp, validate_id},
     antigravity_desktop::ProtoTrajectorySummary,
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
         nested_files_matching, parse_timestamp, paths_match, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot_bounded, validate_provider, visit_json_lines,
+        sort_sessions, sqlite_snapshot_bounded, validate_provider, visit_json_lines_with_omissions,
     },
 };
 
+const UNVERIFIED_LOG: &str = "omnisession.antigravity_ide_unverified_history";
 const PREVIEW_RECORDS: usize = 128;
 const SUMMARY_KEY: &str = "antigravityUnifiedStateSync.trajectorySummaries";
 const MAX_SUMMARIES_BYTES: i64 = 64 * 1024 * 1024;
@@ -42,6 +43,7 @@ const MAX_HISTORY_RECORDS: usize = 100_000;
 pub struct AntigravityIdeAdapter {
     root: Option<PathBuf>,
     legacy_desktop: bool,
+    cached_desktop: Option<AntigravityDesktopAdapter>,
     legacy_root: Option<PathBuf>,
     metadata_root: Option<PathBuf>,
     metadata_unavailable: Arc<AtomicBool>,
@@ -53,10 +55,50 @@ impl AntigravityIdeAdapter {
         Self {
             root: Some(root.into()),
             legacy_desktop: false,
+            cached_desktop: None,
             legacy_root: None,
             metadata_root: None,
             metadata_unavailable: Arc::default(),
         }
+    }
+
+    /// Uses a verified step count for a Desktop database opened through an IDE reference.
+    #[must_use]
+    pub fn with_cached_step_count(root: &Path, file: uuid::Uuid, count: usize) -> Self {
+        Self {
+            legacy_desktop: true,
+            cached_desktop: Some(AntigravityDesktopAdapter::with_cached_step_count(
+                root, file, count,
+            )),
+            ..Self::with_root(root)
+        }
+    }
+
+    /// Opens a Desktop database with conflicting older counts through its IDE reference.
+    #[must_use]
+    pub fn with_uncertain_step_count(root: &Path, file: uuid::Uuid, minimum: usize) -> Self {
+        Self {
+            legacy_desktop: true,
+            cached_desktop: Some(AntigravityDesktopAdapter::with_uncertain_step_count(
+                root, file, minimum,
+            )),
+            ..Self::with_root(root)
+        }
+    }
+
+    /// Compares historical WAL rows for an IDE reference to a verified Desktop database.
+    #[must_use]
+    pub fn with_previous_wal_rows(mut self, expected: Vec<uuid::Uuid>) -> Self {
+        self.cached_desktop = self
+            .cached_desktop
+            .map(|reader| reader.with_previous_wal_rows(expected));
+        self
+    }
+
+    /// Returns whether a standalone IDE transcript read omitted records.
+    #[must_use]
+    pub fn has_unreadable_log_records(snapshot: &CanonicalSnapshot) -> bool {
+        omnis_core::has_unreadable_ide_log_records(snapshot)
     }
 
     /// Uses a specific IDE user-data directory without consulting other profiles.
@@ -142,16 +184,19 @@ impl AntigravityIdeAdapter {
             .map(AntigravityDesktopAdapter::with_root)
     }
 
-    fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
+    fn compatibility_root(&self) -> Option<&Path> {
+        if self.legacy_desktop {
+            self.root.as_deref()
+        } else {
+            self.legacy_root.as_deref()
+        }
+    }
+
+    fn history(&self, session: &SessionRef) -> Result<IdeHistory<'_>> {
         validate_provider(session, Provider::AntigravityIde)?;
         validate_id(&session.id)?;
         let path = self.transcript(&session.id);
-        let legacy_root = if self.legacy_desktop {
-            self.root.as_ref()
-        } else {
-            self.legacy_root.as_ref()
-        }
-        .filter(|root| {
+        let legacy_root = self.compatibility_root().filter(|root| {
             provider_file(
                 root,
                 &root
@@ -168,24 +213,41 @@ impl AntigravityIdeAdapter {
             ));
         }
         if let Some(root) = legacy_root {
-            let desktop = AntigravityDesktopAdapter::with_root(root);
-            let mut snapshot = desktop
-                .read_session(&SessionRef::new(Provider::AntigravityDesktop, &session.id))?;
-            // Preserve old references while recording the actual product in event provenance.
-            snapshot.session = session.clone();
-            return Ok(snapshot);
+            return Ok(IdeHistory::Desktop(root));
         }
-        let path = path.ok_or_else(|| {
+        path.map(IdeHistory::Log).ok_or_else(|| {
             anyhow!(
                 "Antigravity IDE session `{}` has no readable conversation log",
                 session.id
             )
-        })?;
+        })
+    }
+
+    fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
+        let path = match self.history(session)? {
+            IdeHistory::Log(path) => path,
+            IdeHistory::Desktop(root) => {
+                let fallback = AntigravityDesktopAdapter::with_root(root);
+                let desktop = self.cached_desktop.as_ref().unwrap_or(&fallback);
+                let mut snapshot = desktop
+                    .read_session(&SessionRef::new(Provider::AntigravityDesktop, &session.id))?;
+                // Preserve old references while recording the actual product in event provenance.
+                snapshot.session = session.clone();
+                return Ok(snapshot);
+            }
+        };
         let mut metadata = LogMetadata::default();
         let mut builder = EventBuilder::new(Provider::AntigravityIde, &session.id);
         let mut retention = HistoryRetention::new(MAX_HISTORY_BYTES, MAX_HISTORY_RECORDS);
-        if preview {
-            for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
+        let mut skips = if preview {
+            let sample = crate::support::json_lines_preview_with_omissions(
+                &path,
+                PREVIEW_RECORDS,
+                u64::MAX,
+                crate::support::MAX_TRANSCRIPT_LINE_SIZE,
+                |_, _| crate::support::WorkspaceGap::Other,
+            )?;
+            for record in sample.records {
                 metadata.observe(&record);
                 retention.push_record(&mut builder, &record);
             }
@@ -193,14 +255,23 @@ impl AntigravityIdeAdapter {
                 PREVIEW_RECORDS,
                 metadata.updated_at.unwrap_or_else(Utc::now),
             );
+            sample.omissions
         } else {
-            let oversized = visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+            visit_json_lines_with_omissions(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
                 metadata.observe(&record);
                 retention.push_record(&mut builder, &record);
                 Ok(())
-            })?;
-            builder.push_oversized_record_notice(oversized, metadata.updated_at);
-        }
+            })?
+        };
+        retention.omitted_events += skips.malformed;
+        retention.omitted_raw_records += skips.total();
+        skips.malformed = 0;
+        let record_limit = if preview {
+            crate::support::MAX_TRANSCRIPT_LINE_SIZE
+        } else {
+            crate::support::MAX_STREAMED_TRANSCRIPT_LINE_SIZE
+        };
+        builder.push_json_line_omissions(skips, record_limit, None, metadata.updated_at);
         metadata.merge_summary(self.summaries().get(&session.id));
         let captured_at = metadata
             .updated_at
@@ -215,6 +286,11 @@ impl AntigravityIdeAdapter {
             captured_at,
         ))
     }
+}
+
+enum IdeHistory<'a> {
+    Log(PathBuf),
+    Desktop(&'a Path),
 }
 
 impl Default for AntigravityIdeAdapter {
@@ -232,6 +308,7 @@ impl Default for AntigravityIdeAdapter {
         Self {
             root,
             legacy_desktop,
+            cached_desktop: None,
             legacy_root: (!explicitly_set)
                 .then(|| provider_root("ANTIGRAVITY_DESKTOP_HOME", &[".gemini", "antigravity"]))
                 .flatten(),
@@ -249,6 +326,10 @@ impl ProviderAdapter for AntigravityIdeAdapter {
         Provider::AntigravityIde
     }
 
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        crate::support::discovery_home(self.root.as_deref())
+    }
+
     fn probe(&self) -> ProviderInstallation {
         let data_root = self.root.clone().filter(|root| {
             root.join("brain").is_dir()
@@ -263,15 +344,27 @@ impl ProviderAdapter for AntigravityIdeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        Ok(self.list_catalog(project)?.sessions)
+    }
+
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let listing = self.list_catalog(project)?;
+        Ok((listing.sessions, listing.notes))
+    }
+
+    fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
         if let Some(desktop) = self.desktop() {
-            let mut sessions = desktop.list_sessions(project)?;
-            for session in &mut sessions {
+            let mut listing = desktop.list_catalog(project)?;
+            for session in &mut listing.sessions {
                 session.session.provider = Provider::AntigravityIde;
             }
-            return Ok(sessions);
+            return Ok(listing);
         }
         let Some(root) = self.root.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(NativeListing::default());
         };
         let brain = root.join("brain");
         let summaries = self.summaries();
@@ -299,41 +392,130 @@ impl ProviderAdapter for AntigravityIdeAdapter {
             let Some(path) = self.transcript(id) else {
                 continue;
             };
-            let mut metadata = LogMetadata::default();
-            for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
-                metadata.observe(&record);
-            }
-            metadata.merge_summary(summaries.get(id));
-            if project.is_some_and(|requested| {
-                metadata
+            let session = log_session(id, path, summaries.get(id))?;
+            if project.is_none_or(|requested| {
+                session
                     .project_path
                     .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, requested))
+                    .is_some_and(|recorded| paths_match(recorded, requested))
             }) {
-                continue;
+                sessions.push(session);
             }
-            sessions.push(NativeSession {
-                session: SessionRef::new(self.provider(), id),
-                title: metadata.title,
-                project_path: metadata.project_path,
-                git_branch: metadata.git_branch,
-                created_at: metadata.created_at,
-                updated_at: metadata.updated_at.or_else(|| file_time(&path)),
-                updated_at_approximate: metadata.updated_at.is_none(),
-                // A sampled log does not establish an exact native step count.
-                event_count: summaries.get(id).map_or(0, |summary| {
-                    usize::try_from(summary.step_count).unwrap_or(usize::MAX)
-                }),
-                source_path: Some(path),
-                source_revision: None,
-            });
         }
         sort_sessions(&mut sessions);
-        Ok(sessions)
+        Ok(NativeListing {
+            sessions,
+            notes: self.discovery_notes(),
+            ..NativeListing::default()
+        })
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read(session, false)
+    }
+
+    fn observe_search_source(
+        &self,
+        session: &SessionRef,
+        listed: Option<&Path>,
+    ) -> Result<Option<SearchSourceObservation>> {
+        match self.history(session)? {
+            IdeHistory::Desktop(root) => {
+                let desktop = AntigravityDesktopAdapter::with_root(root);
+                let reference = SessionRef::new(Provider::AntigravityDesktop, &session.id);
+                let mut observed = desktop.observe_search_source(&reference, listed)?;
+                if let Some(source) = &mut observed {
+                    source.session.session = session.clone();
+                    if !self.legacy_desktop
+                        && let Some(ide) = &self.root
+                    {
+                        source.watch_absent(
+                            ide.join("brain")
+                                .join(&session.id)
+                                .join(".system_generated/logs/transcript.jsonl"),
+                        )?;
+                    }
+                }
+                Ok(observed)
+            }
+            IdeHistory::Log(path) => {
+                let root = self
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Antigravity IDE root unavailable"))?;
+                ensure!(
+                    listed.is_none_or(|listed| listed == path),
+                    "Antigravity IDE history source changed during search read"
+                );
+                let mut optional = Vec::new();
+                if let Some(metadata) = &self.metadata_root {
+                    let database = metadata.join("User/globalStorage/state.vscdb");
+                    optional.push(crate::support::sidecar(&database, "-wal"));
+                    optional.push(database);
+                }
+                let mut observed = SearchSourceObservation::capture_with_optional(
+                    root,
+                    vec![path.clone()],
+                    optional,
+                    || {
+                        ensure!(
+                            self.transcript(&session.id).as_ref() == Some(&path),
+                            "Antigravity IDE history source changed during search read"
+                        );
+                        log_session(&session.id, path, self.summaries().get(&session.id))
+                    },
+                )?;
+                if let Some(desktop) = self.compatibility_root() {
+                    observed.watch_absent(
+                        desktop
+                            .join("conversations")
+                            .join(format!("{}.db", session.id)),
+                    )?;
+                }
+                Ok(Some(observed))
+            }
+        }
+    }
+
+    fn search_source_files(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        match self.history(session)? {
+            IdeHistory::Desktop(root) => {
+                crate::antigravity_desktop::search_files(root, &session.id, source_path)
+            }
+            IdeHistory::Log(path) => {
+                let summaries = self.metadata_root.as_ref().and_then(|root| {
+                    provider_file(root, &root.join("User/globalStorage/state.vscdb"))
+                });
+                crate::antigravity::selected_search_files(Some(path), summaries, source_path)
+            }
+        }
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        let id = &snapshot.session.id;
+        let IdeHistory::Log(path) = self.history(&snapshot.session)? else {
+            return Ok(snapshot.captured_at);
+        };
+        ensure!(
+            source_path.is_none() || source_path == Some(path.as_path()),
+            "Antigravity IDE history source changed during search read"
+        );
+        let mut metadata = LogMetadata::sample(&path)?;
+        if metadata.updated_at != Some(snapshot.captured_at) {
+            metadata.merge_summary(self.summaries().get(id));
+        }
+        Ok(metadata
+            .updated_at
+            .or_else(|| file_time(&path))
+            .unwrap_or(DateTime::UNIX_EPOCH))
     }
 
     fn discovery_notes(&self) -> Vec<String> {
@@ -375,6 +557,34 @@ struct LogMetadata {
     updated_at: Option<DateTime<Utc>>,
 }
 
+fn log_session(
+    id: &str,
+    path: PathBuf,
+    summary: Option<&ProtoTrajectorySummary>,
+) -> Result<NativeSession> {
+    let mut metadata = LogMetadata::sample(&path)?;
+    metadata.merge_summary(summary);
+    let mut revision = crate::source_file_revision(&path)
+        .ok_or_else(|| anyhow!("Antigravity IDE transcript revision unavailable"))?;
+    if let (Some(contents), Some(summary)) = (revision.contents, summary) {
+        revision.contents = Some(uuid::Uuid::new_v5(&contents, &summary.encode_to_vec()));
+    }
+    Ok(NativeSession {
+        session: SessionRef::new(Provider::AntigravityIde, id),
+        title: metadata.title,
+        project_path: metadata.project_path,
+        git_branch: metadata.git_branch,
+        created_at: metadata.created_at,
+        updated_at: metadata.updated_at.or_else(|| file_time(&path)),
+        updated_at_approximate: metadata.updated_at.is_none(),
+        event_count: summary.map_or(0, |summary| {
+            usize::try_from(summary.step_count).unwrap_or(usize::MAX)
+        }),
+        source_path: Some(path),
+        source_revision: Some(revision),
+    })
+}
+
 fn sole_workspace(value: &Value) -> Option<PathBuf> {
     let mut workspace: Option<PathBuf> = None;
     for value in value.as_array()? {
@@ -395,6 +605,14 @@ fn sole_workspace(value: &Value) -> Option<PathBuf> {
 }
 
 impl LogMetadata {
+    fn sample(path: &Path) -> Result<Self> {
+        let mut metadata = Self::default();
+        for record in json_lines_preview(path, PREVIEW_RECORDS)? {
+            metadata.observe(&record);
+        }
+        Ok(metadata)
+    }
+
     fn merge_summary(&mut self, summary: Option<&ProtoTrajectorySummary>) {
         let Some(summary) = summary else {
             return;
@@ -640,7 +858,7 @@ impl HistoryRetention {
 
     fn finish(self, builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
         // The provider documents the path, not the record schema. Even recognized records
-        // cannot prove full native history, and the tolerant JSONL visitor may skip corruption.
+        // cannot prove full native history.
         builder.push(
             EventKind::ProviderEvent,
             json!({
@@ -651,7 +869,7 @@ impl HistoryRetention {
             }),
             timestamp,
             ReplayPolicy::HistoricalOnly,
-            Some("omnisession.antigravity_ide_unverified_history".to_owned()),
+            Some(UNVERIFIED_LOG.to_owned()),
             None,
         );
     }
@@ -770,6 +988,45 @@ mod tests {
     }
 
     #[test]
+    fn search_uses_the_list_clock_when_the_newest_event_is_outside_the_sample() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let logs = root
+            .path()
+            .join("brain")
+            .join(ID)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript.jsonl");
+        let early = "2026-01-01T00:00:00Z";
+        let late = "2026-01-03T00:00:00Z";
+        let mut file = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+        let mut record =
+            json!({"type":"PLANNER_RESPONSE","content":"Fixture","padding":"x".repeat(15500)});
+        for i in 0..300 {
+            record["created_at"] = json!(if i == 150 { late } else { early });
+            writeln!(file, "{record}").unwrap();
+        }
+        file.flush().unwrap();
+        let adapter = AntigravityIdeAdapter::with_root(root.path());
+        let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+        let snapshot = adapter.read_session(&listed.session).unwrap();
+        let source_time = adapter
+            .search_source_time(&snapshot, listed.source_path.as_deref())
+            .unwrap();
+        assert_eq!(
+            source_time,
+            early.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+        );
+        assert_eq!(listed.updated_at, Some(source_time));
+        assert_eq!(
+            snapshot.captured_at,
+            late.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+        );
+    }
+
+    #[test]
     fn metadata_reads_do_not_create_wal_sidecars_in_provider_store() {
         let temporary = tempfile::tempdir().unwrap();
         let global = temporary.path().join("User/globalStorage");
@@ -884,14 +1141,44 @@ mod tests {
             )],
         );
         let before = fs::read(&database).unwrap();
+        let alias = AntigravityIdeAdapter {
+            legacy_desktop: true,
+            ..AntigravityIdeAdapter::with_root(&desktop)
+        };
+        let listed = alias.list_sessions(None).unwrap().pop().unwrap();
+        let observation = alias
+            .observe_search_source(&listed.session, listed.source_path.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.source_revision, Some(observation.revision));
+        assert_eq!(observation.home, desktop.canonicalize().unwrap());
+        assert!(observation.is_ide_desktop_database());
+        assert!(observation.database_contents().is_some());
+        let physical = AntigravityDesktopAdapter::with_root(&desktop)
+            .observe_search_source(
+                &SessionRef::new(Provider::AntigravityDesktop, ID),
+                listed.source_path.as_deref(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observation.database_contents(),
+            physical.database_contents()
+        );
         let legacy = AntigravityIdeAdapter {
             root: Some(ide.clone()),
             legacy_desktop: false,
+            cached_desktop: None,
             legacy_root: Some(desktop),
             metadata_root: None,
             metadata_unavailable: std::sync::Arc::default(),
         };
         let reference = SessionRef::new(Provider::AntigravityIde, ID);
+        let fallback = legacy
+            .observe_search_source(&reference, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.home, fallback.home);
         let snapshot = legacy.read_session(&reference).unwrap();
         assert_eq!(snapshot.session, reference);
         assert_eq!(
@@ -923,6 +1210,17 @@ mod tests {
                 .to_string()
                 .contains("both IDE and Desktop")
         );
+        assert!(!fallback.is_current());
+        assert!(observation.is_current());
+        let native = AntigravityIdeAdapter::with_root(&ide);
+        let standalone = native
+            .observe_search_source(&reference, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(standalone.home, ide.canonicalize().unwrap());
+        assert!(!standalone.is_ide_desktop_database());
+        assert_eq!(standalone.database_contents(), None);
+        assert_ne!(standalone.revision.file, observation.revision.file);
         assert_eq!(fs::read(&database).unwrap(), before);
     }
 
@@ -1071,6 +1369,8 @@ mod tests {
             assert_eq!(event.replay_policy, ReplayPolicy::HistoricalOnly);
         }
         let notice = &snapshot.events.last().unwrap().payload;
+        assert_eq!(notice["omitted_events"], 1);
+        assert!(AntigravityIdeAdapter::has_unreadable_log_records(&snapshot));
         assert_eq!(notice["unsupported_text_records"], 3);
         assert_eq!(notice["native_history_unverified"], true);
         assert!(omnis_core::import_conversation(&snapshot).truncated);

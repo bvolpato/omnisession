@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub(crate) struct ObservedSourceFile {
     pub(crate) physical_identity: Option<[u64; 2]>,
     pub(crate) revision: SourceRevision,
+    pub(crate) length: u64,
     #[cfg(any(unix, windows))]
     object: [u64; 2],
     #[cfg(windows)]
@@ -137,6 +138,7 @@ impl ObservedSourceFile {
         let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
             physical_identity,
+            length: metadata.len(),
             #[cfg(any(unix, windows))]
             object,
             #[cfg(windows)]

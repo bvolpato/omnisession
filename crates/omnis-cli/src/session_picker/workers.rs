@@ -5,34 +5,60 @@ use super::{
     Provider, ProviderNameChange, Receiver, Result, SESSION_CACHE_TTL, Sender,
     SessionTrajectorySearchPage, Stdio, Store, SyncSender, TRAJECTORY_SEARCH_LIMIT,
     TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env, first_user_message_after,
-    mpsc, normalized_picker_entries, populate_approximate_updated_at, preview_revision,
-    session_preview, thread,
+    has_scoped_home, mpsc, normalized_picker_entries, populate_approximate_updated_at,
+    preview_revision, session_preview, thread,
 };
 
 use std::collections::HashMap;
+use uuid::Uuid;
+
 use std::sync::{
     Arc, Mutex, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 
+use crate::{
+    DiscoveredCatalog, read_native_search_snapshot,
+    search_index::{self, IndexCandidate, IndexProgress, SearchSource},
+};
 use anyhow::Context;
-use omnis_adapters::ProviderAdapter;
+use omnis_adapters::{IndexRead, ProviderAdapter};
 use omnis_ir::{SessionRef, SourceRevision};
 use omnis_store::{
-    CatalogObservation, CatalogRetry, IndexedTrajectoryTitle, SelectedSessionObservation,
-    StoreError, TrajectorySourceGuard,
-};
-
-use crate::{
-    DiscoveredCatalog, full_index_read, read_search_snapshot,
-    search_index::{self, IndexCandidate, IndexProgress},
+    CatalogObservation, CatalogRetry, DiscoveryScope, IndexedTrajectoryTitle,
+    SelectedSessionObservation, SessionDiscoveryAttempt, SessionDiscoveryClaim, StoreError,
+    TrajectorySourceGuard,
 };
 
 pub(super) struct DiscoveryUpdate {
+    pub(super) archived_ids: Vec<String>,
     pub(super) provider: Provider,
-    pub(super) result: anyhow::Result<Vec<PickerEntry>>,
-    pub(super) complete: bool,
+    pub(super) result: anyhow::Result<(Vec<PickerEntry>, bool)>,
     pub(super) names: Option<Arc<CatalogNames>>,
+}
+
+impl DiscoveryUpdate {
+    fn apply(self, state: &mut PickerState, warnings: &mut Vec<String>) {
+        match self.result {
+            Ok((mut entries, complete)) => {
+                if self.provider == Provider::Codex {
+                    state.reconcile_discovered_names(&mut entries, self.names.as_deref());
+                }
+                state.update_provider_entries(
+                    self.provider,
+                    entries,
+                    complete,
+                    &self.archived_ids,
+                    self.names
+                        .as_ref()
+                        .map_or(&[], |names| names.unavailable.as_slice()),
+                );
+            }
+            Err(error) => {
+                record_picker_warning(warnings, format!("{}: {error}", self.provider));
+            }
+        }
+    }
 }
 
 pub(super) struct CatalogNames {
@@ -53,78 +79,173 @@ pub(super) enum CatalogReply {
     Retry(CatalogRetry),
 }
 
-pub(super) struct SessionCacheUpdate {
-    pub(super) names: Option<Arc<CatalogNames>>,
-    pub(super) catalog: DiscoveredCatalog,
-    pub(super) retry: Option<CatalogRetry>,
-    pub(super) reply: Option<SyncSender<omnis_store::Result<CatalogReply>>>,
+pub(super) enum SessionCacheUpdate {
+    Listed {
+        provider: Provider,
+        sessions: Vec<IndexedSession>,
+        scope: DiscoveryScope,
+        database_alias_counts: HashMap<String, usize>,
+        archived_ids: Vec<String>,
+        names: Option<Arc<CatalogNames>>,
+        attempt: Option<SessionDiscoveryAttempt>,
+        publication: Option<Sender<Option<bool>>>,
+    },
+    Observed {
+        catalog: DiscoveredCatalog,
+        retry: Option<CatalogRetry>,
+        reply: SyncSender<omnis_store::Result<CatalogReply>>,
+    },
+    Failed(SessionDiscoveryAttempt),
 }
 
 impl SessionCacheUpdate {
-    pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
-        if self.catalog.provider == Provider::Codex {
-            if let Some(names) = self.names {
-                store.refresh_codex_catalog_with_selected_names(
-                    &self.catalog.sessions,
-                    self.catalog.complete,
-                    names.complete,
-                    &names.inventory,
-                    &names.prior_assignments,
-                    &names.selected_names,
-                )?;
-                store.remove_unavailable_codex_sessions(&names.unavailable)?;
-            }
-            return Ok(());
+    fn from_listing(
+        provider: Provider,
+        listing: &omnis_adapters::NativeListing,
+        complete: bool,
+        names: Option<Arc<CatalogNames>>,
+        attempt: Option<SessionDiscoveryAttempt>,
+        publication: Option<Sender<Option<bool>>>,
+    ) -> Self {
+        let database_alias_counts = crate::ide_database_alias_counts(
+            provider,
+            &listing.sessions,
+            listing.desktop_summaries_unavailable,
+            &listing.missing_desktop_summary_ids,
+        )
+        .into_iter()
+        .map(|(id, count)| (id.to_owned(), count))
+        .collect();
+        Self::Listed {
+            provider,
+            sessions: listing.sessions.iter().map(indexed_session).collect(),
+            scope: crate::discovery_scope(
+                complete,
+                listing.desktop_summaries_unavailable,
+                &listing.missing_desktop_summary_ids,
+                &listing.unverified_desktop_ids,
+            ),
+            names,
+            attempt,
+            publication,
+            archived_ids: listing.archived_desktop_ids.clone(),
+            database_alias_counts,
         }
-        let Some(reply) = self.reply else {
-            return self.catalog.persist(store);
-        };
-        let response = if let Some(retry) = self.retry {
-            self.catalog
-                .persist_retry(store, &retry)
-                .and_then(|accepted| match accepted {
-                    Some(accepted) => {
-                        let visible = store.indexed_sessions_for_provider(self.catalog.provider)?;
-                        let ids: HashSet<_> = visible.iter().map(|row| &row.session.id).collect();
-                        let mut retry_hidden = Vec::new();
-                        for &index in &accepted {
-                            let row = &self.catalog.sessions[index];
-                            if !ids.contains(&row.session.id)
-                                && let Some(revision) = row.source_revision
-                                && store.can_retry_hidden_session(
-                                    &row.session,
-                                    revision,
-                                    omnis_core::search_document_version(row.session.provider),
-                                )?
-                            {
-                                retry_hidden.push(index);
-                            }
-                        }
-                        Ok(CatalogReply::Partial {
-                            accepted,
-                            visible,
-                            retry_hidden,
-                        })
+    }
+
+    pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
+        match self {
+            Self::Listed {
+                provider,
+                sessions,
+                scope,
+                archived_ids,
+                database_alias_counts,
+                names,
+                attempt,
+                publication,
+            } => {
+                if provider == Provider::Codex {
+                    if let Some(names) = names {
+                        store.refresh_codex_catalog_with_selected_names(
+                            &sessions,
+                            scope == DiscoveryScope::CompleteProvider,
+                            names.complete,
+                            &names.inventory,
+                            &names.prior_assignments,
+                            &names.selected_names,
+                        )?;
+                        store.remove_unavailable_codex_sessions(&names.unavailable)?;
                     }
-                    None => Ok(CatalogReply::Published),
-                })
-        } else {
-            match self.catalog.persist(store) {
-                Err(StoreError::TrajectorySourceChanged) => {
-                    self.catalog.observe_retry(store).map(CatalogReply::Retry)
+                } else if let Some(attempt) = attempt {
+                    let file_at = |position: usize| {
+                        sessions[position]
+                            .source_revision
+                            .and_then(|revision| revision.file)
+                    };
+                    let count = |id: &str| database_alias_counts.get(id).copied();
+                    let result = store.publish_session_discovery(
+                        &attempt,
+                        &sessions,
+                        scope
+                            .with_source_files(&file_at)
+                            .with_database_alias_counts(&count)
+                            .with_archived_desktop_ids(&archived_ids),
+                        Utc::now(),
+                    );
+                    if let Some(publication) = publication {
+                        let _ = publication.send(result.as_ref().ok().copied());
+                    }
+                    result?;
+                } else {
+                    store.cache_discovered_sessions(provider, &sessions, scope, None)?;
                 }
-                other => other.map(|()| CatalogReply::Published),
             }
-        };
-        let _ = reply.send(response);
+            Self::Observed {
+                catalog,
+                retry,
+                reply,
+            } => {
+                let _ = reply.send(publish_catalog(store, &catalog, retry.as_ref()));
+            }
+            Self::Failed(attempt) => {
+                store.finish_session_discovery(&attempt, Utc::now())?;
+            }
+        }
         Ok(())
+    }
+}
+
+fn publish_catalog(
+    store: &Store,
+    catalog: &DiscoveredCatalog,
+    retry: Option<&CatalogRetry>,
+) -> omnis_store::Result<CatalogReply> {
+    if let Some(retry) = retry {
+        catalog
+            .persist_retry(store, retry)
+            .and_then(|accepted| match accepted {
+                Some(accepted) => {
+                    let visible = store.indexed_sessions_for_provider(catalog.provider)?;
+                    let ids: HashSet<_> = visible.iter().map(|row| &row.session.id).collect();
+                    let mut retry_hidden = Vec::new();
+                    for &index in &accepted {
+                        let row = &catalog.sessions[index];
+                        if !ids.contains(&row.session.id)
+                            && let Some(revision) = row.source_revision
+                            && store.can_retry_hidden_session(
+                                &row.session,
+                                revision,
+                                omnis_core::search_document_version(row.session.provider),
+                            )?
+                        {
+                            retry_hidden.push(index);
+                        }
+                    }
+                    Ok(CatalogReply::Partial {
+                        accepted,
+                        visible,
+                        retry_hidden,
+                    })
+                }
+                None => Ok(CatalogReply::Published),
+            })
+    } else {
+        match catalog.persist(store) {
+            Err(StoreError::TrajectorySourceChanged) => {
+                catalog.observe_retry(store).map(CatalogReply::Retry)
+            }
+            other => other.map(|()| CatalogReply::Published),
+        }
     }
 }
 
 pub(super) enum PickerUpdate {
     Cached(Result<CachedPickerEntries, String>),
-    StaleCachedPreview(PreviewKey),
+    StaleCachedPreview(Box<PreviewKey>),
     ResumeIndex(Vec<NativeSession>),
+    NativeHomes(HashMap<Provider, PathBuf>),
+    NativeTitles(Vec<(SessionRef, Option<Uuid>, Option<String>)>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
         key: Box<PreviewKey>,
@@ -146,6 +267,12 @@ pub(super) enum PickerUpdate {
     IndexFailures(usize),
 }
 
+pub(super) struct PickerIndexRequest {
+    pub(super) candidates: Vec<IndexCandidate>,
+    pub(super) homes: HashMap<Provider, PathBuf>,
+    pub(super) pending_titles: HashMap<SessionRef, Uuid>,
+}
+
 #[derive(Default)]
 pub(super) struct PreviewMetadata {
     read_revision: Option<SourceRevision>,
@@ -158,7 +285,7 @@ pub(super) struct PickerWorkers {
     pub(super) receiver: Receiver<PickerUpdate>,
     pub(super) preview_sender: Sender<Vec<PreviewRequest>>,
     pub(super) trajectory_search_sender: SyncSender<TrajectorySearchRequest>,
-    pub(super) search_index_sender: Sender<Vec<IndexCandidate>>,
+    pub(super) search_index_sender: Sender<PickerIndexRequest>,
     search_index_stop: Arc<AtomicBool>,
 }
 
@@ -178,7 +305,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<SessionCacheUpdate>();
     let (refresh_codex, changed_codex) = mpsc::sync_channel(1);
-    let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
+    let (search_index_sender, search_index_receiver) = mpsc::channel::<PickerIndexRequest>();
     let search_index_stop = Arc::new(AtomicBool::new(false));
     let preview_failures = Arc::new(PreviewFailures::default());
 
@@ -223,7 +350,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
 pub(super) fn spawn_search_index(
     registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
-    receiver: Receiver<Vec<IndexCandidate>>,
+    receiver: Receiver<PickerIndexRequest>,
     stop: Arc<AtomicBool>,
     preview_failures: Arc<PreviewFailures>,
 ) {
@@ -231,7 +358,7 @@ pub(super) fn spawn_search_index(
         let Ok(store) = Store::open_default() else {
             return;
         };
-        let pending = std::cell::RefCell::new(None::<Vec<IndexCandidate>>);
+        let pending = std::cell::RefCell::new(None::<PickerIndexRequest>);
         // Failed reads are recorded and later passes skip them, so warn about the whole unreadable
         // set only after this picker run found new failures.
         let mut found_failures = false;
@@ -244,7 +371,25 @@ pub(super) fn spawn_search_index(
                     Err(_) => return,
                 },
             };
-            let candidates = receiver.try_iter().last().unwrap_or(candidates);
+            let PickerIndexRequest {
+                candidates,
+                homes,
+                pending_titles,
+            } = receiver.try_iter().last().unwrap_or(candidates);
+            let selected: HashMap<_, _> = candidates
+                .iter()
+                .filter(|candidate| has_scoped_home(candidate.session.provider))
+                .map(|candidate| (candidate.session.clone(), candidate.source_revision.file))
+                .collect();
+            send_native_titles(
+                &store,
+                &sender,
+                &homes,
+                pending_titles
+                    .iter()
+                    .filter(|(session, file)| selected.get(*session) == Some(&Some(**file)))
+                    .map(|(session, file)| (session, Some(*file))),
+            );
             let should_stop = || {
                 if stop.load(Ordering::Relaxed) {
                     return true;
@@ -262,7 +407,21 @@ pub(super) fn spawn_search_index(
                 candidates,
                 false,
                 &should_stop,
-                &mut |progress| {
+                &mut |mut progress| {
+                    send_native_titles(
+                        &store,
+                        &sender,
+                        &homes,
+                        progress.titles.iter().filter_map(|receipt| {
+                            Some((&receipt.session, *selected.get(&receipt.session)?))
+                        }),
+                    );
+                    progress
+                        .titles
+                        .retain(|receipt| !has_scoped_home(receipt.session.provider));
+                    progress
+                        .source_titles
+                        .retain(|(session, _)| !has_scoped_home(session.provider));
                     if progress.failed > reported_failures {
                         reported_failures = progress.failed;
                         refresh_preview_failures(&store, &sender, &preview_failures, |_| true);
@@ -292,6 +451,50 @@ pub(super) fn spawn_search_index(
     });
 }
 
+fn send_native_titles<'a>(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    homes: &HashMap<Provider, PathBuf>,
+    selected: impl Iterator<Item = (&'a SessionRef, Option<Uuid>)> + Clone,
+) {
+    if selected.clone().next().is_none() {
+        return;
+    }
+    let titles = store.read_trajectory_search(|snapshot| -> omnis_store::Result<_> {
+        let conflicts =
+            crate::conflicting_search_documents(snapshot, Some(homes), selected.clone())?;
+        let scoped: Vec<_> = selected
+            .clone()
+            .filter(|(session, _)| conflicts.contains(*session))
+            .map(|(session, file)| (session.clone(), homes.get(&session.provider).cloned(), file))
+            .collect();
+        let scoped_titles: HashMap<_, _> = snapshot
+            .scoped_native_titles(&scoped)?
+            .into_iter()
+            .filter_map(|row| Some((row.session, row.title?)))
+            .collect();
+        selected
+            .filter(|(session, _)| homes.contains_key(&session.provider))
+            .map(|(session, file)| {
+                let title = if conflicts.contains(session) {
+                    scoped_titles.get(session).cloned()
+                } else {
+                    snapshot.trajectory_title(session)?
+                };
+                Ok((session.clone(), file, title))
+            })
+            .collect()
+    });
+    match titles {
+        Ok(titles) => {
+            let _ = sender.send(PickerUpdate::NativeTitles(titles));
+        }
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!("session titles: {error}")));
+        }
+    }
+}
+
 fn refresh_preview_failures(
     store: &Store,
     sender: &Sender<PickerUpdate>,
@@ -307,8 +510,7 @@ fn refresh_preview_failures(
         return;
     };
     failures.retain(|session, failure| {
-        (session.provider == Provider::Grok
-            || TrajectorySourceGuard::uses_file_time(session.provider))
+        super::uses_strict_preview_failures(session.provider)
             && failure.source_file.is_some()
             && failure.source_contents.is_some()
     });
@@ -433,73 +635,91 @@ pub(super) fn spawn_cache_updates(
 ) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
-            let _ = sender.send(PickerUpdate::Cached(Err(
-                "session index is unavailable".to_owned()
-            )));
-            spawn_all_provider_updates(&registry, &sender, &index_sender, &current_project);
+            discover_without_cache(&registry, &sender, &index_sender, &current_project);
             return;
         };
-        let cached =
-            cached_picker_entries(&store, &current_project).map_err(|error| error.to_string());
-        let cache_loaded = cached.is_ok();
-        if sender.send(PickerUpdate::Cached(cached)).is_err() {
+        // Observe the reader before loading the catalog so a concurrent publication cannot be missed.
+        let mut selections: HashMap<_, _> = super::NATIVE_HOME_PROVIDERS
+            .map(|provider| {
+                let selection = select_native_discovery(&store, &registry, provider, &sender);
+                (provider, selection)
+            })
+            .into_iter()
+            .collect();
+        let homes: HashMap<_, _> = selections
+            .iter()
+            .filter_map(|(&provider, selection)| Some((provider, selection.home.clone()?)))
+            .collect();
+        if sender
+            .send(PickerUpdate::NativeHomes(homes.clone()))
+            .is_err()
+        {
             return;
         }
+        let home = |provider| homes.get(&provider).map(PathBuf::as_path);
+        let Some(cache_loaded) = send_cached_picker_entries(
+            &store,
+            &sender,
+            &current_project,
+            home(Provider::Antigravity),
+            home(Provider::AntigravityDesktop),
+            home(Provider::AntigravityIde),
+        ) else {
+            return;
+        };
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
         if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
             return;
         }
-        let freshness = PROVIDERS.map(|provider| {
-            (
-                provider,
-                picker_discovery_due(&store, &registry, provider, cache_loaded),
-            )
-        });
         let mut refreshed_codex = false;
-        for (provider, due) in freshness {
-            let refresh = match due {
-                Ok(due) => due || matches!(provider, Provider::Pi | Provider::OhMyPi),
-                Err(error) => {
-                    if sender
-                        .send(PickerUpdate::Warning(format!(
-                            "{provider} session index: {error}"
-                        )))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    true
-                }
-            };
-            if !refresh {
-                if let Err(error) = resume_pending_sources(&registry, &store, provider, &sender) {
-                    let _ = sender.send(PickerUpdate::Warning(format!(
-                        "{provider} search upgrade: {error}"
-                    )));
-                }
-                continue;
-            }
-            if !TrajectorySourceGuard::uses_file_time(provider)
-                && let Err(error) = store.mark_session_index_checked(provider)
-                && sender
-                    .send(PickerUpdate::Warning(format!(
-                        "{provider} session index: {error}"
-                    )))
-                    .is_err()
-            {
-                return;
-            }
-            start_provider_update(
-                &registry,
-                &sender,
-                &index_sender,
-                &current_project,
+        for provider in PROVIDERS {
+            let decision = provider_discovery_decision(
+                &store,
                 provider,
-                Some(&store),
+                selections.remove(&provider),
+                cache_loaded,
             );
-            refreshed_codex |= provider == Provider::Codex;
+            match decision.unwrap_or_else(|error| {
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "{provider} session index: {error}"
+                )));
+                PickerDiscovery::Due(None)
+            }) {
+                PickerDiscovery::Fresh => {
+                    if let Err(error) = resume_pending_sources(&registry, &store, provider, &sender)
+                    {
+                        let _ = sender.send(PickerUpdate::Warning(format!(
+                            "{provider} search upgrade: {error}"
+                        )));
+                    }
+                }
+                PickerDiscovery::Wait(attempt) => {
+                    if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+                        super::discovery_watch::spawn(
+                            sender.clone(),
+                            index_sender.clone(),
+                            current_project.clone(),
+                            provider,
+                            attempt,
+                        );
+                    }
+                }
+                PickerDiscovery::Due(attempt) => {
+                    refreshed_codex |= provider == Provider::Codex;
+                    start_provider_update(
+                        &registry,
+                        &sender,
+                        &index_sender,
+                        &current_project,
+                        provider,
+                        attempt,
+                        homes.get(&provider),
+                        Some(&store),
+                    );
+                }
+            }
         }
-
+        drop(store);
         // A cached row can change before the discovery cache expires. Refresh once if a
         // preview observes the change. Discovery supplies the new workspace and source stamp.
         if !refreshed_codex && changed_codex.recv().is_ok() {
@@ -509,7 +729,9 @@ pub(super) fn spawn_cache_updates(
                 &index_sender,
                 &current_project,
                 Provider::Codex,
-                Some(&store),
+                None,
+                None,
+                None,
             );
         }
     });
@@ -563,54 +785,158 @@ fn resume_pending_sources(
     Ok(())
 }
 
-fn picker_discovery_due(
-    store: &Store,
-    registry: &AdapterRegistry,
-    provider: Provider,
-    cache_loaded: bool,
-) -> Result<bool> {
-    if !cache_loaded {
-        return Ok(true);
-    }
-    let last = if let Some(home) = registry.discovery_cache_home(provider)? {
-        store.completed_discovery_at(
-            provider,
-            omnis_core::search_document_version(provider),
-            &home,
-        )?
-    } else {
-        store.session_index_checked_at(provider)?
-    };
-    Ok(!last.is_some_and(session_cache_is_fresh))
-}
-
-pub(super) fn spawn_all_provider_updates(
+fn discover_without_cache(
     registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
-    current_project: &Path,
+    project: &Path,
 ) {
+    let homes: HashMap<_, _> = super::NATIVE_HOME_PROVIDERS
+        .into_iter()
+        .filter_map(|provider| Some((provider, registry.discovery_cache_home(provider).ok()??)))
+        .collect();
+    let _ = sender.send(PickerUpdate::NativeHomes(homes.clone()));
+    let _ = sender.send(PickerUpdate::Cached(Err(
+        "session index is unavailable".to_owned()
+    )));
     for provider in PROVIDERS {
         start_provider_update(
             registry,
             sender,
             index_sender,
-            current_project,
+            project,
             provider,
+            None,
+            homes.get(&provider),
             None,
         );
     }
 }
 
-pub(super) fn start_provider_update(
+fn send_cached_picker_entries(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    project: &Path,
+    antigravity: Option<&Path>,
+    desktop: Option<&Path>,
+    ide: Option<&Path>,
+) -> Option<bool> {
+    let entries = cached_picker_entries(store, project, antigravity, desktop, ide)
+        .map_err(|error| error.to_string());
+    let loaded = entries.is_ok();
+    sender.send(PickerUpdate::Cached(entries)).ok()?;
+    Some(loaded)
+}
+
+enum PickerDiscovery {
+    Fresh,
+    Wait(SessionDiscoveryAttempt),
+    Due(Option<SessionDiscoveryAttempt>),
+}
+
+struct HomeDiscovery {
+    home: Option<PathBuf>,
+    decision: PickerDiscovery,
+}
+
+fn select_native_discovery(
+    store: &Store,
+    registry: &AdapterRegistry,
+    provider: Provider,
+    sender: &Sender<PickerUpdate>,
+) -> HomeDiscovery {
+    let home = match registry.discovery_cache_home(provider) {
+        Ok(home) => home,
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "{provider} session home: {error}"
+            )));
+            return HomeDiscovery {
+                home: None,
+                decision: PickerDiscovery::Fresh,
+            };
+        }
+    };
+    let decision = match home.as_deref() {
+        Some(home) => store
+            .try_begin_session_discovery(
+                provider,
+                omnis_core::search_document_version(provider),
+                home,
+                Utc::now() - SESSION_CACHE_TTL,
+            )
+            .map(|claim| match claim {
+                SessionDiscoveryClaim::Fresh => PickerDiscovery::Fresh,
+                SessionDiscoveryClaim::InProgress(attempt) => PickerDiscovery::Wait(attempt),
+                SessionDiscoveryClaim::Claimed(attempt) => PickerDiscovery::Due(Some(attempt)),
+            }),
+        None => begin_picker_discovery(store, provider, true),
+    }
+    .unwrap_or_else(|error| {
+        let _ = sender.send(PickerUpdate::Warning(format!(
+            "{provider} session index: {error}"
+        )));
+        PickerDiscovery::Due(None)
+    });
+    HomeDiscovery { home, decision }
+}
+
+fn provider_discovery_decision(
+    store: &Store,
+    provider: Provider,
+    selection: Option<HomeDiscovery>,
+    cache_loaded: bool,
+) -> omnis_store::Result<PickerDiscovery> {
+    match selection {
+        Some(HomeDiscovery {
+            home: Some(home),
+            decision: PickerDiscovery::Fresh,
+        }) if !cache_loaded => store
+            .mark_session_discovery_attempted(
+                provider,
+                omnis_core::search_document_version(provider),
+                &home,
+            )
+            .map(|attempt| PickerDiscovery::Due(Some(attempt))),
+        Some(selection) => Ok(selection.decision),
+        None => begin_picker_discovery(store, provider, cache_loaded),
+    }
+}
+
+fn begin_picker_discovery(
+    store: &Store,
+    provider: Provider,
+    cache_loaded: bool,
+) -> omnis_store::Result<PickerDiscovery> {
+    if cache_loaded
+        && !TrajectorySourceGuard::uses_guarded_catalog(provider)
+        && store
+            .session_index_checked_at(provider)?
+            .is_some_and(session_cache_is_fresh)
+    {
+        return Ok(PickerDiscovery::Fresh);
+    }
+    if !TrajectorySourceGuard::uses_guarded_catalog(provider) {
+        store.mark_session_index_checked(provider)?;
+    }
+    Ok(PickerDiscovery::Due(None))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_provider_update(
     registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
+    attempt: Option<SessionDiscoveryAttempt>,
+    home: Option<&PathBuf>,
     store: Option<&Store>,
 ) {
-    if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+    if sender.send(PickerUpdate::RefreshStarted(provider)).is_err() {
+        return;
+    }
+    if TrajectorySourceGuard::uses_guarded_catalog(provider) {
         let observation = store.and_then(|store| match store.observe_session_catalog(provider) {
             Ok(observation) => observation,
             Err(error) => {
@@ -620,13 +946,35 @@ pub(super) fn start_provider_update(
                 None
             }
         });
-        spawn_provider_update(
-            Arc::clone(registry),
+        let sender = sender.clone();
+        let index_sender = index_sender.clone();
+        let current_project = current_project.to_path_buf();
+        let registry = Arc::clone(registry);
+        thread::spawn(move || {
+            let result = discover_for_picker(
+                &registry,
+                provider,
+                &current_project,
+                observation,
+                &index_sender,
+                &sender,
+            );
+            let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                provider,
+                result: result.map(|entries| (entries, false)),
+                names: None,
+                archived_ids: Vec::new(),
+            }));
+        });
+    } else {
+        spawn_provider_update_in_home(
             sender.clone(),
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
-            observation,
+            attempt,
+            home.cloned(),
+            Arc::clone(registry),
         );
     }
 }
@@ -717,99 +1065,147 @@ fn codex_catalog_names(
 }
 
 pub(super) fn spawn_provider_update(
-    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
-    observation: Option<CatalogObservation>,
+    attempt: Option<SessionDiscoveryAttempt>,
+) {
+    let home = attempt.as_ref().map(|attempt| attempt.home().to_path_buf());
+    spawn_provider_update_in_home(
+        sender,
+        index_sender,
+        current_project,
+        provider,
+        attempt,
+        home,
+        Arc::new(AdapterRegistry::with_local_adapters()),
+    );
+}
+
+fn list_picker_sessions(
+    registry: &AdapterRegistry,
+    provider: Provider,
+    home: Option<&Path>,
+    sender: &Sender<PickerUpdate>,
+) -> anyhow::Result<(omnis_adapters::NativeListing, Option<Arc<CatalogNames>>)> {
+    let observed = if provider == Provider::Codex {
+        match Store::open_default().and_then(|store| store.observe_codex_catalog_for_refresh()) {
+            Ok(sessions) => Some(sessions),
+            Err(error) => {
+                let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let listing = registry.list_sessions_in_home(provider, None, home)?;
+    let names = observed.and_then(|inventory| {
+        let adapter = registry.adapter(provider).ok()?;
+        Some(codex_catalog_names(
+            adapter,
+            &listing.sessions,
+            inventory,
+            sender,
+        ))
+    });
+    Ok((listing, names))
+}
+
+fn spawn_provider_update_in_home(
+    sender: Sender<PickerUpdate>,
+    index_sender: Sender<SessionCacheUpdate>,
+    current_project: PathBuf,
+    provider: Provider,
+    attempt: Option<SessionDiscoveryAttempt>,
+    home: Option<PathBuf>,
+    registry: Arc<AdapterRegistry>,
 ) {
     thread::spawn(move || {
-        if provider == Provider::Codex {
-            let observed = match Store::open_default()
-                .and_then(|store| store.observe_codex_catalog_for_refresh())
-            {
-                Ok(inventory) => Some(inventory),
-                Err(error) => {
-                    let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
-                    None
-                }
-            };
-            let result = registry.list_sessions_with_notes(provider, None);
-            match result {
-                Ok((mut sessions, notes)) => {
-                    let complete = registry
+        let result = list_picker_sessions(&registry, provider, home.as_deref(), &sender);
+        match result {
+            Ok((mut listing, names)) => {
+                let complete = (provider == Provider::Codex || listing.notes.is_empty())
+                    && registry
                         .adapter(provider)
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let names = observed.and_then(|inventory| {
-                        let adapter = registry.adapter(provider).ok()?;
-                        Some(codex_catalog_names(adapter, &sessions, inventory, &sender))
-                    });
-                    for note in notes {
-                        if sender.send(PickerUpdate::Warning(note)).is_err() {
-                            return;
-                        }
+                for note in listing.notes.drain(..) {
+                    if sender.send(PickerUpdate::Warning(note)).is_err() {
+                        return;
                     }
-                    populate_approximate_updated_at(&mut sessions);
-                    let catalog = DiscoveredCatalog::new(
+                }
+                populate_approximate_updated_at(&mut listing.sessions);
+                if attempt.is_some() || home.is_none() {
+                    let (reply, waiting) = attempt.as_ref().map(|_| mpsc::channel()).unzip();
+                    let update = SessionCacheUpdate::from_listing(
                         provider,
-                        None,
-                        &sessions,
+                        &listing,
                         complete,
-                        false,
-                        indexed_session,
+                        names.clone(),
+                        attempt.clone(),
+                        reply,
                     );
-                    let entries = normalized_picker_entries(sessions, &current_project, false);
-                    if sender
-                        .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                            provider,
-                            result: Ok(entries),
-                            complete,
-                            names: names.clone(),
-                        }))
-                        .is_ok()
-                        && index_sender
-                            .send(SessionCacheUpdate {
-                                catalog,
-                                retry: None,
-                                reply: None,
-                                names,
-                            })
-                            .is_err()
-                    {
+                    if index_sender.send(update).is_err() {
                         let _ = sender.send(PickerUpdate::Warning(
                             "session index writer stopped".to_owned(),
                         ));
+                    } else if let (Some(wait), Some(attempt)) = (waiting, attempt)
+                        && matches!(
+                            wait.recv_timeout(SESSION_CACHE_TTL),
+                            Ok(Some(false)) | Err(mpsc::RecvTimeoutError::Timeout)
+                        )
+                    {
+                        super::discovery_watch::spawn(
+                            sender,
+                            index_sender,
+                            current_project,
+                            provider,
+                            attempt,
+                        );
+                        return;
                     }
                 }
-                Err(error) => {
-                    let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
-                        provider,
-                        result: Err(error),
-                        complete: false,
-                        names: None,
-                    }));
-                }
+                let cached = cached_desktop_observations(
+                    provider,
+                    home.as_deref(),
+                    listing.desktop_summaries_unavailable,
+                    &mut listing.sessions,
+                    &listing.missing_desktop_summary_ids,
+                    &listing.unverified_desktop_ids,
+                )
+                .unwrap_or_else(|error| {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "{provider} cached catalog: {error}"
+                    )));
+                    Vec::new()
+                });
+                let mut entries =
+                    normalized_picker_entries(listing.sessions, &current_project, false);
+                entries.extend(normalized_picker_entries(cached, &current_project, true));
+                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider,
+                    result: Ok((entries, complete)),
+                    archived_ids: listing.archived_desktop_ids,
+                    names,
+                }));
             }
-            return;
+            Err(error) => {
+                if let Some(attempt) = attempt
+                    && registry
+                        .discovery_cache_home(provider)
+                        .is_ok_and(|home| home.as_deref() == Some(attempt.home()))
+                {
+                    let _ = index_sender.send(SessionCacheUpdate::Failed(attempt));
+                }
+                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider,
+                    result: Err(error),
+                    archived_ids: Vec::new(),
+                    names: None,
+                }));
+            }
         }
-        let result = discover_for_picker(
-            &registry,
-            provider,
-            &current_project,
-            observation,
-            &index_sender,
-            &sender,
-        );
-        let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
-            provider,
-            result,
-            complete: !matches!(provider, Provider::Pi | Provider::OhMyPi)
-                && registry
-                    .adapter(provider)
-                    .is_ok_and(ProviderAdapter::discovery_is_complete),
-            names: None,
-        }));
     });
 }
 
@@ -821,13 +1217,9 @@ pub(super) fn discover_for_picker(
     index_sender: &Sender<SessionCacheUpdate>,
     sender: &Sender<PickerUpdate>,
 ) -> Result<Vec<PickerEntry>> {
-    let check = crate::DiscoveryCheck::capture(registry, provider)?;
     let mut retry = None;
     for _ in 0..2 {
         let (mut sessions, notes) = crate::discover_search_sessions(registry, provider, None)?;
-        if let Some(check) = &check {
-            check.verify(registry)?;
-        }
         let unstable = !notes.is_empty();
         let complete = !unstable
             && registry
@@ -837,23 +1229,20 @@ pub(super) fn discover_for_picker(
             let _ = sender.send(PickerUpdate::Warning(note));
         }
         populate_approximate_updated_at(&mut sessions);
-        if observation.is_some() || !TrajectorySourceGuard::uses_file_time(provider) {
+        if let Some(observed) = observation.take() {
             // A checked listing reaches the picker only after the writer accepts its files.
-            let (reply, response) = (observation.is_some() || check.is_some())
-                .then(|| mpsc::sync_channel(1))
-                .unzip();
+            let (reply, response) = mpsc::sync_channel(1);
             let catalog = DiscoveredCatalog::new(
                 provider,
-                observation.take(),
+                Some(observed),
                 &sessions,
                 complete,
                 unstable,
                 indexed_session,
             );
             if index_sender
-                .send(SessionCacheUpdate {
+                .send(SessionCacheUpdate::Observed {
                     catalog,
-                    names: None,
                     retry: retry.take(),
                     reply,
                 })
@@ -862,7 +1251,7 @@ pub(super) fn discover_for_picker(
                 let _ = sender.send(PickerUpdate::Warning(
                     "session index writer stopped".to_owned(),
                 ));
-            } else if let Some(response) = response {
+            } else {
                 match response.recv()?? {
                     CatalogReply::Retry(current) => {
                         observation = Some(current.observation());
@@ -900,11 +1289,7 @@ pub(super) fn discover_for_picker(
                         DiscoveredCatalog::retain_accepted(&mut sessions, &accepted);
                         return Ok(reconcile_partial(sessions, visible, current_project));
                     }
-                    CatalogReply::Published => {
-                        if !unstable && let Some(check) = &check {
-                            check.publish(registry, &Store::open_default()?, &sessions)?;
-                        }
-                    }
+                    CatalogReply::Published => {}
                 }
             }
         }
@@ -950,17 +1335,14 @@ fn reconcile_partial(
         .collect()
 }
 
-pub(super) fn read_picker_preview(
+pub(super) fn read_codex_picker_preview(
     registry: &AdapterRegistry,
     key: &PreviewKey,
     source_path: Option<&Path>,
-    writer: Option<(&Store, omnis_store::TrajectorySourceGuard)>,
+    writer: Option<(&Store, &TrajectorySourceGuard)>,
     source_changed: impl FnOnce(),
 ) -> anyhow::Result<omnis_adapters::IndexRead> {
     let session = &key.session;
-    if session.provider == Provider::Imported {
-        return full_index_read(registry, session, None);
-    }
     let budget = if key.continuation_after.is_some() {
         u64::MAX
     } else {
@@ -1008,7 +1390,7 @@ pub(super) fn read_picker_preview(
     Ok(read)
 }
 
-fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySourceGuard>) -> u64 {
+fn preview_read_budget(key: &PreviewKey, guard: Option<&TrajectorySourceGuard>) -> u64 {
     let revision = key.source.as_ref().and_then(PreviewSource::revision);
     let default_budget = if key.session.provider == Provider::Grok {
         0
@@ -1024,6 +1406,127 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
             default_budget,
         )
     })
+}
+
+fn cached_desktop_observations(
+    provider: Provider,
+    home: Option<&Path>,
+    summaries_unavailable: bool,
+    sessions: &mut [NativeSession],
+    missing_summary_ids: &[String],
+    unverified_ids: &[String],
+) -> omnis_store::Result<Vec<NativeSession>> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    if !summaries_unavailable && missing_summary_ids.is_empty() && unverified_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = Store::open_default()?;
+    if summaries_unavailable || !missing_summary_ids.is_empty() {
+        crate::fill_cached_desktop_summaries(
+            &store,
+            home,
+            sessions,
+            summaries_unavailable,
+            missing_summary_ids,
+        )?;
+    }
+    if provider != Provider::AntigravityDesktop || unverified_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unresolved: HashSet<_> = unverified_ids.iter().collect();
+    let version = omnis_core::search_document_version(Provider::AntigravityDesktop);
+    Ok(store
+        .published_desktop_sessions(version, home)?
+        .into_iter()
+        .flatten()
+        .filter(|row| unresolved.contains(&row.session.id))
+        .map(native_session)
+        .collect())
+}
+
+fn read_picker_preview(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    key: &PreviewKey,
+    source_path: Option<&Path>,
+    writer: Option<(&Store, &TrajectorySourceGuard)>,
+    source_changed: impl FnOnce(),
+) -> anyhow::Result<(IndexRead, Option<SearchSource>)> {
+    let session = &key.session;
+    if session.provider == Provider::Imported {
+        let read = search_index::read_imported(store, session)?;
+        return Ok((read, None));
+    }
+    let full_read = key.continuation_after.is_some();
+    if session.provider == Provider::Codex {
+        return read_codex_picker_preview(registry, key, source_path, writer, source_changed)
+            .map(|read| (read, None));
+    }
+    if has_scoped_home(session.provider) {
+        let home = key
+            .native_home
+            .as_deref()
+            .context("native preview home is unavailable")?;
+        anyhow::ensure!(
+            registry.discovery_cache_home(session.provider)?.as_deref() == Some(home),
+            "native preview home changed"
+        );
+        let (mut read, source) = search_index::observe_native_read(
+            registry,
+            store,
+            session,
+            source_path,
+            key.source_revision,
+            |adapter, path| {
+                let read = if full_read {
+                    adapter.read_full_index_at(session, path)?
+                } else {
+                    adapter.index_session(session, path, 0)?
+                };
+                let time = adapter.search_source_time(&read.snapshot, path)?;
+                Ok((read, time))
+            },
+        )?;
+        let observation = source
+            .as_ref()
+            .and_then(|source| source.observation.as_ref());
+        anyhow::ensure!(
+            observation.is_some_and(|source| source.home == home),
+            "native preview source changed"
+        );
+        if let Some(source) = &source {
+            read.source_revision = source.revision();
+        }
+        read.source_complete &=
+            !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&read.snapshot)
+                && !omnis_adapters::AntigravityIdeAdapter::has_unreadable_log_records(
+                    &read.snapshot,
+                );
+        return Ok((read, source));
+    }
+    let (snapshot, source) = read_native_search_snapshot(registry, store, session, full_read)?;
+    Ok((
+        IndexRead {
+            ancestor_revisions: Vec::new(),
+            ownership_revision: None,
+            native_session: None,
+            source_revision: source
+                .as_ref()
+                .map(SearchSource::revision)
+                .unwrap_or_default(),
+            workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
+            rollback_title: omnis_adapters::RollbackTitle::Unknown,
+            source_complete: full_read,
+            provider_limited: false,
+            database_aliases: Arc::default(),
+            verified_prefix_end: None,
+            search_record_groups: Vec::new(),
+            snapshot,
+        },
+        source,
+    ))
 }
 
 fn reports_incomplete_preview(event: &omnis_ir::OmniEvent) -> bool {
@@ -1066,30 +1569,28 @@ fn grok_preview_update(
             None
         }
     });
-    let guard = writer.as_ref().map(|(store, observed)| {
-        (
-            *store,
-            TrajectorySourceGuard::ObservedRevision(observed.state),
-        )
+    let guard = writer
+        .as_ref()
+        .map(|(store, observed)| (*store, TrajectorySourceGuard::Observed(observed.state)));
+    let read = read_codex_picker_preview(
+        registry,
+        &key,
+        source_path.as_deref(),
+        guard.as_ref().map(|(store, guard)| (*store, guard)),
+        || {},
+    )
+    .and_then(|read| {
+        if let Some((store, observed)) = &writer {
+            search_index::check_grok_preview(store, &read, observed.failure.as_ref())?;
+        }
+        Ok(read)
+    })
+    .inspect_err(|error| {
+        if let Some((store, observed)) = &writer {
+            let _ =
+                search_index::record_grok_rejection(registry, store, &key.session, observed, error);
+        }
     });
-    let read = read_picker_preview(registry, &key, source_path.as_deref(), guard, || {})
-        .and_then(|read| {
-            if let Some((store, observed)) = &writer {
-                search_index::check_grok_preview(store, &read, observed.failure.as_ref())?;
-            }
-            Ok(read)
-        })
-        .inspect_err(|error| {
-            if let Some((store, observed)) = &writer {
-                let _ = search_index::record_grok_rejection(
-                    registry,
-                    store,
-                    &key.session,
-                    observed,
-                    error,
-                );
-            }
-        });
     let mut read_revision = None;
     let value = read.map_or(PreviewValue::Unavailable, |read| {
         read_revision = Some(preview_revision(read.source_revision));
@@ -1103,7 +1604,7 @@ fn grok_preview_update(
                 crate::SearchDocumentTarget::Selected(&target, &observed, None),
                 crate::SearchDocumentInput::Read(&read, None),
                 Some(registry),
-                TrajectorySourceGuard::ObservedRevision(observed.state),
+                &TrajectorySourceGuard::Observed(observed.state),
             ) {
                 let stale = matches!(
                     error.downcast_ref::<StoreError>(),
@@ -1181,10 +1682,8 @@ pub(super) fn spawn_preview_updates(
                         request,
                         &preview_failures,
                     )
-                } else if matches!(
-                    request.key.session.provider,
-                    Provider::Codex | Provider::Imported
-                ) {
+                } else if !TrajectorySourceGuard::uses_guarded_catalog(request.key.session.provider)
+                {
                     preview_update(&registry, store.as_ref(), request, &sender, &refresh_codex)
                 } else {
                     let key = request.key;
@@ -1222,6 +1721,8 @@ pub(super) fn spawn_preview_updates(
                         &index_sender,
                         &current_project,
                         Provider::Grok,
+                        None,
+                        None,
                         store.as_ref(),
                     );
                 }
@@ -1246,11 +1747,10 @@ impl<'a> PreviewWriter<'a> {
         } else {
             None
         };
-        let guard = selected
-            .as_ref()
-            .map_or(TrajectorySourceGuard::NewerSource, |prior| {
-                TrajectorySourceGuard::ObservedRevision(prior.state)
-            });
+        let guard = match &selected {
+            Some(prior) => TrajectorySourceGuard::Observed(prior.state),
+            None => search_index::observe_source(store, &key.session)?,
+        };
         Ok(Self {
             store,
             guard,
@@ -1296,7 +1796,7 @@ impl<'a> PreviewWriter<'a> {
             target,
             crate::SearchDocumentInput::Read(read, name),
             Some(registry),
-            self.guard,
+            &self.guard,
         )?;
         if let (Some(assigned @ NativeSessionName::Named(_)), Some(native)) = (name, native)
             && assigned.confirms(native.title.as_deref())
@@ -1324,7 +1824,7 @@ fn record_bundle_preview(
             session,
             crate::SearchDocumentInput::Bundle(snapshot),
             None,
-            writer.guard,
+            &writer.guard,
         )?;
     }
     Ok(metadata)
@@ -1428,6 +1928,71 @@ fn record_preview(
     Ok(metadata)
 }
 
+fn record_observed_preview(
+    key: &PreviewKey,
+    writer: &PreviewWriter<'_>,
+    read: &IndexRead,
+    source: &SearchSource,
+) -> anyhow::Result<PreviewMetadata> {
+    let full_read = key.continuation_after.is_some();
+    let jsonl = key.session.provider == Provider::Antigravity
+        && source.observation.as_ref().is_some_and(|observation| {
+            observation
+                .session
+                .source_path
+                .as_deref()
+                .and_then(Path::extension)
+                .is_some_and(|extension| extension == "jsonl")
+        });
+    if jsonl
+        && !(full_read && (read.source_complete || read.provider_limited))
+        && (read
+            .snapshot
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+            || matches!(
+                writer.store.observe_verified_session(&key.session)?,
+                TrajectorySourceGuard::Verified {
+                    full_or_provider_limited: true,
+                    ..
+                } | TrajectorySourceGuard::Verified {
+                    fully_scanned: true,
+                    ..
+                }
+            ))
+    {
+        return Ok(PreviewMetadata::default());
+    }
+    crate::store_observed_search_document(
+        writer.store,
+        &key.session,
+        read,
+        read.source_complete,
+        source,
+        &writer.guard,
+        None,
+    )?;
+    let file = key.source_revision.and_then(|revision| revision.file);
+    let title = match key.native_home.as_deref() {
+        Some(home) => writer
+            .store
+            .trajectory_title_for_native_source(&key.session, home, file)?,
+        None => writer.store.trajectory_title(&key.session)?,
+    };
+    Ok(PreviewMetadata {
+        indexed_title: Some(IndexedTrajectoryTitle {
+            document_version: omnis_core::search_document_version(key.session.provider),
+            verified_at: None,
+            cached_at: None,
+            session: key.session.clone(),
+            title,
+            source_revision: read.source_revision,
+        }),
+        ..PreviewMetadata::default()
+    })
+}
+
 pub(super) fn preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -1458,9 +2023,10 @@ pub(super) fn preview_update(
         let mut changed = false;
         let read = read_picker_preview(
             registry,
+            store,
             &key,
             source_path.as_deref(),
-            writer.as_ref().map(|writer| (writer.store, writer.guard)),
+            writer.as_ref().map(|writer| (writer.store, &writer.guard)),
             || {
                 changed = true;
             },
@@ -1468,20 +2034,30 @@ pub(super) fn preview_update(
         if cached && key.session.provider == Provider::Codex && read.is_err() {
             refresh_failed_cached_preview(registry, &key, changed, sender, refresh_codex);
         }
-        read.map_or(PreviewValue::Unavailable, |mut read| {
-            match record_preview(
-                registry,
-                &key.session,
-                writer.as_ref(),
-                provider_name,
-                &mut read,
-            ) {
+        read.map_or(PreviewValue::Unavailable, |(mut read, source)| {
+            let receipts = if matches!(key.session.provider, Provider::Codex | Provider::Imported) {
+                record_preview(
+                    registry,
+                    &key.session,
+                    writer.as_ref(),
+                    provider_name,
+                    &mut read,
+                )
+            } else if let (Some(writer), Some(source)) = (&writer, source) {
+                record_observed_preview(&key, writer, &read, &source)
+            } else {
+                Ok(PreviewMetadata::default())
+            };
+            match receipts {
                 Ok(receipts) => metadata = receipts,
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!(
                         "trajectory index write: {error}"
                     )));
                 }
+            }
+            if has_scoped_home(key.session.provider) {
+                return PreviewValue::from_read(read, key.continuation_after, true);
             }
             let snapshot = read.snapshot;
             let complete = read.source_complete;
@@ -1533,7 +2109,7 @@ fn refresh_failed_cached_preview(
         }
     };
     if changed {
-        let _ = sender.send(PickerUpdate::StaleCachedPreview(key.clone()));
+        let _ = sender.send(PickerUpdate::StaleCachedPreview(Box::new(key.clone())));
     }
     let _ = refresh.try_send(());
 }
@@ -1543,12 +2119,8 @@ fn preview_write_guard(
     session: &SessionRef,
     sender: &Sender<PickerUpdate>,
 ) -> Option<TrajectorySourceGuard> {
-    let observed = if TrajectorySourceGuard::verifies_search_file(session.provider) {
-        store.observe_verified_session(session)
-    } else {
-        search_index::observe_source(store, session)
-    };
-    observed
+    store
+        .observe_verified_session(session)
         .inspect_err(|error| {
             let _ = sender.send(PickerUpdate::Warning(format!(
                 "trajectory index status: {error}"
@@ -1559,15 +2131,13 @@ fn preview_write_guard(
 
 fn report_rejected_preview(
     registry: &AdapterRegistry,
-    writer: Option<(&Store, TrajectorySourceGuard)>,
+    writer: Option<(&Store, &TrajectorySourceGuard)>,
     error: &anyhow::Error,
     key: &PreviewKey,
     sender: &Sender<PickerUpdate>,
     failures: &PreviewFailures,
 ) -> omnis_store::Result<Option<omnis_ir::SourceRevision>> {
-    if TrajectorySourceGuard::uses_file_time(key.session.provider)
-        && search_index::retryable_read_failure(error)
-    {
+    if search_index::retryable_read_failure(error) {
         return Err(StoreError::TrajectorySourceChanged);
     }
     let Some((store, guard)) = writer else {
@@ -1595,27 +2165,25 @@ fn report_rejected_preview(
         .filter(|&revision| preview_source_matches(key, Some(native), revision)))
 }
 
-fn publish_preview_title(
-    registry: &AdapterRegistry,
+fn select_pi_preview_writer(
     store: &Store,
-    session: &SessionRef,
+    native: &NativeSession,
+    path: &Path,
     sender: &Sender<PickerUpdate>,
-) {
-    if matches!(
-        session.provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
-    ) && let Some(title) = search_index::stored_title_update(registry, store, session)
-    {
-        let _ = sender.send(PickerUpdate::Titles(vec![title]));
-    }
+) -> Option<TrajectorySourceGuard> {
+    let workspace = native.project_path.clone()?;
+    let revision = omnis_adapters::TranscriptRevision::read(path).ok()?.key;
+    store
+        .select_pi_workspaces(&[(workspace, crate::indexed_pi_copy(native), Some(revision))])
+        .ok()?;
+    preview_write_guard(store, &native.session, sender)
 }
 
-fn read_pi_preview(
+fn read_provider_preview(
     registry: &AdapterRegistry,
     store: Option<&Store>,
     key: &PreviewKey,
     sender: &Sender<PickerUpdate>,
-    full_read: bool,
     failures: &PreviewFailures,
 ) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
     let path = key.copy_path.as_deref()?;
@@ -1624,186 +2192,98 @@ fn read_pi_preview(
         _ => return None,
     };
     let adapter = registry.adapter(key.session.provider).ok()?;
-    let native = adapter.selected_session_at(&key.session.id, path).ok()??;
-    if native.source_revision.and_then(|r| r.file) != Some(expected)
-        || native.project_path != key.copy_directory
-    {
-        return None;
-    }
-    let writer = store.and_then(|store| {
-        let workspace = native.project_path.clone()?;
-        let revision = omnis_adapters::TranscriptRevision::read(path).ok()?.key;
-        store
-            .select_pi_workspaces(&[(workspace, crate::indexed_pi_copy(&native), Some(revision))])
-            .ok()?;
-        Some((store, preview_write_guard(store, &key.session, sender)?))
-    });
-    let read = if full_read {
-        adapter.read_full_index_at(&key.session, Some(path))
-    } else {
-        adapter
-            .index_session(
-                &key.session,
-                Some(path),
-                crate::search_index::FULL_READ_SOURCE_BYTES,
-            )
-            .or_else(|_| adapter.index_session(&key.session, Some(path), 0))
-    };
-    let read = match read {
-        Ok(read) => read,
-        Err(error) => {
-            let revision =
-                report_rejected_preview(registry, writer, &error, key, sender, failures).ok()??;
-            return Some((PreviewValue::Unavailable, Some(revision)));
-        }
-    };
-    let revision = read.source_revision;
-    if revision.file != Some(expected)
-        || !preview_source_matches(key, read.native_session.as_ref(), revision)
-    {
-        return None;
-    }
-    if let (Some((store, guard)), Some(observed)) = (writer, read.native_session.as_ref())
-        && let Some(time) = observed.updated_at
-        && let Err(error) = crate::store_verified_search_document(
-            store,
-            &key.session,
-            &read,
-            read.source_complete || read.provider_limited,
-            time,
-            guard,
-            Some((registry, observed)),
-        )
-    {
-        let _ = sender.send(PickerUpdate::Warning(format!(
-            "trajectory index write: {error}"
-        )));
-    }
-    Some((
-        PreviewValue::from_read(read, key.continuation_after, true),
-        Some(revision),
-    ))
-}
-
-fn read_provider_preview(
-    registry: &AdapterRegistry,
-    store: Option<&Store>,
-    key: &PreviewKey,
-    sender: &Sender<PickerUpdate>,
-    preview_failures: &PreviewFailures,
-) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
-    let full_read = key.continuation_after.is_some();
-    if key.session.provider == Provider::OpenCode && !full_read {
-        return None;
-    }
-    if matches!(key.session.provider, Provider::Pi | Provider::OhMyPi) {
-        return read_pi_preview(registry, store, key, sender, full_read, preview_failures);
-    }
-    read_other_preview(registry, store, key, sender, preview_failures)
-}
-
-fn read_other_preview(
-    registry: &AdapterRegistry,
-    store: Option<&Store>,
-    key: &PreviewKey,
-    sender: &Sender<PickerUpdate>,
-    preview_failures: &PreviewFailures,
-) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
-    let full_read = key.continuation_after.is_some();
-    let imported = key.session.provider == Provider::Imported;
-    let file_backed =
-        omnis_store::TrajectorySourceGuard::verifies_search_file(key.session.provider);
     let mut retry = true;
     loop {
-        let writer = store
-            .and_then(|store| Some((store, preview_write_guard(store, &key.session, sender)?)));
-        // Antigravity verifies the selected file even when the store is unavailable.
-        let strict = full_read
-            || (file_backed && writer.is_none() && key.session.provider != Provider::Antigravity);
-        let (read, source_time) = match read_search_snapshot(registry, &key.session, strict) {
+        let native = adapter.selected_session_at(&key.session.id, path).ok()??;
+        if native.source_revision.and_then(|r| r.file) != Some(expected)
+            || native.project_path != key.copy_directory
+        {
+            return None;
+        }
+        let writer = store.and_then(|store| {
+            select_pi_preview_writer(store, &native, path, sender).map(|guard| (store, guard))
+        });
+        let writer = writer.as_ref().map(|(store, guard)| (*store, guard));
+        let full_read = key.continuation_after.is_some() || writer.is_none();
+        let read = if full_read {
+            adapter.read_full_index_at(&key.session, Some(path))
+        } else {
+            adapter
+                .index_session(
+                    &key.session,
+                    Some(path),
+                    crate::search_index::FULL_READ_SOURCE_BYTES,
+                )
+                .or_else(|_| adapter.index_session(&key.session, Some(path), 0))
+        };
+        let read = match read {
             Ok(read) => read,
             Err(error) => {
-                match report_rejected_preview(
-                    registry,
-                    writer,
-                    &error,
-                    key,
-                    sender,
-                    preview_failures,
-                ) {
+                match report_rejected_preview(registry, writer, &error, key, sender, failures) {
                     Err(StoreError::TrajectorySourceChanged) if retry => {
                         retry = false;
                         continue;
                     }
-                    result => {
-                        return result
-                            .ok()
-                            .flatten()
-                            .map(|revision| (PreviewValue::Unavailable, Some(revision)));
-                    }
+                    Ok(Some(revision)) => return Some((PreviewValue::Unavailable, Some(revision))),
+                    _ => return None,
                 }
             }
         };
-        if file_backed && source_time.is_none() {
-            if retry {
-                retry = false;
-                continue;
-            }
-            return None;
-        }
         let revision = read.source_revision;
-        if !preview_source_matches(key, read.native_session.as_ref(), revision) {
+        if revision.file != Some(expected)
+            || !preview_source_matches(key, read.native_session.as_ref(), revision)
+        {
             return None;
         }
-        if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
-            let stored = crate::store_verified_search_document(
+        if let (Some((store, guard)), Some(observed)) = (writer, read.native_session.as_ref())
+            && let Some(time) = observed.updated_at
+            && let Err(error) = crate::store_verified_search_document(
                 store,
                 &key.session,
                 &read,
-                strict || imported,
-                source_time,
+                read.source_complete || read.provider_limited,
+                time,
                 guard,
-                read.native_session
-                    .as_ref()
-                    .map(|native| (registry, native)),
-            );
-            if let Err(error) = stored {
-                if matches!(error, omnis_store::StoreError::TrajectoryPreviewRejected) {
-                    refresh_preview_failures(store, sender, preview_failures, |known| {
+                Some((registry, observed)),
+            )
+        {
+            match error {
+                StoreError::TrajectoryPreviewRejected => {
+                    refresh_preview_failures(store, sender, failures, |known| {
                         !known
                             .get(&key.session)
                             .is_some_and(|failed| failed.matches_file_revision(revision))
                     });
                     return Some((PreviewValue::Unavailable, Some(revision)));
                 }
-                if matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
-                    if retry {
-                        retry = false;
-                        continue;
+                StoreError::TrajectorySourceChanged if retry => {
+                    retry = false;
+                    continue;
+                }
+                StoreError::TrajectorySourceChanged => return None,
+                error => {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "trajectory index write: {error}"
+                    )));
+                    if !full_read {
+                        return None;
                     }
-                    return None;
                 }
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index write: {error}"
-                )));
-                if file_backed && !strict {
-                    return None;
-                }
-            } else {
-                publish_preview_title(registry, store, &key.session, sender);
-            }
-            if file_backed {
-                refresh_preview_failures(store, sender, preview_failures, |known| {
-                    known.contains_key(&key.session)
-                });
             }
         }
-        if key.session.provider == Provider::OhMyPi && source_time != key.updated_at {
+        if let Some((store, _)) = writer {
+            refresh_preview_failures(store, sender, failures, |known| {
+                known.contains_key(&key.session)
+            });
+        }
+        if key.session.provider == Provider::OhMyPi
+            && read.native_session.as_ref().and_then(|n| n.updated_at) != key.updated_at
+        {
             return None;
         }
         return Some((
-            PreviewValue::from_read(read, key.continuation_after, strict || imported),
-            revision.file.map(|_| revision),
+            PreviewValue::from_read(read, key.continuation_after, true),
+            Some(revision),
         ));
     }
 }
@@ -1832,6 +2312,11 @@ impl PreviewValue {
         let complete = full_read && read.source_complete;
         let verified_prefix_end = read.verified_prefix_end;
         let mut snapshot = read.snapshot;
+        let can_use_first_title = !has_scoped_home(snapshot.session.provider)
+            || verified_prefix_end.map_or(complete, |end| {
+                omnis_core::search_title_opener_from_messages(&snapshot.events)
+                    .is_some_and(|(sequence, _)| sequence < end)
+            });
         let preview = Box::new(session_preview(&snapshot));
         let message_count_is_complete = omnis_core::session_message_coverage(&snapshot, complete)
             == omnis_core::MessageCoverage::Complete;
@@ -1851,7 +2336,7 @@ impl PreviewValue {
             continuation,
             preview,
             source_provider: snapshot.session.provider,
-            can_use_first_title: true,
+            can_use_first_title,
             message_count_is_complete,
             complete,
         }
@@ -1888,7 +2373,7 @@ pub(super) fn spawn_trajectory_search_updates(
             let result = store.as_ref().map_or_else(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
-                    if request.eligible_sessions.iter().any(|s| {
+                    if request.eligible_sessions.iter().any(|(s, _)| {
                         matches!(s.session.provider, Provider::Pi | Provider::OhMyPi)
                             && s.session.id.ends_with("@unverified")
                     }) {
@@ -1917,18 +2402,15 @@ pub(super) fn spawn_trajectory_search_updates(
                     store
                         .alias_pi_documents(&aliases)
                         .map_err(|error| error.to_string())?;
-                    crate::scope_search_trajectories(
-                        &AdapterRegistry::with_local_adapters(),
-                        store,
-                        &mut request.eligible_sessions,
-                    )
-                    .map_err(|error| error.to_string())?;
                     store
-                        .search_selected_trajectory_page(
-                            &request.query,
-                            TRAJECTORY_SEARCH_LIMIT,
-                            &request.eligible_sessions,
-                        )
+                        .read_trajectory_search(|snapshot| {
+                            let selections = crate::ScopedSearchSelections::new_for_picker(
+                                snapshot,
+                                &request.homes,
+                                request.eligible_sessions,
+                            )?;
+                            selections.search(snapshot, &request.query, TRAJECTORY_SEARCH_LIMIT)
+                        })
                         .map_err(|error| error.to_string())
                 },
             );
@@ -1945,13 +2427,43 @@ pub(super) fn spawn_trajectory_search_updates(
     });
 }
 
+fn remember_native_titles(
+    state: &mut PickerState,
+    titles: Vec<(SessionRef, Option<Uuid>, Option<String>)>,
+) {
+    let titles = titles
+        .into_iter()
+        .filter_map(|(session, file, title)| {
+            let index = *state.entry_positions.get(&session.to_string())?;
+            let selected_file = state.entries[index].source_file();
+            if selected_file == file {
+                state.pending_native_titles.remove(&session);
+                Some(IndexedTrajectoryTitle {
+                    document_version: omnis_core::search_document_version(session.provider),
+                    verified_at: None,
+                    cached_at: None,
+                    session,
+                    title,
+                    source_revision: SourceRevision {
+                        file,
+                        ..SourceRevision::default()
+                    },
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    state.remember_source_titles(titles);
+}
+
 fn receive_preview(
     state: &mut PickerState,
     mut key: PreviewKey,
     value: PreviewValue,
     metadata: PreviewMetadata,
 ) {
-    if !matches!(key.session.provider, Provider::Codex | Provider::Imported) {
+    if super::uses_strict_preview_failures(key.session.provider) {
         state.accept_preview(key, value, metadata.read_revision);
         return;
     }
@@ -1989,6 +2501,8 @@ pub(super) fn receive_updates(
         changed = true;
         match update {
             PickerUpdate::ResumeIndex(native) => state.resume_index_sources(native),
+            PickerUpdate::NativeHomes(homes) => state.native_homes = homes,
+            PickerUpdate::NativeTitles(titles) => remember_native_titles(state, titles),
             PickerUpdate::Cached(Ok(cached)) => {
                 state.cache_loaded = true;
                 state.replace_all_entries(cached.entries);
@@ -2026,25 +2540,7 @@ pub(super) fn receive_updates(
             }
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
-                match update.result {
-                    Ok(mut entries) => {
-                        if update.provider == Provider::Codex {
-                            state.reconcile_discovered_names(&mut entries, update.names.as_deref());
-                        }
-                        state.replace_provider_entries(
-                            update.provider,
-                            entries,
-                            update.complete,
-                            update
-                                .names
-                                .as_ref()
-                                .map_or(&[], |names| names.unavailable.as_slice()),
-                        );
-                    }
-                    Err(error) => {
-                        record_picker_warning(warnings, format!("{}: {error}", update.provider));
-                    }
-                }
+                update.apply(state, warnings);
             }
             PickerUpdate::RefreshStarted(provider) => {
                 pending.insert(provider);
@@ -2126,10 +2622,22 @@ mod tests {
 
     use super::*;
 
+    fn write_full_transcript_fixture(path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut preferred = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let padding = "x".repeat(8 * 1024);
+        for n in 0..2300 {
+            let reply = if n == 1150 { "middlereply" } else { "edge" };
+            writeln!(
+                preferred,
+                r#"{{"type":"PLANNER_RESPONSE","content":"{reply}","thinking":"{padding}"}}"#
+            )?;
+        }
+        preferred.flush()
+    }
+
     #[test]
     fn picker_preview_keeps_full_search_upgrade_for_a_restored_transcript() -> Result<()> {
-        use std::io::Write;
-
         let root = tempfile::tempdir()?;
         let id = uuid::Uuid::new_v4().to_string();
         let logs = root
@@ -2165,36 +2673,40 @@ mod tests {
         };
         assert_eq!(index(&selected()?)?.indexed, 1);
 
-        let mut preferred =
-            std::io::BufWriter::new(std::fs::File::create(logs.join("transcript_full.jsonl"))?);
-        let padding = "x".repeat(8 * 1024);
-        for n in 0..2300 {
-            let reply = if n == 1150 { "middlereply" } else { "edge" };
-            writeln!(
-                preferred,
-                r#"{{"type":"PLANNER_RESPONSE","content":"{reply}","thinking":"{padding}"}}"#
-            )?;
-        }
-        preferred.flush()?;
+        write_full_transcript_fixture(&logs.join("transcript_full.jsonl"))?;
         let native = selected()?;
         let key = PreviewKey {
             copy_path: None,
             copy_directory: None,
             session: native.session.clone(),
             source: native.source_revision.map(PreviewSource::File),
+            source_revision: native.source_revision,
+            native_home: registry.discovery_cache_home(Provider::Antigravity)?,
+            native_summary: false,
+            catalog: None,
             updated_at: native.updated_at,
             continuation_after: None,
         };
         let (sender, _updates) = mpsc::channel();
+        let (refresh, _requests) = mpsc::sync_channel(1);
+        let update = preview_update(
+            &registry,
+            Some(&store),
+            PreviewRequest {
+                key,
+                source_path: native.source_path.clone(),
+                cached: false,
+                provider_name: native.title.clone(),
+            },
+            &sender,
+            &refresh,
+        );
         assert!(matches!(
-            read_provider_preview(
-                &registry,
-                Some(&store),
-                &key,
-                &sender,
-                &PreviewFailures::default()
-            ),
-            Some((PreviewValue::Ready { .. }, _))
+            update,
+            PickerUpdate::Preview {
+                value: PreviewValue::Ready { .. },
+                ..
+            }
         ));
         let metadata = crate::indexed_session_metadata(&native);
         store.upsert_indexed_session(&metadata)?;
@@ -2252,6 +2764,10 @@ mod tests {
             copy_directory: native.project_path.clone(),
             session: native.session.clone(),
             source: Some(PreviewSource::File(native.source_revision.unwrap())),
+            native_home: None,
+            source_revision: native.source_revision,
+            native_summary: false,
+            catalog: None,
             updated_at: native.updated_at,
             continuation_after: None,
         };
@@ -2385,6 +2901,7 @@ mod grok_preview_tests {
         let store = Store::open(root.path().join("store.sqlite3"))?;
         let session = SessionRef::new(Provider::Grok, "selected");
         let failure = omnis_store::TrajectoryIndexFailure {
+            native_summary: false,
             ancestor_revisions: Vec::new(),
             source_file: Some(uuid::Uuid::from_u128(1)),
             source_contents: Some(uuid::Uuid::from_u128(2)),
@@ -2432,10 +2949,15 @@ mod grok_preview_tests {
             copy_directory: None,
             session,
             source: selected.source_revision.map(PreviewSource::File),
+            native_home: None,
+            source_revision: selected.source_revision,
+            native_summary: false,
+            catalog: None,
             updated_at: None,
             continuation_after: None,
         };
-        let guard = TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
+        let guard = TrajectorySourceGuard::Observed(Some(TrajectoryIndexState {
+            native_summary: false,
             ancestor_stamp: None,
             source_complete: true,
             source_byte_count: 0,
@@ -2448,11 +2970,11 @@ mod grok_preview_tests {
             provider_limited: false,
         }));
         let store = Store::open(root.path().join("store.sqlite3"))?;
-        let read = read_picker_preview(
+        let read = read_codex_picker_preview(
             &registry,
             &key,
             selected.source_path.as_deref(),
-            Some((&store, guard)),
+            Some((&store, &guard)),
             || {},
         )?;
         assert!(read.source_complete);

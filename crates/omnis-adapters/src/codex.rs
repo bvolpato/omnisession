@@ -636,7 +636,12 @@ impl CodexAdapter {
             let mut snapshot = native.snapshot(session, events, project, read.snapshot.captured_at);
             snapshot.title.clone_from(&read.snapshot.title);
             let document = omnis_core::trajectory_search_document(&snapshot);
-            if Sha256::digest(document.text.as_bytes())[..] != *expected_hash {
+            let matches = |text: &str| Sha256::digest(text.as_bytes())[..] == *expected_hash;
+            let historical_text = document
+                .legacy_utf8_text
+                .as_ref()
+                .and_then(|projection| projection.historical_text());
+            if !matches(&document.text) && !historical_text.is_some_and(matches) {
                 return Ok(None);
             }
             Ok(Some(IndexRead {

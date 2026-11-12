@@ -124,6 +124,11 @@ fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
                         projection: None,
                         source_revision: omnis_ir::SourceRevision::default(),
                         ancestor_revisions: &[],
+                        database_step_proof: None,
+                        database_wal_commits: None,
+                        database_summary_revision: None,
+                        desktop_projection: None,
+                        legacy_utf8_text: None,
                         provider_limited: false,
                         title_authoritative: false,
                         title_is_verified: false,
@@ -1429,6 +1434,11 @@ fn check_fork_search_upgrade(document_version: u32, padding_rows: u32) -> anyhow
         &session,
         &TrajectoryDocument {
             ancestor_revisions: &[],
+            database_step_proof: None,
+            database_wal_commits: None,
+            database_summary_revision: None,
+            desktop_projection: None,
+            legacy_utf8_text: None,
             redacted_text: local_text,
             source_updated_at: child.metadata()?.modified()?.into(),
             source_revision: if document_version == 4 {
@@ -2008,10 +2018,11 @@ fn restore_legacy_title_cache(fixture: &Fixture) {
     .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE session_trajectories SET document_version=6,derived_title='Tune the rate limiter backoff',
-             derived_title_is_verified=1,derived_title_is_local_opener=0
-             WHERE provider='codex' AND session_id=?1 AND source_complete=0",
-            [CODEX_ID],
+            "UPDATE session_trajectories SET document_version=6,source_updated_submillis=NULL,
+             derived_title='Tune the rate limiter backoff',derived_title_is_verified=1,derived_title_is_local_opener=0
+             WHERE provider='codex' AND session_id=?1 AND source_complete=0
+               AND document_version=?2 AND derived_title='Investigate latency instead'",
+            rusqlite::params![CODEX_ID, omnis_core::search_document_version(omnis_ir::Provider::Codex)],
         )
         .unwrap(),
         1,
@@ -2548,6 +2559,62 @@ fn check_codex_gui_name_changes(archived: bool, legacy: bool) {
 }
 
 #[test]
+fn cached_omp_titles_from_version_eight_require_the_selected_file() {
+    let fixture = Fixture::new();
+    let sessions = fixture.root.join("omp");
+    fs::create_dir(&sessions).unwrap();
+    write_jsonl(
+        &sessions.join("branches.jsonl"),
+        &[
+            json!({"type":"title","title":"Catalog name"}),
+            json!({"type":"session","version":3,"id":"branches","cwd":fixture.workspace}),
+            json!({"type":"title_change","id":"active","parentId":null,"title":"Active name"}),
+            json!({"type":"title_change","id":"other","parentId":null,"title":"Abandoned name"}),
+            json!({"type":"message","id":"latest","parentId":"active","message":{"role":"user","content":"Starmarker"}}),
+        ],
+    );
+    let indexed = fixture
+        .command()
+        .env("OMP_SESSION_DIR", sessions)
+        .args(["--json", "index", "--provider", "omp"])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let cache = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    let cached_title = || {
+        fixture.search_json(&[
+            "Starmarker",
+            "--provider",
+            "omp",
+            "--cached",
+            "--no-index",
+            "--show-text",
+        ])["results"][0]["title"]
+            .clone()
+    };
+    cache
+        .execute(
+            "UPDATE session_trajectories SET document_version=8 WHERE provider='omp'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(cached_title(), "Active name");
+
+    // The other version-8 reader saved the last name across all branches without a file revision.
+    cache
+        .execute_batch(
+            "UPDATE session_index SET source_file_id=NULL, source_contents_id=NULL,
+                source_updated_submillis=NULL WHERE provider='omp';
+             UPDATE pi_search_copies SET metadata=json_set(metadata,'$.source_revision',NULL)
+                WHERE provider='omp';
+             UPDATE session_trajectories SET source_file_id=NULL, source_contents_id=NULL,
+                title_authoritative=NULL, derived_title='Abandoned name' WHERE provider='omp';",
+        )
+        .unwrap();
+    assert_eq!(cached_title(), "Catalog name");
+}
+
+#[test]
 fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     let fixture = Fixture::new();
     let indexed = fixture
@@ -2613,6 +2680,255 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     );
     let live = fixture.search_json(&["zebracorn", "--no-index"]);
     assert!(result_sessions(&live).is_empty());
+}
+
+#[test]
+fn upgraded_search_documents_refresh_on_direct_reads_and_for_imported_bundles() {
+    let fixture = Fixture::new();
+    let source = format!("claude:{CLAUDE_ID}");
+    let bundle_path = fixture.root.join("bundle.json");
+    let bundle_path = bundle_path.to_str().unwrap();
+    fixture.run_json(&["index", "--provider", "claude"]);
+    fixture.run_json(&["export", &source, "--output", bundle_path]);
+    let receipt = fixture.run_json(&["import", bundle_path]);
+    let imported = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+    let other_bundle = fixture.root.join("other-bundle.json");
+    let receipt = fixture.run_json(&[
+        "export",
+        &format!("codex:{OTHER_CODEX_ID}"),
+        "--output",
+        other_bundle.to_str().unwrap(),
+    ]);
+    let other_import = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+
+    let database = fixture.root.join("state/store.sqlite3");
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute("UPDATE session_trajectories SET document_version = 0", [])
+        .unwrap();
+    let store = omnis_store::Store::open(&database).unwrap();
+    for (session, state) in store.trajectory_index_states().unwrap() {
+        store
+            .upsert_session_trajectory(&session, "oldprojectiononly", state.source_updated_at, true)
+            .unwrap();
+    }
+    drop(store);
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "DELETE FROM session_index WHERE provider = 'imported' AND session_id = ?1",
+            [receipt["bundle_id"].as_str().unwrap()],
+        )
+        .unwrap();
+
+    fixture.run_json(&["index", "--provider", "codex"]);
+    fixture.run_json(&["list", "--provider", "codex"]);
+    fixture.run_json(&["show", &format!("codex:{CODEX_ID}")]);
+    let scoped = fixture.search_json(&["oldprojectiononly", "--no-index", "--provider", "codex"]);
+    assert_eq!(scoped["index"]["indexed"], 0);
+    let existing = fixture.search_json(&[
+        "oldprojectiononly",
+        "--cached",
+        "--no-index",
+        "--provider",
+        "imported",
+    ]);
+    assert_eq!(result_sessions(&existing), [imported.as_str()]);
+    assert_eq!(existing["index"]["stale"], 1);
+    assert_eq!(existing["index"]["indexed"], 0);
+    assert_eq!(existing["index"]["skipped"], true);
+    let refreshed = fixture.search_json(&["zebracorn", "--cached", "--provider", "imported"]);
+    assert_eq!(result_sessions(&refreshed), [imported.as_str()]);
+    assert_eq!(refreshed["index"]["stale"], 1);
+    assert_eq!(refreshed["index"]["indexed"], 1);
+    assert_eq!(refreshed["index"]["skipped"], false);
+    let current = fixture.search_json(&["zebracorn", "--cached", "--provider", "imported"]);
+    assert_eq!(current["index"]["stale"], 0);
+    assert_eq!(current["index"]["indexed"], 0);
+    assert_eq!(current["index"]["skipped"], true);
+    let cached = |query| result_sessions(&fixture.search_json(&[query, "--cached"]));
+    assert_eq!(cached("oldprojectiononly"), [source.as_str()]);
+    let other = fixture.search_json(&[
+        "oldprojectiononly",
+        "--no-index",
+        "--provider",
+        "imported",
+        "--all-projects",
+    ]);
+    assert_eq!(result_sessions(&other), [other_import]);
+    fixture.run_json(&["show", &source]);
+    let mut matches = cached("zebracorn");
+    matches.sort();
+    assert_eq!(matches, [source, imported]);
+    assert!(cached("oldprojectiononly").is_empty());
+}
+
+#[test]
+fn opening_an_imported_session_restores_the_locator_and_document_together() {
+    let fixture = Fixture::new();
+    let bundle = fixture.root.join("stored.json");
+    let receipt = fixture.run_json(&[
+        "export",
+        &format!("claude:{CLAUDE_ID}"),
+        "--output",
+        bundle.to_str().unwrap(),
+    ]);
+    let imported = format!("imported:{}", receipt["bundle_id"].as_str().unwrap());
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    database
+        .execute_batch(
+            "DELETE FROM session_index WHERE provider = 'imported';
+         UPDATE session_trajectories SET document_version = 0 WHERE provider = 'imported';
+         CREATE TRIGGER reject_document BEFORE INSERT ON session_trajectories
+         WHEN NEW.provider = 'imported' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+        )
+        .unwrap();
+    fixture.run_json(&["show", &imported]);
+    let count_locator = || {
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM session_index WHERE provider = 'imported'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count_locator(), 0);
+
+    database
+        .execute_batch("DROP TRIGGER reject_document;")
+        .unwrap();
+    fixture.run_json(&["show", &imported]);
+    let matches = fixture.search_json(&[
+        "zebracorn",
+        "--cached",
+        "--no-index",
+        "--provider",
+        "imported",
+        "--all-projects",
+    ]);
+    assert_eq!(result_sessions(&matches), [imported.as_str()]);
+    assert_eq!(matches["index"]["indexed"], 0);
+    assert_eq!(count_locator(), 1);
+}
+
+#[test]
+fn cached_search_counts_a_missing_imported_bundle_as_a_failed_refresh() {
+    let fixture = Fixture::new();
+    #[cfg(unix)]
+    let recorded_workspace = {
+        let alias = fixture.root.join("recorded-workspace");
+        std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let recorded_workspace = fixture.workspace.join(".");
+    fixture.run_json(&["list", "--provider", "imported"]);
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    database
+        .execute(
+            "INSERT INTO session_index (provider, session_id, project_path, event_count, indexed_at)
+             VALUES ('imported', ?1, ?2, 0, 0)",
+            [CLAUDE_ID, recorded_workspace.to_str().unwrap()],
+        )
+        .unwrap();
+    let pending =
+        fixture.search_json(&["marker", "--cached", "--provider", "imported", "--no-index"]);
+    assert_eq!(pending["index"]["stale"], 1);
+    assert_eq!(pending["index"]["failed"], 0);
+    assert_eq!(pending["index"]["skipped"], true);
+    let searched = fixture.search_json(&["marker", "--cached", "--provider", "imported"]);
+    assert_eq!(
+        searched["index"],
+        json!({"candidates": 1, "stale": 1, "indexed": 0, "failed": 1, "failed_skipped": 0, "skipped": false, "interrupted": false})
+    );
+    assert!(
+        searched["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains(CLAUDE_ID) && text.contains("not found")))
+    );
+}
+
+#[test]
+fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
+    let fixture = Fixture::new();
+    let source = format!("claude:{CLAUDE_ID}");
+    let file = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    let file_time = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::create_dir(fixture.root.join("state")).unwrap();
+    let database = fixture.root.join("state/store.sqlite3");
+    let store = omnis_store::Store::open(&database).unwrap();
+    let session = omnis_ir::SessionRef::new(omnis_ir::Provider::Claude, CLAUDE_ID);
+    let preview = "sampledpreview";
+    store
+        .upsert_trajectory_document(
+            &session,
+            &omnis_store::TrajectoryDocument {
+                source_revision: omnis_ir::SourceRevision::default(),
+                ancestor_revisions: &[],
+                redacted_text: preview,
+                projection: None,
+                database_step_proof: None,
+                database_wal_commits: None,
+                database_summary_revision: None,
+                desktop_projection: None,
+                legacy_utf8_text: None,
+                indexed_byte_count: preview.len(),
+                source_byte_count: preview.len(),
+                source_updated_at: file_time.into(),
+                truncation_strategy: "none",
+                source_complete: false,
+                provider_limited: false,
+                origin: omnis_store::SessionTrajectoryOrigin::Native,
+                document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+                derived_title: None,
+                title_is_verified: false,
+                local_opener: omnis_store::LocalOpenerEvidence::Unknown,
+                withdrawn_title: None,
+                title_authoritative: false,
+            },
+        )
+        .unwrap();
+    fixture.run_json(&["show", &source]);
+    assert_eq!(
+        store.search_session_trajectories("zebracorn", 10).unwrap(),
+        std::slice::from_ref(&session)
+    );
+    assert!(
+        store
+            .search_session_trajectories(preview, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let restored = fs::read_to_string(&file)
+        .unwrap()
+        .replace("zebracorn", "backdatedfixture");
+    fs::write(&file, restored).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(file_time - std::time::Duration::from_secs(86_400))
+        .unwrap();
+    fixture.run_json(&["show", &source]);
+    assert_eq!(
+        store
+            .search_session_trajectories("backdatedfixture", 10)
+            .unwrap(),
+        [session]
+    );
+    assert!(
+        store
+            .search_session_trajectories("zebracorn", 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3117,6 +3433,12 @@ fn no_index_searches_only_what_is_already_indexed() {
 
 #[test]
 fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
+    for version in [4, 5] {
+        check_unstamped_middle_messages(version);
+    }
+}
+
+fn check_unstamped_middle_messages(version: u32) {
     use std::io::{BufWriter, Write};
 
     let fixture = Fixture::new();
@@ -3156,8 +3478,8 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
     };
     for substituted in [false, true] {
         db.execute(
-            "UPDATE session_trajectories SET document_version=4, source_file_id=NULL, source_contents_id=NULL WHERE session_id=?1",
-            [CODEX_ID],
+            "UPDATE session_trajectories SET document_version=?2, source_file_id=NULL, source_contents_id=NULL WHERE session_id=?1 AND codex_home IS NOT NULL",
+            rusqlite::params![CODEX_ID, version],
         ).unwrap();
         if substituted {
             write("Topazjackdaw");
@@ -3177,9 +3499,17 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
             // Older readers marked a verified projection partial when the rollout had malformed records.
             for version in 6..=omnis_core::search_document_version(omnis_ir::Provider::Codex) {
                 assert_eq!(db.execute(
-                    "UPDATE session_trajectories SET document_version=?2, source_complete=0, tail_reader_version=0 WHERE session_id=?1",
+                    "UPDATE session_trajectories SET document_version=?2, source_complete=0, tail_reader_version=0 WHERE session_id=?1 AND codex_home IS NOT NULL",
                     rusqlite::params![CODEX_ID, version],
                 ).unwrap(), 1);
+                if version == 8 {
+                    // This reader saved the document before Codex homes had separate rows.
+                    db.execute(
+                        "UPDATE session_trajectories SET codex_home=NULL WHERE session_id=?1 AND codex_home IS NOT NULL",
+                        [CODEX_ID],
+                    )
+                    .unwrap();
+                }
                 assert_eq!(fixture.index_codex()["indexed"], 1);
                 assert!(hit("Bronzekestrel"));
                 assert!(hit("Visible"));
@@ -3322,6 +3652,16 @@ impl Fixture {
             command.env(variable, self.root.join("missing").join(variable));
         }
         command
+    }
+
+    fn run_json(&self, args: &[&str]) -> Value {
+        let output = self.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn search(&self, args: &[&str]) -> Output {

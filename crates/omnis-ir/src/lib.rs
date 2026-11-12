@@ -21,6 +21,10 @@ pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 
 /// Measurements of eligible, redacted text after event limits and before document limits.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "JSONL and SQLite record independent observations"
+)]
 pub struct SearchProjection {
     pub byte_count: usize,
     /// SHA-256 of the eligible text with its event separators.
@@ -38,6 +42,7 @@ pub struct SearchProjection {
     pub torn_final: bool,
     pub verified_append: bool,
     pub database_gap: bool,
+    pub database_history_unverified: bool,
     pub database_steps: Option<Vec<Uuid>>,
     pub database_aliases: std::sync::Arc<antigravity_receipts::DatabaseAliases>,
     /// Physical length scanned from start to end, including unreadable native records.
@@ -59,6 +64,7 @@ impl SearchProjection {
             torn_final: false,
             verified_append: false,
             database_gap: false,
+            database_history_unverified: false,
             database_steps: None,
             database_aliases: std::sync::Arc::default(),
             fully_scanned_bytes: None,
@@ -94,6 +100,7 @@ impl PartialEq for SearchProjection {
             && self.torn_final == other.torn_final
             && self.verified_append == other.verified_append
             && self.database_gap == other.database_gap
+            && self.database_history_unverified == other.database_history_unverified
             && self.database_steps == other.database_steps
             && self.database_aliases == other.database_aliases
             && self.fully_scanned_bytes == other.fully_scanned_bytes

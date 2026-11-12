@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Value, json};
@@ -105,6 +105,12 @@ fn session_id(metadata: &Value, path: &Path) -> Option<String> {
     })
 }
 
+fn metadata_timestamp(value: &Value, paths: &[&[&str]]) -> Option<DateTime<Utc>> {
+    paths
+        .iter()
+        .find_map(|path| parse_timestamp(value_at(value, std::slice::from_ref(path))))
+}
+
 fn metadata(value: &Value) -> CursorMetadata {
     CursorMetadata {
         title: string_at(
@@ -132,7 +138,7 @@ fn metadata(value: &Value) -> CursorMetadata {
             &[&["gitBranch"], &["git_branch"], &["git", "branch"]],
         )
         .map(str::to_owned),
-        created_at: parse_timestamp(value_at(
+        created_at: metadata_timestamp(
             value,
             &[
                 &["createdAt"],
@@ -141,8 +147,8 @@ fn metadata(value: &Value) -> CursorMetadata {
                 &["created"],
                 &["time", "created"],
             ],
-        )),
-        updated_at: parse_timestamp(value_at(
+        ),
+        updated_at: metadata_timestamp(
             value,
             &[
                 &["updatedAt"],
@@ -151,7 +157,7 @@ fn metadata(value: &Value) -> CursorMetadata {
                 &["updated"],
                 &["time", "updated"],
             ],
-        )),
+        ),
         event_count: value_at(
             value,
             &[
@@ -165,6 +171,15 @@ fn metadata(value: &Value) -> CursorMetadata {
         .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(1),
     }
+}
+
+// The first event describes the selected session. Its timestamp comes from Cursor's metadata.
+fn cursor_search_time(snapshot: &CanonicalSnapshot) -> DateTime<Utc> {
+    snapshot
+        .events
+        .first()
+        .and_then(|header| header.timestamp)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
 #[cfg(test)]
@@ -271,8 +286,9 @@ impl ProviderAdapter for CursorCliAdapter {
                 project_path: metadata.project_path,
                 git_branch: metadata.git_branch,
                 created_at: metadata.created_at,
-                updated_at: metadata.updated_at,
-                updated_at_approximate: false,
+                updated_at: metadata.updated_at.or(metadata.created_at),
+                updated_at_approximate: metadata.updated_at.is_none()
+                    && metadata.created_at.is_some(),
                 event_count: metadata.event_count,
                 source_path: Some(path),
                 source_revision: None,
@@ -294,7 +310,7 @@ impl ProviderAdapter for CursorCliAdapter {
                 "storage": "opaque",
                 "metadata": selected_metadata(&value),
             }),
-            metadata.updated_at,
+            metadata.updated_at.or(metadata.created_at),
             ReplayPolicy::HistoricalOnly,
             Some("meta".to_owned()),
             None,
@@ -326,6 +342,14 @@ impl ProviderAdapter for CursorCliAdapter {
             metadata.git_branch,
             captured_at,
         ))
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        _source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        Ok(cursor_search_time(snapshot))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -980,8 +1004,8 @@ fn cursor_ide_headers(
                 );
             }
         }
-        insert_integer(object, "createdAt", row.get(2)?);
-        insert_integer(object, "lastUpdatedAt", row.get(3)?);
+        fill_header_timestamp(object, "createdAt", row.get(2)?);
+        fill_header_timestamp(object, "lastUpdatedAt", row.get(3)?);
         insert_boolean(object, "isArchived", row.get(4)?);
         insert_boolean(object, "isSubagent", row.get(5)?);
         if let Some(mut header) = CursorIdeHeader::parse(
@@ -1021,11 +1045,15 @@ fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> 
     )
 }
 
-fn insert_integer(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<i64>) {
-    if let Some(value) = value {
-        object
-            .entry(key)
-            .or_insert_with(|| Value::Number(value.into()));
+fn fill_header_timestamp(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<i64>,
+) {
+    if let Some(value) = value
+        && parse_timestamp(object.get(key)).is_none()
+    {
+        object.insert(key.to_owned(), Value::from(value));
     }
 }
 
@@ -1092,11 +1120,8 @@ impl CursorIdeHeader {
             id: id.to_owned(),
             title: string_at(value, &[&["title"], &["name"]]).map(str::to_owned),
             project_path,
-            created_at: parse_timestamp(value_at(
-                value,
-                &[&["createdAt"], &["created_at"], &["created"]],
-            )),
-            updated_at: parse_timestamp(value_at(
+            created_at: metadata_timestamp(value, &[&["createdAt"], &["created_at"], &["created"]]),
+            updated_at: metadata_timestamp(
                 value,
                 &[
                     &["updatedAt"],
@@ -1104,7 +1129,7 @@ impl CursorIdeHeader {
                     &["updated_at"],
                     &["lastUpdated"],
                 ],
-            )),
+            ),
             source_path: database.to_path_buf(),
             metadata,
         })
@@ -1117,8 +1142,8 @@ impl CursorIdeHeader {
             project_path: self.project_path,
             git_branch: None,
             created_at: self.created_at,
-            updated_at: self.updated_at,
-            updated_at_approximate: false,
+            updated_at: self.updated_at.or(self.created_at),
+            updated_at_approximate: self.updated_at.is_none() && self.created_at.is_some(),
             event_count: 1,
             source_path: Some(self.source_path),
             source_revision: None,
@@ -1712,7 +1737,7 @@ impl ProviderAdapter for CursorIdeAdapter {
         builder.push(
             EventKind::ProviderEvent,
             json!({ "storage": "opaque", "metadata": header.metadata }),
-            header.updated_at,
+            header.updated_at.or(header.created_at),
             ReplayPolicy::HistoricalOnly,
             Some("composerHeader".to_owned()),
             None,
@@ -1734,6 +1759,14 @@ impl ProviderAdapter for CursorIdeAdapter {
             None,
             captured_at,
         ))
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        _source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        Ok(cursor_search_time(snapshot))
     }
 
     fn new_session_plan(&self, _target: &LaunchTarget) -> Result<LaunchPlan> {

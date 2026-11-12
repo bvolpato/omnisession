@@ -1,13 +1,14 @@
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
-use crate::{Provider, Result, SessionRef, StoreError, database_error};
+use crate::{FIRST_PRIMARY_LEGACY_CHUNK, Provider, Result, SessionRef, StoreError, database_error};
 
 use omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT as MAX_DATABASE_STEPS;
 
-const RECEIPT_TABLES: [(Provider, &str); 2] = [
+const RECEIPT_TABLES: [(Provider, &str); 3] = [
     (Provider::AntigravityDesktop, "desktop_search_receipts"),
     (Provider::Antigravity, "antigravity_cli_search_receipts"),
+    (Provider::AntigravityIde, "antigravity_ide_search_receipts"),
 ];
 
 fn receipt_table(provider: Provider) -> Option<&'static str> {
@@ -17,7 +18,16 @@ fn receipt_table(provider: Provider) -> Option<&'static str> {
 }
 
 pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
+    let old_cleanup = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='antigravity_gap_projections_removed'
+         AND instr(sql,'old.first_chunk>=')=0)",
+        [], |row| row.get::<_, bool>(0),
+    ).map_err(database_error)?;
+    if old_cleanup {
+        tx.execute_batch("DROP TRIGGER antigravity_gap_projections_removed;")
+            .map_err(database_error)?;
+    }
+    tx.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS antigravity_read_catalogs (
             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
             source_home BLOB NOT NULL, source_file BLOB NOT NULL, source_contents BLOB NOT NULL,
@@ -50,9 +60,10 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
         END;
         CREATE TRIGGER IF NOT EXISTS antigravity_gap_projections_removed AFTER DELETE ON antigravity_gap_projections
         BEGIN
-            DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id=old.trajectory_id AND chunk_index>=old.first_chunk;
+            DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id=old.trajectory_id AND chunk_index>=old.first_chunk
+              AND (old.first_chunk>={FIRST_PRIMARY_LEGACY_CHUNK} OR chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK});
         END;",
-    )
+    ))
     .map_err(database_error)?;
     for (provider, table) in RECEIPT_TABLES {
         let legacy_key: bool = tx.query_row(
@@ -114,12 +125,14 @@ pub(super) fn promote_gap_projections(tx: &Transaction<'_>) -> Result<()> {
          CREATE TEMP TABLE promoted_gap_chunks AS
          SELECT d.id, c.chunk_index-d.first_chunk AS chunk_index, c.stored_text
          FROM promoted_gap_documents d JOIN session_trajectory_chunk_rows c
-           ON c.trajectory_id=d.id AND c.chunk_index>=d.first_chunk;
+           ON c.trajectory_id=d.id AND c.chunk_index>=d.first_chunk
+          AND (d.first_chunk>={FIRST_PRIMARY_LEGACY_CHUNK} OR c.chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK});
          DELETE FROM antigravity_search_gaps WHERE trajectory_id IN (
              SELECT trajectory_id FROM antigravity_gap_projections
          );
          DELETE FROM antigravity_gap_projections;
-         DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id IN (SELECT id FROM promoted_gap_documents);
+         DELETE FROM session_trajectory_chunk_rows WHERE chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK}
+           AND trajectory_id IN (SELECT id FROM promoted_gap_documents);
          INSERT INTO session_trajectory_chunk_rows (trajectory_id,chunk_index,stored_text)
          SELECT id,chunk_index,stored_text FROM promoted_gap_chunks;
          UPDATE session_trajectories AS doc SET
@@ -190,8 +203,7 @@ fn clear_unverified_preview_catalogs(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn read(
+pub(crate) fn read(
     tx: &Transaction<'_>,
     session: &SessionRef,
     home: &[u8],
@@ -251,7 +263,8 @@ pub(crate) fn save(
             "INSERT INTO {table}(session_id, trajectory_id, source_home, source_file, source_contents, content_hash, step_proof)
              VALUES(?1, (SELECT id FROM session_trajectories WHERE provider=?7 AND session_id=?1), ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id, source_home, source_file) DO UPDATE SET
-                 source_contents=excluded.source_contents, content_hash=excluded.content_hash, step_proof=excluded.step_proof",
+                 trajectory_id=excluded.trajectory_id, source_contents=excluded.source_contents,
+                 content_hash=excluded.content_hash, step_proof=excluded.step_proof",
         ))
         .and_then(|mut statement| {
             statement.execute(params![
@@ -268,7 +281,7 @@ pub(crate) fn save(
     Ok(())
 }
 
-fn catalog_hash(metadata: &crate::IndexedSession) -> Result<String> {
+pub(super) fn catalog_hash(metadata: &crate::IndexedSession) -> Result<String> {
     let fields = serde_json::to_vec(&(
         &metadata.title,
         &metadata.project_path,
@@ -303,6 +316,48 @@ fn record_catalog(
 }
 
 impl crate::Store {
+    /// Checks whether a scoped document used the current catalog, native revision, and reader version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store or catalog metadata cannot be read.
+    pub fn current_scoped_database_catalog(
+        &self,
+        catalog: &crate::IndexedSession,
+        home: &std::path::Path,
+        version: u32,
+    ) -> Result<bool> {
+        let Some(revision) = catalog.source_revision else {
+            return Ok(false);
+        };
+        let (Some(file), Some(contents)) = (revision.file, revision.contents) else {
+            return Ok(false);
+        };
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scoped_native_documents d
+             JOIN scoped_database_catalogs r ON r.document_id=d.id AND r.catalog_hash=?7
+             JOIN native_catalog_homes h ON h.provider=d.provider AND h.session_id=d.session_id
+               AND h.verified=1 AND h.home=d.source_home
+             JOIN session_index c ON c.provider=d.provider AND c.session_id=d.session_id
+               AND c.source_file_id=d.source_file AND c.source_contents_id=d.source_contents
+             WHERE d.provider=?1 AND d.session_id=?2 AND d.source_home=?3
+               AND d.source_file=?4 AND d.source_contents=?5 AND d.document_version=?6)",
+                params![
+                    catalog.session.provider.to_string(),
+                    catalog.session.id,
+                    home.as_os_str().as_encoded_bytes(),
+                    file.as_bytes(),
+                    contents.as_bytes(),
+                    version,
+                    catalog_hash(catalog)?
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     /// Returns database sessions whose verified read used this home, revision, catalog, and reader version.
     ///
     /// # Errors
@@ -504,12 +559,13 @@ mod tests {
                 id INTEGER PRIMARY KEY, provider TEXT, session_id TEXT
              );
              CREATE TABLE session_trajectory_chunk_rows (trajectory_id INTEGER, chunk_index INTEGER);
-             INSERT INTO session_trajectories(provider,session_id) VALUES('antigravity-desktop','session'), ('antigravity','session');",
+             INSERT INTO session_trajectories(provider,session_id) VALUES('antigravity-desktop','session'), ('antigravity','session'), ('antigravity-ide','session');",
         )
         .unwrap();
         initialize(&tx).unwrap();
         let session = &SessionRef::new(Provider::AntigravityDesktop, "session");
         let cli = &SessionRef::new(Provider::Antigravity, "session");
+        let ide = &SessionRef::new(Provider::AntigravityIde, "session");
         let (file, contents) = (Uuid::new_v4(), Uuid::new_v4());
         let hash = [1; 32];
         let proof = [Uuid::new_v4(), Uuid::new_v4()];
@@ -520,6 +576,12 @@ mod tests {
         save(&tx, session, b"a", file, contents, &hash, Some(&proof)).unwrap();
         assert_eq!(read(&tx, cli, b"a", file, contents, &hash).unwrap(), None);
         save(&tx, cli, b"a", file, contents, &hash, Some(&[])).unwrap();
+        assert_eq!(read(&tx, ide, b"a", file, contents, &hash).unwrap(), None);
+        save(&tx, ide, b"a", file, contents, &hash, Some(&proof[..1])).unwrap();
+        assert_eq!(
+            read(&tx, ide, b"a", file, contents, &hash).unwrap(),
+            Some(proof[..1].to_vec())
+        );
         save(&tx, session, b"b", file, contents, &hash, Some(&[])).unwrap();
         assert_eq!(lookup(b"a", file, contents, &hash), Some(proof.to_vec()));
         assert_eq!(lookup(b"a", file, contents, &[2; 32]), None);

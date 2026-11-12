@@ -172,6 +172,7 @@ fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure(
                 ancestor_revisions: Vec::new(),
                 source_updated_at: Some(old_time),
                 source_file: None,
+                native_summary: false,
                 source_contents: None,
                 source_time_precise: true,
                 document_version: 5,
@@ -406,10 +407,22 @@ fn check_legacy_catalog_recovery(env: &TestEnvironment, provider: &str) {
     assert_eq!(offline["results"][0]["coverage"], "complete", "{offline}");
     assert!(offline["results"][0]["project_path"].is_null());
     let live = state_json(env, "state", &args);
-    assert_eq!(live["index"]["stale"], 1, "{live}");
+    assert_eq!(live["results"][0]["coverage"], "complete", "{live}");
+    let source_verified: bool = store
+        .query_row(
+            "SELECT source_file_id IS NOT NULL AND source_contents_id IS NOT NULL AND verified
+             FROM session_index JOIN native_catalog_homes USING(provider,session_id)
+             WHERE provider=?1",
+            [provider],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(source_verified, "{live}");
+    let refreshed = state_json(env, "state", &cached);
+    assert_eq!(refreshed["results"][0]["coverage"], "complete");
     assert_eq!(
-        state_json(env, "state", &cached)["results"][0]["coverage"],
-        "complete"
+        refreshed["results"][0]["title"],
+        live["results"][0]["title"]
     );
     assert_eq!(state_json(env, "state", &args)["index"]["stale"], 0);
 }
@@ -1342,25 +1355,67 @@ fn search_reads_committed_antigravity_steps_from_the_wal() {
              INSERT INTO steps VALUES (2,x'80');",
             )
             .unwrap();
-        let wal = database.with_extension("db-wal");
-        for _ in 0..2 {
-            fs::copy(backup.with_extension("db-wal"), &wal).unwrap();
-            let observed = search("other");
+        check_restored_wal(provider, &database, &backup, search);
+        if provider == "antigravity-desktop" {
+            let writer = Connection::open(&database).unwrap();
+            writer
+                .execute(
+                    "INSERT INTO steps VALUES (2, x'080e9a01090a0772656e65776564')",
+                    [],
+                )
+                .unwrap();
+            drop(writer);
+            let committed = search("renewed");
             assert_eq!(
-                observed["results"][0]["coverage"], "preview",
-                "{provider} {observed}"
+                committed["results"][0]["coverage"], "complete",
+                "{committed}"
             );
-            let repeated = search("other");
-            assert_eq!(repeated["index"]["stale"], 0, "{provider} {repeated}");
-            assert_eq!(repeated["index"]["indexed"], 0, "{provider} {repeated}");
-            fs::remove_file(&wal).unwrap();
-            assert_eq!(
-                search("restored")["results"][0]["coverage"],
-                "complete",
-                "{provider}"
-            );
-            assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+            assert_eq!(search("restored")["results"][0]["coverage"], "complete");
+            assert!(search("other")["results"].as_array().unwrap().is_empty());
         }
+    }
+}
+
+fn check_restored_wal(
+    provider: &str,
+    database: &std::path::Path,
+    backup: &std::path::Path,
+    search: impl Fn(&str) -> serde_json::Value,
+) {
+    let wal = database.with_extension("db-wal");
+    for _ in 0..2 {
+        fs::copy(backup.with_extension("db-wal"), &wal).unwrap();
+        let observed = search("other");
+        assert_eq!(
+            observed["results"][0]["coverage"], "preview",
+            "{provider} {observed}"
+        );
+        let repeated = search("other");
+        assert_eq!(repeated["index"]["stale"], 0, "{provider} {repeated}");
+        assert_eq!(repeated["index"]["indexed"], 0, "{provider} {repeated}");
+        fs::remove_file(&wal).unwrap();
+        let recovered = search("restored");
+        let coverage = if provider == "antigravity" {
+            "complete"
+        } else {
+            "preview"
+        };
+        assert_eq!(
+            recovered["results"][0]["coverage"], coverage,
+            "{provider} {recovered}"
+        );
+        let prior = search("other");
+        if provider == "antigravity-desktop" {
+            assert_eq!(prior["results"][0]["coverage"], "preview", "{prior}");
+        } else {
+            assert!(prior["results"].as_array().unwrap().is_empty(), "{prior}");
+        }
+        let mixed = search("other restored");
+        assert!(
+            mixed["results"].as_array().unwrap().is_empty(),
+            "{provider} {mixed}"
+        );
+        assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
     }
 }
 
@@ -1947,15 +2002,6 @@ fn process_startup_migrates_legacy_bundle_without_exposing_mismatched_identity()
 
     let store_path = environment.state_root.join("store.sqlite3");
     let reopened = Store::open(&store_path).expect("reopen migrated store");
-    let page = reopened
-        .search_session_trajectory_page_for_sessions(
-            VISIBLE_MARKER,
-            10,
-            std::slice::from_ref(&imported),
-        )
-        .expect("search migrated imported source");
-    assert_eq!(page.matches.len(), 1);
-    assert_eq!(page.matches[0].session, imported);
     let imported_metadata = reopened
         .indexed_sessions_for_provider(Provider::Imported)
         .expect("read migrated metadata");
@@ -1966,7 +2012,34 @@ fn process_startup_migrates_legacy_bundle_without_exposing_mismatched_identity()
             .unwrap_or_default()
             .contains(SECRET_VALUE)
     );
+    assert!(
+        !reopened
+            .trajectory_index_states()
+            .unwrap()
+            .contains_key(&imported)
+    );
     drop(reopened);
+
+    let searched = environment
+        .command()
+        .current_dir(&environment.workspace)
+        .args([
+            "--json",
+            "search",
+            VISIBLE_MARKER,
+            "--cached",
+            "--provider",
+            "imported",
+        ])
+        .output()
+        .expect("search legacy imported session");
+    assert!(
+        searched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    let results: serde_json::Value = serde_json::from_slice(&searched.stdout).expect("search JSON");
+    assert_eq!(results["results"][0]["session"], imported.to_string());
 
     let mismatched = environment
         .command()

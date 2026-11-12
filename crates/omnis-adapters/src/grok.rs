@@ -24,7 +24,7 @@ use crate::{
         json_lines_preview_with_omissions, nested_files, parse_timestamp, paths_match,
         percent_decode, provider_executable, provider_file, provider_root,
         read_bounded_line_with_budget, read_json, sort_sessions, string_at, validate_provider,
-        value_at, visit_json_lines_with_omissions,
+        value_at, visit_json_lines_with_gaps,
     },
 };
 
@@ -431,6 +431,44 @@ impl GrokAdapter {
             .unwrap_or_default()
     }
 
+    fn source_files(&self, summary: &Path) -> Result<Vec<PathBuf>> {
+        let root = self
+            .sessions_root
+            .as_deref()
+            .context("Grok sessions root is unavailable")?;
+        let directory = summary
+            .parent()
+            .context("Grok summary has no parent directory")?;
+        let mut files = vec![summary.to_path_buf(), directory.to_path_buf()];
+        for name in
+            std::iter::once("updates.jsonl").chain(GROK_STATE_FILES.iter().map(|state| state.0))
+        {
+            if let Some(file) = provider_file(root, &directory.join(name)) {
+                files.push(file);
+            }
+        }
+        // Removing goal/state.json changes its parent directory.
+        let goal = directory.join("goal");
+        if goal
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            files.push(goal);
+        }
+        Ok(files)
+    }
+
+    fn search_time(&self, metadata: &GrokMetadata, summary: &Path) -> Result<DateTime<Utc>> {
+        if let Some(time) = metadata.updated_at {
+            return Ok(time);
+        }
+        self.source_files(summary)?
+            .into_iter()
+            .try_fold(DateTime::<Utc>::MIN_UTC, |latest, path| {
+                Ok(latest.max(SnapshotFileStamp::read(&path)?.changed_at()))
+            })
+    }
+
     fn resolved_summary(
         &self,
         id: &str,
@@ -439,6 +477,16 @@ impl GrokAdapter {
         let (summary, path) = self
             .find_summary(id)?
             .ok_or_else(|| anyhow!("Grok session `{id}` was not found"))?;
+        if let Some(hint) = listed_path {
+            anyhow::ensure!(
+                self.sessions_root
+                    .as_deref()
+                    .and_then(|root| provider_file(root, hint))
+                    .as_ref()
+                    == Some(&path),
+                "selected Grok source changed for session `{id}`"
+            );
+        }
         let metadata = self.resolved_metadata(id, &summary, &path, listed_path);
         Ok((summary, path, metadata))
     }
@@ -508,11 +556,8 @@ impl GrokAdapter {
                 Ok(())
             };
             if full {
-                omissions = visit_json_lines_with_omissions(
-                    file,
-                    MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
-                    push,
-                )?;
+                omissions =
+                    visit_json_lines_with_gaps(file, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, push)?;
             } else {
                 let preview = json_lines_preview_with_omissions(
                     file,
@@ -1195,7 +1240,10 @@ impl GrokMetadata {
         }
     }
 
-    fn into_session(self, id: String, source: PathBuf) -> NativeSession {
+    fn into_session(self, adapter: &GrokAdapter, id: String, source: PathBuf) -> NativeSession {
+        let updated_at = self
+            .updated_at
+            .or_else(|| adapter.search_time(&self, &source).ok());
         let revision = self.source_revision(&source);
         NativeSession {
             session: SessionRef::new(Provider::Grok, id),
@@ -1203,8 +1251,8 @@ impl GrokMetadata {
             project_path: self.project_path,
             git_branch: self.git_branch,
             created_at: self.created_at,
-            updated_at: self.updated_at,
-            updated_at_approximate: false,
+            updated_at,
+            updated_at_approximate: self.updated_at.is_none(),
             event_count: 0,
             source_revision: Some(revision),
             source_path: Some(source),
@@ -2279,7 +2327,7 @@ impl ProviderAdapter for GrokAdapter {
             }
             let mut data = metadata(&summary);
             data.fill_missing(&summary, &path, catalog.get(&id));
-            sessions.insert(id.clone(), data.into_session(id, path));
+            sessions.insert(id.clone(), data.into_session(self, id, path));
         }
         for (id, row) in &catalog {
             sessions.entry(id.clone()).or_insert_with(|| row.clone());
@@ -2355,7 +2403,7 @@ impl ProviderAdapter for GrokAdapter {
     fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
         if let Some((summary, path)) = self.find_summary(id)? {
             let metadata = self.resolved_metadata(id, &summary, &path, None);
-            return Ok(Some(metadata.into_session(id.to_owned(), path)));
+            return Ok(Some(metadata.into_session(self, id.to_owned(), path)));
         }
         Ok(self.catalog_sessions(Some(id)).pop())
     }
@@ -2400,11 +2448,27 @@ impl ProviderAdapter for GrokAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        Ok(self.index_session(session, None, u64::MAX)?.snapshot)
+        self.read_session_at(session, None)
+    }
+
+    fn read_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        Ok(self.index_session(session, source_path, u64::MAX)?.snapshot)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        Ok(self.index_session(session, None, 0)?.snapshot)
+        self.preview_session_at(session, None)
+    }
+
+    fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        Ok(self.index_session(session, source_path, 0)?.snapshot)
     }
 
     fn index_session(
@@ -2431,7 +2495,7 @@ impl ProviderAdapter for GrokAdapter {
             Self::updates_revision(&path) == ownership_revision,
             "selected Grok source changed during its read"
         );
-        let native = metadata.into_session(session.id.clone(), path);
+        let native = metadata.into_session(self, session.id.clone(), path);
         anyhow::ensure!(
             native.source_revision == Some(source_revision),
             "selected Grok source changed during its read"
@@ -2458,6 +2522,24 @@ impl ProviderAdapter for GrokAdapter {
             source_revision,
             native_session: Some(native),
         })
+    }
+
+    fn search_source_files(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        let (_, path, _) = self.resolved_summary(&session.id, source_path)?;
+        self.source_files(&path)
+    }
+
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        let (_, path, metadata) = self.resolved_summary(&snapshot.session.id, source_path)?;
+        self.search_time(&metadata, &path)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -2511,6 +2593,47 @@ mod tests {
         )
         .expect("synthetic updates");
         directory
+    }
+
+    #[test]
+    fn missing_update_time_uses_the_same_session_clock_for_each_search_read() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = write_session(
+            root.path(),
+            SESSION_ID,
+            &json!({"id":SESSION_ID, "updated_at":"unknown"}),
+            &[],
+        );
+        let adapter = GrokAdapter::with_root(root.path());
+        let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+        let expected = listed.updated_at.unwrap();
+        let path = listed.source_path.as_deref();
+        assert!(listed.updated_at_approximate);
+        for full in [true, false] {
+            let (_, observed) = adapter
+                .read_for_search(&listed.session, path, full)
+                .unwrap();
+            assert_eq!(observed, expected);
+        }
+        for budget in [0, u64::MAX] {
+            let (_, observed) = adapter
+                .index_for_search(&listed.session, path, budget, None)
+                .unwrap();
+            assert_eq!(observed, expected);
+        }
+
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"new update").unwrap();
+        let mut registry = crate::AdapterRegistry::new();
+        registry.register(adapter);
+        let (_, clock) = registry
+            .observe_search_read(&listed.session, path, |adapter, path| {
+                let read = adapter.read_for_search(&listed.session, path, true)?;
+                fs::rename(&replacement, directory.join("updates.jsonl"))?;
+                Ok(read)
+            })
+            .unwrap();
+        assert_eq!(clock, None);
     }
 
     #[test]

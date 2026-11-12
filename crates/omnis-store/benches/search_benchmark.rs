@@ -204,6 +204,11 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         derived_title: None,
         title_is_verified: false,
         local_opener: omnis_store::LocalOpenerEvidence::Unknown,
+        database_step_proof: None,
+        database_wal_commits: None,
+        database_summary_revision: None,
+        desktop_projection: None,
+        legacy_utf8_text: None,
         withdrawn_title: None,
         title_authoritative: false,
     }
@@ -511,7 +516,7 @@ fn synthetic_bundle(index: usize) -> PortableBundle {
     }
 }
 
-// Every command opens the store, and opening checks bundle protection for all trajectories.
+// Every command opens the store. Include bundles and trajectories to measure startup cost.
 fn bench_store_open(criterion: &mut Criterion) {
     let dataset = Dataset::create(OPEN_TRAJECTORY_COUNT);
     let store = dataset.open();

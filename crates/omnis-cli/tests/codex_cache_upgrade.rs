@@ -87,7 +87,7 @@ impl Fixture {
     }
 
     fn search(&self, provider: &str, term: &str) -> Vec<Value> {
-        let result = self.json(&[
+        let mut args = vec![
             "search",
             "--cached",
             "--show-text",
@@ -95,7 +95,11 @@ impl Fixture {
             "--provider",
             provider,
             term,
-        ]);
+        ];
+        if provider == "imported" {
+            args.push("--no-index");
+        }
+        let result = self.json(&args);
         assert_eq!(result["index"]["indexed"], 0);
         result["results"].as_array().unwrap().clone()
     }

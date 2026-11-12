@@ -14,6 +14,7 @@ mod opencode;
 mod pi;
 mod provider_process;
 mod source_file;
+mod sqlite_wal;
 mod support;
 pub use support::TranscriptRevision;
 #[cfg(all(test, unix))]
@@ -56,8 +57,8 @@ pub use provider_process::{
     inherit_provider_probes, provider_process, with_provider_probes,
 };
 pub use source_file::source_file_revision;
-pub use support::TranscriptReadLimit;
-pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
+pub use sqlite_wal::UnverifiedSqliteWal;
+pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, TranscriptReadLimit};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,8 +91,187 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
-    /// The file revision observed with this session's metadata.
+    /// The file revision observed with this session metadata.
     pub source_revision: Option<SourceRevision>,
+}
+
+/// Native catalog rows and the metadata quality observed during the same read.
+#[derive(Default)]
+pub struct NativeListing {
+    pub conflicting_grok_ids: Vec<String>,
+    pub sessions: Vec<NativeSession>,
+    pub notes: Vec<String>,
+    pub desktop_summaries_unavailable: bool,
+    /// Listed Desktop databases with no entry in a readable summary file.
+    pub missing_desktop_summary_ids: Vec<String>,
+    /// Desktop database IDs with a verified archive annotation.
+    pub archived_desktop_ids: Vec<String>,
+    /// Desktop database IDs whose archive annotations could not be verified.
+    pub unverified_desktop_ids: Vec<String>,
+}
+
+/// A durable source revision and the native path metadata that verified this read.
+#[derive(Debug)]
+pub struct SearchSourceObservation {
+    pub revision: SourceRevision,
+    pub session: NativeSession,
+    /// The desktop database was readable, but its optional summary metadata was unavailable.
+    pub desktop_summaries_unavailable: bool,
+    /// Canonical native home verified together with this session.
+    pub home: PathBuf,
+    selected_home: PathBuf,
+    database_generation: Option<antigravity::DatabaseGeneration>,
+    database_wal_commits: std::sync::OnceLock<Option<Vec<uuid::Uuid>>>,
+    database_summary_revision: Option<uuid::Uuid>,
+    paths: Vec<(PathBuf, FileObservation)>,
+}
+
+type FileObservation = std::result::Result<Option<support::SnapshotFileStamp>, std::io::ErrorKind>;
+
+impl SearchSourceObservation {
+    fn capture(
+        root: &Path,
+        paths: Vec<PathBuf>,
+        read: impl FnOnce() -> Result<NativeSession>,
+    ) -> Result<Self> {
+        Self::capture_with_optional(root, paths, Vec::new(), read)
+    }
+
+    fn capture_with_optional(
+        root: &Path,
+        paths: Vec<PathBuf>,
+        optional: Vec<PathBuf>,
+        read: impl FnOnce() -> Result<NativeSession>,
+    ) -> Result<Self> {
+        let home = root.canonicalize()?;
+        let mut paths = paths
+            .into_iter()
+            .map(|path| {
+                let stamp = optional_stamp(&path)?;
+                Ok((path, Ok(stamp)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        paths.extend(optional.into_iter().map(|path| {
+            let stamp = optional_stamp(&path).map_err(|error| error.kind());
+            (path, stamp)
+        }));
+        let session = read()?;
+        let revision = session
+            .source_revision
+            .ok_or_else(|| anyhow!("provider source revision is unavailable"))?;
+        let observed = Self {
+            revision,
+            session,
+            desktop_summaries_unavailable: false,
+            home,
+            selected_home: root.to_path_buf(),
+            database_generation: None,
+            database_wal_commits: std::sync::OnceLock::new(),
+            database_summary_revision: None,
+            paths,
+        };
+        anyhow::ensure!(
+            observed.is_current(),
+            "provider source changed during search read"
+        );
+        Ok(observed)
+    }
+
+    /// Returns whether an IDE compatibility reference selected a verified Desktop conversation database.
+    #[must_use]
+    pub fn is_ide_desktop_database(&self) -> bool {
+        self.session.session.provider == Provider::AntigravityIde
+            && self
+                .session
+                .source_path
+                .as_deref()
+                .is_some_and(|path| path.extension().is_some_and(|ext| ext == "db"))
+    }
+
+    /// Returns the observed Desktop database and WAL revision, independent of summary metadata.
+    #[must_use]
+    pub fn database_contents(&self) -> Option<uuid::Uuid> {
+        self.database_generation?.revision(None)?.contents
+    }
+
+    /// Returns the checkpointed database revision and the generation of its nonempty WAL, if present.
+    #[must_use]
+    pub fn database_checkpoint(&self) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
+        self.database_generation
+            .map(antigravity::DatabaseGeneration::checkpoint)
+    }
+
+    /// Identifies the committed prefixes of the WAL selected for this observation.
+    #[must_use]
+    pub fn database_wal_commits(&self) -> Option<&[uuid::Uuid]> {
+        let (_, wal) = self.database_checkpoint()?;
+        if !self.is_current() {
+            return None;
+        }
+        if wal.is_none() {
+            return Some(&[]);
+        }
+        self.database_wal_commits
+            .get_or_init(|| {
+                let database = self.session.source_path.as_deref()?;
+                let path = support::provider_file(&self.home, &support::sidecar(database, "-wal"))?;
+                let commits =
+                    sqlite_wal::commit_history(&path, support::sqlite_snapshot_byte_limit().ok()?)
+                        .ok()?;
+                self.is_current().then_some(commits)
+            })
+            .as_deref()
+    }
+
+    /// Identifies the physical summary file that supplied this database's declared count.
+    #[must_use]
+    pub fn database_summary_revision(&self) -> Option<uuid::Uuid> {
+        self.database_summary_revision
+    }
+
+    /// Checks a historical declaration against the selected database and WAL.
+    #[must_use]
+    pub fn matches_database_declaration(&self, count: usize, contents: uuid::Uuid) -> bool {
+        self.database_generation
+            .and_then(|generation| generation.revision(Some(count)))
+            .is_some_and(|revision| revision.contents == Some(contents))
+    }
+
+    fn watch_absent(&mut self, path: PathBuf) -> Result<()> {
+        anyhow::ensure!(
+            optional_stamp(&path)?.is_none(),
+            "provider source changed during search read"
+        );
+        self.paths.push((path, Ok(None)));
+        Ok(())
+    }
+
+    /// Checks the selected source before publishing a captured document or failure.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.selected_home
+            .canonicalize()
+            .is_ok_and(|home| home == self.home)
+            && self
+                .paths
+                .iter()
+                .all(|(path, before)| optional_stamp(path).map_err(|error| error.kind()) == *before)
+    }
+}
+
+fn optional_stamp(path: &Path) -> std::io::Result<Option<support::SnapshotFileStamp>> {
+    match support::SnapshotFileStamp::read(path) {
+        Ok(stamp) => Ok(Some(stamp)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // An unresolved link cannot verify that a companion file is absent.
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => Err(error),
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(other),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The opener confirmed by a full ordinary Codex read or by reconstructing an applied rollback.
@@ -388,12 +568,34 @@ pub trait ProviderAdapter: Send + Sync {
 
     fn probe(&self) -> ProviderInstallation;
 
+    /// Returns the canonical home whose native catalog this adapter uses for discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured home cannot be resolved.
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Lists native session metadata, optionally filtered by exact project path.
     ///
     /// # Errors
     ///
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
+
+    /// Returns the session listing with its non-fatal observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
+        Ok(NativeListing {
+            sessions: self.list_sessions(project)?,
+            notes: self.discovery_notes(),
+            ..NativeListing::default()
+        })
+    }
 
     /// Binds an explicit source workspace for a native ID shared by multiple files.
     ///
@@ -583,15 +785,6 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
-    /// Returns the canonical home whose native catalog this adapter uses for discovery.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configured home cannot be resolved.
-    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
-        Ok(None)
-    }
-
     /// Whether the last listing observed every eligible session across all projects.
     ///
     /// Return false for bounded, incomplete, or structurally unverified listings. An omitted
@@ -721,6 +914,57 @@ pub trait ProviderAdapter: Send + Sync {
         self.read_session(session)
     }
 
+    /// Returns the source time used by discovery for the data that produced this snapshot.
+    /// An adapter with no recorded time can use the Unix epoch as a stable search placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected source can no longer be verified.
+    fn search_source_time(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        _source_path: Option<&Path>,
+    ) -> Result<DateTime<Utc>> {
+        Ok(snapshot.captured_at)
+    }
+
+    /// Reads a snapshot and the provider's update time for that read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot read the session or verify its update time.
+    fn read_for_search(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read: bool,
+    ) -> Result<(CanonicalSnapshot, DateTime<Utc>)> {
+        let snapshot = if full_read {
+            self.read_session_at(session, source_path)?
+        } else {
+            self.preview_session_at(session, source_path)?
+        };
+        let time = self.search_source_time(&snapshot, source_path)?;
+        Ok((snapshot, time))
+    }
+
+    /// Reads the search projection within its budget and records the update time of that source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot read the source or verify its update time.
+    fn index_for_search(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+        prior: Option<PriorSearchDocument>,
+    ) -> Result<(IndexedSearchDocument, DateTime<Utc>)> {
+        let read = self.index_search_document(session, source_path, full_read_bytes, prior)?;
+        let time = self.search_source_time(&read.read.snapshot, source_path)?;
+        Ok((read, time))
+    }
+
     /// Reads a full transcript together with any catalog metadata verified by the same read.
     ///
     /// # Errors
@@ -820,6 +1064,46 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Returns the selected source files and directories when a search read uses several paths.
+    /// The registry checks their identities before and after reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected source cannot be resolved.
+    fn search_source_files(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
+    /// Observes the provider files selected for this search read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot verify the selected source.
+    fn observe_search_source(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Option<SearchSourceObservation>> {
+        Ok(None)
+    }
+
+    /// Returns whether this read covers an empty session recorded only in the native catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog entry or its selected source changed.
+    fn search_source_is_summary(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Reads history for indexing within a full-read byte budget.
     ///
     /// Shared-database adapters measure the selected session's content instead of the database.
@@ -837,7 +1121,8 @@ pub trait ProviderAdapter: Send + Sync {
         let source_path = selected_path.as_deref();
         let over_budget = source_path
             .and_then(|path| path.metadata().ok())
-            .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes)
+            && !self.search_source_is_summary(session, source_path)?;
         read_budgeted_transcript(!over_budget, |preview| {
             if preview {
                 self.preview_session_at(session, source_path)
@@ -976,9 +1261,32 @@ impl AdapterRegistry {
         provider: Provider,
         project: Option<&Path>,
     ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let listing = self.adapter(provider)?.list_catalog(project)?;
+        Ok((listing.sessions, listing.notes))
+    }
+
+    /// Reads catalog metadata from the selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error if the provider home changed or the listing failed.
+    pub fn list_sessions_in_home(
+        &self,
+        provider: Provider,
+        project: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Result<NativeListing> {
         let adapter = self.adapter(provider)?;
-        let sessions = adapter.list_sessions(project)?;
-        Ok((sessions, adapter.discovery_notes()))
+        anyhow::ensure!(
+            adapter.discovery_cache_home()?.as_deref() == home,
+            "provider home changed during discovery"
+        );
+        let listing = adapter.list_catalog(project)?;
+        anyhow::ensure!(
+            adapter.discovery_cache_home()?.as_deref() == home,
+            "provider home changed during discovery"
+        );
+        Ok(listing)
     }
 
     /// Dispatches an exact-ID metadata lookup to provider adapter.
@@ -1079,8 +1387,22 @@ impl AdapterRegistry {
     ) -> Result<(T, Option<DateTime<Utc>>)> {
         let adapter = self.adapter(session.provider)?;
         let Some(path) = adapter.search_timestamp_file(session, source_path)? else {
+            let stamps = || -> Result<Vec<_>> {
+                adapter
+                    .search_source_files(session, source_path)?
+                    .into_iter()
+                    .map(|path| {
+                        let stamp = optional_stamp(&path)?;
+                        Ok((path, stamp))
+                    })
+                    .collect()
+            };
+            let before = stamps()?;
             let (value, time) = read(adapter, source_path)?;
-            return Ok((value, Some(time)));
+            return Ok((
+                value,
+                stamps().is_ok_and(|after| after == before).then_some(time),
+            ));
         };
         let before = support::SnapshotFileStamp::read(&path).ok();
         let (value, _) = read(adapter, Some(&path))?;

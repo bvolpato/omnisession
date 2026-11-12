@@ -687,8 +687,15 @@ pub fn read_opencode_session_with_binary(
     binary: &Path,
     session: &SessionRef,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
+    read_opencode_search_snapshot(binary, session).map(|(snapshot, _)| snapshot)
+}
+
+fn read_opencode_search_snapshot(
+    binary: &Path,
+    session: &SessionRef,
+) -> Result<(omnis_ir::CanonicalSnapshot, DateTime<Utc>)> {
     validate_provider(session, Provider::OpenCode)?;
-    let initial = read_opencode_session_with_binary_at(binary, session, None);
+    let initial = read_opencode_search_snapshot_at(binary, session, None);
     if initial.is_ok() || is_opencode_v2(binary) {
         return initial;
     }
@@ -697,7 +704,7 @@ pub fn read_opencode_session_with_binary(
         .and_then(|record| record.project_path)
         .filter(|path| path.is_dir() && !same_file::is_same_file(path, ".").unwrap_or(false));
     match cwd {
-        Some(cwd) => read_opencode_session_with_binary_at(binary, session, Some(&cwd)),
+        Some(cwd) => read_opencode_search_snapshot_at(binary, session, Some(&cwd)),
         None => initial,
     }
 }
@@ -713,9 +720,17 @@ pub fn read_opencode_session_with_binary_at(
     session: &SessionRef,
     cwd: Option<&Path>,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
+    read_opencode_search_snapshot_at(binary, session, cwd).map(|(snapshot, _)| snapshot)
+}
+
+fn read_opencode_search_snapshot_at(
+    binary: &Path,
+    session: &SessionRef,
+    cwd: Option<&Path>,
+) -> Result<(omnis_ir::CanonicalSnapshot, DateTime<Utc>)> {
     validate_provider(session, Provider::OpenCode)?;
     let export = command_json(binary, &["export", &session.id], cwd)?;
-    canonicalize_opencode_export(session, &export)
+    canonicalize_opencode_export_with_time(session, &export)
 }
 
 /// Reads the requested session with a prepared export command and a caller-supplied deadline budget.
@@ -745,6 +760,13 @@ pub fn canonicalize_opencode_export(
     session: &SessionRef,
     export: &Value,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
+    canonicalize_opencode_export_with_time(session, export).map(|(snapshot, _)| snapshot)
+}
+
+fn canonicalize_opencode_export_with_time(
+    session: &SessionRef,
+    export: &Value,
+) -> Result<(omnis_ir::CanonicalSnapshot, DateTime<Utc>)> {
     validate_provider(session, Provider::OpenCode)?;
     let metadata = metadata(export);
     if metadata.id.as_deref() != Some(session.id.as_str()) {
@@ -756,13 +778,26 @@ pub fn canonicalize_opencode_export(
     let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
     let mut builder = EventBuilder::new(Provider::OpenCode, &session.id);
     push_export_events(&mut builder, export);
-    Ok(builder.snapshot(
+    let snapshot = builder.snapshot(
         session.clone(),
         metadata.title,
         metadata.project_path,
         metadata.git_branch,
         captured_at,
-    ))
+    );
+    // Keep the search clock stable even when OpenCode supplies no timestamps.
+    let search_time = metadata
+        .updated_at
+        .or_else(|| {
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.timestamp)
+                .max()
+        })
+        .or(metadata.created_at)
+        .unwrap_or(DateTime::UNIX_EPOCH);
+    Ok((snapshot, search_time))
 }
 
 fn metadata_id(value: &Value) -> Option<&str> {
@@ -1165,6 +1200,16 @@ impl ProviderAdapter for OpenCodeAdapter {
         validate_provider(session, Provider::OpenCode)?;
         let binary = self.binary.as_deref().ok_or_else(not_installed)?;
         read_opencode_session_with_binary(binary, session)
+    }
+
+    fn read_for_search(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+        _full_read: bool,
+    ) -> Result<(omnis_ir::CanonicalSnapshot, DateTime<Utc>)> {
+        let binary = self.binary.as_deref().ok_or_else(not_installed)?;
+        read_opencode_search_snapshot(binary, session)
     }
 
     // Launch plans keep the command name. The CLI maps it to the real binary, honoring
@@ -1822,6 +1867,31 @@ esac
             v2_plan.args,
             ["--session", "ses_test", "--prompt", "do work"]
         );
+    }
+
+    #[test]
+    fn missing_export_clock_keeps_canonical_capture_time_out_of_search() {
+        let session = SessionRef::new(Provider::OpenCode, "ses_clock");
+        let mut export = serde_json::json!({
+            "id": session.id, "time": {"created": "2026-01-01T00:00:00Z", "updated": "invalid"}
+        });
+        let (_, created) =
+            super::canonicalize_opencode_export_with_time(&session, &export).unwrap();
+        assert_eq!(created.timestamp(), 1_767_225_600);
+        export["messages"] = serde_json::json!([{
+            "role": "assistant", "text": "answer", "timestamp": "2026-01-02T00:00:00Z"
+        }]);
+        let (_, latest) = super::canonicalize_opencode_export_with_time(&session, &export).unwrap();
+        assert_eq!(latest.timestamp(), 1_767_312_000);
+
+        let before = chrono::Utc::now();
+        let (snapshot, unknown) = super::canonicalize_opencode_export_with_time(
+            &session,
+            &serde_json::json!({"id": session.id}),
+        )
+        .unwrap();
+        assert!((before..=chrono::Utc::now()).contains(&snapshot.captured_at));
+        assert_eq!(unknown, chrono::DateTime::UNIX_EPOCH);
     }
 
     #[test]

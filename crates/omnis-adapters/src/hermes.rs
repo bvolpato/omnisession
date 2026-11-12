@@ -103,9 +103,8 @@ impl HermesAdapter {
                 );
             }
 
-            let captured_at = messages
-                .last()
-                .and_then(|message| timestamp(message.timestamp))
+            let captured_at = metadata
+                .updated_at
                 .or(metadata.ended_at)
                 .unwrap_or(metadata.started_at);
             let mut builder = EventBuilder::new(Provider::Hermes, &session.id);
@@ -337,7 +336,8 @@ fn session_metadata(connection: &Connection, id: &str) -> Result<Option<SessionM
         .query_row(
             "SELECT id, title, cwd, git_branch, started_at, ended_at, message_count, source, \
                     model, parent_session_id, input_tokens, output_tokens, cache_read_tokens, \
-                    cache_write_tokens, reasoning_tokens, model_config \
+                    cache_write_tokens, reasoning_tokens, model_config, \
+                    (SELECT MAX(timestamp) FROM messages WHERE session_id = ?1 AND active = 1) \
              FROM sessions WHERE id = ?1",
             [id],
             |row| {
@@ -364,6 +364,7 @@ fn session_metadata(connection: &Connection, id: &str) -> Result<Option<SessionM
                     cache_read_tokens: nonnegative(row.get(12)?),
                     cache_write_tokens: nonnegative(row.get(13)?),
                     reasoning_tokens: nonnegative(row.get(14)?),
+                    updated_at: row.get::<_, Option<f64>>(16)?.and_then(timestamp),
                     ..SessionMetadata::default()
                 })
             },

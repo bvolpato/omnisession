@@ -1,15 +1,773 @@
-use super::{
-    IndexedSession, Result, Store, StoreError, database_error, immediate_transaction,
-    matches_catalog_row, now_timestamp, timestamp_from_db,
-};
-use chrono::{DateTime, Utc};
-use omnis_ir::{Provider, SessionRef, SourceRevision};
-use rusqlite::{OptionalExtension, Transaction, params};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
+
+use chrono::{DateTime, Utc};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::{
+    CatalogListing, DiscoveryScope, IndexedSession, Result, SessionDiscoveryAttempt, Store,
+    StoreError, database_error, immediate_transaction, indexed_session_from_row,
+    matches_catalog_row, now_timestamp, record_discovery_home, timestamp_from_db,
+};
+
+/// Tells a picker whether to read the catalog, follow another reader, or run discovery itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionDiscoveryClaim {
+    /// A recent check finished. Its catalog changes, if any, are visible.
+    Fresh,
+    /// Another reader owns this attempt and has not published a result.
+    InProgress(SessionDiscoveryAttempt),
+    /// The caller owns this attempt.
+    Claimed(SessionDiscoveryAttempt),
+}
+
+/// Outcome visible to a reader following one provider-wide discovery attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDiscoveryState {
+    /// The owner is still within its lease.
+    InProgress,
+    /// The owner committed its listing.
+    Published,
+    /// The listing failed and the previous catalog is still available.
+    Failed,
+    /// The owner has not completed the attempt within its lease.
+    Expired,
+    /// The current attempt belongs to another invocation or home.
+    Superseded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Observation {
+    selected_home: bool,
+    id: Uuid,
+    checked_at: i64,
+    succeeded: Option<bool>,
+}
+
+impl Observation {
+    fn state(&self, fresh_since: DateTime<Utc>) -> SessionDiscoveryState {
+        match self.succeeded {
+            Some(true) => SessionDiscoveryState::Published,
+            Some(false) => SessionDiscoveryState::Failed,
+            None if self.checked_at < fresh_since.timestamp_millis() => {
+                SessionDiscoveryState::Expired
+            }
+            None => SessionDiscoveryState::InProgress,
+        }
+    }
+}
+
+fn current_attempt(
+    connection: &Connection,
+    provider: Provider,
+    version: u32,
+    home: &Path,
+) -> Result<Option<Observation>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT lease.attempt_id, lease.checked_at, result.succeeded, lease.source_home = ?3
+             FROM session_index_reader_checks AS lease
+             LEFT JOIN session_index_discovery_results AS result USING (provider,reader_version,attempt_id)
+             WHERE lease.provider = ?1 AND lease.reader_version = ?2",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_row(
+            params![
+                provider.to_string(),
+                version,
+                home.as_os_str().as_encoded_bytes()
+            ],
+            |row| {
+                Ok(Observation {
+                    id: Uuid::from_bytes(row.get(0)?),
+                    checked_at: row.get(1)?,
+                    succeeded: row.get(2)?,
+                    selected_home: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn recent_claim(
+    connection: &Connection,
+    provider: Provider,
+    version: u32,
+    home: &Path,
+    fresh_since: DateTime<Utc>,
+) -> Result<Option<SessionDiscoveryClaim>> {
+    let Some(check) = current_attempt(connection, provider, version, home)? else {
+        return Ok(None);
+    };
+    if !check.selected_home || check.checked_at < fresh_since.timestamp_millis() {
+        return Ok(None);
+    }
+    if check.succeeded.is_some() {
+        return Ok(Some(SessionDiscoveryClaim::Fresh));
+    }
+    Ok(Some(SessionDiscoveryClaim::InProgress(
+        SessionDiscoveryAttempt {
+            provider,
+            version,
+            home: home.to_owned(),
+            id: check.id,
+        },
+    )))
+}
+
+/// Identifies the provider-wide check in effect when a command starts a live catalog read.
+#[derive(Debug)]
+pub struct SessionDiscoveryCheckpoint {
+    provider: Provider,
+    version: u32,
+    home: PathBuf,
+    observation: Option<Observation>,
+    workspace: Option<PathBuf>,
+    workspace_publication: Option<(i64, bool)>,
+    desktop_generation: Option<i64>,
+}
+
+impl SessionDiscoveryCheckpoint {
+    /// Whether the recorded provider-wide check selected this command's native home.
+    #[must_use]
+    pub fn is_for_selected_home(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|check| check.selected_home)
+    }
+
+    /// Whether this attempt still owns provider-wide publication at this checkpoint.
+    #[must_use]
+    pub fn owns(&self, attempt: &SessionDiscoveryAttempt) -> bool {
+        self.observation.as_ref().is_some_and(|check| {
+            check.selected_home && check.id == attempt.id && check.succeeded.is_none()
+        })
+    }
+
+    /// Whether the intervening publications selected this command's home.
+    #[must_use]
+    pub fn can_follow(&self, prior: &Self) -> bool {
+        let wide_changed = self.observation != prior.observation;
+        let workspace_changed = self.workspace_publication != prior.workspace_publication;
+        let workspace_local = self.workspace_publication.is_some_and(|(_, local)| local);
+        let wide_local = self.is_for_selected_home()
+            || (self.observation.is_none() && workspace_changed && workspace_local);
+        (wide_changed || workspace_changed)
+            && (!wide_changed || wide_local)
+            && (!workspace_changed || workspace_local)
+    }
+
+    fn is_current(&self, connection: &Connection) -> Result<bool> {
+        Ok(
+            current_attempt(connection, self.provider, self.version, &self.home)?
+                == self.observation
+                && workspace_publication(
+                    connection,
+                    self.provider,
+                    &self.home,
+                    self.workspace.as_deref(),
+                )? == self.workspace_publication,
+        )
+    }
+
+    fn record_workspace(&self, tx: &Transaction<'_>, sessions: &[IndexedSession]) -> Result<()> {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return Ok(());
+        };
+        let mut sorted: Vec<_> = sessions.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.session.id.cmp(&b.session.id));
+        let mut hash = Sha256::new();
+        for row in sorted {
+            let fields = (
+                &row.session.id,
+                &row.title,
+                &row.project_path,
+                &row.git_branch,
+                row.created_at.map(|time| time.timestamp_millis()),
+                row.updated_at.map(|time| time.timestamp_millis()),
+                row.updated_at_approximate,
+                row.event_count,
+            );
+            hash.update(
+                serde_json::to_vec(&fields).map_err(|_| StoreError::InvalidSessionReference)?,
+            );
+        }
+        let fingerprint: [u8; 32] = hash.finalize().into();
+        tx.execute(
+            "INSERT INTO session_workspace_catalogs(provider,workspace,source_home,fingerprint,generation)
+             SELECT ?1,?2,?3,?4,coalesce(max(generation),0)+1 FROM session_workspace_catalogs WHERE provider=?1
+             ON CONFLICT(provider,workspace) DO UPDATE SET source_home=excluded.source_home,
+                 fingerprint=excluded.fingerprint, generation=excluded.generation
+             WHERE source_home IS NOT excluded.source_home OR fingerprint IS NOT excluded.fingerprint",
+            params![self.provider.to_string(), workspace.as_os_str().as_encoded_bytes(), self.home.as_os_str().as_encoded_bytes(), fingerprint],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+}
+
+fn workspace_publication(
+    connection: &Connection,
+    provider: Provider,
+    home: &Path,
+    workspace: Option<&Path>,
+) -> Result<Option<(i64, bool)>> {
+    if provider != Provider::Antigravity {
+        return Ok(None);
+    }
+    let local = home.as_os_str().as_encoded_bytes();
+    let provider = provider.to_string();
+    let read = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?));
+    let result = if let Some(workspace) = workspace {
+        connection.query_row(
+            "SELECT generation, source_home = ?2 FROM session_workspace_catalogs WHERE provider = ?1 AND workspace = ?3",
+            params![provider, local, workspace.as_os_str().as_encoded_bytes()], read,
+        )
+    } else {
+        connection.query_row(
+            "SELECT generation, source_home = ?2 FROM session_workspace_catalogs WHERE provider = ?1 ORDER BY generation DESC LIMIT 1",
+            params![provider, local], read,
+        )
+    };
+    result.optional().map_err(database_error)
+}
+
+pub(super) enum CatalogWrite<'a> {
+    Unchecked,
+    Publish(
+        &'a SessionDiscoveryAttempt,
+        DateTime<Utc>,
+        Option<&'a SessionDiscoveryCheckpoint>,
+    ),
+    Merge(&'a SessionDiscoveryCheckpoint),
+}
+
+pub(super) fn remove_archived_ide_aliases(
+    tx: &Transaction<'_>,
+    provider: Provider,
+    home: Option<&Path>,
+    ids: &[String],
+) -> Result<()> {
+    if provider != Provider::AntigravityIde || ids.is_empty() {
+        return Ok(());
+    }
+    let home = home.ok_or(StoreError::InvalidSessionReference)?;
+    let mut delete = tx
+        .prepare_cached(
+            "DELETE FROM session_index WHERE provider='antigravity-ide' AND session_id=?1
+         AND EXISTS (SELECT 1 FROM native_catalog_homes WHERE provider='antigravity-ide'
+                     AND session_id=?1 AND verified AND home=?2)",
+        )
+        .map_err(database_error)?;
+    for id in ids {
+        delete
+            .execute(params![id, home.as_os_str().as_encoded_bytes()])
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+impl CatalogWrite<'_> {
+    pub(super) fn desktop_generation(
+        &self,
+        tx: &Transaction<'_>,
+        provider: Provider,
+    ) -> Result<Option<i64>> {
+        if crate::desktop_declarations::table(provider).is_none() {
+            return Ok(None);
+        }
+        match self {
+            Self::Unchecked => Ok(None),
+            Self::Merge(checkpoint) => Ok(checkpoint.desktop_generation),
+            Self::Publish(attempt, _, _) => tx
+                .query_row(
+                    "SELECT desktop_generation FROM session_index_reader_checks
+                 WHERE provider=?3 AND reader_version=?1 AND attempt_id=?2",
+                    params![
+                        attempt.version,
+                        attempt.id.into_bytes(),
+                        provider.to_string()
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map(Option::flatten)
+                .map_err(database_error),
+        }
+    }
+
+    pub(super) fn permits(
+        self,
+        transaction: &Transaction<'_>,
+        sessions: &[IndexedSession],
+        unverified_desktop_ids: &[String],
+    ) -> Result<bool> {
+        match self {
+            Self::Unchecked => Ok(true),
+            Self::Publish(attempt, finished_at, checkpoint) => {
+                if let Some(checkpoint) = checkpoint
+                    && !checkpoint.is_current(transaction)?
+                {
+                    return Ok(false);
+                }
+                publish_attempt(
+                    transaction,
+                    attempt,
+                    finished_at,
+                    sessions,
+                    unverified_desktop_ids,
+                )
+            }
+            Self::Merge(checkpoint) => {
+                if !checkpoint.is_current(transaction)? {
+                    return Ok(false);
+                }
+                checkpoint.record_workspace(transaction, sessions)?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+impl Store {
+    /// Observes the reader and home without claiming discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the discovery state.
+    pub fn session_discovery_checkpoint(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        project: Option<&Path>,
+    ) -> Result<SessionDiscoveryCheckpoint> {
+        let workspace = project.filter(|_| provider == Provider::Antigravity);
+        let connection = self.connection.borrow();
+        let tx = connection.unchecked_transaction().map_err(database_error)?;
+        let checkpoint = SessionDiscoveryCheckpoint {
+            provider,
+            version,
+            home: home.to_owned(),
+            observation: current_attempt(&tx, provider, version, home)?,
+            desktop_generation: crate::desktop_declarations::generation(&tx, provider)?,
+            workspace: workspace.map(Path::to_owned),
+            workspace_publication: workspace_publication(&tx, provider, home, workspace)?,
+        };
+        tx.commit().map_err(database_error)?;
+        Ok(checkpoint)
+    }
+
+    /// Checks a live read without publishing any catalog data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read its discovery state.
+    pub fn discovery_checkpoint_is_current(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+    ) -> Result<bool> {
+        let connection = self.connection.borrow();
+        let tx = connection.unchecked_transaction().map_err(database_error)?;
+        let current = checkpoint.is_current(&tx)?;
+        tx.commit().map_err(database_error)?;
+        Ok(current)
+    }
+
+    /// Merges a workspace listing while its discovery checkpoint is current, including a successful empty listing.
+    /// This operation preserves provider-wide discovery ownership and completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the checkpoint or save the rows.
+    pub fn merge_sessions_at_discovery_checkpoint(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+    ) -> Result<bool> {
+        self.merge_catalog_at_discovery_checkpoint(checkpoint, sessions, DiscoveryScope::Workspace)
+    }
+
+    /// Merges a Desktop database listing while keeping summary metadata from the same native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog or checkpoint cannot be read or written.
+    pub fn merge_desktop_databases_at_checkpoint(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+    ) -> Result<bool> {
+        self.merge_catalog_at_discovery_checkpoint(
+            checkpoint,
+            sessions,
+            DiscoveryScope::DesktopDatabasesWithoutSummaries,
+        )
+    }
+
+    /// Merges the observed workspace rows and source files while their discovery checkpoint is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scope is invalid or the store cannot save the catalog.
+    pub fn merge_catalog_at_discovery_checkpoint<'a>(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+        listing: impl Into<CatalogListing<'a>>,
+    ) -> Result<bool> {
+        let listing = listing.into();
+        if !matches!(
+            listing.scope,
+            DiscoveryScope::Workspace
+                | DiscoveryScope::DesktopDatabasesWithoutSummaries
+                | DiscoveryScope::DesktopPartialSummaries { .. }
+        ) {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        if sessions.is_empty()
+            && listing.archived_desktop_ids.is_empty()
+            && (listing.scope != DiscoveryScope::Workspace || checkpoint.workspace.is_none())
+        {
+            return self.discovery_checkpoint_is_current(checkpoint);
+        }
+        self.write_discovered_sessions(
+            checkpoint.provider,
+            sessions,
+            listing,
+            Some(&checkpoint.home),
+            CatalogWrite::Merge(checkpoint),
+        )
+    }
+
+    /// Claims a provider-wide discovery if this reader has no recent check for the selected home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read or record the attempt.
+    pub fn try_begin_session_discovery(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<SessionDiscoveryClaim> {
+        if let Some(claim) = recent_claim(
+            &self.connection.borrow(),
+            provider,
+            version,
+            home,
+            fresh_since,
+        )? {
+            return Ok(claim);
+        }
+        self.record_session_discovery_attempt(provider, version, home, Some(fresh_since))
+    }
+
+    /// Records an unconditional provider-wide discovery of the selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot record the attempt.
+    pub fn mark_session_discovery_attempted(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+    ) -> Result<SessionDiscoveryAttempt> {
+        match self.record_session_discovery_attempt(provider, version, home, None)? {
+            SessionDiscoveryClaim::Claimed(attempt) => Ok(attempt),
+            _ => Err(StoreError::CorruptStore),
+        }
+    }
+
+    fn record_session_discovery_attempt(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: Option<DateTime<Utc>>,
+    ) -> Result<SessionDiscoveryClaim> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        if let Some(since) = fresh_since
+            && let Some(claim) = recent_claim(&transaction, provider, version, home, since)?
+        {
+            return Ok(claim);
+        }
+        let name = provider.to_string();
+        let id = Uuid::new_v4();
+        let now = now_timestamp();
+        transaction.execute(
+            "INSERT INTO session_index_reader_checks (provider, reader_version, source_home, checked_at, attempt_id, desktop_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (provider, reader_version) DO UPDATE SET source_home = excluded.source_home,
+                 checked_at = excluded.checked_at, attempt_id = excluded.attempt_id,
+                 desktop_generation = excluded.desktop_generation",
+            params![name, version, home.as_os_str().as_encoded_bytes(), now, id.into_bytes(),
+                    crate::desktop_declarations::generation(&transaction, provider)?],
+        ).map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO session_index_checks (provider, checked_at) VALUES (?1, ?2)
+             ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at",
+                params![name, now],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(SessionDiscoveryClaim::Claimed(SessionDiscoveryAttempt {
+            provider,
+            version,
+            home: home.to_owned(),
+            id,
+        }))
+    }
+
+    /// Reads the state of one discovery without taking a write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the attempt.
+    pub fn observe_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<SessionDiscoveryState> {
+        let observation = current_attempt(
+            &self.connection.borrow(),
+            attempt.provider,
+            attempt.version,
+            &attempt.home,
+        )?;
+        Ok(match observation {
+            Some(check) if check.selected_home && check.id == attempt.id => {
+                check.state(fresh_since)
+            }
+            _ => SessionDiscoveryState::Superseded,
+        })
+    }
+
+    /// Publishes this attempt's provider-wide listing and completion in one transaction.
+    ///
+    /// Returns false when the listing is workspace-scoped or the attempt no longer owns the check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is invalid or the transaction fails.
+    pub fn publish_session_discovery<'a>(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        sessions: &[IndexedSession],
+        scope: impl Into<CatalogListing<'a>>,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.write_discovered_sessions(
+            attempt.provider,
+            sessions,
+            scope.into(),
+            Some(&attempt.home),
+            CatalogWrite::Publish(attempt, finished_at, None),
+        )
+    }
+
+    /// Publishes a provider-wide catalog only while its scoped discovery checkpoint is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing or write fails.
+    pub fn publish_at_discovery_checkpoint<'a>(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+        scope: impl Into<CatalogListing<'a>>,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        if !checkpoint.owns(attempt) {
+            return Ok(false);
+        }
+        self.write_discovered_sessions(
+            attempt.provider,
+            sessions,
+            scope.into(),
+            Some(&attempt.home),
+            CatalogWrite::Publish(attempt, finished_at, Some(checkpoint)),
+        )
+    }
+
+    /// Returns the IDs from the newest reader up to `version` that published a Desktop listing for this home.
+    /// A missing snapshot is distinct from a listing that returned no sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the snapshot.
+    pub fn published_desktop_session_ids(
+        &self,
+        version: u32,
+        home: &Path,
+    ) -> Result<Option<HashSet<String>>> {
+        last_desktop_session_ids(&self.connection.borrow(), version, home)
+    }
+
+    /// Reads the catalog rows in the last successful Desktop listing for this reader and home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot or its catalog rows cannot be read.
+    pub fn published_desktop_sessions(
+        &self,
+        version: u32,
+        home: &Path,
+    ) -> Result<Option<Vec<IndexedSession>>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare(
+            "SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count, catalog.source_updated_submillis,
+                    catalog.source_file_id, catalog.source_contents_id
+             FROM desktop_discovery_snapshots AS snapshot
+             LEFT JOIN json_each(snapshot.session_ids) AS listed ON true
+             LEFT JOIN native_catalog_homes AS native ON native.provider = 'antigravity-desktop'
+                 AND native.session_id = listed.value
+             LEFT JOIN scoped_session_index AS catalog ON catalog.provider = 'antigravity-desktop' AND catalog.session_id = listed.value
+                 AND (native.home IS NULL OR NOT native.verified OR native.home = snapshot.source_home)
+             WHERE snapshot.reader_version = ?1 AND snapshot.source_home = ?2
+             ORDER BY updated_at IS NULL, updated_at DESC, catalog.session_id",
+        ).map_err(database_error)?;
+        // The left join returns one empty row for a known empty snapshot.
+        let rows = statement
+            .query_map(
+                params![version, home.as_os_str().as_encoded_bytes()],
+                |row| {
+                    if matches!(row.get_ref(0)?, rusqlite::types::ValueRef::Null) {
+                        Ok(None)
+                    } else {
+                        indexed_session_from_row(row).map(Some)
+                    }
+                },
+            )
+            .map_err(database_error)?;
+        let mut sessions = None;
+        for row in rows {
+            sessions
+                .get_or_insert_with(Vec::new)
+                .extend(row.map_err(|_| StoreError::CorruptStore)?);
+        }
+        Ok(sessions)
+    }
+
+    /// Records a failed discovery and preserves the last catalog. Returns false for an obsolete or finished attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction fails.
+    pub fn finish_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let finished = complete_attempt(&transaction, attempt, finished_at, false)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(finished)
+    }
+}
+
+fn last_desktop_session_ids(
+    connection: &Connection,
+    version: u32,
+    home: &Path,
+) -> Result<Option<HashSet<String>>> {
+    let ids: Option<String> = connection.query_row(
+        "SELECT COALESCE(
+             (SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version = ?1 AND source_home = ?2),
+             (SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version < ?1 AND source_home = ?2
+              ORDER BY reader_version DESC LIMIT 1))",
+        params![version, home.as_os_str().as_encoded_bytes()],
+        |row| row.get(0),
+    ).map_err(database_error)?;
+    ids.map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
+        .transpose()
+}
+
+pub(super) fn publish_attempt(
+    transaction: &Transaction<'_>,
+    attempt: &SessionDiscoveryAttempt,
+    finished_at: DateTime<Utc>,
+    sessions: &[IndexedSession],
+    unverified_desktop_ids: &[String],
+) -> Result<bool> {
+    if !complete_attempt(transaction, attempt, finished_at, true)? {
+        return Ok(false);
+    }
+    if attempt.provider == Provider::AntigravityDesktop {
+        let mut ids: Vec<_> = sessions.iter().map(|row| row.session.id.as_str()).collect();
+        if !unverified_desktop_ids.is_empty()
+            && let Some(known) =
+                last_desktop_session_ids(transaction, attempt.version, &attempt.home)?
+        {
+            ids.extend(
+                unverified_desktop_ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| known.contains(*id)),
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let ids = serde_json::to_string(&ids).map_err(|_| StoreError::InvalidSessionReference)?;
+        transaction.execute(
+            "INSERT INTO desktop_discovery_snapshots(reader_version,source_home,session_ids)
+             VALUES (?1,?2,?3)
+             ON CONFLICT (reader_version,source_home) DO UPDATE SET session_ids = excluded.session_ids
+             WHERE session_ids <> excluded.session_ids",
+            params![attempt.version, attempt.home.as_os_str().as_encoded_bytes(), ids],
+        ).map_err(database_error)?;
+    }
+    Ok(true)
+}
+
+fn complete_attempt(
+    transaction: &Transaction<'_>,
+    attempt: &SessionDiscoveryAttempt,
+    finished_at: DateTime<Utc>,
+    succeeded: bool,
+) -> Result<bool> {
+    let provider = attempt.provider.to_string();
+    let id = attempt.id.into_bytes();
+    // An older binary can replace the lease. Only the result for the exact attempt is visible.
+    let claimed = transaction
+        .execute(
+            "UPDATE session_index_reader_checks SET checked_at = ?1
+         WHERE provider = ?2 AND reader_version = ?3 AND attempt_id = ?4 AND source_home = ?5
+           AND NOT EXISTS (SELECT 1 FROM session_index_discovery_results
+               WHERE provider = ?2 AND reader_version = ?3 AND attempt_id = ?4)",
+            params![
+                finished_at.timestamp_millis(),
+                provider,
+                attempt.version,
+                id,
+                attempt.home.as_os_str().as_encoded_bytes()
+            ],
+        )
+        .map_err(database_error)?;
+    if claimed == 0 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO session_index_discovery_results(provider,reader_version,attempt_id,succeeded)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT (provider,reader_version) DO UPDATE SET attempt_id=excluded.attempt_id, succeeded=excluded.succeeded",
+        params![provider, attempt.version, id, succeeded],
+    ).map_err(database_error)?;
+    Ok(true)
+}
 
 impl Store {
     /// Returns the last completed provider-wide discovery for this reader and native home.
@@ -100,13 +858,63 @@ impl Store {
         transaction.commit().map_err(database_error)
     }
 
+    /// Returns the files from the last listing whose search upgrade has not finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the recorded sources cannot be read.
+    pub fn pending_discovery_sources(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+    ) -> Result<Vec<(String, Option<PathBuf>)>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare(
+            "SELECT pending.session_id, pending.source_path FROM session_index_upgrade_sources pending
+             JOIN session_index_reader_checks lease USING(provider, reader_version)
+             JOIN session_index_discovery_results result USING(provider,reader_version,attempt_id)
+             JOIN native_catalog_homes origin USING(provider,session_id)
+             JOIN scoped_session_index catalog USING(provider,session_id)
+             WHERE pending.provider=?1 AND pending.reader_version=?2 AND lease.source_home=?3
+               AND origin.home=lease.source_home AND origin.verified AND result.succeeded
+               AND NOT EXISTS(SELECT 1 FROM visible_trajectories d WHERE d.provider=pending.provider
+                              AND d.session_id=pending.session_id AND (d.document_version>pending.reader_version
+                              OR (d.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
+                                  OR (d.source_file_id IS catalog.source_file_id AND d.source_contents_id IS catalog.source_contents_id)))))
+               AND NOT EXISTS(SELECT 1 FROM scoped_trajectory_failures f WHERE f.provider=pending.provider
+                              AND f.session_id=pending.session_id AND (f.document_version>pending.reader_version
+                              OR (f.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
+                                  OR (f.source_file_id IS catalog.source_file_id AND f.source_contents_id IS catalog.source_contents_id)))))"
+        ).map_err(database_error)?;
+        statement
+            .query_map(
+                params![
+                    provider.to_string(),
+                    version,
+                    home.as_os_str().as_encoded_bytes()
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                    ))
+                },
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+}
+
+impl crate::TrajectorySearchSnapshot<'_> {
     /// Returns known catalog rows that the selected home cannot supply.
     ///
     /// # Errors
     ///
     /// Returns an error if the stored home assignments cannot be read.
     pub fn excluded_catalog_ids(&self, provider: Provider, home: &Path) -> Result<HashSet<String>> {
-        let connection = self.connection.borrow();
+        let connection = self.connection;
         let mut statement = connection.prepare(
             "SELECT session_id FROM native_catalog_homes WHERE provider=?1 AND (home<>?2 OR NOT verified)"
         ).map_err(database_error)?;
@@ -132,7 +940,7 @@ impl Store {
         provider: Provider,
         home: &Path,
     ) -> Result<Vec<IndexedSession>> {
-        let connection = self.connection.borrow();
+        let connection = self.connection;
         let mut statement = connection.prepare_cached(
             "SELECT doc.session_id, doc.source_file_id, doc.missing_ancestor_id, doc.source_contents_id
              FROM native_catalog_homes c
@@ -193,7 +1001,7 @@ impl Store {
             .collect();
         let json =
             serde_json::to_string(&picked).map_err(|_| StoreError::InvalidSessionReference)?;
-        let connection = self.connection.borrow();
+        let connection = self.connection;
         let sql = format!(
             "SELECT trajectories.session_id, trajectories.source_file_id, trajectories.missing_ancestor_id, {contents}
              FROM json_each(?1) AS picked
@@ -218,82 +1026,49 @@ impl Store {
             .collect::<rusqlite::Result<_>>()
             .map_err(database_error)
     }
+}
 
-    /// Returns the files from the last listing whose search upgrade has not finished.
+impl Store {
+    /// Returns known catalog rows excluded from the selected home.
     ///
     /// # Errors
     ///
-    /// Returns an error if the recorded sources cannot be read.
-    pub fn pending_discovery_sources(
+    /// Returns an error if the catalog cannot be read.
+    pub fn excluded_catalog_ids(&self, provider: Provider, home: &Path) -> Result<HashSet<String>> {
+        self.read_trajectory_search(|snapshot| snapshot.excluded_catalog_ids(provider, home))
+    }
+
+    /// Returns verified documents whose catalog metadata became unverified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored document identity cannot be read.
+    pub fn uncatalogued_search_documents(
         &self,
         provider: Provider,
-        version: u32,
         home: &Path,
-    ) -> Result<Vec<(String, Option<PathBuf>)>> {
-        let connection = self.connection.borrow();
-        let mut statement = connection.prepare(
-            "SELECT pending.session_id, pending.source_path FROM session_index_upgrade_sources pending
-             JOIN session_index_reader_checks lease USING(provider, reader_version)
-             JOIN session_index_discovery_results result USING(provider,reader_version,attempt_id)
-             JOIN native_catalog_homes origin USING(provider,session_id)
-             JOIN scoped_session_index catalog USING(provider,session_id)
-             WHERE pending.provider=?1 AND pending.reader_version=?2 AND lease.source_home=?3
-               AND origin.home=lease.source_home AND origin.verified AND result.succeeded
-               AND NOT EXISTS(SELECT 1 FROM visible_trajectories d WHERE d.provider=pending.provider
-                              AND d.session_id=pending.session_id AND (d.document_version>pending.reader_version
-                              OR (d.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
-                                  OR (d.source_file_id IS catalog.source_file_id AND d.source_contents_id IS catalog.source_contents_id)))))
-               AND NOT EXISTS(SELECT 1 FROM scoped_trajectory_failures f WHERE f.provider=pending.provider
-                              AND f.session_id=pending.session_id AND (f.document_version>pending.reader_version
-                              OR (f.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
-                                  OR (f.source_file_id IS catalog.source_file_id AND f.source_contents_id IS catalog.source_contents_id)))))"
-        ).map_err(database_error)?;
-        statement
-            .query_map(
-                params![
-                    provider.to_string(),
-                    version,
-                    home.as_os_str().as_encoded_bytes()
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get::<_, Option<String>>(1)?.map(PathBuf::from),
-                    ))
-                },
-            )
-            .map_err(database_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(database_error)
-    }
-}
-
-pub(super) fn record_discovery_home(
-    transaction: &Transaction<'_>,
-    session: &SessionRef,
-    home: &Path,
-) -> Result<()> {
-    if !matches!(
-        session.provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
-    ) {
-        return Err(StoreError::InvalidSessionReference);
-    }
-    transaction
-        .prepare_cached(
-            "INSERT INTO native_catalog_homes(provider,session_id,home) VALUES(?1,?2,?3)
-         ON CONFLICT(provider,session_id) DO UPDATE SET home=excluded.home, verified=1
-         WHERE native_catalog_homes.home IS NOT excluded.home OR NOT native_catalog_homes.verified",
-        )
-        .and_then(|mut statement| {
-            statement.execute(params![
-                session.provider.to_string(),
-                session.id,
-                home.as_os_str().as_encoded_bytes()
-            ])
+    ) -> Result<Vec<IndexedSession>> {
+        self.read_trajectory_search(|snapshot| {
+            snapshot.uncatalogued_search_documents(provider, home)
         })
-        .map_err(database_error)?;
-    Ok(())
+    }
+
+    /// Returns the stored revisions that belong to the selected native home.
+    /// A selected file can identify a document from a reader that did not record its home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document or its home cannot be read.
+    pub fn selected_document_revisions(
+        &self,
+        provider: Provider,
+        home: &Path,
+        sessions: &[(&str, SourceRevision)],
+    ) -> Result<HashMap<String, SourceRevision>> {
+        self.read_trajectory_search(|snapshot| {
+            snapshot.selected_document_revisions(provider, home, sessions)
+        })
+    }
 }
 
 pub(super) fn record_verified_document_home(
@@ -317,86 +1092,27 @@ pub(super) fn record_verified_document_home(
     Ok(())
 }
 
-pub(super) fn initialize_session_index_checks(transaction: &Transaction<'_>) -> Result<()> {
-    transaction
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_index_checks (
-            provider TEXT PRIMARY KEY,
-            checked_at INTEGER NOT NULL
-        ) WITHOUT ROWID;",
-        )
-        .map_err(database_error)
-}
-
-pub(super) fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Result<()> {
-    let enrolled = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='session_index_upgrade_sources')",
-        [], |row| row.get::<_, bool>(0),
-    ).map_err(database_error)?;
-    transaction
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_index_reader_checks (
-            provider TEXT NOT NULL,
-            reader_version INTEGER NOT NULL,
-            source_home BLOB NOT NULL,
-            checked_at INTEGER NOT NULL,
-            attempt_id BLOB NOT NULL,
-            PRIMARY KEY (provider, reader_version)
-        ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS session_index_discovery_results (
-            provider TEXT NOT NULL,
-            reader_version INTEGER NOT NULL,
-            attempt_id BLOB NOT NULL,
-            succeeded INTEGER NOT NULL CHECK (succeeded IN (0, 1)),
-            PRIMARY KEY (provider, reader_version),
-            FOREIGN KEY (provider, reader_version)
-                REFERENCES session_index_reader_checks(provider, reader_version) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS session_index_upgrade_sources(
-            provider TEXT NOT NULL, reader_version INTEGER NOT NULL, session_id TEXT NOT NULL, source_path TEXT,
-            PRIMARY KEY(provider, reader_version, session_id),
-            FOREIGN KEY(provider, reader_version) REFERENCES session_index_reader_checks(provider, reader_version) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS native_search_document_homes (
-            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
-            source_file BLOB NOT NULL,
-            source_home BLOB NOT NULL,
-            verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1)),
-            declared_steps INTEGER CHECK(declared_steps >= 0)
-        );",
-        )
-        .map_err(database_error)?;
-    initialize_catalog_homes(transaction)?;
-    let (verified, steps): (bool, bool) = transaction.query_row(
-        "SELECT count(*) FILTER (WHERE name='verification'), count(*) FILTER (WHERE name='declared_steps')
-         FROM pragma_table_info('native_search_document_homes')", [], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(database_error)?;
-    if !verified {
-        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1));").map_err(database_error)?;
-    }
-    if !steps {
-        transaction.execute_batch("ALTER TABLE native_search_document_homes ADD COLUMN declared_steps INTEGER CHECK(declared_steps >= 0);").map_err(database_error)?;
-    }
-    if !enrolled {
-        transaction.execute_batch(
-            "DELETE FROM session_index_discovery_results WHERE provider IN ('antigravity','antigravity-desktop');
-             DELETE FROM session_index_reader_checks WHERE provider IN ('antigravity','antigravity-desktop');"
-        ).map_err(database_error)?;
-    }
-    Ok(())
-}
-
-fn initialize_catalog_homes(transaction: &Transaction<'_>) -> Result<()> {
+pub(super) fn initialize_catalog_homes(transaction: &Transaction<'_>) -> Result<()> {
     let legacy_home_key: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('native_catalog_homes') WHERE \"table\"='session_index')",
         [], |row| row.get(0),
     ).map_err(database_error)?;
+    let old_delete_trigger = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='remove_discovery_home_after_catalog_delete'
+         AND instr(sql,'WHEN OLD.provider')>0)", [], |row| row.get::<_, bool>(0),
+    ).map_err(database_error)?;
+    if old_delete_trigger {
+        transaction
+            .execute_batch("DROP TRIGGER remove_discovery_home_after_catalog_delete;")
+            .map_err(database_error)?;
+    }
     if legacy_home_key {
         transaction
             .execute_batch(
                 "DROP TRIGGER IF EXISTS forget_changed_catalog_home;
-             ALTER TABLE native_catalog_homes RENAME TO previous_native_catalog_homes;",
+             CREATE TEMP TABLE previous_native_catalog_homes AS
+             SELECT provider,session_id,home,verified FROM native_catalog_homes;
+             DROP TABLE native_catalog_homes;",
             )
             .map_err(database_error)?;
     }
@@ -415,15 +1131,15 @@ fn initialize_catalog_homes(transaction: &Transaction<'_>) -> Result<()> {
         transaction
             .execute_batch(
                 "INSERT INTO native_catalog_homes(provider,session_id,home,verified)
-             SELECT provider,session_id,home,verified FROM previous_native_catalog_homes;
-             DROP TABLE previous_native_catalog_homes;",
+             SELECT provider,session_id,home,verified FROM temp.previous_native_catalog_homes;
+             DROP TABLE temp.previous_native_catalog_homes;",
             )
             .map_err(database_error)?;
     }
     transaction
         .execute_batch(
             "CREATE TRIGGER IF NOT EXISTS remove_discovery_home_after_catalog_delete
-        AFTER DELETE ON session_index WHEN OLD.provider IN ('antigravity','antigravity-desktop')
+        AFTER DELETE ON session_index
         BEGIN
             DELETE FROM native_catalog_homes WHERE provider=OLD.provider AND session_id=OLD.session_id;
         END;
@@ -433,29 +1149,7 @@ fn initialize_catalog_homes(transaction: &Transaction<'_>) -> Result<()> {
         BEGIN
             SELECT RAISE(ABORT, 'missing discovery catalog row');
         END;
-        CREATE TRIGGER IF NOT EXISTS forget_changed_catalog_home
-                AFTER UPDATE ON session_index
-                WHEN NEW.provider IN ('antigravity', 'antigravity-desktop')
-                 AND (OLD.title, OLD.project_path, OLD.git_branch, OLD.created_at, OLD.updated_at, OLD.event_count, OLD.source_file_id, OLD.source_contents_id)
-                     IS NOT (NEW.title, NEW.project_path, NEW.git_branch, NEW.created_at, NEW.updated_at, NEW.event_count, NEW.source_file_id, NEW.source_contents_id)
-                BEGIN
-                    UPDATE native_catalog_homes SET verified = 0
-                    WHERE provider = NEW.provider AND session_id = NEW.session_id AND verified = 1;
-                END;
-        CREATE TRIGGER IF NOT EXISTS expire_changed_catalog_receipt
-        AFTER UPDATE OF verified ON native_catalog_homes WHEN OLD.verified AND NOT NEW.verified
-        BEGIN
-            UPDATE session_index_discovery_results SET succeeded=0
-            WHERE provider=OLD.provider AND EXISTS (
-                SELECT 1 FROM session_index_reader_checks lease
-                WHERE lease.provider=OLD.provider AND lease.source_home=OLD.home
-                  AND lease.reader_version=session_index_discovery_results.reader_version);
-        END;
-        CREATE TRIGGER IF NOT EXISTS expire_rebound_catalog_home
-                AFTER UPDATE OF home ON native_catalog_homes WHEN OLD.home IS NOT NEW.home
-                BEGIN
-                    DELETE FROM session_index_reader_checks WHERE provider = OLD.provider AND source_home = OLD.home;
-                END;",
+",
         )
         .map_err(database_error)?;
     Ok(())
