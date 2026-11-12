@@ -492,7 +492,8 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
                 END AS replace_title, upgrading_title
                 FROM (SELECT ?17 AND session_trajectories.origin = 'native' AND excluded.origin = 'native'
                     AND ((session_trajectories.document_version < 7 AND excluded.document_version >= 7)
-                         OR (session_trajectories.document_version < 8 AND excluded.document_version >= 8))
+                         OR (session_trajectories.document_version < 8 AND excluded.document_version >= 8)
+                         OR (session_trajectories.document_version < 9 AND excluded.document_version >= 9))
                     AND session_trajectories.derived_title_is_local_opener IS NOT 1 AS upgrading_title))
         )
     WHERE excluded.document_version >= session_trajectories.document_version AND (

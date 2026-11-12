@@ -62,6 +62,7 @@ mod tests {
 
     #[test]
     fn capture_waits_for_stdout_writers_and_preserves_failure_diagnostics() {
+        let worker = tempfile::tempdir().unwrap();
         for (script, stdout, stderr, status) in [
             (
                 "printf '['; (sleep 0.05; printf ']') 2>/dev/null &",
@@ -70,20 +71,34 @@ mod tests {
                 0,
             ),
             (
-                "sleep 10 </dev/null >/dev/null 2>&1 & printf '{'; printf failure >&2; exit 7",
+                // The worker outlives the capture deadline and exits when the test removes its directory.
+                r#"
+                    (
+                        n=0
+                        while [ -d "$1" ] && [ "$n" -lt 90 ]; do
+                            sleep 1
+                            n=$((n+1))
+                        done
+                    ) </dev/null >/dev/null 2>&1 &
+                    printf '{'
+                    printf failure >&2
+                    exit 7
+                "#,
                 "{",
                 "failure",
                 7,
             ),
         ] {
             let output = super::super::bounded_terminal_output(
-                Command::new("sh").args(["-c", script]),
-                std::time::Duration::from_secs(3),
+                Command::new("sh")
+                    .args(["-c", script, "sh"])
+                    .arg(worker.path()),
+                std::time::Duration::from_secs(30),
                 16,
                 Some(16),
                 None,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("fixture expecting exit {status}: {error}"));
             assert_eq!(output.status.code(), Some(status));
             assert_eq!(output.stdout, stdout.as_bytes());
             assert_eq!(output.stderr, stderr.as_bytes());

@@ -23,9 +23,9 @@ use omnis_core::{
     build_fidelity_report, build_native_fork_report,
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
-    redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
-    trajectory_search_document_in_records, workspace_paths_match, workspace_remote_fingerprint,
-    workspace_root, workspace_state_matches,
+    redact_secrets, render_markdown_export, render_semantic_handoff,
+    render_session_history_preview, safe_terminal_line, trajectory_search_document_in_records,
+    workspace_paths_match, workspace_remote_fingerprint, workspace_root, workspace_state_matches,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -3436,7 +3436,7 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         }
         println!("Events: {}", snapshot.events.len());
         println!();
-        println!("{}", render_semantic_handoff(&snapshot));
+        println!("{}", render_session_history_preview(&snapshot));
     }
     Ok(())
 }

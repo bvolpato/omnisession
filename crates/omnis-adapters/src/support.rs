@@ -1433,6 +1433,7 @@ pub(crate) fn visit_json_lines_with_tail(
 pub(crate) struct JsonLineLocation {
     pub(crate) offset: u64,
     pub(crate) length: u64,
+    pub(crate) terminated: bool,
 }
 
 /// Visits records from an already-open transcript and reports their source locations.
@@ -1662,6 +1663,7 @@ fn visit_json_lines_with_offsets_and_limits(
                         JsonLineLocation {
                             offset: line_offset,
                             length: read,
+                            terminated: line.ends_with(b"\n"),
                         },
                         record,
                     )?;
@@ -1775,6 +1777,7 @@ pub(crate) fn visit_json_reader(
                         JsonLineLocation {
                             offset: line_offset,
                             length: read,
+                            terminated: line.ends_with(b"\n"),
                         },
                         record,
                         omissions,
@@ -2511,6 +2514,63 @@ pub(crate) struct PreviewEvent {
     tool: bool,
 }
 
+impl PreviewEvent {
+    fn new(sequence: u64, kind: &EventKind, payload: &Value, source_bytes: usize) -> Self {
+        Self {
+            sequence,
+            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
+            tool: is_tool_event(kind),
+        }
+    }
+}
+
+fn select_preview_edges(
+    outline: impl DoubleEndedIterator<Item = PreviewEvent> + ExactSizeIterator + Clone,
+    limit: usize,
+    bytes_per_edge: usize,
+) -> (VecDeque<PreviewEvent>, usize) {
+    let mut selected = VecDeque::new();
+    let add_edge = |events: &mut dyn Iterator<Item = PreviewEvent>| {
+        let mut added = Vec::new();
+        let mut remaining = bytes_per_edge;
+        for event in events {
+            if event.bytes > bytes_per_edge {
+                continue;
+            }
+            if added.len() == limit / 2 || event.bytes > remaining {
+                break;
+            }
+            remaining -= event.bytes;
+            added.push(event);
+        }
+        added
+    };
+    let total = outline.len();
+    selected.extend(add_edge(&mut outline.clone()));
+    let end = selected.back().map(|event| event.sequence);
+    selected.extend(
+        add_edge(&mut outline.rev())
+            .into_iter()
+            .rev()
+            .filter(|event| end.is_none_or(|last| event.sequence > last)),
+    );
+    let omitted = total - selected.len();
+    (selected, omitted)
+}
+
+fn preview_prefix_end(
+    sequences: impl Iterator<Item = u64>,
+    selected: &VecDeque<PreviewEvent>,
+    end: u64,
+) -> u64 {
+    sequences
+        .enumerate()
+        .find_map(|(index, sequence)| {
+            (selected.get(index).map(|event| event.sequence) != Some(sequence)).then_some(sequence)
+        })
+        .unwrap_or(end)
+}
+
 impl EventPreview {
     fn record(
         &mut self,
@@ -2519,11 +2579,7 @@ impl EventPreview {
         payload: &Value,
         source_bytes: usize,
     ) -> bool {
-        let item = PreviewEvent {
-            sequence,
-            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
-            tool: is_tool_event(kind),
-        };
+        let item = PreviewEvent::new(sequence, kind, payload, source_bytes);
         self.outline.push(item);
         let Some(selected) = self.selection.as_mut() else {
             return false;
@@ -2644,38 +2700,48 @@ impl EventBuilder {
             .as_ref()
             .expect("preview planning enabled")
             .outline;
-        let mut selected = VecDeque::new();
-        let add_edge = |events: &mut dyn Iterator<Item = &PreviewEvent>| {
-            let mut added = Vec::new();
-            let mut remaining = bytes_per_edge;
-            for event in events {
-                if event.bytes > bytes_per_edge {
-                    continue;
-                }
-                if added.len() == limit / 2 || event.bytes > remaining {
-                    break;
-                }
-                remaining -= event.bytes;
-                added.push(*event);
-            }
-            added
-        };
-        selected.extend(add_edge(&mut outline.iter()));
-        let end = selected.back().map(|event| event.sequence);
-        selected.extend(
-            add_edge(&mut outline.iter().rev())
-                .into_iter()
-                .rev()
-                .filter(|event| end.is_none_or(|last| event.sequence > last)),
+        let (selected, omitted) =
+            select_preview_edges(outline.iter().copied(), limit, bytes_per_edge);
+        let prefix_end = preview_prefix_end(
+            outline.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
         );
-        let omitted = outline.len() - selected.len();
-        // An event above the byte limit can be missing even from the first edge.
-        let prefix_end = outline
-            .iter()
-            .enumerate()
-            .find(|(index, event)| selected.get(*index) != Some(*event))
-            .map_or(self.next_sequence, |(_, event)| event.sequence);
         (selected, omitted, prefix_end)
+    }
+
+    /// Selects the preview after published revisions and rollbacks have updated canonical events.
+    pub(crate) fn retain_bounded_preview(
+        &mut self,
+        limit: usize,
+        bytes_per_edge: usize,
+    ) -> (usize, u64) {
+        let outline = self.events.iter().map(|event| {
+            let source_bytes = event.source.native_session_id.len()
+                + event
+                    .source
+                    .provider_version
+                    .as_ref()
+                    .map_or(0, String::len)
+                + event.source.raw_record_type.as_ref().map_or(0, String::len);
+            PreviewEvent::new(event.sequence, &event.kind, &event.payload, source_bytes)
+        });
+        let (selected, omitted) = select_preview_edges(outline, limit, bytes_per_edge);
+        if omitted == 0 {
+            return (0, self.next_sequence);
+        }
+        let prefix_end = preview_prefix_end(
+            self.events.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
+        );
+        let mut selected = selected.into_iter().peekable();
+        self.events.retain(|event| {
+            selected
+                .next_if(|next| next.sequence == event.sequence)
+                .is_some()
+        });
+        (omitted, prefix_end)
     }
 
     pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
@@ -2694,6 +2760,37 @@ impl EventBuilder {
 
     pub(crate) fn checkpoint(&self) -> u64 {
         self.next_sequence
+    }
+
+    pub(crate) fn first_sequence(&self) -> u64 {
+        self.events
+            .first()
+            .map_or(self.next_sequence, |event| event.sequence)
+    }
+
+    /// Finds a retained event after truncation or pruning has left gaps in the sequence.
+    pub(crate) fn event_at_mut(&mut self, sequence: u64) -> Option<&mut OmniEvent> {
+        let index = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok()?;
+        self.events.get_mut(index)
+    }
+
+    /// Move confirmed early model messages to their first display position after all ID lookups.
+    pub(crate) fn order_delayed_messages(&mut self, positions: &HashMap<u64, (u64, u64)>) {
+        if positions.is_empty() {
+            return;
+        }
+        let sequences: Vec<_> = self.events.iter().map(|event| event.sequence).collect();
+        self.events
+            .sort_unstable_by_key(|event| match positions.get(&event.sequence) {
+                Some(&(before, ordinal)) => (before, false, ordinal),
+                None => (event.sequence, true, 0),
+            });
+        for (event, sequence) in self.events.iter_mut().zip(sequences) {
+            event.sequence = sequence;
+        }
     }
 
     pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
@@ -2743,6 +2840,30 @@ impl EventBuilder {
         })
     }
 
+    pub(crate) fn record_paginated_opener_withdrawal(&mut self, inherited: bool) {
+        if let Some((prior, successor)) = omnis_core::codex_withdrawn_search_opener(&self.events) {
+            let mut opener = RollbackOpener {
+                gap: inherited,
+                full_read: true,
+                first_message: successor.map(|title| (0, Some(title))),
+                ..Default::default()
+            };
+            opener
+                .withdrawn
+                .record(crate::RollbackTitle::fingerprint(&prior));
+            self.rollback_opener = Some(opener);
+        }
+    }
+
+    pub(crate) fn withdrew_saved_opener(&self, title: &str) -> bool {
+        self.rollback_opener.as_ref().is_some_and(|opener| {
+            opener
+                .withdrawn
+                .hashes
+                .contains(&crate::RollbackTitle::fingerprint(title))
+        })
+    }
+
     pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
         match &self.rollback_opener {
             Some(opener) if opener.gap => opener.withdrawn.after_gap(),
@@ -2782,6 +2903,18 @@ impl EventBuilder {
             );
         }
         self.events.retain(|event| event.sequence < checkpoint);
+    }
+
+    pub(crate) fn visit_events(&self, visit: impl FnMut(&OmniEvent)) {
+        self.events.iter().for_each(visit);
+    }
+
+    pub(crate) fn visit_events_mut(&mut self, visit: impl FnMut(&mut OmniEvent)) {
+        self.events.iter_mut().for_each(visit);
+    }
+
+    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
+        self.events.retain(keep);
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
@@ -3757,6 +3890,63 @@ mod tests {
                 Ok(())
             })?;
         Ok((visited, oversized))
+    }
+
+    #[test]
+    fn materialized_preview_uses_the_size_of_revised_events() {
+        let mut builder = EventBuilder::new(Provider::Codex, "revised-size");
+        for text in ["original", "surviving head", "surviving tail"] {
+            builder.push(
+                EventKind::MessageAssistant,
+                json!({"text": text}),
+                None,
+                ReplayPolicy::Contextual,
+                None,
+                None,
+            );
+        }
+        builder.event_at_mut(0).unwrap().payload["text"] = "x".repeat(8192).into();
+        assert_eq!(builder.retain_bounded_preview(2, 4096), (1, 0));
+
+        let events = &builder.events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["text"], "surviving head");
+        assert_eq!(events[1].payload["text"], "surviving tail");
+    }
+
+    #[test]
+    fn physical_records_report_damage_and_keep_offsets_across_blank_lines() {
+        use super::{WorkspaceGap, visit_json_reader};
+
+        let (_root, path) = write_fixture(b"1\r\n{x}\n\xff\n \t\r\n2\n3");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut records = Vec::new();
+        let (omissions, bytes) = visit_json_reader(
+            &mut reader,
+            JsonLinesLimits::streamed(64),
+            |_, _| WorkspaceGap::Other,
+            |location, value, omitted| {
+                records.push((
+                    location.offset,
+                    location.length,
+                    location.terminated,
+                    value.as_u64(),
+                    omitted.malformed,
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                (0, 3, true, Some(1), 0),
+                (13, 2, true, Some(2), 2),
+                (15, 1, false, Some(3), 2),
+            ]
+        );
+        assert_eq!((omissions.malformed, bytes), (2, 16));
+        assert_eq!(visit_all(&path, LIMITS).unwrap(), (3, 0));
     }
 
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {

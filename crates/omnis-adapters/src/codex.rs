@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     ffi::OsString,
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -28,11 +28,30 @@ use crate::{
     },
 };
 
+mod attachments;
+mod checkpoint_wire;
+mod completed_item;
+mod completion_positions;
+mod deferred_receipts;
+mod display_text;
+mod message_mirrors;
+mod model_cut;
+use message_mirrors::{MessageIdentity, MessageMatch, MessageMirrors};
 mod current_launch;
 mod current_rollout;
 mod gui_names;
+mod paginated_answers;
+mod paginated_checkpoint;
+mod paginated_rollback;
+mod paginated_workspace;
 mod rollout_cache;
 mod rollout_file;
+mod rollout_lines;
+mod tool_history;
+mod tool_occurrences;
+mod tool_revisions;
+mod turn_aliases;
+mod wire_enums;
 mod workspace_check;
 mod workspace_damage;
 mod workspace_search;
@@ -41,7 +60,13 @@ mod workspace_settings;
 use current_rollout::{
     CurrentFile, CurrentRolloutStamp, CurrentRolloutUnavailable, CurrentRollouts,
 };
+use paginated_answers::{PaginatedAnswers, ToolId};
+use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_lines::{Admission, OrdinalGap, RolloutLines};
+use tool_history::{NativeCalls, PendingOutcomes};
+use tool_revisions::{DisplayRevisions, PreviousDisplay};
+use turn_aliases::{MessageIds, TurnAliases};
 
 const SCAN_LIMIT: usize = 10_000;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
@@ -1978,7 +2003,7 @@ impl CodexSession {
         let mut matched_source = false;
         let (events, _) =
             self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                rollout_file::visit(&self.path, |record, skipped| {
+                rollout_file::visit(&self.path, |record, skipped, terminated| {
                     matched_source |= match check {
                         SavedOpenerCheck::LegacyOrToolCatalog => {
                             (record["type"] == "session_meta"
@@ -1988,7 +2013,7 @@ impl CodexSession {
                         SavedOpenerCheck::ToolCatalog => is_dynamic_tool_catalog(&record),
                         SavedOpenerCheck::Withdrawal => false,
                     };
-                    visit(record, skipped)
+                    visit(record, skipped, terminated)
                 })
             })?;
         Ok(match check {
@@ -1998,11 +2023,24 @@ impl CodexSession {
     }
 
     fn withdrew_search_title(&self, prior_title: &str) -> Result<bool> {
+        if self.history_mode == CodexHistoryMode::Paginated {
+            return match self.canonical_events_with(|visit| {
+                rollout_file::visit_with_limits(
+                    &self.path,
+                    rollout_file::LEGACY_PROJECTION_LIMITS,
+                    visit,
+                )
+            }) {
+                Ok((events, _)) => Ok(events.withdrew_saved_opener(prior_title)),
+                Err(error) if error.is::<crate::TranscriptReadLimit>() => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         let mut builder = self.event_builder();
         let mut history = CodexHistory::preview();
         let mut opener: Option<(u64, bool)> = None;
         let mut withdrew = false;
-        let complete = rollout_file::visit_all_records(&self.path, |record| {
+        let complete = rollout_file::visit_all_records(&self.path, |mut record, terminated| {
             if history.records_seen == 0 {
                 anyhow::ensure!(
                     record["type"] == "session_meta"
@@ -2019,7 +2057,7 @@ impl CodexSession {
             {
                 return Ok(false);
             }
-            let rollback = history.push(&mut builder, &record)?;
+            let rollback = history.push(&mut builder, &mut record, terminated)?;
             if let Some(boundary) = rollback
                 && let Some((_, matched)) = opener.take_if(|(sequence, _)| *sequence >= boundary)
             {
@@ -2048,7 +2086,9 @@ impl CodexSession {
 
     fn canonical_events_with(
         &self,
-        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
+        read: impl FnOnce(
+            &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+        ) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, Option<PathBuf>)> {
         let mut builder = self.event_builder();
         builder.track_rollback_opener(true);
@@ -2057,8 +2097,8 @@ impl CodexSession {
             CodexHistory::new(self.project_path.clone()),
             read,
         )?;
-        let unknown = history.workspace_unknown() || history.settings.has_owned();
-        let project = history.settings.directory(history.project_path);
+        let unknown = history.workspace.unknown() || history.settings.has_owned();
+        let project = history.settings.directory(history.workspace.path);
         if unknown && project.is_none() {
             events.mark_codex_workspace_unknown(self.updated_at);
         }
@@ -2069,11 +2109,15 @@ impl CodexSession {
         &self,
         mut builder: EventBuilder,
         mut history: CodexHistory,
-        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
+        read: impl FnOnce(
+            &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+        ) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, CodexHistory)> {
         let mut unread_ancestor = false;
         let mut first_gap = None;
-        let unreadable = read(&mut |record, skipped_before| {
+        let mut malformed = 0;
+        let unreadable = read(&mut |mut record, skipped_before, terminated| {
+            history.observe_malformed(&mut malformed, skipped_before);
             if builder.tracks_rollback_opener()
                 && !ordinary_rollback_record(&record, history.records_seen == 0)
             {
@@ -2083,12 +2127,14 @@ impl CodexSession {
                 first_gap = Some(builder.checkpoint());
                 builder.note_rollback_history_gap();
             }
-            history.observe_workspace_gaps(skipped_before.workspace_gaps());
+            history
+                .workspace
+                .observe_gaps(skipped_before.workspace_gaps(), history.records_seen);
             // The latest settings for this thread survive conversation rollback.
             history.settings.observe_gaps(skipped_before);
             history.settings.observe(&self.id, &record);
             unread_ancestor |= records_history_base(&record);
-            history.push(&mut builder, &record)?;
+            history.push(&mut builder, &mut record, terminated)?;
             if history
                 .records_seen
                 .checked_rem(TOOL_COMPACTION_RECORD_INTERVAL)
@@ -2098,7 +2144,10 @@ impl CodexSession {
             }
             Ok(())
         })?;
-        history.observe_workspace_gaps(unreadable.workspace_gaps());
+        history.observe_malformed(&mut malformed, unreadable);
+        history
+            .workspace
+            .observe_gaps(unreadable.workspace_gaps(), history.records_seen);
         history.settings.observe_gaps(unreadable);
         let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
@@ -2149,9 +2198,13 @@ impl CodexSession {
             self.updated_at,
         );
         if unread_ancestor {
-            history.workspace_history_incomplete |=
-                history.workspace_record.is_none_or(|record| record <= 1);
+            history.workspace.incomplete |=
+                history.workspace.record.is_none_or(|record| record <= 1);
             report_unread_ancestor(&mut builder, self.updated_at);
+        }
+        history.finish(&mut builder);
+        if !self.is_subagent && history.paginated && !history.withdrawn.is_empty() {
+            builder.record_paginated_opener_withdrawal(unread_ancestor);
         }
         Ok((builder, history))
     }
@@ -2196,11 +2249,15 @@ impl CodexSession {
                 read.workspace_projection,
             ));
         }
-        let scan = self.scan_workspace()?;
-        let (events, project, reconstructed) = if scan.reconstruct_history {
-            self.reconstructed_preview(rollout_file::LIMITS)?
+        let (events, project, reconstructed) = if self.history_mode == CodexHistoryMode::Legacy {
+            let scan = self.scan_workspace(true)?;
+            if scan.reconstruct_history || contains_rollback_marker(&self.path)? {
+                self.reconstructed_preview(rollout_file::LIMITS)?
+            } else {
+                self.preview_events(scan.directory)?
+            }
         } else {
-            self.preview_events(scan.directory)?
+            self.reconstructed_preview(rollout_file::LIMITS)?
         };
         let branch = self.branch_at(project.as_deref());
         let title = events.rollback_title();
@@ -2250,8 +2307,14 @@ impl CodexSession {
     fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let (events, project, source_complete, workspace_reconstructed) =
-            match rollout_file::sample(&self.path, budget, self.project_path.as_deref(), &self.id)
-                .context("sampling compressed Codex rollout")?
+            match rollout_file::sample(
+                &self.path,
+                budget,
+                self.project_path.as_deref(),
+                &self.id,
+                self.history_mode,
+            )
+            .context("sampling compressed Codex rollout")?
             {
                 rollout_file::Sample::Complete(bytes) => {
                     let (events, project) = self.canonical_events_with(|visit| {
@@ -2276,7 +2339,7 @@ impl CodexSession {
                         prefix_records,
                         unreadable,
                         Some(omitted),
-                    );
+                    )?;
                     (events, directory, false, true)
                 }
             };
@@ -2301,16 +2364,53 @@ impl CodexSession {
         })
     }
 
+    fn materialized_preview(
+        &self,
+        limits: crate::support::JsonLinesLimits,
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+        let mut builder = self.event_builder();
+        builder.track_rollback_opener(true);
+        let (mut events, history) = self.canonical_events_into(
+            builder,
+            CodexHistory::new(self.project_path.clone()),
+            |visit| rollout_file::visit_with_limits(&self.path, limits, visit),
+        )?;
+        let verified = history.settings.has_owned() || !history.workspace.incomplete;
+        let unknown = history.workspace.unknown() || history.settings.has_owned();
+        let project = history.settings.directory(history.workspace.path);
+        if project.is_none() && unknown {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
+        let (omitted, prefix_end) = events.retain_bounded_preview(
+            rollout_file::SAMPLE_RECORDS,
+            usize::try_from(MAX_PREVIEW_TAIL_SIZE)?,
+        );
+        self.finish_preview_prefix(
+            &mut events,
+            Some(omitted),
+            history
+                .source_prefix_end
+                .map_or(prefix_end, |end| end.min(prefix_end)),
+            history.source_prefix_end.is_none(),
+        );
+        Ok((events, project, verified))
+    }
+
     fn reconstructed_preview(
         &self,
         limits: crate::support::JsonLinesLimits,
     ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+        if self.history_mode != CodexHistoryMode::Legacy {
+            return self.materialized_preview(limits);
+        }
         let stamp = || fs::metadata(&self.path).map(|metadata| RolloutStamp::new(&metadata));
         let before = stamp()?;
         let per_edge = usize::try_from(MAX_PREVIEW_TAIL_SIZE)?;
         let mut builder = self.event_builder();
         builder.plan_preview(None);
         builder.track_rollback_opener(false);
+        let mut materialize = false;
+        let mut replay = DisplayReplay::default();
         let (
             (selected, omitted, prefix_end),
             workspace_record,
@@ -2320,16 +2420,31 @@ impl CodexSession {
         ) = {
             let (plan, history) =
                 self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                    rollout_file::visit_with_limits(&self.path, limits, visit)
+                    rollout_file::visit_with_limits(
+                        &self.path,
+                        limits,
+                        |record, skipped, terminated| {
+                            materialize |= replay.observe(&record);
+                            visit(record, skipped, terminated)
+                        },
+                    )
                 })?;
             (
                 plan.select_preview(rollout_file::SAMPLE_RECORDS, per_edge),
-                history.workspace_record,
+                history.workspace.record,
                 history.source_prefix_end,
                 history.settings,
                 plan.rollback_title(),
             )
         };
+        if materialize {
+            let preview = self.materialized_preview(limits)?;
+            anyhow::ensure!(
+                stamp()? == before,
+                "Codex rollout changed while reconstructing its preview"
+            );
+            return Ok(preview);
+        }
         let expected = selected.len();
         let mut builder = self.event_builder();
         builder.plan_preview(Some(selected.clone()));
@@ -2338,16 +2453,20 @@ impl CodexSession {
         let mut position = 0_usize;
         let (mut events, history) =
             self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                rollout_file::visit_with_limits(&self.path, limits, |record, skipped_before| {
-                    position += 1;
-                    if workspace_record == Some(position) {
-                        project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
-                    }
-                    visit(record, skipped_before)
-                })
+                rollout_file::visit_with_limits(
+                    &self.path,
+                    limits,
+                    |record, skipped_before, terminated| {
+                        position += 1;
+                        if workspace_record == Some(position) {
+                            project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
+                        }
+                        visit(record, skipped_before, terminated)
+                    },
+                )
             })?;
         if stamp()? != before
-            || history.workspace_record != workspace_record
+            || history.workspace.record != workspace_record
             || history.settings != first_settings
             || events.rollback_title() != first_title
             || history.source_prefix_end != source_prefix_end
@@ -2361,7 +2480,7 @@ impl CodexSession {
         events.finish_preview(expected)?;
         let project = history.settings.directory(project);
         let owned_settings = history.settings.has_owned();
-        if project.is_none() && (history.workspace_unknown() || owned_settings) {
+        if project.is_none() && (history.workspace.unknown() || owned_settings) {
             events.mark_codex_workspace_unknown(self.updated_at);
         }
         self.finish_preview_prefix(
@@ -2373,7 +2492,7 @@ impl CodexSession {
         Ok((
             events,
             project,
-            owned_settings || !history.workspace_history_incomplete,
+            owned_settings || !history.workspace.incomplete,
         ))
     }
 
@@ -2397,7 +2516,7 @@ impl CodexSession {
             preview.prefix_records,
             preview.omissions,
             (!preview.sampled).then_some(0),
-        );
+        )?;
         Ok((events, directory, true))
     }
 
@@ -2407,9 +2526,9 @@ impl CodexSession {
         prefix_records: usize,
         omissions: JsonLineSkips,
         omitted: Option<usize>,
-    ) -> EventBuilder {
+    ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
-        let mut last_visible = None;
+        let mut history = CodexHistory::new(self.project_path.clone());
         let unread_ancestor = records.iter().any(records_history_base);
         if !self.is_subagent
             && prefix_records > 0
@@ -2422,16 +2541,17 @@ impl CodexSession {
             builder.note_rollback_history_gap();
         }
         let mut records = records.into_iter();
-        for record in records.by_ref().take(prefix_records) {
-            push_record(&mut builder, &record, &mut last_visible);
+        for mut record in records.by_ref().take(prefix_records) {
+            history.push(&mut builder, &mut record, true)?;
         }
         let prefix_end = builder.checkpoint();
-        for record in records {
-            push_record(&mut builder, &record, &mut last_visible);
+        for mut record in records {
+            history.push(&mut builder, &mut record, true)?;
         }
         if unread_ancestor {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
+        history.finish(&mut builder);
         builder.push_json_line_omissions(
             omissions,
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
@@ -2444,7 +2564,7 @@ impl CodexSession {
             prefix_end,
             omissions.total() == 0 && !unread_ancestor,
         );
-        builder
+        Ok(builder)
     }
 
     fn finish_preview_prefix(
@@ -2482,26 +2602,153 @@ impl CodexSession {
 }
 
 struct TurnCheckpoint {
+    id: Option<String>,
     sequence: u64,
+    request_sequence: u64,
+    admission: Option<InputPosition>,
     project_path: Option<PathBuf>,
     workspace_record: Option<usize>,
     tool_events: usize,
 }
 
+impl TurnCheckpoint {
+    fn admitted_sequence(&self) -> Option<u64> {
+        // A completed display alone does not establish a native instruction boundary.
+        self.admission.map(|_| self.sequence)
+    }
+}
+
+fn confirm_admission(turns: &mut [TurnCheckpoint], sequence: Option<u64>, position: InputPosition) {
+    if let Some(sequence) = sequence
+        && let Ok(index) = turns.binary_search_by_key(&sequence, |turn| turn.request_sequence)
+    {
+        turns[index].admission = Some(position);
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum CompletedKind {
+    User,
+    Assistant,
+    AsyncAssistant,
+    Documentary,
+    Plan,
+    Tool,
+}
+
+impl CompletedKind {
+    fn for_item(payload: &Value) -> Self {
+        match payload["item"]["type"].as_str() {
+            Some("UserMessage") => Self::User,
+            Some("AgentMessage")
+                if completed_item::assistant::is_async(&payload["item"]["delivery"]) =>
+            {
+                Self::AsyncAssistant
+            }
+            Some("AgentMessage") => Self::Assistant,
+            Some("Plan") => Self::Plan,
+            Some(_) if !completed_item::model_receipt(&payload["item"]) => Self::Documentary,
+            _ => Self::Tool,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompletedPosition {
+    display_identity: Option<tool_history::DisplayCallIdentity>,
+    pending_output_call: Option<u64>,
+    deferred_output: Option<[u8; 32]>,
+    receipt: Option<tool_occurrences::Receipt>,
+    ambiguous: bool,
+    model: Option<u64>,
+    kind: CompletedKind,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum CompletionScope {
+    Published,
+    LegacyOutput,
+    Historical(CompletedKind),
+}
+
+type CompletedTurn = HashMap<(CompletionScope, String), CompletedPosition>;
+
+struct WorkspaceHistory {
+    path: Option<PathBuf>,
+    record: Option<usize>,
+    retain_path: bool,
+    gaps: usize,
+    records_before_gap: usize,
+    checkpoints_pruned: bool,
+    incomplete: bool,
+}
+
+impl WorkspaceHistory {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            record: Some(1),
+            retain_path: true,
+            gaps: 0,
+            records_before_gap: 0,
+            checkpoints_pruned: false,
+            incomplete: false,
+        }
+    }
+
+    fn unknown(&self) -> bool {
+        self.gaps > 0 && self.record.is_none()
+    }
+
+    fn observe_gaps(&mut self, skipped: usize, records_seen: usize) {
+        if skipped != self.gaps {
+            self.gaps = skipped;
+            // Only a cwd recorded after this gap can establish the workspace again.
+            self.records_before_gap = records_seen;
+            self.record = None;
+            self.path = None;
+        }
+    }
+}
+
 struct CodexHistory {
-    project_path: Option<PathBuf>,
+    workspace: WorkspaceHistory,
+    items: CodexItems,
     settings: workspace_check::WorkspaceSettings,
-    workspace_record: Option<usize>,
-    retain_workspace_path: bool,
-    workspace_gaps: usize,
-    records_before_workspace_gap: usize,
     records_seen: usize,
-    last_visible: Option<(EventKind, String, &'static str)>,
+    last_rollback_boundary: Option<u64>,
     turns: Vec<TurnCheckpoint>,
-    pruned_turn_checkpoints: bool,
-    workspace_history_incomplete: bool,
     pending_turn: Option<TurnCheckpoint>,
-    tool_events: usize,
+    active_turn_id: Option<String>,
+    source_ordinal: u64,
+    paginated: bool,
+    paginated_inputs: PaginatedRollback,
+    paginated_checkpoint: paginated_checkpoint::CheckpointHistory,
+    checkpoint_turns: paginated_checkpoint::CheckpointTurns,
+    paginated_workspace: paginated_workspace::PaginatedWorkspace,
+    paginated_answers: PaginatedAnswers,
+    withdrawn: HashMap<u64, Withdrawal>,
+    explicit_display_turn: bool,
+    legacy_display: MessageIdentity,
+    legacy_request: Option<u64>,
+    uncertain_legacy_rollback: bool,
+    legacy_private: LegacyPrivateInputs,
+    rollout_lines: RolloutLines,
+    // Codex updates a completed item in place using its turn and item IDs.
+    completed: HashMap<String, CompletedTurn>,
+    named_turns: HashMap<String, u64>,
+    plan_turns: HashSet<String>,
+    plan_receipts: display_text::PlanReceipts,
+    message_ids: MessageIds,
+    aliases: TurnAliases,
+    calls: NativeCalls,
+    occurrences: tool_occurrences::ToolOccurrences,
+    display_revisions: DisplayRevisions,
+    late_owners: HashMap<u64, u64>,
+    display_positions: HashMap<u64, (u64, u64)>,
+    ambiguous_receipts: usize,
+    deferred_receipts: deferred_receipts::DeferredReceipts,
     omitted_tool_events: usize,
     omitted_events: usize,
     source_prefix_end: Option<u64>,
@@ -2510,19 +2757,41 @@ struct CodexHistory {
 impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
-            project_path,
+            paginated_workspace: paginated_workspace::PaginatedWorkspace::new(project_path.clone()),
+            workspace: WorkspaceHistory::new(project_path),
+            items: CodexItems::default(),
             settings: workspace_check::WorkspaceSettings::from_header(None),
-            workspace_record: Some(1),
-            retain_workspace_path: true,
-            workspace_gaps: 0,
-            records_before_workspace_gap: 0,
             records_seen: 0,
-            last_visible: None,
+            last_rollback_boundary: None,
             turns: Vec::new(),
-            pruned_turn_checkpoints: false,
-            workspace_history_incomplete: false,
             pending_turn: None,
-            tool_events: 0,
+            active_turn_id: None,
+            source_ordinal: 0,
+            paginated: false,
+            paginated_inputs: PaginatedRollback::default(),
+            paginated_checkpoint: paginated_checkpoint::CheckpointHistory::default(),
+            checkpoint_turns: paginated_checkpoint::CheckpointTurns::default(),
+            paginated_answers: PaginatedAnswers::default(),
+            withdrawn: HashMap::new(),
+            explicit_display_turn: false,
+            legacy_display: MessageIdentity::default(),
+            legacy_request: None,
+            uncertain_legacy_rollback: false,
+            legacy_private: LegacyPrivateInputs::default(),
+            rollout_lines: RolloutLines::default(),
+            completed: HashMap::new(),
+            named_turns: HashMap::new(),
+            plan_turns: HashSet::new(),
+            plan_receipts: display_text::PlanReceipts::default(),
+            message_ids: MessageIds::default(),
+            aliases: TurnAliases::default(),
+            calls: NativeCalls::default(),
+            occurrences: tool_occurrences::ToolOccurrences::default(),
+            display_revisions: DisplayRevisions::default(),
+            late_owners: HashMap::new(),
+            display_positions: HashMap::new(),
+            ambiguous_receipts: 0,
+            deferred_receipts: deferred_receipts::DeferredReceipts::default(),
             omitted_tool_events: 0,
             omitted_events: 0,
             source_prefix_end: None,
@@ -2531,122 +2800,1477 @@ impl CodexHistory {
 
     /// During preview, a checkpoint holds the position of the cwd record. The second pass reads the surviving path.
     fn preview() -> Self {
-        Self {
-            retain_workspace_path: false,
-            ..Self::new(None)
-        }
+        let mut history = Self::new(None);
+        history.workspace.retain_path = false;
+        history
     }
 
-    fn workspace_unknown(&self) -> bool {
-        self.workspace_gaps > 0 && self.workspace_record.is_none()
-    }
-
-    fn observe_workspace_gaps(&mut self, skipped: usize) {
-        if skipped != self.workspace_gaps {
-            self.workspace_gaps = skipped;
-            // Only a cwd recorded after this gap can establish the workspace again.
-            self.records_before_workspace_gap = self.records_seen;
-            self.workspace_record = None;
-            self.project_path = None;
+    fn observe_malformed(&mut self, prior: &mut usize, skipped: JsonLineSkips) {
+        for _ in *prior..skipped.malformed {
+            self.rollout_lines.malformed();
         }
+        *prior = skipped.malformed;
     }
 
     /// Applies the retained tool event, event, and turn checkpoint caps.
     fn compact(&mut self, builder: &mut EventBuilder) {
-        self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
-        self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        let tools_removed = builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        let events_removed = builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        self.omitted_tool_events += tools_removed;
+        self.omitted_events += events_removed;
+        if tools_removed > 0 || events_removed > 0 {
+            self.prune_completed(builder);
+            let first = builder.first_sequence();
+            self.items.mirrors.discard_before(first);
+            self.paginated_inputs.discard_before(first);
+            self.paginated_answers.discard_before(first);
+            self.withdrawn.retain(|seq, _| *seq >= first);
+        }
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
         if excess > 0 || self.omitted_events > 0 || self.omitted_tool_events > 0 {
             builder.note_rollback_history_gap();
         }
-        self.pruned_turn_checkpoints |= excess > 0;
-        self.turns.drain(..excess);
+        self.workspace.checkpoints_pruned |= excess > 0;
+        if self.plan_turns.len() > MAX_CANONICAL_EVENTS {
+            self.plan_turns.retain(|id| {
+                self.named_turns.contains_key(id) || self.active_turn_id.as_deref() == Some(id)
+            });
+        }
+        if excess > 0 {
+            self.turns.drain(..excess);
+            let earliest = self.turns[0].sequence;
+            self.named_turns.retain(|_, seq| *seq >= earliest);
+            self.aliases.retain(&self.named_turns);
+            self.plan_turns
+                .retain(|id| self.named_turns.contains_key(id));
+        }
+        if tools_removed > 0 || events_removed > 0 || excess > 0 {
+            let oldest = self.turns.first().map_or(0, |turn| turn.sequence);
+            self.display_revisions.prune(builder, oldest);
+        }
     }
 
     fn checkpoint(&self, builder: &EventBuilder) -> TurnCheckpoint {
         TurnCheckpoint {
+            id: self.active_turn_id.clone(),
             sequence: builder.checkpoint(),
-            project_path: self.project_path.clone(),
-            workspace_record: self.workspace_record,
-            tool_events: self.tool_events,
+            request_sequence: builder.checkpoint(),
+            admission: None,
+            project_path: self.workspace.path.clone(),
+            tool_events: self.items.tool_events,
+            workspace_record: self.workspace.record,
         }
     }
 
-    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
-        self.records_seen += 1;
-        let record_type = record.get("type").and_then(Value::as_str);
-        let event_type = (record_type == Some("event_msg"))
-            .then(|| string_at(record, &[&["payload", "type"]]))
-            .flatten();
-        if event_type == Some("thread_rolled_back") {
-            let count = record["payload"]["num_turns"]
-                .as_u64()
-                .context("Codex rollback marker has no valid num_turns")?;
-            let mut truncated = None;
-            if count > 0 {
-                let count = usize::try_from(count).unwrap_or(usize::MAX);
-                if self.pruned_turn_checkpoints && count > self.turns.len() {
-                    self.workspace_history_incomplete = true;
-                }
-                let retained = self.turns.len().saturating_sub(count);
-                if retained < self.turns.len() {
-                    let checkpoint = self.turns.remove(retained);
-                    self.turns.truncate(retained);
-                    builder.truncate_from(checkpoint.sequence);
-                    truncated = Some(checkpoint.sequence);
-                    self.workspace_record = checkpoint
-                        .workspace_record
-                        .filter(|position| *position > self.records_before_workspace_gap);
-                    self.project_path = self.workspace_record.and(checkpoint.project_path);
-                    self.tool_events = checkpoint.tool_events;
-                    self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
-                } else if self.workspace_gaps > 0 {
-                    self.project_path = None;
-                    self.workspace_record = None;
-                }
-                self.last_visible = None;
-                self.pending_turn = None;
+    fn remember_turn(&mut self, mut checkpoint: TurnCheckpoint, request: u64) {
+        checkpoint.request_sequence = request;
+        if let Some(id) = &checkpoint.id {
+            let canonical = self.aliases.resolve(id).to_owned();
+            self.named_turns
+                .insert(canonical.clone(), checkpoint.sequence);
+            checkpoint.id = Some(canonical);
+        }
+        self.turns.push(checkpoint);
+    }
+
+    fn prune_completed(&mut self, builder: &mut EventBuilder) {
+        self.deferred_receipts
+            .retain(|seq, _| builder.event_at_mut(seq).is_some());
+        self.items
+            .outcomes
+            .retain(|seq| builder.event_at_mut(seq).is_some());
+        self.calls.retain(|seq| builder.event_at_mut(seq).is_some());
+        self.occurrences
+            .retain(|seq| builder.event_at_mut(seq).is_some());
+        self.message_ids
+            .retain(|seq| builder.event_at_mut(seq).is_some());
+        self.completed.retain(|_, items| {
+            items.retain(|_, position| builder.event_at_mut(position.sequence).is_some());
+            !items.is_empty()
+        });
+        self.late_owners
+            .retain(|seq, _| builder.event_at_mut(*seq).is_some());
+        self.display_positions
+            .retain(|seq, _| builder.event_at_mut(*seq).is_some());
+    }
+
+    fn rollback(&mut self, builder: &mut EventBuilder, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if self.workspace.checkpoints_pruned && count > self.turns.len() as u64 {
+            self.workspace.incomplete = true;
+        }
+        let retained = self
+            .turns
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+        if retained < self.turns.len() {
+            self.uncertain_legacy_rollback |= self.turns[retained..]
+                .iter()
+                .any(|turn| turn.admission.is_none());
+            if let Some(cut) = self.turns[retained].admission {
+                let excess = count.saturating_sub(self.turns.len() as u64);
+                self.uncertain_legacy_rollback |= self.legacy_private.crosses(cut, excess);
             }
-            return Ok(truncated);
+            let checkpoint = self.turns.remove(retained);
+            self.turns.truncate(retained);
+            self.plan_receipts.rollback(checkpoint.sequence);
+            // A migrated turn can have both its original and generated ID.
+            self.named_turns.retain(|_, seq| *seq < checkpoint.sequence);
+            for turn in &self.turns {
+                self.uncertain_legacy_rollback |= turn.admission.is_none();
+                if let Some(id) = &turn.id {
+                    self.named_turns.insert(id.clone(), turn.sequence);
+                }
+            }
+            self.aliases.retain(&self.named_turns);
+            self.items.tool_events = checkpoint.tool_events;
+            if self.late_owners.is_empty() {
+                builder.truncate_from(checkpoint.sequence);
+            } else {
+                builder.retain_events(|event| {
+                    let owner = self
+                        .late_owners
+                        .get(&event.sequence)
+                        .copied()
+                        .unwrap_or(event.sequence);
+                    let keep = owner < checkpoint.sequence;
+                    if keep != (event.sequence < checkpoint.sequence)
+                        && matches!(
+                            event.kind,
+                            EventKind::CommandExecuted
+                                | EventKind::ToolCalled
+                                | EventKind::ToolCompleted
+                                | EventKind::ToolFailed
+                        )
+                    {
+                        if keep {
+                            self.items.tool_events += 1;
+                        } else {
+                            self.items.tool_events = self.items.tool_events.saturating_sub(1);
+                        }
+                    }
+                    keep
+                });
+            }
+            self.omitted_tool_events = self.omitted_tool_events.min(self.items.tool_events);
+            self.display_revisions
+                .rollback(builder, checkpoint.sequence);
+            self.deferred_receipts
+                .retain(|_, owner| owner < checkpoint.sequence);
+            self.last_rollback_boundary = Some(checkpoint.sequence);
+            self.workspace.record = checkpoint
+                .workspace_record
+                .filter(|position| *position > self.workspace.records_before_gap);
+            self.workspace.path = self.workspace.record.and(checkpoint.project_path);
+            self.prune_completed(builder);
+        } else if self.workspace.gaps > 0 {
+            self.workspace.record = None;
+            self.workspace.path = None;
+        }
+        self.plan_turns
+            .retain(|id| self.named_turns.contains_key(id));
+        self.items.clear_mirrors();
+        self.items.in_turn = false;
+        self.explicit_display_turn = false;
+        self.legacy_display = MessageIdentity::default();
+        self.legacy_request = None;
+        self.items.plan_mode = false;
+        self.pending_turn = None;
+        self.active_turn_id = None;
+    }
+
+    fn model_plan_mode(&self, item: &Value) -> bool {
+        let turn = item["internal_chat_message_metadata_passthrough"]["turn_id"]
+            .as_str()
+            .filter(|turn| !turn.is_empty())
+            .map(|turn| self.aliases.resolve(turn));
+        turn.map_or(self.items.plan_mode, |turn| {
+            self.plan_turns.contains(turn)
+                || (self.items.plan_mode
+                    && self.current_turn_id().is_none_or(|active| active == turn))
+        })
+    }
+
+    fn set_plan_mode(&mut self, turn: Option<&str>, plan: bool) {
+        self.items.plan_mode = plan;
+        if let Some(turn) = turn {
+            let turn = self.aliases.resolve(turn);
+            if plan {
+                self.plan_turns.insert(turn.to_owned());
+            } else {
+                self.plan_turns.remove(turn);
+            }
+        }
+    }
+
+    fn current_turn_id(&self) -> Option<&str> {
+        self.active_turn_id
+            .as_deref()
+            .or_else(|| self.turns.last()?.id.as_deref())
+            .map(|turn| self.aliases.resolve(turn))
+    }
+
+    fn observe_context_turn(&mut self, turn: &str, sequence: u64) {
+        if self
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|active| self.aliases.resolve(active) == self.aliases.resolve(turn))
+        {
+            return;
+        }
+        // Some older rollouts name the turn in its context after the first request.
+        if self.active_turn_id.is_none()
+            && self
+                .items
+                .message
+                .as_ref()
+                .is_some_and(|message| message.kind == EventKind::MessageUser)
+            && let Some(checkpoint) = self.turns.last_mut()
+            && checkpoint.id.as_deref().is_none_or(|id| id == turn)
+        {
+            checkpoint.id = Some(turn.to_owned());
+            self.named_turns
+                .insert(turn.to_owned(), checkpoint.sequence);
+        } else {
+            if is_implicit_turn(turn) {
+                self.items.turn_boundary(Some(turn));
+            } else {
+                self.items.message = None;
+                self.items.mirrors.start_context(sequence);
+                self.items.outcomes.retain_models();
+            }
+            self.pending_turn = None;
+        }
+        self.active_turn_id = Some(turn.to_owned());
+        self.items.in_turn = true;
+    }
+
+    fn push(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &mut Value,
+        terminated: bool,
+    ) -> Result<Option<u64>> {
+        self.records_seen += 1;
+        self.last_rollback_boundary = None;
+        if self.source_ordinal == 0 {
+            self.rollout_lines.start_segment(record);
+            self.paginated = self.rollout_lines.paginated();
+            self.items.tool_projection.paginated = self.paginated;
+        }
+        let disposition =
+            self.rollout_lines
+                .prepare(record, terminated, self.paginated.then_some(true));
+        self.push_admitted(builder, record, disposition)?;
+        Ok(self.last_rollback_boundary)
+    }
+
+    fn push_admitted(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        disposition: Admission,
+    ) -> Result<()> {
+        let index = self.source_ordinal;
+        self.source_ordinal += 1;
+        match disposition {
+            Admission::Complete if record["type"] == "realtime_item" => {
+                self.rollout_lines.project_realtime(record, index, builder);
+                Ok(())
+            }
+            Admission::Complete => self.push_verified(builder, record, index),
+            Admission::ModelOnly => {
+                let event_type = (record["type"] == "event_msg")
+                    .then(|| record["payload"]["type"].as_str())
+                    .flatten();
+                if !self.consume_model_record(record, event_type, builder)? {
+                    self.push_model_tool(builder, record);
+                }
+                Ok(())
+            }
+            Admission::Skip => Ok(()),
+        }
+    }
+
+    fn push_verified(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        index: u64,
+    ) -> Result<()> {
+        let record_type = record.get("type").and_then(Value::as_str);
+        let payload = &record["payload"];
+        let event_type = (record_type == Some("event_msg"))
+            .then(|| payload["type"].as_str())
+            .flatten();
+        if self.paginated && index > 0 && record_type == Some("session_meta") {
+            self.start_copied_segment(builder.checkpoint());
+        }
+        if self.consume_model_record(record, event_type, builder)? {
+            return Ok(());
+        }
+        let turn_id = payload["turn_id"].as_str();
+        if event_type == Some("thread_rolled_back") {
+            let count = rollout_lines::rollback_turns(payload)
+                .context("Codex rollback marker has no valid num_turns")?;
+            self.rollback(builder, u64::from(count));
+            return Ok(());
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
+            if self.paginated {
+                self.paginated_inputs
+                    .turn_started(turn_id, self.source_ordinal);
+            }
+            self.explicit_display_turn = true;
+            self.legacy_request = None;
+            // The migrator writes a default mode when it synthesizes a turn after its context.
+            let generated = turn_id.is_some_and(is_implicit_turn);
+            let plan =
+                payload["collaboration_mode_kind"] == "plan" || (generated && self.items.plan_mode);
+            self.set_plan_mode(turn_id, plan);
+            self.active_turn_id = turn_id.map(str::to_owned);
             self.pending_turn = Some(self.checkpoint(builder));
-            self.last_visible = None;
+            self.items.turn_boundary(turn_id);
+            self.items.in_turn = true;
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
-        ) {
+        ) && turn_id
+            .zip(self.current_turn_id())
+            .is_none_or(|(target, current)| self.aliases.resolve(target) == current)
+        {
+            self.explicit_display_turn = false;
+            self.legacy_display = MessageIdentity::default();
+            self.legacy_request = None;
             self.pending_turn = None;
-            self.last_visible = None;
+            self.active_turn_id = None;
+            self.items.turn_boundary(turn_id);
+            self.items.in_turn = false;
+            self.items.plan_mode = false;
         }
         if record_type == Some("turn_context") {
+            if let Some(mode) = payload["collaboration_mode"]["mode"].as_str() {
+                self.set_plan_mode(turn_id, mode == "plan");
+            } else if turn_id.is_some()
+                && turn_id.map(|id| self.aliases.resolve(id)) != self.current_turn_id()
+            {
+                self.items.plan_mode = turn_id
+                    .is_some_and(|turn| self.plan_turns.contains(self.aliases.resolve(turn)));
+            }
+            if let Some(turn) = turn_id {
+                self.observe_context_turn(turn, builder.checkpoint());
+            }
             if self.pending_turn.is_none()
-                && (self.workspace_unknown()
+                && (self.workspace.unknown()
                     || self
-                        .last_visible
+                        .items
+                        .message
                         .as_ref()
-                        .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser))
+                        .is_none_or(|message| message.kind != EventKind::MessageUser))
             {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
             if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
-                self.workspace_record = Some(self.records_seen);
-                if self.retain_workspace_path {
-                    self.project_path = Some(PathBuf::from(cwd));
+                if self.paginated {
+                    self.paginated_workspace
+                        .observe(turn_id.or(self.active_turn_id.as_deref()), Path::new(&cwd));
+                }
+                self.workspace.record = Some(self.records_seen);
+                if self.workspace.retain_path {
+                    self.workspace.path = Some(PathBuf::from(cwd));
                 }
             }
         }
-        let checkpoint = self.checkpoint(builder);
-        if push_record(builder, record, &mut self.last_visible) {
-            self.turns
-                .push(self.pending_turn.take().unwrap_or(checkpoint));
-        } else if record_type == Some("response_item")
-            && record["payload"]["type"] != "message"
-            && builder.checkpoint() > checkpoint.sequence
-        {
-            self.tool_events += 1;
+        // A legacy request can start a generated display turn at its source ordinal.
+        if event_type == Some("user_message") && self.items.in_turn && !self.explicit_display_turn {
+            self.legacy_display =
+                MessageIdentity::new(Some(&format!("rollout-{index}")), None, true);
         }
-        Ok(None)
+        if event_type == Some("item_completed")
+            && let (Some(turn), Some(id)) = (turn_id, payload["item"]["id"].as_str())
+        {
+            self.push_identified_item(
+                builder,
+                payload,
+                turn,
+                id,
+                parse_timestamp(record.get("timestamp")),
+            );
+        } else if !self.push_model_tool(builder, record) {
+            self.push_message_or_metadata(builder, record, event_type);
+        }
+        Ok(())
+    }
+
+    fn start_copied_segment(&mut self, sequence: u64) {
+        self.paginated_inputs.segment();
+        self.paginated_workspace.new_segment(sequence);
+        self.paginated_answers.segment();
+    }
+
+    fn consume_model_record(
+        &mut self,
+        record: &Value,
+        event_type: Option<&str>,
+        builder: &mut EventBuilder,
+    ) -> Result<bool> {
+        if !self.paginated {
+            return Ok(self.legacy_private.observe(record, self.source_ordinal));
+        }
+        let payload = &record["payload"];
+        self.checkpoint_turns.observe(record, self.source_ordinal);
+        if let Some(turn) = payload["turn_id"].as_str() {
+            let finished = matches!(event_type, Some("task_complete" | "turn_complete"));
+            if finished && self.plan_turns.contains(self.aliases.resolve(turn)) {
+                self.plan_receipts.finish_turn(turn, self.source_ordinal);
+            }
+            if finished
+                || (record["type"] == "token_usage_record" && payload["response_id"].is_string())
+            {
+                self.paginated_answers.end_response(turn);
+            }
+        }
+        if record["type"] == "compacted" {
+            self.record_paginated_checkpoint(record, builder);
+            return Ok(true);
+        }
+        if record["type"] == "inter_agent_communication"
+            || (record["type"] == "response_item"
+                && matches!(payload["type"].as_str(), Some("message" | "agent_message")))
+        {
+            if !self
+                .paginated_inputs
+                .model_user(record, self.source_ordinal, builder.checkpoint())
+                && payload["type"] == "message"
+                && payload["role"] == "assistant"
+            {
+                let plan_mode = self.model_plan_mode(payload);
+                let active = self
+                    .active_turn_id
+                    .as_deref()
+                    .filter(|t| !is_implicit_turn(t));
+                self.paginated_answers.model(
+                    record,
+                    self.source_ordinal,
+                    builder.checkpoint(),
+                    plan_mode,
+                    active,
+                );
+            }
+            return Ok(true);
+        }
+        if event_type == Some("thread_rolled_back") {
+            let count = rollout_lines::rollback_turns(payload)
+                .context("Codex rollback marker has no valid num_turns")?;
+            self.withdraw_displayed_inputs(builder, usize::try_from(count).unwrap_or(usize::MAX));
+            return Ok(true);
+        }
+        Ok(matches!(event_type, Some("user_message" | "agent_message")))
+    }
+
+    fn record_paginated_checkpoint(&mut self, record: &Value, builder: &mut EventBuilder) {
+        let payload = &record["payload"];
+        let selection = self.checkpoint_turns.selected();
+        if let Some(window) =
+            paginated_checkpoint::PaginatedCheckpoint::read(self, builder, payload)
+        {
+            self.paginated_checkpoint.record(Some(window), selection);
+        } else if let Some(message) = payload["message"].as_str() {
+            self.paginated_checkpoint.record_legacy(
+                self.source_ordinal,
+                builder.checkpoint(),
+                message,
+                &self.paginated_inputs,
+                selection,
+            );
+            let summary = if message.is_empty() {
+                "(no summary available)"
+            } else {
+                message
+            };
+            builder.push(
+                EventKind::CompactionCreated,
+                json!({"summary":summary,"ordinal":self.source_ordinal}),
+                parse_timestamp(record.get("timestamp")),
+                ReplayPolicy::Contextual,
+                Some(omnis_core::CODEX_POSITIONED_LEGACY_SUMMARY.to_owned()),
+                None,
+            );
+        }
+    }
+
+    fn withdraw_displayed_inputs(&mut self, builder: &EventBuilder, count: usize) {
+        let effective = self.paginated_checkpoint.rollback(
+            count,
+            &self.paginated_inputs,
+            self.checkpoint_turns.selected(),
+        );
+        let aliases = self.paginated_inputs.resolved_turns();
+        let checkpoint_floor = self
+            .paginated_checkpoint
+            .as_ref()
+            .map_or(0, paginated_checkpoint::PaginatedCheckpoint::source_ordinal);
+        let mut owners = self.paginated_inputs.withdraw(
+            effective.input_count,
+            &aliases,
+            effective.boundary,
+            checkpoint_floor,
+        );
+        if effective.changed {
+            self.workspace.path = self.paginated_workspace.surviving(
+                &self.aliases,
+                &aliases,
+                self.turns.iter().map(|turn| {
+                    let seq = turn.request_sequence;
+                    let baseline = owners
+                        .get(&seq)
+                        .or_else(|| self.withdrawn.get(&seq))
+                        .copied();
+                    let status = self.paginated_checkpoint.status(seq, Some(seq), baseline);
+                    if turn.id.is_some()
+                        && self
+                            .paginated_checkpoint
+                            .as_ref()
+                            .is_some_and(|window| window.applies_to(seq))
+                        && let Some(status @ (Withdrawal::Confirmed | Withdrawal::Unverified)) =
+                            status
+                    {
+                        owners.insert(seq, status);
+                    }
+                    (seq, turn.id.as_deref(), status)
+                }),
+            );
+        }
+        self.paginated_answers.resolve_turns(aliases);
+        let replies = effective
+            .boundary
+            .map_or_else(HashMap::new, |(ordinal, order)| {
+                self.paginated_answers.rollback(ordinal, order)
+            });
+        if owners.is_empty() && replies.is_empty() {
+            return;
+        }
+        builder.visit_events(|event| {
+            if let Some(&withdrawal) = replies.get(&event.sequence) {
+                if let Some(status) = withdrawal {
+                    self.withdrawn.insert(event.sequence, status);
+                }
+                return;
+            }
+            let sequence = self
+                .late_owners
+                .get(&event.sequence)
+                .copied()
+                .unwrap_or(event.sequence);
+            if let Some(input) = self
+                .turns
+                .partition_point(|turn| turn.sequence <= sequence)
+                .checked_sub(1)
+                && let Some(status) = owners.get(&self.turns[input].request_sequence)
+            {
+                self.withdrawn.insert(event.sequence, *status);
+            }
+        });
+    }
+
+    fn finish(&mut self, builder: &mut EventBuilder) {
+        let missing = self
+            .plan_receipts
+            .missing_paginated(self.paginated_answers.surviving_plans(), || {
+                self.paginated_inputs.resolved_turns()
+            });
+        self.plan_receipts.report(builder, missing);
+        self.display_revisions.finish(builder);
+        self.finish_deferred_receipts(builder);
+        if !self.paginated {
+            self.finish_legacy_outputs(builder);
+        }
+        if self.uncertain_legacy_rollback {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true, "reason": "The legacy display and model records do not establish the same rollback boundary."}),
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_legacy_rollback".into()),
+                None,
+            );
+        }
+        for (count, record, reason) in [
+            (
+                self.ambiguous_receipts,
+                "omnisession.codex_ambiguous_receipt",
+                "The published command does not distinguish repeated model calls. Their outcomes remain separate.",
+            ),
+            (
+                self.rollout_lines.invalid_checkpoints,
+                "omnisession.codex_invalid_checkpoint",
+                "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
+            ),
+            (
+                self.rollout_lines.invalid_messages,
+                "omnisession.codex_invalid_message",
+                "A Codex history item could not be verified. The handoff uses its last verified version.",
+            ),
+        ] {
+            if count > 0 {
+                builder.push(
+                    EventKind::ProviderEvent,
+                    json!({"omitted_events": count, "native_history_unverified": true, "reason": reason}),
+                    None,
+                    ReplayPolicy::HistoricalOnly,
+                    Some(record.into()),
+                    None,
+                );
+            }
+        }
+        self.rollout_lines.finish_segment();
+        let gap = self.rollout_lines.gap;
+        if self.rollout_lines.skipped > 0 || gap != OrdinalGap::None {
+            let reason = if self.rollout_lines.contested {
+                "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
+            } else if gap == OrdinalGap::Possible {
+                "A documentary Codex record follows a gap in the recorded positions. OmniSession could not verify whether any published history is missing."
+            } else if !self.paginated {
+                "The Codex rollout contains unreadable records. The handoff uses the last verified history."
+            } else {
+                "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+            };
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": self.rollout_lines.skipped,
+                    "ordinal_gap": gap == OrdinalGap::Confirmed,
+                    "possible_ordinal_gap": gap == OrdinalGap::Possible,
+                    "contested_ordinal": self.rollout_lines.contested,
+                    "native_history_unverified": true,
+                    "reason": reason
+                }),
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_rollout_line".into()),
+                None,
+            );
+        }
+        if self.paginated {
+            self.annotate_model_window(builder);
+        } else {
+            builder.retain_events(|event| {
+                event.source.raw_record_type.as_deref()
+                    != Some("omnisession.codex_tool_display_mirror")
+            });
+        }
+        builder.visit_events_mut(|event| completed_item::clear_source_receipt(&mut event.payload));
+        builder.order_delayed_messages(&self.display_positions);
+    }
+
+    fn annotate_model_window(&mut self, builder: &mut EventBuilder) {
+        let aliases = self.paginated_inputs.resolved_turns();
+        let answers = self.paginated_answers.finish_answers(&aliases);
+        let checkpoint = self.paginated_checkpoint.as_ref();
+        if self.paginated_checkpoint.saw_legacy() {
+            builder.retain_events(|event| {
+                event.source.raw_record_type.as_deref()
+                    != Some(omnis_core::CODEX_POSITIONED_LEGACY_SUMMARY)
+                    || event.payload["ordinal"].as_u64().is_some_and(|ordinal| {
+                        self.paginated_checkpoint.legacy_summary_active(ordinal)
+                    })
+            });
+        }
+        let mut has_positioned_replies = false;
+        builder.visit_events_mut(|event| {
+            let realtime =
+                event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT);
+            if !matches!(
+                event.kind,
+                EventKind::MessageUser
+                    | EventKind::MessageAssistant
+                    | EventKind::ToolCalled
+                    | EventKind::ToolCompleted
+                    | EventKind::ToolFailed
+                    | EventKind::CommandExecuted
+            ) {
+                return;
+            }
+            let seq = event.sequence;
+            let baseline = answers
+                .get(&seq)
+                .copied()
+                .unwrap_or_else(|| self.withdrawn.get(&seq).copied());
+            let status = if realtime {
+                self.paginated_checkpoint.status(seq, None, None)
+            } else if self.paginated_checkpoint.is_empty() {
+                baseline
+            } else {
+                let physical = self.late_owners.get(&seq).copied().unwrap_or(seq);
+                let owner = self
+                    .turns
+                    .partition_point(|turn| turn.sequence <= physical)
+                    .checked_sub(1)
+                    .map(|index| self.turns[index].request_sequence);
+                self.paginated_checkpoint.status(seq, owner, baseline)
+            };
+            let (status, prior) = if event.kind == EventKind::MessageAssistant && !realtime {
+                let projection =
+                    self.paginated_answers
+                        .project_answer(seq, &self.paginated_checkpoint, status);
+                if !projection.versions.is_empty() {
+                    has_positioned_replies = true;
+                    let mut versions = Vec::with_capacity(projection.versions.len());
+                    for version in projection.versions {
+                        let position = match version.anchor {
+                            paginated_answers::ReplyAnchor::Checkpoint { ordinal, index } => {
+                                let Some(checkpoint) = checkpoint else {
+                                    continue;
+                                };
+                                json!([checkpoint.display_end(), ordinal, index])
+                            }
+                            paginated_answers::ReplyAnchor::Source { ordinal, sequence } => {
+                                json!([sequence, ordinal, 0])
+                            }
+                        };
+                        versions.push(json!({"position":position,"text":version.spelling}));
+                    }
+                    event.payload["omnisession_codex_active_replies"] = versions.into();
+                }
+                (projection.status, projection.prior)
+            } else {
+                (status, None)
+            };
+            if let Some(status) = status {
+                let field = if status == Withdrawal::OutsideCheckpoint {
+                    "omnisession_codex_checkpoint"
+                } else {
+                    "omnisession_codex_rollback"
+                };
+                event.payload[field] = status.as_str().into();
+                if let Some(prior) = prior {
+                    event.payload["omnisession_codex_prior_display"] = prior.into();
+                }
+            }
+        });
+        if has_positioned_replies {
+            self.position_model_window(builder, &aliases);
+        }
+    }
+
+    fn position_model_window(
+        &self,
+        builder: &mut EventBuilder,
+        aliases: &HashMap<[u8; 32], [u8; 32]>,
+    ) {
+        let legacy = self.paginated_checkpoint.legacy_ordinal();
+        let checkpoint = self
+            .paginated_checkpoint
+            .as_ref()
+            .filter(|_| legacy.is_none());
+        let Some(after) = legacy
+            .or_else(|| checkpoint.map(paginated_checkpoint::PaginatedCheckpoint::source_ordinal))
+        else {
+            return;
+        };
+        let users = self
+            .paginated_inputs
+            .confirmed_suffix_positions(after, aliases);
+        builder.visit_events_mut(|event| {
+            let seq = event.sequence;
+            if let Some((ordinal, slot)) = users
+                .get(&seq)
+                .copied()
+                .or_else(|| self.paginated_answers.surviving_position(seq, after))
+            {
+                event.payload["omnisession_codex_checkpoint_position"] = json!([slot, ordinal, 0]);
+            } else if let Some(window) = checkpoint
+                && let Some(index) = window.first_retained_index(seq)
+            {
+                event.payload["omnisession_codex_checkpoint_position"] =
+                    json!([window.display_end(), window.source_ordinal(), index]);
+            }
+        });
+    }
+
+    fn push_message_or_metadata(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        event_type: Option<&str>,
+    ) {
+        let payload = &record["payload"];
+        let checkpoint = self.checkpoint(builder);
+        if self.push_record(builder, record) {
+            let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+            checkpoint.admission = InputPosition::user(record, self.source_ordinal);
+            // The migrator can emit the next raw request before closing a synthesized turn.
+            if let Some(stamped) =
+                payload["internal_chat_message_metadata_passthrough"]["turn_id"].as_str()
+            {
+                checkpoint.id = Some(stamped.to_owned());
+            } else if checkpoint.id.as_deref().is_some_and(|id| {
+                is_implicit_turn(id) && self.named_turns.contains_key(self.aliases.resolve(id))
+            }) {
+                checkpoint.id = None;
+            }
+            let request = self.items.projected.unwrap_or(checkpoint.sequence);
+            self.remember_turn(checkpoint, request);
+        }
+        if event_type == Some("user_message") {
+            self.legacy_request = self.items.projected;
+        } else if event_type == Some("agent_message")
+            && let Some(sequence) = self.items.projected
+            && let Some(request) = self.legacy_request
+            && let Ok(input) = self
+                .turns
+                .binary_search_by_key(&request, |turn| turn.request_sequence)
+        {
+            self.place_early_answer(builder, input, sequence);
+        }
+    }
+
+    fn legacy_revision_input(&self, owner: Option<u64>) -> Option<&TurnCheckpoint> {
+        if self.paginated {
+            return None;
+        }
+        if let Some(owner) = owner {
+            let index = self
+                .turns
+                .binary_search_by_key(&owner, |turn| turn.sequence)
+                .ok()?;
+            self.turns.get(index)
+        } else {
+            self.turns.last()
+        }
+    }
+
+    fn push_unscoped_record(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        let payload = &record["payload"];
+        self.items.projected = None;
+        self.items.identity = if record["type"] == "event_msg"
+            && !self.explicit_display_turn
+            && matches!(
+                payload["type"].as_str(),
+                Some("user_message" | "agent_message")
+            ) {
+            self.legacy_display
+        } else {
+            MessageIdentity::default()
+        };
+        self.items.cited_display =
+            payload["type"] == "agent_message" && payload["memory_citation"].is_object();
+        let input = self
+            .legacy_revision_input(None)
+            .and_then(TurnCheckpoint::admitted_sequence);
+        let new_turn = push_record(builder, record, &mut self.items);
+        self.display_revisions.observe_message(
+            builder,
+            self.items.previous_message.take(),
+            input,
+            &self.late_owners,
+        );
+        if record["type"] == "response_item" {
+            self.observe_model_tool(self.items.projected, record, None, None);
+        }
+        new_turn
+    }
+
+    fn push_record(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        let payload = &record["payload"];
+        if record["type"] != "response_item" || payload["type"] != "message" {
+            return self.push_unscoped_record(builder, record);
+        }
+        let role = payload["role"].as_str();
+        if !matches!(role, Some("assistant" | "user")) {
+            return false;
+        }
+        let stamped = payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+            .as_str()
+            .filter(|turn| !turn.is_empty())
+            .map(|turn| self.aliases.resolve(turn));
+        // A generated turn can close after the next raw message has already arrived.
+        let turn = stamped.or_else(|| {
+            self.active_turn_id
+                .as_deref()
+                .filter(|id| !is_implicit_turn(id))
+                .map(|id| self.aliases.resolve(id))
+        });
+        let mut identity = MessageIdentity::new(turn, payload["id"].as_str(), false);
+        identity.ordered_user_input =
+            role == Some("user") && model_cut::input_order(&record["metadata"]).is_some();
+        let key = identity.scoped(role == Some("assistant"));
+        let owner = stamped
+            .filter(|turn| self.current_turn_id().is_some_and(|active| active != *turn))
+            .and_then(|turn| self.named_turns.get(turn).copied());
+        let input = self
+            .legacy_revision_input(owner)
+            .and_then(TurnCheckpoint::admitted_sequence);
+        let plan_mode = self.model_plan_mode(payload);
+        let mut late = CodexItems::default();
+        let items = if owner.is_some() {
+            &mut late
+        } else {
+            &mut self.items
+        };
+        let plan_scope = turn.or(self.active_turn_id.as_deref());
+        let previous_plan_mode = std::mem::replace(&mut items.plan_mode, plan_mode);
+        items.identity = identity;
+        items.cited_display = false;
+        items.update = key.and_then(|key| self.message_ids.get(&key).copied());
+        items.projected = None;
+        let new_turn = push_record(builder, record, items);
+        if let Some(proposal) = items.raw_proposal.take() {
+            let owner = owner.or_else(|| self.turns.last().map(|turn| turn.sequence));
+            self.plan_receipts.proposal(plan_scope, proposal, owner);
+        }
+        if !new_turn && let Some(position) = InputPosition::user(record, self.source_ordinal) {
+            confirm_admission(&mut self.turns, items.projected, position);
+        }
+        self.display_revisions.observe_message(
+            builder,
+            items.previous_message.take(),
+            input,
+            &self.late_owners,
+        );
+        if role == Some("assistant")
+            && let Some(copy) = items
+                .mirrors
+                .confirm_ordered_copy(items.projected, builder.checkpoint())
+        {
+            // The raw admission remains a rollback checkpoint even when both displayed messages match.
+            builder.truncate_from(copy.accepted);
+            if let Some(key) = copy.scoped_id {
+                self.message_ids.insert(key, copy.original);
+            }
+        }
+        items.plan_mode = previous_plan_mode;
+        if let Some(seq) = items.projected {
+            if let Some(key) = key {
+                self.message_ids.insert(key, seq);
+            }
+            if let Some(owner) = owner {
+                self.late_owners.entry(seq).or_insert(owner);
+            }
+        }
+        items.update = None;
+        items.identity = MessageIdentity::default();
+        new_turn && owner.is_none()
+    }
+
+    fn owns_implicit_call(&self, named: &str, id: &str) -> bool {
+        // A generated turn can remain open after the next raw input has arrived.
+        // Use it only while its confirmed request is the most recent checkpoint.
+        let Some(owner) = self.named_turns.get(named) else {
+            return false;
+        };
+        let completed = self.completed.get(named).is_some_and(|items| {
+            items
+                .get(&(CompletionScope::Published, id.to_owned()))
+                .is_some_and(|p| p.kind == CompletedKind::Tool)
+                || items.contains_key(&(
+                    CompletionScope::Historical(CompletedKind::Tool),
+                    id.to_owned(),
+                ))
+        });
+        self.turns
+            .last()
+            .is_some_and(|turn| turn.sequence == *owner)
+            && !completed
+    }
+
+    fn push_model_tool(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        if record["type"] != "response_item" {
+            return false;
+        }
+        let payload = &record["payload"];
+        let stamp = parse_timestamp(record.get("timestamp"));
+        let stamped = payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+            .as_str()
+            .filter(|turn| !turn.is_empty())
+            .map(|turn| self.aliases.resolve(turn));
+        let current = self.active_turn_id.as_deref();
+        let active = current
+            .filter(|turn| !is_implicit_turn(turn))
+            .map(|turn| self.aliases.resolve(turn));
+        let scoped = stamped
+            .or(active)
+            .is_some_and(|turn| !is_implicit_turn(turn));
+        if let Some(id) = scoped_model_call_id(payload, scoped) {
+            let known = stamped.or(active);
+            let implicit = current.filter(|_| known.is_none()).and_then(|current| {
+                let named = self.aliases.resolve(current);
+                self.owns_implicit_call(named, id).then(|| named.to_owned())
+            });
+            let turn = known.or(implicit.as_deref());
+            let sequence = builder.checkpoint();
+            let owner = turn.and_then(|turn| self.named_turns.get(turn).copied());
+            if let Some(owner) = owner.filter(|_| turn != self.current_turn_id()) {
+                self.late_owners.insert(sequence, owner);
+                let mut late = CodexItems::default();
+                push_response_item(builder, payload, stamp, &mut late);
+                self.items.tool_events += late.tool_events;
+            } else {
+                push_response_item(builder, payload, stamp, &mut self.items);
+            }
+            self.calls
+                .push(id, turn.map(str::to_owned), sequence, owner, payload);
+            let key = self.paginated_tool_id(payload, turn, id);
+            self.observe_model_tool(Some(sequence), record, None, key);
+            return true;
+        }
+        let Some(id) = scoped_model_result_id(payload, scoped) else {
+            return false;
+        };
+        let call = self.calls.take(id, stamped, active);
+        if id.is_empty() && call.is_none() {
+            return false;
+        }
+        let turn = stamped
+            .or_else(|| call.as_ref()?.turn.as_deref())
+            .or(active)
+            .map(str::to_owned);
+        let rejected = call.as_ref().is_some_and(|call| {
+            self.reject_pending_display(builder, turn.as_deref(), id, call, &payload["output"])
+        });
+        let sequence = if let Some(turn) = &turn {
+            self.push_identified_item(builder, payload, turn, id, stamp)
+        } else {
+            self.items.projected = None;
+            self.items.tool_owner = self.legacy_revision_input(None).and_then(|input| {
+                (input.admission.is_some()
+                    && call
+                        .as_ref()
+                        .is_some_and(|call| call.sequence >= input.request_sequence))
+                .then_some(input.sequence)
+            });
+            self.items.tool_projection.wait_for_call = rejected;
+            push_response_item(builder, payload, stamp, &mut self.items);
+            self.items.tool_projection.wait_for_call = false;
+            self.items.tool_owner = None;
+            self.finish_unscoped_result(id);
+            self.items.projected
+        };
+        let key = self.paginated_tool_id(payload, turn.as_deref(), id);
+        self.observe_model_tool(
+            sequence,
+            record,
+            call.as_ref().map(|call| call.sequence),
+            key,
+        );
+        if let Some(sequence) = sequence
+            && let Some(call) = call
+        {
+            self.calls.result_calls.insert(sequence, call.sequence);
+            if let Some(owner) = call.owner.or_else(|| {
+                turn.as_ref()
+                    .and_then(|turn| self.named_turns.get(turn).copied())
+            }) {
+                self.late_owners.insert(sequence, owner);
+                self.late_owners.insert(call.sequence, owner);
+            } else if call.turn.is_none() {
+                self.calls.linked.insert(sequence, call.sequence);
+            }
+        }
+        true
+    }
+
+    fn paginated_tool_id(&self, payload: &Value, turn: Option<&str>, id: &str) -> Option<ToolId> {
+        if !self.paginated {
+            return None;
+        }
+        ToolId::new(
+            payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+                .as_str()
+                .or(turn),
+            id,
+        )
+    }
+
+    fn observe_model_tool(
+        &mut self,
+        sequence: Option<u64>,
+        record: &Value,
+        call: Option<u64>,
+        key: Option<ToolId>,
+    ) {
+        if self.paginated
+            && let Some(sequence) = sequence
+            && let Some(status) =
+                self.paginated_answers
+                    .model_tool(sequence, record, self.source_ordinal, call, key)
+        {
+            self.withdrawn.insert(sequence, status);
+        }
+    }
+
+    fn push_identified_item(
+        &mut self,
+        builder: &mut EventBuilder,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> Option<u64> {
+        let display = payload["type"] == "item_completed";
+        if display {
+            push_codex_session_metadata(builder, payload, timestamp, true);
+        }
+        let native_turn = self.aliases.resolve(turn).to_owned();
+        let kind = CompletedKind::for_item(payload);
+        let projection = self.completion_position(builder, &native_turn, id, kind, payload);
+        let original = projection.original;
+        let owner = self
+            .named_turns
+            .get(&native_turn)
+            .copied()
+            .filter(|_| self.current_turn_id() != Some(native_turn.as_str()));
+        let input = self.legacy_revision_input(owner).filter(|_| display);
+        let message_input = input.and_then(TurnCheckpoint::admitted_sequence);
+        let revision_input = input.map(|turn| turn.sequence);
+        let previous_display = revision_input
+            .filter(|_| owner.is_none())
+            .and_then(|input| self.display_revisions.before(builder, original, input));
+        // A late result cannot act as a message or tool mirror in the current turn.
+        let mut late = self.items.for_late_turn();
+        let checkpoint = self.checkpoint(builder);
+        let items = if owner.is_some() {
+            &mut late
+        } else {
+            &mut self.items
+        };
+        let message_id =
+            items.prepare_identified(payload, turn, id, &native_turn, projection, self.paginated);
+        items.tool_owner = self.named_turns.get(&native_turn).copied();
+        items.update =
+            original.or_else(|| message_id.and_then(|key| self.message_ids.get(&key).copied()));
+        items.projected = None;
+        let new_turn = items.project_identified(builder, payload, turn, id, timestamp);
+        let previous_message = items.previous_message.take();
+        let peer = items.tool_projection.peer.take();
+        let projected = items.finish_identified();
+        let was_displayed = self.observe_reply_revision(builder, previous_message, message_input);
+        if owner.is_some() {
+            self.items.tool_events += late.tool_events;
+        }
+        let sequence = projected?;
+        self.detach_tool_display(builder, projection, peer);
+        if display {
+            self.deferred_receipts.observe(
+                (&native_turn, id),
+                sequence,
+                revision_input.or(owner).unwrap_or(sequence),
+                projection.reconsider,
+                projection.ambiguous && projection.reconsider.is_some(),
+                projection.display_identity,
+            );
+        }
+        if let Some(input) = revision_input {
+            self.display_revisions
+                .observe(builder, sequence, input, previous_display);
+        }
+        if display {
+            self.observe_display_sequence(
+                builder,
+                peer.unwrap_or(sequence),
+                turn,
+                id,
+                &payload["item"],
+            );
+        }
+        if let Some(key) = message_id {
+            self.message_ids.insert(key, sequence);
+        }
+        let item_owner = (original.is_none()
+            && payload["item"]["type"] != "UserMessage"
+            && payload["item"]["type"] != "AgentMessage")
+            .then(|| self.named_turns.get(&native_turn).copied())
+            .flatten();
+        if let Some(owner) = owner
+            .filter(|_| sequence >= checkpoint.sequence)
+            .or(item_owner)
+        {
+            self.late_owners.entry(sequence).or_insert(owner);
+        } else if new_turn {
+            let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+            checkpoint.id = Some(turn.to_owned());
+            self.remember_turn(checkpoint, sequence);
+        } else if payload["item"]["type"] == "UserMessage" && original.is_none() {
+            self.name_request_turn(turn, sequence);
+        }
+        if display
+            && original.is_none()
+            && !was_displayed
+            && payload["item"]["type"] == "AgentMessage"
+            && let Some(boundary) = self.named_turns.get(&native_turn)
+            && let Ok(input) = self
+                .turns
+                .binary_search_by_key(boundary, |turn| turn.sequence)
+        {
+            self.place_early_answer(builder, input, sequence);
+        }
+        self.remember_completion(builder, (turn, id), kind, projection, sequence, peer);
+        Some(sequence)
+    }
+
+    fn observe_reply_revision(
+        &mut self,
+        builder: &mut EventBuilder,
+        previous: Option<(u64, PreviousDisplay)>,
+        input: Option<u64>,
+    ) -> bool {
+        if self.paginated {
+            self.paginated_answers
+                .archive_changed_reply(builder, previous.as_ref());
+        }
+        // A late completed copy cannot move an answer that Codex already displayed.
+        let was_displayed = previous
+            .as_ref()
+            .is_some_and(|(_, prior)| prior.was_displayed_message());
+        self.display_revisions
+            .observe_message(builder, previous, input, &self.late_owners);
+        was_displayed
+    }
+
+    fn observe_display_sequence(
+        &mut self,
+        builder: &mut EventBuilder,
+        sequence: u64,
+        turn: &str,
+        id: &str,
+        item: &Value,
+    ) {
+        if item["type"] == "Plan"
+            && let Some(text) = item["text"].as_str()
+        {
+            let turn = self.aliases.resolve(turn);
+            let owner = self
+                .named_turns
+                .get(turn)
+                .copied()
+                .or_else(|| self.turns.last().map(|turn| turn.sequence));
+            self.plan_receipts.completed(turn, text, owner);
+        }
+        if let Some(call) = self.calls.linked.remove(&sequence)
+            && let Some(owner) = self.named_turns.get(self.aliases.resolve(turn))
+        {
+            self.late_owners.entry(call).or_insert(*owner);
+        }
+        if !self.paginated {
+            return;
+        }
+        if matches!(
+            item["type"].as_str(),
+            Some("Plan" | "AgentMessage" | "ExitedReviewMode")
+        ) {
+            if let Some(text) = builder
+                .event_at_mut(sequence)
+                .and_then(|event| event.payload["text"].as_str())
+            {
+                self.paginated_answers.display(
+                    sequence,
+                    turn,
+                    id,
+                    text,
+                    self.source_ordinal,
+                    item["type"] == "Plan",
+                );
+            }
+            if !completed_item::assistant::is_async(&item["delivery"]) {
+                return;
+            }
+        }
+        if self.withdrawn.contains_key(&sequence) {
+            return;
+        }
+        if item["type"] == "UserMessage" {
+            self.paginated_inputs
+                .display_user(sequence, turn, item, self.source_ordinal);
+        } else {
+            let withdrawal = match item["type"].as_str() {
+                None => None,
+                _ => self
+                    .paginated_answers
+                    .display_tool(sequence, turn, id, item),
+            };
+            if let Some(status) = withdrawal {
+                self.withdrawn.insert(sequence, status);
+            }
+        }
+    }
+
+    fn place_early_answer(&mut self, builder: &EventBuilder, input: usize, sequence: u64) {
+        let turn = &self.turns[input];
+        if sequence >= turn.request_sequence || self.display_positions.contains_key(&sequence) {
+            return;
+        }
+        let next = self
+            .turns
+            .get(input + 1)
+            .map_or_else(|| builder.checkpoint(), |next| next.sequence);
+        self.display_positions
+            .insert(sequence, (next, self.source_ordinal));
+        self.late_owners.insert(sequence, turn.sequence);
+    }
+
+    /// A migrated request can precede its generated display turn.
+    fn name_request_turn(&mut self, turn: &str, sequence: u64) {
+        let Some(index) = self
+            .turns
+            .partition_point(|checkpoint| checkpoint.sequence <= sequence)
+            .checked_sub(1)
+        else {
+            return;
+        };
+        let checkpoint = &mut self.turns[index];
+        if let Some(original) = &checkpoint.id
+            && self.aliases.bind(turn, original)
+        {
+            self.message_ids.bind(turn, original);
+            self.occurrences.bind(turn, original);
+            if let Some(known) = self.completed.remove(turn) {
+                self.completed
+                    .entry(original.clone())
+                    .or_default()
+                    .extend(known);
+            }
+            if self.plan_turns.remove(turn) {
+                self.plan_turns.insert(original.clone());
+            }
+        }
+        let canonical = self.aliases.resolve(turn);
+        checkpoint.id = Some(canonical.to_owned());
+        self.named_turns
+            .insert(canonical.to_owned(), checkpoint.sequence);
+        if self
+            .pending_turn
+            .as_ref()
+            .is_some_and(|pending| sequence < pending.sequence)
+        {
+            self.pending_turn = None;
+        }
+    }
+}
+
+fn encoded_rollback(record: &Value) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "event_msg"
+        && payload
+            .get("type")
+            .or_else(|| payload.get(0))
+            .is_some_and(|tag| {
+                tag == "thread_rolled_back"
+                    || tag.as_u64() == Some(u64::from(rollout_lines::ROLLBACK_TAG))
+            })
+}
+
+fn contains_rollback_marker(path: &Path) -> Result<bool> {
+    if !contains_rollback_marker_with_chunk(path, 1024 * 1024)? {
+        return Ok(false);
+    }
+    let mut rollback = false;
+    rollout_file::visit(path, |record, _, _| {
+        rollback |= encoded_rollback(&record);
+        Ok(())
+    })?;
+    Ok(rollback)
+}
+
+fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
+    const MARKER: &[u8] = b"thread_rolled_back";
+    let marker = memchr::memmem::Finder::new(MARKER);
+    let tag = rollout_lines::ROLLBACK_TAG.to_string();
+    let numeric = memchr::memmem::Finder::new(tag.as_bytes());
+    let escape = memchr::memmem::Finder::new(b"\\u00");
+    let mut file = fs::File::open(path)?;
+    // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
+    let mut buffer = vec![0_u8; chunk.max(MARKER.len())];
+    let mut overlap = 0;
+    loop {
+        let read = file.read(&mut buffer[overlap..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let length = overlap + read;
+        let window = &buffer[..length];
+        // Writers never need to escape letters, so an escaped letter may be hiding the marker.
+        if marker.find(window).is_some()
+            // A possible numeric tag is enough to select the full reader, which checks its context.
+            || numeric.find_iter(window).any(|start| {
+                start.checked_sub(1).and_then(|i| window.get(i)).is_some_and(|b|
+                    matches!(b, b':' | b'[') || b.is_ascii_whitespace()
+                ) && window.get(start + tag.len()).is_some_and(|b|
+                    matches!(b, b',' | b'}') || b.is_ascii_whitespace()
+                )
+            })
+            || escape
+                .find_iter(window)
+                .any(|position| escapes_ascii_letter(window.get(position + 4..position + 6)))
+        {
+            return Ok(true);
+        }
+        overlap = (MARKER.len() - 1).min(length);
+        buffer.copy_within(length - overlap..length, 0);
+    }
+}
+
+fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
+    hex.and_then(|hex| std::str::from_utf8(hex).ok())
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+}
+
+/// Published displays can update or reorder earlier events. An outline cannot apply those edits.
+#[derive(Default)]
+struct DisplayReplay {
+    model_message: bool,
+    display_message: bool,
+}
+
+impl DisplayReplay {
+    fn observe(&mut self, record: &Value) -> bool {
+        let payload = &record["payload"];
+        match record["type"].as_str() {
+            Some("session_meta") => payload["history_mode"] == "paginated",
+            Some("event_msg")
+                if matches!(
+                    payload["type"].as_str(),
+                    Some("agent_message" | "user_message")
+                ) =>
+            {
+                self.display_message = true;
+                self.model_message
+                    || payload["turn_id"].is_string()
+                    || payload["item_id"].is_string()
+            }
+            Some("event_msg") => !matches!(
+                payload["type"].as_str(),
+                Some(
+                    "thread_settings_applied"
+                        | "thread_rolled_back"
+                        | "token_count"
+                        | "task_started"
+                        | "turn_started"
+                        | "task_complete"
+                        | "turn_complete"
+                )
+            ),
+            Some("response_item") => {
+                self.model_message |= payload["type"] == "message";
+                self.display_message
+                    || payload["type"] != "message"
+                    || payload["id"].is_string()
+                    || payload["internal_chat_message_metadata_passthrough"]["turn_id"].is_string()
+                    || model_cut::input_order(&record["metadata"]).is_some()
+                    || payload["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            !matches!(
+                                part["type"].as_str(),
+                                Some("input_text" | "output_text" | "text")
+                            )
+                        })
+                    })
+            }
+            Some("compacted") => true,
+            _ => false,
+        }
     }
 }
 
@@ -2689,7 +4313,7 @@ fn records_history_base(record: &Value) -> bool {
 fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
     builder.push(
         EventKind::ProviderEvent,
-        json!({"native_history_unverified":true,"reason":"The rollout references earlier history that was not read."}),
+        json!({"omitted_events":1,"native_history_unverified":true,"reason":"The rollout references earlier history that was not read."}),
         timestamp,
         ReplayPolicy::HistoricalOnly,
         Some(UNAVAILABLE_ANCESTRY.to_owned()),
@@ -2697,11 +4321,7 @@ fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime
     );
 }
 
-fn push_record(
-    builder: &mut EventBuilder,
-    record: &Value,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
-) -> bool {
+fn push_record(builder: &mut EventBuilder, record: &Value, items: &mut CodexItems) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     let kind = record.get("type").and_then(Value::as_str);
     match kind {
@@ -2720,13 +4340,13 @@ fn push_record(
         }
         Some("response_item") => {
             if let Some(payload) = record.get("payload") {
-                return push_response_item(builder, payload, timestamp, last_visible);
+                return push_response_item(builder, payload, timestamp, items);
             }
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
                 push_codex_session_metadata(builder, payload, timestamp, true);
-                return push_event_message(builder, payload, timestamp, last_visible);
+                return push_event_message(builder, payload, timestamp, items);
             }
         }
         _ => {}
@@ -2786,26 +4406,480 @@ fn push_codex_session_metadata(
     );
 }
 
-fn push_message_text(
+#[derive(Default)]
+struct ToolProjection {
+    wait_for_call: bool,
+    ambiguous: bool,
+    paginated: bool,
+    peer: Option<u64>,
+    matched_turn: Option<String>,
+}
+
+#[derive(Default)]
+struct CodexItems {
+    shell_sources: completed_item::ShellSources,
+    tool_projection: ToolProjection,
+    message: Option<VisibleMessage>,
+    previous_message: Option<(u64, PreviousDisplay)>,
+    mirrors: MessageMirrors,
+    identity: MessageIdentity,
+    cited_display: bool,
+    plan_mode: bool,
+    raw_proposal: Option<[u8; 32]>,
+    in_turn: bool,
+    update: Option<u64>,
+    projected: Option<u64>,
+    // A completed display item and a response item can describe the same tool result.
+    outcomes: PendingOutcomes,
+    tool_turn: Option<String>,
+    tool_owner: Option<u64>,
+    tool_events: usize,
+}
+
+struct VisibleMessage {
+    kind: EventKind,
+    sequence: u64,
+}
+
+fn is_implicit_turn(id: &str) -> bool {
+    id.strip_prefix("rollout-")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+impl CodexItems {
+    fn for_late_turn(&self) -> Self {
+        Self {
+            shell_sources: self.shell_sources.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn can_publish_empty(&self, kind: &EventKind) -> bool {
+        match kind {
+            EventKind::MessageAssistant => {
+                self.update.is_some() || self.identity.scoped(true).is_some()
+            }
+            EventKind::MessageUser => self.update.is_some(),
+            _ => false,
+        }
+    }
+
+    fn finish_identified(&mut self) -> Option<u64> {
+        self.tool_projection.wait_for_call = false;
+        self.tool_projection.ambiguous = false;
+        self.tool_turn = None;
+        self.tool_owner = None;
+        self.update = None;
+        self.identity = MessageIdentity::default();
+        self.projected
+    }
+
+    fn clear_mirrors(&mut self) {
+        self.message = None;
+        self.mirrors.clear();
+        self.outcomes = PendingOutcomes::default();
+    }
+
+    fn turn_boundary(&mut self, turn_id: Option<&str>) {
+        if turn_id.is_some_and(is_implicit_turn) {
+            // The migrator writes model records before synthesizing a display turn.
+            self.mirrors.retain_unpaired_models();
+            self.outcomes.retain_models();
+        } else {
+            self.clear_mirrors();
+        }
+    }
+
+    /// Codex displays a completed plan as a separate assistant item, even when
+    /// another assistant message in the turn has the same text.
+    fn project_identified(
+        &mut self,
+        builder: &mut EventBuilder,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> bool {
+        if payload["type"] != "item_completed" {
+            return push_response_item(builder, payload, timestamp, self);
+        }
+        if let Some(item_type @ ("Plan" | "ExitedReviewMode")) = payload["item"]["type"].as_str()
+            && let Some(text) = payload["item"]["text"].as_str()
+        {
+            let content = json!({"type":item_type,"turn_id":turn,"id":id,"text":text});
+            self.push_published_text(builder, content, timestamp);
+            return false;
+        }
+        push_completed_item(builder, &payload["item"], timestamp, self)
+    }
+
+    fn push_published_text(
+        &mut self,
+        builder: &mut EventBuilder,
+        payload: Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        self.message = None;
+        if let Some(seq) = self.update
+            && let Some(previous) = builder.event_at_mut(seq)
+        {
+            self.previous_message = Some((
+                seq,
+                PreviousDisplay::replace_payload(
+                    previous,
+                    EventKind::MessageAssistant,
+                    payload,
+                    "event_msg.item_completed",
+                ),
+            ));
+            self.projected = Some(seq);
+        } else {
+            self.projected = Some(builder.checkpoint());
+            builder.push(
+                EventKind::MessageAssistant,
+                payload,
+                timestamp,
+                ReplayPolicy::Contextual,
+                Some("event_msg.item_completed".to_owned()),
+                None,
+            );
+        }
+    }
+
+    fn take_tool_outcome(&mut self, id: &str, display: bool) -> Option<u64> {
+        if self.tool_projection.wait_for_call {
+            return None;
+        }
+        let position = if self.tool_projection.paginated || !display {
+            self.tool_projection.peer
+        } else {
+            self.update
+        };
+        let entry = self.outcomes.take(
+            id,
+            display,
+            position,
+            self.tool_turn.as_deref(),
+            self.tool_owner,
+        )?;
+        self.tool_projection.matched_turn = entry.turn;
+        Some(entry.sequence)
+    }
+
+    fn push_historical(
+        &mut self,
+        builder: &mut EventBuilder,
+        kind: EventKind,
+        mut payload: Value,
+        timestamp: Option<DateTime<Utc>>,
+        raw_type: String,
+        result_id: Option<&str>,
+    ) {
+        self.message = None;
+        clear_projection_metadata(&mut payload);
+        let display = raw_type == "event_msg.item_completed";
+        if display && self.tool_projection.ambiguous {
+            completion_positions::unattribute_display(&mut payload);
+        }
+        let result_id = result_id.filter(|id| {
+            !id.is_empty()
+                || self
+                    .tool_turn
+                    .as_deref()
+                    .is_some_and(|turn| !is_implicit_turn(turn))
+        });
+        let matched = result_id.and_then(|id| self.take_tool_outcome(id, display));
+        let physical = self.tool_projection.paginated || !display;
+        let mirror = physical
+            .then(|| self.tool_projection.peer.take().or(matched))
+            .flatten();
+        let original = if physical {
+            self.update
+        } else {
+            self.update.or(matched).filter(|&sequence| {
+                builder.event_at_mut(sequence).is_some_and(|event| {
+                    if !completion_positions::model_output(event)
+                        || completed_item::equivalent_model_receipt(
+                            &payload,
+                            &event.payload,
+                            &self.shell_sources,
+                        )
+                    {
+                        return true;
+                    }
+                    if payload["type"] == "FunctionCallOutput"
+                        && event.payload["omnisession_codex_tool_display"]["type"]
+                            == "FunctionCallOutput"
+                    {
+                        completion_positions::restore_model_output(event);
+                    }
+                    false
+                })
+            })
+        };
+        if let Some(sequence) = original
+            && let Some(previous) = builder.event_at_mut(sequence)
+        {
+            let has_model = completion_positions::model_output(previous);
+            let failed_display = previous.kind == EventKind::ToolFailed
+                && (!has_model || model_result_kind(&previous.payload) != EventKind::ToolFailed);
+            if display && has_model {
+                if !self.tool_projection.paginated {
+                    completed_item::annotate_model_receipt(&mut previous.payload, &payload);
+                }
+                // Codex shows a command's display output but gives the model the native result.
+                previous.kind = if kind == EventKind::ToolFailed {
+                    kind
+                } else {
+                    model_result_kind(&previous.payload)
+                };
+            } else {
+                previous.kind = if !display && failed_display {
+                    EventKind::ToolFailed
+                } else {
+                    kind
+                };
+                previous.payload = payload;
+                previous.source.raw_record_type = Some(raw_type);
+                previous.replay_policy = ReplayPolicy::HistoricalOnly;
+            }
+            self.finish_tool_projection(builder, sequence, display, mirror);
+            return;
+        }
+        let sequence = builder.checkpoint();
+        if let Some(id) = result_id.filter(|_| mirror.is_none() && !self.tool_projection.ambiguous)
+        {
+            self.outcomes.push(
+                id,
+                display,
+                sequence,
+                self.tool_turn.clone(),
+                self.tool_owner,
+            );
+        }
+        if (self.tool_projection.paginated || mirror.is_none())
+            && !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent)
+        {
+            self.tool_events += 1;
+        }
+        builder.push(
+            kind,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some(raw_type),
+            None,
+        );
+        self.finish_tool_projection(builder, sequence, display, mirror);
+    }
+
+    fn prepare_identified(
+        &mut self,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        native_turn: &str,
+        projection: completion_positions::Projection,
+        paginated: bool,
+    ) -> Option<message_mirrors::ScopedMessageId> {
+        let user = payload["item"]["type"] == "UserMessage";
+        self.identity = MessageIdentity::completed(turn, id, user);
+        let scoped = MessageIdentity::completed(native_turn, id, user);
+        self.tool_projection = projection.tool_projection(paginated);
+        self.tool_turn = Some(native_turn.to_owned());
+        self.cited_display = matches!(
+            payload["item"]["memory_citation"],
+            Value::Object(_) | Value::Array(_)
+        );
+        match payload["item"]["type"].as_str() {
+            Some("AgentMessage") => scoped.scoped(true),
+            Some("UserMessage") => scoped.scoped(false),
+            _ => None,
+        }
+    }
+    fn finish_tool_projection(
+        &mut self,
+        builder: &mut EventBuilder,
+        sequence: u64,
+        display: bool,
+        mirror: Option<u64>,
+    ) {
+        self.projected = Some(sequence);
+        self.tool_projection.peer = mirror.filter(|&other| {
+            let (slot, model) = if display {
+                (sequence, other)
+            } else {
+                (other, sequence)
+            };
+            completion_positions::pair(builder, slot, model, &self.shell_sources)
+        });
+    }
+}
+
+fn clear_projection_metadata(payload: &mut Value) {
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("omnisession_codex_rollback");
+        fields.remove("omnisession_codex_checkpoint");
+        fields.remove("omnisession_codex_prior_display");
+        fields.remove("omnisession_codex_active_replies");
+        fields.remove("omnisession_codex_checkpoint_position");
+        fields.remove("omnisession_codex_tool_display");
+    }
+}
+
+fn push_completed_item(
+    builder: &mut EventBuilder,
+    item: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    items: &mut CodexItems,
+) -> bool {
+    let kind = match item["type"].as_str() {
+        Some("UserMessage") => EventKind::MessageUser,
+        Some("AgentMessage") => EventKind::MessageAssistant,
+        _ => {
+            if let Some((kind, payload)) = completed_item::historical_item(item) {
+                let id = completed_item::model_receipt(item)
+                    .then(|| item["id"].as_str())
+                    .flatten();
+                let payload = completed_item::with_source_receipt(payload, item);
+                items.shell_sources.remember(&payload, item);
+                items.push_historical(
+                    builder,
+                    kind,
+                    payload,
+                    timestamp,
+                    "event_msg.item_completed".to_owned(),
+                    id,
+                );
+            }
+            return false;
+        }
+    };
+    let Some(content) = item["content"].as_array() else {
+        return false;
+    };
+    let parts = content
+        .iter()
+        .filter_map(|part| match kind {
+            EventKind::MessageAssistant => completed_item::assistant::text(part),
+            EventKind::MessageUser if part["type"] == "text" => part["text"].as_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let contextual = parts.iter().any(|part| is_contextual_user_text(part));
+    let alternate = (parts.len() > 1).then(|| parts.join("\n"));
+    let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.concat());
+    if text.is_empty() && !items.can_publish_empty(&kind) {
+        return false;
+    }
+    let attachment = (kind == EventKind::MessageUser)
+        .then(|| attachments::completed(content, &parts))
+        .flatten();
+    push_message_text(
+        builder,
+        kind,
+        &text,
+        timestamp,
+        "event_msg.item_completed",
+        MessageMatch {
+            alternate: alternate.as_deref(),
+            attachment,
+            ..MessageMatch::default()
+        },
+        items,
+    ) && !contextual
+}
+
+fn push_message_text<'a>(
     builder: &mut EventBuilder,
     kind: EventKind,
     text: &str,
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    matching: impl Into<MessageMatch<'a>>,
+    items: &mut CodexItems,
 ) -> bool {
-    let mirrored = last_visible
-        .as_ref()
-        .is_some_and(|(last_kind, last_text, last_raw_type)| {
-            last_kind == &kind && last_text == text && last_raw_type != &raw_type
-        });
-    if mirrored {
+    let mut matching = matching.into();
+    matching.identity = items.identity;
+    let plan_text = (kind == EventKind::MessageAssistant
+        && raw_type == "response_item.message"
+        && items.plan_mode)
+        .then_some(matching.alternate.unwrap_or(text));
+    items.raw_proposal = plan_text.and_then(display_text::proposal_digest);
+    let plan_display = plan_text.and_then(display_text::without_plan);
+    let text = if let Some(visible) = &plan_display {
+        // Plan-only replies have a dedicated completed Plan item and no assistant message.
+        if visible.trim().is_empty() {
+            return false;
+        }
+        matching.alternate = None;
+        visible.as_str()
+    } else {
+        text
+    };
+    if kind == EventKind::MessageAssistant {
+        matching.citation = if raw_type == "response_item.message" {
+            message_mirrors::model_citation_spelling(matching.alternate.unwrap_or(text))
+        } else {
+            items
+                .cited_display
+                .then(|| message_mirrors::display_citation_spelling(text))
+        };
+    }
+    let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
+    if text.is_empty()
+        && !(raw_type == "event_msg.item_completed" && items.can_publish_empty(&kind))
+    {
+        return user_turn;
+    }
+    if !items.in_turn {
+        // Without a named turn, only adjacent content can identify a mirror.
+        matching.adjacent = Some(
+            items
+                .message
+                .as_ref()
+                .map_or_else(|| builder.checkpoint(), |message| message.sequence),
+        );
+    }
+    let update = items
+        .update
+        .or_else(|| items.mirrors.native_match(&kind, items.identity, raw_type))
+        .filter(|seq| builder.event_at_mut(*seq).is_some());
+    let matched = if let Some(sequence) = update {
+        items.mirrors.update(
+            &kind,
+            text,
+            matching,
+            raw_type,
+            sequence,
+            builder.checkpoint(),
+        );
+        Some(sequence)
+    } else {
+        items
+            .mirrors
+            .observe(&kind, text, matching, raw_type, builder.checkpoint())
+    };
+    let matched = matched.filter(|seq| {
+        builder
+            .event_at_mut(*seq)
+            .is_some_and(|event| !completion_positions::model_output(event))
+    });
+    let sequence = matched.unwrap_or_else(|| builder.checkpoint());
+    items.message = Some(VisibleMessage {
+        kind: kind.clone(),
+        sequence,
+    });
+    items.projected = Some(sequence);
+    if let Some(old) = matched.and_then(|seq| builder.event_at_mut(seq))
+        && (update.is_some() || raw_type != "response_item.message")
+    {
+        items.previous_message = PreviousDisplay::replace_message(old, kind, text, raw_type)
+            .map(|previous| (sequence, previous));
         return false;
     }
-    *last_visible = Some((kind.clone(), text.to_owned(), raw_type));
-    let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
-    if text.is_empty() {
-        return user_turn;
+    if matched.is_some() {
+        return false;
     }
     builder.push(
         kind,
@@ -2831,24 +4905,55 @@ fn is_contextual_user_text(text: &str) -> bool {
     .any(|prefix| text.starts_with(prefix))
 }
 
-/// Visible text parts of a message payload and how many images it carries.
-///
-/// Codex wraps local images in tag texts that the user never typed, so those tags are dropped.
-fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
-    let content = payload
-        .get("content")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+fn hook_attribution(metadata: &Value, index: usize) -> Option<bool> {
+    let source = &metadata["content_item_metadata"][index]["provenance"];
+    match source["type"].as_str() {
+        Some("user") => return Some(false),
+        Some("harness") if source["hook"] == true => return Some(true),
+        _ => {}
+    }
+    match metadata["content_item_kinds"][index].as_str() {
+        Some("user.text") => Some(false),
+        Some("hooks.additional_context") => Some(true),
+        _ => None,
+    }
+}
+
+/// Codex serializes each stop-hook fragment as one XML element with a run ID and escaped text.
+fn is_hook_fragment(text: &str) -> bool {
+    let Some(fragment) = text.trim().strip_prefix("<hook_prompt") else {
+        return false;
+    };
+    let Some((attribute, body)) = fragment.split_once('>') else {
+        return false;
+    };
+    let Some((name, value)) = attribute.split_once('=') else {
+        return false;
+    };
+    let mut value = value.trim().chars();
+    let Some(quote @ ('\'' | '"')) = value.next() else {
+        return false;
+    };
+    attribute.starts_with(char::is_whitespace)
+        && name.trim() == "hook_run_id"
+        && value
+            .as_str()
+            .strip_suffix(quote)
+            .is_some_and(|id| !id.trim().is_empty() && !id.contains([quote, '<']))
+        && body
+            .strip_suffix("</hook_prompt>")
+            .is_some_and(|body| !body.contains('<'))
+}
+
+/// Codex adds framing text around attachments when it builds the model input.
+fn message_parts(content: &[Value], mut keep: impl FnMut(usize, &str) -> bool) -> Vec<&str> {
     let part_type = |index: Option<usize>| {
         index
             .and_then(|index| content.get(index))
             .and_then(|part| part.get("type"))
             .and_then(Value::as_str)
     };
-    let images = (0..content.len())
-        .filter(|index| part_type(Some(*index)) == Some("input_image"))
-        .count();
-    let parts = content
+    content
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -2859,24 +4964,72 @@ fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
         })
         .filter_map(|(index, part)| Some((index, part.get("text").and_then(Value::as_str)?)))
         .filter(|(index, text)| {
-            !is_image_wrapper(
-                text,
-                part_type(index.checked_sub(1)) == Some("input_image"),
-                part_type(Some(index + 1)) == Some("input_image"),
-            )
+            keep(*index, text)
+                && !is_media_wrapper(
+                    text,
+                    part_type(index.checked_sub(1)),
+                    part_type(Some(index + 1)),
+                )
         })
         .map(|(_, text)| text)
-        .collect();
-    (parts, images)
+        .collect()
+}
+
+fn omitted_input_media(kind: &EventKind, parts: &[&str], content: &[Value]) -> Option<String> {
+    if *kind != EventKind::MessageUser || parts.iter().any(|part| !part.trim().is_empty()) {
+        return None;
+    }
+    let images = content
+        .iter()
+        .filter(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("input_image" | "image" | "local_image")
+            )
+        })
+        .count();
+    let audio = content.iter().any(|part| {
+        matches!(
+            part["type"].as_str(),
+            Some("input_audio" | "audio" | "local_audio")
+        )
+    });
+    omitted_media_text(images, audio)
+}
+
+fn omitted_media_text(images: usize, audio: bool) -> Option<String> {
+    match (images, audio) {
+        (0, false) => None,
+        (0, true) => Some("[audio omitted]".to_owned()),
+        (_, false) => Some(omitted_images_text(images)),
+        (_, true) => Some(format!("{} [audio omitted]", omitted_images_text(images))),
+    }
+}
+
+// Before per-part attribution, a hook message contained only hook fragments and contextual input.
+fn legacy_hook_context(payload: &Value, content: &[Value], metadata: &Value) -> bool {
+    !payload["id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("msg_input_"))
+        && content.iter().enumerate().all(|(index, part)| {
+            part["type"] == "input_text"
+                && part["text"].as_str().is_some_and(|text| {
+                    hook_attribution(metadata, index).unwrap_or_else(|| is_hook_fragment(text))
+                        || is_contextual_user_text(text)
+                })
+        })
 }
 
 fn push_response_item(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    items: &mut CodexItems,
 ) -> bool {
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if paginated_rollback::is_private_instruction(payload) {
+        return false;
+    }
     if item_type == "message" {
         let kind = match payload.get("role").and_then(Value::as_str) {
             Some("user") => Some(EventKind::MessageUser),
@@ -2893,24 +5046,57 @@ fn push_response_item(
                 text,
                 timestamp,
                 "response_item.message",
-                last_visible,
+                None,
+                items,
             );
         }
-        let (parts, images) = message_parts(payload);
+        let content = payload["content"].as_array().map_or(&[][..], Vec::as_slice);
+        let metadata = &payload["internal_chat_message_metadata_passthrough"];
+        let user = kind == EventKind::MessageUser;
+        let hook_context = user && legacy_hook_context(payload, content, metadata);
+        let mut omitted_hook = false;
+        let mut inferred_hook = false;
+        let parts = message_parts(content, |index, text| {
+            let attribution = hook_attribution(metadata, index);
+            let hook = user
+                && content[index]["type"] == "input_text"
+                && attribution.unwrap_or_else(|| hook_context && is_hook_fragment(text));
+            omitted_hook |= hook;
+            inferred_hook |= hook && attribution.is_none();
+            !hook
+        });
+        if inferred_hook {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"content_omitted": true, "reason": "Legacy hook input has no user attribution."}),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_hook_input_omitted".to_owned()),
+                None,
+            );
+        }
         let contextual = parts.iter().any(|text| is_contextual_user_text(text));
-        // An image-only turn keeps a placeholder so the reply still follows a request.
-        let text = if parts.is_empty() && images > 0 && kind == EventKind::MessageUser {
-            omitted_images_text(images)
-        } else {
-            parts.join("\n")
-        };
+        let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.join("\n"));
+        if omitted_hook && text.is_empty() {
+            return false;
+        }
+        // Codex joins the original text parts without separators in display events.
+        let alternate = (parts.len() > 1).then(|| parts.concat());
+        let attachment = (kind == EventKind::MessageUser)
+            .then(|| attachments::model(content, &parts))
+            .flatten();
         return push_message_text(
             builder,
             kind,
             &text,
             timestamp,
             "response_item.message",
-            last_visible,
+            MessageMatch {
+                alternate: alternate.as_deref(),
+                attachment,
+                ..MessageMatch::default()
+            },
+            items,
         ) && !contextual;
     }
 
@@ -2922,35 +5108,98 @@ fn push_response_item(
         "function_call_output"
         | "custom_tool_call_output"
         | "local_shell_call_output"
-        | "computer_call_output" => {
-            let failed = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| matches!(status, "failed" | "error"));
-            Some(if failed {
-                EventKind::ToolFailed
-            } else {
-                EventKind::ToolCompleted
-            })
-        }
+        | "computer_call_output" => Some(model_result_kind(payload)),
         _ => None,
     };
     let Some(kind) = kind else {
         return false;
     };
-    builder.push(
+    let scoped = items
+        .tool_turn
+        .as_deref()
+        .is_some_and(|turn| !is_implicit_turn(turn));
+    let result_id = scoped_model_result_id(payload, scoped);
+    items.push_historical(
+        builder,
         kind,
-        compact_tool_value(payload, None),
+        completed_item::with_source_receipt(compact_tool_value(payload, None), payload),
         timestamp,
-        ReplayPolicy::HistoricalOnly,
-        Some(format!("response_item.{item_type}")),
-        None,
+        format!("response_item.{item_type}"),
+        result_id,
     );
-    *last_visible = None;
     false
 }
 
+fn model_call_id(payload: &Value) -> Option<&str> {
+    scoped_model_call_id(payload, false)
+}
+
+fn scoped_model_call_id(payload: &Value, scoped: bool) -> Option<&str> {
+    match payload["type"].as_str()? {
+        "function_call" | "custom_tool_call" | "web_search_call" | "computer_call"
+        | "local_shell_call" => tool_wire_id(payload, scoped),
+        _ => None,
+    }
+}
+
+fn scoped_model_result_id(payload: &Value, scoped: bool) -> Option<&str> {
+    match payload["type"].as_str()? {
+        "function_call_output"
+        | "custom_tool_call_output"
+        | "local_shell_call_output"
+        | "computer_call_output" => tool_wire_id(payload, scoped),
+        _ => None,
+    }
+}
+
+fn tool_wire_id(payload: &Value, scoped: bool) -> Option<&str> {
+    if scoped && payload["call_id"].as_str() == Some("") {
+        Some("")
+    } else {
+        string_at(payload, &[&["call_id"], &["id"]])
+    }
+}
+
+fn model_result_kind(payload: &Value) -> EventKind {
+    if matches!(payload["status"].as_str(), Some("failed" | "error")) {
+        EventKind::ToolFailed
+    } else {
+        EventKind::ToolCompleted
+    }
+}
+
+fn omitted_tool_value(value: &Value) -> Value {
+    let mut omitted = json!({"content_omitted": true});
+    if let Some(text) = value.as_str() {
+        omitted["original_bytes"] = text.len().into();
+    } else if let Some(items) = value.as_array() {
+        omitted["original_items"] = items.len().into();
+    }
+    omitted
+}
+
 fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
+    let output_part = field.filter(|key| *key == "output");
+    if output_part.is_some()
+        && matches!(
+            value["type"].as_str(),
+            Some("input_image" | "input_audio" | "encrypted_content")
+        )
+    {
+        let mut part = json!({"type": value["type"]});
+        for key in ["image_url", "file_id", "audio_url", "encrypted_content"] {
+            if let Some(content) = value.get(key) {
+                part[key] = omitted_tool_value(content);
+            }
+        }
+        if let Some(detail) = value
+            .get("detail")
+            .filter(|v| checkpoint_wire::image_detail(v))
+        {
+            part["detail"] = detail.clone();
+        }
+        return part;
+    }
     if field.is_some_and(|field| {
         matches!(
             field,
@@ -2962,13 +5211,7 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
                 | "internal_chat_message_metadata_passthrough"
         )
     }) {
-        let mut omitted = Map::from_iter([("content_omitted".to_owned(), Value::Bool(true))]);
-        if let Some(value) = value.as_str() {
-            omitted.insert("original_bytes".to_owned(), Value::from(value.len()));
-        } else if let Some(value) = value.as_array() {
-            omitted.insert("original_items".to_owned(), Value::from(value.len()));
-        }
-        return Value::Object(omitted);
+        return omitted_tool_value(value);
     }
     match value {
         Value::String(value) => Value::String(compact_tool_string(value)),
@@ -2977,7 +5220,7 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
             let mut compact = values
                 .iter()
                 .take(edge)
-                .map(|value| compact_tool_value(value, None))
+                .map(|value| compact_tool_value(value, output_part))
                 .collect::<Vec<_>>();
             compact.push(json!({
                 "content_omitted": true,
@@ -2987,14 +5230,14 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
                 values
                     .iter()
                     .skip(values.len() - edge)
-                    .map(|value| compact_tool_value(value, None)),
+                    .map(|value| compact_tool_value(value, output_part)),
             );
             Value::Array(compact)
         }
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|value| compact_tool_value(value, None))
+                .map(|value| compact_tool_value(value, output_part))
                 .collect(),
         ),
         Value::Object(values) => Value::Object(
@@ -3032,9 +5275,12 @@ fn push_event_message(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    items: &mut CodexItems,
 ) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if event_type == "item_completed" {
+        return push_completed_item(builder, &payload["item"], timestamp, items);
+    }
     let kind = match event_type {
         "user_message" => Some(EventKind::MessageUser),
         "agent_message" => Some(EventKind::MessageAssistant),
@@ -3049,34 +5295,57 @@ fn push_event_message(
     if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
         return false;
     }
-    let images = ["images", "local_images"]
-        .into_iter()
-        .filter_map(|field| payload.get(field).and_then(Value::as_array))
-        .map(Vec::len)
-        .sum::<usize>();
-    if text.is_empty() && images > 0 && kind == EventKind::MessageUser {
-        let placeholder = omitted_images_text(images);
-        return push_message_text(
-            builder,
-            kind,
-            &placeholder,
-            timestamp,
-            "event_msg",
-            last_visible,
-        );
-    }
-    push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
+    let placeholder = if text.trim().is_empty() && kind == EventKind::MessageUser {
+        let images = ["images", "file_ids", "local_images"]
+            .into_iter()
+            .filter_map(|field| payload.get(field).and_then(Value::as_array))
+            .map(Vec::len)
+            .sum();
+        let audio = ["audio", "audio_references", "local_audio"]
+            .into_iter()
+            .any(|field| {
+                payload[field]
+                    .as_array()
+                    .is_some_and(|audio| !audio.is_empty())
+            });
+        omitted_media_text(images, audio)
+    } else {
+        None
+    };
+    let attachment = (kind == EventKind::MessageUser)
+        .then(|| attachments::legacy(payload, text))
+        .flatten();
+    push_message_text(
+        builder,
+        kind,
+        placeholder.as_deref().unwrap_or(text),
+        timestamp,
+        "event_msg",
+        MessageMatch {
+            attachment,
+            ..MessageMatch::default()
+        },
+        items,
+    )
 }
 
-/// Whether `text` is Codex's tag around an adjacent image part (`codex-rs/protocol/src/models.rs`).
-///
-/// A tag the user typed without an image beside it stays visible.
-fn is_image_wrapper(text: &str, image_before: bool, image_after: bool) -> bool {
-    let opens = text == "<image>"
-        || text
-            .strip_prefix("<image name=")
-            .is_some_and(|rest| rest.ends_with('>'));
-    (opens && image_after) || (text == "</image>" && image_before)
+/// A tag typed without its matching attachment stays visible.
+fn is_media_wrapper(text: &str, before: Option<&str>, after: Option<&str>) -> bool {
+    if matches!(
+        (text, before),
+        ("</image>", Some("input_image")) | ("</audio>", Some("input_audio"))
+    ) {
+        return true;
+    }
+    match after {
+        Some("input_image") => {
+            text == "<image>" || (text.starts_with("<image name=") && text.ends_with('>'))
+        }
+        Some("input_audio") => {
+            text == "<audio>" || (text.starts_with("<audio name=") && text.ends_with('>'))
+        }
+        _ => false,
+    }
 }
 
 impl ProviderAdapter for CodexAdapter {
@@ -3424,9 +5693,21 @@ impl ProviderAdapter for CodexAdapter {
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
         self.read_selected(self.find_session(&session.id, None)?, |native, _| {
-            native.preview(session)
+            let small_plain_rollout = !rollout_file::compressed(&native.path)
+                && fs::metadata(&native.path)?.len() <= MAX_PREVIEW_TAIL_SIZE;
+            let (mut snapshot, _, _) = native.preview(session)?;
+            if small_plain_rollout
+                && snapshot.events.last().is_some_and(|event| {
+                    event.source.raw_record_type.as_deref()
+                        == Some("omnisession.codex_preview_prefix")
+                        && event.payload["prefix_complete"].as_bool() == Some(true)
+                        && event.payload["prefix_end_sequence"].as_u64() == Some(event.sequence)
+                })
+            {
+                snapshot.events.pop();
+            }
+            Ok(snapshot)
         })
-        .map(|(snapshot, _, _)| snapshot)
     }
 
     fn read_full_index_at(
@@ -3743,6 +6024,34 @@ mod tests {
     }
 
     #[test]
+    fn rollback_scan_ignores_unicode_escapes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let escaped = temporary.path().join("escaped.jsonl");
+        fs::write(
+            &escaped,
+            "{\"type\":\"event_msg\",\"payload\":{\"text\":\"\\u001b[31mred\\u001b[0m\"}}\n",
+        )
+        .expect("escaped rollout");
+        assert!(!contains_rollback_marker(&escaped).expect("scan escaped rollout"));
+
+        let rolled_back = temporary.path().join("rolled-back.jsonl");
+        fs::write(
+            &rolled_back,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n",
+        )
+        .expect("rolled back rollout");
+        assert!(contains_rollback_marker(&rolled_back).expect("scan rolled back rollout"));
+
+        let escaped_marker = temporary.path().join("escaped-marker.jsonl");
+        fs::write(
+            &escaped_marker,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_\\u0062ack\"}}\n",
+        )
+        .expect("escaped marker rollout");
+        assert!(contains_rollback_marker(&escaped_marker).expect("scan escaped marker rollout"));
+    }
+
+    #[test]
     fn path_uuid_ignores_stems_that_end_mid_character() {
         let mid_character = format!("{}a.jsonl", "\u{e9}".repeat(18));
         assert_eq!(path_uuid(Path::new(&mid_character)), None);
@@ -3799,6 +6108,40 @@ mod tests {
         );
     }
 
+    fn naive_rollback_marker(bytes: &[u8]) -> bool {
+        const MARKER: &[u8] = b"thread_rolled_back";
+        bytes.windows(MARKER.len()).any(|window| window == MARKER)
+            || bytes.windows(4).any(|token| {
+                &token[1..3] == b"14"
+                    && (matches!(token[0], b'[' | b':') || token[0].is_ascii_whitespace())
+                    && (matches!(token[3], b',' | b'}') || token[3].is_ascii_whitespace())
+            })
+            || bytes.windows(6).any(|window| {
+                window.starts_with(b"\\u00")
+                    && std::str::from_utf8(&window[4..])
+                        .ok()
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            })
+    }
+
+    /// JSON unicode escape of one byte, e.g. the escaped `b` a writer may emit.
+    fn json_escape(byte: u8) -> String {
+        format!("\\u{byte:04x}")
+    }
+
+    fn rollback_filler() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            8 => b'a'..=b'z',
+            1 => Just(b'\\'),
+            1 => Just(b'u'),
+            1 => Just(b'0'),
+            1 => Just(b'_'),
+            1 => Just(b'"'),
+            1 => Just(b'\n'),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -3820,5 +6163,42 @@ mod tests {
             );
         }
 
+        #[test]
+        fn rollback_scan_matches_naive_search_across_chunk_boundaries(
+            filler in proptest::collection::vec(rollback_filler(), 0..160),
+            marker in prop_oneof![
+                Just(String::new()),
+                Just("thread_rolled_back".to_owned()),
+                Just("[14,1]".to_owned()),
+                Just(r#"{"num_turns":1,"type":14}"#.to_owned()),
+                Just("[   14  ,1]".to_owned()),
+                Just("[ 140 ,1]".to_owned()),
+                Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
+                Just(format!("{}hread_rolled_back", json_escape(b't'))),
+                Just(format!("{}[31m", json_escape(0x1b))),
+            ],
+            chunk in 18_usize..48,
+            window in 0_usize..4,
+            shift in 0_usize..24,
+            random_offset in any::<proptest::sample::Index>(),
+            near_boundary in any::<bool>(),
+        ) {
+            // After the first window, each read advances by `chunk` minus the 17-byte overlap.
+            let boundary = chunk + window * (chunk - 17);
+            let offset = if near_boundary {
+                boundary.saturating_sub(shift).min(filler.len())
+            } else {
+                random_offset.index(filler.len() + 1)
+            };
+            let bytes = [&filler[..offset], marker.as_bytes(), &filler[offset..]].concat();
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let path = temporary.path().join("rollout.jsonl");
+            fs::write(&path, &bytes).expect("synthetic rollout");
+
+            prop_assert_eq!(
+                contains_rollback_marker_with_chunk(&path, chunk).expect("chunked scan"),
+                naive_rollback_marker(&bytes)
+            );
+        }
     }
 }

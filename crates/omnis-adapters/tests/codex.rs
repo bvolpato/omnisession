@@ -4,6 +4,39 @@ use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
 use serde_json::{Value, json};
 
+#[path = "codex/active_order.rs"]
+mod active_order;
+#[path = "codex/async_questions.rs"]
+mod async_questions;
+#[path = "codex/display_text.rs"]
+mod display_text;
+#[path = "codex/early_assistants.rs"]
+mod early_assistants;
+#[path = "codex/hooks.rs"]
+mod hooks;
+#[path = "codex/inherited_prefix.rs"]
+mod inherited_prefix;
+#[path = "codex/media.rs"]
+mod media;
+#[path = "codex/message_identity.rs"]
+mod message_identity;
+#[path = "codex/mirror_turns.rs"]
+mod mirror_turns;
+#[path = "codex/paginated_answers.rs"]
+mod paginated_answers;
+#[path = "codex/paginated_instructions.rs"]
+mod paginated_instructions;
+#[path = "codex/paginated_visibility.rs"]
+mod paginated_visibility;
+#[path = "codex/rollout_lines.rs"]
+mod rollout_lines;
+#[path = "codex/steered_inputs.rs"]
+mod steered_inputs;
+#[path = "codex/tool_outcomes.rs"]
+mod tool_outcomes;
+#[path = "codex/turn_ownership.rs"]
+mod turn_ownership;
+
 const SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
 fn read_records(records: Vec<Value>) -> anyhow::Result<CanonicalSnapshot> {
@@ -14,19 +47,47 @@ fn read_records_with_preview(
     records: Vec<impl std::fmt::Display>,
     preview: bool,
 ) -> anyhow::Result<CanonicalSnapshot> {
+    read_with_history_mode(records, preview, None)
+}
+
+fn read_with_history_mode(
+    records: Vec<impl std::fmt::Display>,
+    preview: bool,
+    mode: Option<&str>,
+) -> anyhow::Result<CanonicalSnapshot> {
     let temporary = tempfile::tempdir()?;
     fs::create_dir(temporary.path().join("sessions"))?;
     let source = temporary
         .path()
         .join(format!("sessions/rollout-{SESSION_ID}.jsonl"));
-    let mut document = json!({
+    let mut header = json!({
         "type": "session_meta",
         "payload": {"id": SESSION_ID, "cwd": "/workspace/original"},
-    })
-    .to_string();
-    for record in records {
+    });
+    if let Some(mode) = mode {
+        header["payload"]["history_mode"] = mode.into();
+    }
+    let paginated = mode == Some("paginated");
+    let timestamp = "2026-01-05T09:00:00.000Z";
+    if paginated {
+        header["timestamp"] = timestamp.into();
+        header["ordinal"] = 0.into();
+    }
+    let mut document = header.to_string();
+    for (index, record) in records.into_iter().enumerate() {
         document.push('\n');
-        document.push_str(&record.to_string());
+        let line = record.to_string();
+        if paginated
+            && let Ok(Value::Object(mut row)) = serde_json::from_str(&line)
+            && !row.contains_key("timestamp")
+            && !row.contains_key("ordinal")
+        {
+            row.insert("timestamp".into(), timestamp.into());
+            row.insert("ordinal".into(), (index + 1).into());
+            document.push_str(&Value::Object(row).to_string());
+        } else {
+            document.push_str(&line);
+        }
     }
     document.push('\n');
     fs::write(&source, &document)?;
@@ -60,6 +121,175 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
         .iter()
         .filter_map(|event| event.payload["text"].as_str())
         .collect()
+}
+
+fn completed(item: &Value) -> Value {
+    event(
+        "item_completed",
+        json!({"thread_id":SESSION_ID, "turn_id":"turn-1", "item":item}),
+    )
+}
+
+#[test]
+fn migrated_codex_messages_survive_full_reads_and_previews() {
+    let request = completed(&json!({"type":"UserMessage", "id":"item-1", "content":[
+        {"type":"text","text":"Inspect "}, {"type":"text","text":"the cache."}
+    ]}));
+    let answer = completed(&json!({"type":"AgentMessage", "id":"item-2", "content":[
+        {"type":"Text","text":"The entry "}, {"type":"Text","text":"expired."}
+    ]}));
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(
+            vec![
+                request.clone(),
+                completed(&json!({"type":"Reasoning","id":"private","raw_content":["private reasoning"]})),
+                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"private hook context"}]})),
+                answer.clone(),
+                message("assistant", "The entry expired."),
+                completed(&json!({"type":"AgentMessage","id":"item-3","content":[{"type":"Text","text":"The entry expired."}]})),
+                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"private-image.png"}]})),
+            ],
+            preview,
+        ).unwrap();
+        assert_eq!(
+            visible_text(&snapshot),
+            [
+                "Inspect the cache.",
+                "The entry expired.",
+                "The entry expired.",
+                "[1 image omitted]"
+            ]
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("private"));
+    }
+}
+
+#[test]
+fn rollback_counts_a_paginated_multipart_request_and_its_mirror_once() {
+    let mut model_request = message("user", "first");
+    model_request["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":" second"}));
+    let display_request = completed(&json!({"type":"UserMessage","id":"request","content":[
+        {"type":"text","text":"first"},{"type":"text","text":" second"}
+    ]}));
+    for (first, second) in [
+        (&model_request, &display_request),
+        (&display_request, &model_request),
+    ] {
+        let snapshot = read_records(vec![
+            message("user", "keep this"),
+            first.clone(),
+            second.clone(),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ])
+        .unwrap();
+        assert_eq!(visible_text(&snapshot), ["keep this"]);
+    }
+}
+
+#[test]
+fn paginated_model_records_can_follow_all_display_items_in_the_turn() {
+    let display_user = completed(
+        &json!({"type":"UserMessage","id":"request","content":[{"type":"text","text":"repeat"}]}),
+    );
+    let display_reply = completed(
+        &json!({"type":"AgentMessage","id":"reply","content":[{"type":"Text","text":"repeat"}]}),
+    );
+    let records = vec![
+        event("task_started", json!({"turn_id":"turn-1"})),
+        display_user,
+        display_reply,
+        message("user", "repeat"),
+        message("assistant", "repeat"),
+        event("task_complete", json!({"turn_id":"turn-1"})),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        let roles: Vec<_> = snapshot.events.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            roles,
+            [&EventKind::MessageUser, &EventKind::MessageAssistant]
+        );
+        let mut rolled_back = records.clone();
+        rolled_back.push(event("thread_rolled_back", json!({"num_turns":1})));
+        assert!(
+            read_records_with_preview(rolled_back, preview)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn paginated_model_messages_can_precede_their_synthesized_turns() {
+    let mut rows = vec![
+        message("user", "first question"),
+        message("assistant", "first answer"),
+        message("user", "second question"),
+        message("assistant", "second answer"),
+    ];
+    for (turn, question, answer) in [
+        ("rollout-5", "first question", "first answer"),
+        ("rollout-7", "second question", "second answer"),
+    ] {
+        rows.push(event("task_started", json!({"turn_id":turn})));
+        for (item_type, tag, id, text) in [
+            ("UserMessage", "text", "question", question),
+            ("AgentMessage", "Text", "answer", answer),
+        ] {
+            rows.push(event(
+                "item_completed",
+                json!({"thread_id":SESSION_ID,"turn_id":turn,"item":{
+                    "type":item_type,"id":id,"content":[{"type":tag,"text":text}]
+                }}),
+            ));
+        }
+        rows.push(event("task_complete", json!({"turn_id":turn})));
+    }
+    for preview in [false, true] {
+        let mut history = rows.clone();
+        for wanted in [
+            vec![
+                "first question",
+                "first answer",
+                "second question",
+                "second answer",
+            ],
+            vec!["first question", "first answer"],
+            vec![],
+        ] {
+            assert_eq!(
+                visible_text(&read_records_with_preview(history.clone(), preview).unwrap()),
+                wanted
+            );
+            history.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+    }
+}
+
+#[test]
+fn paginated_command_and_model_output_preserve_one_result_in_either_order() {
+    let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"cmd","name":"exec_command","arguments":json!({"cmd":"example"}).to_string()}});
+    let display = completed(
+        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","exit_code":1,"aggregated_output":"display text","status":"failed"}),
+    );
+    let result = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"cmd","output":"model-visible result"}});
+    for (first, second) in [(&display, &result), (&result, &display)] {
+        let snapshot = read_records(vec![call.clone(), first.clone(), second.clone()]).unwrap();
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].kind, EventKind::ToolCalled);
+        let outcome = &snapshot.events[1];
+        assert_eq!(outcome.kind, EventKind::ToolFailed);
+        assert_eq!(outcome.payload["output"], "model-visible result");
+        assert_eq!(
+            outcome.replay_policy,
+            omnis_ir::ReplayPolicy::HistoricalOnly
+        );
+    }
 }
 
 #[test]
@@ -438,10 +668,18 @@ fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> any
         (
             vec![
                 saved(),
-                rolled_back(u64::MAX),
+                rolled_back(u64::from(u32::MAX)),
                 message("user", "replacement"),
             ],
             true,
+        ),
+        (
+            vec![
+                saved(),
+                rolled_back(u64::MAX),
+                message("user", "replacement"),
+            ],
+            false,
         ),
         (
             vec![message("user", "earlier"), saved(), rolled_back(1)],
@@ -787,7 +1025,7 @@ fn codex_rollback_handles_zero_excess_and_consecutive_rollbacks() {
         message("assistant", "first answer"),
         message("user", "second request"),
         event("thread_rolled_back", json!({"num_turns": 1})),
-        event("thread_rolled_back", json!({"num_turns": u64::MAX})),
+        event("thread_rolled_back", json!({"num_turns": u32::MAX})),
         message("user", "fresh request"),
         message("assistant", "fresh answer"),
     ]).expect("saturating rollback");
@@ -852,23 +1090,75 @@ fn codex_rollback_reports_surviving_tools_evicted_during_discarded_turn() {
 
 #[test]
 fn codex_preview_finds_rollback_outside_prefix_and_tail_samples() {
-    let mut records = vec![message("user", "discarded request")];
-    records.extend((0..1_050).map(|_| event("token_count", json!({}))));
-    records.push(event("thread_rolled_back", json!({"num_turns": 1})));
-    records.push(json!({"type": "response_item", "payload": {
-        "type": "reasoning", "encrypted_content": "x".repeat(5 * 1024 * 1024),
-    }}));
-    records.push(message("user", "replacement request"));
-    let encoded = records
-        .into_iter()
-        .map(|record| {
-            record
-                .to_string()
-                .replace("thread_rolled_back", r"thread_rolled_\u0062ack")
-        })
+    let middle = (0..1_050).map(|_| event("token_count", json!({})).to_string());
+    let prefix: Vec<_> = std::iter::once(message("user", "discarded request").to_string())
+        .chain(middle)
         .collect();
-    let snapshot = read_records_with_preview(encoded, true).expect("rollback-aware preview");
-    assert_eq!(visible_text(&snapshot), ["replacement request"]);
+    let tail = json!({"type": "response_item", "payload": {
+        "type": "reasoning", "encrypted_content": "x".repeat(5 * 1024 * 1024),
+    }})
+    .to_string();
+    for rollback in [
+        r#"{"type":"event_msg","payload":{"type":"thread_rolled_\u0062ack","num_turns":1}}"#,
+        r#"{"type":"event_msg","payload":[ 14 ,1]}"#,
+        r#"{"type":"event_msg","payload":{"num_turns":1,"type":14}}"#,
+    ] {
+        let mut records = prefix.clone();
+        records.extend([
+            rollback.to_owned(),
+            tail.clone(),
+            message("user", "replacement request").to_string(),
+        ]);
+        let snapshot = read_records_with_preview(records, true).expect("rollback-aware preview");
+        assert_eq!(visible_text(&snapshot), ["replacement request"]);
+    }
+}
+
+#[test]
+fn legacy_preview_applies_a_display_revision_between_sampled_edges() -> anyhow::Result<()> {
+    let assistant = |text| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"AgentMessage","id":"answer","content":[{"type":"Text","text":text}]
+            }),
+        )
+    };
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic"}});
+    let padding = format!(
+        "{}\n",
+        json!({"type":"progress","padding":"p".repeat(8 * 1024)})
+    )
+    .repeat(1050);
+    let document = format!(
+        "{header}\n{}\n{}\n{padding}{}\n{padding}",
+        event("task_started", json!({"turn_id":"turn"})),
+        assistant("earlier draft"),
+        assistant("corrected answer")
+    );
+    for suffix in ["jsonl", "gz", "zst"] {
+        let home = tempfile::tempdir()?;
+        let folder = home.path().join("sessions");
+        fs::create_dir(&folder)?;
+        let bytes = if suffix == "jsonl" {
+            document.as_bytes().to_vec()
+        } else {
+            encode_rollout(document.as_bytes(), suffix)
+        };
+        let extension = if suffix == "jsonl" {
+            suffix.to_owned()
+        } else {
+            format!("jsonl.{suffix}")
+        };
+        fs::write(
+            folder.join(format!("rollout-{SESSION_ID}.{extension}")),
+            bytes,
+        )?;
+        let preview = CodexAdapter::with_root(home.path())
+            .preview_session(&SessionRef::new(Provider::Codex, SESSION_ID))?;
+        assert_eq!(visible_text(&preview), ["corrected answer"], "{suffix}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -1120,6 +1410,131 @@ fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     assert!(visible_text(&snapshot).is_empty());
 }
 
+fn turn_item(turn: &str, item: &Value) -> Value {
+    event(
+        "item_completed",
+        json!({"thread_id": SESSION_ID, "turn_id": turn, "item": item}),
+    )
+}
+
+fn page_user(turn: &str, id: &str, text: &str) -> Value {
+    turn_item(
+        turn,
+        &json!({"type":"UserMessage","id":id,"content":[{"type":"text","text":text}]}),
+    )
+}
+
+#[test]
+fn paginated_implicit_turns_match_model_requests_across_synthetic_boundaries() {
+    let records = vec![
+        message("user", "repeat"),
+        event("task_started", json!({"turn_id":"rollout-2"})),
+        page_user("rollout-2", "item-1", "repeat"),
+        message("user", "repeat"),
+        event("task_complete", json!({"turn_id":"rollout-2"})),
+        event("task_started", json!({"turn_id":"rollout-4"})),
+        page_user("rollout-4", "item-2", "repeat"),
+        event("task_complete", json!({"turn_id":"rollout-4"})),
+    ];
+    for preview in [false, true] {
+        let mut rows = records.clone();
+        for expected in [vec!["repeat", "repeat"], vec!["repeat"], vec![]] {
+            let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
+            assert_eq!(visible_text(&snapshot), expected);
+            rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+    }
+}
+
+#[test]
+fn paginated_rollback_preserves_late_command_results_from_surviving_turns() {
+    let command = |turn, id, output| {
+        turn_item(
+            turn,
+            &json!({
+                "type":"CommandExecution","id":id,"command":["example"],"cwd":"file:///workspace",
+                "parsed_cmd":[],"source":"agent","aggregated_output":output,"status":"completed","exit_code":0
+            }),
+        )
+    };
+    let records = vec![
+        event("task_started", json!({"turn_id":"first"})),
+        page_user("first", "item-1", "keep"),
+        event("task_started", json!({"turn_id":"second"})),
+        page_user("second", "item-2", "discard"),
+        event("task_complete", json!({"turn_id":"first"})),
+        command("first", "command-1", "late result"),
+        command("second", "command-2", "discarded result"),
+        event("task_complete", json!({"turn_id":"second"})),
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        assert_eq!(visible_text(&snapshot), ["keep"]);
+        let results: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::CommandExecuted)
+            .map(|event| event.payload["output"].as_str().unwrap())
+            .collect();
+        assert_eq!(results, ["late result"]);
+        let mut rows = records.clone();
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        let snapshot = read_records_with_preview(rows, preview).unwrap();
+        let [notice] = snapshot.events.as_slice() else {
+            panic!("expected only the notice for the unconfirmed legacy input");
+        };
+        assert!(omnis_core::reports_omitted_events(notice));
+        assert_eq!(
+            notice.source.raw_record_type.as_deref(),
+            Some("omnisession.codex_legacy_rollback")
+        );
+    }
+}
+
+#[test]
+fn paginated_item_updates_keep_the_original_position_and_turn() {
+    let assistant = |turn, id, text| {
+        turn_item(
+            turn,
+            &json!({
+                "type":"AgentMessage","id":id,"content":[{"type":"Text","text":text}]
+            }),
+        )
+    };
+    let records = vec![
+        event("task_started", json!({"turn_id":"first"})),
+        page_user("first", "request", "first request"),
+        assistant("first", "answer", "superseded"),
+        assistant("first", "other", "separate answer"),
+        assistant("first", "answer", "updated answer"),
+        event("task_complete", json!({"turn_id":"first"})),
+        event("task_started", json!({"turn_id":"second"})),
+        page_user("second", "request", "second request"),
+        assistant("second", "answer", "second answer"),
+    ];
+    for preview in [false, true] {
+        let mut rows = records.clone();
+        let snapshot = read_records_with_preview(rows.clone(), preview).unwrap();
+        assert_eq!(
+            visible_text(&snapshot),
+            [
+                "first request",
+                "updated answer",
+                "separate answer",
+                "second request",
+                "second answer"
+            ]
+        );
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        let snapshot = read_records_with_preview(rows, preview).unwrap();
+        assert_eq!(
+            visible_text(&snapshot),
+            ["first request", "updated answer", "separate answer"]
+        );
+    }
+}
+
 fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
     use std::io::Write;
     if extension == "gz" {
@@ -1170,7 +1585,24 @@ fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Res
         if let Some(prefix) = prefix {
             header["payload"]["history_base"] = prefix.clone();
         }
-        let rows = format!("{header}\n{}\n", message("user", "retained request"));
+        let paginated = header["payload"]["history_mode"] == "paginated";
+        let offset = prefix
+            .and_then(|base| base["end_ordinal_exclusive"].as_u64())
+            .unwrap_or(0);
+        let mut records = vec![header.clone(), message("user", "retained request")];
+        if paginated {
+            records.push(page_user("turn-one", "request", "retained request"));
+            for (index, record) in records.iter_mut().enumerate() {
+                record["ordinal"] = (offset + index as u64).into();
+                record["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+            }
+        }
+        let rows = records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         fs::write(&path, &rows)?;
         assert_eq!(
             adapter.native_resume_support(&source)?,
@@ -1200,10 +1632,12 @@ fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Res
     )?;
     let mut damaged = header;
     damaged["payload"]["history_base"] = malformed_base;
-    fs::write(
-        &path,
-        format!("{damaged}\n{}\n", message("user", "readable leaf")),
-    )?;
+    damaged["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+    damaged["ordinal"] = 0.into();
+    let mut retained = page_user("turn-one", "request", "readable leaf");
+    retained["timestamp"] = damaged["timestamp"].clone();
+    retained["ordinal"] = 1.into();
+    fs::write(&path, format!("{damaged}\n{retained}\n"))?;
     assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
     let snapshot = adapter.read_session(&source)?;
     assert_eq!(visible_text(&snapshot), ["readable leaf"]);
@@ -1389,6 +1823,48 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
 }
 
 #[test]
+fn a_copied_parent_header_preserves_the_child_history_mode() {
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let rows = [
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"forked_from_id":parent,"history_mode":"legacy"}}),
+        json!({"type":"session_meta","payload":{"id":parent,"history_mode":"paginated"}}),
+        message("user", "child request"),
+        message("assistant", "child reply"),
+    ];
+    let source = rows.map(|row| row.to_string()).join("\n") + "\n";
+    for extension in ["", "gz", "zst"] {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let mut path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let bytes = if extension.is_empty() {
+            source.as_bytes().to_vec()
+        } else {
+            path.set_extension(format!("jsonl.{extension}"));
+            encode_rollout(source.as_bytes(), extension)
+        };
+        fs::write(&path, bytes).unwrap();
+        let adapter = CodexAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        for snapshot in [
+            adapter.read_session(&session).unwrap(),
+            adapter.preview_session(&session).unwrap(),
+            adapter
+                .index_session(&session, Some(&path), u64::MAX)
+                .unwrap()
+                .snapshot,
+        ] {
+            assert_eq!(visible_text(&snapshot), ["child request", "child reply"]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert!(text.contains("child request") && text.contains("child reply"));
+            }
+        }
+    }
+}
+
+#[test]
 fn codex_discovers_and_reads_compressed_active_and_archived_rollouts() {
     use omnis_adapters::NativeResumeSupport;
     for extension in ["gz", "zst"] {
@@ -1474,11 +1950,23 @@ fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
         }
         rows.insert(0, header);
         rows.push(message("user", "request in the retained rollout"));
+        if inherited {
+            rows.push(page_user(
+                "turn-one",
+                "request",
+                "request in the retained rollout",
+            ));
+            for (index, row) in rows.iter_mut().enumerate() {
+                row["ordinal"] = (4 + index).into();
+                row["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+            }
+        }
         let text = rows
             .iter()
             .map(Value::to_string)
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            + "\n";
         let encoded = encode_rollout(text.as_bytes(), "zst");
         fs::write(&source, &encoded).unwrap();
         let adapter = CodexAdapter::with_root(home.path());
@@ -2465,7 +2953,18 @@ fn compressed_archive_uses_the_name_and_reply_of_the_registered_generation() -> 
             "rollout-2026-10-01T00-00-00-{SESSION_ID}_{generation}.jsonl"
         ));
         let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/project","history_mode":"paginated"}});
-        let text = format!("{header}\n{}\n", message("assistant", reply));
+        let started = event("task_started", json!({"turn_id":"archive-turn"}));
+        let published = turn_item(
+            "archive-turn",
+            &json!({"type":"AgentMessage","id":"reply","content":[{"type":"Text","text":reply}]}),
+        );
+        let mut text = String::new();
+        for (ordinal, mut row) in [header, started, published].into_iter().enumerate() {
+            row["ordinal"] = ordinal.into();
+            row["timestamp"] = "2026-10-01T00:00:00Z".into();
+            text.push_str(&row.to_string());
+            text.push('\n');
+        }
         if compressed {
             fs::write(
                 path.with_extension("jsonl.zst"),
