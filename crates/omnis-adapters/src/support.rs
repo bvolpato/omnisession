@@ -525,12 +525,23 @@ impl SnapshotFileStamp {
     }
 
     fn copy_unchanged(&self, path: &Path, target: &Path) -> Result<bool> {
-        let mut source = match File::open(path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            result => result?,
+        let Some(mut source) = open_observed_source(path)? else {
+            return Ok(false);
         };
         if *self != Self::from_metadata(&source.metadata()?)? {
             return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        if rustix::fs::fclonefileat(
+            &source,
+            rustix::fs::CWD,
+            target,
+            rustix::fs::CloneFlags::empty(),
+        )
+        .is_ok()
+        {
+            return Ok(*self == Self::from_metadata(&source.metadata()?)?
+                && fs::metadata(target)?.len() == self.len);
         }
         let mut copy = File::create(target)?;
         let bytes = io::copy(&mut (&mut source).take(self.len), &mut copy)?;
@@ -615,6 +626,179 @@ impl SnapshotStamp {
     }
 }
 
+fn open_snapshot_source(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "provider SQLite source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// A file observed in a snapshot stamp can disappear before the copy opens it.
+fn open_observed_source(path: &Path) -> io::Result<Option<File>> {
+    match open_snapshot_source(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// A WAL reset replaces the header salts. Appending transactions preserves the header.
+struct WalPrefix {
+    header: [u8; 32],
+    len: u64,
+}
+
+impl WalPrefix {
+    fn capture(path: &Path, len: u64) -> Result<Option<Self>> {
+        if len < 32 {
+            return Ok(None);
+        }
+        let Some(file) = open_observed_source(path)? else {
+            return Ok(None);
+        };
+        let mut reader = BufReader::with_capacity(128 * 1024, file);
+        let mut header = [0; 32];
+        if !read_snapshot_bytes(&mut reader, &mut header)? {
+            return Ok(None);
+        }
+        let magic = u32::from_be_bytes(header[0..4].try_into()?);
+        let page_size = u32::from_be_bytes(header[8..12].try_into()?);
+        if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+            || !(512..=65_536).contains(&page_size)
+            || !page_size.is_power_of_two()
+        {
+            return Ok(None);
+        }
+        // SQLite can reuse a WAL without truncating it. Frames from the prior generation
+        // and an unfinished write after the last commit do not belong to this snapshot.
+        let frame_size = 24 + u64::from(page_size);
+        let mut offset = 32;
+        let mut committed = offset;
+        let mut frame = [0; 24];
+        while len - offset >= frame_size {
+            if !read_snapshot_bytes(&mut reader, &mut frame)?
+                || frame[8..16] != header[16..24]
+                || frame[..4] == [0; 4]
+            {
+                break;
+            }
+            offset += frame_size;
+            if frame[4..8] != [0; 4] {
+                committed = offset;
+            }
+            reader.seek_relative(i64::from(page_size))?;
+        }
+        Ok(Some(Self {
+            header,
+            len: committed,
+        }))
+    }
+
+    fn still_matches(&self, path: &Path) -> Result<bool> {
+        let mut header = [0; 32];
+        let Some(mut file) = open_observed_source(path)? else {
+            return Ok(false);
+        };
+        Ok(read_snapshot_bytes(&mut file, &mut header)? && header == self.header)
+    }
+}
+
+fn read_snapshot_bytes(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn prefix_matches(source: &Path, copy: &Path, len: u64) -> Result<bool> {
+    let Some(mut source) = open_observed_source(source)? else {
+        return Ok(false);
+    };
+    let mut copy = File::open(copy)?;
+    let mut left = vec![0_u8; 64 * 1024];
+    let mut right = vec![0_u8; left.len()];
+    let mut remaining = len;
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(left.len() as u64))?;
+        if let Err(err) = source.read_exact(&mut left[..count]) {
+            if err.kind() == ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(err.into());
+        }
+        copy.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
+impl SnapshotStamp {
+    fn copy_live_wal(
+        &self,
+        root: &Path,
+        database: &Path,
+        limits: SnapshotLimits,
+        prefix: &WalPrefix,
+    ) -> Result<Option<SqliteSnapshot>> {
+        let directory = private_snapshot_directory()?;
+        ensure_snapshot_space(directory.path(), self.bytes(), limits.free_space_reserve)?;
+        let copy = directory.path().join("snapshot.sqlite");
+        let wal = sidecar(database, "-wal");
+        let copy_wal = sidecar(&copy, "-wal");
+        if !self.database.copy_unchanged(database, &copy)? || !prefix.still_matches(&wal)? {
+            return Ok(None);
+        }
+        let Some(file) = open_observed_source(&wal)? else {
+            return Ok(None);
+        };
+        let copied = io::copy(&mut file.take(prefix.len), &mut File::create(&copy_wal)?)?;
+        if copied != prefix.len
+            || !prefix_matches(&wal, &copy_wal, prefix.len)?
+            || !prefix.still_matches(&wal)?
+        {
+            return Ok(None);
+        }
+        let latest = Self::read(root, database, limits.max_bytes, true)?;
+        if latest.database != self.database || latest.wal.is_none_or(|wal| wal.len < prefix.len) {
+            return Ok(None);
+        }
+        if !self.database.has_precise_change_time()
+            && !prefix_matches(database, &copy, self.database.len)?
+        {
+            return Ok(None);
+        }
+        // SQLite recovers complete committed frames in the private WAL. An unfinished tail is ignored.
+        open_snapshot(directory)
+    }
+}
+
 fn optional_regular_file(path: &Path) -> Result<Option<SnapshotFileStamp>> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => Ok(Some(SnapshotFileStamp::from_metadata(&meta)?)),
@@ -671,7 +855,7 @@ impl SqliteSnapshotCache {
         self.read_using(root, database, false, read)
     }
 
-    /// Copies an unchanged database and WAL once when both files have precise Unix change times.
+    /// Reads a stable database and committed WAL prefix. Unchanged precise Unix stamps permit reuse.
     pub(crate) fn read_stamped<T>(
         &self,
         root: &Path,
@@ -709,7 +893,22 @@ impl SqliteSnapshotCache {
                 return read(&snapshot.snapshot.connection);
             }
             *cached = None;
-            let snapshot = if cacheable && stamped {
+            let live_prefix = if stamped && let Some(wal) = &stamp.wal {
+                let path = sidecar(&database, "-wal");
+                let prefix = WalPrefix::capture(&path, wal.len)?;
+                if prefix.is_none() && optional_regular_file(&path)?.as_ref() != Some(wal) {
+                    continue;
+                }
+                prefix
+            } else {
+                None
+            };
+            let snapshot = if let Some(prefix) = &live_prefix {
+                let Some(snapshot) = stamp.copy_live_wal(root, &database, limits, prefix)? else {
+                    continue;
+                };
+                snapshot
+            } else if cacheable && stamped {
                 let Some(snapshot) = stamp.copy_snapshot(root, &database, limits)? else {
                     continue;
                 };
@@ -718,6 +917,10 @@ impl SqliteSnapshotCache {
                 sqlite_snapshot_with_limits(root, &database, limits)?
             };
             if stamp != SnapshotStamp::read(root, &database, limits.max_bytes, stamped)? {
+                if live_prefix.is_some() {
+                    // A later lookup must observe commits appended after this private snapshot.
+                    return read(&snapshot.connection);
+                }
                 continue;
             }
             if !cacheable {
@@ -2459,6 +2662,109 @@ mod tests {
         assert_eq!(next.0, 3);
         assert_ne!(first.1, next.1);
         assert_eq!(directory_bytes(root.path()), written);
+        Ok(())
+    }
+
+    #[test]
+    fn live_wal_snapshot_accepts_appends_and_rejects_a_restarted_generation() -> anyhow::Result<()>
+    {
+        let (root, database, writer) = wal_store();
+        let db = database.canonicalize()?;
+        let wal = super::sidecar(&db, "-wal");
+        let limits = SnapshotLimits {
+            max_bytes: 1024 * 1024,
+            free_space_reserve: 0,
+        };
+        let observe = || -> anyhow::Result<_> {
+            let stamp = super::SnapshotStamp::read(root.path(), &db, limits.max_bytes, true)?;
+            let len = stamp.wal.as_ref().expect("fixture WAL").len;
+            let prefix = super::WalPrefix::capture(&wal, len)?.expect("fixture WAL prefix");
+            Ok((stamp, prefix))
+        };
+        let (initial, prefix) = observe()?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(512))", [])?;
+        let snapshot = initial
+            .copy_live_wal(root.path(), &db, limits, &prefix)?
+            .expect("unchanged WAL prefix");
+        let rows: i64 = snapshot
+            .connection
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+        assert_eq!(rows, 2);
+
+        let restart = || -> anyhow::Result<()> {
+            let (busy, frames, copied): (i64, i64, i64) =
+                writer.query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            assert_eq!(busy, 0);
+            assert_eq!(frames, copied);
+            Ok(())
+        };
+        restart()?;
+        let (checkpointed, prefix) = observe()?;
+        let previous = std::fs::read(&wal)?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(65536))", [])?;
+        let restarted = std::fs::read(&wal)?;
+        assert!(restarted.len() >= previous.len());
+        assert_ne!(previous[16..24], restarted[16..24]);
+        assert!(
+            checkpointed
+                .copy_live_wal(root.path(), &db, limits, &prefix)?
+                .is_none()
+        );
+
+        restart()?;
+        let physical_len = std::fs::metadata(&wal)?.len();
+        let insert = "INSERT INTO blobs (data) VALUES (zeroblob(128))";
+        writer.execute(insert, [])?;
+        let (small, prefix) = observe()?;
+        assert!(prefix.len < physical_len);
+        let count = "SELECT COUNT(*) FROM blobs";
+        let at_capture: i64 = writer.query_row(count, [], |row| row.get(0))?;
+        for _ in 0..3 {
+            writer.execute(insert, [])?;
+        }
+        assert_eq!(std::fs::metadata(&wal)?.len(), physical_len);
+        assert_eq!(
+            writer.query_row(count, [], |row| row.get::<_, i64>(0))?,
+            at_capture + 3
+        );
+        let copy = small
+            .copy_live_wal(root.path(), &db, limits, &prefix)?
+            .expect("valid commits within the preallocated WAL");
+        assert_eq!(
+            copy.connection
+                .query_row(count, [], |row| row.get::<_, i64>(0))?,
+            at_capture
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_registry_recovers_when_the_last_writer_closes_its_wal() -> anyhow::Result<()> {
+        let (root, database, writer) = wal_store();
+        let db = database.canonicalize()?;
+        writer.execute_batch(
+            "CREATE TABLE threads(title TEXT); INSERT INTO threads VALUES ('updated title')",
+        )?;
+        let stamp = super::SnapshotStamp::read(root.path(), &db, u64::MAX, true)?;
+        let wal = super::sidecar(&db, "-wal");
+        let len = stamp.wal.as_ref().unwrap().len;
+        let prefix = super::WalPrefix::capture(&wal, len)?.unwrap();
+        drop(writer);
+        assert!(!wal.exists());
+        assert!(super::WalPrefix::capture(&wal, len)?.is_none());
+        let limits = SnapshotLimits::from_environment()?;
+        assert!(
+            stamp
+                .copy_live_wal(root.path(), &db, limits, &prefix)?
+                .is_none()
+        );
+        let title: String =
+            super::SqliteSnapshotCache::default().read_stamped(root.path(), &db, |conn| {
+                Ok(conn.query_row("SELECT title FROM threads", [], |row| row.get(0))?)
+            })?;
+        assert_eq!(title, "updated title");
         Ok(())
     }
 

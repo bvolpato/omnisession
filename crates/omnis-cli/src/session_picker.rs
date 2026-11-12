@@ -568,7 +568,7 @@ impl PickerState {
         let key = self.preview_key(entry);
         let dialog = DeleteDialog {
             session: entry.session.session.clone(),
-            title: display_title(&entry.session, self.previews.get(&key)),
+            title: display_title(entry, self.previews.get(&key)),
             workspace: entry.session.project_path.clone(),
             branch: entry.session.git_branch.clone(),
             phase: DeletePhase::Confirm,
@@ -753,6 +753,7 @@ impl PickerState {
                 receipt.session,
                 omnis_store::IndexedTitle {
                     title: receipt.title,
+                    document_version: receipt.document_version,
                     source_revision: preview_revision(receipt.source_revision),
                     verified_at: receipt.verified_at,
                     cached_at: receipt.cached_at,
@@ -817,6 +818,7 @@ impl PickerState {
             return;
         }
         let record = omnis_store::IndexedTitle {
+            document_version: omnis_core::search_document_version(key.session.provider),
             title,
             verified_at,
             cached_at: key.updated_at,
@@ -1472,6 +1474,7 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             session
         })
         .collect::<Vec<_>>();
+    omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -4230,6 +4233,7 @@ mod tests {
         let receipt = |revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
             session: SessionRef::new(Provider::Codex, uuid),
             title: title.map(str::to_owned),
+            document_version: omnis_core::search_document_version(Provider::Codex),
             source_revision: revision,
             cached_at: None,
             verified_at: None,
@@ -4289,6 +4293,7 @@ mod tests {
                 SessionRef::new(Provider::Codex, "untitled"),
                 omnis_store::IndexedTitle {
                     title: Some("Rate limiter retry".to_owned()),
+                    document_version: omnis_core::search_document_version(Provider::Codex),
                     ..Default::default()
                 },
             ),
@@ -4301,12 +4306,9 @@ mod tests {
             ),
         ]);
 
-        let untitled = &state.entries[0].session;
+        let untitled = &state.entries[0];
         assert_eq!(display_title(untitled, None), "Rate limiter retry");
-        assert_eq!(
-            display_title(&state.entries[1].session, None),
-            "Provider title"
-        );
+        assert_eq!(display_title(&state.entries[1], None), "Provider title");
         state.query = "ratelimiter".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
@@ -4387,7 +4389,7 @@ mod tests {
             },
         )]);
 
-        let rendered = display_title(&state.entries[0].session, state.previews.get(&new_key));
+        let rendered = display_title(&state.entries[0], state.previews.get(&new_key));
         assert_eq!(rendered, "Restored title");
         assert!(!state.previews.contains(&old_key));
         assert_eq!(
@@ -4441,7 +4443,7 @@ mod tests {
             };
             state.remember_preview_title(&key, &value);
             assert_eq!(
-                display_title(&state.entries[0].session, Some(&value)),
+                display_title(&state.entries[0], Some(&value)),
                 title.unwrap_or("Untitled session")
             );
             state.query = "Current request".into();
@@ -5383,6 +5385,48 @@ mod tests {
 
         assert!(line.contains("Fix pagination without changing the API"));
         assert!(!line.contains("session-id"));
+    }
+
+    #[test]
+    fn codex_name_leads_the_picker_after_a_rename_with_a_cached_preview() {
+        let root = Path::new("/workspace");
+        let mut listed = session(Provider::Codex, "example", root, Some("Former name"));
+        listed.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![listed.clone()], root, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let first = "<external_codex_apps_open_page>{}</external_codex_apps_open_page>";
+        state.accept_preview(
+            key.clone(),
+            PreviewValue::Ready {
+                preview: Box::new(synthetic_preview(first)),
+                continuation: Some(HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Continue the synthetic task".into(),
+                }),
+                complete: true,
+            },
+            None,
+        );
+        let name = "🛰️ Orbit";
+        listed.title = Some(name.to_owned());
+        state.replace_provider(Provider::Codex, vec![listed], root, false);
+        let lines = selected_detail_lines(&state, 120, 40);
+        assert_eq!(lines[1].text, name);
+        assert!(lines.iter().any(|line| line.text.contains(first)));
+        let row = render::session_row(
+            &state.entries[0],
+            true,
+            "",
+            &ListColumns::for_width(100, false),
+            state.previews.get(&key),
+            false,
+            &[],
+        );
+        assert!(row.text.contains(name));
     }
 
     #[test]

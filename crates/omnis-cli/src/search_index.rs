@@ -23,7 +23,7 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession, RollbackTitle};
 use omnis_core::{
-    SearchDocument, search_document_version, session_search_title, trajectory_search_document,
+    SearchDocument, indexed_search_title, search_document_version, trajectory_search_document,
     workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
@@ -150,7 +150,7 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
-            source_revision: session.source_revision.unwrap_or_default(),
+            source_revision: crate::selected_search_source(session, false).unwrap_or_default(),
             document_version: search_document_version(provider),
             metadata: matches!(provider, Provider::Codex | Provider::Grok)
                 .then(|| crate::indexed_session_metadata(session)),
@@ -1559,7 +1559,7 @@ fn reread_after_conflict(
 ) -> anyhow::Result<PreparedIndex> {
     let registry = selections.registry;
     let session = &candidate.session;
-    let guard = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let guard = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         store.observe_verified_session(session)?
     } else {
         observe_source(store, session)?
@@ -1635,15 +1635,17 @@ pub(crate) struct IndexedTitle {
 
 impl IndexedTitle {
     pub(crate) fn from_read(
+        provider: Provider,
         snapshot: &CanonicalSnapshot,
         full_read: bool,
         document: &SearchDocument,
         rollback_title: &RollbackTitle,
     ) -> Self {
-        let provider_named = snapshot
+        let has_native_name = snapshot
             .title
             .as_deref()
             .is_some_and(|title| !title.trim().is_empty());
+        let provider_named = provider != Provider::Codex && has_native_name;
         if !provider_named {
             match rollback_title {
                 RollbackTitle::Known(current) => {
@@ -1673,7 +1675,7 @@ impl IndexedTitle {
                     && event.payload["native_history_unverified"].as_bool() == Some(true)
             });
         Self {
-            current: session_search_title(snapshot),
+            current: indexed_search_title(provider, snapshot),
             verified: provider_named || (full_read && document.source_complete),
             local_opener: LocalOpenerEvidence::Unknown,
             uncertain_rollback: RollbackTitle::Unknown,
@@ -1703,29 +1705,41 @@ impl IndexedTitle {
         let Some(file) = revision.file else {
             return Ok(());
         };
-        let selected_path = |require_unnamed: bool| -> Result<PathBuf> {
+        let selected_session = || -> Result<NativeSession> {
             registry
                 .find_native_session(Provider::Codex, &session.id)?
                 .filter(|selected| {
-                    (!require_unnamed || selected.title.is_none())
-                        && selected
-                            .source_revision
-                            .is_some_and(|selected| selected.matches_file_contents(revision))
+                    selected
+                        .source_revision
+                        .is_some_and(|selected| selected.matches_file_contents(revision))
                 })
-                .and_then(|selected| selected.source_path)
+                .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
+        };
+        let selected_path = || -> Result<PathBuf> {
+            selected_session()?
+                .source_path
                 .ok_or_else(|| omnis_store::StoreError::TrajectorySourceChanged.into())
         };
         if (uncertain || self.local_opener == LocalOpenerEvidence::Current)
             && let Some(prior) = store.legacy_codex_opener_candidate(session, file)?
+            && let NativeSession {
+                title: None,
+                source_path: Some(path),
+                ..
+            } = selected_session()?
             && omnis_adapters::CodexAdapter::verify_legacy_local_opener(
-                &selected_path(true)?,
+                &path,
                 session,
                 revision,
                 &prior.title,
                 prior.requires_tool_catalog,
             )?
         {
-            selected_path(true)?;
+            let checked = selected_session()?;
+            anyhow::ensure!(
+                checked.title.is_none() && checked.source_path.as_ref() == Some(&path),
+                omnis_store::StoreError::TrajectorySourceChanged
+            );
             self.withdrawn = Some(prior.title);
             self.local_opener = if uncertain {
                 LocalOpenerEvidence::RecheckedWithdrawn
@@ -1744,13 +1758,13 @@ impl IndexedTitle {
             if self.uncertain_rollback.withdraws(&prior)
                 || (self.uncertain_rollback.needs_withdrawal_check(&prior)
                     && omnis_adapters::CodexAdapter::verify_earlier_opener_withdrawal(
-                        &selected_path(false)?,
+                        &selected_path()?,
                         session,
                         revision,
                         &prior,
                     )?)
             {
-                selected_path(false)?;
+                selected_path()?;
                 self.withdrawn = Some(prior);
                 self.local_opener = LocalOpenerEvidence::Withdrawn;
             }
@@ -1761,12 +1775,12 @@ impl IndexedTitle {
             return Ok(());
         }
         if omnis_adapters::CodexAdapter::rollout_withdrew_search_title(
-            &selected_path(false)?,
+            &selected_path()?,
             session,
             revision,
             &prior,
         )? {
-            selected_path(false)?;
+            selected_path()?;
             if matches_projection {
                 self.current = None;
             }
@@ -1878,11 +1892,13 @@ fn read_candidate(
             Some(updated_at),
         )
     } else if matches!(candidate.session.provider, Provider::Codex | Provider::Grok) {
-        let read = registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            full_read_bytes,
-        )?;
+        let read = registry
+            .adapter(candidate.session.provider)?
+            .index_search_document(
+                &candidate.session,
+                candidate.source_path.as_deref(),
+                full_read_bytes,
+            )?;
         anyhow::ensure!(
             candidate.source_revision.file.is_none()
                 || read
@@ -1963,7 +1979,13 @@ fn prepare_session(
             .as_ref()
             .and_then(|native| native.source_path.clone());
     }
-    let mut title = IndexedTitle::from_read(&snapshot, source_complete, &document, &rollback_title);
+    let mut title = IndexedTitle::from_read(
+        candidate.session.provider,
+        &snapshot,
+        source_complete,
+        &document,
+        &rollback_title,
+    );
     let title_authoritative =
         omnis_core::session_search_title_is_authoritative(&snapshot, source_complete);
     if candidate.session.provider != Provider::Codex {
@@ -2141,7 +2163,7 @@ mod tests {
             contents: Some(uuid::Uuid::from_u128(2)),
             ..SourceRevision::default()
         };
-        let budget = |stored, selected, updated_at| {
+        let budget = |stored, selected, updated_at, document_version| {
             projection_read_budget(
                 Provider::Codex,
                 TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
@@ -2152,14 +2174,21 @@ mod tests {
                     provider_limited: false,
                     source_revision: stored,
                     source_complete: true,
-                    document_version: 4,
+                    document_version,
                 })),
                 Some(updated_at),
                 selected,
                 FULL_READ_SOURCE_BYTES,
             )
         };
-        assert_eq!(budget(revision, revision, time), u64::MAX);
+        let current_version = search_document_version(Provider::Codex);
+        for previous_version in [4, current_version - 1] {
+            assert_eq!(budget(revision, revision, time, previous_version), u64::MAX);
+        }
+        assert_eq!(
+            budget(revision, revision, time, current_version),
+            FULL_READ_SOURCE_BYTES
+        );
         for other in [
             SourceRevision::default(),
             SourceRevision {
@@ -2179,11 +2208,11 @@ mod tests {
                 ..revision
             },
         ] {
-            assert_eq!(budget(other, revision, time), FULL_READ_SOURCE_BYTES);
-            assert_eq!(budget(revision, other, time), FULL_READ_SOURCE_BYTES);
+            assert_eq!(budget(other, revision, time, 4), FULL_READ_SOURCE_BYTES);
+            assert_eq!(budget(revision, other, time, 4), FULL_READ_SOURCE_BYTES);
         }
         assert_eq!(
-            budget(revision, revision, time - chrono::Duration::seconds(1)),
+            budget(revision, revision, time - chrono::Duration::seconds(1), 4),
             FULL_READ_SOURCE_BYTES
         );
     }
@@ -2314,7 +2343,7 @@ mod tests {
             provider_limited: false,
             title_authoritative: Some(false),
             source_time_precise: true,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(!needs_index(

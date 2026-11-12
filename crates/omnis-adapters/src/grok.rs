@@ -585,6 +585,7 @@ struct PendingMessage {
     kind: EventKind,
     text: String,
     content: Vec<Value>,
+    alternate_content: Vec<(usize, Vec<Value>)>,
     content_unreadable: bool,
     cumulative_text: Option<(usize, String)>,
     has_source_text: bool,
@@ -763,6 +764,31 @@ struct NativeMessageGroup {
     has_fallback: bool,
 }
 
+fn redundant_damaged_text(body: &Value, canonical: &Value) -> bool {
+    let Some(mut remaining) = block_text(canonical).filter(|text| !text.is_empty()) else {
+        return false;
+    };
+    for block in message_blocks(body) {
+        if let MessageBlock::Text(text) = classify_message_block(block) {
+            let Some(rest) = remaining.strip_prefix(text) else {
+                return false;
+            };
+            remaining = rest;
+        }
+    }
+    remaining.is_empty()
+}
+
+fn empty_text_descriptor(block: &Value) -> bool {
+    block["type"] == "text"
+        && block["text"].is_null()
+        && block.as_object().is_some_and(|fields| {
+            fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "text"))
+        })
+}
+
 impl NativeMessageGroup {
     fn needs_fallback(&self) -> bool {
         (self.has_fallback && !self.has_chunk)
@@ -804,9 +830,15 @@ impl NativeMessageGroup {
             }
             for body in message_bodies(update).filter(|body| !std::ptr::eq(*body, canonical)) {
                 let mut occurrences = HashMap::<_, usize>::new();
+                let matching_text = std::cell::OnceCell::new();
                 for block in message_blocks(body) {
                     if block.is_null()
                         || matches!(classify_message_block(block), MessageBlock::Text(_))
+                    {
+                        continue;
+                    }
+                    if empty_text_descriptor(block)
+                        && *matching_text.get_or_init(|| redundant_damaged_text(body, canonical))
                     {
                         continue;
                     }
@@ -1034,7 +1066,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v10");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v11");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1301,6 +1333,7 @@ impl GrokUpdateProcessor {
         if content_unreadable {
             self.malformed_updates = self.malformed_updates.saturating_add(1);
         }
+        let (content, mut alternate) = split_message_evidence(update, content);
         match &mut self.pending {
             Some(pending) if pending.kind == kind && pending.message_id == message_id => {
                 if gap {
@@ -1312,6 +1345,11 @@ impl GrokUpdateProcessor {
                 pending.has_source_text |= has_source_text;
                 pending.text.push_str(&text);
                 pending.content.extend(content);
+                pending.alternate_content.extend(
+                    alternate
+                        .drain(..)
+                        .map(|view| (pending.content.len(), view)),
+                );
                 pending.content_unreadable |= content_unreadable;
             }
             _ => {
@@ -1319,6 +1357,10 @@ impl GrokUpdateProcessor {
                 self.pending = Some(PendingMessage {
                     kind,
                     text,
+                    alternate_content: alternate
+                        .into_iter()
+                        .map(|view| (content.len(), view))
+                        .collect(),
                     content,
                     content_unreadable,
                     cumulative_text: cumulative_text.map(|text| (0, text)),
@@ -1394,7 +1436,7 @@ fn nonmessage_kind(update_type: &str, status: Option<&str>) -> Option<EventKind>
     }
 }
 
-fn message_bodies(update: &Value) -> impl Iterator<Item = &Value> {
+fn message_bodies(update: &Value) -> impl Iterator<Item = &Value> + Clone {
     [
         update.get("content"),
         update.get("text"),
@@ -1562,16 +1604,24 @@ fn message_content(
                 historical_content.push(block.clone());
             }
         }
-        let mut seen: HashSet<_> = message_blocks(content)
+        let mut seen = HashMap::new();
+        for block in message_blocks(content)
             .iter()
             .filter(|block| historical_block(block))
-            .collect();
+        {
+            *seen.entry(block).or_insert(0usize) += 1;
+        }
         for alternate in message_bodies(update).filter(|value| !std::ptr::eq(*value, content)) {
+            let mut occurrences = HashMap::new();
             for block in message_blocks(alternate)
                 .iter()
                 .filter(|block| historical_block(block))
             {
-                if seen.insert(block) {
+                let count = occurrences.entry(block).or_insert(0usize);
+                *count += 1;
+                let retained = seen.entry(block).or_default();
+                if *count > *retained {
+                    *retained = *count;
                     content_unreadable |= partial_attachment_block(block);
                     if preservation.retain(block) {
                         historical_content.push(block.clone());
@@ -1685,6 +1735,91 @@ fn push_grok_state(builder: &mut EventBuilder, directory: &Path) {
     }
 }
 
+fn split_message_evidence(update: &Value, content: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
+    if content.is_empty() {
+        return (content, Vec::new());
+    }
+    let mut bodies = message_bodies(update);
+    let Some(primary) = bodies.next() else {
+        return (content, Vec::new());
+    };
+    if bodies.clone().next().is_none() {
+        return (content, Vec::new());
+    }
+    let mut retained = HashMap::new();
+    for block in &content {
+        *retained.entry(block).or_insert(0usize) += 1;
+    }
+    let collect = |body: &Value| {
+        let mut occurrences = HashMap::new();
+        message_blocks(body)
+            .iter()
+            .filter(|block| {
+                let Some(limit) = retained.get(*block) else {
+                    return false;
+                };
+                let count = occurrences.entry(*block).or_insert(0usize);
+                *count += 1;
+                *count <= *limit
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    (
+        collect(primary),
+        bodies
+            .map(collect)
+            .filter(|view| !view.is_empty())
+            .collect(),
+    )
+}
+
+fn reconcile_message_evidence(chunks: Vec<Value>, views: &[(usize, Vec<Value>)]) -> Vec<Value> {
+    if views.is_empty() {
+        return chunks;
+    }
+    let mut positions = HashMap::<&Value, Vec<usize>>::new();
+    for (index, block) in chunks.iter().enumerate() {
+        positions.entry(block).or_default().push(index);
+    }
+    let mut extras = HashSet::new();
+    let mut insertions = Vec::new();
+    for (offset, view) in views {
+        let mut occurrences = HashMap::new();
+        let mut pending = Vec::new();
+        let mut after_last_match = 0;
+        for block in view {
+            let index = occurrences.entry(block).or_insert(0usize);
+            if let Some(position) = positions.get(block).and_then(|items| items.get(*index)) {
+                insertions.extend(pending.drain(..).map(|extra| (*position, extra)));
+                after_last_match = *position + 1;
+            } else if extras.insert((block, *index)) {
+                pending.push(block);
+            }
+            *index += 1;
+        }
+        insertions.extend(
+            pending
+                .into_iter()
+                .map(|extra| ((*offset).max(after_last_match), extra)),
+        );
+    }
+    insertions.sort_by_key(|(offset, _)| *offset);
+    let mut insertions = insertions.into_iter().peekable();
+    let mut result = Vec::with_capacity(chunks.len() + insertions.len());
+    for (index, block) in chunks.into_iter().enumerate() {
+        while insertions
+            .peek()
+            .is_some_and(|(offset, _)| *offset == index)
+        {
+            result.push(insertions.next().unwrap().1.clone());
+        }
+        result.push(block);
+    }
+    result.extend(insertions.map(|(_, block)| block.clone()));
+    result
+}
+
 fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage>) {
     let Some(pending) = pending.take() else {
         return;
@@ -1702,13 +1837,17 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
             payload["message_id"] = Value::String(id);
         }
     }
-    let nontext_blocks = pending
-        .content
+    let content = reconcile_message_evidence(pending.content, &pending.alternate_content);
+    let opaque = content
+        .iter()
+        .filter(|block| matches!(classify_message_block(block), MessageBlock::Opaque))
+        .count();
+    let nontext_blocks = content
         .iter()
         .filter(|block| attachment_block(block))
         .count();
-    if !pending.content.is_empty() {
-        payload["content"] = Value::Array(pending.content);
+    if !content.is_empty() {
+        payload["content"] = Value::Array(content);
     }
     let replay_policy = if pending.kind == EventKind::ReasoningSummary {
         ReplayPolicy::HistoricalOnly
@@ -1723,6 +1862,16 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
         pending.raw_type,
         None,
     );
+    if opaque > 0 {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({"unsupported_text_records":opaque,"raw_records_preserved":true}),
+            pending.timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.unsupported_history".to_owned()),
+            None,
+        );
+    }
     if nontext_blocks > 0 {
         builder.push(
                 EventKind::ProviderEvent,
@@ -2312,6 +2461,23 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_evidence_matches_ordered_chunk_occurrences() {
+        let a = json!({"type":"resource_link","uri":"fixture:a","name":"a"});
+        let b = json!({"type":"resource_link","uri":"fixture:b","name":"b"});
+        let c = json!({"type":"resource_link","uri":"fixture:c","name":"c"});
+        let view = vec![a.clone(), b.clone(), b.clone(), c.clone()];
+        for offset in [0, 2] {
+            assert_eq!(
+                reconcile_message_evidence(
+                    vec![a.clone(), c.clone()],
+                    &[(offset, view.clone()), (offset, view.clone())]
+                ),
+                view
+            );
+        }
+    }
+
+    #[test]
     fn alternate_bodies_keep_distinct_historical_blocks() {
         let mime = json!({"type":"image","mimeType":"image/png","text":""});
         let data = json!({"type":"image","data":"YWJj"});
@@ -2412,6 +2578,26 @@ mod tests {
             assert_eq!(
                 omnis_core::import_conversation(&snapshot).truncated,
                 partial
+            );
+        }
+    }
+
+    #[test]
+    fn native_fork_accepts_only_redundant_empty_text_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("updates.jsonl");
+        for (alias, descriptor, direct) in [
+            ("answer", json!({"type":"text"}), true),
+            ("answer", json!({"type":"text","text":null}), true),
+            ("different", json!({"type":"text"}), false),
+            ("answer", json!({"type":"text","note":"evidence"}), false),
+            ("answer", json!({"type":"future","value":7}), false),
+        ] {
+            let record = json!({"params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"},"message":{"content":[{"type":"text","text":alias},descriptor]}}}});
+            fs::write(&log, record.to_string()).unwrap();
+            assert_eq!(
+                native_update_headers(&log, SESSION_ID, 1).unwrap() == NativeResumeSupport::Direct,
+                direct
             );
         }
     }

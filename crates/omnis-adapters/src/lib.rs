@@ -535,6 +535,20 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
+    /// Reads the conversation for its search document. Discovery supplies separately stored session names.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, full_read_bytes)
+    }
+
     /// Describes a fresh interactive provider launch.
     ///
     /// # Errors
