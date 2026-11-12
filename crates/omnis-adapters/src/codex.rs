@@ -1893,42 +1893,48 @@ impl CodexSession {
         let mut history = CodexHistory::preview();
         builder.track_saved_opener(prior_title);
         let mut row = 0;
-        let complete = rollout_file::visit_all_records(&self.path, |record| {
-            row += 1;
-            if history.records_seen == 0 {
-                anyhow::ensure!(
-                    record["type"] == "session_meta"
-                        && string_at(&record, &[&["payload", "id"], &["payload", "session_id"]])
-                            == Some(self.id.as_str()),
-                    "selected Codex rollout has a different session header"
-                );
-            } else if record["type"] == "session_meta" {
-                return Ok(false);
-            }
-            match lineage.leaf_record_visibility(&record, row) {
-                Some(true) => {}
-                Some(false) => return Ok(true),
-                None => return Ok(false),
-            }
-            // An unknown record or an unreconstructed compaction can change the visible opener.
-            if !matches!(
-                record["type"].as_str(),
-                Some("session_meta" | "turn_context" | "response_item" | "event_msg")
-            ) && !is_dynamic_tool_catalog(&record)
-            {
-                return Ok(false);
-            }
-            let record = lineage.project_leaf_request(record);
-            history.push(&mut builder, &record)?;
-            drop(builder.drain_events());
-            if history
-                .records_seen
-                .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
-            {
-                history.compact(&mut builder);
-            }
-            Ok(true)
-        })?;
+        let complete = rollout_file::visit_all_projected_records(
+            &self.path,
+            &self.id,
+            |record, confirmed| {
+                row += 1;
+                if history.records_seen == 0 {
+                    anyhow::ensure!(
+                        record["type"] == "session_meta"
+                            && string_at(
+                                &record,
+                                &[&["payload", "id"], &["payload", "session_id"]]
+                            ) == Some(self.id.as_str()),
+                        "selected Codex rollout has a different session header"
+                    );
+                } else if record["type"] == "session_meta" {
+                    return Ok(false);
+                }
+                match lineage.leaf_record_visibility(&record, row) {
+                    Some(true) => {}
+                    Some(false) => return Ok(true),
+                    None => return Ok(false),
+                }
+                // An unknown record or an unreconstructed compaction can change the visible opener.
+                if !matches!(
+                    record["type"].as_str(),
+                    Some("session_meta" | "turn_context" | "response_item" | "event_msg")
+                ) && !is_dynamic_tool_catalog(&record)
+                {
+                    return Ok(false);
+                }
+                let record = lineage.project_leaf_request(record);
+                history.push_recovered(&mut builder, &record, false, 0, confirmed)?;
+                drop(builder.drain_events());
+                if history
+                    .records_seen
+                    .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
+                {
+                    history.compact(&mut builder);
+                }
+                Ok(true)
+            },
+        )?;
         Ok(complete && builder.witnessed_saved_opener_withdrawal(prior_title))
     }
 
@@ -1983,28 +1989,17 @@ impl CodexSession {
                            inherited: usize,
                            recovering: bool|
          -> Result<()> {
-            let InheritedRecord::Native(record) = record else {
-                if let InheritedRecord::SegmentEnd(end) = record {
-                    history.end_segment(end, recovering);
-                    return Ok(());
-                }
-                history.native_start = None;
-                if matches!(record, InheritedRecord::WithheldWorkspace) {
-                    withheld_workspaces += 1;
-                    history.observe_workspace_gaps(inherited + withheld_workspaces);
-                    return Ok(());
-                }
-                if let InheritedRecord::WithheldRequest { client_submission } = record
-                    && history.separate_request(client_submission)
-                {
-                    let checkpoint = history
-                        .pending_turn
-                        .take()
-                        .unwrap_or_else(|| history.checkpoint(&builder));
-                    history.turns.push(checkpoint);
-                }
-                // An intervening reply separates two requests even when its text is withheld.
-                MirrorGroup::barrier(&mut history.last_visible);
+            let confirmed = matches!(record, InheritedRecord::ConfirmedRequest(_));
+            let (InheritedRecord::Native(record) | InheritedRecord::ConfirmedRequest(record)) =
+                record
+            else {
+                history.observe_inherited_marker(
+                    &record,
+                    &builder,
+                    inherited,
+                    recovering,
+                    &mut withheld_workspaces,
+                );
                 return Ok(());
             };
             if workspace_record == Some(history.records_seen + 1) {
@@ -2031,6 +2026,7 @@ impl CodexSession {
                 &record,
                 recovering,
                 skipped_before.total() + inherited,
+                confirmed,
             )?;
             if history
                 .records_seen
@@ -2044,9 +2040,15 @@ impl CodexSession {
         let inherited = lineage.visit(|record, skipped, recovering| {
             observe(record, JsonLineSkips::default(), skipped, recovering)
         })?;
-        let mut unreadable = lineage.visit_leaf(&self.id, read, |record, skipped| {
-            observe(InheritedRecord::Native(record), skipped, inherited, false)
-        })?;
+        let mut unreadable =
+            lineage.visit_confirmed_leaf(&self.id, read, |record, skipped, confirmed| {
+                observe(
+                    InheritedRecord::request(record, confirmed),
+                    skipped,
+                    inherited,
+                    false,
+                )
+            })?;
         history
             .observe_workspace_gaps(unreadable.workspace_gaps() + inherited + withheld_workspaces);
         unreadable.possible_settings += inherited;
@@ -2337,6 +2339,7 @@ impl CodexSession {
                 }
                 rollout_file::Sample::Edges {
                     records,
+                    run_starts,
                     omitted,
                     unreadable,
                     prefix_records,
@@ -2345,6 +2348,7 @@ impl CodexSession {
                     let events = self.events_from_preview(
                         JsonLinesPreview {
                             records,
+                            run_starts,
                             omissions: unreadable,
                             sampled: omitted > 0,
                             prefix_records,
@@ -2498,7 +2502,6 @@ impl CodexSession {
         line_limit: u64,
     ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
-        let mut last_visible = None;
         let unread_ancestor = preview.records.iter().any(|record| {
             record["type"] == "session_meta"
                 && HistoryBase::from_header(&self.path, record).is_some()
@@ -2514,26 +2517,26 @@ impl CodexSession {
             builder.track_rollback_opener(false);
             builder.note_rollback_history_gap();
         }
+        let total = preview.records.len();
         let mut records = preview.records.into_iter();
-        let mut push_edge =
-            |builder: &mut EventBuilder, edge: &mut dyn Iterator<Item = Value>, contiguous| {
-                let mut receipts = RequestReceipts::new(&self.id, contiguous);
-                let mut push = |record, ()| {
-                    push_record(builder, &record, &mut last_visible);
-                    Ok(())
-                };
-                for record in edge {
-                    receipts.observe(record, (), &mut push)?;
-                }
-                receipts.flush(push)
+        let mut start = 0;
+        let mut prefix_end = builder.checkpoint();
+        for end in preview.run_starts.into_iter().chain(std::iter::once(total)) {
+            let mut last_visible = None;
+            let mut receipts = RequestReceipts::new(&self.id, true);
+            let mut push = |record, (), confirmed| {
+                push_record(&mut builder, &record, &mut last_visible, confirmed);
+                Ok(())
             };
-        push_edge(
-            &mut builder,
-            &mut records.by_ref().take(preview.prefix_records),
-            true,
-        )?;
-        let prefix_end = builder.checkpoint();
-        push_edge(&mut builder, &mut records, preview.omissions.total() == 0)?;
+            for record in records.by_ref().take(end - start) {
+                receipts.observe_confirmed(record, (), &mut push)?;
+            }
+            receipts.flush(|record, mark| push(record, mark, false))?;
+            if end <= preview.prefix_records {
+                prefix_end = builder.checkpoint();
+            }
+            start = end;
+        }
         if unread_ancestor {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
@@ -2704,10 +2707,6 @@ impl CodexHistory {
         true
     }
 
-    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
-        self.push_recovered(builder, record, false, 0)
-    }
-
     fn rollback(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
         let count = record["payload"]["num_turns"]
             .as_u64()
@@ -2741,6 +2740,37 @@ impl CodexHistory {
             self.seen_client_submission = None;
         }
         Ok(truncated)
+    }
+
+    fn observe_inherited_marker(
+        &mut self,
+        record: &InheritedRecord,
+        builder: &EventBuilder,
+        inherited: usize,
+        recovering: bool,
+        withheld_workspaces: &mut usize,
+    ) {
+        if let InheritedRecord::SegmentEnd(end) = record {
+            self.end_segment(*end, recovering);
+            return;
+        }
+        self.native_start = None;
+        if matches!(record, InheritedRecord::WithheldWorkspace) {
+            *withheld_workspaces += 1;
+            self.observe_workspace_gaps(inherited + *withheld_workspaces);
+            return;
+        }
+        if let InheritedRecord::WithheldRequest { client_submission } = record
+            && self.separate_request(*client_submission)
+        {
+            let checkpoint = self
+                .pending_turn
+                .take()
+                .unwrap_or_else(|| self.checkpoint(builder));
+            self.turns.push(checkpoint);
+        }
+        // An intervening reply separates two requests even when its text is withheld.
+        MirrorGroup::barrier(&mut self.last_visible);
     }
 
     fn end_segment(&mut self, end: u64, recovering: bool) {
@@ -2841,6 +2871,7 @@ impl CodexHistory {
         record: &Value,
         recovering: bool,
         skipped: usize,
+        confirmed: bool,
     ) -> Result<Option<u64>> {
         self.records_seen += 1;
         let record_type = record.get("type").and_then(Value::as_str);
@@ -2875,7 +2906,7 @@ impl CodexHistory {
         }
         let checkpoint = self.checkpoint(builder);
         let client_submission = client_submission(record);
-        if push_record(builder, record, &mut self.last_visible) {
+        if push_record(builder, record, &mut self.last_visible, confirmed) {
             if let Some(start) = self
                 .last_visible
                 .as_mut()
@@ -2988,6 +3019,32 @@ fn push_record(
     builder: &mut EventBuilder,
     record: &Value,
     last_visible: &mut Option<MirrorGroup>,
+    confirmed: bool,
+) -> bool {
+    if confirmed {
+        MirrorGroup::finish_provisional_batch(last_visible);
+    }
+    let position = builder.checkpoint();
+    let user = project_record(builder, record, last_visible);
+    if confirmed {
+        MirrorGroup::finish_provisional_batch(last_visible);
+        if let Some(group) = last_visible
+            && user
+            && position < builder.checkpoint()
+        {
+            group.confirmed_positions.insert(position);
+            if group.confirmed_positions.len() > MAX_CANONICAL_EVENTS {
+                group.confirmed_positions.pop_first();
+            }
+        }
+    }
+    user
+}
+
+fn project_record(
+    builder: &mut EventBuilder,
+    record: &Value,
+    last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     let kind = record.get("type").and_then(Value::as_str);
@@ -3090,6 +3147,7 @@ struct MirrorGroup {
     next: usize,
     order: BTreeMap<usize, bool>,
     provisional_requests: VecDeque<u64>,
+    confirmed_positions: BTreeSet<u64>,
     saved_batch: bool,
     batch_checkpoint: Option<u64>,
     last_text: Option<(MediaDigest, Option<MediaDigest>)>,
@@ -3114,6 +3172,7 @@ impl MirrorGroup {
             order: BTreeMap::new(),
             kind: EventKind::ProviderEvent,
             provisional_requests: VecDeque::new(),
+            confirmed_positions: BTreeSet::new(),
             saved_batch: false,
             batch_checkpoint: None,
             last_text: None,
@@ -3131,6 +3190,13 @@ impl MirrorGroup {
         }
     }
 
+    fn finish_provisional_batch(slot: &mut Option<Self>) {
+        if let Some(group) = slot {
+            group.provisional_requests.clear();
+            group.saved_batch = false;
+        }
+    }
+
     fn publish_implicit_request(
         &mut self,
         builder: &mut EventBuilder,
@@ -3142,15 +3208,19 @@ impl MirrorGroup {
         }
         if !saved {
             if !paired {
-                if self.saved_batch {
-                    self.provisional_requests.clear();
-                    self.saved_batch = false;
-                }
                 if self.provisional_requests.len() == MAX_CANONICAL_EVENTS {
                     self.provisional_requests.pop_front();
                 }
                 self.provisional_requests.push_back(builder.checkpoint());
             }
+            return false;
+        }
+        if paired
+            && self
+                .paired_position
+                .and_then(|pos| u64::try_from(pos).ok())
+                .is_some_and(|pos| self.confirmed_positions.remove(&pos))
+        {
             return false;
         }
         if paired && self.provisional_requests.len() > 1 {
@@ -3160,8 +3230,10 @@ impl MirrorGroup {
             }
             self.saved_batch = true;
         }
+        let publish = self.saved_batch;
+        self.saved_batch |= paired;
         self.provisional_requests.clear();
-        self.saved_batch
+        publish
     }
 
     fn observe(
@@ -3173,6 +3245,7 @@ impl MirrorGroup {
         if group.kind != message.kind
             || (!group.scoped
                 && group.provisional_requests.is_empty()
+                && group.confirmed_positions.is_empty()
                 && !group.saved_batch
                 && !group
                     .last_text
@@ -3182,6 +3255,7 @@ impl MirrorGroup {
             group.order.clear();
             group.image_pairs = ImagePairs::default();
             group.provisional_requests.clear();
+            group.confirmed_positions.clear();
             group.saved_batch = false;
         }
         group.batch_checkpoint = None;
@@ -3775,16 +3849,7 @@ fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageMedia>> {
                     }
                 }
                 "input_image" => {
-                    let wrapper = index
-                        .checked_sub(1)
-                        .and_then(|i| parts.get(i))
-                        .filter(|p| p["type"] == "input_text")
-                        .and_then(|p| p["text"].as_str())
-                        .filter(|t| is_image_wrapper(t, false, true));
-                    let path = wrapper
-                        .and_then(|s| s.strip_suffix("\">"))
-                        .and_then(|s| s.rsplit_once(" path=\""))
-                        .map(|(_, path)| media_digest(path));
+                    let path = local_image_path(parts, index).map(media_digest);
                     let file = part["file_id"].as_str().map(media_digest);
                     let url = part["image_url"].as_str().map(media_digest);
                     if file.is_some() == url.is_some() {
@@ -3849,6 +3914,10 @@ fn push_message_text(
         usize::try_from(builder.checkpoint()).ok(),
     );
     let paired = matches!(observation, MirrorObservation::Paired(_));
+    if !saved && !paired && request && last_visible.as_ref().is_some_and(|group| group.saved_batch)
+    {
+        return false;
+    }
     let publish_saved = request
         && !text.is_empty()
         && last_visible
@@ -3894,6 +3963,19 @@ fn is_contextual_user_text(text: &str) -> bool {
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
+}
+
+fn local_image_path(parts: &[Value], index: usize) -> Option<&str> {
+    let opener = parts.get(index.checked_sub(1)?)?;
+    if opener["type"] != "input_text" {
+        return None;
+    }
+    let text = opener["text"].as_str()?;
+    if !is_image_wrapper(text, false, true) {
+        return None;
+    }
+    let (_, path) = text.strip_suffix("\">")?.rsplit_once(" path=\"")?;
+    (!path.is_empty()).then_some(path)
 }
 
 fn local_audio_path(parts: &[Value], index: usize) -> Option<&str> {
@@ -3952,14 +4034,15 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
         }
     }
 
-    fn observe(
+    fn observe_confirmed(
         &mut self,
         record: Value,
         mark: M,
-        mut visit: impl FnMut(Value, M) -> Result<()>,
+        mut visit: impl FnMut(Value, M, bool) -> Result<()>,
     ) -> Result<()> {
         let payload = &record["payload"];
         if let Some((mut request, before)) = self.pending.take() {
+            let mut confirmed = false;
             if before == mark
                 && (self.contiguous || request["ordinal"].is_u64())
                 && record["type"] == "event_msg"
@@ -3977,8 +4060,9 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
                 && let Some(parts) = history_base::receipt_literal_parts(&request, &record)
             {
                 history_base::project_literal_parts(&mut request, &parts);
+                confirmed = true;
             }
-            visit(request, before)?;
+            visit(request, before, confirmed)?;
         }
         if record["type"] == "event_msg" {
             match payload["type"].as_str() {
@@ -3994,21 +4078,11 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
         if record["type"] == "response_item"
             && payload["role"] == "user"
             && payload["id"].is_string()
-            && payload["content"].as_array().is_some_and(|parts| {
-                parts.iter().any(|p| {
-                    p["type"] == "input_text"
-                        && p["text"].as_str().is_some_and(|text| {
-                            text.starts_with("<audio")
-                                || text.starts_with("<image")
-                                || matches!(text, "</audio>" | "</image>")
-                        })
-                })
-            })
         {
             self.pending = Some((record, mark));
             Ok(())
         } else {
-            visit(record, mark)
+            visit(record, mark, false)
         }
     }
 

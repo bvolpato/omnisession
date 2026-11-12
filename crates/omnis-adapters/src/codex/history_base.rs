@@ -138,11 +138,19 @@ struct LiteralTags {
 }
 
 impl VisibleStart {
+    fn confirmed_request(&self, record: &Value) -> Option<&LiteralTags> {
+        self.attached
+            .as_ref()?
+            .literal_tags
+            .as_ref()
+            .filter(|proof| {
+                record["ordinal"].as_u64() == Some(proof.ordinal)
+                    && super::media_digest(&record.to_string()) == proof.request_digest
+            })
+    }
+
     fn project_request(&self, mut record: Value) -> Value {
-        if let Some(literal) = self.attached.as_ref().and_then(|a| a.literal_tags.as_ref())
-            && record["ordinal"].as_u64() == Some(literal.ordinal)
-            && super::media_digest(&record.to_string()) == literal.request_digest
-        {
+        if let Some(literal) = self.confirmed_request(&record) {
             project_literal_parts(&mut record, &literal.indices);
         }
         record
@@ -591,7 +599,7 @@ impl AttachmentPreamble {
                     .flatten()
                 });
                 let recovered = verified.is_some();
-                if let Some(literal_tags) = verified.filter(|tags| !tags.is_empty())
+                if let Some(literal_tags) = verified
                     && let Some((ordinal, request)) = previous_ordinal.zip(request)
                 {
                     self.start.literal_tags = Some(LiteralTags {
@@ -691,6 +699,25 @@ pub(super) fn receipt_literal_parts(request: &Value, completed: &Value) -> Optio
             {
                 literal_tags.push(index);
             }
+            continue;
+        }
+        if let Some(path) = super::local_image_path(raw, index + 1)
+            && let Some(image) = raw.get(index + 1)
+            && image["type"] == "input_image"
+            && media_reference(image, "image_url").is_some()
+            && raw
+                .get(index + 2)
+                .is_some_and(|end| end["type"] == "input_text" && end["text"] == "</image>")
+            && saved
+                .next_if(|candidate| {
+                    candidate["type"] == "local_image"
+                        && candidate["path"].as_str() == Some(path)
+                        && image_detail(image)
+                            .is_some_and(|detail| image_detail(candidate) == Some(detail))
+                })
+                .is_some()
+        {
+            parts.nth(1);
             continue;
         }
         if let Some(path) = super::local_audio_path(raw, index + 1)
@@ -1071,10 +1098,20 @@ impl Lineage {
         read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
         mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
     ) -> Result<JsonLineSkips> {
-        let read = |visit: &mut dyn FnMut(Value, JsonLineSkips) -> Result<()>| {
+        self.visit_confirmed_leaf(session, read, |row, mark, _| visit(row, mark))
+    }
+
+    pub(super) fn visit_confirmed_leaf(
+        &self,
+        session: &str,
+        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
+        mut visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+    ) -> Result<JsonLineSkips> {
+        let read = |visit: &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>| {
             let mut receipts = super::RequestReceipts::new(session, true);
-            let skipped = read(&mut |record, mark| receipts.observe(record, mark, &mut *visit))?;
-            receipts.flush(visit)?;
+            let skipped =
+                read(&mut |record, mark| receipts.observe_confirmed(record, mark, &mut *visit))?;
+            receipts.flush(|row, mark| visit(row, mark, false))?;
             Ok(skipped)
         };
         if self.visible_leaf_start.ordinal().is_none() {
@@ -1082,12 +1119,13 @@ impl Lineage {
         }
         let mut unplaced = JsonLineSkips::default();
         let mut row = 0;
-        let skipped = read(&mut |record, skipped| {
+        let skipped = read(&mut |record, skipped, confirmed| {
             row += 1;
             match self.leaf_record_visibility(&record, row) {
                 Some(true) => visit(
                     self.visible_leaf_start.project_request(record),
                     skipped.combined(unplaced),
+                    confirmed,
                 )?,
                 Some(false) => {}
                 None => unplaced.observe_unplaced(unplaced_workspace_gap(&record, session)),
@@ -1248,9 +1286,20 @@ fn access_denied(error: &anyhow::Error) -> bool {
 pub(super) enum InheritedRecord {
     SegmentEnd(u64),
     Native(Value),
+    ConfirmedRequest(Value),
     WithheldRequest { client_submission: bool },
     WithheldReply,
     WithheldWorkspace,
+}
+
+impl InheritedRecord {
+    pub(super) fn request(record: Value, confirmed: bool) -> Self {
+        if confirmed {
+            Self::ConfirmedRequest(record)
+        } else {
+            Self::Native(record)
+        }
+    }
 }
 
 enum PrefixRead {
@@ -1279,11 +1328,12 @@ fn read_prefix(
     let owner = rollout_identity::thread_id(&segment.path).unwrap_or_default();
     let mut receipts = super::RequestReceipts::new(owner, false);
     let mut projection = read_prefix_from(segment, &mut source, &mut |record, skipped| {
-        let mut native = |row, mark| visit(InheritedRecord::Native(row), mark);
         if let InheritedRecord::Native(row) = record {
-            receipts.observe(row, skipped, native)
+            receipts.observe_confirmed(row, skipped, |row, mark, confirmed| {
+                visit(InheritedRecord::request(row, confirmed), mark)
+            })
         } else {
-            receipts.flush(&mut native)?;
+            receipts.flush(|row, mark| visit(InheritedRecord::Native(row), mark))?;
             visit(record, skipped)
         }
     })?;
@@ -1944,7 +1994,13 @@ fn read_prefix_from(
                 };
                 if cursor.observe(segment, visible_start, &record, row)? {
                     visit(
-                        InheritedRecord::Native(visible_start.project_request(record)),
+                        if let Some(proof) = visible_start.confirmed_request(&record) {
+                            let mut record = record;
+                            project_literal_parts(&mut record, &proof.indices);
+                            InheritedRecord::ConfirmedRequest(record)
+                        } else {
+                            InheritedRecord::Native(record)
+                        },
                         skipped,
                     )?;
                 } else if !visible_start.hides_parsed_row(row, &record)

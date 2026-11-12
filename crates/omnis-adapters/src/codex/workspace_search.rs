@@ -231,10 +231,10 @@ impl WorkspaceProbe<'_> {
             .map(CodexSession::visible_leaf)
             .transpose()?
             .unwrap_or_default();
-        let skipped = lineage.visit_leaf(
+        let skipped = lineage.visit_confirmed_leaf(
             &session.session.id,
             |visit| rollout_file::read_records(bytes, visit),
-            |record, skipped| {
+            |record, skipped, confirmed| {
                 history.settings.observe_gaps(skipped);
                 history.observe_workspace_gaps(skipped.workspace_gaps());
                 if history.records_seen == 0 {
@@ -250,7 +250,7 @@ impl WorkspaceProbe<'_> {
                     }
                 }
                 history.settings.observe(&session.session.id, &record);
-                history.push_recovered(&mut builder, &record, false, skipped.total())?;
+                history.push_recovered(&mut builder, &record, false, skipped.total(), confirmed)?;
                 if history
                     .records_seen
                     .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)

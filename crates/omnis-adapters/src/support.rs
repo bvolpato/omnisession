@@ -1339,6 +1339,7 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
 
 #[derive(Default)]
 pub(crate) struct JsonLinesPreview {
+    pub(crate) run_starts: Vec<usize>,
     pub(crate) records: Vec<Value>,
     pub(crate) omissions: JsonLineSkips,
     pub(crate) sampled: bool,
@@ -1365,7 +1366,7 @@ pub(crate) fn json_lines_preview_with_omissions(
     } else {
         sample_records
     };
-    let prefix_end = read_json_lines_prefix(
+    let prefix = read_json_lines_prefix(
         &file,
         limit,
         prefix_bytes,
@@ -1374,13 +1375,13 @@ pub(crate) fn json_lines_preview_with_omissions(
         &match_malformed,
     )?;
     if small {
-        preview.sampled = prefix_end < metadata.len();
+        preview.sampled = prefix.0 < metadata.len();
         return Ok(preview);
     }
     let tail = read_json_lines_tail(
         &file,
         sample_records,
-        prefix_end,
+        prefix,
         line_bytes,
         &mut preview,
         &match_malformed,
@@ -1396,7 +1397,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
     read_json_lines_tail(
         &File::open(path)?,
         limit,
-        0,
+        (0, false),
         MAX_TRANSCRIPT_LINE_SIZE,
         &mut JsonLinesPreview::default(),
         &|_, _| WorkspaceGap::Other,
@@ -1406,7 +1407,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
 fn read_json_lines_tail(
     mut file: &File,
     limit: usize,
-    prefix_end: u64,
+    (prefix_end, trailing_gap): (u64, bool),
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
@@ -1436,6 +1437,8 @@ fn read_json_lines_tail(
     }
     let mut records = VecDeque::with_capacity(limit);
     let mut verified_tail_records = 0;
+    let mut tail_truncated = start > prefix_end || trailing_gap;
+    let mut last_skips = preview.omissions.total();
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1458,18 +1461,31 @@ fn read_json_lines_tail(
             }
             if records.len() == limit {
                 records.pop_front();
+                tail_truncated = true;
                 preview.sampled = true;
             }
             if !preview.sampled && preview.omissions.total() == 0 {
                 verified_tail_records += 1;
             }
-            records.push_back((line_offset, record));
+            let skipped = preview.omissions.total();
+            records.push_back((line_offset, record, skipped != last_skips));
+            last_skips = skipped;
         }
     }
     if !preview.sampled {
         preview.prefix_records += verified_tail_records;
     }
-    Ok(records.into_iter().collect())
+    let base = preview.records.len();
+    Ok(records
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, record, gap))| {
+            if gap || (index == 0 && tail_truncated) {
+                preview.run_starts.push(base + index);
+            }
+            (offset, record)
+        })
+        .collect())
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
@@ -1494,7 +1510,7 @@ fn read_json_lines_prefix(
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1502,6 +1518,7 @@ fn read_json_lines_prefix(
     let mut reader = BufReader::new(file.take(byte_limit));
     let mut line = Vec::new();
     let mut consumed = 0_u64;
+    let mut last_skips = 0;
     for _ in 0..limit {
         let Some((line_kind, read)) = read_bounded_line(&mut reader, line_bytes, &mut line)? else {
             break;
@@ -1521,12 +1538,17 @@ fn read_json_lines_prefix(
                     if preview.omissions.total() == 0 {
                         preview.prefix_records += 1;
                     }
+                    let skipped = preview.omissions.total();
+                    if skipped != last_skips {
+                        preview.run_starts.push(preview.records.len());
+                    }
+                    last_skips = skipped;
                     preview.records.push(record);
                 }
             }
         }
     }
-    Ok(consumed)
+    Ok((consumed, last_skips != preview.omissions.total()))
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {

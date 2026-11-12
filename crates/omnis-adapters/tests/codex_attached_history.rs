@@ -1025,8 +1025,13 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
             "wrong text" => receipt["item"]["content"][0]["text"] = json!("different content"),
             _ => {}
         }
-        rows.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":8,"payload":{"type":"task_started","turn_id":"further-child-turn"}}));
-        rows.push(message(9, "later child request"));
+        if diff.starts_with("matching") {
+            rows.push(message(8, "later child request"));
+            rows.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":9,"payload":{"type":"user_message","message":"later child request"}}));
+        } else {
+            rows.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":8,"payload":{"type":"task_started","turn_id":"further-child-turn"}}));
+            rows.push(message(9, "later child request"));
+        }
         write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
         let detached = [
             header(REVERT, 10, Some(bookmark(CHILD, &rows)), false),

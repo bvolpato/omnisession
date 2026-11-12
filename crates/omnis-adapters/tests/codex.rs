@@ -1060,6 +1060,53 @@ fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_mid
 }
 
 #[test]
+fn bounded_samples_keep_mirror_matches_within_contiguous_records() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID}});
+    let mut rows = vec![message("user", "head A"), message("user", "head B")];
+    let padding = event("token_count", json!({"padding":"x".repeat(64 * 1024)}));
+    rows.extend(std::iter::repeat_n(padding.clone(), 144));
+    rows.extend([
+        event("user_message", json!({"message":"head A","client_id":"A"})),
+        event("user_message", json!({"message":"head B","client_id":"B"})),
+    ]);
+    rows.extend(std::iter::repeat_n(padding, 144));
+    rows.extend([
+        event("user_message", json!({"message":"head B","client_id":"C"})),
+        message("user", "tail C"),
+        event("user_message", json!({"message":"tail C"})),
+    ]);
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let body = std::iter::once(header)
+        .chain(rows)
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for extension in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let path = folder.join(format!("rollout-{SESSION_ID}.{extension}"));
+        if extension == "jsonl" {
+            fs::write(&path, &body)?;
+        } else {
+            fs::write(
+                &path,
+                encode_rollout(body.as_bytes(), path.extension().unwrap().to_str().unwrap()),
+            )?;
+        }
+        let adapter = CodexAdapter::with_root(home.path());
+        let read = adapter.index_session(&session, Some(&path), 16 * 1024 * 1024)?;
+        assert_eq!(
+            visible_text(&read.snapshot),
+            ["head A", "head B", "head B", "tail C"],
+            "{extension}"
+        );
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn codex_preview_certifies_absence_only_after_reading_through_eof() {
     const MIB: usize = 1024 * 1024;
     let metadata = event("token_count", json!({"padding": "x".repeat(MIB)})).to_string();
@@ -2692,13 +2739,21 @@ fn native_receipt_disambiguates_literal_tags_from_local_media() -> anyhow::Resul
             json!({"type":"input_text","text":close}),
         ]);
         let text = format!("Question\n{tag}\n{close}");
+        raw["payload"]["content"].as_array_mut().unwrap().extend([
+            json!({"type":"input_text","text":r#"<image name=[Image #2] path="fixture.png">"#}),
+            json!({"type":"input_image","image_url":"fixture-url","detail":"high"}),
+            json!({"type":"input_text","text":"</image>"}),
+        ]);
         let receipt = event(
             "item_completed",
             json!({"thread_id":SESSION_ID,"turn_id":"task","item":{"id":"request","type":"UserMessage",
-            "content":[{"type":"text","text":"Question"},{"type":"text","text":tag},{"type":kind,&wire:&url},{"type":"text","text":close}]}}),
+            "content":[{"type":"text","text":"Question"},{"type":"text","text":tag},{"type":kind,&wire:&url},{"type":"text","text":close},{"type":"local_image","path":"fixture.png"}]}}),
         );
         let media = if kind == "audio" { "audio" } else { "images" };
-        let saved = event("user_message", json!({"message":text,media:[url]}));
+        let saved = event(
+            "user_message",
+            json!({"message":text,media:[url],"local_images":["fixture.png"]}),
+        );
         for foreign in [false, true] {
             let mut completion = receipt.clone();
             if foreign {
@@ -2770,6 +2825,107 @@ fn implicit_rollback_counts_the_saved_submissions_in_wire_order() -> anyhow::Res
             let (full, sampled) = rollback_title_reads(&header, &data, "")?;
             for read in [full, sampled] {
                 assert_eq!(visible_text(&read.snapshot), expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn missing_ancestor_title_withdrawal_uses_the_literal_request_receipt() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(format!("rollout-{SESSION_ID}.jsonl"));
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let header = json!({"type":"session_meta","ordinal":3,"payload":{"id":SESSION_ID,"history_mode":"paginated","history_base":{"thread_id":"11111111-1111-4111-8111-111111111111","end_ordinal_exclusive":3,"end_byte_offset":400}}});
+    let tag = "<audio name=[Audio #1] path=\"Orchid\">";
+    let mut raw = message("user", "Question");
+    raw["payload"]["id"] = json!("item");
+    raw["payload"]["content"].as_array_mut().unwrap().extend([
+        json!({"type":"input_text","text":tag}),
+        json!({"type":"input_audio","audio_url":"audio-test"}),
+        json!({"type":"input_text","text":"</audio>"}),
+    ]);
+    for owner in [SESSION_ID, "11111111-1111-4111-8111-111111111111"] {
+        let mut rows = [
+            header.clone(),
+            event("task_started", json!({"turn_id":"T"})),
+            raw.clone(),
+            event(
+                "item_completed",
+                json!({"thread_id":owner,"turn_id":"T","item":{"id":"item","type":"UserMessage","content":[{"type":"text","text":"Question"},{"type":"text","text":tag},{"type":"audio","audio_url":"audio-test"},{"type":"text","text":"</audio>"}]}}),
+            ),
+            event("task_complete", json!({"turn_id":"T"})),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ];
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["ordinal"] = json!(index + 3);
+        }
+        fs::write(
+            &path,
+            rows.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+        let revision = CodexAdapter::index_file_revision(&path).unwrap();
+        assert_eq!(
+            CodexAdapter::rollout_withdrew_search_title(
+                &path,
+                &source,
+                revision,
+                &format!("Question {tag} </audio>")
+            )?,
+            owner == SESSION_ID
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn implicit_saved_submissions_may_interleave_with_later_raw_requests() -> anyhow::Result<()> {
+    let raw = |id: &str| {
+        let mut row = message("user", id);
+        row["payload"]["client_id"] = json!(id);
+        row
+    };
+    let saved = |id: &str| event("user_message", json!({"client_id":id,"message":id}));
+    for (rows, saved_order) in [
+        (
+            vec![
+                raw("A"),
+                raw("B"),
+                saved("B"),
+                raw("C"),
+                saved("A"),
+                saved("C"),
+            ],
+            vec!["B", "A", "C"],
+        ),
+        (
+            vec![raw("A"), raw("B"), saved("B"), raw("C"), saved("A")],
+            vec!["B", "A"],
+        ),
+        (vec![raw("A"), raw("B"), saved("B"), raw("C")], vec!["B"]),
+        (vec![raw("B"), saved("B"), raw("C")], vec!["B"]),
+    ] {
+        for ids in [true, false] {
+            for count in 0..=saved_order.len() {
+                let mut records = rows.clone();
+                if !ids {
+                    for record in &mut records {
+                        record["payload"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("client_id");
+                    }
+                }
+                records.push(event("thread_rolled_back", json!({"num_turns":count})));
+                for preview in [false, true] {
+                    assert_eq!(
+                        visible_text(&read_records_with_preview(records.clone(), preview)?),
+                        &saved_order[..saved_order.len() - count]
+                    );
+                }
             }
         }
     }

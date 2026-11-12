@@ -227,20 +227,21 @@ pub(super) fn visit(
 }
 
 /// Returns whether every nonblank record could be read and the visitor accepted it.
-pub(super) fn visit_all_records(
+pub(super) fn visit_all_projected_records(
     path: &Path,
-    mut visit: impl FnMut(Value) -> Result<bool>,
+    owner: &str,
+    mut accepts: impl FnMut(Value, bool) -> Result<bool>,
 ) -> Result<bool> {
     let mut accepted = true;
-    let (omissions, _) = visit_json_reader(
-        &mut BufReader::new(open(path)?),
-        LIMITS,
-        workspace_record_candidate,
-        |_, record, _| {
-            accepted &= visit(record)?;
-            Ok(())
-        },
-    )?;
+    let mut receipts = super::RequestReceipts::new(owner, true);
+    let mut project = |record, _, confirmed| {
+        accepted &= accepts(record, confirmed)?;
+        Ok(())
+    };
+    let omissions = visit(path, |record, skipped| {
+        receipts.observe_confirmed(record, skipped, &mut project)
+    })?;
+    receipts.flush(|record, mark| project(record, mark, false))?;
     Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
 }
 
@@ -280,6 +281,7 @@ pub(super) enum Sample {
     Complete(Vec<u8>),
     Edges {
         records: Vec<Value>,
+        run_starts: Vec<usize>,
         omitted: usize,
         unreadable: JsonLineSkips,
         prefix_records: usize,
@@ -405,7 +407,7 @@ pub(super) fn sample(
             workspace.settings.observe_gaps(skipped);
             workspace.observe(session, &record)?;
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
-                head.push(record);
+                head.push((ordinal, record));
                 if ordinal == prefix_records {
                     prefix_records += 1;
                 }
@@ -434,15 +436,21 @@ pub(super) fn sample(
             if ordinal == prefix_records {
                 prefix_records += 1;
             }
-            head.push(record);
+            head.push((ordinal, record));
         }
     }
+    let run_starts = head
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| (pair[1].0 != pair[0].0 + 1).then_some(i + 1))
+        .collect();
     Ok(Sample::Edges {
+        run_starts,
         omitted: count - head.len(),
         prefix_records,
         unreadable,
         directory: workspace.settings.directory(workspace.directory),
-        records: head,
+        records: head.into_iter().map(|(_, record)| record).collect(),
     })
 }
 
