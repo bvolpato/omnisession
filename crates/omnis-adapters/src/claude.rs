@@ -1068,24 +1068,30 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut history = self.history_index();
-        let mut seen = HashSet::new();
-        let duplicates = self
-            .session_files()
-            .iter()
-            .filter_map(|(id, _)| (!seen.insert(id)).then_some(id))
-            .collect::<HashSet<_>>();
-        let mut selected = HashMap::new();
-        for id in duplicates {
-            let path = match self.find_session(id) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    history.notes.push(error.to_string());
-                    None
-                }
-            };
-            selected.insert(id, path);
+        let mut candidates = HashMap::<&str, &PathBuf>::new();
+        let mut exact = HashSet::new();
+        for (id, path) in self.session_files() {
+            let direct = self
+                .projects_root
+                .as_deref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .is_some_and(|relative| relative.components().count() <= 2);
+            if candidates.insert(id, path).is_some() || !direct {
+                exact.insert(id.as_str());
+            }
         }
-        let mut sessions = sample_files_concurrently(self.session_files(), |session_files| {
+        let mut selected = Vec::with_capacity(candidates.len());
+        for (id, path) in candidates {
+            if exact.contains(id) {
+                match self.find_session(id) {
+                    Ok(path) => selected.push((id.to_owned(), path)),
+                    Err(error) => history.notes.push(error.to_string()),
+                }
+            } else {
+                selected.push((id.to_owned(), path.clone()));
+            }
+        }
+        let mut sessions = sample_files_concurrently(&selected, |session_files| {
             let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
             let mut sessions = Vec::new();
@@ -1093,12 +1099,6 @@ impl ProviderAdapter for ClaudeAdapter {
                 let Some(path) = files.as_mut().and_then(|files| files.resolve(path)) else {
                     continue;
                 };
-                if selected
-                    .get(id)
-                    .is_some_and(|chosen| chosen.as_ref() != Some(&path))
-                {
-                    continue;
-                }
                 let indexed = history.sessions.get(id);
                 let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
                 let fallback = sample

@@ -92,11 +92,18 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
     let search_index_stop = Arc::new(AtomicBool::new(false));
 
+    let registry = Arc::new(AdapterRegistry::with_local_adapters());
     spawn_index_writer(sender.clone(), index_receiver);
-    spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
-    spawn_preview_updates(sender.clone(), preview_receiver);
+    spawn_cache_updates(
+        Arc::clone(&registry),
+        sender.clone(),
+        index_sender,
+        current_project.to_path_buf(),
+    );
+    spawn_preview_updates(Arc::clone(&registry), sender.clone(), preview_receiver);
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
     spawn_search_index(
+        registry,
         sender.clone(),
         search_index_receiver,
         Arc::clone(&search_index_stop),
@@ -115,13 +122,13 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
 
 // Newer candidate lists replace the running pass; stopping the picker ends it.
 pub(super) fn spawn_search_index(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<IndexCandidate>>,
     stop: Arc<AtomicBool>,
     current_project: PathBuf,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let Ok(store) = Store::open_default() else {
             return;
         };
@@ -257,6 +264,7 @@ pub(super) fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(super) fn spawn_cache_updates(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
@@ -266,7 +274,7 @@ pub(super) fn spawn_cache_updates(
             let _ = sender.send(PickerUpdate::Cached(Err(
                 "session index is unavailable".to_owned()
             )));
-            spawn_all_provider_updates(&sender, &index_sender, &current_project);
+            spawn_all_provider_updates(&registry, &sender, &index_sender, &current_project);
             return;
         };
         let cached = match cached_picker_entries(&store, &current_project) {
@@ -336,22 +344,30 @@ pub(super) fn spawn_cache_updates(
             {
                 return;
             }
-            start_provider_update(&sender, &index_sender, &current_project, provider);
+            start_provider_update(
+                &registry,
+                &sender,
+                &index_sender,
+                &current_project,
+                provider,
+            );
         }
     });
 }
 
 pub(super) fn spawn_all_provider_updates(
+    registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
 ) {
     for provider in PROVIDERS {
-        start_provider_update(sender, index_sender, current_project, provider);
+        start_provider_update(registry, sender, index_sender, current_project, provider);
     }
 }
 
 pub(super) fn start_provider_update(
+    registry: &Arc<AdapterRegistry>,
     sender: &Sender<PickerUpdate>,
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
@@ -359,6 +375,7 @@ pub(super) fn start_provider_update(
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
         spawn_provider_update(
+            Arc::clone(registry),
             sender.clone(),
             index_sender.clone(),
             current_project.to_path_buf(),
@@ -394,13 +411,13 @@ pub(super) fn spawn_index_writer(
 }
 
 pub(super) fn spawn_provider_update(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let result = registry.list_sessions_with_notes(provider, None);
         match result {
             Ok((mut sessions, notes)) => {
@@ -545,11 +562,11 @@ fn read_picker_preview(
 }
 
 pub(super) fn spawn_preview_updates(
+    registry: Arc<AdapterRegistry>,
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewKey>>,
 ) {
     thread::spawn(move || {
-        let registry = AdapterRegistry::with_local_adapters();
         let mut store_warning_sent = false;
         let mut store = match Store::open_default() {
             Ok(store) => Some(store),

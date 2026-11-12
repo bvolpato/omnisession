@@ -1039,15 +1039,15 @@ impl ProviderAdapter for PiAdapter {
             let Ok(header) = read_header(&path, self.provider) else {
                 continue;
             };
+            if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
+                continue;
+            }
             let std::collections::hash_map::Entry::Vacant(entry) =
                 listed_paths.entry(header.id.clone())
             else {
                 continue;
             };
             entry.insert(path.clone());
-            if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
-                continue;
-            }
             let file_updated_at = fs::metadata(&path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())

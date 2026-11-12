@@ -207,26 +207,47 @@ fn store_search_document(
         document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
         derived_title: derived_title.as_deref(),
     };
-    for _ in 0..4 {
+    let mut write = |guard| {
+        index_document.source.expected = guard;
         if full_read || source.1.provider_limited {
-            store.upsert_trajectory_document(session, &index_document)?;
+            store.upsert_trajectory_document(session, &index_document)
         } else {
-            store.upsert_trajectory_preview(session, &index_document)?;
+            store.upsert_trajectory_preview(session, &index_document)
         }
-        let (Some(registry), Some(key)) = (registry, source.1.revision) else {
-            return Ok(derived_title);
-        };
+    };
+    write(source.1.expected)?;
+    if let Some(registry) = registry {
+        confirm_search_write(store, registry, session, None, source.1.revision, write)?;
+    }
+    Ok(derived_title)
+}
+
+fn confirm_search_write(
+    store: &Store,
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    path: Option<&std::path::Path>,
+    revision: Option<i64>,
+    mut retry: impl FnMut(omnis_store::TrajectoryWriteGuard) -> omnis_store::Result<()>,
+) -> Result<()> {
+    let Some(key) = revision else {
+        return Ok(());
+    };
+    for attempt in 0..=4 {
         let observed = store.trajectory_write_guard(session)?;
         if observed == omnis_store::TrajectoryWriteGuard::Existing(Some(key)) {
-            return Ok(derived_title);
+            return Ok(());
+        }
+        if attempt == 4 {
+            break;
         }
         anyhow::ensure!(
             registry
-                .search_revision(session, None)?
+                .search_revision(session, path)?
                 .is_some_and(|revision| revision.key == key),
             "selected transcript changed before publishing its search document"
         );
-        index_document.source.expected = observed;
+        retry(observed)?;
     }
     anyhow::bail!("concurrent trajectory updates prevented publishing the search document")
 }

@@ -294,7 +294,7 @@ pub(crate) fn index_candidates(
         &prepare,
         |candidate, prepared| {
             if stop() {
-                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
@@ -311,7 +311,7 @@ pub(crate) fn index_candidates(
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
                                 > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
                     {
-                        flush_batch(store, &mut batch, &mut summary, &mut titles);
+                        flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                         batch_bytes = 0;
                     }
                     batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
@@ -335,7 +335,7 @@ pub(crate) fn index_candidates(
                 || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
                 || last_report.elapsed() >= PROGRESS_INTERVAL
             {
-                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                 batch_bytes = 0;
             }
             if last_report.elapsed() >= PROGRESS_INTERVAL {
@@ -345,7 +345,7 @@ pub(crate) fn index_candidates(
             true
         },
     );
-    flush_batch(store, &mut batch, &mut summary, &mut titles);
+    flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
     report(progress(&summary, &mut titles));
     Ok(summary)
 }
@@ -475,6 +475,7 @@ fn prepare_in_order<I: Sync, T: Send>(
 }
 
 fn flush_batch(
+    registry: &AdapterRegistry,
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
@@ -492,22 +493,15 @@ fn flush_batch(
     } else {
         store.upsert_trajectory_documents(&documents)
     };
-    if stored.is_ok() {
-        summary.indexed += batch.len();
-        for prepared in batch.drain(..) {
+    for prepared in batch.drain(..) {
+        let write =
+            || store.upsert_trajectory_document(&prepared.session, &prepared.store_document());
+        let result = if stored.is_ok() { Ok(()) } else { write() };
+        if result.is_ok() && prepared.confirm_write(registry, store).is_ok() {
+            summary.indexed += 1;
             prepared.report_title(store, titles);
-        }
-    } else {
-        for prepared in batch.drain(..) {
-            if store
-                .upsert_trajectory_document(&prepared.session, &prepared.store_document())
-                .is_ok()
-            {
-                summary.indexed += 1;
-                prepared.report_title(store, titles);
-            } else {
-                summary.failed += 1;
-            }
+        } else {
+            summary.failed += 1;
         }
     }
 }
@@ -525,6 +519,7 @@ fn progress(
 }
 
 struct PreparedIndex {
+    source_path: Option<PathBuf>,
     source: omnis_store::TrajectorySource,
     session: SessionRef,
     document: SearchDocument,
@@ -535,6 +530,21 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
+    fn confirm_write(&self, registry: &AdapterRegistry, store: &Store) -> anyhow::Result<()> {
+        let mut document = self.store_document();
+        crate::confirm_search_write(
+            store,
+            registry,
+            &self.session,
+            self.source_path.as_deref(),
+            self.source.revision,
+            |guard| {
+                document.source.expected = guard;
+                store.upsert_trajectory_document(&self.session, &document)
+            },
+        )
+    }
+
     fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
         if self.session.provider == Provider::Claude {
             if let Ok(title) = store.trajectory_title(&self.session) {
@@ -605,6 +615,7 @@ fn prepare_session(
         SessionTrajectoryOrigin::Native
     };
     Ok(PreparedIndex {
+        source_path: candidate.source_path.clone(),
         source: omnis_store::TrajectorySource {
             expected: candidate.expected,
             file_bytes: observed.map(|revision| revision.bytes),
@@ -1125,6 +1136,7 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
+                source_path: None,
                 source: omnis_store::TrajectorySource::default(),
                 session: SessionRef::new(Provider::Codex, id),
                 document: SearchDocument {
@@ -1145,7 +1157,13 @@ mod tests {
         let mut summary = IndexSummary::default();
         let mut titles = Vec::new();
 
-        flush_batch(&store, &mut batch, &mut summary, &mut titles);
+        flush_batch(
+            &AdapterRegistry::new(),
+            &store,
+            &mut batch,
+            &mut summary,
+            &mut titles,
+        );
 
         assert!(batch.is_empty());
         assert_eq!((summary.indexed, summary.failed), (2, 1));
