@@ -585,7 +585,8 @@ struct PendingMessage {
     text: String,
     content: Vec<Value>,
     content_unreadable: bool,
-    cumulative_text: Option<String>,
+    cumulative_text: Option<(usize, String)>,
+    has_source_text: bool,
     timestamp: Option<DateTime<Utc>>,
     raw_type: Option<String>,
     message_id: Option<String>,
@@ -695,6 +696,14 @@ fn native_message_block(content: &Value) -> bool {
     }
 }
 
+fn native_message_content(update: &Value) -> bool {
+    let content = &update["content"];
+    native_message_block(content)
+        && !malformed_message_block(content)
+        && message_body(update)
+            .is_none_or(|body| std::ptr::eq(content, body) || cumulative_fallback(update).is_some())
+}
+
 fn native_tool_content(value: &Value) -> bool {
     value.as_array().is_some_and(|items| {
         items.iter().all(|item| {
@@ -760,8 +769,7 @@ impl NativeMessageGroup {
         }
         if self.kind.is_some() {
             self.has_fallback |= cumulative_fallback(update).is_some();
-            self.has_chunk |=
-                update["content"]["type"] != "text" || update["content"]["text"] != "";
+            self.has_chunk |= block_text(&update["content"]).is_some_and(|text| !text.is_empty());
         }
         true
     }
@@ -794,10 +802,7 @@ fn native_update_headers(
         Ok(match update["sessionUpdate"].as_str() {
             Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk") => {
                 optional_native_field(update, "messageId", Value::is_string)
-                    && native_message_block(&update["content"])
-                    && (update["content"]["text"] != ""
-                        || message_body(update).is_none()
-                        || cumulative_fallback(update).is_some())
+                    && native_message_content(update)
             }
             Some("tool_call") => {
                 update["toolCallId"].is_string()
@@ -973,7 +978,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v6");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v7");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1224,9 +1229,10 @@ impl GrokUpdateProcessor {
         )
         .map(str::to_owned);
         let omitted_before = self.preservation.omitted_events;
-        let cumulative_text = cumulative_fallback(update).map(str::to_owned);
-        let (text, content, content_unreadable) = if cumulative_text.is_some() {
-            (String::new(), Vec::new(), false)
+        let cumulative_text = cumulative_fallback(update)
+            .map(|blocks| blocks.iter().filter_map(block_text).collect::<String>());
+        let (text, content, content_unreadable, has_source_text) = if cumulative_text.is_some() {
+            (String::new(), Vec::new(), false, false)
         } else {
             message_content(update, &mut self.preservation)
         };
@@ -1242,9 +1248,10 @@ impl GrokUpdateProcessor {
                 if gap {
                     pending.text.push_str("\n[Source records omitted]\n");
                 }
-                if cumulative_text.is_some() {
-                    pending.cumulative_text = cumulative_text;
+                if let Some(text) = cumulative_text {
+                    pending.cumulative_text = Some((pending.text.len(), text));
                 }
+                pending.has_source_text |= has_source_text;
                 pending.text.push_str(&text);
                 pending.content.extend(content);
                 pending.content_unreadable |= content_unreadable;
@@ -1256,7 +1263,8 @@ impl GrokUpdateProcessor {
                     text,
                     content,
                     content_unreadable,
-                    cumulative_text,
+                    cumulative_text: cumulative_text.map(|text| (0, text)),
+                    has_source_text,
                     timestamp,
                     raw_type,
                     message_id,
@@ -1356,13 +1364,26 @@ fn block_text(block: &Value) -> Option<&str> {
 }
 
 fn attachment_block(block: &Value) -> bool {
-    matches!(
-        block["type"].as_str(),
-        Some("image" | "audio" | "resource" | "resource_link")
-    )
+    let present = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
+    match block["type"].as_str() {
+        Some("image" | "audio") => present(&block["data"]),
+        Some("resource_link") => present(&block["uri"]),
+        Some("resource") => {
+            let resource = &block["resource"];
+            present(&resource["uri"])
+                && (resource["text"].is_string() || resource["blob"].is_string())
+        }
+        _ => false,
+    }
 }
 
-fn malformed_text_block(block: &Value) -> bool {
+fn malformed_message_block(block: &Value) -> bool {
+    if matches!(
+        block["type"].as_str(),
+        Some("image" | "audio" | "resource" | "resource_link")
+    ) {
+        return !attachment_block(block);
+    }
     (block["type"] == "text" || (block["type"].is_null() && block.get("text").is_some()))
         && !block["text"].is_string()
 }
@@ -1374,17 +1395,22 @@ fn message_body(update: &Value) -> Option<&Value> {
     message_bodies(update).find(|value| message_blocks(value).iter().any(contributes))
 }
 
-fn cumulative_fallback(update: &Value) -> Option<&str> {
-    if update["content"]["type"] == "text" && update["content"]["text"] == "" {
-        return message_body(update).and_then(Value::as_str);
+fn cumulative_fallback(update: &Value) -> Option<&[Value]> {
+    if update["content"]["type"] != "text" || update["content"]["text"] != "" {
+        return None;
     }
-    None
+    let blocks = message_blocks(message_body(update)?);
+    blocks
+        .iter()
+        .all(|block| block_text(block).is_some())
+        .then_some(blocks)
 }
 
 fn message_content(
     update: &Value,
     preservation: &mut GrokPreservationBudget,
-) -> (String, Vec<Value>, bool) {
+) -> (String, Vec<Value>, bool, bool) {
+    let mut has_source_text = false;
     let mut text = String::new();
     let mut historical_content = Vec::new();
     let mut content_unreadable = false;
@@ -1413,8 +1439,9 @@ fn message_content(
     }
     let mut push = |block: &Value| {
         if let Some(chunk) = block_text(block) {
+            has_source_text |= !chunk.is_empty();
             text.push_str(chunk);
-        } else if block.is_null() || malformed_text_block(block) {
+        } else if block.is_null() || malformed_message_block(block) {
             text.push_str("\n[Source message content unreadable]\n");
             content_unreadable = true;
             if !block.is_null() && preservation.retain(block) {
@@ -1439,7 +1466,12 @@ fn message_content(
     } else {
         push(&Value::Null);
     }
-    (text, historical_content, content_unreadable)
+    (
+        text,
+        historical_content,
+        content_unreadable,
+        has_source_text,
+    )
 }
 
 fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
@@ -1540,11 +1572,12 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let Some(pending) = pending.take() else {
         return;
     };
-    let text = if pending.text.is_empty() {
-        pending.cumulative_text.unwrap_or_default()
-    } else {
-        pending.text
-    };
+    let mut text = pending.text;
+    if !pending.has_source_text
+        && let Some((offset, fallback)) = pending.cumulative_text
+    {
+        text.insert_str(offset, &fallback);
+    }
     let mut payload = json!({ "text": text });
     if pending.content_unreadable {
         payload["content_unreadable"] = Value::Bool(true);
@@ -1555,7 +1588,7 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let nontext_blocks = pending
         .content
         .iter()
-        .filter(|block| block["type"] != "text" && !malformed_text_block(block))
+        .filter(|block| block["type"] != "text" && !malformed_message_block(block))
         .count();
     if !pending.content.is_empty() {
         payload["content"] = Value::Array(pending.content);
@@ -2147,6 +2180,16 @@ mod tests {
         let empty = json!([{"type":"text","text":""}]);
         for (message, expected, partial) in [
             (
+                json!({"content":[{"type":"image"}],"text":"restored marigold"}),
+                "restored marigold",
+                false,
+            ),
+            (
+                json!({"content":[{"type":"image"}]}),
+                "\n[Source message content unreadable]\n",
+                true,
+            ),
+            (
                 json!({"content":[{"text":null}],"text":"untyped recovery"}),
                 "untyped recovery",
                 false,
@@ -2199,7 +2242,8 @@ mod tests {
                 "sessionUpdate":"agent_message_chunk","messageId":"reply","content":{"type":"text","text":text}
             }}})
         );
-        updates[1]["params"]["update"]["message"] = json!({"text":"copperfinch"});
+        updates[1]["params"]["update"]["message"] =
+            json!({"content":[{"type":"text","text":"copper"},{"type":"text","text":"finch"}]});
         write_session(
             root.path(),
             SESSION_ID,
@@ -2212,6 +2256,38 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.events[0].payload["text"], "copperfinch");
         assert!(!omnis_core::import_conversation(&snapshot).truncated);
+    }
+
+    #[test]
+    fn damage_preserves_the_only_readable_fallback_at_its_source_position() {
+        let root = tempfile::tempdir().unwrap();
+        let updates = [
+            json!({"content":{"type":"text","text":""},"message":{"text":"marigold fallback"}}),
+            json!({"content":{"type":"text","text":null}}),
+        ]
+        .map(|mut update| {
+            update["sessionUpdate"] = json!("agent_message_chunk");
+            update["messageId"] = json!("same-reply");
+            json!({"params":{"sessionId":SESSION_ID,"update":update}})
+        });
+        let adapter = GrokAdapter::with_root(root.path());
+        for (records, expected) in [
+            (
+                updates.clone(),
+                "marigold fallback\n[Source message content unreadable]\n",
+            ),
+            (
+                [updates[1].clone(), updates[0].clone()],
+                "\n[Source message content unreadable]\nmarigold fallback",
+            ),
+        ] {
+            write_session(root.path(), SESSION_ID, &json!({"id":SESSION_ID}), &records);
+            let snapshot = adapter
+                .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+                .unwrap();
+            assert_eq!(snapshot.events[0].payload["text"], expected);
+            assert!(omnis_core::import_conversation(&snapshot).truncated);
+        }
     }
 
     #[test]
