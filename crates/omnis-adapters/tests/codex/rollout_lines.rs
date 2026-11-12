@@ -1111,7 +1111,7 @@ fn identical_outputs_follow_the_published_command_and_working_directory() {
             for raw_first in [false, true] {
                 let args = |cmd: &str, dir: &str| {
                     if different_dirs {
-                        json!({"cmd":cmd,"workdir":dir})
+                        json!({"cmd":cmd,"workdir":format!("{dir}/temporary/..")})
                     } else {
                         json!({"cmd":cmd})
                     }
@@ -1229,5 +1229,109 @@ fn an_unrecognized_command_wrapper_does_not_disambiguate_identical_results() {
             }
         }
         rows.truncate(5);
+    }
+}
+
+#[test]
+fn a_lookup_correction_does_not_transfer_its_failure_to_a_pending_command() {
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "objective"),
+        physical_call("lookup", &json!({})),
+        physical_result("first receipt"),
+        completed_lookup("completed"),
+        physical_call("exec_command", &json!({"cmd":"pwd"})),
+        completed_lookup("failed"),
+        physical_result("second receipt"),
+    ];
+    for mode in ["legacy", "paginated"] {
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            let native = omnis_core::native_trajectory_items(&trajectory);
+            let results: Vec<_> = native
+                .iter()
+                .filter_map(|entry| match entry {
+                    omnis_core::NativeTrajectoryItem::Tool {
+                        output, is_error, ..
+                    } => Some((output.as_str(), *is_error)),
+                    omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                })
+                .collect();
+            assert_eq!(
+                results,
+                [("first receipt", true), ("second receipt", false)],
+                "{mode}"
+            );
+            assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+        }
+    }
+}
+
+#[test]
+fn an_overlapping_or_conflicting_command_keeps_its_unattributed_failure() {
+    for (overlap, raw_first) in [(false, false), (false, true), (true, false), (true, true)] {
+        let first = physical_call("exec_command", &json!({"cmd":"first"}));
+        let second = physical_call("exec_command", &json!({"cmd":"second"}));
+        let mut display = command_display(
+            "second",
+            "failed",
+            if overlap { "alpha" } else { "published" },
+        );
+        display["payload"]["item"]["command"] = json!(["/bin/sh", "-c", "second"]);
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "request", "objective"),
+            first,
+        ];
+        if overlap {
+            rows.extend([second, physical_result("alpha")]);
+        }
+        let raw = physical_result(if overlap { "beta" } else { "alpha" });
+        rows.extend(if raw_first {
+            [raw, display]
+        } else {
+            [display, raw]
+        });
+        for mode in ["legacy", "paginated"] {
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(
+                    !search.source_complete,
+                    "{mode} overlap={overlap} raw_first={raw_first}"
+                );
+                let plan = omnis_core::plan_semantic_handoff(&snapshot);
+                let failed: Vec<_> = plan
+                    .tool_outcomes
+                    .iter()
+                    .filter(|entry| entry.status == omnis_core::ToolOutcomeStatus::Failed)
+                    .collect();
+                assert_eq!(failed.len(), 1);
+                assert!(
+                    failed[0]
+                        .summary
+                        .contains(if overlap { "alpha" } else { "published" })
+                );
+                let completed: Vec<_> = plan
+                    .tool_outcomes
+                    .iter()
+                    .filter(|entry| entry.status == omnis_core::ToolOutcomeStatus::Completed)
+                    .collect();
+                assert_eq!(completed.len(), if overlap { 2 } else { 1 });
+                assert!(
+                    completed
+                        .iter()
+                        .any(|entry| entry.summary.contains("alpha"))
+                );
+                assert!(!overlap || completed.iter().any(|entry| entry.summary.contains("beta")));
+                let trajectory = omnis_core::import_trajectory(&snapshot);
+                let native = omnis_core::native_trajectory_items(&trajectory);
+                assert!(native.iter().all(|entry| !matches!(
+                    entry,
+                    omnis_core::NativeTrajectoryItem::Tool { is_error: true, .. }
+                )));
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Match tool calls, model results, and display results by their native identifiers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Default)]
 pub(super) struct PendingOutcomes {
@@ -97,15 +97,23 @@ pub(super) struct ScopedRecord {
 
 #[derive(Clone, Copy)]
 pub(super) enum PendingCall {
+    First(u64),
     Unique(u64),
     Overlapping(u64),
     Multiple,
 }
 
 impl PendingCall {
-    pub(super) fn sequence(self) -> Option<u64> {
+    pub(super) fn after_result(self) -> Option<u64> {
         match self {
             Self::Unique(seq) | Self::Overlapping(seq) => Some(seq),
+            Self::First(_) | Self::Multiple => None,
+        }
+    }
+
+    pub(super) fn sequence(self) -> Option<u64> {
+        match self {
+            Self::First(seq) | Self::Unique(seq) | Self::Overlapping(seq) => Some(seq),
             Self::Multiple => None,
         }
     }
@@ -154,7 +162,7 @@ impl CommandIdentity {
         Self {
             command: super::paginated_rollback::json_digest(&command),
             directory: directory.filter(|path| path.is_absolute()).map(|path| {
-                let path: std::path::PathBuf = path.components().collect();
+                let path = super::workspace_settings::normalized_directory(path);
                 super::paginated_rollback::json_digest(&path.as_os_str().as_encoded_bytes())
             }),
         }
@@ -172,6 +180,8 @@ impl CommandIdentity {
 #[derive(Default)]
 pub(super) struct NativeCalls {
     pub(super) result_calls: HashMap<u64, u64>,
+    pub(super) overlapping: HashSet<u64>,
+    pub(super) function_names: HashMap<u64, [u8; 32]>,
     pub(super) commands: HashMap<u64, CommandIdentity>,
     pub(super) source_keys: HashMap<u64, [u8; 32]>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
@@ -203,6 +213,22 @@ impl NativeCalls {
                     .insert(sequence, CommandIdentity::new(&args.cmd, cwd));
                 serde_json::Value::String(args.cmd)
             });
+        if payload["type"] == "function_call"
+            && let Some(name) = payload["name"].as_str()
+        {
+            self.function_names
+                .insert(sequence, super::paginated_rollback::json_digest(&name));
+        }
+        if let Some(queue) = self.pending.get(id) {
+            for call in queue.iter().filter(|call| {
+                call.turn
+                    .as_ref()
+                    .zip(turn.as_ref())
+                    .is_none_or(|(a, b)| a == b)
+            }) {
+                self.overlapping.extend([call.sequence, sequence]);
+            }
+        }
         self.source_keys.insert(
             sequence,
             super::paginated_rollback::json_digest(&[
@@ -238,7 +264,9 @@ impl NativeCalls {
         if matching.next().is_some() {
             return Some(PendingCall::Multiple);
         }
-        let result = result?;
+        let Some(result) = result else {
+            return Some(PendingCall::First(first));
+        };
         if first > result {
             return Some(PendingCall::Unique(first));
         }
@@ -299,6 +327,8 @@ impl NativeCalls {
     }
 
     pub(super) fn retain(&mut self, mut exists: impl FnMut(u64) -> bool) {
+        self.overlapping.retain(|seq| exists(*seq));
+        self.function_names.retain(|&seq, _| exists(seq));
         self.commands.retain(|&seq, _| exists(seq));
         self.source_keys.retain(|&seq, _| exists(seq));
         self.result_calls

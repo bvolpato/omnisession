@@ -2148,6 +2148,7 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
+    pending_output_call: Option<u64>,
     deferred_output: Option<[u8; 32]>,
     receipt: Option<tool_occurrences::Receipt>,
     ambiguous: bool,
@@ -3994,6 +3995,26 @@ impl CodexItems {
         }
     }
 
+    fn take_tool_outcome(&mut self, id: &str, display: bool) -> Option<u64> {
+        if self.tool_projection.wait_for_call {
+            return None;
+        }
+        let position = if self.tool_projection.paginated || !display {
+            self.tool_projection.peer
+        } else {
+            self.update
+        };
+        let entry = self.outcomes.take(
+            id,
+            display,
+            position,
+            self.tool_turn.as_deref(),
+            self.tool_owner,
+        )?;
+        self.tool_projection.matched_turn = entry.turn;
+        Some(entry.sequence)
+    }
+
     fn push_historical(
         &mut self,
         builder: &mut EventBuilder,
@@ -4006,6 +4027,9 @@ impl CodexItems {
         self.message = None;
         clear_projection_metadata(&mut payload);
         let display = raw_type == "event_msg.item_completed";
+        if display && self.tool_projection.ambiguous {
+            completion_positions::unattribute_display(&mut payload);
+        }
         let result_id = result_id.filter(|id| {
             !id.is_empty()
                 || self
@@ -4013,25 +4037,7 @@ impl CodexItems {
                     .as_deref()
                     .is_some_and(|turn| !is_implicit_turn(turn))
         });
-        let matched = result_id
-            .filter(|_| !self.tool_projection.wait_for_call)
-            .and_then(|id| {
-                self.outcomes.take(
-                    id,
-                    display,
-                    if self.tool_projection.paginated || !display {
-                        self.tool_projection.peer
-                    } else {
-                        self.update
-                    },
-                    self.tool_turn.as_deref(),
-                    self.tool_owner,
-                )
-            });
-        let matched = matched.map(|entry| {
-            self.tool_projection.matched_turn = entry.turn;
-            entry.sequence
-        });
+        let matched = result_id.and_then(|id| self.take_tool_outcome(id, display));
         let physical = self.tool_projection.paginated || !display;
         let mirror = physical
             .then(|| self.tool_projection.peer.take().or(matched))
@@ -4041,8 +4047,18 @@ impl CodexItems {
         } else {
             self.update.or(matched).filter(|&sequence| {
                 builder.event_at_mut(sequence).is_some_and(|event| {
-                    !completion_positions::model_output(event)
+                    if !completion_positions::model_output(event)
                         || completed_item::equivalent_model_receipt(&payload, &event.payload)
+                    {
+                        return true;
+                    }
+                    if payload["type"] == "FunctionCallOutput"
+                        && event.payload["omnisession_codex_tool_display"]["type"]
+                            == "FunctionCallOutput"
+                    {
+                        completion_positions::restore_model_output(event);
+                    }
+                    false
                 })
             })
         };

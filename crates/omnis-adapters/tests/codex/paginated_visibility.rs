@@ -1893,3 +1893,51 @@ fn legacy_output_corrections_supersede_only_the_published_text() {
         }
     }
 }
+
+#[test]
+fn a_pending_reused_call_does_not_keep_the_previous_legacy_output_display() {
+    let (turn, id) = ("turn", "reused");
+    let [first, alpha, _] = command_rows(turn, id, "alpha cue");
+    let [second, gamma, _] = command_rows(turn, id, "gamma cue");
+    let display = |body| {
+        turn_item(
+            turn,
+            &json!({"type":"FunctionCallOutput","id":id,"name":"lookup","output":body}),
+        )
+    };
+    let prefix = vec![
+        event("task_started", json!({"turn_id":turn})),
+        page_user(turn, "u", "request"),
+        first,
+        alpha,
+        display("beta cue"),
+        page_user(turn, "steer", "followup"),
+        second,
+        display("gamma cue"),
+    ];
+    for (result, rollback) in [(false, false), (true, false), (true, true)] {
+        let mut rows = prefix.clone();
+        if result {
+            rows.push(gamma.clone());
+        }
+        if rollback {
+            rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        }
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            for text in [&search.text, &handoff] {
+                assert_eq!(text.matches("alpha cue").count(), 1);
+                assert_eq!(
+                    text.matches("beta cue").count(),
+                    usize::from(rollback),
+                    "{result}, {rollback}: {text}"
+                );
+                if !rollback {
+                    assert_eq!(text.matches("gamma cue").count(), 1, "{text}");
+                }
+            }
+        }
+    }
+}

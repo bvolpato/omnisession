@@ -1424,6 +1424,8 @@ fn mcp_structured_results_match_the_serialized_model_body_and_keep_display_text(
 fn a_long_dynamic_result_compares_the_original_bytes_before_shortening_them() {
     let edge = "ü".repeat(16_384);
     let raw_text = format!("{edge}a{edge}");
+    let mut lookup = call(Some("turn"));
+    lookup["payload"]["name"] = "lookup".into();
     for middle in ["a", "z"] {
         let display = turn_item(
             "turn",
@@ -1431,7 +1433,7 @@ fn a_long_dynamic_result_compares_the_original_bytes_before_shortening_them() {
         );
         let rows = vec![
             event("task_started", json!({"turn_id":"turn"})),
-            call(Some("turn")),
+            lookup.clone(),
             model_result(&raw_text),
             display,
         ];
@@ -1508,6 +1510,8 @@ fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
     structured["result"]["structuredContent"] = json!({"code":"missing_file"});
     let dynamic = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":diagnostic},{"type":"inputImage","imageUrl":image}]});
     let cancelled = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[],"error":cancel});
+    let mut lookup = call(Some("turn"));
+    lookup["payload"]["name"] = "lookup".into();
     for (item, body, other) in [
         (
             mcp,
@@ -1535,7 +1539,7 @@ fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
                 for display_first in [false, true] {
                     let mut records = vec![
                         event("task_started", json!({"turn_id":"turn"})),
-                        call(Some("turn")),
+                        lookup.clone(),
                     ];
                     let mut raw = model_result("");
                     raw["payload"]["output"] = output.clone();
@@ -1747,6 +1751,67 @@ fn published_function_identity_survives_result_pairing_and_revision() {
                     );
                     assert_eq!(text.matches("fixed receipt").count(), 1, "{text}");
                     assert!(!text.contains("initialspace"), "{text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn corrected_function_body_releases_the_previous_display_identity() {
+    let display = |name, namespace, output| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"FunctionCallOutput","id":"cmd","name":name,"namespace":namespace,"output":output
+            }),
+        )
+    };
+    for mode in [None, Some("paginated")] {
+        for raw_first in [true, false] {
+            let mut records = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                {
+                    let mut input = message("user", "fixture objective");
+                    input["payload"]["id"] = "u".into();
+                    input["payload"]["internal_chat_message_metadata_passthrough"] =
+                        json!({"turn_id":"turn"});
+                    input
+                },
+                page_user("turn", "u", "fixture objective"),
+                call(Some("turn")),
+            ];
+            let raw = model_result("rawalpha");
+            let original = display("lookup", "initialspace", "rawalpha");
+            records.extend(if raw_first {
+                [raw, original]
+            } else {
+                [original, raw]
+            });
+            records.push(display("revisedname", "revisedspace", "displaybeta"));
+            for rolled in [false, true] {
+                if rolled {
+                    records.push(event("thread_rolled_back", json!({"num_turns":1})));
+                }
+                for preview in [false, true] {
+                    let snapshot = read_with_history_mode(records.clone(), preview, mode).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                    for (text, retains_history) in
+                        [(&search.text, mode.is_some()), (&handoff, false)]
+                    {
+                        assert!(
+                            !text.contains("initialspace"),
+                            "{mode:?} {raw_first} {rolled} {text}"
+                        );
+                        for term in ["rawalpha", "revisedspace", "revisedname", "displaybeta"] {
+                            assert_eq!(
+                                text.contains(term),
+                                !rolled || retains_history,
+                                "{mode:?} {raw_first} {rolled} {term} {text}"
+                            );
+                        }
+                    }
                 }
             }
         }

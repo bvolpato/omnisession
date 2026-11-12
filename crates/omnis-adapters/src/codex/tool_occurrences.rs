@@ -94,6 +94,14 @@ impl ToolOccurrences {
         }
     }
 
+    pub(super) fn results(&self, turn: &str, id: &str) -> impl Iterator<Item = u64> {
+        self.0
+            .get(turn)
+            .and_then(|items| items.get(id))
+            .into_iter()
+            .flat_map(|records| records.keys().copied())
+    }
+
     pub(super) fn observe(&mut self, turn: &str, id: &str, seq: u64, receipt: Option<Receipt>) {
         let record = self
             .0
