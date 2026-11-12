@@ -270,7 +270,7 @@ fn legacy_projection_source(
     }
     // Retries and picker previews can revisit a wider partial projection after its tail repair.
     (!prior.source_complete
-        && prior.document_version == SEARCH_DOCUMENT_VERSION
+        && (6..=search_document_version(Provider::Codex)).contains(&prior.document_version)
         && revision.file.is_some()
         && revision.contents.is_some()
         && revision.matches_file_contents(prior.source_revision))
