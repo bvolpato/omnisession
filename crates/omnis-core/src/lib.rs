@@ -2063,7 +2063,7 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
         let (output, has_content) = match value {
             Value::String(text) => (text.clone(), !text.is_empty()),
             // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
-            Value::Array(blocks) => {
+            Value::Array(blocks) if *path != ["rawOutput"] => {
                 let texts = blocks
                     .iter()
                     .map(|block| {
@@ -6769,6 +6769,13 @@ mod tests {
     #[test]
     fn native_tool_results_keep_readable_alternatives_to_empty_content() {
         for (content, raw_output, expected) in [
+            (
+                json!([]),
+                json!([{"text":"marigold label","unit":"tests","value":73}]),
+                r#"[{"text":"marigold label","unit":"tests","value":73}]"#,
+            ),
+            (json!([]), json!([true, 7, ["a"]]), r#"[true,7,["a"]]"#),
+            (json!([]), json!([]), "[]"),
             (json!([]), json!("marigold output"), "marigold output"),
             (
                 json!([{"content":{"text":"preferred"}}]),

@@ -978,7 +978,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v7");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v8");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1229,14 +1229,18 @@ impl GrokUpdateProcessor {
         )
         .map(str::to_owned);
         let omitted_before = self.preservation.omitted_events;
-        let cumulative_text = cumulative_fallback(update)
-            .map(|blocks| blocks.iter().filter_map(block_text).collect::<String>());
-        let (text, content, content_unreadable, has_source_text) = if cumulative_text.is_some() {
-            (String::new(), Vec::new(), false, false)
+        let (mut text, content, content_unreadable, mut has_source_text) =
+            message_content(update, &mut self.preservation);
+        let cumulative_text = if has_source_text && cumulative_fallback(update).is_some() {
+            has_source_text = false;
+            Some(std::mem::take(&mut text))
         } else {
-            message_content(update, &mut self.preservation)
+            None
         };
-        if text.is_empty() && self.preservation.omitted_events > omitted_before {
+        if text.is_empty()
+            && cumulative_text.is_none()
+            && self.preservation.omitted_events > omitted_before
+        {
             flush_message(builder, &mut self.pending);
             return;
         }
@@ -1353,39 +1357,73 @@ fn message_blocks(value: &Value) -> &[Value] {
         .map_or_else(|| std::slice::from_ref(value), Vec::as_slice)
 }
 
-fn block_text(block: &Value) -> Option<&str> {
-    block.as_str().or_else(|| {
-        if block["type"].is_null() || block["type"] == "text" {
-            block["text"].as_str()
-        } else {
-            None
+enum MessageBlock<'a> {
+    Text(&'a str),
+    Attachment,
+    Malformed(Option<&'a str>),
+    Opaque,
+}
+
+fn classify_message_block(block: &Value) -> MessageBlock<'_> {
+    if let Some(text) = block.as_str() {
+        return MessageBlock::Text(text);
+    }
+    let text = block["text"].as_str();
+    match block["type"].as_str() {
+        Some("text") => text.map_or(MessageBlock::Malformed(None), MessageBlock::Text),
+        Some("image" | "audio" | "resource_link" | "resource") => {
+            let empty_media =
+                matches!(block["type"].as_str(), Some("image" | "audio")) && block["data"] == "";
+            if native_message_block(block) && !empty_media {
+                MessageBlock::Attachment
+            } else {
+                MessageBlock::Malformed(text)
+            }
         }
-    })
+        Some(_) => MessageBlock::Opaque,
+        None if block.get("type").is_none() => {
+            text.map_or(MessageBlock::Malformed(None), MessageBlock::Text)
+        }
+        None => MessageBlock::Malformed(text),
+    }
+}
+
+fn block_text(block: &Value) -> Option<&str> {
+    match classify_message_block(block) {
+        MessageBlock::Text(text) | MessageBlock::Malformed(Some(text)) => Some(text),
+        _ => None,
+    }
 }
 
 fn attachment_block(block: &Value) -> bool {
-    let present = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
+    matches!(classify_message_block(block), MessageBlock::Attachment)
+}
+
+fn partial_attachment_block(block: &Value) -> bool {
+    if !matches!(classify_message_block(block), MessageBlock::Malformed(_)) {
+        return false;
+    }
+    let has_field = |value: &Value, keys: &[&str]| {
+        keys.iter()
+            .any(|key| value[*key].as_str().is_some_and(|text| !text.is_empty()))
+    };
     match block["type"].as_str() {
-        Some("image" | "audio") => present(&block["data"]),
-        Some("resource_link") => present(&block["uri"]),
-        Some("resource") => {
-            let resource = &block["resource"];
-            present(&resource["uri"])
-                && (resource["text"].is_string() || resource["blob"].is_string())
+        Some("image") => has_field(block, &["data", "mimeType", "uri"]),
+        Some("audio") => has_field(block, &["data", "mimeType"]),
+        Some("resource_link") => {
+            has_field(block, &["uri", "name", "title", "description", "mimeType"])
+                || block["size"].is_u64()
         }
+        Some("resource") => has_field(&block["resource"], &["uri", "text", "blob", "mimeType"]),
         _ => false,
     }
 }
 
 fn malformed_message_block(block: &Value) -> bool {
-    if matches!(
-        block["type"].as_str(),
-        Some("image" | "audio" | "resource" | "resource_link")
-    ) {
-        return !attachment_block(block);
-    }
-    (block["type"] == "text" || (block["type"].is_null() && block.get("text").is_some()))
-        && !block["text"].is_string()
+    matches!(
+        classify_message_block(block),
+        MessageBlock::Malformed(_) | MessageBlock::Opaque
+    )
 }
 
 fn message_body(update: &Value) -> Option<&Value> {
@@ -1395,15 +1433,15 @@ fn message_body(update: &Value) -> Option<&Value> {
     message_bodies(update).find(|value| message_blocks(value).iter().any(contributes))
 }
 
-fn cumulative_fallback(update: &Value) -> Option<&[Value]> {
+fn cumulative_fallback(update: &Value) -> Option<&Value> {
     if update["content"]["type"] != "text" || update["content"]["text"] != "" {
         return None;
     }
-    let blocks = message_blocks(message_body(update)?);
-    blocks
-        .iter()
-        .all(|block| block_text(block).is_some())
-        .then_some(blocks)
+    message_body(update).filter(|body| {
+        message_blocks(body)
+            .iter()
+            .any(|block| block_text(block).is_some_and(|text| !text.is_empty()))
+    })
 }
 
 fn message_content(
@@ -1431,40 +1469,59 @@ fn message_content(
                 .iter()
                 .filter(|block| !block.is_null() && block_text(block).is_none())
             {
+                if partial_attachment_block(block) {
+                    content_unreadable = true;
+                }
                 if preservation.retain(block) {
                     historical_content.push(block.clone());
                 }
             }
         }
     }
-    let mut push = |block: &Value| {
-        if let Some(chunk) = block_text(block) {
-            has_source_text |= !chunk.is_empty();
-            text.push_str(chunk);
-        } else if block.is_null() || malformed_message_block(block) {
-            text.push_str("\n[Source message content unreadable]\n");
-            content_unreadable = true;
-            if !block.is_null() && preservation.retain(block) {
-                historical_content.push(block.clone());
-            }
-        } else if preservation.retain(block) {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(match block.get("type").and_then(Value::as_str) {
-                Some("image") => "[Source image attachment preserved as historical metadata]",
-                Some("audio") => "[Source audio attachment preserved as historical metadata]",
-                _ => "[Source nontext content preserved as historical metadata]",
-            });
-            historical_content.push(block.clone());
-        }
-    };
     if let Some(content) = body {
         for block in message_blocks(content) {
-            push(block);
+            match classify_message_block(block) {
+                MessageBlock::Text(chunk) => {
+                    has_source_text |= !chunk.is_empty();
+                    text.push_str(chunk);
+                    continue;
+                }
+                MessageBlock::Malformed(Some(chunk)) if !chunk.is_empty() => {
+                    content_unreadable = true;
+                    has_source_text = true;
+                    text.push_str(chunk);
+                }
+                MessageBlock::Malformed(_) | MessageBlock::Opaque => {
+                    content_unreadable = true;
+                    text.push_str("\n[Source message content unreadable]\n");
+                }
+                MessageBlock::Attachment => {
+                    if !preservation.retain(block) {
+                        continue;
+                    }
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(match block["type"].as_str() {
+                        Some("image") => {
+                            "[Source image attachment preserved as historical metadata]"
+                        }
+                        Some("audio") => {
+                            "[Source audio attachment preserved as historical metadata]"
+                        }
+                        _ => "[Source nontext content preserved as historical metadata]",
+                    });
+                    historical_content.push(block.clone());
+                    continue;
+                }
+            }
+            if preservation.retain(block) {
+                historical_content.push(block.clone());
+            }
         }
     } else {
-        push(&Value::Null);
+        content_unreadable = true;
+        text.push_str("\n[Source message content unreadable]\n");
     }
     (
         text,
@@ -1588,7 +1645,7 @@ fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage
     let nontext_blocks = pending
         .content
         .iter()
-        .filter(|block| block["type"] != "text" && !malformed_message_block(block))
+        .filter(|block| attachment_block(block))
         .count();
     if !pending.content.is_empty() {
         payload["content"] = Value::Array(pending.content);
@@ -2174,6 +2231,31 @@ mod tests {
     }
 
     #[test]
+    fn attachment_evidence_is_distinct_from_recovered_text() {
+        let incomplete = json!({"type":"image","data":"YWJj"});
+        assert!(partial_attachment_block(&incomplete));
+        assert!(!partial_attachment_block(&json!({"type":"image"})));
+        let body = json!({"content":incomplete, "message":{"text":"recovered reply"}});
+        assert_eq!(message_body(&body), body.pointer("/message/text"));
+        assert!(matches!(
+            classify_message_block(&json!({})),
+            MessageBlock::Malformed(None)
+        ));
+        assert!(matches!(
+            classify_message_block(&json!({"type":17,"text":"readable"})),
+            MessageBlock::Malformed(Some("readable"))
+        ));
+        assert!(matches!(
+            classify_message_block(&json!({"type":"unknown","body":1})),
+            MessageBlock::Opaque
+        ));
+        let embedded =
+            json!({"content":{"type":"resource","resource":{"uri":"","text":"embedded text"}}});
+        assert!(attachment_block(&embedded["content"]));
+        assert!(native_message_content(&embedded));
+    }
+
+    #[test]
     fn empty_text_blocks_use_the_readable_message_body() {
         let root = tempfile::tempdir().unwrap();
         let update = |message: Value| json!({"sessionUpdate":"agent_message_chunk", "messageId":"reply", "message":message});
@@ -2242,8 +2324,7 @@ mod tests {
                 "sessionUpdate":"agent_message_chunk","messageId":"reply","content":{"type":"text","text":text}
             }}})
         );
-        updates[1]["params"]["update"]["message"] =
-            json!({"content":[{"type":"text","text":"copper"},{"type":"text","text":"finch"}]});
+        updates[1]["params"]["update"]["message"] = json!({"content":[{"type":"text","text":"copper"},{"type":"text","text":"finch"}, null]});
         write_session(
             root.path(),
             SESSION_ID,
@@ -2255,7 +2336,7 @@ mod tests {
             .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
             .unwrap();
         assert_eq!(snapshot.events[0].payload["text"], "copperfinch");
-        assert!(!omnis_core::import_conversation(&snapshot).truncated);
+        assert_eq!(snapshot.events[0].payload["content"], json!([null]));
     }
 
     #[test]
@@ -3142,7 +3223,7 @@ mod tests {
         };
         for record in [
             json!({"sessionUpdate": "future_record", "text": "Small opaque history"}),
-            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "image", "data": "x".repeat(8_192)}}),
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "image", "mimeType": "image/png", "data": "x".repeat(8_192)}}),
             json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "x".repeat(8_192)}}),
             json!({"sessionUpdate": "future_record", "text": "x".repeat(8_192)}),
             json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "Unchanged visible question"}}),
