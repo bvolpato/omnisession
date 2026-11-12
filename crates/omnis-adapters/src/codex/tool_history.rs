@@ -182,6 +182,28 @@ impl CommandIdentity {
         Some(Self::new(command, directory.as_deref()))
     }
 
+    fn from_call(payload: &Value) -> Option<(String, Self)> {
+        if payload["type"] != "function_call" {
+            return None;
+        }
+        let field = match payload["name"].as_str()? {
+            "exec_command" => "cmd",
+            "shell_command" => "command",
+            _ => return None,
+        };
+        let mut args: Value = serde_json::from_str(payload["arguments"].as_str()?).ok()?;
+        let Value::String(command) = args.get_mut(field)?.take() else {
+            return None;
+        };
+        let directory = match &args["workdir"] {
+            Value::Null => None,
+            Value::String(path) => Some(std::path::Path::new(path)),
+            _ => return None,
+        };
+        let identity = Self::new(&command, directory);
+        Some((command, identity))
+    }
+
     fn new(command: &str, directory: Option<&std::path::Path>) -> Self {
         Self {
             command: super::paginated_rollback::json_digest(&command),
@@ -295,21 +317,10 @@ impl NativeCalls {
         owner: Option<u64>,
         payload: &serde_json::Value,
     ) {
-        #[derive(serde::Deserialize)]
-        struct ExecCommand {
-            cmd: String,
-            workdir: Option<String>,
-        }
-        let command = (payload["name"] == "exec_command")
-            .then(|| payload["arguments"].as_str())
-            .flatten()
-            .and_then(|text| serde_json::from_str::<ExecCommand>(text).ok())
-            .map(|args| {
-                let cwd = args.workdir.as_deref().map(std::path::Path::new);
-                self.commands
-                    .insert(sequence, CommandIdentity::new(&args.cmd, cwd));
-                serde_json::Value::String(args.cmd)
-            });
+        let command = CommandIdentity::from_call(payload).map(|(command, identity)| {
+            self.commands.insert(sequence, identity);
+            Value::String(command)
+        });
         if let Some(call) = RecordedFunction::from_call(payload) {
             self.functions.insert(sequence, call);
         }

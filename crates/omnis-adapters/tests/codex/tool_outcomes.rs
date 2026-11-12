@@ -2065,3 +2065,151 @@ fn ambiguous_legacy_function_outputs_keep_both_physical_results_and_the_display(
         }
     }
 }
+
+#[test]
+fn a_function_output_correction_selects_its_named_or_namespaced_call() {
+    for namespaces in [false, true] {
+        let (first, second) = if namespaces {
+            ("lookup", "lookup")
+        } else {
+            ("firsttool", "secondtool")
+        };
+        let named = |name, ns| {
+            let mut row = call(Some("turn"));
+            row["payload"]["name"] = json!(name);
+            row["payload"]["namespace"] = json!(ns);
+            row
+        };
+        let shown = |name, ns, body| {
+            turn_item(
+                "turn",
+                &json!({"type":"FunctionCallOutput","id":"cmd","name":name,"namespace":ns,"output":body}),
+            )
+        };
+        let first_raw = "alpha cue";
+        let second_raw = if namespaces { first_raw } else { "gamma cue" };
+        let (name, ns) = if namespaces {
+            (second, "catalog2")
+        } else {
+            (first, "catalog1")
+        };
+        for raw_first in [true, false] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                named(first, "catalog1"),
+                model_result(first_raw),
+                shown(first, "catalog1", "beta cue"),
+                named(second, "catalog2"),
+            ];
+            let raw = model_result(second_raw);
+            let corrected = shown(name, ns, first_raw);
+            rows.extend(if raw_first {
+                [raw, corrected]
+            } else {
+                [corrected, raw]
+            });
+            for mode in [None, Some("paginated")] {
+                for preview in [false, true] {
+                    let snapshot = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    let context = format!("{namespaces} {raw_first} {mode:?} {preview}");
+                    assert!(search.source_complete, "{context}");
+                    let outcomes = results(&snapshot);
+                    assert_eq!(outcomes.len(), 2, "{context} {outcomes:?}");
+                    let model: Vec<_> = snapshot
+                        .events
+                        .iter()
+                        .filter(|e| {
+                            e.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .collect();
+                    assert_eq!(
+                        model[usize::from(namespaces)].payload["omnisession_codex_tool_display"]["namespace"],
+                        ns,
+                        "{context}"
+                    );
+                    for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                        assert_eq!(
+                            text.matches(first_raw).count(),
+                            1 + usize::from(namespaces),
+                            "{context} {text}"
+                        );
+                        assert!(!text.contains("beta cue"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_dynamic_calls_use_the_full_recorded_output_in_either_order() {
+    let mut lookup = call(Some("turn"));
+    lookup["payload"]["name"] = "lookup".into();
+    lookup["payload"]["namespace"] = "catalog".into();
+    let display = |body: &str, status: &str| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"DynamicToolCall","id":"cmd","tool":"lookup","namespace":"catalog","arguments":{},
+                "status":status,"success":status=="completed","content_items":[{"type":"inputText","text":body}]
+            }),
+        )
+    };
+    for prior_display in [false, true] {
+        for (second, published, matched) in [
+            ("second result", "second result", true),
+            ("second result", "unassociated failure", false),
+            ("first result", "first result", false),
+        ] {
+            let mut prefix = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                lookup.clone(),
+                model_result("first result"),
+            ];
+            if prior_display {
+                prefix.push(display("first result", "completed"));
+            }
+            prefix.push(lookup.clone());
+            let failed = display(published, "failed");
+            let raw = model_result(second);
+            for suffix in [[raw.clone(), failed.clone()], [failed.clone(), raw.clone()]] {
+                let mut rows = prefix.clone();
+                rows.extend(suffix);
+                for mode in [None, Some("paginated")] {
+                    for preview in [false, true] {
+                        let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                        let search = omnis_core::trajectory_search_document(&snap);
+                        assert_eq!(
+                            search.source_complete, matched,
+                            "{prior_display} {second} {published} {mode:?} {preview}"
+                        );
+                        let expected = if matched {
+                            EventKind::ToolFailed
+                        } else {
+                            EventKind::ToolCompleted
+                        };
+                        assert_eq!(
+                            results(&snap),
+                            [
+                                (&EventKind::ToolCompleted, "first result"),
+                                (&expected, second)
+                            ]
+                        );
+                        let handoff = omnis_core::render_semantic_handoff(&snap);
+                        assert!(handoff.contains(published));
+                        if matched {
+                            assert_eq!(handoff.matches(published).count(), 1);
+                            assert!(omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snap)).iter()
+                                .any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Tool{output,is_error:true,..} if output==second)));
+                        } else {
+                            assert!(snap.events.iter().any(|e| e.kind == EventKind::ToolFailed
+                                && e.payload["type"] == "DynamicToolCall"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

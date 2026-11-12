@@ -1429,3 +1429,69 @@ fn a_command_published_before_its_call_requires_compatible_execution_evidence() 
         }
     }
 }
+
+#[test]
+fn shell_command_receipts_match_the_executed_command_in_each_record_order() {
+    let diagnostic = "cat: absent-fixture: No such file or directory";
+    for (command, code, body) in [
+        ("cat absent-fixture", 1, diagnostic),
+        ("printf first", 0, "first output"),
+    ] {
+        let paired = code == 1;
+        let call = physical_call(
+            "shell_command",
+            &json!({"command":command,"workdir":"/workspace"}),
+        );
+        let result = physical_result(&format!(
+            "Exit code: {code}\nWall time: 0 seconds\nOutput:\n{body}"
+        ));
+        let mut display = command_display("cat absent-fixture", "failed", diagnostic);
+        display["payload"]["item"]["command"] = json!(["/bin/sh", "-c", "cat absent-fixture"]);
+        display["payload"]["item"]["exit_code"] = 1.into();
+        for order in [
+            [&call, &display, &result],
+            [&display, &call, &result],
+            [&call, &result, &display],
+        ] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                page_user("turn", "user", "request"),
+            ];
+            rows.extend(order.into_iter().cloned());
+            for mode in ["paginated", "legacy"] {
+                for preview in [false, true] {
+                    let snapshot =
+                        read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    assert_eq!(search.source_complete, paired, "{command} {mode}");
+                    for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                        assert_eq!(text.matches(diagnostic).count(), 1, "{text}");
+                        assert_eq!(
+                            text.matches("first output").count(),
+                            usize::from(!paired),
+                            "{text}"
+                        );
+                    }
+                    let raw = snapshot
+                        .events
+                        .iter()
+                        .find(|event| {
+                            event.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .unwrap();
+                    assert_eq!(raw.kind == EventKind::ToolFailed, paired);
+                    let trajectory = omnis_core::import_trajectory(&snapshot);
+                    let native = omnis_core::native_trajectory_items(&trajectory);
+                    assert_eq!(
+                        native.iter().any(|entry| matches!(
+                            entry,
+                            omnis_core::NativeTrajectoryItem::Tool { is_error: true, .. }
+                        )),
+                        paired
+                    );
+                }
+            }
+        }
+    }
+}

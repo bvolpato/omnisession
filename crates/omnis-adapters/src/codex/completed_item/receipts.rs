@@ -253,16 +253,18 @@ fn body_matches(witness: &Value, body: Option<&str>, structured: Option<&str>, m
         || structured.is_some_and(|key| exact == Some(key) || (mcp && witness["mcp_text"] == key))
 }
 
-pub(in super::super) fn model_output_matcher(source: &Value) -> impl Fn(&Value) -> bool + use<> {
-    let (body, structured) = display_keys(source);
-    let body = body.map(hex::encode);
+pub(in super::super) fn model_output_matcher(
+    source: &Value,
+) -> (Option<Key>, impl Fn(&Value) -> bool + use<>) {
+    let (body_key, structured) = display_keys(source);
+    let body = body_key.map(hex::encode);
     let structured = structured.map(hex::encode);
     let mcp = source["type"] == "McpToolCall";
     let sanitized = sanitized_mcp_key(source).map(hex::encode);
-    move |model| {
+    (body_key, move |model: &Value| {
         body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
             || body_matches(&model[WITNESS], sanitized.as_deref(), None, mcp)
-    }
+    })
 }
 
 pub(in super::super) fn pending_command_output_matches(display: &Value, output: &Value) -> bool {

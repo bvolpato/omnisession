@@ -114,7 +114,10 @@ impl CodexHistory {
         candidate: Option<PendingCall>,
         last_result: Option<u64>,
     ) -> Match {
-        let matches = super::completed_item::model_output_matcher(item);
+        if item["type"] == "FunctionCallOutput" {
+            return self.match_function_output(builder, (turn, id), item, candidate);
+        }
+        let (body, matches) = super::completed_item::model_output_matcher(item);
         let mut output_matches = |seq| {
             builder
                 .event_at_mut(seq)
@@ -154,6 +157,17 @@ impl CodexHistory {
                 known
             };
         }
+        if matches!(candidate, PendingCall::Unique(_))
+            && next_matches == Some(true)
+            && item["type"] == "DynamicToolCall"
+            && let Some(expected) = body
+            && self
+                .occurrences
+                .results(turn, id)
+                .all(|seq| input_agrees(seq) == Some(false) || !output_matches(seq))
+        {
+            return Match::AwaitOutput(expected);
+        }
         if matches!(candidate, PendingCall::Overlapping(_))
             && matches!(known, Match::DifferentCommand)
         {
@@ -183,8 +197,7 @@ impl CodexHistory {
                 }
                 if matches!(candidate, PendingCall::Unique(_))
                     && item["type"] == "CommandExecution"
-                    && let Some(expected) =
-                        super::completed_item::model_body(&item["aggregated_output"])
+                    && let Some(expected) = body
                     && !output_matches(old)
                 {
                     return Match::AwaitOutput(expected);
@@ -294,46 +307,57 @@ impl CodexHistory {
         true
     }
 
-    fn project_legacy_output(
+    fn match_function_output(
         &self,
         builder: &mut EventBuilder,
         (turn, id): (&str, &str),
         item: &Value,
-        sequence: u64,
-        projection: &mut Projection,
-    ) {
-        projection.scope = CompletionScope::LegacyOutput;
-        projection.original = Some(sequence);
-        if projection.pending.is_some() {
-            return;
-        }
-        let matches_output = super::completed_item::model_output_matcher(item);
+        candidate: Option<PendingCall>,
+    ) -> Match {
+        let (_, matches_output) = super::completed_item::model_output_matcher(item);
+        let matches_name = |event: &OmniEvent| {
+            event.payload["name"] == item["name"]
+                && event.payload["namespace"]
+                    .as_str()
+                    .zip(item["namespace"].as_str())
+                    .is_none_or(|(left, right)| left == right)
+        };
         let mut best = 0;
+        let mut selected = Match::Missing;
+        let mut count = 0;
         for result in self.occurrences.results(turn, id) {
             let Some(&call) = self.calls.result_calls.get(&result) else {
                 continue;
             };
-            let same_name = builder
+            count += 1;
+            let name = builder
                 .event_at_mut(call)
-                .is_some_and(|event| event.payload["name"] == item["name"]);
-            let same_body = builder
+                .is_some_and(|event| matches_name(event));
+            let body = builder
                 .event_at_mut(result)
                 .is_some_and(|event| matches_output(&event.payload));
-            let evidence = u8::from(same_name) + u8::from(same_body);
-            match evidence.cmp(&best) {
-                std::cmp::Ordering::Greater => {
-                    best = evidence;
-                    projection.pending = Some(call);
-                    projection.ambiguous = false;
-                }
-                std::cmp::Ordering::Equal if projection.pending != Some(call) => {
-                    projection.pending = None;
-                    projection.ambiguous = true;
-                }
-                _ => {}
+            let score = u8::from(name) + u8::from(body);
+            if score > best {
+                best = score;
+                selected = Match::One(result);
+            } else if score == best && count > 1 {
+                selected = Match::Multiple;
             }
         }
-        projection.wait_for_call |= projection.ambiguous;
+        if let Some(pending) = candidate {
+            let Some(call) = pending.sequence() else {
+                return Match::Multiple;
+            };
+            let pending_name = builder
+                .event_at_mut(call)
+                .is_some_and(|event| matches_name(event));
+            return match (best, pending_name) {
+                (2, true) => Match::Multiple,
+                (2, false) => selected,
+                _ => Match::Missing,
+            };
+        }
+        selected
     }
 
     pub(super) fn completion_position(
@@ -404,13 +428,11 @@ impl CodexHistory {
                 return projection;
             }
             if let Some(slot) = legacy_output.filter(|_| item["type"] == "FunctionCallOutput") {
-                self.project_legacy_output(
-                    builder,
-                    (turn, id),
-                    item,
-                    slot.sequence,
-                    &mut projection,
-                );
+                projection.scope = CompletionScope::LegacyOutput;
+                projection.original = Some(slot.sequence);
+                if let Some(result) = prior {
+                    projection.pending = self.calls.result_calls.get(&result).copied();
+                }
                 return projection;
             }
             projection.original = prior.or(history).filter(|_| display && !wait_for_call);
