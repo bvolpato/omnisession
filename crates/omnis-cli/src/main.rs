@@ -546,6 +546,13 @@ fn cached_search_sessions(
                 .filter(|s| args.provider.is_none_or(|p| p == s.session.provider)),
         );
     }
+    if args
+        .provider
+        .is_none_or(|provider| matches!(provider, Provider::Pi | Provider::OhMyPi))
+        && store.has_unassigned_pi_history()?
+    {
+        warnings.push("The local index retains older Pi history whose workspace could not be verified. Open the original transcript to verify its copy.".to_owned());
+    }
     let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
@@ -596,7 +603,7 @@ fn select_pi_search_copies(
     index: &mut search_index::IndexSummary,
     json_output: bool,
 ) -> Result<()> {
-    if args.all_projects && !args.cached {
+    if !args.cached {
         for copies in pi_index_batches(registry, args.provider)? {
             if !index.stopped {
                 let candidates = search_index::ordered_candidates(&copies, Some(project));
@@ -649,6 +656,20 @@ fn qualify_pi_sessions(
     Ok(())
 }
 
+fn sort_search_copies(sessions: &mut Vec<NativeSession>) {
+    sessions.sort_by_key(|session| Reverse(session.updated_at));
+    let mut seen = HashSet::new();
+    sessions.retain(|session| {
+        seen.insert((
+            session.session.clone(),
+            session
+                .project_path
+                .as_ref()
+                .map(|p| p.as_os_str().to_owned()),
+        ))
+    });
+}
+
 fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: bool) -> Result<()> {
     let query = args.query.join(" ");
     if query.trim().is_empty() {
@@ -679,9 +700,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
                 .to_owned(),
         );
     }
-    sessions.sort_by_key(|session| Reverse(session.updated_at));
-    let mut seen = HashSet::new();
-    sessions.retain(|session| seen.insert((session.session.clone(), session.project_path.clone())));
+    sort_search_copies(&mut sessions);
     let mut index = if args.cached {
         search_index::IndexSummary {
             candidates: sessions.len(),
@@ -1844,9 +1863,10 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
             rows.push((path.clone(), indexed_session_metadata(session), None));
         }
     }
-    if !rows.is_empty() {
-        let store = Store::open_default()?;
-        store.select_pi_workspaces(&rows)?;
+    if !rows.is_empty()
+        && let Ok(store) = Store::open_default()
+        && store.select_pi_workspaces(&rows).is_ok()
+    {
         qualify_pi_sessions(&store, &mut sessions, false)?;
     }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
@@ -2012,7 +2032,7 @@ fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Resul
         Err(error) => return Err(error.into()),
     };
     if !projects.is_empty() {
-        if qualified.is_none() && projects.len() == 1 && !projects[0].as_os_str().is_empty() {
+        if qualified.is_none() && projects.len() == 1 {
             return Ok(session);
         }
         let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;

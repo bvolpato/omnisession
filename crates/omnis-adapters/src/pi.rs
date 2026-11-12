@@ -107,11 +107,11 @@ impl PiAdapter {
                 && header.id == id
                 && bound
                     .as_ref()
-                    .is_none_or(|workspace| workspace == &header.cwd)
+                    .is_none_or(|workspace| workspace.as_os_str() == header.cwd.as_os_str())
             {
                 if let Some((_, workspace)) = &found {
                     anyhow::ensure!(
-                        workspace == &header.cwd,
+                        workspace.as_os_str() == header.cwd.as_os_str(),
                         "multiple Pi workspaces contain session `{id}`"
                     );
                 } else {
@@ -148,7 +148,9 @@ impl PiAdapter {
             read_header(&path, self.provider)
                 .ok()
                 .filter(|header| {
-                    header.id == id && workspace.is_none_or(|expected| expected == header.cwd)
+                    header.id == id
+                        && workspace
+                            .is_none_or(|expected| expected.as_os_str() == header.cwd.as_os_str())
                 })
                 .map(|_| path)
         };
@@ -1115,7 +1117,10 @@ impl ProviderAdapter for PiAdapter {
                 continue;
             }
             let seen = workspaces.entry(header.id.clone()).or_default();
-            if seen.contains(&header.cwd) {
+            if seen
+                .iter()
+                .any(|cwd| cwd.as_os_str() == header.cwd.as_os_str())
+            {
                 continue;
             }
             let first = seen.is_empty();

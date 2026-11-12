@@ -322,7 +322,6 @@ pub(super) fn spawn_cache_updates(
                     !cache_loaded
                         || !session_cache_is_fresh(checked_at)
                         || matches!(provider, Provider::Pi | Provider::OhMyPi)
-                            && store.has_pi_duplicates(provider).unwrap_or(false)
                 }
                 Ok(None) => true,
                 Err(error) => {
@@ -438,26 +437,7 @@ pub(super) fn spawn_provider_update(
                 if matches!(provider, Provider::Pi | Provider::OhMyPi)
                     && let Ok(adapter) = registry.adapter(provider)
                 {
-                    let mut matcher = omnis_core::SessionWorkspaceMatcher::new(&current_project);
-                    let preferred = adapter
-                        .additional_search_sessions()
-                        .into_iter()
-                        .filter(|session| {
-                            session
-                                .project_path
-                                .as_deref()
-                                .is_some_and(|path| matcher.matches(provider, path))
-                        })
-                        .map(|s| (s.session.clone(), s))
-                        .collect::<std::collections::HashMap<_, _>>();
-                    for row in &mut sessions {
-                        if let Some(copy) = preferred.get(&row.session)
-                            && let Some(path) = &copy.project_path
-                            && adapter.bind_workspace_copy(&row.session, path).is_ok()
-                        {
-                            row.clone_from(copy);
-                        }
-                    }
+                    sessions.extend(adapter.additional_search_sessions());
                 }
                 populate_approximate_updated_at(&mut sessions);
                 let indexed = sessions
@@ -555,7 +535,11 @@ fn read_picker_preview(
     let guard = store
         .and_then(|store| store.trajectory_write_guard(&key.session).ok())
         .unwrap_or_default();
-    let revision = registry.search_revision(&key.session, None)?;
+    let hint = key.copy_path.as_deref();
+    if key.copy_directory.is_some() && hint.is_none() {
+        anyhow::bail!("waiting for native copy discovery");
+    }
+    let revision = registry.search_revision(&key.session, hint)?;
     let full = |snapshot| omnis_adapters::IndexRead {
         snapshot,
         source_complete: true,
@@ -564,7 +548,7 @@ fn read_picker_preview(
     let read = if key.session.provider == Provider::Imported {
         full(read_session(registry, &key.session)?)
     } else if key.continuation_after.is_some() {
-        full(registry.read_session(&key.session)?)
+        full(registry.read_session_at(&key.session, hint)?)
     } else if store.is_some_and(|store| {
         store
             .needs_full_projection_upgrade(
@@ -577,16 +561,16 @@ fn read_picker_preview(
             )
             .unwrap_or(false)
     }) {
-        registry.index_session(&key.session, None, u64::MAX)?
+        registry.index_session(&key.session, hint, u64::MAX)?
     } else {
         omnis_adapters::IndexRead {
-            snapshot: registry.preview_session(&key.session)?,
+            snapshot: registry.preview_session_at(&key.session, hint)?,
             source_complete: false,
             provider_limited: false,
         }
     };
     anyhow::ensure!(
-        revision == registry.search_revision(&key.session, None)?,
+        revision == registry.search_revision(&key.session, hint)?,
         "selected transcript changed during indexing"
     );
     Ok(PickerPreviewRead {
@@ -692,8 +676,23 @@ pub(super) fn spawn_trajectory_search_updates(
             let result = store.as_ref().map_or_else(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
+                    let keys = store
+                        .pi_copy_keys(&request.pi_rows)
+                        .map_err(|error| error.to_string())?;
+                    let aliases = request
+                        .pi_rows
+                        .iter()
+                        .zip(keys)
+                        .filter_map(|((session, path), key)| {
+                            Some((
+                                session.clone(),
+                                key?,
+                                crate::pi_copy_selector(&session.id, path),
+                            ))
+                        })
+                        .collect::<Vec<_>>();
                     store
-                        .scope_pi_picker_rows(&request.pi_rows)
+                        .alias_pi_documents(&aliases)
                         .map_err(|error| error.to_string())?;
                     store
                         .search_session_trajectory_page_for_sessions(

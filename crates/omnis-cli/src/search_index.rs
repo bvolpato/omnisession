@@ -290,6 +290,46 @@ pub(crate) fn index_candidates(
     stop: &dyn Fn() -> bool,
     report: &mut dyn FnMut(IndexProgress),
 ) -> Result<IndexSummary> {
+    let mut counts = HashMap::<SessionRef, usize>::new();
+    let mut batches = Vec::<Vec<IndexCandidate>>::new();
+    for candidate in candidates {
+        let index = if candidate.pi_metadata.is_some() {
+            let n = counts.entry(candidate.session.clone()).or_default();
+            *n += 1;
+            *n - 1
+        } else {
+            0
+        };
+        if index == batches.len() {
+            batches.push(Vec::new());
+        }
+        batches[index].push(candidate);
+    }
+    let mut result = IndexSummary::default();
+    for batch in batches {
+        let indexed =
+            index_distinct_candidates(registry, store, batch, retry_failed, stop, report)?;
+        result.candidates += indexed.candidates;
+        result.indexed += indexed.indexed;
+        result.stale += indexed.stale;
+        result.failed += indexed.failed;
+        result.failed_skipped += indexed.failed_skipped;
+        result.stopped |= indexed.stopped;
+        if result.stopped {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn index_distinct_candidates(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+    stop: &dyn Fn() -> bool,
+    report: &mut dyn FnMut(IndexProgress),
+) -> Result<IndexSummary> {
     let Pending {
         stale,
         failures,

@@ -968,7 +968,6 @@ dependencies = [
  "directories",
  "lz4_flex",
  "memchr",
- "omnisession-core",
  "omnisession-ir",
  "rusqlite",
  "serde",

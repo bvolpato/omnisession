@@ -870,7 +870,7 @@ impl PickerState {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| entry.session.session.clone())
+                .map(|(_, entry)| picker_search_ref(&entry.session))
                 .collect(),
         })
     }
@@ -950,6 +950,12 @@ impl PickerState {
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
         PreviewKey {
             session: session.session.clone(),
+            copy_path: matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+                .then(|| session.source_path.clone())
+                .flatten(),
+            copy_directory: matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+                .then(|| session.project_path.clone())
+                .flatten(),
             revision: self.previews.revision(&session.session),
             updated_at: session.updated_at,
             continuation_after: self.lineage.continuation_after(&session.session),
@@ -1027,6 +1033,8 @@ impl PickerState {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
+    copy_path: Option<PathBuf>,
+    copy_directory: Option<PathBuf>,
     session: SessionRef,
     revision: u64,
     updated_at: Option<DateTime<Utc>>,
@@ -1294,22 +1302,26 @@ fn cached_picker_entries(
         .into_iter()
         .map(workers::native_session)
         .collect::<Vec<_>>();
-    let mut matcher = SessionWorkspaceMatcher::new(current_project);
     let copies = store
         .cached_all_pi_copies()?
         .into_iter()
-        .filter(|row| {
-            row.project_path
-                .as_deref()
-                .is_some_and(|path| matcher.matches(row.session.provider, path))
-        })
         .map(workers::native_session)
         .collect::<Vec<_>>();
     let ids = copies
         .iter()
-        .map(|row| &row.session)
+        .map(|row| {
+            (
+                &row.session,
+                row.project_path.as_deref().map(Path::as_os_str),
+            )
+        })
         .collect::<HashSet<_>>();
-    sessions.retain(|row| !ids.contains(&row.session));
+    sessions.retain(|row| {
+        !ids.contains(&(
+            &row.session,
+            row.project_path.as_deref().map(Path::as_os_str),
+        ))
+    });
     sessions.extend(copies);
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
@@ -1365,11 +1377,23 @@ fn picker_entry(
     PickerEntry::new(session, current, cached)
 }
 
+fn picker_search_ref(session: &NativeSession) -> SessionRef {
+    if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+        && let Some(path) = &session.project_path
+    {
+        return SessionRef::new(
+            session.session.provider,
+            crate::pi_copy_selector(&session.session.id, path),
+        );
+    }
+    session.session.clone()
+}
+
 impl PickerEntry {
     fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
         Self {
             provider_title: session.title.clone(),
-            key: session.session.to_string(),
+            key: picker_search_ref(&session).to_string(),
             current_workspace,
             fields: SearchFields::new(&session, None),
             session,
@@ -4426,6 +4450,8 @@ mod tests {
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
                 revision: 0,
+                copy_path: None,
+                copy_directory: None,
                 updated_at: None,
                 continuation_after: None,
             })
@@ -4439,6 +4465,8 @@ mod tests {
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
                 revision: 0,
+                copy_path: None,
+                copy_directory: None,
                 updated_at: None,
                 continuation_after: None,
             },
