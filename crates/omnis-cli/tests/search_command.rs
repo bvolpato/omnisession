@@ -1010,6 +1010,139 @@ fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
 }
 
 #[test]
+fn missing_rollout_names_follow_the_last_readable_assignment_in_their_home() {
+    let name = json!({"id":CODEX_ID,"thread_name":"Violet Quokka"}).to_string();
+    let renamed = json!({"id":CODEX_ID,"thread_name":"Copper Fennel"}).to_string();
+    for (absent_index, expected, partial, search) in [
+        (String::new(), None, false, false),
+        (String::new(), None, false, true),
+        (String::new(), None, true, false),
+        (
+            format!("{{\n{renamed}\n"),
+            Some("Copper Fennel"),
+            false,
+            false,
+        ),
+        (
+            format!("{{\n{renamed}\n"),
+            Some("Copper Fennel"),
+            false,
+            true,
+        ),
+        ("{".into(), Some("Violet Quokka"), false, false),
+    ] {
+        let fixture = Fixture::new();
+        let codex = fixture.root.join("codex");
+        let parked = fixture.root.join("parked");
+        let inner = codex.join("sessions/nested");
+        fs::rename(codex.join("sessions"), &parked).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::rename(&parked, inner.join("sessions")).unwrap();
+        let sidecar = codex.join("session_index.jsonl");
+        fs::write(&sidecar, &name).unwrap();
+        fixture.index_codex();
+        let args = ["Violet Quokka", "--provider", "codex"];
+        assert!(!result_sessions(&fixture.search_json(&args)).is_empty());
+
+        fs::write(&sidecar, "{").unwrap();
+        let switched = fixture
+            .command()
+            .env("CODEX_HOME", &inner)
+            .args(["--json", "search"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(switched.status.success());
+        assert!(result_sessions(&serde_json::from_slice(&switched.stdout).unwrap()).is_empty());
+        let unreadable = codex.join("sessions/unreadable.jsonl");
+        if partial {
+            fs::write(&unreadable, "{").unwrap();
+        }
+        fs::rename(&inner, &parked).unwrap();
+        fs::write(&sidecar, absent_index).unwrap();
+        if search {
+            fixture.search_json(&["Violet Quokka", "--provider", "codex", "--all-projects"]);
+        } else {
+            fixture.index_codex();
+        }
+        fs::write(&sidecar, "{").unwrap();
+        fs::rename(&parked, &inner).unwrap();
+        if partial {
+            fs::remove_file(unreadable).unwrap();
+        }
+        for query in ["Violet Quokka", "Copper Fennel"] {
+            let flags = [query, "--provider", "codex"];
+            for flags in [flags.to_vec(), [&flags[..], &["--cached"]].concat()] {
+                assert_eq!(
+                    !result_sessions(&fixture.search_json(&flags)).is_empty(),
+                    Some(query) == expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn show_preserves_a_verified_name_only_for_the_same_rollout() {
+    use omnis_ir::{Provider, SessionRef};
+
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let sidecar = codex.join("session_index.jsonl");
+    let session = SessionRef::new(Provider::Codex, CODEX_ID);
+    let name = json!({"id": CODEX_ID, "thread_name": "Violet Quokka"});
+    fs::write(&sidecar, name.to_string()).unwrap();
+    fixture.index_codex();
+    let check = |official: Option<&str>| {
+        let output = fixture
+            .command()
+            .args(["--json", "show", &session.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["title"].as_str(), official);
+    };
+    let opener_search = |expected: &str| {
+        let hit =
+            fixture.search_json(&["limter", "--provider", "codex", "--no-index", "--show-text"]);
+        assert_eq!(hit["results"][0]["match"], "metadata", "{hit}");
+        assert_eq!(hit["results"][0]["title"], expected, "{hit}");
+    };
+    opener_search("Violet Quokka");
+    let ambiguous = format!(
+        "{}\n{{",
+        json!({"id": CODEX_ID, "thread_name": "Amber Heron"})
+    );
+    fs::write(&sidecar, &ambiguous).unwrap();
+    check(Some("Violet Quokka"));
+    fs::write(&sidecar, "\n").unwrap();
+    opener_search("Tune the rate limiter backoff");
+    check(None);
+
+    fs::write(&sidecar, name.to_string()).unwrap();
+    check(Some("Violet Quokka"));
+    fs::write(&sidecar, ambiguous).unwrap();
+    let file = codex.join(format!(
+        "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    let replacement = file.with_extension("new");
+    fs::copy(&file, &replacement).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(fs::metadata(&file).unwrap().modified().unwrap())
+        .unwrap();
+    fs::rename(replacement, file).unwrap();
+    check(None);
+}
+
+#[test]
 fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
     use omnis_ir::{Provider, SessionRef};
 
@@ -1132,7 +1265,7 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
 }
 
 #[test]
-fn sampled_fork_index_withdraws_its_rolled_back_title() {
+fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
@@ -1181,6 +1314,20 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
             ])
         };
         fixture.index_codex();
+        assert!(search(CODEX_ID)["results"][0]["title"].is_null());
+        // Older indexers used the first local turn as a title when the parent was missing.
+        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE session_trajectories SET derived_title = ?1
+                 WHERE provider = 'codex' AND session_id = ?2
+                   AND derived_title IS NULL AND NOT derived_title_is_verified",
+                [initial_title, CODEX_ID],
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
         assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
 
         let rollback = json!({"ordinal":27,"timestamp":STAMP,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
@@ -1345,6 +1492,101 @@ fn restore_legacy_title_cache(fixture: &Fixture) {
 }
 
 #[test]
+fn malformed_catalog_keeps_a_provider_name_after_a_local_rollback() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let catalog = codex.join("session_index.jsonl");
+    let name = "Violet Quokka";
+    write_jsonl(&catalog, &[json!({"id":CODEX_ID,"thread_name":name})]);
+    let cached = |query: &str| {
+        fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
+    };
+    fixture.index_codex();
+    assert_eq!(cached(CODEX_ID)["results"][0]["title"], name);
+
+    fs::write(&catalog, "{").unwrap();
+    let path = codex.join(format!(
+        "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+    ));
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    for row in [
+        json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"Investigate Copperwren"}}),
+    ] {
+        writeln!(file, "{row}").unwrap();
+    }
+    drop(file);
+    fixture.index_codex();
+    let updated = cached("Copperwren");
+    assert_eq!(updated["results"][0]["title"], name);
+    assert_eq!(updated["results"][0]["match"], "conversation");
+    assert!(result_sessions(&cached("backoff")).is_empty());
+}
+
+#[test]
+fn an_incomplete_name_index_preserves_a_provider_name_but_updates_an_inferred_fork_title() {
+    for provider_name in [Some("Violet Quokka"), None] {
+        let fixture = Fixture::new();
+        let codex = fixture.root.join("codex");
+        let catalog = codex.join("session_index.jsonl");
+        if let Some(name) = provider_name {
+            write_jsonl(&catalog, &[json!({"id":CODEX_ID,"thread_name":name})]);
+        }
+        let path = codex.join(format!(
+            "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        let write_fork = |parent, opening, reply| {
+            write_jsonl(
+                &path,
+                &[
+                    json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"forked_from_id":parent}}),
+                    json!({"type":"event_msg","payload":{"type":"user_message","message":opening}}),
+                    json!({"type":"event_msg","payload":{"type":"agent_message","message":reply}}),
+                ],
+            );
+        };
+        let cached_title = |query| {
+            fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
+                ["results"][0]["title"].clone()
+        };
+        write_fork(OTHER_CODEX_ID, "Opening copied request", "Initial answer");
+        fixture.index_codex();
+        assert_eq!(
+            cached_title(CODEX_ID),
+            provider_name.unwrap_or("Opening copied request")
+        );
+
+        fs::write(&catalog, "{").unwrap();
+        write_fork(
+            OTHER_CODEX_ID,
+            "Updated copied request",
+            "Copperwren answer",
+        );
+        fixture.index_codex();
+        assert_eq!(
+            cached_title("Copperwren"),
+            provider_name.unwrap_or("Updated copied request")
+        );
+
+        if provider_name.is_some() {
+            write_fork(
+                "019ccd00-0000-7000-8000-000000000778",
+                "Updated copied request",
+                "Copperwren answer",
+            );
+            fixture.index_codex();
+            assert_eq!(cached_title("Copperwren"), "Updated copied request");
+        }
+
+        fs::write(catalog, "").unwrap();
+        fixture.index_codex();
+        assert_eq!(cached_title("Copperwren"), "Updated copied request");
+    }
+}
+
+#[test]
 fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
@@ -1425,6 +1667,176 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
 }
 
 #[test]
+fn failed_discovery_cannot_assign_a_name_with_two_possible_rollouts() {
+    let fixture = Fixture::new();
+    let home = fixture.root.join("codex");
+    let filename = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let selected = home.join("sessions/2026/01/02").join(&filename);
+    let archive = home.join("archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let content = fs::read_to_string(selected).unwrap();
+    fs::write(
+        archive.join(filename),
+        content.replace("Pagination", "Archive"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("session_index.jsonl"),
+        json!({"id": CODEX_ID, "thread_name": "Violet Quokka"}).to_string(),
+    )
+    .unwrap();
+    let query = ["Violet Quokka", "--provider", "codex", "--cached"];
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
+    fs::write(home.join("state_5.sqlite"), "unreadable database").unwrap();
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
+}
+
+#[test]
+fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
+    use omnis_adapters::{CodexAdapter, ProviderAdapter};
+    use omnis_store::{IndexedSession, Store};
+
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let native = CodexAdapter::with_root(&codex)
+        .find_native_session(CODEX_ID)
+        .unwrap()
+        .unwrap();
+    let state = fixture.root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("store.sqlite3")).unwrap();
+    store
+        .upsert_indexed_session(&IndexedSession {
+            session: native.session.clone(),
+            source_revision: native.source_revision,
+            title: Some("Amber Heron".into()),
+            project_path: native.project_path,
+            git_branch: native.git_branch,
+            created_at: native.created_at,
+            updated_at: native.updated_at,
+            updated_at_approximate: native.updated_at_approximate,
+            event_count: native.event_count,
+        })
+        .unwrap();
+    let db = rusqlite::Connection::open(state.join("store.sqlite3")).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE session_index SET codex_home=?1 WHERE provider='codex' AND session_id=?2 AND title='Amber Heron'
+           AND NOT EXISTS (SELECT 1 FROM session_trajectories WHERE provider='codex' AND session_id=?2)",
+        rusqlite::params![codex.canonicalize().unwrap().to_str().unwrap(), CODEX_ID],
+    ).unwrap(), 1);
+    write_jsonl(
+        &codex.join("session_index.jsonl"),
+        &[json!({
+            "id": CODEX_ID, "thread_name": "Violet Quokka"
+        })],
+    );
+
+    for indexed in [1, 0] {
+        let found = fixture.search_json(&["--provider", "codex", "--show-text", "unchanged"]);
+        assert_eq!(found["index"]["failed"], 0);
+        assert_eq!(found["index"]["indexed"], indexed);
+        assert_eq!(result_sessions(&found), [format!("codex:{CODEX_ID}")]);
+        assert_eq!(found["results"][0]["title"], "Violet Quokka");
+    }
+    let cached = fixture.search_json(&["--cached", "--provider", "codex", "--show-text", "Quokka"]);
+    assert_eq!(result_sessions(&cached), [format!("codex:{CODEX_ID}")]);
+    assert_eq!(cached["results"][0]["title"], "Violet Quokka");
+    let recorded_check: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_index_checks)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!recorded_check);
+}
+
+#[test]
+fn an_unscoped_catalog_name_needs_its_prior_assignment_and_original_rollout() {
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex");
+    let names = codex.join("session_index.jsonl");
+    let assignment = |id, name| json!({"id": id, "thread_name": name});
+    let prior = assignment(CODEX_ID, "Azure Quokka");
+    let other = assignment(OTHER_CODEX_ID, "Elm Cormorant");
+    fs::write(&names, format!("{prior}\n{other}\n")).unwrap();
+    fixture.index_codex();
+
+    // An interrupted older index saved the catalog before writing trajectories or recording the home.
+    let state = fixture.root.join("state");
+    let populated = fixture.root.join("populated");
+    fs::rename(&state, &populated).unwrap();
+    fixture.search(&["--cached", "Quokka"]);
+    let db = rusqlite::Connection::open(state.join("store.sqlite3")).unwrap();
+    db.execute(
+        "ATTACH DATABASE ?1 AS populated",
+        [populated.join("store.sqlite3").to_str().unwrap()],
+    )
+    .unwrap();
+    db.execute_batch(
+        "INSERT INTO session_index
+            (provider, session_id, title, project_path, git_branch, created_at, updated_at,
+             updated_at_approximate, event_count, indexed_at, source_file_id, source_contents_id)
+         SELECT provider, session_id, title, project_path, git_branch, created_at, updated_at,
+                updated_at_approximate, event_count, indexed_at, source_file_id, source_contents_id
+         FROM populated.session_index WHERE provider='codex'",
+    )
+    .unwrap();
+    drop(db);
+
+    fs::write(&names, format!("{prior}\n{other}\n{{")).unwrap();
+    let file = codex.join(format!(
+        "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+    ));
+    let replaced = file.with_extension("previous");
+    fs::rename(&file, &replaced).unwrap();
+    fs::copy(&replaced, &file).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(fs::metadata(replaced).unwrap().modified().unwrap())
+        .unwrap();
+
+    let cached = |term| fixture.search_json(&["--all-projects", "--cached", "--show-text", term]);
+    assert!(result_sessions(&cached("Quokka")).is_empty());
+    let shown = |id| {
+        let output = fixture
+            .command()
+            .args(["--json", "show", &format!("codex:{id}")])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(shown(CODEX_ID)["title"], "Azure Quokka");
+    assert_eq!(
+        result_sessions(&cached("Quokka")),
+        [format!("codex:{CODEX_ID}")]
+    );
+    assert_eq!(cached("unchanged")["results"][0]["title"], "Azure Quokka");
+    assert!(shown(OTHER_CODEX_ID)["title"].is_null());
+    assert!(result_sessions(&cached("Cormorant")).is_empty());
+    assert_eq!(
+        cached("zebracorn")["results"][0]["title"],
+        "Draft release notes"
+    );
+    fs::write(names, "").unwrap();
+    assert_eq!(fixture.index_codex()["failed"], 0);
+    assert!(result_sessions(&cached("Quokka")).is_empty());
+    assert_eq!(
+        cached("unchanged")["results"][0]["title"],
+        "Tune the rate limiter backoff"
+    );
+}
+
+#[test]
 fn codex_search_follows_a_restored_active_rollout_at_an_older_or_equal_time() {
     for (same_project, legacy_index) in [(false, false), (true, false), (true, true)] {
         let fixture = Fixture::new();
@@ -1499,12 +1911,12 @@ fn codex_search_follows_a_restored_active_rollout_at_an_older_or_equal_time() {
 
 #[test]
 fn codex_gui_name_changes_without_reindexing_the_conversation() {
-    for archived in [false, true] {
-        check_codex_gui_name_changes(archived);
+    for (archived, legacy) in [(false, false), (false, true), (true, true)] {
+        check_codex_gui_name_changes(archived, legacy);
     }
 }
 
-fn check_codex_gui_name_changes(archived: bool) {
+fn check_codex_gui_name_changes(archived: bool, legacy: bool) {
     let fixture = Fixture::new();
     let db = rusqlite::Connection::open(fixture.root.join("codex/state_5.sqlite")).unwrap();
     db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, history_mode TEXT, name TEXT)").unwrap();
@@ -1536,36 +1948,63 @@ fn check_codex_gui_name_changes(archived: bool) {
     }
     let original = "Xylophonist";
     let renamed = "Vibraphonist";
+    let search = |q| fixture.search_json(&[q, "--provider", "codex", "--show-text"]);
+    let ordinary = "Carillonneur";
+    if !legacy {
+        write_jsonl(
+            &fixture.root.join("codex/session_index.jsonl"),
+            &[json!({"id":CODEX_ID,"thread_name":ordinary})],
+        );
+        assert_eq!(search(ordinary)["results"][0]["title"], ordinary);
+    }
     db.execute(
         "INSERT INTO threads VALUES (?1, ?2, ?3, 'paginated', ?4)",
         rusqlite::params![
             CODEX_ID,
             rollout.to_str(),
             fixture.workspace.to_str(),
-            original
+            legacy.then_some(original)
         ],
     )
     .unwrap();
-    let search = |q| fixture.search_json(&[q, "--provider", "codex", "--show-text"]);
+    if !legacy {
+        let obsolete = fixture.search_json(&[ordinary, "--provider", "codex", "--no-index"]);
+        assert!(result_sessions(&obsolete).is_empty(), "{obsolete}");
+        db.execute("UPDATE threads SET name = ?1", [original])
+            .unwrap();
+        let renamed = fixture.search_json(&[ordinary, "--provider", "codex", "--no-index"]);
+        assert!(result_sessions(&renamed).is_empty(), "{renamed}");
+    }
     assert_eq!(search(original)["results"][0]["title"], original);
-    let cache = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    assert_eq!(
-        cache.execute(
+    if legacy {
+        let cache = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        let rows = cache.execute(
             "UPDATE session_trajectories SET document_version=6, derived_title=?1, derived_title_is_verified=1, derived_title_is_local_opener=0 WHERE provider='codex' AND session_id=?2",
             rusqlite::params![original, CODEX_ID],
-        ).unwrap(),
-        1
-    );
+        ).unwrap();
+        assert_eq!(rows, 1);
+    }
+    let mut previous = original;
     for name in [Some(renamed), None] {
         db.execute("UPDATE threads SET name = ?1", [name]).unwrap();
+        let old_name = fixture.search_json(&[previous, "--provider", "codex", "--no-index"]);
         assert!(
-            result_sessions(
-                &fixture.search_json(&[original, "--provider", "codex", "--no-index",])
-            )
-            .is_empty()
+            result_sessions(&old_name).is_empty(),
+            "old name {previous}, current {name:?}, archived {archived}, legacy {legacy}: {old_name}"
         );
+        if name.is_none() {
+            let body = fixture.search_json(&[
+                "unchanged",
+                "--provider",
+                "codex",
+                "--no-index",
+                "--show-text",
+            ]);
+            assert_eq!(body["results"][0]["title"], "Tune the rate limiter backoff");
+        }
         assert!(result_sessions(&search(original)).is_empty());
         if let Some(name) = name {
+            previous = name;
             assert_eq!(search(name)["results"][0]["match"], "metadata");
         } else {
             assert!(result_sessions(&search(renamed)).is_empty());

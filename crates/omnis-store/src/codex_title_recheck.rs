@@ -2,17 +2,20 @@ use super::{
     LegacyCodexOpenerCandidate, LocalOpenerEvidence, PreparedTrajectoryWrite, Result,
     SelectedMetadata, SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, database_error,
 };
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 // The catalog can advance to an appended revision while the old document still awaits its read.
 const MATCHING_PROOF: &str = "
     FROM legacy_codex_title_proofs p
     JOIN visible_trajectories t ON t.id=p.trajectory_id
-    JOIN scoped_session_index c ON c.provider=t.provider AND c.session_id=t.session_id
-    WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native' AND NOT t.protected_by_bundle
-      AND t.source_file_id=?2 AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id
+    JOIN scoped_session_catalog c ON c.provider=t.provider AND c.session_id=t.session_id AND c.name_observable
+    LEFT JOIN legacy_codex_name_retries r ON r.trajectory_id=p.trajectory_id
+    WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle
+      AND (r.trajectory_id IS NULL OR r.codex_home=(SELECT home FROM current_codex_home))
+      AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id
       AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown' AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
       AND t.derived_title=p.previous_title AND c.title IS NULL AND c.source_file_id=p.source_file_id
       AND c.source_contents_id IS NOT NULL";
@@ -102,6 +105,30 @@ pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>
     ).map_err(database_error)
 }
 
+pub(super) fn name_retries(connection: &Connection) -> Result<HashMap<SessionRef, SourceRevision>> {
+    let sql = format!(
+        "SELECT doc.session_id,doc.source_file_id,doc.source_contents_id FROM legacy_codex_name_retries pending
+         CROSS JOIN session_trajectories doc WHERE doc.id=pending.trajectory_id AND EXISTS (
+             SELECT 1 {MATCHING_PROOF} AND p.trajectory_id=pending.trajectory_id AND c.source_contents_id=p.source_contents_id)"
+    );
+    let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                SessionRef::new(Provider::Codex, row.get::<_, String>(0)?),
+                SourceRevision {
+                    file: Some(Uuid::from_bytes(row.get(1)?)),
+                    legacy_file: None,
+                    contents: Some(Uuid::from_bytes(row.get(2)?)),
+                    missing_ancestor: None,
+                },
+            ))
+        })
+        .map_err(database_error)?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(database_error)
+}
+
 pub(super) fn candidate(
     connection: &Connection,
     session: &SessionRef,
@@ -112,7 +139,7 @@ pub(super) fn candidate(
     }
     connection
         .query_row(
-            &format!("SELECT p.previous_title,p.requires_tool_catalog {MATCHING_PROOF}"),
+            &format!("SELECT p.previous_title,p.requires_tool_catalog {MATCHING_PROOF} AND t.session_id=?1 AND t.source_file_id=?2"),
             params![session.id, file.into_bytes()],
             |row| {
                 Ok(LegacyCodexOpenerCandidate {
@@ -131,7 +158,8 @@ pub(super) fn accept(
     selected: Option<SelectedMetadata<'_>>,
 ) -> Result<()> {
     let document = &write.document;
-    if !document.local_opener.rechecks_legacy_title() {
+    let deferred = document.local_opener == LocalOpenerEvidence::DeferredLegacyName;
+    if !deferred && !document.local_opener.rechecks_legacy_title() {
         return Ok(());
     }
     let TrajectorySourceGuard::ObservedRevision(Some(observed)) = write.guard else {
@@ -156,14 +184,11 @@ pub(super) fn accept(
     {
         return Err(StoreError::TrajectorySourceChanged);
     }
-    let sql = format!(
-        "UPDATE session_trajectories SET derived_title_is_local_opener=NULL WHERE id=(
-           SELECT p.trajectory_id {MATCHING_PROOF} AND p.source_contents_id=?3 AND p.previous_title=?4
-           AND t.source_updated_at=?5 AND t.document_version<=?6
-           AND (c.source_contents_id=p.source_contents_id OR c.source_contents_id=?7))"
-    );
-    let changed = transaction
-        .execute(
+    let sql = format!("SELECT p.trajectory_id {MATCHING_PROOF} AND t.session_id=?1 AND t.source_file_id=?2
+                       AND p.source_contents_id=?3 AND p.previous_title=?4 AND t.source_updated_at=?5
+                       AND t.document_version<=?6 AND (c.source_contents_id=p.source_contents_id OR c.source_contents_id=?7)");
+    let id = transaction
+        .query_row(
             &sql,
             params![
                 write.session.id,
@@ -174,10 +199,30 @@ pub(super) fn accept(
                 document.document_version,
                 contents.into_bytes(),
             ],
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(database_error)?;
-    if changed == 0 {
-        return Err(StoreError::TrajectorySourceChanged);
+        .optional()
+        .map_err(database_error)?
+        .ok_or(StoreError::TrajectorySourceChanged)?;
+    if deferred {
+        transaction
+            .execute(
+                "INSERT INTO legacy_codex_name_retries SELECT ?1,home FROM current_codex_home
+             WHERE home IS NOT NULL ON CONFLICT(trajectory_id) DO NOTHING",
+                [id],
+            )
+            .map_err(database_error)?;
+        transaction.execute(
+            "UPDATE legacy_codex_title_proofs SET source_contents_id=?2 WHERE trajectory_id=?1 AND source_contents_id<>?2",
+            params![id, contents.into_bytes()],
+        ).map_err(database_error)?;
+    } else {
+        transaction
+            .execute(
+                "UPDATE session_trajectories SET derived_title_is_local_opener=NULL WHERE id=?1",
+                [id],
+            )
+            .map_err(database_error)?;
     }
     Ok(())
 }

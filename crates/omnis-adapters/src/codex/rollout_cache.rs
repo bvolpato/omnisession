@@ -144,6 +144,7 @@ pub(super) fn default_path(codex_home: &Path) -> Option<PathBuf> {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ObservedRollout {
     pub(super) revision: SourceRevision,
+    pub(super) physical_identity: Option<[u64; 2]>,
     pub(super) stamp: Option<RolloutStamp>,
     pub(super) modified: Option<DateTime<Utc>>,
 }
@@ -153,7 +154,13 @@ impl ObservedRollout {
         super::rollout_file::jsonl_file_name(path)?;
         let canonical = fs::canonicalize(path).ok()?;
         #[cfg(windows)]
-        let handle = fs::File::open(&canonical).ok()?;
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .access_mode(0)
+                .open(&canonical)
+                .ok()?
+        };
         #[cfg(windows)]
         let metadata = handle.metadata().ok()?;
         #[cfg(not(windows))]
@@ -169,6 +176,7 @@ impl ObservedRollout {
             stamp.file_id = source.revision.file;
         }
         Some(Self {
+            physical_identity: source.physical_identity,
             modified: source.modified,
             revision: source.revision,
             stamp,

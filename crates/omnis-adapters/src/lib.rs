@@ -67,6 +67,16 @@ pub struct ProviderInstallation {
     pub data_root: Option<PathBuf>,
 }
 
+pub use omnis_core::NativeSessionName;
+
+/// Name assignments that still agree with the native index used for a listing.
+pub struct ObservedSessionNames {
+    /// Confirmed assignments, including readable rows after the last damaged row.
+    pub names: std::sync::Arc<HashMap<String, String>>,
+    /// Whether an omitted ID confirms that the thread has no assignment.
+    pub complete: bool,
+}
+
 /// Metadata returned by session discovery. Transcript content is intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeSession {
@@ -88,6 +98,8 @@ pub struct NativeSession {
 pub enum RollbackTitle {
     #[default]
     Unknown,
+    /// The source is an ordinary local session. Its opening title remains unconfirmed.
+    UnknownLocal,
     /// An empty title means the surviving transcript has no eligible user opener.
     Known(Option<String>),
     /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
@@ -121,7 +133,7 @@ impl WithdrawnOpeners {
 
     fn after_gap(&self) -> RollbackTitle {
         if self.hashes.is_empty() && !self.overflowed {
-            RollbackTitle::Unknown
+            RollbackTitle::UnknownLocal
         } else {
             RollbackTitle::UnknownAfterWithdrawal(self.clone())
         }
@@ -499,6 +511,92 @@ pub trait ProviderAdapter: Send + Sync {
     /// session can be treated as deleted only after complete discovery. The default preserves it.
     fn discovery_is_complete(&self) -> bool {
         false
+    }
+
+    /// Returns whether a missing provider name confirms that the session has no name.
+    fn session_titles_are_complete(&self) -> bool {
+        false
+    }
+
+    /// Reads selected name observations for a batch of session IDs, paths, and file revisions.
+    fn listed_session_names(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Rechecks the named rows selected by discovery before their search documents are published.
+    fn listed_session_names_still_current(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Returns name assignments and clears confirmed for the selected paths and file revisions.
+    fn observed_listed_names(
+        &self,
+        sessions: &[NativeSession],
+    ) -> HashMap<String, NativeSessionName> {
+        let requested: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .filter_map(|s| {
+                Some((
+                    s.session.id.as_str(),
+                    s.source_path.as_deref()?,
+                    s.source_revision?,
+                ))
+            })
+            .collect();
+        let mut names = self.listed_session_names(&requested);
+        sessions
+            .iter()
+            .filter(|session| session.session.provider == Provider::Codex)
+            .filter_map(|session| {
+                let id = &session.session.id;
+                let name = names.remove(id)?;
+                name.confirms(session.title.as_deref())
+                    .then(|| (id.clone(), name))
+            })
+            .collect()
+    }
+
+    /// Returns GUI assignments and clears that match the selected sessions.
+    fn gui_session_names(&self, sessions: &[NativeSession]) -> HashMap<String, Option<String>> {
+        self.observed_listed_names(sessions)
+            .into_iter()
+            .filter_map(|(id, name)| {
+                if let NativeSessionName::Gui(title) = name {
+                    Some((id, title))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the individually confirmed assignments in the name index used for discovery.
+    /// Only a complete index also confirms that omitted IDs have no assignment.
+    fn observed_session_names(&self) -> Option<ObservedSessionNames> {
+        None
+    }
+
+    /// Reads the latest name assignment for one session.
+    fn native_session_name(&self, _id: &str) -> NativeSessionName {
+        NativeSessionName::Unknown
+    }
+
+    /// Returns earlier readable assignments that can corroborate a saved name for the same rollout.
+    /// An unreadable later row prevents these assignments from establishing the current name.
+    fn prior_session_names(&self, _sessions: &[&NativeSession]) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    /// Checks whether the name still matches the provider's index after a session read.
+    fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
+        self.native_session_name(id).confirms(name)
     }
 
     /// Returns the cached Codex sessions that their recorded rollout selections rule out.

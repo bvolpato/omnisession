@@ -1941,6 +1941,8 @@ fn visit_bounded_lines(
 pub(crate) struct IndexScan {
     /// Records above the line budget, skipped whole.
     pub(crate) oversized_records: usize,
+    /// Nonblank lines that did not contain valid JSON.
+    pub(crate) malformed_records: usize,
     /// Oldest bytes left unread because the file exceeds its byte budget.
     pub(crate) skipped_bytes: u64,
 }
@@ -1971,7 +1973,22 @@ impl IndexScan {
 ///
 /// Files above the byte budget keep their newest suffix, starting at the first complete record.
 /// Oversized records are skipped and counted. Only open or read failures are errors.
-pub(crate) fn visit_index_json_lines(path: &Path, visit: impl FnMut(Value)) -> Result<IndexScan> {
+pub(crate) fn visit_index_json_lines(
+    path: &Path,
+    mut visit: impl FnMut(Value),
+) -> Result<IndexScan> {
+    visit_index_json_lines_with_gaps(path, |record| {
+        if let Some(record) = record {
+            visit(record);
+        }
+    })
+}
+
+/// Reports an unreadable nonblank row as `None` at its position in the file.
+pub(crate) fn visit_index_json_lines_with_gaps(
+    path: &Path,
+    visit: impl FnMut(Option<Value>),
+) -> Result<IndexScan> {
     visit_index_json_lines_with_limits(path, MAX_INDEX_FILE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, visit)
 }
 
@@ -1979,7 +1996,7 @@ fn visit_index_json_lines_with_limits(
     path: &Path,
     file_limit: u64,
     line_limit: u64,
-    mut visit: impl FnMut(Value),
+    mut visit: impl FnMut(Option<Value>),
 ) -> Result<IndexScan> {
     let mut file = File::open(path)?;
     let (mut reader, skipped_bytes) = jsonl_tail_reader(&mut file, file_limit)?;
@@ -1990,12 +2007,18 @@ fn visit_index_json_lines_with_limits(
     let mut line = Vec::new();
     while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
         match line_kind {
-            BoundedLine::Oversized => scan.oversized_records += 1,
-            BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
-                    visit(record);
-                }
+            BoundedLine::Oversized => {
+                scan.oversized_records += 1;
+                visit(None);
             }
+            BoundedLine::Complete => match serde_json::from_slice(&line) {
+                Ok(record) => visit(Some(record)),
+                Err(_) if !line.iter().all(u8::is_ascii_whitespace) => {
+                    scan.malformed_records += 1;
+                    visit(None);
+                }
+                Err(_) => {}
+            },
         }
     }
     Ok(scan)
@@ -2154,6 +2177,8 @@ pub(crate) struct JsonLinesPreview {
     pub(crate) records: Vec<Value>,
     pub(crate) omissions: JsonLineSkips,
     pub(crate) sampled: bool,
+    /// Number of leading records retained without any unreadable or unsampled row.
+    pub(crate) prefix_records: usize,
     suffix_len: usize,
 }
 
@@ -2279,6 +2304,7 @@ fn read_json_lines_tail(
         offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
+    let mut verified_tail_records = 0;
     let mut previous = preview.omissions.total();
     let mut line = Vec::new();
     loop {
@@ -2308,11 +2334,17 @@ fn read_json_lines_tail(
                 preview.suffix_len = preview.suffix_len.min(limit);
                 preview.sampled = true;
             }
+            if !preview.sampled && preview.omissions.total() == 0 {
+                verified_tail_records += 1;
+            }
             records.push_back((line_offset, record, preview.omissions.total() > previous));
             previous = preview.omissions.total();
         } else {
             preview.suffix_len = 0;
         }
+    }
+    if !preview.sampled {
+        preview.prefix_records += verified_tail_records;
     }
     let records = records
         .into_iter()
@@ -2364,6 +2396,9 @@ fn read_json_lines_prefix(
             }
             BoundedLine::Complete => {
                 if let Some(record) = preview.omissions.parse(&line, match_malformed) {
+                    if preview.omissions.total() == 0 {
+                        preview.prefix_records += 1;
+                    }
                     preview.records.push(record);
                     preview.suffix_len += 1;
                 } else {
@@ -2796,6 +2831,19 @@ fn select_preview_edges(
     (selected, omitted)
 }
 
+fn preview_prefix_end(
+    sequences: impl Iterator<Item = u64>,
+    selected: &VecDeque<PreviewEvent>,
+    end: u64,
+) -> u64 {
+    sequences
+        .enumerate()
+        .find_map(|(index, sequence)| {
+            (selected.get(index).map(|event| event.sequence) != Some(sequence)).then_some(sequence)
+        })
+        .unwrap_or(end)
+}
+
 impl EventPreview {
     fn record(
         &mut self,
@@ -2919,13 +2967,20 @@ impl EventBuilder {
         &self,
         limit: usize,
         bytes_per_edge: usize,
-    ) -> (VecDeque<PreviewEvent>, usize) {
+    ) -> (VecDeque<PreviewEvent>, usize, u64) {
         let outline = &self
             .preview
             .as_ref()
             .expect("preview planning enabled")
             .outline;
-        select_preview_edges(outline.iter().copied(), limit, bytes_per_edge)
+        let (selected, omitted) =
+            select_preview_edges(outline.iter().copied(), limit, bytes_per_edge);
+        let prefix_end = preview_prefix_end(
+            outline.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
+        );
+        (selected, omitted, prefix_end)
     }
 
     /// Selects the preview after published revisions and rollbacks have updated canonical events.
@@ -2933,8 +2988,7 @@ impl EventBuilder {
         &mut self,
         limit: usize,
         bytes_per_edge: usize,
-        timestamp: DateTime<Utc>,
-    ) {
+    ) -> (usize, u64) {
         let outline = self.events.iter().map(|event| {
             let source_bytes = event.source.native_session_id.len()
                 + event
@@ -2947,22 +3001,20 @@ impl EventBuilder {
         });
         let (selected, omitted) = select_preview_edges(outline, limit, bytes_per_edge);
         if omitted == 0 {
-            return;
+            return (0, self.next_sequence);
         }
+        let prefix_end = preview_prefix_end(
+            self.events.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
+        );
         let mut selected = selected.into_iter().peekable();
         self.events.retain(|event| {
             selected
                 .next_if(|next| next.sequence == event.sequence)
                 .is_some()
         });
-        self.push(
-            EventKind::ProviderEvent,
-            serde_json::json!({"omitted_events": omitted}),
-            Some(timestamp),
-            ReplayPolicy::HistoricalOnly,
-            Some("omnisession.preview_limit".to_owned()),
-            None,
-        );
+        (omitted, prefix_end)
     }
 
     pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
@@ -3144,7 +3196,8 @@ impl EventBuilder {
                         .and_then(|(_, title)| title.clone()),
                 )
             }
-            _ => crate::RollbackTitle::Unknown,
+            Some(_) => crate::RollbackTitle::UnknownLocal,
+            None => crate::RollbackTitle::Unknown,
         }
     }
 
@@ -3225,13 +3278,17 @@ impl EventBuilder {
         timestamp: Option<DateTime<Utc>>,
     ) {
         if omissions.oversized > 0 {
+            let mut payload = serde_json::json!({
+                "omitted_events": omissions.oversized,
+                "omitted_records": omissions.oversized,
+                "max_record_bytes": line_limit,
+            });
+            if let Some(end) = prefix_end {
+                payload["prefix_end_sequence"] = end.into();
+            }
             self.push(
                 EventKind::ProviderEvent,
-                serde_json::json!({
-                    "omitted_events": omissions.oversized,
-                    "omitted_records": omissions.oversized,
-                    "max_record_bytes": line_limit,
-                }),
+                payload,
                 timestamp,
                 ReplayPolicy::HistoricalOnly,
                 Some("omnisession.record_size_limit".to_owned()),
@@ -3262,6 +3319,26 @@ impl EventBuilder {
                 None,
             );
         }
+    }
+
+    pub(crate) fn push_codex_preview_prefix(
+        &mut self,
+        prefix_end_sequence: u64,
+        complete: bool,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let mut payload = serde_json::json!({"prefix_end_sequence": prefix_end_sequence});
+        if complete {
+            payload["prefix_complete"] = true.into();
+        }
+        self.push(
+            EventKind::ProviderEvent,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.codex_preview_prefix".to_owned()),
+            None,
+        );
     }
 
     /// Keeps the workspace decision even when a sampled preview leaves out the omission event.
@@ -4157,13 +4234,12 @@ mod tests {
             );
         }
         builder.event_at_mut(0).unwrap().payload["text"] = "x".repeat(8192).into();
-        builder.retain_bounded_preview(2, 4096, chrono::Utc::now());
+        assert_eq!(builder.retain_bounded_preview(2, 4096), (1, 0));
 
         let events = &builder.events;
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["text"], "surviving head");
         assert_eq!(events[1].payload["text"], "surviving tail");
-        assert_eq!(events[2].payload["omitted_events"], 1);
     }
 
     #[test]
@@ -4268,7 +4344,7 @@ mod tests {
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {
         let mut values = Vec::new();
         let scan = visit_index_json_lines_with_limits(path, file_limit, line_limit, |record| {
-            values.extend(record["n"].as_u64());
+            values.extend(record.and_then(|record| record["n"].as_u64()));
         })
         .expect("index scan");
         (values, scan)
@@ -4464,6 +4540,7 @@ mod tests {
                     values,
                     IndexScan {
                         oversized_records: 0,
+                        malformed_records: 0,
                         skipped_bytes
                     }
                 ),
@@ -4483,6 +4560,7 @@ mod tests {
                     values,
                     IndexScan {
                         oversized_records: 0,
+                        malformed_records: 0,
                         skipped_bytes
                     }
                 ),
@@ -4897,7 +4975,7 @@ mod tests {
             let (values, scan) = index_values(&path, file_limit, 64);
 
             prop_assert_eq!(values, kept);
-            prop_assert_eq!(scan, IndexScan { oversized_records: 0, skipped_bytes: first_kept });
+            prop_assert_eq!(scan, IndexScan { skipped_bytes: first_kept, ..IndexScan::default() });
         }
     }
 }

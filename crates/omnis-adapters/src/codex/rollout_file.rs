@@ -4,13 +4,16 @@ use std::{
     cell::OnceCell,
     collections::VecDeque,
     fs::{self, File},
-    io::{BufRead, BufReader, Cursor, Read},
+    io::{BufRead, BufReader, Cursor, Read, Seek},
     path::{Path, PathBuf},
 };
 
+use crate::source_file::ObservedSourceFile;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
+use omnis_ir::SourceRevision;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::CodexHistoryMode;
 use super::workspace_check::{WorkspaceScan, same_thread};
@@ -31,6 +34,107 @@ pub(super) fn jsonl_file_name(path: &Path) -> Option<&Path> {
         _ => return None,
     };
     (plain.extension()? == "jsonl").then_some(plain)
+}
+
+impl super::CodexAdapter {
+    pub const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+    /// Hashes a verified rollout through its current or previously recorded length.
+    /// Returns no evidence if the requested prefix exceeds the full-read budget or the file changes during the read.
+    #[must_use]
+    pub fn rollout_prefix_hash(
+        path: &Path,
+        expected: SourceRevision,
+        bytes: Option<u64>,
+    ) -> Option<(u64, [u8; 32])> {
+        Self::hash_name_source(path, expected, bytes, None)
+    }
+
+    /// Binds the name to the complete ordinary rollout or the original metadata of a native fork.
+    #[must_use]
+    pub fn rollout_name_anchor(
+        path: &Path,
+        expected: SourceRevision,
+        session_id: &str,
+    ) -> Option<(u64, [u8; 32])> {
+        Self::hash_name_source(path, expected, None, Some(session_id))
+    }
+
+    fn hash_name_source(
+        path: &Path,
+        expected: SourceRevision,
+        bytes: Option<u64>,
+        session_id: Option<&str>,
+    ) -> Option<(u64, [u8; 32])> {
+        jsonl_file_name(path)?;
+        if expected.contents.is_none()
+            || omnis_core::may_reach_network(path)
+            || !fs::symlink_metadata(path).ok()?.is_file()
+        {
+            return None;
+        }
+        let canonical = fs::canonicalize(path).ok()?;
+        if omnis_core::may_reach_network(&canonical) {
+            return None;
+        }
+        let mut file = File::open(&canonical).ok()?;
+        let metadata = file.metadata().ok()?;
+        let source = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)?;
+        if source.physical_identity.is_none() || !expected.matches_file_contents(source.revision) {
+            return None;
+        }
+        if let Some(id) = session_id
+            && !compressed(path)
+        {
+            if let Some(header) = fork_name_header(&file, path, id, expected) {
+                source.ensure_unchanged(&canonical, path, &file).ok()?;
+                return Some((
+                    u64::try_from(header.len()).ok()?,
+                    Sha256::digest(header).into(),
+                ));
+            }
+            file.rewind().ok()?;
+        }
+        let length = bytes.unwrap_or(metadata.len());
+        if !(1..=Self::FULL_READ_SOURCE_BYTES).contains(&length) || length > metadata.len() {
+            return None;
+        }
+        let mut reader = (&file).take(length);
+        let mut hash = Sha256::new();
+        let mut chunk = [0; 16 * 1024];
+        while reader.limit() > 0 {
+            let read = reader.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            hash.update(&chunk[..read]);
+        }
+        source.ensure_unchanged(&canonical, path, &file).ok()?;
+        Some((length, hash.finalize().into()))
+    }
+}
+
+fn fork_name_header(
+    file: &File,
+    path: &Path,
+    id: &str,
+    revision: SourceRevision,
+) -> Option<Vec<u8>> {
+    let mut header = Vec::new();
+    BufReader::new(file.take(MAX_TRANSCRIPT_LINE_SIZE))
+        .read_until(b'\n', &mut header)
+        .ok()?;
+    if !header.ends_with(b"\n") {
+        return None;
+    }
+    let record = serde_json::from_slice(&header).ok()?;
+    let observed = super::ObservedRollout::read(path)?;
+    if !revision.matches_file_contents(observed.revision) {
+        return None;
+    }
+    let session = super::CodexSession::parse_metadata_record(path.to_owned(), &record, observed)?;
+    let parent = session.forked_from_id?;
+    (same_thread(&session.id, id) && !same_thread(&parent.to_string(), id)).then_some(header)
 }
 
 pub(super) fn compressed(path: &Path) -> bool {
@@ -173,6 +277,7 @@ pub(super) enum Sample {
         records: Vec<Value>,
         omitted: usize,
         unreadable: JsonLineSkips,
+        prefix_records: usize,
         directory: Option<PathBuf>,
     },
     Reconstruct,
@@ -308,7 +413,7 @@ pub(super) fn sample(
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
     // Indexing normally supplies 16 MiB. Keep a larger caller budget from forcing a huge buffer.
-    let budget = budget.min(16 * 1024 * 1024);
+    let budget = budget.min(super::CodexAdapter::FULL_READ_SOURCE_BYTES);
     reader.by_ref().take(budget + 1).read_to_end(&mut prefix)?;
     if u64::try_from(prefix.len())? <= budget {
         return Ok(Sample::Complete(prefix));
@@ -319,19 +424,24 @@ pub(super) fn sample(
     let mut head = Vec::new();
     let mut tail = VecDeque::new();
     let mut count = 0;
+    let mut prefix_records = 0;
     let mut workspace = WorkspaceScan::new(creation_directory);
     let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
         |line, oversized| workspace_gap(line, oversized, Some(session)),
         |loc, record, skipped| {
+            let ordinal = count + skipped.total();
             count += 1;
             workspace.settings.observe_gaps(skipped);
             workspace.observe(session, &record);
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push(record);
+                if ordinal == prefix_records {
+                    prefix_records += 1;
+                }
             } else {
-                while tail.front().is_some_and(|(offset, _)| {
+                while tail.front().is_some_and(|(offset, _, _)| {
                     loc.offset + loc.length - offset > MAX_PREVIEW_TAIL_SIZE
                 }) {
                     tail.pop_front();
@@ -340,7 +450,7 @@ pub(super) fn sample(
                     if tail.len() == SAMPLE_RECORDS {
                         tail.pop_front();
                     }
-                    tail.push_back((loc.offset, record));
+                    tail.push_back((loc.offset, ordinal, record));
                 }
             }
             Ok(())
@@ -350,13 +460,60 @@ pub(super) fn sample(
     if workspace.reconstruct_history || unreadable.workspace_gaps() > 0 {
         return Ok(Sample::Reconstruct);
     }
-    head.extend(tail.into_iter().filter_map(|(offset, record)| {
-        (bytes - offset <= MAX_PREVIEW_TAIL_SIZE).then_some(record)
-    }));
+    for (offset, ordinal, record) in tail {
+        if bytes - offset <= MAX_PREVIEW_TAIL_SIZE {
+            if ordinal == prefix_records {
+                prefix_records += 1;
+            }
+            head.push(record);
+        }
+    }
     Ok(Sample::Edges {
         omitted: count - head.len(),
+        prefix_records,
         unreadable,
         directory: workspace.settings.directory(workspace.directory),
         records: head,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CodexAdapter;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn a_retained_name_requires_every_original_byte_to_survive_the_append() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let path = fixture.path().join("rollout.jsonl");
+        let original = vec![b'a'; 64 * 1024];
+        fs::write(&path, &original)?;
+        let revision = || CodexAdapter::index_file_revision(&path).unwrap();
+        let capture = |bytes| CodexAdapter::rollout_prefix_hash(&path, revision(), bytes);
+        let prior = revision();
+        let receipt = capture(None).unwrap();
+        assert_eq!(receipt.1.as_slice(), &Sha256::digest(&original)[..]);
+        let mut file = fs::OpenOptions::new().write(true).open(&path)?;
+        file.set_modified(file.metadata()?.modified()? + std::time::Duration::from_secs(2))?;
+        assert_eq!(capture(Some(receipt.0)), Some(receipt));
+        assert!(capture(Some(receipt.0 + 1)).is_none());
+        file.write_all(b"z")?;
+        assert_ne!(capture(Some(receipt.0)).unwrap().1, receipt.1);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(b"a")?;
+        let budget = 16 * 1024 * 1024;
+        file.set_len(budget)?;
+        let at_limit = capture(None).unwrap();
+        assert_eq!(at_limit.0, budget);
+        file.set_len(budget + 1)?;
+        assert_eq!(capture(Some(budget)), Some(at_limit));
+        assert!(capture(None).is_none());
+        assert!(CodexAdapter::rollout_prefix_hash(&path, prior, Some(receipt.0)).is_none());
+        assert_eq!(capture(Some(receipt.0)), Some(receipt));
+        file.seek(SeekFrom::Start(receipt.0 / 2))?;
+        file.write_all(b"b")?;
+        assert_ne!(capture(Some(receipt.0)).unwrap().1, receipt.1);
+        Ok(())
+    }
 }

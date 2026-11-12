@@ -1227,28 +1227,26 @@ pub(super) fn selected_detail_lines(
     };
     let key = state.preview_key(entry);
     let preview = state.previews.get(&key);
-    let (ready_preview, preview_complete) = match preview {
+    let (ready_preview, preview_complete, message_count_is_complete) = match preview {
         Some(PreviewValue::Ready {
-            preview, complete, ..
-        }) => (Some(preview.as_ref()), *complete),
-        _ => (None, false),
+            preview,
+            complete,
+            message_count_is_complete,
+            ..
+        }) => (
+            Some(preview.as_ref()),
+            *complete,
+            *message_count_is_complete,
+        ),
+        _ => (None, false, false),
     };
     let title = display_title(entry, preview);
     let location = session_location(state, entry, ready_preview);
-    let cache_state = if entry.cached { " · indexed" } else { "" };
     let sampled_grok = entry.session.session.provider == Provider::Grok && !preview_complete;
-    let activity = preview_activity(ready_preview, sampled_grok, entry.session.event_count);
     let mut lines = vec![
         detail_line("SELECTED SESSION", DetailStyle::Accent),
         detail_line(title, DetailStyle::Strong),
-        detail_line(
-            format!(
-                "{}{activity} · {}{cache_state}",
-                entry.session.session.provider,
-                session_relative_time(&entry.session),
-            ),
-            DetailStyle::Muted,
-        ),
+        session_activity_line(entry, preview),
     ];
     if let Some(trajectory_match) = state.trajectory_match(entry) {
         append_search_match(&mut lines, trajectory_match, &state.query, width, 6);
@@ -1256,12 +1254,16 @@ pub(super) fn selected_detail_lines(
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     match preview {
-        Some(PreviewValue::Ready { preview, .. }) => {
+        Some(PreviewValue::Ready {
+            preview,
+            can_use_first_title,
+            ..
+        }) => {
             append_preview_lines(
                 &mut lines,
                 preview,
-                preview_complete,
-                sampled_grok,
+                *can_use_first_title,
+                (message_count_is_complete, sampled_grok),
                 width,
                 height,
             );
@@ -1279,7 +1281,7 @@ pub(super) fn selected_detail_lines(
             &mut lines,
             preview,
             preview_complete,
-            sampled_grok,
+            (message_count_is_complete, sampled_grok),
             entry.session.event_count,
             width,
             usize::MAX,
@@ -1290,22 +1292,39 @@ pub(super) fn selected_detail_lines(
     lines
 }
 
-fn preview_activity(
-    preview: Option<&SessionPreview>,
-    sampled_grok: bool,
-    event_count: usize,
-) -> String {
-    match preview {
-        Some(preview) if sampled_grok && preview.message_count > 0 => format!(
-            " · {} in preview",
-            counted(preview.message_count, "message")
-        ),
-        Some(preview) if preview.message_count > 0 => {
-            format!(" · {} messages", preview.message_count)
+fn session_activity_line(entry: &PickerEntry, preview: Option<&PreviewValue>) -> DetailLine {
+    let event_count = entry.session.event_count;
+    let activity = match preview {
+        Some(PreviewValue::Ready {
+            preview,
+            message_count_is_complete,
+            ..
+        }) if preview.message_count > 0 => {
+            format!(
+                " · {}",
+                preview_message_count(preview.message_count, *message_count_is_complete)
+            )
         }
-        _ if event_count > 0 => format!(" · {event_count} events"),
+        _ if event_count > 0 => {
+            format!(" · {event_count} events")
+        }
         _ => String::new(),
-    }
+    };
+    let cache_state = if entry.cached { " · indexed" } else { "" };
+    detail_line(
+        format!(
+            "{}{activity} · {}{cache_state}",
+            entry.session.session.provider,
+            session_relative_time(&entry.session),
+        ),
+        DetailStyle::Muted,
+    )
+}
+
+fn preview_message_count(count: usize, complete: bool) -> String {
+    let unit = if count == 1 { "message" } else { "messages" };
+    let scope = if complete { "" } else { " in preview" };
+    format!("{} {unit}{scope}", grouped_number(count))
 }
 
 fn counted(value: usize, noun: &str) -> String {
@@ -1317,7 +1336,7 @@ pub(super) fn append_session_metadata(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     preview_complete: bool,
-    sampled_grok: bool,
+    (message_count_is_complete, sampled_grok): (bool, bool),
     discovered_event_count: usize,
     width: usize,
     height: usize,
@@ -1336,8 +1355,8 @@ pub(super) fn append_session_metadata(
         "Message count unknown".to_owned()
     } else {
         format!(
-            "{} messages · {} tools · {event_count} events",
-            grouped_number(preview.message_count),
+            "{} · {} tools · {event_count} events",
+            preview_message_count(preview.message_count, message_count_is_complete),
             grouped_number(preview.tool_event_count),
         )
     };
@@ -1643,8 +1662,8 @@ pub(super) fn format_timestamp(timestamp: Option<DateTime<Utc>>, approximate: bo
 pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
-    complete: bool,
-    sampled_grok: bool,
+    can_use_first_title: bool,
+    (message_count_is_complete, sampled_grok): (bool, bool),
     width: usize,
     height: usize,
 ) {
@@ -1657,25 +1676,29 @@ pub(super) fn append_preview_lines(
     };
     let first_label = if sampled_grok {
         "FIRST IN PREVIEW"
-    } else {
+    } else if can_use_first_title {
         "FIRST MESSAGE"
-    };
-    let latest_label = if sampled_grok {
-        "LATEST IN PREVIEW"
     } else {
-        "LATEST MESSAGE"
+        "FIRST AVAILABLE MESSAGE"
     };
     match (&preview.first, &preview.latest) {
-        (None, _) if !complete => lines.push(detail_line(
-            "Preview incomplete. No messages were visible in the sample.",
+        (None, _) => lines.push(detail_line(
+            if message_count_is_complete {
+                "No visible messages"
+            } else {
+                "Preview incomplete. No messages were visible in the sample."
+            },
             DetailStyle::Muted,
         )),
-        (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
         (Some(first), Some(_)) if preview.message_count == 1 => {
             let label = if sampled_grok {
                 "SAMPLED MESSAGE"
-            } else {
+            } else if message_count_is_complete {
                 "ONLY MESSAGE"
+            } else if can_use_first_title {
+                "FIRST MESSAGE"
+            } else {
+                "AVAILABLE MESSAGE"
             };
             append_message_excerpt(lines, label, first, width, excerpt_lines);
         }
@@ -1684,6 +1707,13 @@ pub(super) fn append_preview_lines(
             if height >= 15 {
                 lines.push(detail_line(String::new(), DetailStyle::Normal));
             }
+            let latest_label = if sampled_grok {
+                "LATEST IN PREVIEW"
+            } else if message_count_is_complete {
+                "LATEST MESSAGE"
+            } else {
+                "LATEST AVAILABLE MESSAGE"
+            };
             append_message_excerpt(lines, latest_label, latest, width, excerpt_lines);
         }
         (Some(first), None) => {
@@ -1693,7 +1723,13 @@ pub(super) fn append_preview_lines(
 }
 
 pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
-    let PreviewValue::Ready { preview, .. } = preview else {
+    let PreviewValue::Ready {
+        preview,
+        source_provider,
+        can_use_first_title: true,
+        ..
+    } = preview
+    else {
         return None;
     };
     match &preview.title {
@@ -1705,6 +1741,7 @@ pub(super) fn preview_title(preview: &PreviewValue) -> Option<String> {
     preview
         .first
         .as_ref()
+        .filter(|message| *source_provider != Provider::Codex || message.role == HandoffRole::User)
         .map(|message| compact_text(&message.text))
         .filter(|title| !title.is_empty())
 }

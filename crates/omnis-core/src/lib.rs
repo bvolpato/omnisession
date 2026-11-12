@@ -9,7 +9,7 @@ use codex_replies::Occurrence;
 
 pub use cursor_workspace::{
     SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
-    local_cursor_workspace_path, session_workspace_matches,
+    local_cursor_workspace_path, resolve_local_path, session_workspace_matches,
 };
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 pub use remote::RemoteFingerprints;
@@ -51,6 +51,42 @@ const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
 const CODEX_ROLLBACK_NOTICE: &str = "Earlier Codex display items were excluded from active history after a model rollback. The recovery handoff records their status.";
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
+const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
+/// The provider name established by the latest readable name index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NativeSessionName {
+    Named(String),
+    /// The selected SQLite thread owns this name or explicitly has no GUI name.
+    Gui(Option<String>),
+    /// A complete name index has no assignment for this session.
+    Absent,
+    /// The available index cannot establish this session's current name.
+    #[default]
+    Unknown,
+}
+
+impl NativeSessionName {
+    /// Returns the observed assigned name, if present.
+    #[must_use]
+    pub fn into_title(self) -> Option<String> {
+        match self {
+            Self::Named(title) | Self::Gui(Some(title)) => Some(title),
+            Self::Gui(None) | Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    /// Checks whether the observed name agrees with the session metadata.
+    #[must_use]
+    pub fn confirms(&self, expected: Option<&str>) -> bool {
+        match self {
+            Self::Named(current) => expected == Some(current.as_str()),
+            Self::Gui(current) => current.as_deref() == expected,
+            Self::Absent => expected.is_none(),
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 7;
 
@@ -58,8 +94,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 7;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity => 11,
-        Provider::OhMyPi | Provider::Codex => 10,
+        Provider::Antigravity | Provider::Codex => 11,
+        Provider::OhMyPi => 10,
         Provider::AntigravityDesktop => 9,
         Provider::Pi | Provider::Claude => 8,
         _ => SEARCH_DOCUMENT_VERSION,
@@ -96,6 +132,70 @@ const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "INSTRUCTIONS.md",
 ];
 static WORKSPACE_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+
+/// Maximum number of directories scanned below a Codex sessions directory.
+pub const CODEX_ROLLOUT_DIRECTORY_DEPTH: usize = 5;
+
+/// Resolves the native directory spelling while keeping subdirectories and filenames literal.
+#[must_use]
+pub fn codex_rollout_path_in_home(canonical_home: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components();
+    let std::path::Component::Normal(name) = components.next()? else {
+        return None;
+    };
+    if name != "sessions" && name != "archived_sessions" {
+        return None;
+    }
+    let directory = canonical_home.join(name);
+    if !directory.symlink_metadata().ok()?.is_dir() {
+        return None;
+    }
+    let canonical = directory.canonicalize().ok()?;
+    (canonical.parent() == Some(canonical_home)).then(|| canonical.join(components.as_path()))
+}
+
+/// Returns the only Codex home that can discover a canonical rollout path.
+#[must_use]
+pub fn unique_codex_rollout_home(canonical_rollout: &Path) -> Option<&Path> {
+    let mut home = None;
+    for directory in canonical_rollout
+        .ancestors()
+        .skip(1)
+        .take(CODEX_ROLLOUT_DIRECTORY_DEPTH + 1)
+    {
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        #[cfg(unix)]
+        let observed = directory.symlink_metadata().ok()?;
+        for name in ["sessions", "archived_sessions"] {
+            let native = parent.join(name);
+            let metadata = match native.symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            // Discovery skips directory symlinks. Other spellings can name the same directory.
+            if !metadata.is_dir() {
+                continue;
+            }
+            #[cfg(unix)]
+            let same = {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino()) == (observed.dev(), observed.ino())
+            };
+            #[cfg(not(unix))]
+            let same = same_file::is_same_file(&native, directory).ok()?;
+            if same {
+                if home.replace(parent).is_some() {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    home
+}
 
 /// Failure while collecting non-secret workspace metadata.
 #[derive(Debug, Error)]
@@ -883,6 +983,10 @@ pub fn session_search_title_is_authoritative(
     snapshot: &CanonicalSnapshot,
     full_read: bool,
 ) -> bool {
+    if snapshot.session.provider == Provider::Codex {
+        return provider_search_title(snapshot).is_some()
+            || session_message_prefix_is_known(snapshot, full_read);
+    }
     (full_read && !snapshot.events.iter().any(reports_omitted_events))
         || verified_omp_rename(snapshot).is_some()
         || latest_omp_reset(snapshot).is_some_and(|reset| {
@@ -906,26 +1010,12 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
             None
         };
     }
-    snapshot
-        .title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-        .map_or_else(|| session_history_title(snapshot), compact_search_title)
+    provider_search_title(snapshot).or_else(|| session_message_search_title(snapshot))
 }
 
-/// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
+/// Returns the redacted title from the opening visible message when it is a user request.
 #[must_use]
-pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
-    if provider == Provider::Codex {
-        session_history_title(snapshot)
-    } else {
-        session_search_title(snapshot)
-    }
-}
-
-/// Returns the first visible user turn as a search title when the provider has no catalog title.
-#[must_use]
-pub fn session_history_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+pub fn session_message_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     let events = visible_events(snapshot);
     title_opener(
         events
@@ -934,6 +1024,18 @@ pub fn session_history_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     )
     .and_then(|(_, title)| title)
 }
+
+/// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
+#[must_use]
+pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
+    if provider == Provider::Codex {
+        session_message_search_title(snapshot)
+    } else {
+        session_search_title(snapshot)
+    }
+}
+
+pub use session_message_search_title as session_history_title;
 
 /// Returns the withdrawn opening title and its first surviving local successor.
 /// The caller supplies the complete local paginated display in canonical order.
@@ -990,7 +1092,133 @@ pub fn compact_search_title(title: &str) -> Option<String> {
         .chars()
         .take(SEARCH_TITLE_CHARACTER_LIMIT)
         .collect::<String>();
-    (!title.is_empty()).then_some(title)
+    (!title.trim().is_empty()).then_some(title)
+}
+
+fn provider_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    snapshot.title.as_deref().and_then(compact_search_title)
+}
+
+/// Returns whether this read covers the first visible message or confirms there are none.
+///
+/// A bounded read or a read with omissions can still include the start of the conversation.
+/// The reader records the sequence where its verified prefix ends.
+#[must_use]
+pub fn session_message_prefix_is_known(snapshot: &CanonicalSnapshot, full_read: bool) -> bool {
+    session_message_coverage(snapshot, full_read) != MessageCoverage::Unknown
+}
+
+/// Which visible messages the reader can verify from the source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageCoverage {
+    /// A gap may precede the first retained message.
+    Unknown,
+    /// The opening message is known, but later messages may be missing.
+    VerifiedPrefix,
+    /// The read accounts for every visible message.
+    Complete,
+}
+
+/// Determines whether the source covers the opening message and the complete message count.
+#[must_use]
+pub fn session_message_coverage(snapshot: &CanonicalSnapshot, full_read: bool) -> MessageCoverage {
+    let events = || snapshot.events.iter().filter(|event| !is_secret(event));
+    let mut prefix_end = None::<u64>;
+    let mut only_eof_markers = true;
+    let mut has_legacy_display = false;
+    for event in events() {
+        has_legacy_display |= codex_display_marker(event)
+            && event.source.raw_record_type.as_deref() == Some("event_msg");
+        if let Some(end) = codex_verified_prefix_end(snapshot, event) {
+            prefix_end = Some(prefix_end.map_or(end, |previous| previous.min(end)));
+            only_eof_markers &= end == event.sequence
+                && event.source.raw_record_type.as_deref()
+                    == Some("omnisession.codex_preview_prefix")
+                && event.payload["prefix_complete"].as_bool() == Some(true)
+                && omitted_history(event).is_none();
+        } else if omitted_history(event) == Some(OmittedHistory::MayIncludeMessages) {
+            return MessageCoverage::Unknown;
+        }
+    }
+    // Only the EOF marker can occupy the final sequence.
+    let reached_eof = only_eof_markers
+        && prefix_end.is_some_and(|end| {
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.sequence >= end)
+                .take(2)
+                .count()
+                == 1
+        });
+    if reached_eof {
+        prefix_end = None;
+    } else if !full_read && prefix_end.is_none() {
+        return MessageCoverage::Unknown;
+    }
+    let display_history = (snapshot.session.provider == Provider::Codex && has_legacy_display)
+        .then(|| visible_history(snapshot));
+    if let Some(gap) = display_history
+        .as_ref()
+        .and_then(|history| history.unattributed_codex_displays.first().copied())
+    {
+        prefix_end = Some(prefix_end.map_or(gap, |end| end.min(gap)));
+    }
+    let first_checkpoint = events()
+        .filter(|event| source_compaction_text(event).is_some())
+        .map(|event| (event.sequence, event.event_id))
+        .min();
+    if prefix_end.is_none() && first_checkpoint.is_none() {
+        return MessageCoverage::Complete;
+    }
+    let verified_opener = |event: &OmniEvent| {
+        prefix_end.is_none_or(|end| event.sequence < end)
+            && first_checkpoint
+                .is_none_or(|checkpoint| (event.sequence, event.event_id) < checkpoint)
+            && is_preview_message(event)
+    };
+    let has_opener = if let Some(history) = display_history {
+        history.events.into_iter().any(verified_opener)
+    } else {
+        events().any(verified_opener)
+    };
+    if has_opener {
+        MessageCoverage::VerifiedPrefix
+    } else {
+        MessageCoverage::Unknown
+    }
+}
+
+fn codex_verified_prefix_end(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<u64> {
+    let record_type = event.source.raw_record_type.as_deref()?;
+    if event.kind != EventKind::ProviderEvent
+        || event.replay_policy != ReplayPolicy::HistoricalOnly
+        || snapshot.session.provider != Provider::Codex
+        || event.source.provider != Provider::Codex
+        || event.source.native_session_id != snapshot.session.id
+        || reports_unsupported_text(event)
+        || (record_type != "omnisession.preview_limit"
+            && event.payload["native_history_unverified"].as_bool() == Some(true))
+    {
+        return None;
+    }
+    match record_type {
+        "omnisession.codex_preview_prefix"
+        | "omnisession.preview_limit"
+        | "omnisession.record_size_limit" => {}
+        CODEX_MALFORMED_RECORDS => {
+            let count = event.payload["malformed_records"]
+                .as_u64()
+                .filter(|count| *count > 0)?;
+            if event.payload["omitted_events"].as_u64() != Some(count) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    event.payload["prefix_end_sequence"]
+        .as_u64()
+        .filter(|end| *end <= event.sequence)
 }
 
 fn reset_preview_context(snapshot: &CanonicalSnapshot) -> Option<(ContextEvents<'_>, bool)> {
@@ -1024,6 +1252,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut first = None;
     let mut latest = None;
     let mut message_count = 0;
+    let mut event_count = snapshot.events.len();
     let metadata = session_recorded_metadata(snapshot);
 
     let (events, start, title) = if let Some((context, verified)) = reset_preview_context(snapshot)
@@ -1052,6 +1281,11 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
             first.get_or_insert(event);
             latest = Some(event);
             message_count += 1;
+        } else if event.source.raw_record_type.as_deref()
+            == Some("omnisession.codex_preview_prefix")
+            && codex_verified_prefix_end(snapshot, event).is_some()
+        {
+            event_count -= 1;
         }
     }
 
@@ -1061,7 +1295,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         first: first.and_then(preview_message),
         latest: latest.and_then(preview_message),
         message_count,
-        event_count: snapshot.events.len(),
+        event_count,
         tool_event_count: snapshot
             .events
             .iter()
@@ -3972,17 +4206,47 @@ fn is_secret(event: &OmniEvent) -> bool {
 /// Returns whether the provider adapter reported incomplete history.
 #[must_use]
 pub fn reports_omitted_events(event: &OmniEvent) -> bool {
-    event.kind == EventKind::ProviderEvent
-        && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
-            || ["omitted_events", "unsupported_text_records"]
-                .iter()
-                .any(|key| {
-                    event
-                        .payload
-                        .get(key)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|count| count > 0)
-                }))
+    omitted_history(event).is_some()
+}
+
+#[derive(Eq, PartialEq)]
+enum OmittedHistory {
+    ToolsOnly,
+    MayIncludeMessages,
+}
+
+fn omitted_history(event: &OmniEvent) -> Option<OmittedHistory> {
+    if event.kind != EventKind::ProviderEvent {
+        return None;
+    }
+    if reports_unverified_messages(event)
+        || (event.source.provider == Provider::Codex
+            && event.source.raw_record_type.as_deref() == Some(CODEX_MALFORMED_RECORDS))
+    {
+        return Some(OmittedHistory::MayIncludeMessages);
+    }
+    let omitted = event.payload["omitted_events"]
+        .as_u64()
+        .filter(|count| *count > 0)?;
+    if event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("omnisession.codex_tool_limit")
+        && event.payload["omitted_tool_events"].as_u64() == Some(omitted)
+    {
+        Some(OmittedHistory::ToolsOnly)
+    } else {
+        Some(OmittedHistory::MayIncludeMessages)
+    }
+}
+
+fn reports_unverified_messages(event: &OmniEvent) -> bool {
+    event.payload["native_history_unverified"].as_bool() == Some(true)
+        || reports_unsupported_text(event)
+}
+
+fn reports_unsupported_text(event: &OmniEvent) -> bool {
+    event.payload["unsupported_text_records"]
+        .as_u64()
+        .is_some_and(|count| count > 0)
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -5367,6 +5631,43 @@ mod tests {
         session_preview, session_search_title, trajectory_search_document,
         trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
+
+    #[test]
+    fn rollout_home_follows_the_filesystems_directory_lookup() {
+        for spelling in ["Sessions", "ſessions"] {
+            let temp = TempDir::new().unwrap();
+            let outer = temp.path().canonicalize().unwrap();
+            let inner = outer.join(spelling).join("team");
+            let sessions = inner.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let rollout = sessions.join("restored.jsonl");
+            fs::write(&rollout, "").unwrap();
+            let canonical = rollout.canonicalize().unwrap();
+            let discoverable = outer
+                .join("sessions/team/sessions/restored.jsonl")
+                .is_file();
+            let expected = (!discoverable).then_some(inner.as_path());
+            assert_eq!(super::unique_codex_rollout_home(&canonical), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_searchable_active_directory_preserves_the_archived_rollout_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let active = home.join("sessions");
+        fs::create_dir(&active).unwrap();
+        let archive = home.join("archived_sessions");
+        fs::create_dir(&archive).unwrap();
+        let rollout = archive.join("restored.jsonl");
+        fs::write(&rollout, "").unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o111)).unwrap();
+        let actual = super::unique_codex_rollout_home(&rollout);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(actual, Some(home.as_path()));
+    }
 
     #[test]
     fn native_antigravity_documents_upgrade_independently_of_imported_bundles() {
@@ -7075,11 +7376,278 @@ mod tests {
             session_search_title(&snapshot).as_deref(),
             Some("Fix the pagination bug with [REDACTED: API_KEY]")
         );
+        assert_eq!(
+            super::search_title_opener_from_messages(&snapshot.events),
+            Some((1, session_search_title(&snapshot)))
+        );
         snapshot.title = Some("Provider summary".to_owned());
         assert_eq!(
             session_search_title(&snapshot).as_deref(),
             Some("Provider summary")
         );
+    }
+
+    #[test]
+    fn title_authority_distinguishes_sampled_requests_from_provider_titles() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            8,
+            EventKind::MessageUser,
+            json!({"text": "A later request"}),
+        )]);
+        assert!(session_search_title(&snapshot).is_some());
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        snapshot.title = Some("\u{1b}\t".to_owned());
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        snapshot.title = Some("Provider title".to_owned());
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, false
+        ));
+        assert!(!super::session_message_prefix_is_known(&snapshot, false));
+        assert!(super::session_message_prefix_is_known(&snapshot, true));
+    }
+
+    #[test]
+    fn title_authority_distinguishes_tool_only_omissions_from_missing_messages() {
+        let mut notice = event(
+            1,
+            EventKind::ProviderEvent,
+            json!({
+                "omitted_events": 42, "omitted_tool_events": 42, "event_kind": "tool",
+            }),
+        );
+        notice.source.raw_record_type = Some("omnisession.codex_tool_limit".to_owned());
+        let mut snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageAssistant,
+                json!({"text": "Assistant first"}),
+            ),
+            notice,
+        ]);
+        assert!(session_search_title(&snapshot).is_none());
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            super::MessageCoverage::Complete
+        );
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
+        for (record_type, payload, authoritative) in [
+            (
+                "omnisession.codex_history_base",
+                json!({"native_history_unverified": true}),
+                false,
+            ),
+            (
+                "omnisession.codex_history_base",
+                json!({"omitted_events": 1}),
+                false,
+            ),
+            (
+                "omnisession.record_size_limit",
+                json!({"omitted_events": 1, "omitted_records": 1}),
+                false,
+            ),
+            (
+                "omnisession.codex_tool_limit",
+                json!({"omitted_events": 2, "omitted_tool_events": 1}),
+                false,
+            ),
+            ("omnisession.codex_attached_parent_context", json!({}), true),
+            ("omnisession.codex_subagent_model_context", json!({}), true),
+        ] {
+            let mut notice = event(2, EventKind::ProviderEvent, payload);
+            notice.source.raw_record_type = Some(record_type.to_owned());
+            snapshot.events.push(notice);
+            assert_eq!(
+                super::session_search_title_is_authoritative(&snapshot, true),
+                authoritative,
+                "{record_type}"
+            );
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn title_authority_uses_the_first_gap_in_the_visible_message_prefix() {
+        let mut first_secret = event(0, EventKind::MessageUser, json!({"text": "Hidden message"}));
+        first_secret.sensitivity = Sensitivity::Secret;
+        let mut snapshot = snapshot_with_events(vec![
+            first_secret,
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text": "<environment_context>setup"}),
+            ),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Opening request"}),
+            ),
+        ]);
+        for (full_read, record_type, payload) in [
+            (
+                false,
+                "omnisession.codex_preview_prefix",
+                json!({"prefix_end_sequence": 3}),
+            ),
+            (
+                false,
+                "omnisession.preview_limit",
+                json!({"omitted_events": 1, "prefix_end_sequence": 3}),
+            ),
+            (
+                false,
+                "omnisession.preview_limit",
+                json!({"native_history_unverified": true, "prefix_end_sequence": 3}),
+            ),
+            (
+                true,
+                "omnisession.record_size_limit",
+                json!({"omitted_events": 1, "prefix_end_sequence": 3}),
+            ),
+            (
+                true,
+                "omnisession.codex_malformed_records",
+                json!({"omitted_events": 1, "malformed_records": 1, "prefix_end_sequence": 3}),
+            ),
+        ] {
+            let mut notice = event(3, EventKind::ProviderEvent, payload);
+            notice.source.raw_record_type = Some(record_type.to_owned());
+            snapshot.events.push(notice);
+            assert_eq!(
+                super::session_preview(&snapshot).event_count,
+                snapshot.events.len()
+                    - usize::from(record_type == "omnisession.codex_preview_prefix")
+            );
+            assert_eq!(
+                super::session_message_coverage(&snapshot, full_read),
+                super::MessageCoverage::VerifiedPrefix,
+                "{record_type}"
+            );
+            snapshot.events.push(event(
+                4,
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+            ));
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            snapshot.events.pop();
+            let notice = snapshot.events.last_mut().unwrap();
+            notice.payload["unsupported_text_records"] = 1.into();
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            let notice = snapshot.events.last_mut().unwrap();
+            notice.payload["unsupported_text_records"] = 0.into();
+            notice.payload["prefix_end_sequence"] = 2.into();
+            assert!(!super::session_message_prefix_is_known(
+                &snapshot, full_read
+            ));
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn inconsistent_malformed_record_counts_cannot_confirm_a_title() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "A retained request"}),
+        )]);
+        for (omitted, malformed) in [
+            (Some(1), None),
+            (Some(1), Some(0)),
+            (Some(2), Some(1)),
+            (None, Some(1)),
+        ] {
+            let mut notice = event(
+                1,
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": omitted, "malformed_records": malformed, "prefix_end_sequence": 1,
+                }),
+            );
+            notice.source.raw_record_type = Some("omnisession.codex_malformed_records".to_owned());
+            snapshot.events.push(notice);
+            assert!(!super::session_message_prefix_is_known(&snapshot, true));
+            snapshot.events.pop();
+        }
+    }
+
+    #[test]
+    fn complete_preview_confirms_no_messages_only_at_an_uninterrupted_eof() {
+        let mut notice = event(
+            2,
+            EventKind::ProviderEvent,
+            json!({"prefix_end_sequence": 2, "prefix_complete": true}),
+        );
+        notice.source.raw_record_type = Some("omnisession.codex_preview_prefix".to_owned());
+        let mut snapshot = snapshot_with_events(vec![
+            event(0, EventKind::ToolCompleted, json!({"output": "Worked"})),
+            notice,
+        ]);
+        assert!(session_search_title(&snapshot).is_none());
+        assert_eq!(
+            super::session_message_coverage(&snapshot, false),
+            super::MessageCoverage::Complete
+        );
+
+        let mut positioned_gap = event(
+            1,
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1, "prefix_end_sequence": 1}),
+        );
+        positioned_gap.source.raw_record_type = Some("omnisession.record_size_limit".to_owned());
+        for gap in [
+            positioned_gap,
+            event(
+                1,
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+            ),
+            compaction(1, Provider::Codex, "A retained checkpoint"),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Conflicting sequence"}),
+            ),
+            event(3, EventKind::MessageUser, json!({"text": "Later request"})),
+        ] {
+            snapshot.events.push(gap);
+            assert!(!super::session_message_prefix_is_known(&snapshot, false));
+            snapshot.events.pop();
+        }
+        snapshot.events[1].source.native_session_id = "different-session".to_owned();
+        assert!(!super::session_message_prefix_is_known(&snapshot, false));
+    }
+
+    #[test]
+    fn title_authority_requires_a_visible_message_before_a_compacted_prefix() {
+        let mut snapshot = snapshot_with_events(vec![
+            compaction(1, Provider::Codex, "A checkpoint from earlier history"),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "A later request"}),
+            ),
+        ]);
+        assert!(!super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
+        snapshot.events.push(event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Original request"}),
+        ));
+        assert!(super::session_search_title_is_authoritative(
+            &snapshot, true
+        ));
     }
 
     #[test]
@@ -7362,15 +7930,10 @@ mod tests {
     #[test]
     fn legacy_codex_marker_uses_the_import_boundary() {
         let literal = super::CODEX_IMPORT_MARKER;
-        let display = |kind, text: &str| {
-            let mut item = event(0, kind, json!({"text": text}));
-            item.source.raw_record_type = Some("event_msg".to_owned());
-            item
-        };
-        let user = display(EventKind::MessageUser, "Question");
-        let marker = display(EventKind::MessageAssistant, literal);
-        let reply = display(EventKind::MessageAssistant, "Four.");
-        let mut native_reply = display(EventKind::MessageAssistant, "Later reply");
+        let user = legacy_display(EventKind::MessageUser, "Question");
+        let marker = legacy_display(EventKind::MessageAssistant, literal);
+        let reply = legacy_display(EventKind::MessageAssistant, "Four.");
+        let mut native_reply = legacy_display(EventKind::MessageAssistant, "Later reply");
         native_reply.source.raw_record_type = Some("response_item.message".to_owned());
         let mut native_literal = marker.clone();
         native_literal.source.raw_record_type = Some("response_item.message".to_owned());
@@ -7426,6 +7989,7 @@ mod tests {
                 false,
             ),
             // Older exports omitted usage, including from sessions that later resumed.
+            (vec![&user, &marker], vec![], true),
             (
                 vec![&user, &reply, &marker, &user, &native_reply],
                 vec!["Four.", "Later reply"],
@@ -7460,6 +8024,32 @@ mod tests {
         }
     }
 
+    fn legacy_display(kind: EventKind, text: &str) -> OmniEvent {
+        let mut item = event(0, kind, json!({"text": text}));
+        item.source.raw_record_type = Some("event_msg".to_owned());
+        item
+    }
+
+    #[test]
+    fn an_unattributed_display_cannot_supply_the_first_visible_message() {
+        let harness = legacy_display(
+            EventKind::MessageUser,
+            "<environment_context><cwd>/synthetic</cwd></environment_context>",
+        );
+        let snapshot = snapshot_with_events(vec![
+            harness,
+            OmniEvent {
+                sequence: 1,
+                ..legacy_display(EventKind::MessageAssistant, super::CODEX_IMPORT_MARKER)
+            },
+        ]);
+        assert!(super::session_message_search_title(&snapshot).is_none());
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            super::MessageCoverage::Unknown
+        );
+    }
+
     fn assert_legacy_codex_projection(
         events: Vec<&OmniEvent>,
         expected: &[&str],
@@ -7489,6 +8079,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(assistants, expected);
         assert_eq!(conversation.truncated, incomplete);
+        assert_eq!(
+            super::session_message_coverage(&snapshot, true),
+            if !incomplete {
+                super::MessageCoverage::Complete
+            } else if snapshot.events.iter().any(super::reports_omitted_events) {
+                super::MessageCoverage::Unknown
+            } else {
+                super::MessageCoverage::VerifiedPrefix
+            }
+        );
         let markdown = render_markdown_export(&snapshot);
         let (_, tool_section) = markdown.split_once("## Historical Tool Activity").unwrap();
         assert_eq!(

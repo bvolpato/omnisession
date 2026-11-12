@@ -225,7 +225,7 @@ impl fmt::Display for CurrentRolloutUnconfirmed {
 
 impl std::error::Error for CurrentRolloutUnconfirmed {}
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct CurrentRollout {
     path: PathBuf,
     paginated: Option<bool>,
@@ -261,8 +261,19 @@ fn same_index_filename(a: &Path, b: &Path) -> bool {
 }
 
 impl CurrentRollout {
-    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
-        self.name.title(indexed)
+    pub(super) fn observed_name(
+        &self,
+        indexed: impl FnOnce() -> crate::NativeSessionName,
+    ) -> crate::NativeSessionName {
+        use crate::NativeSessionName;
+        match &self.name {
+            gui_names::StateName::Gui(name) => NativeSessionName::Gui(name.clone()),
+            gui_names::StateName::Index | gui_names::StateName::CorroboratedIndex => indexed(),
+            gui_names::StateName::Guardian(name) => match indexed() {
+                named @ NativeSessionName::Named(_) => named,
+                _ => NativeSessionName::Gui(Some(name.clone())),
+            },
+        }
     }
 
     pub(super) fn corroborates_index(&self) -> bool {
@@ -358,11 +369,7 @@ impl CurrentRollout {
     }
 
     pub(super) fn requires_selection(&self, home: &Path) -> bool {
-        self.required() || self.outside_home(home)
-    }
-
-    pub(super) fn outside_home(&self, home: &Path) -> bool {
-        !self.path.starts_with(home)
+        self.required() || !self.path.starts_with(home)
     }
 
     pub(super) fn has_legacy_name(&self) -> bool {
@@ -545,6 +552,23 @@ impl CurrentRollout {
                     .is_some_and(|generation| generation != id),
             CurrentRolloutUnavailable
         );
+        let Some(path) = self.recorded_representation(home)? else {
+            return Ok(None);
+        };
+        let Some(mut current) = self.check(&path, id)? else {
+            return Ok(None);
+        };
+        if !paginated && current.session.history_mode != CodexHistoryMode::Legacy {
+            return Ok(None);
+        }
+        current.native = !paginated
+            && path.extension().is_none_or(|ext| ext != "gz")
+            && !self.archived
+            && path.starts_with(home.join("sessions"));
+        Ok(Some(current))
+    }
+
+    fn recorded_representation(&self, home: &Path) -> Result<Option<PathBuf>> {
         let name = rollout_file::jsonl_file_name(&self.path).context(CurrentRolloutUnavailable)?;
         let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
         let recorded =
@@ -556,20 +580,23 @@ impl CurrentRollout {
             .filter(|path| path.extension().is_some_and(|ext| ext == "gz") == gzip)
         {
             local_recording(home, &root, &path)?;
-            if !accessible(home, &root, &path)? {
-                continue;
+            if accessible(home, &root, &path)? {
+                return Ok(Some(path));
             }
-            let Some(mut current) = self.check(&path, id)? else {
-                return Ok(None);
-            };
-            if !paginated && current.session.history_mode != CodexHistoryMode::Legacy {
-                return Ok(None);
-            }
-            current.native =
-                !paginated && !gzip && !self.archived && path.starts_with(home.join("sessions"));
-            return Ok(Some(current));
         }
         Ok(None)
+    }
+
+    pub(super) fn recorded_file_replaces(&self, home: &Path, prior: &Path, prior_id: Uuid) -> bool {
+        let Some(path) = self.recorded_representation(home).ok().flatten() else {
+            return false;
+        };
+        let prior =
+            ObservedRollout::read(prior).filter(|source| source.revision.file == Some(prior_id));
+        prior
+            .and_then(|source| source.physical_identity)
+            .zip(ObservedRollout::read(&path).and_then(|source| source.physical_identity))
+            .is_some_and(|(prior, selected)| prior != selected)
     }
 
     fn check(&self, path: &Path, id: &str) -> Result<Option<CurrentFile>> {
@@ -843,7 +870,13 @@ mod tests {
         for (rows, marker) in [(before, "before"), (after, "after")] {
             for id in [THREAD, NEXT] {
                 assert_eq!(rows[id].path, PathBuf::from(format!("{marker}.jsonl")));
-                assert_eq!(rows[id].name.title(|| None).as_deref(), Some(marker));
+                assert_eq!(
+                    rows[id]
+                        .observed_name(|| crate::NativeSessionName::Unknown)
+                        .into_title()
+                        .as_deref(),
+                    Some(marker)
+                );
             }
         }
         drop(writer);

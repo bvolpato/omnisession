@@ -35,8 +35,8 @@ use omnis_core::{
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
-    TrajectorySelection, TrajectorySourceGuard,
+    HandoffRecord, IndexedSession, IndexedTrajectoryTitle, SessionTrajectoryMatch,
+    SessionTrajectorySearchPage, Store, TrajectorySelection, TrajectorySourceGuard,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -144,11 +144,22 @@ struct PickerEntry {
     session: NativeSession,
     current_workspace: bool,
     listed_title: Option<String>,
+    retired_names: Vec<String>,
     fields: SearchFields,
     cached: bool,
 }
 
 impl PickerEntry {
+    fn provider_name(&self) -> Option<&str> {
+        self.listed_title.as_deref()
+    }
+
+    fn retire_previous_name(&mut self, name: &str) {
+        if self.provider_name() != Some(name) && !self.retired_names.iter().any(|old| old == name) {
+            self.retired_names.push(name.to_owned());
+        }
+    }
+
     fn source_revision(&self) -> Option<SourceRevision> {
         if !matches!(
             self.session.session.provider,
@@ -194,6 +205,8 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
+    indexed_titles: HashMap<String, (SourceRevision, String)>,
+    preview_titles: HashMap<String, (PreviewKey, String)>,
     derived_titles: HashMap<String, omnis_store::IndexedTitle>,
     workspace_updates: HashMap<SourceRevision, omnis_store::CodexWorkspaceUpdate>,
     index_progress: Option<(usize, usize)>,
@@ -284,6 +297,8 @@ impl PickerState {
             selection_touched: false,
             visible_cache: RefCell::new(None),
             derived_titles: HashMap::new(),
+            indexed_titles: HashMap::new(),
+            preview_titles: HashMap::new(),
             workspace_updates: HashMap::new(),
             index_progress: None,
             index_deadline: None,
@@ -468,14 +483,46 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
-        self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
+        self.replace_provider_entries(
+            provider,
+            picker_entries(sessions, current_project, cached),
+            true,
+            &[],
+        );
     }
 
-    fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
+    fn replace_provider_entries(
+        &mut self,
+        provider: Provider,
+        mut entries: Vec<PickerEntry>,
+        complete: bool,
+        unavailable: &[IndexedSession],
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
-        self.entries
-            .retain(|entry| entry.session.session.provider != provider);
+        self.forget_replaced_sources(&entries);
+        if provider == Provider::Codex && !complete {
+            let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
+            let unavailable: HashMap<_, _> = unavailable
+                .iter()
+                .map(|row| (&row.session, row.source_revision.map(preview_revision)))
+                .collect();
+            self.entries.retain(|entry| {
+                if unavailable.get(&entry.session.session)
+                    == Some(&entry.session.source_revision.map(preview_revision))
+                {
+                    self.indexed_titles.remove(&entry.key);
+                    self.preview_titles.remove(&entry.key);
+                    self.trajectory_matches.remove(&entry.key);
+                    self.previews.remove_session(&entry.session.session);
+                    return false;
+                }
+                !observed.contains(entry.key.as_str())
+            });
+        } else {
+            self.entries
+                .retain(|entry| entry.session.session.provider != provider);
+        }
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
@@ -491,6 +538,7 @@ impl PickerState {
     fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
+        self.forget_replaced_sources(&entries);
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
         self.apply_verified_workspaces(0..self.entries.len());
@@ -500,6 +548,93 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
+    }
+
+    fn forget_replaced_sources(&mut self, entries: &[PickerEntry]) {
+        for entry in entries {
+            let Some(index) = self.entry_positions.get(&entry.key) else {
+                continue;
+            };
+            let previous = &self.entries[*index];
+            let previous_key = self.preview_key(previous);
+            let path_changed = previous.session.source_revision.is_none()
+                && previous.session.source_path != entry.session.source_path;
+            if (path_changed || previous_key.source != self.preview_key(entry).source)
+                && (previous.session.source_path.is_some()
+                    || previous.session.source_revision.is_some()
+                    || self.preview_titles.contains_key(&entry.key)
+                    || self.previews.contains(&previous_key))
+            {
+                self.indexed_titles.remove(&entry.key);
+                self.preview_titles.remove(&entry.key);
+                self.previews.remove_session(&entry.session.session);
+            }
+        }
+    }
+
+    fn reconcile_discovered_names(
+        &mut self,
+        entries: &mut [PickerEntry],
+        names: Option<&workers::CatalogNames>,
+    ) {
+        let prior: HashMap<_, _> = names
+            .into_iter()
+            .flat_map(|names| {
+                names.inventory.observed.iter().filter_map(|row| {
+                    let name = names.inventory.observable_names.get(&row.session)?;
+                    Some((&row.session, (row.source_revision?, name)))
+                })
+            })
+            .collect();
+        for entry in entries {
+            let Some(revision) = entry
+                .source_revision()
+                .filter(|revision| revision.contents.is_some())
+            else {
+                continue;
+            };
+            let corroborated = names.and_then(|names| {
+                let assignment = names.prior_assignments.get(&entry.session.session.id)?;
+                names.inventory.corroborated_legacy_codex_name(
+                    &crate::indexed_session_metadata(&entry.session),
+                    assignment,
+                )
+            });
+            let observed_name = prior
+                .get(&entry.session.session)
+                .filter(|(source, _)| source.matches_file_contents(revision))
+                .map(|(_, name)| name.as_str())
+                .or(corroborated);
+            let current = self
+                .entry_positions
+                .get(&entry.key)
+                .map(|&i| &self.entries[i])
+                .filter(|old| old.source_revision() == Some(revision))
+                .filter(|old| {
+                    !(old.cached && old.provider_name().is_none() && corroborated.is_some())
+                });
+            let old_name = current.map_or(observed_name, PickerEntry::provider_name);
+            if (entry.provider_name().is_none() && names.is_none_or(|names| !names.complete))
+                || (current.is_some()
+                    && old_name != observed_name
+                    && entry.provider_name() != old_name)
+            {
+                entry.listed_title = old_name.map(str::to_owned);
+                entry.session.title = old_name.map(str::to_owned);
+                entry.fields = SearchFields::new(&entry.session, None);
+            }
+            if let Some(current) = current {
+                entry.retired_names.clone_from(&current.retired_names);
+            }
+            if names
+                .and_then(|names| names.selected_names.get(&entry.session.session.id))
+                .is_some_and(|name| name.confirms(entry.provider_name()))
+            {
+                for prior in [old_name, observed_name].into_iter().flatten() {
+                    entry.retire_previous_name(prior);
+                }
+            }
+        }
     }
 
     fn restore_selection(&mut self, selected_key: Option<String>) {
@@ -593,8 +728,25 @@ impl PickerState {
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
+        self.deleted_sessions.insert(session.to_string());
+        self.remove_entry(session, None);
+    }
+
+    fn discard_stale_cached_preview(&mut self, key: &PreviewKey) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        let entry = &self.entries[index];
+        if entry.cached && self.preview_key(entry) == *key {
+            let selected = self.selected_entry().map(|entry| entry.key.clone());
+            self.remove_entry(&key.session, selected);
+        }
+    }
+
+    fn remove_entry(&mut self, session: &SessionRef, selected: Option<String>) {
         let key = session.to_string();
-        self.deleted_sessions.insert(key.clone());
+        self.indexed_titles.remove(&key);
+        self.preview_titles.remove(&key);
         self.entries.retain(|entry| entry.key != key);
         self.trajectory_matches.remove(&key);
         self.trajectory_match_order.remove(&key);
@@ -605,7 +757,7 @@ impl PickerState {
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
-        self.restore_selection(None);
+        self.restore_selection(selected);
     }
 
     fn reset_selection(&mut self) {
@@ -702,7 +854,8 @@ impl PickerState {
         if self.workspace_updates.is_empty() {
             return false;
         }
-        let mut matcher = SessionWorkspaceMatcher::new(&self.current_project);
+        let current_project = self.current_project.clone();
+        let mut matcher = SessionWorkspaceMatcher::new(&current_project);
         let mut changed = false;
         for index in rows {
             let entry = &mut self.entries[index];
@@ -733,15 +886,156 @@ impl PickerState {
                     .project_path
                     .as_deref()
                     .is_some_and(|path| matcher.matches(entry.session.session.provider, path));
-                if let Some(record) = self.derived_titles.get(&entry.key) {
-                    apply_derived_title(entry, record);
-                } else {
-                    entry.fields = SearchFields::new(&entry.session, None);
-                }
+                self.refresh_entry_title(index);
                 changed = true;
             }
         }
         changed
+    }
+
+    fn remember_preview_title(
+        &mut self,
+        key: &mut PreviewKey,
+        value: &PreviewValue,
+        read_revision: Option<SourceRevision>,
+        indexed_title: Option<IndexedTrajectoryTitle>,
+    ) -> bool {
+        let session_key = key.session.to_string();
+        let Some(&index) = self.entry_positions.get(&session_key) else {
+            return false;
+        };
+        if self.preview_key(&self.entries[index]) != *key {
+            return false;
+        }
+        if let Some(revision) = read_revision {
+            if key
+                .source
+                .as_ref()
+                .and_then(PreviewSource::revision)
+                .is_some_and(|expected| expected != revision)
+            {
+                return false;
+            }
+            if matches!(key.source, Some(PreviewSource::Workspace(_))) {
+                self.entries[index].session.source_revision = Some(revision);
+                key.source = Some(PreviewSource::File(revision));
+            }
+        }
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let title = preview_continuation_title(value).or_else(|| preview_title(value));
+        let preview_changed = if let Some(title) = title {
+            let value = (key.clone(), title);
+            if self.preview_titles.get(&session_key) == Some(&value) {
+                false
+            } else {
+                self.preview_titles.insert(session_key.clone(), value);
+                true
+            }
+        } else if matches!(
+            value,
+            PreviewValue::Ready { complete, source_provider, can_use_first_title: true, .. } if *complete || *source_provider == Provider::Codex
+        ) {
+            self.preview_titles.remove(&session_key).is_some()
+        } else {
+            false
+        };
+        let index_changed =
+            indexed_title.is_some_and(|receipt| self.update_indexed_title(index, receipt));
+        if index_changed || preview_changed {
+            self.refresh_entry_title(index);
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.restore_selection(selected);
+        }
+        true
+    }
+
+    fn accepts_provider_name(&self, key: &PreviewKey, change: &ProviderNameChange) -> bool {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return false;
+        };
+        let entry = &self.entries[index];
+        let name = entry.provider_name().map(omnis_core::redact_secrets);
+        self.preview_key(entry) == *key && (name == change.previous || name == change.current)
+    }
+
+    fn remember_provider_name(&mut self, key: &PreviewKey, change: ProviderNameChange) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        if self.entries[index].provider_name() == change.current.as_deref() {
+            return;
+        }
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let entry = &mut self.entries[index];
+        entry.listed_title.clone_from(&change.current);
+        entry.session.title = change.current;
+        if let Some(previous) = change.previous {
+            entry.retire_previous_name(&previous);
+        }
+        self.refresh_entry_title(index);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected);
+    }
+
+    fn update_indexed_title(&mut self, index: usize, receipt: IndexedTrajectoryTitle) -> bool {
+        let entry = &self.entries[index];
+        let revision = preview_revision(receipt.source_revision);
+        if receipt.session != entry.session.session
+            || (receipt.session.provider == Provider::Codex
+                && entry.source_revision().unwrap_or_default() != revision)
+        {
+            return false;
+        }
+        let title = receipt.title.map(|title| (revision, title));
+        if self.indexed_titles.get(&entry.key) == title.as_ref() {
+            return false;
+        }
+        if let Some(title) = title {
+            self.indexed_titles.insert(entry.key.clone(), title);
+        } else {
+            self.indexed_titles.remove(&entry.key);
+        }
+        true
+    }
+
+    fn refresh_entry_title(&mut self, index: usize) {
+        let entry = &self.entries[index];
+        let indexed = self
+            .indexed_titles
+            .get(&entry.key)
+            .filter(|(revision, _)| {
+                entry.session.session.provider != Provider::Codex
+                    || entry.source_revision().unwrap_or_default() == *revision
+            })
+            .map(|(_, title)| title.as_str())
+            .filter(|title| {
+                !entry
+                    .retired_names
+                    .iter()
+                    .any(|old| crate::matches_previous_name(title, old))
+            });
+        let preview = self
+            .preview_titles
+            .get(&entry.key)
+            .filter(|(key, _)| *key == self.preview_key(entry))
+            .map(|(_, title)| title.as_str());
+        let entry = &mut self.entries[index];
+        if entry.listed_title.is_none() {
+            entry.session.title = indexed.or(preview).map(str::to_owned);
+        }
+        entry.fields = SearchFields::new(&entry.session, indexed.into_iter().chain(preview));
+    }
+
+    fn apply_derived_titles(&mut self) {
+        for index in 0..self.entries.len() {
+            let key = self.entries[index].key.clone();
+            if let Some(record) = self.derived_titles.get(&key) {
+                apply_derived_title(&mut self.entries[index], record);
+            }
+            if self.indexed_titles.contains_key(&key) || self.preview_titles.contains_key(&key) {
+                self.refresh_entry_title(index);
+            }
+        }
     }
 
     fn remember_source_titles(
@@ -787,13 +1081,13 @@ impl PickerState {
         {
             return false;
         }
-        self.remember_preview_title(&key, &value);
+        self.remember_other_preview_title(&key, &value);
         self.previews.insert(key, value, &self.preview_window);
         self.trajectory_index_changed();
         true
     }
 
-    fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
+    fn remember_other_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         let title = preview_continuation_title(value).or_else(|| preview_title(value));
         let PreviewValue::Ready { preview, .. } = value else {
             return;
@@ -835,6 +1129,25 @@ impl PickerState {
         let mut changed = false;
         for (session, record) in titles {
             let key = session.to_string();
+            if session.provider == Provider::Codex {
+                if let Some(&index) = self.entry_positions.get(&key)
+                    && self.update_indexed_title(
+                        index,
+                        IndexedTrajectoryTitle {
+                            session,
+                            title: record.title,
+                            document_version: record.document_version,
+                            source_revision: record.source_revision,
+                            verified_at: record.verified_at,
+                            cached_at: record.cached_at,
+                        },
+                    )
+                {
+                    self.refresh_entry_title(index);
+                    changed = true;
+                }
+                continue;
+            }
             if self.previews.rejected(&session, record.source_revision)
                 || self.derived_titles.get(&key) == Some(&record)
             {
@@ -856,14 +1169,6 @@ impl PickerState {
         if changed {
             self.entries_generation = self.entries_generation.wrapping_add(1);
             self.restore_selection(selected_key);
-        }
-    }
-
-    fn apply_derived_titles(&mut self) {
-        for entry in &mut self.entries {
-            if let Some(record) = self.derived_titles.get(&entry.key) {
-                apply_derived_title(entry, record);
-            }
         }
     }
 
@@ -1137,11 +1442,12 @@ impl PickerState {
             .iter()
             .filter(|key| !self.previews.contains(key))
             .filter_map(|key| {
-                let index = self.entry_positions.get(&key.session.to_string())?;
+                let entry = &self.entries[*self.entry_positions.get(&key.session.to_string())?];
                 Some(PreviewRequest {
-                    cached: self.entries[*index].cached,
                     key: key.clone(),
-                    source_path: self.entries[*index].session.source_path.clone(),
+                    source_path: entry.session.source_path.clone(),
+                    cached: entry.cached,
+                    provider_name: entry.provider_name().map(omnis_core::redact_secrets),
                 })
             })
             .collect::<Vec<_>>();
@@ -1191,6 +1497,12 @@ struct PreviewRequest {
     cached: bool,
     key: PreviewKey,
     source_path: Option<PathBuf>,
+    provider_name: Option<String>,
+}
+
+struct ProviderNameChange {
+    previous: Option<String>,
+    current: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1199,6 +1511,9 @@ enum PreviewValue {
         preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
         complete: bool,
+        source_provider: Provider,
+        can_use_first_title: bool,
+        message_count_is_complete: bool,
     },
     Unavailable,
 }
@@ -1475,10 +1790,12 @@ struct CachedPickerEntries {
     warnings: Vec<String>,
 }
 
-fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let registry = AdapterRegistry::with_local_adapters();
-    let (sessions, mut titles, mut warnings) =
-        crate::cached_native_catalog(&registry, store, None, false)?;
+fn retain_current_antigravity_titles(
+    registry: &AdapterRegistry,
+    store: &Store,
+    titles: &mut Vec<omnis_store::IndexedTrajectoryTitle>,
+    warnings: &mut Vec<String>,
+) {
     let mut eligible: Vec<_> = titles
         .iter()
         .filter(|row| {
@@ -1492,12 +1809,9 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             source: None,
         })
         .collect();
-    if let Err(error) = crate::scope_search_trajectories(&registry, store, &mut eligible) {
+    if let Err(error) = crate::scope_search_trajectories(registry, store, &mut eligible) {
         eligible.clear();
-        workers::record_picker_warning(
-            &mut warnings,
-            format!("Antigravity cached titles: {error:#}"),
-        );
+        workers::record_picker_warning(warnings, format!("Antigravity cached titles: {error:#}"));
     }
     let revisions: HashMap<_, _> = eligible
         .into_iter()
@@ -1511,6 +1825,14 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             .get(&row.session)
             .is_some_and(|revision| revision.matches_file_contents(row.source_revision))
     });
+}
+
+fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
+    let registry = AdapterRegistry::with_local_adapters();
+    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
+    let (sessions, mut titles, mut warnings) =
+        crate::scope_cached_native_catalog(&registry, store, None, false, sessions, titles)?;
+    retain_current_antigravity_titles(&registry, store, &mut titles, &mut warnings);
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -1526,14 +1848,35 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             session
         })
         .collect::<Vec<_>>();
-    omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+    let observed = omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+    let mut retired = HashMap::new();
+    if !observed.is_empty() {
+        let mut effective = titles
+            .iter()
+            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
+            .collect();
+        crate::apply_live_search_titles(store, &mut sessions, observed, &mut effective)?;
+        for receipt in &mut titles {
+            let current = effective.remove(&receipt.session);
+            if current != receipt.title
+                && let Some(previous) = std::mem::replace(&mut receipt.title, current)
+            {
+                retired.insert(receipt.session.clone(), previous);
+            }
+        }
+    }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut paths = SessionWorkspaceMatcher::new(current_project);
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
         if session.session.provider != Provider::Imported {
-            entries.push(picker_entry(session, &mut paths, true));
+            let previous = retired.remove(&session.session);
+            let mut entry = picker_entry(session, &mut paths, true);
+            if let Some(previous) = previous {
+                entry.retire_previous_name(&previous);
+            }
+            entries.push(entry);
             continue;
         }
         let current = match imports.matches(&session.session, session.project_path.as_deref()) {
@@ -1590,6 +1933,7 @@ impl PickerEntry {
             key: session.session.to_string(),
             current_workspace,
             listed_title: session.title.clone(),
+            retired_names: Vec::new(),
             fields: SearchFields::new(&session, None),
             session,
             cached,
@@ -3176,8 +3520,15 @@ mod tests {
                     false,
                     workers::indexed_session,
                 ),
-                retry: None,
                 reply: None,
+                retry: None,
+                names: Some(std::sync::Arc::new(workers::CatalogNames {
+                    inventory: store.observe_codex_catalog_inventory().unwrap(),
+                    unavailable: Vec::new(),
+                    prior_assignments: HashMap::new(),
+                    selected_names: HashMap::new(),
+                    complete: true,
+                })),
             }
             .persist(&store)
             .expect("persist picker discovery");
@@ -3322,6 +3673,8 @@ mod tests {
                 .send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider: Provider::Pi,
                     result,
+                    complete: true,
+                    names: None,
                 }))
                 .expect("return discovered entries");
         });
@@ -4060,6 +4413,9 @@ mod tests {
                 preview: Box::new(synthetic_preview("Start with cursor pagination.")),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
+                source_provider: Provider::Codex,
+                can_use_first_title: true,
             },
             &[],
         );
@@ -4094,32 +4450,84 @@ mod tests {
     #[test]
     fn preview_titles_become_searchable() {
         let current = fixture_workspace();
-        let mut state = PickerState::new(
-            vec![session(Provider::Codex, "session", current, None)],
-            current,
-            None,
-            false,
-        );
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut original = session(Provider::Codex, id, current, None);
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(format!("rollout-original-{id}.jsonl"));
+        fs::write(&path, "original").unwrap();
+        original.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&path);
+        original.source_path = Some(path);
+        let revision = original.source_revision.unwrap();
+        let mut state = PickerState::new(vec![original.clone()], current, None, false);
         state.query = "pagination".to_owned();
         assert!(state.visible_indices().is_empty());
 
-        let key = state.preview_key(&state.entries[0]);
+        let mut key = state.preview_key(&state.entries[0]);
+        let receipt = |title: Option<&str>| IndexedTrajectoryTitle {
+            verified_at: None,
+            cached_at: None,
+            session: original.session.clone(),
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            source_revision: revision,
+            title: title.map(str::to_owned),
+        };
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
+            source_provider: Provider::Codex,
+            can_use_first_title: true,
             complete: false,
+            message_count_is_complete: false,
         };
-        let previous = PreviewKey {
+        let mut previous = PreviewKey {
             source: Some(PreviewSource::Path(PathBuf::from(
                 "archived_sessions/old-rollout.jsonl",
             ))),
             ..key.clone()
         };
-        state.accept_preview(previous, value.clone(), None);
+        state.remember_preview_title(&mut previous, &value, None, None);
         assert!(state.visible_indices().is_empty());
-        state.accept_preview(key, value, None);
+        let sampled = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("A later pagination request")),
+            continuation: None,
+            complete: false,
+            message_count_is_complete: false,
+            source_provider: Provider::Codex,
+            can_use_first_title: false,
+        };
+        state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
+        assert!(state.visible_indices().is_empty());
+        assert_eq!(
+            display_title(&state.entries[0], Some(&sampled)),
+            "Untitled session"
+        );
 
+        state.remember_preview_title(&mut key, &value, None, Some(receipt(None)));
         assert_eq!(state.visible_indices().len(), 1);
+        state.remember_source_titles([receipt(Some("A separate title"))]);
+        state.remember_source_titles([receipt(None)]);
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            display_title(&state.entries[0], None),
+            "Fix pagination without changing the API"
+        );
+
+        state.remember_source_titles([receipt(Some("Indexed pagination"))]);
+        let mut replacement = original.clone();
+        let path = home.path().join(format!("rollout-replacement-{id}.jsonl"));
+        fs::write(&path, "replacement").unwrap();
+        replacement.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&path);
+        replacement.source_path = Some(path);
+        state.replace_provider(Provider::Codex, vec![replacement], current, false);
+        assert!(state.visible_indices().is_empty());
+        assert!(state.entries[0].session.title.is_none());
+        state.remember_preview_title(
+            &mut key,
+            &value,
+            None,
+            Some(receipt(Some("Retired pagination"))),
+        );
+        assert!(state.visible_indices().is_empty());
     }
 
     #[test]
@@ -4162,16 +4570,36 @@ mod tests {
         picker.refresh_preview_window(1);
         picker.preview_deadline = Some(Instant::now());
         let request = picker.due_preview_request().unwrap().pop().unwrap();
-        let read = workers::read_selected_preview(
+        let read = workers::read_picker_preview(
             &worker,
             &request.key,
             request.source_path.as_deref(),
-            crate::search_index::FULL_READ_SOURCE_BYTES,
+            None,
+            || {},
         )?;
         assert_eq!(
             session_preview(&read.snapshot).first.unwrap().text,
             "current conversation"
         );
+        let path = request.source_path.as_deref().unwrap();
+        let header =
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":home.path()}});
+        let mut restored = fs::File::create(path)?;
+        writeln!(restored, "{header}")?;
+        restored.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))?;
+        drop(restored);
+        let (refresh, notifications) = mpsc::sync_channel(1);
+        assert!(
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || {}).is_err()
+        );
+        assert!(notifications.try_recv().is_err());
+        assert!(
+            workers::read_picker_preview(&worker, &request.key, Some(path), None, || refresh
+                .try_send(())
+                .unwrap())
+            .is_err()
+        );
+        notifications.try_recv()?;
         Ok(())
     }
 
@@ -4198,27 +4626,62 @@ mod tests {
             );
             state.preview_key(&state.entries[0])
         };
+        let (refresh, notifications) = mpsc::sync_channel(1);
         assert!(
-            workers::read_selected_preview(
+            workers::read_picker_preview(
                 &registry,
                 &request(&home.path().join("old")),
                 None,
-                crate::search_index::FULL_READ_SOURCE_BYTES
+                None,
+                || refresh.try_send(()).unwrap()
             )
             .is_err()
         );
+        notifications.try_recv()?;
         assert!(
-            workers::read_selected_preview(
-                &registry,
-                &request(&current),
-                None,
-                crate::search_index::FULL_READ_SOURCE_BYTES
-            )?
+            workers::read_picker_preview(&registry, &request(&current), None, None, || refresh
+                .try_send(())
+                .unwrap())?
             .source_revision
             .file
             .is_some()
         );
+        assert!(notifications.try_recv().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_late_name_receipt_cannot_revert_the_current_provider_name() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Codex, "renamed", project, Some("Amber Heron"));
+        native.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        });
+        let old_title = IndexedTrajectoryTitle {
+            session: native.session.clone(),
+            title: native.title.clone(),
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            source_revision: native.source_revision.unwrap(),
+            verified_at: None,
+            cached_at: native.updated_at,
+        };
+        let mut state = PickerState::new(vec![native], project, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let name = |previous: &str, current: &str| ProviderNameChange {
+            previous: Some(previous.to_owned()),
+            current: Some(current.to_owned()),
+        };
+        let changed = name("Amber Heron", "Violet Quokka");
+        assert!(state.accepts_provider_name(&key, &changed));
+        state.remember_provider_name(&key, changed);
+        state.remember_source_titles([old_title]);
+        assert!(!state.accepts_provider_name(&key, &name("Amber Heron", "Amber Heron")));
+        state.query = "amberheron".to_owned();
+        assert!(state.visible_indices().is_empty());
+        state.query = "violetquokka".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
     }
 
     #[test]
@@ -4248,8 +4711,22 @@ mod tests {
         let mut state = PickerState::new(vec![header.clone()], &project_a, None, false);
         assert_eq!(state.visible_indices().len(), 1);
 
+        let mut key = state.preview_key(&state.entries[0]);
+        let preview = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("First prompt from this rollout")),
+            continuation: None,
+            complete: true,
+            message_count_is_complete: true,
+            source_provider: Provider::Codex,
+            can_use_first_title: true,
+        };
+        assert!(state.remember_preview_title(&mut key, &preview, Some(revision), None));
+        state.query = "first prompt".to_owned();
         state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
         assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), 1);
+        state.all_projects = false;
         state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
         assert!(state.visible_indices().is_empty());
         state.all_projects = true;
@@ -4297,6 +4774,8 @@ mod tests {
         header.source_revision.as_mut().unwrap().contents = Some(uuid::Uuid::from_u128(3));
         state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
         state.remember_codex_workspaces([(header.session.clone(), update)]);
+        assert!(state.visible_indices().is_empty());
+        state.query.clear();
         state.all_projects = false;
         state.select_newest_session();
         assert_eq!(state.visible_indices().len(), 1);
@@ -4312,6 +4791,69 @@ mod tests {
     }
 
     #[test]
+    fn partial_codex_discovery_removes_only_the_confirmed_unavailable_revision() {
+        let project = Path::new("/workspace");
+        let cached = session(Provider::Codex, "unseen", project, Some("Cached session"));
+        let unavailable = session(Provider::Codex, "unavailable", project, Some("Retired"));
+        let mut restored = session(Provider::Codex, "restored", project, Some("Restored"));
+        let prior = workers::indexed_session(&restored);
+        restored.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let confirmed = [workers::indexed_session(&unavailable), prior];
+        let found = session(Provider::Codex, "found", project, Some("Fresh session"));
+        let mut state = PickerState::new(
+            vec![cached.clone(), unavailable, restored.clone()],
+            project,
+            None,
+            true,
+        );
+        let found_entries = || picker_entries(vec![found.clone()], project, false);
+        state.replace_provider_entries(Provider::Codex, found_entries(), false, &confirmed);
+        let visible: HashSet<_> = state
+            .entries
+            .iter()
+            .map(|entry| &entry.session.session)
+            .collect();
+        assert_eq!(
+            visible,
+            HashSet::from([&cached.session, &restored.session, &found.session])
+        );
+        state.replace_provider_entries(Provider::Codex, found_entries(), true, &[]);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].session.session, found.session);
+    }
+
+    #[test]
+    fn a_stale_preview_hides_only_its_cached_row_until_rediscovery() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Codex, "restored", project, Some("Retired prompt"));
+        native.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![native.clone()], project, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let other = PreviewKey {
+            source: Some(PreviewSource::File(SourceRevision::default())),
+            ..key.clone()
+        };
+        state.discard_stale_cached_preview(&other);
+        assert_eq!(state.entries.len(), 1);
+
+        state.discard_stale_cached_preview(&key);
+        assert!(state.entries.is_empty());
+        native.title = Some("Verified prompt".to_owned());
+        state.replace_provider(Provider::Codex, vec![native], project, false);
+        state.discard_stale_cached_preview(&key);
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Verified prompt")
+        );
+    }
+
+    #[test]
     fn replaced_codex_rollout_rejects_queued_titles_and_previews() {
         let home = tempfile::tempdir().unwrap();
         let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -4321,22 +4863,25 @@ mod tests {
         native.source_path = Some(rollout.clone());
         native.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&rollout);
         let receipt = |revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
+            verified_at: None,
+            cached_at: None,
             session: SessionRef::new(Provider::Codex, uuid),
             title: title.map(str::to_owned),
             document_version: omnis_core::search_document_version(Provider::Codex),
             source_revision: revision,
-            cached_at: None,
-            verified_at: None,
         };
         let mut state = PickerState::new(vec![native.clone()], home.path(), None, true);
-        let old_key = state.preview_key(&state.entries[0]);
+        let mut old_key = state.preview_key(&state.entries[0]);
         let archived = native.source_revision.unwrap();
         let preview = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Archived title")),
             continuation: None,
             complete: true,
+            message_count_is_complete: true,
+            source_provider: Provider::Codex,
+            can_use_first_title: true,
         };
-        assert!(state.accept_preview(old_key.clone(), preview.clone(), None));
+        assert!(state.remember_preview_title(&mut old_key, &preview, None, None));
         state.query = "archived title".to_owned();
         state.query_changed();
         assert_eq!(state.visible_indices().len(), 1);
@@ -4351,7 +4896,7 @@ mod tests {
         let current = native.source_revision.unwrap();
         state.replace_provider(Provider::Codex, vec![native], home.path(), false);
 
-        assert!(!state.accept_preview(old_key, preview, None));
+        assert!(!state.remember_preview_title(&mut old_key, &preview, None, None));
         state.remember_source_titles([receipt(archived, Some("Archived title"))]);
         assert!(state.visible_indices().is_empty());
         assert_ne!(generation, state.trajectory_search_generation);
@@ -4403,6 +4948,26 @@ mod tests {
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
+        state.remember_source_titles(
+            [(Provider::Codex, "untitled"), (Provider::Claude, "titled")]
+                .into_iter()
+                .map(|(provider, id)| IndexedTrajectoryTitle {
+                    verified_at: None,
+                    cached_at: None,
+                    session: SessionRef::new(provider, id),
+                    document_version: omnis_core::search_document_version(provider),
+                    title: None,
+                    source_revision: SourceRevision::default(),
+                }),
+        );
+        assert!(state.visible_indices().is_empty());
+        state.query = "ratelimiter".to_owned();
+        assert!(state.visible_indices().is_empty());
+        assert!(state.entries[0].session.title.is_none());
+        assert_eq!(
+            state.entries[1].session.title.as_deref(),
+            Some("Provider title")
+        );
     }
 
     #[test]
@@ -4458,6 +5023,9 @@ mod tests {
                 preview: Box::new(preview),
                 continuation: None,
                 complete: false,
+                source_provider: Provider::OhMyPi,
+                can_use_first_title: true,
+                message_count_is_complete: false,
             }
         };
         state.accept_preview(
@@ -4530,8 +5098,11 @@ mod tests {
                 preview: Box::new(preview),
                 continuation: None,
                 complete: true,
+                source_provider: Provider::OhMyPi,
+                can_use_first_title: true,
+                message_count_is_complete: true,
             };
-            state.remember_preview_title(&key, &value);
+            state.remember_other_preview_title(&key, &value);
             assert_eq!(
                 display_title(&state.entries[0], Some(&value)),
                 title.unwrap_or("Untitled session")
@@ -4622,6 +5193,9 @@ mod tests {
             preview: Box::new(synthetic_preview("Bounded title")),
             continuation: None,
             complete: false,
+            source_provider: Provider::OhMyPi,
+            can_use_first_title: true,
+            message_count_is_complete: false,
         };
         for provider in [Provider::Pi, Provider::OhMyPi, Provider::Grok] {
             let mut native = session(provider, "selected", root, None);
@@ -5097,6 +5671,45 @@ mod tests {
     }
 
     #[test]
+    fn a_single_excerpt_requires_complete_message_coverage_for_the_only_message_label() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        let key = state.preview_key(&state.entries[0]);
+        for (full_read, known_prefix, all_messages, label) in [
+            (true, true, true, "ONLY MESSAGE"),
+            (false, true, false, "FIRST MESSAGE"),
+            (true, true, false, "FIRST MESSAGE"),
+            (false, false, false, "AVAILABLE MESSAGE"),
+        ] {
+            let mut preview = synthetic_preview("Opening request");
+            preview.latest.clone_from(&preview.first);
+            state.previews.insert(
+                key.clone(),
+                PreviewValue::Ready {
+                    preview: Box::new(preview),
+                    continuation: None,
+                    complete: full_read,
+                    source_provider: Provider::Codex,
+                    can_use_first_title: known_prefix,
+                    message_count_is_complete: all_messages,
+                },
+                &[],
+            );
+            let lines = selected_detail_lines(&state, 100, 40);
+            let header = format!("{label} · USER");
+            assert!(lines.iter().any(|line| line.text == header));
+            let summary = &lines[2].text;
+            assert_eq!(summary.contains("1 message ·"), all_messages);
+            assert_eq!(summary.contains("1 message in preview ·"), !all_messages);
+        }
+    }
+
+    #[test]
     fn selected_detail_distinguishes_empty_samples_from_empty_conversations() {
         let project = Path::new("/workspace");
         for (provider, complete) in [
@@ -5125,6 +5738,9 @@ mod tests {
                     preview: Box::new(preview),
                     continuation: None,
                     complete,
+                    source_provider: provider,
+                    can_use_first_title: complete,
+                    message_count_is_complete: complete,
                 },
                 &[],
             );
@@ -5184,6 +5800,9 @@ mod tests {
                 }),
                 continuation: None,
                 complete: false,
+                message_count_is_complete: false,
+                source_provider: Provider::Codex,
+                can_use_first_title: true,
             },
             &[],
         );
@@ -5219,7 +5838,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "LATEST MESSAGE · ASSISTANT")
+                .any(|line| line == "LATEST AVAILABLE MESSAGE · ASSISTANT")
         );
         assert!(lines.iter().any(|line| line.contains("patch is ready")));
     }
@@ -5463,6 +6082,9 @@ mod tests {
             }),
             continuation: None,
             complete: false,
+            message_count_is_complete: false,
+            source_provider: Provider::Codex,
+            can_use_first_title: true,
         };
 
         let line = session_line(
@@ -5476,6 +6098,51 @@ mod tests {
 
         assert!(line.contains("Fix pagination without changing the API"));
         assert!(!line.contains("session-id"));
+    }
+
+    #[test]
+    fn codex_assistant_opener_stays_in_the_preview_without_naming_the_session() {
+        let project = fixture_workspace();
+        let answer = "Scarlet Finch answer";
+        for (provider, source_provider, expected_title) in [
+            (Provider::Codex, Provider::Codex, "Untitled session"),
+            (Provider::Imported, Provider::Codex, "Untitled session"),
+            (Provider::Pi, Provider::Pi, answer),
+        ] {
+            let mut state = PickerState::new(
+                vec![session(provider, "session-id", project, None)],
+                project,
+                None,
+                false,
+            );
+            let mut preview = synthetic_preview(answer);
+            preview.first.as_mut().unwrap().role = HandoffRole::Assistant;
+            preview.latest.clone_from(&preview.first);
+            let value = PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                source_provider,
+                can_use_first_title: true,
+                complete: true,
+                message_count_is_complete: true,
+            };
+            let mut key = state.preview_key(&state.entries[0]);
+            assert!(state.remember_preview_title(&mut key, &value, None, None));
+            state.previews.insert(key, value, &[]);
+            let detail = selected_detail_lines(&state, 100, 40);
+            assert_eq!(detail[1].text, expected_title);
+            assert!(
+                detail
+                    .iter()
+                    .any(|line| line.text == "ONLY MESSAGE · ASSISTANT")
+            );
+            assert!(detail.iter().any(|line| line.text == answer));
+            state.query = "scarlet finch".to_owned();
+            assert_eq!(
+                state.visible_indices().len(),
+                usize::from(provider == Provider::Pi)
+            );
+        }
     }
 
     #[test]
@@ -5498,7 +6165,10 @@ mod tests {
                     role: HandoffRole::User,
                     text: "Continue the synthetic task".into(),
                 }),
+                source_provider: Provider::Codex,
+                can_use_first_title: true,
                 complete: true,
+                message_count_is_complete: true,
             },
             None,
         );
@@ -5558,6 +6228,9 @@ mod tests {
                 text: "Fix the retry race after this fork".to_owned(),
             }),
             complete: true,
+            message_count_is_complete: true,
+            source_provider: Provider::OpenCode,
+            can_use_first_title: true,
         };
 
         let line = session_line(
@@ -6348,6 +7021,8 @@ mod tests {
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
                 result: Err(anyhow::anyhow!("provider unavailable")),
+                complete: false,
+                names: None,
             }))
             .expect("send failure");
 
@@ -6389,6 +7064,8 @@ mod tests {
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
+                complete: true,
+                names: None,
                 result: Ok(picker_entries(
                     vec![session(
                         Provider::Claude,
