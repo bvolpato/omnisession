@@ -285,12 +285,14 @@ pub(super) enum Sample {
         omitted: usize,
         unreadable: JsonLineSkips,
         prefix_records: usize,
+        saved_messages: usize,
         directory: Option<PathBuf>,
     },
     Reconstruct,
 }
 
 pub(super) enum WorkspaceRecord {
+    SavedMessage,
     Candidate,
     Compacted,
     Other,
@@ -334,16 +336,16 @@ pub(super) fn workspace_record_kind(line: &[u8]) -> WorkspaceRecord {
     match string_field(line, "type").as_deref() {
         Some("compacted") => WorkspaceRecord::Compacted,
         None | Some("turn_context" | "session_meta") => WorkspaceRecord::Candidate,
-        Some("event_msg")
-            if matches!(
-                field(line, "payload")
-                    .and_then(|payload| string_field(payload, "type"))
-                    .as_deref(),
-                None | Some("thread_rolled_back" | "thread_settings_applied")
-            ) =>
+        Some("event_msg") => match field(line, "payload")
+            .and_then(|payload| string_field(payload, "type"))
+            .as_deref()
         {
-            WorkspaceRecord::Candidate
-        }
+            Some("user_message" | "agent_message") => WorkspaceRecord::SavedMessage,
+            None | Some("thread_rolled_back" | "thread_settings_applied") => {
+                WorkspaceRecord::Candidate
+            }
+            _ => WorkspaceRecord::Other,
+        },
         _ => WorkspaceRecord::Other,
     }
 }
@@ -446,6 +448,7 @@ pub(super) fn sample(
         .collect();
     Ok(Sample::Edges {
         run_starts,
+        saved_messages: workspace.saved_messages,
         omitted: count - head.len(),
         prefix_records,
         unreadable,

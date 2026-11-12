@@ -1725,36 +1725,19 @@ fn attached_saved_pairs_require_consistent_turn_ownership() -> Result<()> {
     for case in [
         "child",
         "copied",
+        "copied item",
+        "child abort",
+        "several before abort",
+        "foreign abort",
+        "wrong turn abort",
+        "closed parent",
+        "wrong close",
+        "root start",
         "foreign owner",
         "turn mismatch",
         "item mismatch",
     ] {
-        let mut rows = interrupted_fork(&dir)?;
-        rows.truncate(2);
-        if case == "copied" {
-            rows.push(json!({"type":"event_msg","ordinal":4,"payload":{"type":"task_started","turn_id":"scope","thread_id":PARENT}}));
-        }
-        let ordinal = rows.len() + 2;
-        let mut raw = message(ordinal, "paired request");
-        raw["payload"]["id"] = json!("pair");
-        raw["payload"]["turn_id"] = json!("scope");
-        let mut saved = json!({"type":"event_msg","ordinal":ordinal+1,"payload":{"type":"user_message","message":"paired request","item_id":"pair","turn_id":"scope"}});
-        if case != "copied" {
-            raw["payload"]["thread_id"] = json!(CHILD);
-            saved["payload"]["thread_id"] = json!(CHILD);
-        }
-        match case {
-            "foreign owner" => saved["payload"]["thread_id"] = json!(PARENT),
-            "turn mismatch" => saved["payload"]["turn_id"] = json!("another"),
-            "item mismatch" => saved["payload"]["item_id"] = json!("another"),
-            _ => {}
-        }
-        rows.extend([raw, saved]);
-        if case == "copied" {
-            rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"task_complete","turn_id":"scope","thread_id":PARENT}}));
-        } else {
-            rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"scope","item":{"type":"UserMessage","id":"pair","content":[{"type":"text","text":"paired request"}]}}}));
-        }
+        let rows = scoped_pair_rows(&dir, case)?;
         let end = rows.len() + 2;
         write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
         write(
@@ -1768,16 +1751,133 @@ fn attached_saved_pairs_require_consistent_turn_ownership() -> Result<()> {
         for id in [CHILD, REVERT] {
             let snapshot = CodexAdapter::with_root(home.path())
                 .read_session(&SessionRef::new(Provider::Codex, id))?;
-            let messages = omnis_core::import_conversation(&snapshot).messages;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            if matches!(case, "child" | "child abort") {
+                assert!(!conversation.truncated, "{id} {case}");
+            }
+            if case == "several before abort" {
+                assert!(conversation.truncated);
+                assert!(
+                    conversation
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "earlier child")
+                );
+                assert!(
+                    !conversation
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "unplaced parent")
+                );
+            }
+            let messages = conversation.messages;
             assert_eq!(
                 messages
                     .iter()
                     .filter(|m| m.text == "paired request")
                     .count(),
-                usize::from(case == "child"),
+                usize::from(matches!(
+                    case,
+                    "child"
+                        | "child abort"
+                        | "several before abort"
+                        | "closed parent"
+                        | "root start"
+                )),
                 "{id} {case}"
             );
         }
     }
     Ok(())
+}
+
+fn scoped_pair_rows(dir: &Path, case: &str) -> Result<Vec<Value>> {
+    let mut rows = interrupted_fork(dir)?;
+    rows.truncate(2);
+    if matches!(
+        case,
+        "copied" | "copied item" | "closed parent" | "wrong close" | "root start"
+    ) {
+        let kind = if case == "copied item" {
+            "item_started"
+        } else {
+            "task_started"
+        };
+        rows.push(json!({"type":"event_msg","ordinal":4,"payload":{"type":kind,"turn_id":"scope","thread_id":PARENT}}));
+        if matches!(case, "closed parent" | "wrong close") {
+            let turn = if case == "closed parent" {
+                "scope"
+            } else {
+                "another"
+            };
+            rows.push(json!({"type":"event_msg","ordinal":5,"payload":{"type":"task_complete","turn_id":turn}}));
+        }
+        if case == "root start" {
+            rows.push(json!({"type":"event_msg","ordinal":5,"thread_id":CHILD,"payload":{"type":"task_started","turn_id":"child-turn"}}));
+        }
+    }
+    if case == "several before abort" {
+        rows.push(json!({"type":"event_msg","ordinal":4,"payload":{"type":"damaged_marker"}}));
+        for (ordinal, text, owned) in [(5, "unplaced parent", false), (7, "earlier child", true)] {
+            let mut raw = message(ordinal, text);
+            let mut saved = json!({"type":"event_msg","ordinal":ordinal+1,"payload":{"type":"user_message","message":text}});
+            if owned {
+                for row in [&mut raw, &mut saved] {
+                    row["payload"]["thread_id"] = json!(CHILD);
+                    row["payload"]["turn_id"] = json!("earlier");
+                }
+            }
+            rows.extend([raw, saved]);
+        }
+    }
+    let ordinal = rows.len() + 2;
+    let mut raw = message(ordinal, "paired request");
+    raw["payload"]["id"] = json!("pair");
+    raw["payload"]["turn_id"] = json!("scope");
+    let mut saved = json!({"type":"event_msg","ordinal":ordinal+1,"payload":{"type":"user_message","message":"paired request","item_id":"pair","turn_id":"scope"}});
+    if !case.starts_with("copied") {
+        raw["payload"]["thread_id"] = json!(CHILD);
+        saved["payload"]["thread_id"] = json!(CHILD);
+    }
+    match case {
+        "closed parent" | "wrong close" => {
+            raw["payload"].as_object_mut().unwrap().remove("turn_id");
+            saved["payload"].as_object_mut().unwrap().remove("turn_id");
+        }
+        "root start" => {
+            raw["payload"]["role"] = json!("assistant");
+            raw["payload"]["content"] = json!([{"type":"output_text","text":"paired request"}]);
+            saved["payload"]["type"] = json!("agent_message");
+            raw["payload"]["turn_id"] = json!("child-turn");
+            saved["payload"]["turn_id"] = json!("child-turn");
+        }
+        "foreign owner" => saved["payload"]["thread_id"] = json!(PARENT),
+        "turn mismatch" => saved["payload"]["turn_id"] = json!("another"),
+        "item mismatch" => saved["payload"]["item_id"] = json!("another"),
+        _ => {}
+    }
+    rows.extend([raw, saved]);
+    if case.ends_with("abort") {
+        let owner = if case == "foreign abort" {
+            PARENT
+        } else {
+            CHILD
+        };
+        let turn = if case == "wrong turn abort" {
+            "another"
+        } else {
+            "scope"
+        };
+        rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"turn_aborted","turn_id":turn,"thread_id":owner,"reason":"interrupted"}}));
+    } else if case.starts_with("copied") {
+        let kind = if case == "copied item" {
+            "item_completed"
+        } else {
+            "task_complete"
+        };
+        rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":kind,"turn_id":"scope","thread_id":PARENT}}));
+    } else {
+        rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"scope","item":{"type":"UserMessage","id":"pair","content":[{"type":"text","text":"paired request"}]}}}));
+    }
+    Ok(rows)
 }

@@ -98,6 +98,7 @@ pub(super) struct WorkspaceScan {
     pub(super) settings: WorkspaceSettings,
     pub(super) directory: Option<PathBuf>,
     pub(super) reconstruct_history: bool,
+    pub(super) saved_messages: usize,
     rolled_back: bool,
 }
 
@@ -107,6 +108,7 @@ impl WorkspaceScan {
             settings: WorkspaceSettings::from_header(directory.map(Path::to_path_buf)),
             directory: directory.map(Path::to_path_buf),
             reconstruct_history: false,
+            saved_messages: 0,
             rolled_back: false,
         }
     }
@@ -119,6 +121,7 @@ impl WorkspaceScan {
     }
 
     pub(super) fn observe(&mut self, session: &str, record: &Value) -> Result<()> {
+        self.saved_messages += usize::from(super::saved_message(record));
         self.settings.observe(session, record);
         if records_history_base(record) {
             self.directory = None;
@@ -244,6 +247,10 @@ impl CodexSession {
             if !oversized {
                 match rollout_file::workspace_record_kind(&line) {
                     rollout_file::WorkspaceRecord::Other => continue,
+                    rollout_file::WorkspaceRecord::SavedMessage => {
+                        workspace.saved_messages += 1;
+                        continue;
+                    }
                     rollout_file::WorkspaceRecord::Compacted => {
                         workspace.reconstruct_history = true;
                         continue;

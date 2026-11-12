@@ -21,7 +21,7 @@ use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 9] = [
+const PARSER_SOURCES: [&[u8]; 10] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
     include_bytes!("current_rollout.rs"),
@@ -31,6 +31,7 @@ const PARSER_SOURCES: [&[u8]; 9] = [
     include_bytes!("history_base/observed.rs"),
     include_bytes!("rollout_identity.rs"),
     include_bytes!("rollout_file.rs"),
+    include_bytes!("saved_message.rs"),
 ];
 // Evaluation visits each byte of the finite parser source list once.
 #[allow(long_running_const_eval)]

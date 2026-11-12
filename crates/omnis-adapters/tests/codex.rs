@@ -3082,25 +3082,31 @@ fn interruptions_keep_the_saved_implicit_request_and_replies_in_one_turn() -> an
         ("turn_aborted", Value::Null, vec!["older"]),
         ("turn_aborted", json!("implicit"), vec!["older"]),
         ("task_complete", Value::Null, vec!["older"]),
+        ("task_complete", json!(17), vec!["older"]),
         (
             "task_complete",
             json!("implicit"),
             vec!["older", "steer", "first"],
         ),
     ] {
-        let records = [
-            event("task_started", json!({"turn_id":"old"})),
-            event("user_message", json!({"message":"older"})),
-            event("task_complete", json!({"turn_id":"old"})),
-            event("user_message", json!({"message":"steer"})),
-            event("agent_message", json!({"message":"first"})),
-            event(terminal, json!({"turn_id":turn})),
-            event("agent_message", json!({"message":"last"})),
-            event("thread_rolled_back", json!({"num_turns":1})),
-        ];
-        let (full, preview) = rollback_title_reads(&header, &records, "")?;
-        for read in [full, preview] {
-            assert_eq!(visible_text(&read.snapshot), remaining);
+        for named in [false, true] {
+            let mut records = vec![
+                event("task_started", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"older"})),
+                event("task_complete", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"steer"})),
+                event("agent_message", json!({"message":"first"})),
+                event(terminal, json!({"turn_id":turn})),
+                event("agent_message", json!({"message":"last"})),
+                event("thread_rolled_back", json!({"num_turns":1})),
+            ];
+            if named {
+                records.insert(3, event("task_started", json!({"turn_id":"implicit"})));
+            }
+            let (full, preview) = rollback_title_reads(&header, &records, "")?;
+            for read in [full, preview] {
+                assert_eq!(visible_text(&read.snapshot), remaining);
+            }
         }
     }
     Ok(())
@@ -3172,6 +3178,119 @@ fn raw_provenance_preserves_an_authored_import_marker_in_a_saved_legacy_turn() -
             };
             assert_eq!(visible_text(&read.snapshot), expected);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn positional_saved_messages_use_the_same_turns_as_named_messages() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    let base = [
+        event("task_started", json!({"turn_id":"old"})),
+        event("user_message", json!({"message":"older"})),
+        event("task_complete", json!({"turn_id":"old"})),
+    ];
+    let user = json!([
+        "user_message",
+        "client",
+        "new",
+        null,
+        [],
+        null,
+        [],
+        [],
+        [],
+        [],
+        null
+    ]);
+    let named = event(
+        "user_message",
+        json!({"client_id":"client","message":"new"}),
+    );
+    let positional = json!({"type":"event_msg","payload":user});
+    let (_, ordinary) = rollback_title_reads(&header, &[named], "")?;
+    let (_, compact) = rollback_title_reads(&header, &[positional], "")?;
+    assert_eq!(compact.rollback_title, ordinary.rollback_title);
+    for (payload, reply) in [
+        (json!(["agent_message", "reply"]), true),
+        (
+            json!(["agent_message", "reply", "final_answer", null, "async", []]),
+            true,
+        ),
+        (json!(["agent_message", ["reply"]]), false),
+        (json!(["agent_message", "reply", 17]), false),
+        (
+            json!(["agent_message", "reply", null, null, null, null, null]),
+            false,
+        ),
+    ] {
+        for count in [None, Some(0), Some(1)] {
+            let mut rows = base.to_vec();
+            rows.extend([
+                json!({"type":"event_msg","payload":user}),
+                message("assistant", "raw"),
+                json!({"type":"event_msg","payload":payload}),
+                json!({"type":"event_msg","payload":["user_message","missing fields"]}),
+            ]);
+            if let Some(count) = count {
+                rows.push(event("thread_rolled_back", json!({"num_turns":count})));
+            }
+            let (full, preview) = rollback_title_reads(&header, &rows, "")?;
+            for read in [full, preview] {
+                let expected: &[&str] = if count == Some(1) {
+                    &["older"]
+                } else if reply {
+                    &["older", "new", "reply"]
+                } else {
+                    &["older", "new"]
+                };
+                assert_eq!(visible_text(&read.snapshot), expected, "{payload}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sampled_assistant_text_requires_a_saved_reply_after_a_legacy_submission() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir()?;
+    let sessions = temporary.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let source = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let padding = " ".repeat(512 * 1024);
+    for saved_reply in [false, true] {
+        let mut file = std::io::BufWriter::new(fs::File::create(&source)?);
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy","cwd":"/synthetic"}})
+        )?;
+        writeln!(
+            file,
+            "{}",
+            event("user_message", json!({"message":"Question"}))
+        )?;
+        writeln!(file, "{}", message("assistant", "Sampled answer"))?;
+        for i in 0..20 {
+            if i == 10 && saved_reply {
+                writeln!(
+                    file,
+                    "{}",
+                    event("agent_message", json!({"message":"Sampled answer"}))
+                )?;
+            }
+            writeln!(file, "{}{padding}", event("token_count", json!({})))?;
+        }
+        file.flush()?;
+        let preview = adapter.preview_session(&session)?;
+        assert_eq!(
+            visible_text(&preview).contains(&"Sampled answer"),
+            saved_reply
+        );
     }
     Ok(())
 }

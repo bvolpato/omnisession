@@ -39,6 +39,7 @@ mod current_launch;
 mod current_rollout;
 mod rollout_cache;
 mod rollout_file;
+mod saved_message;
 mod workspace_check;
 mod workspace_damage;
 mod workspace_search;
@@ -2199,7 +2200,7 @@ impl CodexSession {
         let (events, project, reconstructed) = if scan.reconstruct_history {
             self.reconstructed_preview(rollout_file::LIMITS)?
         } else {
-            self.preview_events(scan.directory)?
+            self.preview_events(scan.directory, scan.saved_messages)?
         };
         let branch = self.branch_at(project.as_deref());
         let title = events.rollback_title();
@@ -2349,20 +2350,28 @@ impl CodexSession {
                     omitted,
                     unreadable,
                     prefix_records,
+                    saved_messages,
                     directory,
                 } => {
-                    let events = self.events_from_preview(
-                        JsonLinesPreview {
-                            records,
-                            run_starts,
-                            omissions: unreadable,
-                            sampled: omitted > 0,
-                            prefix_records,
-                        },
-                        Some(omitted),
-                        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-                    )?;
-                    (events, directory, false, true)
+                    let preview = JsonLinesPreview {
+                        records,
+                        run_starts,
+                        omissions: unreadable,
+                        sampled: omitted > 0,
+                        prefix_records,
+                    };
+                    if requires_assistant_reconstruction(&preview, saved_messages) {
+                        let (events, project, verified) =
+                            self.reconstructed_preview(rollout_file::LIMITS)?;
+                        (events, project, false, verified)
+                    } else {
+                        let events = self.events_from_preview(
+                            preview,
+                            Some(omitted),
+                            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+                        )?;
+                        (events, directory, false, true)
+                    }
                 }
             };
         let branch = self.branch_at(project.as_deref());
@@ -2485,6 +2494,7 @@ impl CodexSession {
     fn preview_events(
         &self,
         directory: Option<PathBuf>,
+        saved_messages: usize,
     ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
         const SAMPLE_RECORDS: usize = 1_024;
         let preview = json_lines_preview_with_omissions(
@@ -2494,7 +2504,9 @@ impl CodexSession {
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             rollout_file::workspace_record_candidate,
         )?;
-        if preview.omissions.workspace_gaps() > 0 {
+        if preview.omissions.workspace_gaps() > 0
+            || requires_assistant_reconstruction(&preview, saved_messages)
+        {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
         let events = self.events_from_preview(preview, None, MAX_STREAMED_TRANSCRIPT_LINE_SIZE)?;
@@ -2503,11 +2515,15 @@ impl CodexSession {
 
     fn events_from_preview(
         &self,
-        preview: JsonLinesPreview,
+        mut preview: JsonLinesPreview,
         omitted: Option<usize>,
         line_limit: u64,
     ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
+        preview
+            .records
+            .iter_mut()
+            .for_each(saved_message::normalize);
         let unread_ancestor = preview.records.iter().any(|record| {
             record["type"] == "session_meta"
                 && HistoryBase::from_header(&self.path, record).is_some()
@@ -2528,17 +2544,32 @@ impl CodexSession {
         let mut records = preview.records.into_iter();
         let mut start = 0;
         let mut prefix_end = builder.checkpoint();
+        let mut assistant_mode = None;
         for end in preview.run_starts.into_iter().chain(std::iter::once(total)) {
             let mut last_visible = None;
             let mut receipts = RequestReceipts::new(&self.id, true);
-            let mut push = |record, (), confirmed| {
+            let mut push = |record: Value, (), confirmed| {
+                let raw_assistant = !complete
+                    && record["type"] == "response_item"
+                    && record["payload"]["role"] == "assistant";
+                if raw_assistant {
+                    builder.codex_saved_users = assistant_mode;
+                }
                 push_record(
                     &mut builder,
                     &record,
                     &mut last_visible,
                     confirmed && matches!(self.history_base, HistoryBase::Attachment(_)),
                 );
-                if !complete && record["type"] == "session_meta" {
+                if !complete {
+                    if record["type"] == "session_meta" {
+                        assistant_mode = builder.codex_saved_users;
+                    } else if client_submission(&record)
+                        && string_at(&record["payload"], &[&["message"], &["text"]]).is_some()
+                        && assistant_mode.is_some()
+                    {
+                        assistant_mode = Some(true);
+                    }
                     builder.codex_saved_users = None;
                 }
                 Ok(())
@@ -2961,7 +2992,7 @@ impl CodexHistory {
         self.records_seen += 1;
         let record_type = record.get("type").and_then(Value::as_str);
         let event_type = (record_type == Some("event_msg"))
-            .then(|| string_at(record, &[&["payload", "type"]]))
+            .then(|| history_event_type(&record["payload"]))
             .flatten();
         self.observe_task_boundary(builder, record, event_type, recovering, skipped);
         if event_type == Some("thread_rolled_back") {
@@ -3038,6 +3069,47 @@ impl CodexHistory {
     }
 }
 
+fn native_legacy_header(payload: &Value) -> bool {
+    CodexHistoryMode::from_payload(payload) == CodexHistoryMode::Legacy
+        && (payload.get("history_mode").is_some()
+            || ["originator", "cli_version"]
+                .iter()
+                .all(|key| payload[key].as_str().is_some_and(|value| !value.is_empty())))
+}
+
+fn requires_assistant_reconstruction(preview: &JsonLinesPreview, saved_messages: usize) -> bool {
+    (preview.sampled || preview.omissions.total() > 0)
+        && saved_messages > preview.records.iter().filter(|r| saved_message(r)).count()
+        && preview.records.first().is_some_and(|header| {
+            header["type"] == "session_meta" && native_legacy_header(&header["payload"])
+        })
+        && preview.records.iter().any(|record| {
+            record["type"] == "response_item"
+                && record["payload"]["type"] == "message"
+                && record["payload"]["role"] == "assistant"
+        })
+}
+
+fn saved_message(record: &Value) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "event_msg"
+        && matches!(
+            payload["type"]
+                .as_str()
+                .or_else(|| payload.get(0)?.as_str()),
+            Some("user_message" | "agent_message")
+        )
+}
+
+fn history_event_type(payload: &Value) -> Option<&str> {
+    let kind = payload["type"].as_str()?;
+    let id = &payload["turn_id"];
+    if matches!(kind, "turn_complete" | "task_complete") && !id.is_null() && !id.is_string() {
+        return None;
+    }
+    Some(kind)
+}
+
 fn client_submission(record: &Value) -> bool {
     record["type"] == "event_msg" && record["payload"]["type"] == "user_message"
 }
@@ -3108,14 +3180,7 @@ fn push_record(
 ) -> bool {
     let payload = &record["payload"];
     if record["type"] == "session_meta" {
-        let declared = payload.get("history_mode").is_some();
-        let native_header = ["originator", "cli_version"]
-            .iter()
-            .all(|key| payload[key].as_str().is_some_and(|value| !value.is_empty()));
-        builder.codex_saved_users = (CodexHistoryMode::from_payload(payload)
-            == CodexHistoryMode::Legacy
-            && (declared || native_header))
-            .then_some(false);
+        builder.codex_saved_users = native_legacy_header(payload).then_some(false);
     } else if client_submission(record)
         && string_at(payload, &[&["message"], &["text"]]).is_some()
         && let Some(saved) = &mut builder.codex_saved_users
@@ -3176,7 +3241,7 @@ fn project_record(
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
-                match payload["type"].as_str() {
+                match history_event_type(payload) {
                     Some("task_started" | "turn_started") => {
                         *last_visible = payload["turn_id"].as_str().filter(|id| !id.is_empty()).map(|_| MirrorGroup::new(true));
                         builder.track_codex_mirror_openers(last_visible.is_some());
@@ -4201,6 +4266,7 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
         mark: M,
         mut visit: impl FnMut(Value, M, bool) -> Result<()>,
     ) -> Result<()> {
+        let record = saved_message::project(record);
         let payload = &record["payload"];
         if let Some((mut request, before)) = self.pending.take() {
             let mut confirmed = false;
@@ -4215,7 +4281,7 @@ impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
             visit(request, before, confirmed)?;
         }
         if record["type"] == "event_msg" && event_scope_matches(&record, self.owner) {
-            match payload["type"].as_str() {
+            match history_event_type(payload) {
                 Some("task_started" | "turn_started") => {
                     self.turn = payload["turn_id"].as_str().map(str::to_owned);
                 }

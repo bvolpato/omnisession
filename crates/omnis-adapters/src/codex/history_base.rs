@@ -126,9 +126,16 @@ struct AttachmentStart {
     owner: Option<Uuid>,
     hidden_rows: usize,
     hidden_records: usize,
-    saved_pairs: Vec<(usize, usize)>,
+    saved_pairs: Vec<SavedPair>,
     literal_tags: Option<LiteralTags>,
     incomplete: bool,
+}
+
+#[derive(Clone)]
+struct SavedPair {
+    row: usize,
+    record: usize,
+    child_turn: Option<super::MediaDigest>,
 }
 
 #[derive(Clone)]
@@ -166,10 +173,10 @@ impl VisibleStart {
     fn hides_parsed_row(&self, row: usize, record: &Value) -> bool {
         self.hides_row(row)
             && !self.owned_settings(record)
-            && !self.in_saved_pair(row, |pair| pair.0)
+            && !self.in_saved_pair(row, |pair| pair.row)
     }
 
-    fn in_saved_pair(&self, index: usize, end: impl Fn(&(usize, usize)) -> usize) -> bool {
+    fn in_saved_pair(&self, index: usize, end: impl Fn(&SavedPair) -> usize) -> bool {
         self.attached.as_ref().is_some_and(|start| {
             let pos = start.saved_pairs.partition_point(|pair| end(pair) < index);
             start
@@ -194,7 +201,7 @@ impl VisibleStart {
             .as_ref()
             .is_some_and(|start| index > 1 && index <= start.hidden_records)
             && !self.owned_settings(record)
-            && !self.in_saved_pair(index, |pair| pair.1)
+            && !self.in_saved_pair(index, |pair| pair.record)
     }
 
     fn ordinal(&self) -> Option<u64> {
@@ -537,14 +544,14 @@ fn attached_history_start(
             continue;
         };
         preamble.records += 1;
-        if preamble.observe(record) {
+        if preamble.observe(super::saved_message::project(record)) {
             return Ok(preamble.start);
         }
     }
     if preamble.gap || preamble.responses > 0 && (preamble.settings || prefix_end.is_some()) {
         preamble.start.hidden_rows = preamble.row;
         preamble.start.hidden_records = preamble.records;
-        preamble.start.incomplete |= preamble.responses > 0;
+        preamble.start.incomplete |= preamble.responses > preamble.start.saved_pairs.len();
     }
     Ok(preamble.start)
 }
@@ -557,11 +564,17 @@ struct AttachmentPreamble {
     records: usize,
     previous_ordinal: Option<u64>,
     turn_hint: Option<String>,
-    foreign_turn: Option<(Uuid, String)>,
+    foreign_turn: Option<ForeignTurn>,
     request: Option<Value>,
     settings: bool,
     gap: bool,
     responses: usize,
+}
+
+struct ForeignTurn {
+    owner: Uuid,
+    turn: String,
+    item: Option<super::MediaDigest>,
 }
 
 impl AttachmentPreamble {
@@ -583,25 +596,45 @@ impl AttachmentPreamble {
         let Some(turn) = payload["turn_id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
+        let item_id = payload["item"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(super::media_digest);
         let owner = payload
             .get("thread_id")
             .or_else(|| record.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok());
-        let Some(owner) = owner.filter(|id| {
-            Some(*id) != self.start.owner && super::event_scope_matches(record, &id.to_string())
-        }) else {
-            return;
-        };
         match payload["type"].as_str() {
-            Some("task_started" | "turn_started") => {
-                self.foreign_turn = Some((owner, turn.to_owned()));
+            Some("task_started" | "turn_started" | "item_started") => {
+                if let Some(owner) = owner.filter(|id| {
+                    Some(*id) != self.start.owner
+                        && super::event_scope_matches(record, &id.to_string())
+                }) {
+                    let item = payload["type"] == "item_started";
+                    if !item
+                        || self
+                            .foreign_turn
+                            .as_ref()
+                            .is_none_or(|active| active.turn != turn || active.owner != owner)
+                    {
+                        self.foreign_turn = Some(ForeignTurn {
+                            owner,
+                            turn: turn.to_owned(),
+                            item: item.then_some(item_id).flatten(),
+                        });
+                    }
+                }
             }
-            Some("task_complete" | "turn_complete")
-                if self
-                    .foreign_turn
-                    .as_ref()
-                    .is_some_and(|(id, active)| *id == owner && active == turn) =>
+            Some("task_complete" | "turn_complete" | "item_completed")
+                if self.foreign_turn.as_ref().is_some_and(|active| {
+                    active.turn == turn
+                        && super::event_scope_matches(record, &active.owner.to_string())
+                        && (payload["type"] != "item_completed"
+                            || active.item.is_some()
+                                && active.item == item_id
+                                && owner == Some(active.owner))
+                }) =>
             {
                 self.foreign_turn = None;
             }
@@ -609,19 +642,63 @@ impl AttachmentPreamble {
         }
     }
 
+    fn finish_abort(&mut self, record: &Value) {
+        let child_turn = self
+            .start
+            .owns(record)
+            .then(|| {
+                record["payload"]["turn_id"]
+                    .as_str()
+                    .map(super::media_digest)
+            })
+            .flatten();
+        let confirmed = child_turn.is_some()
+            && self
+                .start
+                .saved_pairs
+                .iter()
+                .rev()
+                .find_map(|pair| pair.child_turn)
+                == child_turn;
+        self.start
+            .saved_pairs
+            .retain(|pair| confirmed && pair.child_turn.is_some());
+        self.start.incomplete |=
+            child_turn.is_some() && self.responses > self.start.saved_pairs.len();
+    }
+
+    fn save_pair(&mut self, raw: &Value, saved: &Value) {
+        let child_turn = (self.start.owns(raw) || self.start.owns(saved))
+            .then(|| {
+                raw["payload"]["turn_id"]
+                    .as_str()
+                    .or_else(|| saved["payload"]["turn_id"].as_str())
+            })
+            .flatten()
+            .map(super::media_digest);
+        self.start.save_pair(self.row, self.records, child_turn);
+    }
+
     fn matches_saved_pair(&self, raw: &Value, saved: &Value, previous: Option<u64>) -> bool {
         let Some((left, right)) = previous.zip(self.previous_ordinal) else {
             return false;
         };
-        let owned = [raw, saved].into_iter().any(|row| {
-            self.start.matches_scope(row)
-                && (row.get("thread_id").is_some() || row["payload"].get("thread_id").is_some())
-        });
+        if [raw, saved].into_iter().any(|row| {
+            row["payload"]
+                .get("turn_id")
+                .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+        }) {
+            return false;
+        }
+        let owned = self.start.owns(raw) || self.start.owns(saved);
         let turn = raw["payload"]
             .get("turn_id")
             .or_else(|| saved["payload"].get("turn_id"));
-        if self.foreign_turn.as_ref().is_some_and(|(_, foreign)| {
-            !owned || turn.and_then(Value::as_str).is_none_or(|id| id == foreign)
+        if self.foreign_turn.as_ref().is_some_and(|foreign| {
+            !owned
+                || turn
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id == foreign.turn)
         }) || !(self.gap || owned)
             || left < self.start.ordinal
             || left.checked_add(1) != Some(right)
@@ -677,7 +754,7 @@ impl AttachmentPreamble {
                 if let (Some(prev), Some(abort)) = (previous_ordinal, self.previous_ordinal) {
                     self.start.incomplete |= prev.checked_add(1) != Some(abort);
                 }
-                self.start.saved_pairs.clear();
+                self.finish_abort(&record);
                 self.start.hidden_rows = self.row;
                 self.start.hidden_records = self.records;
                 return true;
@@ -687,8 +764,9 @@ impl AttachmentPreamble {
                 Some(kind @ ("task_started" | "turn_started" | "item_started" | "item_completed")),
             ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
                 && self.start.matches_scope(&record)
-                && self.foreign_turn.as_ref().is_none_or(|(_, turn)| {
-                    payload["turn_id"].as_str() != Some(turn.as_str()) && self.start.owns(&record)
+                && self.foreign_turn.as_ref().is_none_or(|active| {
+                    payload["turn_id"].as_str() != Some(active.turn.as_str())
+                        && self.start.owns(&record)
                 })
                 && (matches!(kind, "task_started" | "turn_started")
                     || payload["thread_id"].is_string()) =>
@@ -716,7 +794,8 @@ impl AttachmentPreamble {
                         indices: literal_tags,
                     });
                 }
-                let omitted = self.responses > usize::from(recovered);
+                let omitted =
+                    self.responses > self.start.saved_pairs.len() + usize::from(recovered);
                 if self.gap || omitted {
                     let keep = 1 + usize::from(recovered);
                     self.start.hidden_rows = self.row - keep;
@@ -731,7 +810,7 @@ impl AttachmentPreamble {
                         self.matches_saved_pair(raw, &record, previous_ordinal)
                     }) =>
             {
-                self.start.save_pair(self.row, self.records);
+                self.save_pair(request.as_ref().unwrap(), &record);
             }
             _ => {
                 self.gap = true;
@@ -746,9 +825,13 @@ impl AttachmentPreamble {
 }
 
 impl AttachmentStart {
-    fn save_pair(&mut self, row: usize, records: usize) {
+    fn save_pair(&mut self, row: usize, record: usize, child_turn: Option<super::MediaDigest>) {
         if self.saved_pairs.len() < super::MAX_CANONICAL_EVENTS {
-            self.saved_pairs.push((row, records));
+            self.saved_pairs.push(SavedPair {
+                row,
+                record,
+                child_turn,
+            });
         } else {
             self.incomplete = true;
         }
@@ -760,7 +843,8 @@ impl AttachmentStart {
     }
 
     fn owns(&self, record: &Value) -> bool {
-        record["payload"]["thread_id"].is_string() && self.matches_scope(record)
+        (record["payload"]["thread_id"].is_string() || record["thread_id"].is_string())
+            && self.matches_scope(record)
     }
 }
 
@@ -2134,6 +2218,7 @@ fn read_prefix_from(
                         continue;
                     }
                 };
+                let record = super::saved_message::project(record);
                 if cursor.observe(segment, visible_start, &record, row)? {
                     visit(
                         if let Some(proof) = visible_start.confirmed_request(&record) {
