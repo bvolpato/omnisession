@@ -151,6 +151,7 @@ fn full_index_read(
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
             native_session: None,
             verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -486,9 +487,9 @@ fn store_search_document<'a>(
     let rollback_title = read.map_or(&omnis_adapters::RollbackTitle::Unknown, |read| {
         &read.rollback_title
     });
-    let document = trajectory_search_document_in_records(
-        snapshot,
-        read.map_or(&[][..], |r| r.search_record_groups.as_slice()),
+    let document = read.map_or_else(
+        || trajectory_search_document_in_records(snapshot, &[]),
+        omnis_adapters::IndexRead::search_document,
     );
     let mut title =
         search_index::IndexedTitle::from_read(snapshot, source_complete, &document, rollback_title);
@@ -607,7 +608,7 @@ fn store_verified_search_document(
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let document = trajectory_search_document_in_records(snapshot, &read.search_record_groups);
+    let document = read.search_document();
     let derived_title = search_index::indexed_title(session, snapshot, read.verified_prefix_end);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
@@ -2006,6 +2007,7 @@ fn read_search_snapshot(
         return Ok((
             omnis_adapters::IndexRead {
                 verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
@@ -2037,6 +2039,7 @@ fn read_search_snapshot(
         } else {
             omnis_adapters::IndexRead {
                 verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,

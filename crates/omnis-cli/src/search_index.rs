@@ -1734,6 +1734,7 @@ fn read_candidate(
         (
             IndexRead {
                 verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
                 native_session: None,
                 rollback_title: RollbackTitle::Unknown,
@@ -1816,6 +1817,7 @@ fn prepare_session(
         read_candidate(registry, candidate, guard, budget, store)?;
     let IndexRead {
         verified_prefix_end,
+        database_aliases: _,
         search_record_groups: _,
         snapshot,
         source_complete,

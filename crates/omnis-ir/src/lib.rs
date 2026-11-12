@@ -1,5 +1,7 @@
 //! Stable canonical types used between `OmniSession` core, adapters, and bundles.
 
+pub mod antigravity_receipts;
+
 use std::{fmt, path::PathBuf, str::FromStr};
 
 use chrono::{DateTime, Utc};
@@ -37,6 +39,7 @@ pub struct SearchProjection {
     pub verified_append: bool,
     pub database_gap: bool,
     pub database_steps: Option<Vec<Uuid>>,
+    pub database_aliases: std::sync::Arc<antigravity_receipts::DatabaseAliases>,
     /// Physical length scanned from start to end, including unreadable native records.
     pub fully_scanned_bytes: Option<u64>,
     state: sha2::Sha256,
@@ -57,6 +60,7 @@ impl SearchProjection {
             verified_append: false,
             database_gap: false,
             database_steps: None,
+            database_aliases: std::sync::Arc::default(),
             fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
             before_last_record: before_last_record.finalize().into(),
@@ -91,6 +95,7 @@ impl PartialEq for SearchProjection {
             && self.verified_append == other.verified_append
             && self.database_gap == other.database_gap
             && self.database_steps == other.database_steps
+            && self.database_aliases == other.database_aliases
             && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
 }

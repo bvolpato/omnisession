@@ -172,6 +172,7 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
     /// Exclusive event sequence at the first gap in an otherwise sequential read.
     pub verified_prefix_end: Option<u64>,
     /// Sequence ranges for native records that produced multiple canonical events.
@@ -213,13 +214,24 @@ pub struct IndexedSearchDocument {
     pub read: IndexRead,
 }
 
+impl IndexRead {
+    #[must_use]
+    pub fn search_document(&self) -> omnis_core::SearchDocument {
+        let mut document = omnis_core::trajectory_search_document_in_records(
+            &self.snapshot,
+            &self.search_record_groups,
+        );
+        if let Some(projection) = document.projection.as_mut() {
+            projection.database_aliases = std::sync::Arc::clone(&self.database_aliases);
+        }
+        document
+    }
+}
+
 impl From<IndexRead> for IndexedSearchDocument {
     fn from(read: IndexRead) -> Self {
         Self {
-            document: omnis_core::trajectory_search_document_in_records(
-                &read.snapshot,
-                &read.search_record_groups,
-            ),
+            document: read.search_document(),
             read,
         }
     }
@@ -285,6 +297,7 @@ fn read_budgeted_transcript(
             Ok(snapshot) => {
                 return Ok(IndexRead {
                     verified_prefix_end: None,
+                    database_aliases: std::sync::Arc::default(),
                     search_record_groups: Vec::new(),
                     native_session: None,
                     rollback_title: RollbackTitle::Unknown,
@@ -301,6 +314,7 @@ fn read_budgeted_transcript(
     }
     Ok(IndexRead {
         verified_prefix_end: None,
+        database_aliases: std::sync::Arc::default(),
         search_record_groups: Vec::new(),
         native_session: None,
         rollback_title: RollbackTitle::Unknown,
@@ -508,6 +522,7 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<IndexRead> {
         Ok(IndexRead {
             verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
             native_session: None,
             rollback_title: RollbackTitle::Unknown,

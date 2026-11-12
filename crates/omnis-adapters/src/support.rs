@@ -2684,11 +2684,11 @@ impl EventBuilder {
         }
     }
 
-    pub(crate) fn database_step_hash(&self, index: i64, opaque: bool, wire: &[u8]) -> Uuid {
+    pub(crate) fn database_step_namespace(&self, index: i64, opaque: bool) -> Uuid {
         let mut key = [0; 9];
         key[..8].copy_from_slice(&index.to_be_bytes());
         key[8] = u8::from(opaque);
-        Uuid::new_v5(&Uuid::new_v5(&self.thread_id, &key), wire)
+        Uuid::new_v5(&self.thread_id, &key)
     }
 
     pub(crate) fn set_last_database_step_hash(&mut self, hash: Option<Uuid>) {

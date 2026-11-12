@@ -113,6 +113,7 @@ impl AntigravityDesktopAdapter {
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
             verified_prefix_end: coverage.verified_prefix_end,
+            database_aliases: coverage.aliases.into(),
             search_record_groups: Vec::new(),
             snapshot,
             source_complete: complete && coverage.omitted == 0,

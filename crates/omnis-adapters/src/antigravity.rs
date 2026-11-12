@@ -145,6 +145,7 @@ impl AntigravityAdapter {
                     .filter(|_| !preview)
                     .and_then(JsonLineDamage::verified_prefix_end)
             }),
+            database_aliases: history.database_aliases.into(),
             search_record_groups: history.search_record_groups,
             snapshot: history.snapshot,
             source_complete: !preview
@@ -181,6 +182,7 @@ impl AntigravityAdapter {
         let mut groups = Vec::new();
         let mut verified_prefix_end = None;
         let mut omitted_database_rows = 0;
+        let mut database_aliases = omnis_ir::antigravity_receipts::DatabaseAliases::new();
         match self.source(summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
                 let mut push = |record: Value| {
@@ -225,6 +227,7 @@ impl AntigravityAdapter {
                     push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
                 verified_prefix_end = coverage.verified_prefix_end;
                 omitted_database_rows = coverage.omitted;
+                database_aliases = coverage.aliases;
             }
             None if summary.step_count > 0 => {
                 return Err(anyhow!(
@@ -237,6 +240,7 @@ impl AntigravityAdapter {
 
         Ok(ObservedHistory {
             snapshot: summary.snapshot(session, builder),
+            database_aliases,
             search_record_groups: groups,
             verified_prefix_end,
             omitted_database_rows,
@@ -245,6 +249,7 @@ impl AntigravityAdapter {
 }
 
 struct ObservedHistory {
+    database_aliases: omnis_ir::antigravity_receipts::DatabaseAliases,
     omitted_database_rows: usize,
     snapshot: CanonicalSnapshot,
     search_record_groups: Vec<std::ops::Range<u64>>,
@@ -777,6 +782,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 rollback_title: crate::RollbackTitle::Unknown,
                 verified_prefix_end: torn.verified_prefix_end(),
+                database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
                 snapshot: title_source,
                 source_complete: !limited && torn.count() == 0,
@@ -1139,6 +1145,7 @@ fn push_historical(
 
 /// Returns the decoded step count and the exclusive event sequence at the earliest gap.
 pub(crate) struct DatabaseCoverage {
+    pub(crate) aliases: omnis_ir::antigravity_receipts::DatabaseAliases,
     pub(crate) verified_prefix_end: Option<u64>,
     pub(crate) omitted: usize,
 }
@@ -1238,6 +1245,7 @@ fn push_database_steps_with_limits(
         .connection
         .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
     let mut rows = statement.query([i64::try_from(limits.records)?])?;
+    let mut proofs = DatabaseProofs::default();
     let mut retained = Vec::new();
     let mut position = 0;
     let mut decoded = 0;
@@ -1277,13 +1285,9 @@ fn push_database_steps_with_limits(
         let bytes = estimated_event_bytes(&event.payload);
         if bytes <= remaining_history {
             remaining_history -= bytes;
-            event.hash = index.map(|idx| {
-                builder.database_step_hash(
-                    idx,
-                    event.replay_policy == ReplayPolicy::HistoricalOnly,
-                    &payload,
-                )
-            });
+            if let Some(index) = index {
+                proofs.record(builder, &mut event, index, payload);
+            }
             retained.push((position, index, event));
         }
     }
@@ -1301,6 +1305,7 @@ fn push_database_steps_with_limits(
         oldest_ambiguous_row,
     );
     let coverage = DatabaseCoverage {
+        aliases: proofs.for_coverage(omitted),
         verified_prefix_end: prefix_end,
         omitted,
     };
@@ -1369,6 +1374,58 @@ fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static st
         "Antigravity steps have neither a rowid nor an idx primary key"
     );
     Ok(("idx", "idx DESC"))
+}
+
+struct DatabaseProofs {
+    rows: Vec<(
+        uuid::Uuid,
+        omnis_ir::antigravity_receipts::DatabaseStepAlias,
+    )>,
+    small_bytes: usize,
+    large_bytes: usize,
+}
+
+impl Default for DatabaseProofs {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            small_bytes: omnis_ir::antigravity_receipts::LEGACY_WIRE_BYTES,
+            large_bytes: omnis_ir::antigravity_receipts::LEGACY_LARGE_BYTES,
+        }
+    }
+}
+
+impl DatabaseProofs {
+    fn record(
+        &mut self,
+        builder: &EventBuilder,
+        event: &mut DatabaseStepEvent,
+        index: i64,
+        wire: Vec<u8>,
+    ) {
+        let opaque = event.replay_policy == ReplayPolicy::HistoricalOnly;
+        let namespace = builder.database_step_namespace(index, opaque);
+        let raw = uuid::Uuid::new_v5(&namespace, &wire);
+        event.hash = Some(raw);
+        if !opaque
+            && let Some(alias) = omnis_ir::antigravity_receipts::DatabaseStepAlias::from_wire(
+                namespace,
+                raw,
+                wire,
+                &mut self.small_bytes,
+                &mut self.large_bytes,
+            )
+        {
+            self.rows.push((raw, alias));
+        }
+    }
+
+    fn for_coverage(self, omitted: usize) -> omnis_ir::antigravity_receipts::DatabaseAliases {
+        self.rows
+            .into_iter()
+            .filter(|(raw, alias)| omitted > 0 || *raw != alias.canonical)
+            .collect()
+    }
 }
 
 struct DatabaseStepEvent {

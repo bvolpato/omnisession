@@ -117,11 +117,10 @@ pub(super) fn record_verified(
     write: &crate::PreparedTrajectoryWrite<'_, '_>,
     home: &std::path::Path,
 ) -> Result<()> {
-    let Some(steps) = write
-        .document
-        .projection
-        .and_then(|p| p.database_steps.as_deref())
-    else {
+    let Some(projection) = write.document.projection else {
+        return Ok(());
+    };
+    let Some(steps) = projection.database_steps.as_deref() else {
         return Ok(());
     };
     let revision = write.document.source_revision;
@@ -133,6 +132,21 @@ pub(super) fn record_verified(
             |row| row.get(0),
         ).map_err(database_error)?;
         if matches {
+            let canonical;
+            let steps = if projection.database_aliases.is_empty() {
+                steps
+            } else {
+                canonical = steps
+                    .iter()
+                    .map(|raw| {
+                        projection
+                            .database_aliases
+                            .get(raw)
+                            .map_or(*raw, |alias| alias.canonical)
+                    })
+                    .collect::<Vec<_>>();
+                &canonical
+            };
             save(
                 tx,
                 write.session,
@@ -190,12 +204,22 @@ pub(super) fn accept_gap(
         return Ok(Some(false));
     };
     if let Some(previous) = read(tx, write.session, home, file, contents, &hash)? {
-        let mut incoming = rows.iter();
-        return Ok(Some(
-            previous
-                .iter()
-                .all(|step| incoming.any(|next| step == next)),
-        ));
+        let aliases = &projection.database_aliases;
+        let retains = |legacy: bool| {
+            let mut bytes = omnis_ir::antigravity_receipts::LEGACY_HASH_BYTES;
+            let mut layouts = omnis_ir::antigravity_receipts::LEGACY_HASH_LAYOUTS;
+            let mut incoming = rows.iter();
+            previous.iter().all(|old| {
+                incoming.any(|row| {
+                    row == old
+                        || aliases.get(row).is_some_and(|alias| {
+                            alias.canonical == *old
+                                || (legacy && alias.matches_legacy(*old, &mut bytes, &mut layouts))
+                        })
+                })
+            })
+        };
+        return Ok(Some(retains(false) || retains(true)));
     }
     if hash == write.content_hash {
         return Ok(Some(true));

@@ -285,7 +285,8 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
         assert_eq!(index()["stale"], 0);
         database
             .execute_batch(
-                "INSERT INTO steps VALUES (4,x'80'),(5,x'080fa2010b0a096d6f726576616c7565');",
+                "UPDATE steps SET step_payload=x'a2010b0a096e6578747265706c79080f' WHERE idx=3;
+                 INSERT INTO steps VALUES (4,x'80'),(5,x'080fa2010b0a096d6f726576616c7565');",
             )
             .unwrap();
         let reference = format!("{provider}:{id}");

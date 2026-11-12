@@ -350,6 +350,7 @@ impl CodexAdapter {
             }
             Ok(Some(IndexRead {
                 verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
                 rollback_title,
                 workspace_projection,
@@ -1773,6 +1774,7 @@ impl CodexSession {
         };
         Ok(IndexRead {
             verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
             native_session,
             snapshot,
@@ -1836,6 +1838,7 @@ impl CodexSession {
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
             verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
             native_session: None,
             workspace_projection,
