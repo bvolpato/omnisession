@@ -213,14 +213,19 @@ pub(super) struct Descendants {
 
 // The leaves are in tree order. Each internal entry is the newest record under it.
 struct NodeBlock {
-    newest: Vec<usize>,
+    newest: Vec<(usize, usize)>,
 }
 
 impl NodeBlock {
-    fn new(first: usize, len: usize, paths: &Paths) -> Self {
-        let mut newest = vec![0; len];
-        newest.extend(first..first + len);
-        newest[len..].sort_unstable_by(|&a, &b| paths.walk_order((a, false), (b, false)));
+    fn new(
+        first: usize,
+        len: usize,
+        paths: &Paths,
+        source_order: &impl Fn(usize) -> usize,
+    ) -> Self {
+        let mut newest = vec![(0, 0); len];
+        newest.extend((first..first + len).map(|node| (source_order(node), node)));
+        newest[len..].sort_unstable_by(|&(_, a), &(_, b)| paths.walk_order((a, false), (b, false)));
         for i in (1..len).rev() {
             newest[i] = newest[2 * i].max(newest[2 * i + 1]);
         }
@@ -231,17 +236,18 @@ impl NodeBlock {
         self.newest.len() / 2
     }
 
-    fn last_in(&self, node: usize, paths: &Paths) -> Option<usize> {
+    fn last_in(&self, node: usize, paths: &Paths) -> Option<(usize, usize)> {
         let len = self.len();
         let leaves = &self.newest[len..];
         let boundary = |leave| {
-            len + leaves.partition_point(|&i| paths.walk_order((i, false), (node, leave)).is_lt())
+            len + leaves
+                .partition_point(|&(_, i)| paths.walk_order((i, false), (node, leave)).is_lt())
         };
         let (mut start, mut end) = (boundary(false), boundary(true));
         if start == end {
             return None;
         }
-        let mut newest = 0;
+        let mut newest = (0, 0);
         while start < end {
             if !start.is_multiple_of(2) {
                 newest = newest.max(self.newest[start]);
@@ -259,7 +265,12 @@ impl NodeBlock {
 }
 
 impl Descendants {
-    pub(super) fn latest(&mut self, node: usize, paths: &Paths) -> usize {
+    pub(super) fn latest(
+        &mut self,
+        node: usize,
+        paths: &Paths,
+        source_order: impl Fn(usize) -> usize,
+    ) -> usize {
         if self.indexed != paths.len() {
             let mut first = 0;
             let mut index = 0;
@@ -268,7 +279,8 @@ impl Descendants {
                 // Full chronological blocks retain their tree order as later nodes arrive.
                 if self.blocks.get(index).is_none_or(|b| b.len() != len) {
                     self.blocks.truncate(index);
-                    self.blocks.push(NodeBlock::new(first, len, paths));
+                    self.blocks
+                        .push(NodeBlock::new(first, len, paths, &source_order));
                 }
                 first += len;
                 index += 1;
@@ -277,9 +289,9 @@ impl Descendants {
         }
         self.blocks
             .iter()
-            .rev()
-            .find_map(|block| block.last_in(node, paths))
-            .unwrap_or(node)
+            .filter_map(|block| block.last_in(node, paths))
+            .max()
+            .map_or(node, |(_, index)| index)
     }
 }
 

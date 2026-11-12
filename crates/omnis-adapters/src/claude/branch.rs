@@ -1,7 +1,7 @@
 //! Select the conversation that Claude would continue after a rewind.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     ops::Range,
 };
@@ -634,6 +634,7 @@ pub(super) struct Branch {
     hidden_parents: HashMap<usize, Option<usize>>,
     checked_copy_revision: HashMap<usize, usize>,
     rebased_nodes: HashMap<(usize, usize), usize>,
+    copied_source: HashMap<usize, usize>,
     opaque_records: Vec<OpaqueRecord>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
@@ -728,9 +729,11 @@ impl Branch {
         let mut cursor = self.tip;
         while let Some(node) = cursor {
             if let Some(retained) = self.suffix_parents.get(&node) {
-                return retained
-                    .node
-                    .is_some_and(|node| self.copy_paths.distance(original, node).is_some());
+                return retained.node.is_some_and(|node| {
+                    self.copy_paths
+                        .distance(original, node)
+                        .is_some_and(|n| n > 0)
+                });
             }
             if node == summary {
                 return true;
@@ -738,6 +741,28 @@ impl Branch {
             cursor = self.nodes[node].parent;
         }
         false
+    }
+
+    fn raw_copy_parent(
+        &self,
+        mut uuid: Uuid,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) -> Option<usize> {
+        let mut visited = HashSet::new();
+        loop {
+            let record = records.get(&uuid)?;
+            let node = record.branch.node?;
+            if !record.branch.transparent
+                || self.nodes[node].uuid == Some(uuid)
+                || self.nodes[node].summary.is_some()
+            {
+                return Some(node);
+            }
+            if !visited.insert(uuid) {
+                return None;
+            }
+            uuid = record.parent?;
+        }
     }
 
     fn refresh_copy_ancestry(&mut self, node: usize, records: &mut HashMap<Uuid, ClaudeRecord>) {
@@ -752,7 +777,10 @@ impl Branch {
             let Some(record) = self.nodes[child].uuid.and_then(|id| records.get(&id)) else {
                 break;
             };
-            let Some(actual) = record.parent.and_then(|id| records.get(&id)?.branch.node) else {
+            let Some(actual) = record
+                .parent
+                .and_then(|id| self.raw_copy_parent(id, records))
+            else {
                 break;
             };
             if visited.contains(&actual) {
@@ -790,7 +818,8 @@ impl Branch {
                 );
             }
         }
-        let mut remapped = HashMap::new();
+        let mut edges = HashMap::new();
+        let mut roots = Vec::new();
         for index in 0..self.nodes.len() {
             let source = &self.nodes[index];
             if source.summary == Some(index) || self.suffix_parents.contains_key(&index) {
@@ -805,29 +834,27 @@ impl Branch {
             {
                 continue;
             }
-            let parent = changes
-                .get(&index)
-                .copied()
-                .map(|p| *remapped.get(&p).unwrap_or(&p))
-                .or_else(|| source.parent.and_then(|p| remapped.get(&p).copied()))
-                .or_else(|| {
-                    source.response.as_ref().and_then(|r| {
-                        responses
-                            .get(&(
-                                r.clone(),
-                                source.writer.clone(),
-                                source.turn,
-                                source.summary,
-                                source.parent,
-                            ))
-                            .copied()
-                    })
-                });
-            if let Some(parent) = parent {
-                let updated = self.rebase_copy_node(index, parent);
-                remapped.insert(index, updated);
+            let parent = changes.get(&index).copied().or_else(|| {
+                source.response.as_ref().and_then(|r| {
+                    responses
+                        .get(&(
+                            r.clone(),
+                            source.writer.clone(),
+                            source.turn,
+                            source.summary,
+                            source.parent,
+                        ))
+                        .copied()
+                })
+            });
+            if parent.is_some() {
+                roots.push(index);
+            }
+            if let Some(parent) = parent.or(source.parent) {
+                edges.insert(index, parent);
             }
         }
+        let remapped = self.rebuild_changed_nodes(&edges, roots);
         // A transparent record can share a conversation node with a different UUID.
         for record in records.values_mut() {
             if let Some(updated) = record
@@ -853,6 +880,42 @@ impl Branch {
                 *issuer = current;
             }
         }
+    }
+
+    fn rebuild_changed_nodes(
+        &mut self,
+        edges: &HashMap<usize, usize>,
+        mut pending: Vec<usize>,
+    ) -> HashMap<usize, usize> {
+        let mut children = HashMap::<usize, Vec<usize>>::new();
+        for (&child, &parent) in edges {
+            children.entry(parent).or_default().push(child);
+        }
+        let mut affected = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if affected.insert(node)
+                && let Some(next) = children.get(&node)
+            {
+                pending.extend(next);
+            }
+        }
+        // A replacement parent can appear later in the file than a child that needs it.
+        let mut ready: BTreeSet<_> = affected
+            .iter()
+            .copied()
+            .filter(|node| !affected.contains(&edges[node]))
+            .collect();
+        let mut remapped = HashMap::new();
+        while let Some(original) = ready.pop_first() {
+            let parent = edges[&original];
+            let current = remapped.get(&parent).copied().unwrap_or(parent);
+            let copy = self.rebase_copy_node(original, current);
+            remapped.insert(original, copy);
+            if let Some(next) = children.get(&original) {
+                ready.extend(next);
+            }
+        }
+        remapped
     }
 
     fn rebase_copy_node(&mut self, child: usize, parent: usize) -> usize {
@@ -881,6 +944,10 @@ impl Branch {
         if let Some(source) = self.tool_sources.get(&child).copied() {
             self.tool_sources.insert(index, source);
         }
+        self.copied_source.insert(
+            index,
+            self.copied_source.get(&child).copied().unwrap_or(child),
+        );
         self.rebased_nodes.insert((child, parent), index);
         index
     }
@@ -919,7 +986,9 @@ impl Branch {
                 return;
             }
             self.index_parents();
-            self.copy_descendants.latest(node, &self.copy_paths)
+            self.copy_descendants.latest(node, &self.copy_paths, |i| {
+                self.copied_source.get(&i).copied().unwrap_or(i)
+            })
         } else {
             node
         };
@@ -2969,7 +3038,7 @@ impl Branch {
                     continue;
                 }
                 let id = events[position].payload["tool_use_id"].as_str();
-                let prior = calls.prior_result(origin, id, &outcomes);
+                let prior = calls.prior_result(origin, node, id, &outcomes);
                 if selected {
                     declared.observe(self, &calls, &mut results, position, (id, &prior));
                 }
@@ -3054,9 +3123,18 @@ impl DeclaredResult<'_> {
         call: ToolCall,
         parent: Option<usize>,
     ) -> bool {
-        branch.suffix_parents.contains_key(&self.index)
-            && (self.source == ToolSource::Absent
-                || matches!(self.source, ToolSource::Record(id) if id == call.node))
+        let mut cursor = self.index;
+        while !branch.suffix_parents.contains_key(&cursor) {
+            let Some(parent) = branch.nodes[cursor]
+                .parent
+                .filter(|p| branch.hidden_parents.contains_key(p))
+            else {
+                return false;
+            };
+            cursor = parent;
+        }
+        (self.source == ToolSource::Absent
+            || matches!(self.source, ToolSource::Record(id) if id == call.node))
             && parent == Some(call.node)
     }
 
@@ -3279,6 +3357,7 @@ impl<'a> ToolCalls<'a> {
     fn prior_result(
         &self,
         origin: Option<ResponseUnit<'a>>,
+        node: &'a Node,
         id: Option<&'a str>,
         outcomes: &HashMap<(ToolCall, bool, Option<usize>), Outcome>,
     ) -> PriorResult {
@@ -3287,7 +3366,15 @@ impl<'a> ToolCalls<'a> {
             .and_then(|key| self.by_response.get(&key))
             .and_then(|c| c.unique())
         else {
-            return PriorResult::Unknown;
+            let prior = id
+                .and_then(|id| {
+                    self.by_scope
+                        .get(&(node.writer.as_deref(), node.turn, node.summary, id))
+                })
+                .and_then(|c| outcomes.get(&(c.last(), false, None)));
+            return prior.map_or(PriorResult::Unknown, |result| {
+                PriorResult::Answered(result.position)
+            });
         };
         outcomes
             .get(&(call, false, None))

@@ -469,6 +469,20 @@ impl RecordCopies {
             && self.missing_parent(Some(parent), records) != Some(missing)
     }
 
+    fn found_duration_parent(
+        &self,
+        id: Uuid,
+        parent: Option<Uuid>,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) -> bool {
+        parent.is_some_and(|parent| {
+            self.missing.get(&id) == Some(&parent)
+                && records
+                    .get(&parent)
+                    .is_some_and(|record| record.branch.node.is_some())
+        })
+    }
+
     fn observe(
         &mut self,
         id: Uuid,
@@ -1668,7 +1682,11 @@ impl ClaudeTranscript {
                     causal_parent,
                     &self.records,
                     &self.duplicate_records,
-                ) {
+                ) || (is_turn_duration(record)
+                    && self
+                        .record_copies
+                        .found_duration_parent(id, causal_parent, &self.records))
+                {
                     restored_order = Some(self.records[&id].order);
                 } else {
                     self.reselect_existing(id, record);
