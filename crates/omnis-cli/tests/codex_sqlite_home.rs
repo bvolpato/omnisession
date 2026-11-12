@@ -137,8 +137,15 @@ fn configured_sqlite_home_controls_which_generation_of_a_thread_is_visible() -> 
     assert_eq!(shown(&root, Some(&environment))?, None);
     fs::remove_file(&current)?;
     assert_eq!(shown(&root, Some(&environment))?, None);
+    let newest = day.join(format!(
+        "rollout-2026-01-01T01-00-00-{THREAD}_{CONFIG_GENERATION}.jsonl"
+    ));
+    write_rollout(&newest, THREAD, &workspace, "filename fallback")?;
     fs::write(config, "sqlite_home = '../missing state'\n")?;
-    assert_eq!(shown(&root, Some(&environment))?, None);
+    assert_eq!(
+        shown(&root, Some(&environment))?,
+        Some(vec!["filename fallback".into()])
+    );
     Ok(())
 }
 

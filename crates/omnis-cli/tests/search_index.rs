@@ -169,6 +169,7 @@ fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure(
         .record_trajectory_index_failure(
             &session,
             &omnis_store::TrajectoryIndexFailure {
+                ancestor_revisions: Vec::new(),
                 source_updated_at: Some(old_time),
                 source_file: None,
                 native_summary: false,
@@ -1716,6 +1717,7 @@ fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
     let store = Store::open(environment.state_root.join("store.sqlite3")).expect("open CLI store");
     store
         .upsert_indexed_session(&IndexedSession {
+            source_path: None,
             source_revision: None,
             session: SessionRef::new(Provider::Imported, missing_id.to_string()),
             title: Some("missing bundle".to_owned()),

@@ -31,6 +31,7 @@ const LEGACY_RECHECKS: &str = "SELECT t.trajectory_id,t.source_file_id,t.source_
 #[derive(Debug, Default)]
 pub struct CodexWorkspaceIndex {
     pub verified: HashMap<Uuid, CodexWorkspace>,
+    pub ancestor_revisions: HashMap<Uuid, Vec<(Uuid, Uuid)>>,
     pub pending: HashSet<SourceRevision>,
 }
 
@@ -104,35 +105,59 @@ impl CodexWorkspace {
             pending_queries.push(format!("{LEGACY_RECHECKS}{legacy_filter}"));
         }
         let pending_rows = pending_queries.join(" UNION ");
+        let has_ancestry: bool = connection
+            .query_row(
+                "SELECT count(*)=2 FROM pragma_table_info('session_trajectories')
+             WHERE name IN ('ancestor_revisions','missing_ancestor_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let ancestry = if has_ancestry {
+            "CASE WHEN t.missing_ancestor_id IS NULL AND t.source_file_id=w.source_file_id
+              AND t.source_contents_id=w.source_contents_id THEN coalesce(t.ancestor_revisions,x'5b5d') END"
+        } else {
+            "NULL"
+        };
         let workspace_rows = if settings_checked {
-            format!(" UNION ALL SELECT w.trajectory_id,w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0
-                FROM codex_indexed_workspaces w
+            format!(" UNION ALL SELECT w.trajectory_id,w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,0,{ancestry}
+                FROM codex_indexed_workspaces w JOIN session_trajectories t ON t.id=w.trajectory_id
+                  AND t.document_version >= {version}
                 WHERE NOT EXISTS(SELECT 1 FROM pending p WHERE p.trajectory_id=w.trajectory_id
                     AND p.source_file_id=w.source_file_id AND p.source_contents_id=w.source_contents_id)
-                {workspace_filter}")
+                {workspace_filter}", version = omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION)
         } else {
             String::new()
         };
         let sql = format!(
             "WITH pending AS ({pending_rows}), observations AS (
-                SELECT trajectory_id,source_file_id,source_contents_id,NULL AS project_path,NULL AS git_branch,1 AS pending
+                SELECT trajectory_id,source_file_id,source_contents_id,NULL AS project_path,NULL AS git_branch,1 AS pending,NULL AS ancestry
                 FROM pending{workspace_rows})
-             SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,w.pending
+             SELECT w.source_file_id,w.source_contents_id,w.project_path,w.git_branch,w.pending,w.ancestry
              FROM observations w JOIN visible_trajectories t ON t.id=w.trajectory_id"
         );
         let filter = file.map(Uuid::into_bytes);
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(filter.as_slice()), |row| {
-                Ok((workspace_row(row)?, row.get::<_, bool>(4)?))
+                Ok((
+                    workspace_row(row)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                ))
             })
             .map_err(database_error)?;
         let mut index = CodexWorkspaceIndex::default();
         for row in rows {
-            let ((file, workspace), pending) = row.map_err(database_error)?;
+            let ((file, workspace), pending, ancestry) = row.map_err(database_error)?;
             if pending {
                 index.pending.insert(workspace.source_revision);
             } else {
+                if let Some(bytes) = ancestry {
+                    let revisions =
+                        serde_json::from_slice(&bytes).map_err(|_| StoreError::CorruptStore)?;
+                    index.ancestor_revisions.insert(file, revisions);
+                }
                 index.verified.insert(file, workspace);
             }
         }
@@ -343,6 +368,20 @@ pub(super) fn initialize(transaction: &Transaction<'_>) -> Result<()> {
     if !has_settings_generation(transaction)? {
         schedule_legacy_workspace_rechecks(transaction)?;
     }
+    Ok(())
+}
+
+pub(super) fn install_display_upgrade_trigger(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER IF NOT EXISTS refresh_codex_display_workspace
+         AFTER UPDATE OF document_version ON session_trajectories
+         WHEN OLD.provider='codex' AND OLD.origin='native' AND OLD.document_version < {floor}
+              AND NEW.document_version >= {floor}
+         BEGIN DELETE FROM codex_indexed_workspaces WHERE trajectory_id=OLD.id; END;",
+            floor = omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
+        ))
+        .map_err(database_error)?;
     Ok(())
 }
 

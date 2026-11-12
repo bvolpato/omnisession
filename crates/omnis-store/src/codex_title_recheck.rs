@@ -16,8 +16,10 @@ const MATCHING_PROOF: &str = "
     WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle
       AND (r.trajectory_id IS NULL OR r.codex_home=(SELECT home FROM current_codex_home))
       AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id
-      AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown' AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
-      AND t.derived_title=p.previous_title AND c.title IS NULL AND c.source_file_id=p.source_file_id
+      AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown'
+      AND ((t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0 AND t.derived_title=p.previous_title)
+           OR (r.trajectory_id IS NOT NULL AND t.derived_title IS NULL))
+      AND c.title IS NULL AND c.source_file_id=p.source_file_id
       AND c.source_contents_id IS NOT NULL";
 
 pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) -> Result<()> {
@@ -245,8 +247,10 @@ pub(super) fn retire(
         "DELETE FROM legacy_codex_title_proofs AS p WHERE trajectory_id=(
              SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?1)
          AND (?2 OR NOT EXISTS (SELECT 1 FROM session_trajectories t WHERE t.id=p.trajectory_id
-              AND t.origin='native' AND NOT t.protected_by_bundle AND t.derived_title=p.previous_title
-              AND t.derived_title_is_local_opener IS 0 AND t.missing_ancestor_id IS NULL
+              AND t.origin='native' AND NOT t.protected_by_bundle AND t.missing_ancestor_id IS NULL
+              AND ((t.derived_title=p.previous_title AND t.derived_title_is_local_opener IS 0)
+                   OR (t.derived_title IS NULL AND EXISTS (
+                       SELECT 1 FROM legacy_codex_name_retries r WHERE r.trajectory_id=p.trajectory_id)))
               AND t.source_file_id=p.source_file_id AND t.source_contents_id=p.source_contents_id)
               OR (?3 AND p.source_file_id=?4 AND p.source_contents_id=?5))"
     ).map_err(database_error)?.execute(

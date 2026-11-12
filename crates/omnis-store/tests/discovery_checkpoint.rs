@@ -25,6 +25,7 @@ fn scoped_rows_cannot_overwrite_a_newer_provider_listing() {
     let pending = checkpoint();
     assert!(pending.is_for_selected_home());
     let mut row = IndexedSession {
+        source_path: None,
         source_revision: None,
         session: SessionRef::new(provider, "shared"),
         title: Some("Published title".into()),
@@ -101,6 +102,7 @@ fn independent_workspaces_and_unchanged_listings_keep_their_checkpoints() {
     let initial = read(&first);
     let separate = read(&second);
     let row = IndexedSession {
+        source_path: None,
         source_revision: None,
         session: SessionRef::new(provider, "new"),
         title: Some("Found".into()),
@@ -171,6 +173,7 @@ fn partial_desktop_archives_retain_only_previously_visible_ids_in_the_selected_h
         let rows = known
             .iter()
             .map(|id| IndexedSession {
+                source_path: None,
                 source_revision: None,
                 session: SessionRef::new(provider, *id),
                 title: Some((*id).to_owned()),

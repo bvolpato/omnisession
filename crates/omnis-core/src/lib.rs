@@ -42,6 +42,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
+/// Identifies Codex parent context that exists outside an attached thread's visible history.
+pub const CODEX_ATTACHED_PARENT_CONTEXT: &str = "omnisession.codex_attached_parent_context";
+/// Identifies model context copied into a Codex subagent before its first visible turn.
+pub const CODEX_SUBAGENT_MODEL_CONTEXT: &str = "omnisession.codex_subagent_model_context";
+
 const RECENT_MESSAGE_LIMIT: usize = 6;
 const RECENT_TOOL_OUTCOME_LIMIT: usize = 12;
 const MESSAGE_CHARACTER_LIMIT: usize = 4_000;
@@ -92,7 +97,11 @@ impl NativeSessionName {
 }
 
 /// Base version of the indexed search document.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 8;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 10;
+/// Minimum readable projection for native Codex search text, titles, and workspace metadata.
+pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 58;
+// A title recheck can keep a readable conversation at the display minimum until the next index pass.
+const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 59;
 
 /// Version of the searchable content produced for this provider.
 #[must_use]
@@ -100,10 +109,9 @@ pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::Antigravity => 13,
         Provider::AntigravityDesktop => 15,
-        Provider::AntigravityIde => 12,
-        Provider::OhMyPi => 10,
-        Provider::Codex => 11,
-        Provider::Pi | Provider::Claude => 9,
+        Provider::AntigravityIde | Provider::Claude => 12,
+        Provider::OhMyPi | Provider::Pi => 11,
+        Provider::Codex => CODEX_SEARCH_DOCUMENT_VERSION,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -112,7 +120,7 @@ pub const fn search_document_version(provider: Provider) -> u32 {
 #[must_use]
 pub const fn imported_search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Claude | Provider::Pi | Provider::OhMyPi | Provider::Codex => {
+        Provider::Pi | Provider::OhMyPi | Provider::Codex | Provider::Claude => {
             search_document_version(provider)
         }
         _ => SEARCH_DOCUMENT_VERSION,
@@ -3277,6 +3285,9 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
         markdown.push_str(
             "> OmniSession retained recent context after source omissions or its export size limit.\n\n",
         );
+        for warning in codex_record_omission_warnings(snapshot) {
+            writeln!(markdown, "> {warning}\n").expect("writing to String cannot fail");
+        }
     }
 
     if let Some(warning) = conversation.compaction_order_warning {
@@ -5531,10 +5542,8 @@ pub fn build_native_materialization_report_for_snapshot(
     )
 }
 
-fn with_source_compaction(
-    mut report: FidelityReport,
-    snapshot: &CanonicalSnapshot,
-) -> FidelityReport {
+fn with_source_compaction(report: FidelityReport, snapshot: &CanonicalSnapshot) -> FidelityReport {
+    let mut report = with_codex_history_warnings(report, snapshot);
     if matches!(snapshot.session.provider, Provider::Pi | Provider::OhMyPi) {
         if !snapshot.events.iter().any(is_source_compaction_boundary) {
             return report;
@@ -5592,7 +5601,7 @@ fn with_source_compaction(
             detail.push_str(". A reply appeared in the Codex display after compaction. The handoff follows its recorded model position");
         }
     }
-    with_codex_history_warnings(report, snapshot)
+    report
 }
 
 fn with_codex_history_warnings(
@@ -5602,6 +5611,14 @@ fn with_codex_history_warnings(
     report
         .warnings
         .extend(codex_history_warnings(snapshot).map(str::to_owned));
+    if !matches!(
+        report.mode,
+        TransferMode::NativeResume | TransferMode::NativeFork
+    ) {
+        report
+            .warnings
+            .extend(model_context_notices(snapshot).map(str::to_owned));
+    }
     let Some((notice, reason)) = codex_exclusion_receipt(snapshot) else {
         return report;
     };
@@ -5637,8 +5654,35 @@ fn with_codex_history_warnings(
     report
 }
 
-fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+fn codex_record_omission_warnings(
+    snapshot: &CanonicalSnapshot,
+) -> impl Iterator<Item = &'static str> {
+    let mut invalid_json = false;
+    let mut missing_ordinal = false;
+    if snapshot.session.provider == Provider::Codex {
+        for event in snapshot.events.iter().filter(|event| {
+            !is_secret(event)
+                && event.source.raw_record_type.as_deref() == Some(CODEX_MALFORMED_RECORDS)
+        }) {
+            let unplaced = event.payload["unplaced_records"].as_u64().unwrap_or(0);
+            missing_ordinal |= unplaced > 0;
+            invalid_json |= event.payload["malformed_records"]
+                .as_u64()
+                .is_none_or(|count| count > unplaced);
+        }
+    }
     [
+        (invalid_json, "Some Codex rollout records contained invalid JSON and could not be read."),
+        (missing_ordinal, "Some Codex records had no valid ordinal, so OmniSession could not place them in the visible conversation."),
+    ].into_iter().filter_map(|(observed, warning)| observed.then_some(warning))
+}
+
+fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    let other = [
+        (
+            "omnisession.record_size_limit",
+            "Some Codex rollout records exceeded the reader's record size limit.",
+        ),
         (
             "omnisession.codex_history_base",
             "The Codex fork references earlier history that was unavailable for this transfer.",
@@ -5646,10 +5690,6 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
         (
             "omnisession.codex_compacted",
             "This transfer could not reconstruct a Codex compaction checkpoint.",
-        ),
-        (
-            "omnisession.codex_malformed_records",
-            "Some Codex rollout records contained invalid JSON and could not be read.",
         ),
     ]
     .into_iter()
@@ -5659,6 +5699,19 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
                 !is_secret(event) && event.source.raw_record_type.as_deref() == Some(record)
             }))
         .then_some(warning)
+    });
+    codex_record_omission_warnings(snapshot).chain(other)
+}
+
+fn model_context_notices(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    [
+        (CODEX_ATTACHED_PARENT_CONTEXT, "Codex keeps parent context for attached threads outside their visible history. This handoff omits that parent context."),
+        (CODEX_SUBAGENT_MODEL_CONTEXT, "Codex copied model context into a subagent before its first visible turn. This handoff omits that copied context."),
+    ].into_iter().filter_map(move |(record_type, notice)| {
+        let hidden = snapshot.session.provider == Provider::Codex && snapshot.events.iter().any(|event| {
+            event.kind == EventKind::ProviderEvent && event.source.raw_record_type.as_deref() == Some(record_type)
+        });
+        hidden.then_some(notice)
     })
 }
 
@@ -5673,7 +5726,10 @@ pub fn fidelity_report_for_snapshot(
     if source != target && target != Provider::OpenCode {
         build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches)
     } else {
-        build_fidelity_report(source, target, repository_matches)
+        with_codex_history_warnings(
+            build_fidelity_report(source, target, repository_matches),
+            snapshot,
+        )
     }
 }
 

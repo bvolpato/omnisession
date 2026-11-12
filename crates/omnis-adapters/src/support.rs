@@ -2,7 +2,7 @@ mod json_tail;
 
 use std::{
     cell::{Cell, OnceCell},
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     ffi::OsStr,
     fs,
@@ -280,7 +280,15 @@ pub(crate) fn nested_files_matching(
     depth: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
-    nested_files_with_limit(
+    nested_file_inventory(root, depth, include).0
+}
+
+pub(crate) fn nested_file_inventory(
+    root: &Path,
+    depth: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
+    nested_inventory_with_limit(
         root,
         depth,
         MAX_DISCOVERED_FILES,
@@ -289,6 +297,7 @@ pub(crate) fn nested_files_matching(
     )
 }
 
+#[cfg(test)]
 fn nested_files_with_limit(
     root: &Path,
     depth: usize,
@@ -296,6 +305,16 @@ fn nested_files_with_limit(
     entry_limit: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
+    nested_inventory_with_limit(root, depth, file_limit, entry_limit, include).0
+}
+
+fn nested_inventory_with_limit(
+    root: &Path,
+    depth: usize,
+    file_limit: usize,
+    entry_limit: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
@@ -357,7 +376,8 @@ fn nested_files_with_limit(
         );
     }
     output.sort();
-    output
+    let limited = output.len() == file_limit || entries_left == 0;
+    (output, limited)
 }
 
 pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
@@ -631,6 +651,52 @@ impl SnapshotFileStamp {
         let mut copy = File::create(target)?;
         let bytes = io::copy(&mut (&mut source).take(self.len), &mut copy)?;
         Ok(bytes == self.len && *self == Self::from_metadata(&source.metadata()?)?)
+    }
+}
+
+/// Physical identity of a selected transcript for search cache validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptRevision {
+    pub bytes: i64,
+    pub modified: DateTime<Utc>,
+    pub key: i64,
+}
+
+impl TranscriptRevision {
+    /// Reads the path, size, write time and platform file identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file metadata cannot be read.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let path = path.canonicalize()?;
+        let stamp = SnapshotFileStamp::read(&path)?;
+        let modified = DateTime::<Utc>::from(stamp.modified);
+        let mut hash = Sha256::new();
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update(stamp.len.to_le_bytes());
+        hash.update(modified.timestamp().to_le_bytes());
+        hash.update(modified.timestamp_subsec_nanos().to_le_bytes());
+        if let Some((device, inode, seconds, nanos)) = stamp.unix_identity {
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+            hash.update(nanos.to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        if let Some(created) = stamp.created {
+            let created = DateTime::<Utc>::from(created);
+            hash.update(created.timestamp().to_le_bytes());
+            hash.update(created.timestamp_subsec_nanos().to_le_bytes());
+        }
+        let digest = hash.finalize();
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            bytes: i64::try_from(stamp.len).map_err(io::Error::other)?,
+            modified,
+            key: i64::from_le_bytes(prefix),
+        })
     }
 }
 
@@ -1861,6 +1927,7 @@ pub(crate) enum WorkspaceGap {
 pub(crate) struct JsonLineSkips {
     pub(crate) oversized: usize,
     pub(crate) malformed: usize,
+    unplaced: usize,
     workspace_gaps: usize,
     pub(crate) possible_settings: usize,
     pub(crate) foreign_settings: usize,
@@ -1874,6 +1941,23 @@ impl JsonLineSkips {
 
     pub(crate) fn workspace_gaps(self) -> usize {
         self.workspace_gaps
+    }
+
+    pub(crate) fn combined(self, other: Self) -> Self {
+        Self {
+            oversized: self.oversized + other.oversized,
+            malformed: self.malformed + other.malformed,
+            unplaced: self.unplaced + other.unplaced,
+            workspace_gaps: self.workspace_gaps + other.workspace_gaps,
+            possible_settings: self.possible_settings + other.possible_settings,
+            foreign_settings: self.foreign_settings + other.foreign_settings,
+            unclassified: self.unclassified + other.unclassified,
+        }
+    }
+
+    pub(crate) fn observe_unplaced(&mut self, gap: WorkspaceGap) {
+        self.observe(gap, false);
+        self.unplaced += 1;
     }
 
     pub(crate) fn observe(&mut self, gap: WorkspaceGap, oversized: bool) {
@@ -2226,6 +2310,7 @@ fn jsonl_tail_reader(file: &mut File, byte_limit: u64) -> Result<(impl BufRead +
 
 #[derive(Default)]
 pub(crate) struct JsonLinesPreview {
+    pub(crate) run_starts: Vec<usize>,
     pub(crate) gap_before: std::collections::BTreeSet<usize>,
     pub(crate) records: Vec<Value>,
     pub(crate) omissions: JsonLineSkips,
@@ -2233,6 +2318,26 @@ pub(crate) struct JsonLinesPreview {
     /// Number of leading records retained without any unreadable or unsampled row.
     pub(crate) prefix_records: usize,
     suffix_len: usize,
+}
+
+impl JsonLinesPreview {
+    pub(crate) fn from_records(
+        records: Vec<Value>,
+        run_starts: Vec<usize>,
+        omissions: JsonLineSkips,
+        sampled: bool,
+        prefix_records: usize,
+    ) -> Self {
+        Self {
+            records,
+            gap_before: run_starts.iter().copied().collect(),
+            run_starts,
+            omissions,
+            sampled,
+            prefix_records,
+            suffix_len: 0,
+        }
+    }
 }
 
 pub(crate) fn json_lines_preview_with_omissions(
@@ -2269,7 +2374,7 @@ fn read_preview(
     } else {
         sample_records
     };
-    let mut prefix_end = read_json_lines_prefix(
+    let mut prefix = read_json_lines_prefix(
         file,
         limit,
         prefix_bytes,
@@ -2277,7 +2382,7 @@ fn read_preview(
         &mut preview,
         match_malformed,
     )?;
-    if prefix_end == metadata.len() {
+    if prefix.0 == metadata.len() {
         return Ok(preview);
     }
     if small && metadata.len() > prefix_bytes {
@@ -2289,7 +2394,7 @@ fn read_preview(
         // A short file can contain more records than the full-preview limit.
         // Use the requested head and tail when the prefix did not reach EOF.
         preview = JsonLinesPreview::default();
-        prefix_end = read_json_lines_prefix(
+        prefix = read_json_lines_prefix(
             file,
             sample_records,
             prefix_bytes,
@@ -2301,7 +2406,7 @@ fn read_preview(
     let tail = read_json_lines_tail(
         file,
         sample_records,
-        prefix_end,
+        prefix,
         line_bytes,
         &mut preview,
         match_malformed,
@@ -2317,7 +2422,7 @@ fn json_lines_tail_with_offsets(file: &mut File, limit: usize) -> Result<Vec<(u6
     read_json_lines_tail(
         file,
         limit,
-        0,
+        (0, false),
         MAX_TRANSCRIPT_LINE_SIZE,
         &mut JsonLinesPreview::default(),
         &|_, _| WorkspaceGap::Other,
@@ -2327,7 +2432,7 @@ fn json_lines_tail_with_offsets(file: &mut File, limit: usize) -> Result<Vec<(u6
 fn read_json_lines_tail(
     file: &mut File,
     limit: usize,
-    prefix_end: u64,
+    (prefix_end, trailing_gap): (u64, bool),
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
@@ -2358,7 +2463,8 @@ fn read_json_lines_tail(
     }
     let mut records = VecDeque::with_capacity(limit);
     let mut verified_tail_records = 0;
-    let mut previous = preview.omissions.total();
+    let mut tail_truncated = start > prefix_end || trailing_gap;
+    let mut last_skips = preview.omissions.total();
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -2384,14 +2490,16 @@ fn read_json_lines_tail(
             }
             if records.len() == limit {
                 records.pop_front();
+                tail_truncated = true;
                 preview.suffix_len = preview.suffix_len.min(limit);
                 preview.sampled = true;
             }
             if !preview.sampled && preview.omissions.total() == 0 {
                 verified_tail_records += 1;
             }
-            records.push_back((line_offset, record, preview.omissions.total() > previous));
-            previous = preview.omissions.total();
+            let skipped = preview.omissions.total();
+            records.push_back((line_offset, record, skipped != last_skips));
+            last_skips = skipped;
         } else {
             preview.suffix_len = 0;
         }
@@ -2399,20 +2507,23 @@ fn read_json_lines_tail(
     if !preview.sampled {
         preview.prefix_records += verified_tail_records;
     }
-    let records = records
+    let base = preview.records.len();
+    Ok(records
         .into_iter()
         .enumerate()
         .map(|(index, (offset, record, gap))| {
+            if gap || (index == 0 && tail_truncated) {
+                preview.run_starts.push(base + index);
+            }
             if gap || (index == 0 && preview.sampled) {
-                preview.gap_before.insert(preview.records.len() + index);
+                preview.gap_before.insert(base + index);
             }
             (offset, record)
         })
-        .collect();
-    Ok(records)
+        .collect())
 }
 
-/// Reads up to `limit` leading lines and returns the end of the observed prefix.
+/// Reads up to `limit` leading lines and reports the end offset and any trailing gap.
 fn read_json_lines_prefix(
     file: &mut File,
     limit: usize,
@@ -2420,7 +2531,7 @@ fn read_json_lines_prefix(
     line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     file.rewind()?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -2429,6 +2540,7 @@ fn read_json_lines_prefix(
     let mut reader = BufReader::new(file.take(byte_limit));
     let mut line = Vec::new();
     let mut consumed = 0_u64;
+    let mut last_skips = 0;
     for _ in 0..limit {
         let Some((line_kind, read)) = read_bounded_line(&mut reader, line_bytes, &mut line)? else {
             break;
@@ -2452,6 +2564,11 @@ fn read_json_lines_prefix(
                     if preview.omissions.total() == 0 {
                         preview.prefix_records += 1;
                     }
+                    let skipped = preview.omissions.total();
+                    if skipped != last_skips {
+                        preview.run_starts.push(preview.records.len());
+                    }
+                    last_skips = skipped;
                     preview.records.push(record);
                     preview.suffix_len += 1;
                 } else {
@@ -2463,7 +2580,7 @@ fn read_json_lines_prefix(
             preview.gap_before.insert(preview.records.len());
         }
     }
-    Ok(consumed)
+    Ok((consumed, last_skips != preview.omissions.total()))
 }
 
 /// Collects the physical records when the whole file fits the small-preview budgets.
@@ -2814,17 +2931,31 @@ pub(crate) struct EventBuilder {
     events: Vec<OmniEvent>,
     preview: Option<EventPreview>,
     rollback_opener: Option<RollbackOpener>,
+    removed_mirrors: HashSet<u64>,
+    pub(crate) codex_saved_users: Option<bool>,
+    pub(crate) codex_saved_assistant: bool,
 }
 
 #[derive(Default)]
 struct RollbackOpener {
     full_read: bool,
     first_message: Option<(u64, Option<String>)>,
+    mirror_openers: Option<BTreeMap<u64, Option<String>>>,
     applied_rollback: bool,
     gap: bool,
     /// A repeated surviving opener cancels an earlier withdrawal of the same title.
     withdrawn: crate::WithdrawnOpeners,
     target: Option<[u8; 32]>,
+}
+
+impl RollbackOpener {
+    fn active_withdrawals(&self) -> crate::WithdrawnOpeners {
+        let mut withdrawn = self.withdrawn.clone();
+        if let Some((_, Some(title))) = &self.first_message {
+            withdrawn.reissued(title);
+        }
+        withdrawn
+    }
 }
 
 #[derive(Default)]
@@ -2838,6 +2969,7 @@ pub(crate) struct PreviewEvent {
     sequence: u64,
     bytes: usize,
     tool: bool,
+    unverified_history: bool,
 }
 
 impl PreviewEvent {
@@ -2846,6 +2978,7 @@ impl PreviewEvent {
             sequence,
             bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
             tool: is_tool_event(kind),
+            unverified_history: history_unverified(kind, payload),
         }
     }
 }
@@ -2884,17 +3017,26 @@ fn select_preview_edges(
     (selected, omitted)
 }
 
+fn history_unverified(kind: &EventKind, payload: &Value) -> bool {
+    *kind == EventKind::ProviderEvent
+        && payload["native_history_unverified"].as_bool() == Some(true)
+}
+
 fn preview_prefix_end(
-    sequences: impl Iterator<Item = u64>,
+    sequences: impl Iterator<Item = (u64, bool)>,
     selected: &VecDeque<PreviewEvent>,
     end: u64,
 ) -> u64 {
-    sequences
-        .enumerate()
-        .find_map(|(index, sequence)| {
-            (selected.get(index).map(|event| event.sequence) != Some(sequence)).then_some(sequence)
-        })
-        .unwrap_or(end)
+    let mut prefix_end = end;
+    for (index, (sequence, unverified)) in sequences.enumerate() {
+        if unverified {
+            return 0;
+        }
+        if prefix_end == end && selected.get(index).map(|event| event.sequence) != Some(sequence) {
+            prefix_end = sequence;
+        }
+    }
+    prefix_end
 }
 
 impl EventPreview {
@@ -3005,7 +3147,31 @@ impl EventBuilder {
             events: Vec::new(),
             preview: None,
             rollback_opener: None,
+            removed_mirrors: HashSet::new(),
+            codex_saved_users: None,
+            codex_saved_assistant: false,
         }
+    }
+
+    pub(crate) fn empty_with_same_plan(&self) -> Self {
+        debug_assert_eq!(self.next_sequence, 0);
+        let mut builder = Self::new(self.provider, &self.session_id);
+        builder.provider_version.clone_from(&self.provider_version);
+        builder.thread_id = self.thread_id;
+        builder.branch_id = self.branch_id;
+        builder.codex_saved_users = self.codex_saved_users;
+        builder.codex_saved_assistant = self.codex_saved_assistant;
+        if let Some(preview) = &self.preview {
+            builder.plan_preview(preview.selection.clone());
+        }
+        builder.rollback_opener = self.rollback_opener.as_ref().map(|opener| RollbackOpener {
+            full_read: opener.full_read,
+            target: opener.target,
+            gap: opener.gap,
+            mirror_openers: opener.mirror_openers.as_ref().map(|_| BTreeMap::new()),
+            ..RollbackOpener::default()
+        });
+        builder
     }
 
     /// The first pass retains only event sizes and sequence numbers. The second pass materializes the selection.
@@ -3017,10 +3183,11 @@ impl EventBuilder {
     }
 
     pub(crate) fn select_preview(
-        &self,
+        &mut self,
         limit: usize,
         bytes_per_edge: usize,
     ) -> (VecDeque<PreviewEvent>, usize, u64) {
+        self.purge_removed_mirrors();
         let outline = &self
             .preview
             .as_ref()
@@ -3029,7 +3196,9 @@ impl EventBuilder {
         let (selected, omitted) =
             select_preview_edges(outline.iter().copied(), limit, bytes_per_edge);
         let prefix_end = preview_prefix_end(
-            outline.iter().map(|event| event.sequence),
+            outline
+                .iter()
+                .map(|event| (event.sequence, event.unverified_history)),
             &selected,
             self.next_sequence,
         );
@@ -3042,6 +3211,7 @@ impl EventBuilder {
         limit: usize,
         bytes_per_edge: usize,
     ) -> (usize, u64) {
+        self.purge_removed_mirrors();
         let outline = self.events.iter().map(|event| {
             let source_bytes = event.source.native_session_id.len()
                 + event
@@ -3053,14 +3223,19 @@ impl EventBuilder {
             PreviewEvent::new(event.sequence, &event.kind, &event.payload, source_bytes)
         });
         let (selected, omitted) = select_preview_edges(outline, limit, bytes_per_edge);
-        if omitted == 0 {
-            return (0, self.next_sequence);
-        }
         let prefix_end = preview_prefix_end(
-            self.events.iter().map(|event| event.sequence),
+            self.events.iter().map(|event| {
+                (
+                    event.sequence,
+                    history_unverified(&event.kind, &event.payload),
+                )
+            }),
             &selected,
             self.next_sequence,
         );
+        if omitted == 0 {
+            return (0, prefix_end);
+        }
         let mut selected = selected.into_iter().peekable();
         self.events.retain(|event| {
             selected
@@ -3071,6 +3246,7 @@ impl EventBuilder {
     }
 
     pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
+        self.purge_removed_mirrors();
         self.preview = None;
         if self.events.len() != expected {
             return Err(anyhow!(
@@ -3151,6 +3327,7 @@ impl EventBuilder {
         if positions.is_empty() {
             return;
         }
+        self.purge_removed_mirrors();
         let sequences: Vec<_> = self.events.iter().map(|event| event.sequence).collect();
         // An answer from an older window must stay on its side of the compaction boundary.
         for window in self
@@ -3168,6 +3345,7 @@ impl EventBuilder {
     }
 
     pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
+        self.purge_removed_mirrors();
         self.events.drain(..)
     }
 
@@ -3199,6 +3377,15 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn witnessed_saved_opener_withdrawal(&self, title: &str) -> bool {
+        self.rollback_opener.as_ref().is_some_and(|opener| {
+            opener
+                .active_withdrawals()
+                .hashes
+                .contains(&crate::RollbackTitle::fingerprint(title))
+        })
+    }
+
     pub(crate) fn confirms_saved_local_opener(&self, title: &str) -> bool {
         self.rollback_opener.as_ref().is_some_and(|opener| {
             (!opener.gap
@@ -3207,10 +3394,7 @@ impl EventBuilder {
                     .as_ref()
                     .and_then(|(_, title)| title.as_deref())
                     == Some(title))
-                || opener
-                    .withdrawn
-                    .hashes
-                    .contains(&crate::RollbackTitle::fingerprint(title))
+                || self.witnessed_saved_opener_withdrawal(title)
         })
     }
 
@@ -3240,7 +3424,7 @@ impl EventBuilder {
 
     pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
         match &self.rollback_opener {
-            Some(opener) if opener.gap => opener.withdrawn.after_gap(),
+            Some(opener) if opener.gap => opener.active_withdrawals().after_gap(),
             Some(opener) if opener.full_read || opener.applied_rollback => {
                 crate::RollbackTitle::Known(
                     opener
@@ -3254,6 +3438,102 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn track_codex_mirror_openers(&mut self, enabled: bool) {
+        if let Some(opener) = &mut self.rollback_opener {
+            opener.mirror_openers = (enabled && opener.first_message.is_none()).then(BTreeMap::new);
+        }
+    }
+
+    pub(crate) fn track_codex_provisional_opener(&mut self) {
+        if let Some(opener) = &mut self.rollback_opener
+            && opener.first_message.is_none()
+        {
+            opener.mirror_openers.get_or_insert_with(BTreeMap::new);
+        }
+    }
+
+    pub(crate) fn replace_codex_user_text(
+        &mut self,
+        sequence: u64,
+        text: &str,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let retained = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok();
+        let tracks_opener = self.rollback_opener.as_ref().is_some_and(|opener| {
+            !opener.gap
+                && (opener.mirror_openers.is_some()
+                    || opener
+                        .first_message
+                        .as_ref()
+                        .is_none_or(|(pos, _)| sequence <= *pos))
+        });
+        if retained.is_none() && !tracks_opener {
+            return;
+        }
+        let event = self.event_at(
+            (sequence, None),
+            EventKind::MessageUser,
+            serde_json::json!({"text":text}),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("event_msg".to_owned()),
+        );
+        if tracks_opener && let Some(opener) = &mut self.rollback_opener {
+            let replacement =
+                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event));
+            if let Some(candidates) = &mut opener.mirror_openers {
+                if let Some((_, title)) = &replacement {
+                    candidates.insert(sequence, title.clone());
+                } else {
+                    candidates.remove(&sequence);
+                }
+                opener.first_message = candidates
+                    .first_key_value()
+                    .map(|(&pos, title)| (pos, title.clone()));
+            } else {
+                opener.first_message = replacement;
+            }
+        }
+        if let Some(index) = retained {
+            self.events[index] = event;
+        }
+    }
+
+    pub(crate) fn remove_codex_mirror(&mut self, sequence: u64) {
+        self.removed_mirrors.insert(sequence);
+        if let Some(opener) = &mut self.rollback_opener
+            && let Some(candidates) = &mut opener.mirror_openers
+        {
+            candidates.remove(&sequence);
+            if opener
+                .first_message
+                .as_ref()
+                .is_some_and(|(pos, _)| *pos == sequence)
+            {
+                opener.first_message = candidates
+                    .first_key_value()
+                    .map(|(&pos, title)| (pos, title.clone()));
+            }
+        }
+    }
+
+    fn purge_removed_mirrors(&mut self) {
+        if self.removed_mirrors.is_empty() {
+            return;
+        }
+        self.events
+            .retain(|event| !self.removed_mirrors.contains(&event.sequence));
+        if let Some(preview) = &mut self.preview {
+            preview
+                .outline
+                .retain(|event| !self.removed_mirrors.contains(&event.sequence));
+        }
+        self.removed_mirrors.clear();
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
         self.rollback_events(|sequence| sequence < checkpoint);
     }
@@ -3263,6 +3543,9 @@ impl EventBuilder {
             && !opener.gap
         {
             opener.applied_rollback = true;
+            if let Some(candidates) = &mut opener.mirror_openers {
+                candidates.retain(|sequence, _| keep(*sequence));
+            }
             if let Some((_, Some(title))) = opener
                 .first_message
                 .take_if(|(sequence, _)| !keep(*sequence))
@@ -3271,6 +3554,13 @@ impl EventBuilder {
                 if opener.target.is_none_or(|target| target == hash) {
                     opener.withdrawn.record(hash);
                 }
+            }
+            if opener.first_message.is_none()
+                && let Some(candidates) = &opener.mirror_openers
+            {
+                opener.first_message = candidates
+                    .first_key_value()
+                    .map(|(&pos, title)| (pos, title.clone()));
             }
         }
         if let Some(preview) = &mut self.preview {
@@ -3292,14 +3582,23 @@ impl EventBuilder {
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
+        self.purge_removed_mirrors();
         if self.events.len() <= limit {
+            if self.provider == Provider::Codex {
+                self.push_codex_preview_prefix(self.checkpoint(), true, Some(timestamp));
+            }
             return;
         }
         let omitted = self.events.len() - limit;
+        let mut payload =
+            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit});
+        if self.provider == Provider::Codex {
+            payload["prefix_end_sequence"] = self.events[limit / 2].sequence.into();
+        }
         self.events.drain(limit / 2..limit / 2 + omitted);
         self.push(
             EventKind::ProviderEvent,
-            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit}),
+            payload,
             Some(timestamp),
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.preview_limit".to_owned()),
@@ -3353,6 +3652,9 @@ impl EventBuilder {
                 "omitted_events": omissions.malformed,
                 "malformed_records": omissions.malformed,
             });
+            if omissions.unplaced > 0 {
+                payload["unplaced_records"] = omissions.unplaced.into();
+            }
             if let Some(end) = prefix_end {
                 payload["prefix_end_sequence"] = end.into();
             }
@@ -3432,19 +3734,56 @@ impl EventBuilder {
                 + raw_record_type.as_ref().map_or(0, String::len);
             preview.record(sequence, &kind, &payload, source_bytes)
         });
-        let observe = self.rollback_opener.as_mut().filter(|opener| {
+        let observe = self.rollback_opener.as_ref().is_some_and(|opener| {
             !opener.gap
-                && opener.first_message.is_none()
+                && (opener.first_message.is_none() || opener.mirror_openers.is_some())
                 && matches!(kind, EventKind::MessageUser | EventKind::MessageAssistant)
         });
-        if !retained && observe.is_none() {
+        if !retained && !observe {
             return;
         }
+        let event = self.event_at(
+            (sequence, event_id),
+            kind,
+            payload,
+            timestamp,
+            replay_policy,
+            raw_record_type,
+        );
+        if observe
+            && let Some(opener) = &mut self.rollback_opener
+            && let Some((pos, title)) =
+                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event))
+        {
+            if let Some(candidates) = &mut opener.mirror_openers {
+                candidates.insert(pos, title.clone());
+                if candidates.len() > super::codex::MAX_CANONICAL_EVENTS {
+                    opener.mirror_openers = None;
+                }
+            }
+            if opener.first_message.is_none() {
+                opener.first_message = Some((pos, title));
+            }
+        }
+        if retained {
+            self.events.push(event);
+        }
+    }
+
+    fn event_at(
+        &self,
+        (sequence, event_id): (u64, Option<Uuid>),
+        kind: EventKind,
+        payload: Value,
+        timestamp: Option<DateTime<Utc>>,
+        replay_policy: ReplayPolicy,
+        raw_record_type: Option<String>,
+    ) -> OmniEvent {
         let event_seed = event_id.map_or_else(
             || sequence.to_string(),
             |native_id| format!("{sequence}:{native_id}"),
         );
-        let event = OmniEvent {
+        OmniEvent {
             schema_version: SCHEMA_VERSION.to_owned(),
             event_id: Uuid::new_v5(&self.thread_id, event_seed.as_bytes()),
             thread_id: self.thread_id,
@@ -3462,16 +3801,6 @@ impl EventBuilder {
             raw_blob_hash: None,
             sensitivity: Sensitivity::Normal,
             replay_policy,
-        };
-        if let Some(opener) = observe {
-            opener.first_message =
-                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event));
-            if let Some((_, Some(title))) = &opener.first_message {
-                opener.withdrawn.reissued(title);
-            }
-        }
-        if retained {
-            self.events.push(event);
         }
     }
 
@@ -3514,6 +3843,7 @@ impl EventBuilder {
 
     /// Drops the oldest events above `limit` and returns how many were dropped.
     pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        self.purge_removed_mirrors();
         if let Some(preview) = &mut self.preview {
             let omitted = preview.outline.len().saturating_sub(limit);
             preview.outline.drain(..omitted);
@@ -3525,13 +3855,14 @@ impl EventBuilder {
     }
 
     pub(crate) fn snapshot(
-        self,
+        mut self,
         session: SessionRef,
         title: Option<String>,
         project_path: Option<PathBuf>,
         git_branch: Option<String>,
         captured_at: DateTime<Utc>,
     ) -> CanonicalSnapshot {
+        self.purge_removed_mirrors();
         let current_dir = project_path.unwrap_or_default();
         CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
@@ -4355,6 +4686,35 @@ mod tests {
                 Ok(())
             })?;
         Ok((visited, oversized))
+    }
+
+    #[test]
+    fn preview_edges_keep_unverified_history_out_of_the_verified_prefix() {
+        for limit in [2, 4] {
+            for planned in [true, false] {
+                let mut builder = EventBuilder::new(Provider::Codex, "uncertain-prefix");
+                if planned {
+                    builder.plan_preview(None);
+                }
+                for (kind, payload) in [
+                    (EventKind::MessageUser, json!({"text": "first"})),
+                    (
+                        EventKind::ProviderEvent,
+                        json!({"native_history_unverified": true}),
+                    ),
+                    (EventKind::MessageAssistant, json!({"text": "last"})),
+                ] {
+                    builder.push(kind, payload, None, ReplayPolicy::Contextual, None, None);
+                }
+                let result = if planned {
+                    let (_, omitted, end) = builder.select_preview(limit, 4096);
+                    (omitted, end)
+                } else {
+                    builder.retain_bounded_preview(limit, 4096)
+                };
+                assert_eq!(result, (usize::from(limit == 2), 0));
+            }
+        }
     }
 
     #[test]

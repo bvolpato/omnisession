@@ -16,6 +16,7 @@ mod provider_process;
 mod source_file;
 mod sqlite_wal;
 mod support;
+pub use support::TranscriptRevision;
 #[cfg(all(test, unix))]
 mod test_support;
 
@@ -362,8 +363,10 @@ impl CodexWorkspaceProjection {
     }
 }
 
-/// A search indexing read and whether it covered the full provider source.
+/// A canonical snapshot and the source state observed while building it.
 pub struct IndexRead {
+    /// Physical ancestor rollout IDs and the inventory revisions observed during this projection.
+    pub ancestor_revisions: Vec<(uuid::Uuid, uuid::Uuid)>,
     /// Physical file whose ownership was checked independently of display metadata.
     pub ownership_revision: Option<SourceRevision>,
     pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
@@ -377,12 +380,17 @@ pub struct IndexRead {
     pub rollback_title: RollbackTitle,
     /// The workspace projection belongs to this read's source revision.
     pub workspace_projection: CodexWorkspaceProjection,
-    pub source_complete: bool,
     /// A provider limit made a full read impossible, even without an indexer byte budget.
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+    /// True when the read retained all available canonical events. The snapshot can still report missing history.
+    pub source_complete: bool,
 }
+
+/// Reads a session with the source selection shared by one indexing pass.
+pub type IndexSessionReader<'a> =
+    dyn Fn(&SessionRef, Option<&Path>, u64) -> Result<IndexRead> + Send + Sync + 'a;
 
 /// Search text previously indexed from the same physical transcript.
 #[derive(Clone, Copy)]
@@ -498,6 +506,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    ancestor_revisions: Vec::new(),
                     ownership_revision: None,
                     verified_prefix_end: None,
                     database_aliases: std::sync::Arc::default(),
@@ -516,6 +525,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        ancestor_revisions: Vec::new(),
         ownership_revision: None,
         verified_prefix_end: None,
         database_aliases: std::sync::Arc::default(),
@@ -541,6 +551,12 @@ pub trait NativeSelectionInventory: Send + Sync {
 
     /// Returns the entry chosen by the provider's exact-ID rule.
     fn selected(&self, id: &str) -> Option<&NativeSession>;
+
+    /// Returns the provider file named by the original discovery row.
+    fn selected_copy(&self, id: &str, path: &Path) -> Option<&NativeSession> {
+        self.selected(id)
+            .filter(|row| row.source_path.as_deref() == Some(path))
+    }
 
     /// Checks known paths together and returns the result for each request in order.
     /// If a transcript changed, the adapter can check its previously observed header.
@@ -579,6 +595,48 @@ pub trait ProviderAdapter: Send + Sync {
             notes: self.discovery_notes(),
             ..NativeListing::default()
         })
+    }
+
+    /// Binds an explicit source workspace for a native ID shared by multiple files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot select that workspace.
+    fn bind_workspace_copy(
+        &self,
+        _session: &SessionRef,
+        _workspace: &Path,
+        _file: Option<&Path>,
+        _object: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        anyhow::bail!("this provider does not support workspace-qualified sessions")
+    }
+
+    /// Returns the verified file selected for a native read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected file is ambiguous or unavailable.
+    fn selected_source(&self, _session: &SessionRef) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// Returns other physical copies found by an unscoped discovery pass.
+    fn additional_search_sessions(&self) -> Vec<NativeSession> {
+        Vec::new()
+    }
+
+    /// Returns the selected physical transcript for providers with file-based search revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot resolve the selected session.
+    fn search_transcript_path(
+        &self,
+        _session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(hint.map(Path::to_owned))
     }
 
     /// Finds candidates for live indexing in one project, including recorded workspace changes.
@@ -632,6 +690,19 @@ pub trait ProviderAdapter: Send + Sync {
             .find(|session| session.session.id == id))
     }
 
+    /// Finds an exact ID, with an optional workspace for providers whose listings depend on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn find_native_session_with_project(
+        &self,
+        id: &str,
+        _project: Option<&Path>,
+    ) -> Result<Option<NativeSession>> {
+        self.find_native_session(id)
+    }
+
     /// Reads the effective workspace when it can differ from the discovery metadata.
     ///
     /// # Errors
@@ -639,6 +710,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error when the provider cannot determine the effective directory.
     fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
         Ok(None)
+    }
+
+    /// Checks workspace evidence for a session the user selected from a provider listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected session cannot be identified or read.
+    fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
+        if let Some(workspace) = self.native_workspace(&listed.session)? {
+            return Ok(workspace.directory);
+        }
+        let live = self
+            .find_native_session_with_project(&listed.session.id, listed.project_path.as_deref())?
+            .filter(|session| session.session == listed.session)
+            .ok_or_else(|| anyhow!("the provider did not return the selected session"))?;
+        Ok(live.project_path)
     }
 
     /// Describes whether the provider can continue the stored representation by its session ID.
@@ -655,7 +742,7 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
-    /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
+    /// Resolves the local Codex database directory for a continuation. An existing ID must select the displayed session there.
     ///
     /// # Errors
     ///
@@ -889,6 +976,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
@@ -925,6 +1013,42 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<CanonicalSnapshot> {
         self.preview_session(session)
+    }
+
+    /// Prepares one reader for the given native session IDs. An adapter can pin its selected
+    /// source paths for this pass. The caller drops the reader before the next pass.
+    fn index_batch(&self, _ids: &[&str]) -> Option<Box<IndexSessionReader<'_>>> {
+        None
+    }
+
+    /// Prepares a batch reader for search. Discovery supplies names for the listed sessions.
+    fn index_search_batch(
+        &self,
+        ids: &[&str],
+        _listed: &HashSet<&str>,
+    ) -> Option<Box<IndexSessionReader<'_>>> {
+        self.index_batch(ids)
+    }
+
+    fn apply_verified_workspace(
+        &self,
+        _session: &mut NativeSession,
+        _index: &omnis_store::CodexWorkspaceIndex,
+    ) -> bool {
+        false
+    }
+
+    /// Observes the current physical copies of each ancestor used to index a descendant.
+    fn index_ancestor_revisions(
+        &self,
+        _ids: &HashSet<uuid::Uuid>,
+    ) -> HashMap<uuid::Uuid, uuid::Uuid> {
+        HashMap::new()
+    }
+
+    /// Finds previously missing sources that can now contribute to a new index read.
+    fn available_index_sources(&self, _ids: &HashSet<uuid::Uuid>) -> HashSet<uuid::Uuid> {
+        HashSet::new()
     }
 
     /// Returns the transcript file when discovery uses its modification time for search freshness.
@@ -993,6 +1117,8 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
+        let selected_path = self.search_transcript_path(session, source_path)?;
+        let source_path = selected_path.as_deref();
         let over_budget = source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes)
@@ -1222,6 +1348,30 @@ impl AdapterRegistry {
             .preview_session_at(session, source_path)
     }
 
+    /// Reads the physical revision of the provider's selected transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider selection or filesystem errors.
+    pub fn search_revision(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<TranscriptRevision>> {
+        if !matches!(
+            session.provider,
+            Provider::Claude | Provider::Codex | Provider::Pi | Provider::OhMyPi
+        ) {
+            return Ok(None);
+        }
+        self.adapter(session.provider)?
+            .search_transcript_path(session, hint)?
+            .as_deref()
+            .map(TranscriptRevision::read)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Reads a source and its indexing time. A file change during the read leaves the time unset.
     ///
     /// For adapters without a file clock, the reader supplies the provider's timestamp.
@@ -1273,8 +1423,8 @@ impl AdapterRegistry {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        self.adapter(session.provider)?
-            .index_session(session, source_path, full_read_bytes)
+        let adapter = self.adapter(session.provider)?;
+        adapter.index_session(session, source_path, full_read_bytes)
     }
 
     /// Dispatches native resume or fork planning to provider adapter.

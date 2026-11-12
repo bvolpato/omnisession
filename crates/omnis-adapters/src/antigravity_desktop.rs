@@ -223,6 +223,7 @@ impl AntigravityDesktopAdapter {
         let incomplete = coverage.omitted > 0
             || crate::antigravity::AntigravityAdapter::has_missing_database_steps(&snapshot);
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             ownership_revision: None,
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,

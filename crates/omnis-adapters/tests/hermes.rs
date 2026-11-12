@@ -152,6 +152,30 @@ fn hermes_reads_documented_sqlite_without_reasoning_or_mutation() {
 }
 
 #[test]
+fn exact_lookup_preserves_metadata_without_reading_other_histories() {
+    let temporary = tempfile::tempdir().unwrap();
+    fixture(temporary.path());
+    let adapter = HermesAdapter::with_root(temporary.path());
+    let expected = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let connection = Connection::open(temporary.path().join("state.db")).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO sessions (id, source, started_at, archived)
+             VALUES ('other', 'cli', 200.0, 0), ('archived', 'cli', 300.0, 1);
+             INSERT INTO messages (session_id, role, content, timestamp)
+             VALUES ('other', 'user', x'FF', 201.0);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        adapter.find_native_session(SESSION_ID).unwrap(),
+        Some(expected)
+    );
+    assert!(adapter.find_native_session("archived").unwrap().is_none());
+    assert!(adapter.find_native_session("missing").unwrap().is_none());
+}
+
+#[test]
 fn missing_hermes_database_does_not_claim_complete_discovery() {
     let temporary = tempfile::tempdir().unwrap();
     let adapter = HermesAdapter::with_root(temporary.path());

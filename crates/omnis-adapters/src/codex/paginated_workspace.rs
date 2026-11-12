@@ -28,7 +28,7 @@ impl TurnState {
 /// A paginated rollback keeps the display, including the context of a withdrawn request.
 pub(super) struct PaginatedWorkspace {
     before: Option<PathBuf>,
-    contexts: VecDeque<(Option<String>, PathBuf)>,
+    contexts: VecDeque<(Option<String>, PathBuf, usize)>,
     first_sequence: u64,
 }
 
@@ -47,11 +47,11 @@ impl PaginatedWorkspace {
         self.first_sequence = sequence;
     }
 
-    pub(super) fn observe(&mut self, turn: Option<&str>, directory: &Path) {
+    pub(super) fn observe(&mut self, turn: Option<&str>, directory: &Path, position: usize) {
         if self
             .contexts
             .back()
-            .is_some_and(|(previous, path)| previous.as_deref() == turn && path == directory)
+            .is_some_and(|(previous, path, _)| previous.as_deref() == turn && path == directory)
         {
             return;
         }
@@ -60,7 +60,7 @@ impl PaginatedWorkspace {
             self.before = None;
         }
         self.contexts
-            .push_back((turn.map(str::to_owned), directory.to_owned()));
+            .push_back((turn.map(str::to_owned), directory.to_owned(), position));
     }
 
     pub(super) fn surviving<'a>(
@@ -68,7 +68,7 @@ impl PaginatedWorkspace {
         aliases: &'a TurnAliases,
         paginated_aliases: &HashMap<[u8; 32], [u8; 32]>,
         requests: impl Iterator<Item = (u64, Option<&'a str>, Option<Withdrawal>)>,
-    ) -> Option<PathBuf> {
+    ) -> Option<(PathBuf, usize)> {
         // A turn can contain several requests. Withdrawing a steer leaves its primary request.
         let mut keys = HashMap::new();
         let mut turn_key = |id: &'a str| {
@@ -98,7 +98,7 @@ impl PaginatedWorkspace {
             }
         }
         let mut mixed_dirs = HashMap::new();
-        for (turn, directory) in &self.contexts {
+        for (turn, directory, _) in &self.contexts {
             if let Some(turn) = turn.as_deref().map(&mut turn_key)
                 && turns.get(&turn) == Some(&TurnState::Mixed)
             {
@@ -109,7 +109,7 @@ impl PaginatedWorkspace {
             }
         }
         let mut possible = None;
-        for (turn, directory) in self.contexts.iter().rev() {
+        for (turn, directory, position) in self.contexts.iter().rev() {
             let turn = turn.as_deref().map(&mut turn_key);
             let state = turn.and_then(|id| turns.get(&id)).copied();
             if state == Some(TurnState::Withdrawn) {
@@ -121,7 +121,7 @@ impl PaginatedWorkspace {
             if state == Some(TurnState::Present)
                 || turn.is_some_and(|id| mixed_dirs.get(&id) == Some(&Some(directory)))
             {
-                return Some(directory.clone());
+                return Some((directory.clone(), *position));
             }
             // A missing or ambiguous owner can survive. Every possible directory must agree.
             possible = Some(directory);
@@ -129,5 +129,6 @@ impl PaginatedWorkspace {
         self.before
             .clone()
             .filter(|path| possible.is_none_or(|other| other == path))
+            .map(|path| (path, 1))
     }
 }

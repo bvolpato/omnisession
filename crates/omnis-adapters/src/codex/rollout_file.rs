@@ -1,7 +1,7 @@
 //! Read the physical representation of a Codex JSONL rollout without modifying the source.
 
 use std::{
-    cell::OnceCell,
+    cell::{Cell, OnceCell},
     collections::VecDeque,
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read, Seek},
@@ -142,7 +142,15 @@ pub(super) fn compressed(path: &Path) -> bool {
         .is_some_and(|extension| extension == "zst" || extension == "gz")
 }
 
-pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
+pub(super) fn representation_priority(path: &Path) -> u8 {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("jsonl") => 2,
+        Some("zst") => 1,
+        _ => 0,
+    }
+}
+
+fn physical_file(path: &Path) -> Result<File> {
     if !fs::symlink_metadata(path)?.is_file() {
         bail!("Codex rollout must be a regular file");
     }
@@ -151,6 +159,67 @@ pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
     if !meta.is_file() || meta.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
         bail!("Codex rollout exceeds safe streaming limit or is not a regular file");
     }
+    Ok(file)
+}
+
+// Resolving one fork can open several rollouts while selecting and verifying archival copies.
+// Charge all reads on the synchronous discovery thread to the same search budget.
+thread_local! {
+    static SEARCH_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(super) fn within_search_budget<T>(
+    remaining: &mut u64,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEARCH_BYTES.set(self.0);
+        }
+    }
+    let _restore = Restore(SEARCH_BYTES.replace(Some(*remaining)));
+    let result = run();
+    *remaining = SEARCH_BYTES.get().expect("active search budget");
+    anyhow::ensure!(*remaining != 0, "workspace search budget exhausted");
+    result
+}
+
+struct SearchReader<R>(R);
+
+impl<R: Read> Read for SearchReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = SEARCH_BYTES.get().expect("active search budget");
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if remaining == 0 {
+            return Err(std::io::Error::other("workspace search budget exhausted"));
+        }
+        let limit = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let count = self.0.read(&mut buf[..limit])?;
+        SEARCH_BYTES.set(Some(remaining - count as u64));
+        Ok(count)
+    }
+}
+
+pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
+    let file = physical_file(path)?;
+    if let Some(remaining) = SEARCH_BYTES.get() {
+        if compressed(path) {
+            // A decoder can consume a large encoded stream before it returns any output.
+            let encoded = file.metadata()?.len();
+            SEARCH_BYTES.set(Some(remaining.saturating_sub(encoded)));
+            anyhow::ensure!(encoded < remaining, "workspace search budget exhausted");
+        }
+        return Ok(Box::new(SearchReader(decoder(path, file)?)));
+    }
+    decoder(path, file)
+}
+
+fn decoder(path: &Path, file: File) -> Result<Box<dyn Read>> {
     let reader: Box<dyn Read> = match path.extension().and_then(|ext| ext.to_str()) {
         Some("gz") => Box::new(MultiGzDecoder::new(file)),
         Some("zst") => {
@@ -164,19 +233,74 @@ pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
     Ok(reader)
 }
 
+#[derive(Debug)]
+pub(super) struct CompressedHeaderError;
+
+impl std::fmt::Display for CompressedHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reading compressed Codex rollout header")
+    }
+}
+
 pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
-    if !compressed(path) {
+    if !compressed(path) && SEARCH_BYTES.get().is_none() {
         return json_lines_prefix(path, 1);
     }
     // Listing thousands of archives should consume only their first line.
     let mut line = Vec::new();
     BufReader::new(open(path)?.take(MAX_TRANSCRIPT_LINE_SIZE + 1))
         .read_until(b'\n', &mut line)
-        .context("reading compressed Codex rollout header")?;
+        .context(CompressedHeaderError)?;
     if u64::try_from(line.len())? > MAX_TRANSCRIPT_LINE_SIZE {
         bail!("Codex rollout header exceeds safe line limit");
     }
     Ok(serde_json::from_slice(&line).ok().into_iter().collect())
+}
+
+#[derive(Default)]
+pub(super) struct NativeReadBudget {
+    encoded: u64,
+    decoded: u64,
+}
+
+impl NativeReadBudget {
+    pub(super) fn contains_prefix(
+        &mut self,
+        path: &Path,
+        end: u64,
+        check: impl FnOnce(&mut dyn Read) -> Result<bool>,
+    ) -> Result<bool> {
+        let file = physical_file(path)?;
+        let length = file.metadata()?.len();
+        let remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.decoded;
+        if end > remaining {
+            return Ok(false);
+        }
+        if !compressed(path) {
+            if end > length {
+                return Ok(false);
+            }
+            self.decoded += end;
+            let mut prefix = file.take(end);
+            return Ok(check(&mut prefix)? && prefix.limit() == 0);
+        }
+        if length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.encoded {
+            return Ok(false);
+        }
+        self.encoded += length;
+        let mut reader = decoder(path, file)?.take(remaining + 1);
+        let mut prefix = reader.by_ref().take(end);
+        if !check(&mut prefix)? || prefix.limit() != 0 {
+            return Ok(false);
+        }
+        // Native Codex must also open the suffix beyond an otherwise valid bookmark.
+        let bytes = end + std::io::copy(&mut reader, &mut std::io::sink())?;
+        if bytes > remaining {
+            return Ok(false);
+        }
+        self.decoded += bytes;
+        Ok(true)
+    }
 }
 
 pub(super) const LIMITS: JsonLinesLimits = JsonLinesLimits {
@@ -230,6 +354,24 @@ pub(super) fn visit_all_records(
     Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
 }
 
+pub(super) fn visit_all_projected_records(
+    path: &Path,
+    owner: &str,
+    mut accepts: impl FnMut(Value, bool) -> Result<bool>,
+) -> Result<bool> {
+    let mut accepted = true;
+    let mut receipts = super::history_base::replay_messages::RequestReceipts::new(owner, true);
+    let mut project = |record, _, confirmed| {
+        accepted &= accepts(record, confirmed)?;
+        Ok(())
+    };
+    let omissions = visit(path, |record, skipped, _| {
+        receipts.observe_confirmed(record, skipped, &mut project)
+    })?;
+    receipts.flush(|record, mark| project(record, mark, false))?;
+    Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
+}
+
 pub(super) fn read_records(
     reader: impl Read,
     visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
@@ -275,15 +417,18 @@ pub(super) enum Sample {
     Complete(Vec<u8>),
     Edges {
         records: Vec<Value>,
+        run_starts: Vec<usize>,
         omitted: usize,
         unreadable: JsonLineSkips,
         prefix_records: usize,
+        saved_messages: usize,
         directory: Option<PathBuf>,
     },
     Reconstruct,
 }
 
 pub(super) enum WorkspaceRecord {
+    SavedMessage,
     Candidate,
     Compacted,
     Other,
@@ -359,16 +504,16 @@ pub(super) fn workspace_record_kind(line: &[u8], inspect_displays: bool) -> Work
         Some("compacted") => WorkspaceRecord::Compacted,
         Some("response_item" | "event_msg") if inspect_displays => WorkspaceRecord::Candidate,
         None | Some("turn_context" | "session_meta") => WorkspaceRecord::Candidate,
-        Some("event_msg")
-            if matches!(
-                field(line, "payload")
-                    .and_then(|payload| string_field(payload, "type"))
-                    .as_deref(),
-                None | Some("thread_rolled_back" | "thread_settings_applied")
-            ) =>
+        Some("event_msg") => match field(line, "payload")
+            .and_then(|payload| string_field(payload, "type"))
+            .as_deref()
         {
-            WorkspaceRecord::Candidate
-        }
+            Some("user_message" | "agent_message") => WorkspaceRecord::SavedMessage,
+            None | Some("thread_rolled_back" | "thread_settings_applied") => {
+                WorkspaceRecord::Candidate
+            }
+            _ => WorkspaceRecord::Other,
+        },
         _ => WorkspaceRecord::Other,
     }
 }
@@ -431,12 +576,13 @@ pub(super) fn sample(
         LIMITS,
         |line, oversized| workspace_gap(line, oversized, Some(session)),
         |loc, record, skipped| {
+            let record = super::saved_message::project(record);
             let ordinal = count + skipped.total();
             count += 1;
             workspace.settings.observe_gaps(skipped);
             workspace.observe(session, &record);
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
-                head.push(record);
+                head.push((ordinal, record));
                 if ordinal == prefix_records {
                     prefix_records += 1;
                 }
@@ -465,15 +611,22 @@ pub(super) fn sample(
             if ordinal == prefix_records {
                 prefix_records += 1;
             }
-            head.push(record);
+            head.push((ordinal, record));
         }
     }
+    let run_starts = head
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| (pair[1].0 != pair[0].0 + 1).then_some(i + 1))
+        .collect();
     Ok(Sample::Edges {
+        run_starts,
+        saved_messages: workspace.saved_messages,
         omitted: count - head.len(),
         prefix_records,
         unreadable,
         directory: workspace.settings.directory(workspace.directory),
-        records: head,
+        records: head.into_iter().map(|(_, record)| record).collect(),
     })
 }
 
@@ -514,6 +667,39 @@ mod tests {
         file.seek(SeekFrom::Start(receipt.0 / 2))?;
         file.write_all(b"b")?;
         assert_ne!(capture(Some(receipt.0)).unwrap().1, receipt.1);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_ancestor_budget_is_shared_across_the_chain() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("ancestor.jsonl.zst");
+        let records = b"fixture data inside and after a bookmark";
+        let frame = zstd::bulk::compress(records, 1)?;
+        fs::write(&path, &frame)?;
+        let size = |n| MAX_STREAMED_TRANSCRIPT_FILE_SIZE - 2 * n + 1;
+        let check = |reader: &mut dyn Read| Ok(std::io::copy(reader, &mut std::io::sink())? > 0);
+        for mut budget in [
+            NativeReadBudget {
+                encoded: size(u64::try_from(frame.len())?),
+                decoded: 0,
+            },
+            NativeReadBudget {
+                encoded: 0,
+                decoded: size(u64::try_from(records.len())?),
+            },
+        ] {
+            assert!(budget.contains_prefix(&path, 1, check)?);
+            assert!(!budget.contains_prefix(&path, 1, check)?);
+        }
+        let plain = home.path().join("ancestor.jsonl");
+        fs::write(&plain, records)?;
+        let mut budget = NativeReadBudget {
+            decoded: MAX_STREAMED_TRANSCRIPT_FILE_SIZE - u64::try_from(records.len())?,
+            ..NativeReadBudget::default()
+        };
+        assert!(budget.contains_prefix(&plain, 1, check)?);
+        assert!(!budget.contains_prefix(&path, 1, check)?);
         Ok(())
     }
 }

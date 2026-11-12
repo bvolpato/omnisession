@@ -426,7 +426,7 @@ pub struct WorkspaceSnapshot {
 }
 
 /// The selected provider file, its contents revision, and any missing source needed for indexing.
-#[derive(Clone, Copy, Debug, Default, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Serialize)]
 pub struct SourceRevision {
     /// A historical file ID derived from the same open file for cache migration.
     pub legacy_file: Option<Uuid>,

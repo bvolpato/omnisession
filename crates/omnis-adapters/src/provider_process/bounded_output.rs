@@ -465,18 +465,19 @@ fn collect(
             Stream::Stderr(bytes) => stderr = bytes,
         }
     }
-    if cancel.is_some() || wait.response.is_some() {
-        if !stopped {
-            // A worker can finish the response after its launcher exits. Drain the streams first.
-            while !stop_exited_probe(child, |_| true)? {
-                let wait = probe_wait(cancel, remaining(), true)?;
-                if wait.is_zero() {
-                    return Err(timed_out().into());
-                }
-                thread::sleep(wait);
+    let stop_workers = cancel.is_some() || wait.response.is_some();
+    if stop_workers && !stopped {
+        // A worker can finish the response after its launcher exits. Drain the streams first.
+        while !stop_exited_probe(child, |_| true)? {
+            let wait = probe_wait(cancel, remaining(), true)?;
+            if wait.is_zero() {
+                return Err(timed_out().into());
             }
+            thread::sleep(wait);
         }
-        #[cfg(target_vendor = "apple")]
+    }
+    #[cfg(target_vendor = "apple")]
+    if stop_workers {
         stop_remaining_workers(
             child,
             drain_until

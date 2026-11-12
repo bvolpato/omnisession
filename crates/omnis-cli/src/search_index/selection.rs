@@ -69,10 +69,13 @@ impl<'a> FileSelections<'a> {
         let Some(inventory) = inventory else {
             return Ok(self.provider_selects(check));
         };
-        Ok(inventory.selected(&check.session.id).is_some_and(|native| {
-            native.source_path.as_deref() == check.path
-                && native.source_revision == Some(check.revision)
-        }))
+        Ok(check
+            .path
+            .and_then(|path| inventory.selected_copy(&check.session.id, path))
+            .is_some_and(|native| {
+                native.source_path.as_deref() == check.path
+                    && native.source_revision == Some(check.revision)
+            }))
     }
 
     pub(super) fn selected_session_at(
@@ -82,10 +85,7 @@ impl<'a> FileSelections<'a> {
     ) -> anyhow::Result<Option<omnis_adapters::NativeSession>> {
         self.observe(session.provider)?;
         if let Ok(Some(inventory)) = &self.inventories[&session.provider] {
-            return Ok(inventory
-                .selected(&session.id)
-                .filter(|native| native.source_path.as_deref() == Some(path))
-                .cloned());
+            return Ok(inventory.selected_copy(&session.id, path).cloned());
         }
         self.registry
             .adapter(session.provider)?

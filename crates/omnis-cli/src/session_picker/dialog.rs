@@ -1,11 +1,23 @@
 use super::{KeyCode, KeyEvent, PathBuf, PickerAction, PickerState, SessionRef};
 
 pub(super) struct DeleteDialog {
+    pub(super) pi_file: Option<crate::pi_import::ConfirmedPiFile>,
+    pub(super) row_key: String,
     pub(super) session: SessionRef,
     pub(super) title: String,
     pub(super) workspace: Option<PathBuf>,
     pub(super) branch: Option<String>,
     pub(super) phase: DeletePhase,
+}
+
+impl DeleteDialog {
+    pub(super) fn workspace_or(&self, fallback: &std::path::Path) -> PathBuf {
+        self.workspace
+            .as_deref()
+            .filter(|path| path.is_dir())
+            .unwrap_or(fallback)
+            .to_owned()
+    }
 }
 
 pub(super) enum DeletePhase {

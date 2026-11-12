@@ -239,6 +239,7 @@ impl AntigravityAdapter {
         );
         let history = read?;
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             ownership_revision: None,
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
@@ -1059,6 +1060,7 @@ impl ProviderAdapter for AntigravityAdapter {
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {
+                ancestor_revisions: Vec::new(),
                 ownership_revision: None,
                 workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 rollback_title: crate::RollbackTitle::Unknown,

@@ -284,6 +284,7 @@ impl CodexSession {
             time.and_then(|time| chrono::DateTime::from_timestamp_millis(time.timestamp_millis()))
         };
         IndexedSession {
+            source_path: None,
             session: SessionRef::new(Provider::Codex, self.id.clone()),
             source_revision: self.observed_revision,
             title: self.title.as_deref().map(omnis_core::redact_secrets),

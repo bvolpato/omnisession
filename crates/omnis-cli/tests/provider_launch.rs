@@ -165,6 +165,103 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn native_fork_and_cached_resume_follow_the_directory_at_the_bookmark() {
+    const CHILD: &str = "22222222-2222-4222-8222-222222222222";
+    let fixture = Fixture::new();
+    let inherited = fixture.workspace.join("inherited");
+    fs::create_dir(&inherited).unwrap();
+    fixture.init_git();
+    let rollout = |id| {
+        fixture.root.join(format!(
+            "codex/sessions/rollout-2026-01-01T00-00-00-{id}.jsonl"
+        ))
+    };
+    let header = |id, ordinal| {
+        json!({"type":"session_meta","ordinal":ordinal,"payload":{
+            "id":id,"cwd":fixture.workspace,"history_mode":"paginated"
+        }})
+    };
+    let context = json!({"type":"turn_context","ordinal":1,"payload":{"cwd":inherited}});
+    let parent = format!("{}\n{context}\n", header(SOURCE_ID, 0));
+    let mut child = header(CHILD, 2);
+    child["payload"]["history_base"] = json!({
+        "thread_id":SOURCE_ID,"end_byte_offset":parent.len(),"end_ordinal_exclusive":2
+    });
+    fs::write(rollout(SOURCE_ID), parent).unwrap();
+    fs::write(rollout(CHILD), format!("{child}\n")).unwrap();
+    let codex = fixture.root.join("fake-codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'codex-cli 0.167.0'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output_after_write(Command::new(&codex).arg("--version"))
+            .status
+            .success()
+    );
+
+    let output = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", &codex)
+        .args(["--json", "fork", CHILD, "--in", "codex", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["launch"]["cwd"], json!(inherited));
+    let args = plan["launch"]["args"].as_array().unwrap();
+    assert!(args.ends_with(&[json!("fork"), json!(CHILD)]));
+
+    let index = fixture
+        .command()
+        .args(["index", "--provider", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let changed = fixture.workspace.join("different");
+    fs::create_dir(&changed).unwrap();
+    let context = json!({"type":"turn_context","ordinal":1,"payload":{"cwd":changed}});
+    let replacement = format!("{}\n{context}\n", header(SOURCE_ID, 0));
+    assert_eq!(
+        replacement.len() as u64,
+        fs::metadata(rollout(SOURCE_ID)).unwrap().len()
+    );
+    fs::write(rollout(SOURCE_ID), replacement).unwrap();
+    let resumed = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", &codex)
+        .args([
+            "--json",
+            "resume",
+            &format!("codex:{CHILD}"),
+            "--in",
+            "codex",
+            "--no-fork",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(plan["launch"]["cwd"], json!(changed));
+}
+
+#[cfg(unix)]
+#[test]
 fn legacy_opencode_resolves_the_last_listed_id_and_retries_export_in_its_directory() {
     let fixture = Fixture::new();
     let directory = fixture.workspace.join("subdir");

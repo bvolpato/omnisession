@@ -81,8 +81,18 @@ const HISTORY_HASH: u64 = fnv1a(
         include_bytes!("paginated_workspace.rs"),
     ],
 );
-const PARSER_FINGERPRINT: u64 = fnv1a(
+const LINEAGE_HASH: u64 = fnv1a(
     HISTORY_HASH,
+    &[
+        include_bytes!("history_base.rs"),
+        include_bytes!("history_base/copies.rs"),
+        include_bytes!("history_base/observed.rs"),
+        include_bytes!("rollout_identity.rs"),
+        include_bytes!("saved_message.rs"),
+    ],
+);
+const PARSER_FINGERPRINT: u64 = fnv1a(
+    LINEAGE_HASH,
     &[
         include_bytes!("rollout_cache.rs"),
         include_bytes!("rollout_file.rs"),
@@ -250,6 +260,8 @@ pub(super) struct RolloutHeader {
     pub(super) project_path: Option<PathBuf>,
     pub(super) git: GitState,
     pub(super) cli_version: Option<String>,
+    pub(super) history_base: super::HistoryBase,
+    pub(super) subagent_history_start: Option<u64>,
     pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,

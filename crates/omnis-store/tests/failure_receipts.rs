@@ -16,6 +16,7 @@ fn revision(file: u128, contents: u128) -> SourceRevision {
 
 fn full(text: &str, rev: SourceRevision) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
+        ancestor_revisions: &[],
         title_authoritative: true,
         title_is_verified: false,
         local_opener: LocalOpenerEvidence::Unknown,
@@ -50,8 +51,9 @@ fn preview(rev: SourceRevision) -> TrajectoryDocument<'static> {
     }
 }
 
-fn failure(doc: TrajectoryDocument<'_>) -> TrajectoryIndexFailure {
+fn failure(doc: &TrajectoryDocument<'_>) -> TrajectoryIndexFailure {
     TrajectoryIndexFailure {
+        ancestor_revisions: doc.ancestor_revisions.to_vec(),
         source_file: doc.source_revision.file,
         source_contents: doc.source_revision.contents,
         source_updated_at: Some(doc.source_updated_at),
@@ -63,6 +65,7 @@ fn failure(doc: TrajectoryDocument<'_>) -> TrajectoryIndexFailure {
 
 fn locator(session: &SessionRef) -> IndexedSession {
     IndexedSession {
+        source_path: None,
         source_revision: None,
         session: session.clone(),
         title: None,
@@ -106,10 +109,10 @@ impl Fixture {
             .observe_trajectory_document(&self.session)
             .unwrap()
     }
-    fn write(&self, doc: TrajectoryDocument<'_>, guard: &TrajectorySourceGuard) -> usize {
+    fn write(&self, doc: &TrajectoryDocument<'_>, guard: &TrajectorySourceGuard) -> usize {
         self.index
             .upsert_observed_trajectory_documents_checked(
-                &[(&self.session, doc, *guard)],
+                &[(&self.session, *doc, *guard)],
                 |_, _| true,
             )
             .unwrap()
@@ -135,8 +138,8 @@ fn a_late_failure_or_clear_cannot_replace_the_current_receipt() {
     };
     let first = summary(revision(1, 1));
     let second = summary(revision(1, 2));
-    let current = failure(second);
-    f.write(first, &f.observe());
+    let current = failure(&second);
+    f.write(&first, &f.observe());
     let prior = index.observe_trajectory_document(session).unwrap();
     index
         .record_observed_trajectory_index_failure_checked(
@@ -147,7 +150,7 @@ fn a_late_failure_or_clear_cannot_replace_the_current_receipt() {
         )
         .unwrap();
     assert_eq!(index.trajectory_index_failures().unwrap()[session], current);
-    let old = failure(first);
+    let old = failure(&first);
     let rejected = index.record_observed_trajectory_index_failure_checked(
         session,
         &old,
@@ -156,30 +159,30 @@ fn a_late_failure_or_clear_cannot_replace_the_current_receipt() {
     );
     assert!(matches!(rejected, Err(StoreError::TrajectorySourceChanged)));
     for obsolete in [
-        old,
-        TrajectoryIndexFailure {
+        &old,
+        &TrajectoryIndexFailure {
             native_summary: false,
-            ..current
+            ..current.clone()
         },
-        TrajectoryIndexFailure {
+        &TrajectoryIndexFailure {
             source_time_precise: false,
-            ..current
+            ..current.clone()
         },
     ] {
         index
-            .clear_observed_trajectory_index_failure(session, &obsolete)
+            .clear_observed_trajectory_index_failure(session, obsolete)
             .unwrap();
     }
-    f.write(first, &prior);
-    assert_eq!(f.saved(), Some(current));
+    f.write(&first, &prior);
+    assert_eq!(f.saved().as_ref(), Some(&current));
     let reading = f.observe();
-    let concurrent = failure(summary(revision(1, 3)));
+    let concurrent = failure(&summary(revision(1, 3)));
     f.record(&concurrent);
     let rejected = index.record_observed_trajectory_index_failure(session, &current, reading);
     assert!(matches!(rejected, Err(StoreError::TrajectorySourceChanged)));
-    f.write(first, &reading);
+    f.write(&first, &reading);
     assert_eq!(f.saved(), Some(concurrent));
-    f.write(second, &f.observe());
+    f.write(&second, &f.observe());
     assert_eq!(f.saved(), None);
     let rejected = index.record_observed_trajectory_index_failure(session, &old, prior);
     assert!(matches!(rejected, Err(StoreError::TrajectorySourceChanged)));
@@ -196,9 +199,9 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
         derived_title: Some("Original"),
         ..full("original indexed words", revision(1, 1))
     };
-    assert_eq!(f.write(first, &f.observe()), 1);
+    assert_eq!(f.write(&first, &f.observe()), 1);
     let old = reader.observe_trajectory_document(session).unwrap();
-    assert_eq!(f.write(preview(first.source_revision), &f.observe()), 0);
+    assert_eq!(f.write(&preview(first.source_revision), &f.observe()), 0);
     raw.execute_batch(
         "CREATE TRIGGER no_chunk_delete BEFORE DELETE ON session_trajectory_chunk_rows
         BEGIN SELECT RAISE(ABORT, 'unchanged search chunks were rewritten'); END;",
@@ -208,7 +211,7 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
         source_revision: revision(1, 2),
         ..first
     };
-    assert_eq!(f.write(revised, &f.observe()), 0);
+    assert_eq!(f.write(&revised, &f.observe()), 0);
     let state = f.index.trajectory_index_states().unwrap()[session];
     assert_eq!(state.source_revision, revised.source_revision);
     assert!(state.source_complete);
@@ -225,14 +228,14 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
     assert_eq!(reader.trajectory_index_state(&other).unwrap(), None);
     raw.execute_batch("DROP TRIGGER no_chunk_delete").unwrap();
     let replaced = preview(revision(2, 1));
-    assert_eq!(f.write(replaced, &fresh), 1);
+    assert_eq!(f.write(&replaced, &fresh), 1);
     assert_eq!(f.index.trajectory_title(session).unwrap(), None);
     let weak = TrajectoryDocument {
         source_revision: SourceRevision::default(),
         document_version: 7,
         ..first
     };
-    assert_eq!(f.write(weak, &f.observe()), 0);
+    assert_eq!(f.write(&weak, &f.observe()), 0);
     let state = reader.trajectory_index_state(session).unwrap().unwrap();
     assert_eq!(state.source_revision, replaced.source_revision);
     assert!(!state.source_complete);
@@ -289,7 +292,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 7,
         ..preview(rev)
     };
-    assert_eq!(f.write(partial, &f.observe()), 0);
+    assert_eq!(f.write(&partial, &f.observe()), 0);
     let state = read();
     assert!(state.source_complete);
     assert_eq!(state.source_revision, legacy.source_revision);
@@ -299,7 +302,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 7,
         ..legacy
     };
-    assert_eq!(f.write(upgraded, &f.observe()), 0);
+    assert_eq!(f.write(&upgraded, &f.observe()), 0);
     assert_eq!(read().document_version, upgraded.document_version);
     assert_eq!(read().source_revision, rev);
     let limited = TrajectoryDocument {
@@ -307,7 +310,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 8,
         ..partial
     };
-    assert_eq!(f.write(limited, &f.observe()), 1);
+    assert_eq!(f.write(&limited, &f.observe()), 1);
     let state = read();
     assert_eq!(state.source_revision, rev);
     assert!(state.provider_limited);
@@ -319,17 +322,17 @@ fn a_verified_preview_retires_an_obsolete_failure_and_keeps_full_text() {
     let f = Fixture::new();
     let current = full("preface middlequartz epilogue", revision(1, 1));
     let observed = preview(current.source_revision);
-    let other = failure(full("", revision(1, 2)));
-    assert_eq!(f.write(current, &f.observe()), 1);
-    let same = failure(current);
+    let other = failure(&full("", revision(1, 2)));
+    assert_eq!(f.write(&current, &f.observe()), 1);
+    let same = failure(&current);
     let future = TrajectoryIndexFailure {
         document_version: 7,
-        ..other
+        ..other.clone()
     };
     for (failed, retain) in [(other, false), (same, true), (future, true)] {
         f.record(&failed);
-        assert_eq!(f.write(observed, &f.observe()), 0);
-        assert_eq!(f.saved(), retain.then_some(failed));
+        assert_eq!(f.write(&observed, &f.observe()), 0);
+        assert_eq!(f.saved().as_ref(), retain.then_some(&failed));
         f.index
             .clear_observed_trajectory_index_failure(&f.session, &failed)
             .unwrap();
@@ -347,6 +350,7 @@ fn a_verified_native_read_publishes_its_locator_with_the_indexed_source() {
     let f = Fixture::new();
     let current = full("middlequartz", revision(1, 1));
     let mut locator = IndexedSession {
+        source_path: None,
         source_revision: None,
         session: f.session.clone(),
         title: Some("First".into()),
@@ -432,6 +436,7 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
     for limited in [false, true] {
         let f = Fixture::new();
         let mut locator = IndexedSession {
+            source_path: None,
             source_revision: None,
             session: f.session.clone(),
             title: Some("Previous name".into()),
@@ -475,7 +480,7 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
             ..preview(revision(1, 7))
         };
         assert_eq!(publish(&locator, &other, partial), 0);
-        assert_eq!(f.write(partial, &f.observe()), 0);
+        assert_eq!(f.write(&partial, &f.observe()), 0);
         assert!(
             f.index
                 .indexed_sessions_in_homes(Some(&other), None)
@@ -523,6 +528,7 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
     let a = f.root.path().join("a");
     let b = f.root.path().join("b");
     let mut locator = IndexedSession {
+        source_path: None,
         source_revision: None,
         session: f.session.clone(),
         title: Some("A".into()),
@@ -561,7 +567,7 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
         assert!(matches!(
             f.index.record_observed_trajectory_index_failure_checked(
                 &f.session,
-                &failure(old),
+                &failure(&old),
                 guard,
                 |_, _| true
             ),
@@ -589,7 +595,7 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
     locator.title = Some("B renamed".into());
     list(&locator, &b);
     rejected(before_rename);
-    assert_eq!(f.write(full("beta", revision(2, 2)), &observe(&b)), 1);
+    assert_eq!(f.write(&full("beta", revision(2, 2)), &observe(&b)), 1);
 
     // Direct reads can publish a verified locator and document together when the native home changes.
     assert_eq!(
@@ -1060,7 +1066,7 @@ fn a_partial_read_from_another_home_owns_its_preview_and_retires_its_failure() {
             .unwrap()
             .matches
     };
-    let failed = failure(partial);
+    let failed = failure(&partial);
     f.record(&failed);
     assert!(matches!(
         publish(&b, partial, false),

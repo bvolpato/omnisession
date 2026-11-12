@@ -669,8 +669,8 @@ fn exact_session(record: &Value, id: &str) -> Result<NativeSession> {
         .context("OpenCode exact lookup returned a missing or different session ID")
 }
 
-fn legacy_listed_session(binary: &Path, id: &str) -> Option<NativeSession> {
-    let rows = command_json(binary, &["session", "list", "--format", "json"], None).ok()?;
+fn legacy_listed_session(binary: &Path, id: &str, project: Option<&Path>) -> Option<NativeSession> {
+    let rows = command_json(binary, &["session", "list", "--format", "json"], project).ok()?;
     let row = session_values(&rows)
         .iter()
         .find(|row| metadata_id(row) == Some(id))?;
@@ -700,7 +700,7 @@ fn read_opencode_search_snapshot(
         return initial;
     }
     // Legacy OpenCode may need the working directory from its project listing for export.
-    let cwd = legacy_listed_session(binary, &session.id)
+    let cwd = legacy_listed_session(binary, &session.id, None)
         .and_then(|record| record.project_path)
         .filter(|path| path.is_dir() && !same_file::is_same_file(path, ".").unwrap_or(false));
     match cwd {
@@ -1156,6 +1156,14 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        self.find_native_session_with_project(id, None)
+    }
+
+    fn find_native_session_with_project(
+        &self,
+        id: &str,
+        project: Option<&Path>,
+    ) -> Result<Option<NativeSession>> {
         let Some(binary) = self.binary.as_deref() else {
             return Ok(None);
         };
@@ -1168,7 +1176,15 @@ impl ProviderAdapter for OpenCodeAdapter {
             Err(error) if !generation.is_v2() => {
                 // A listed session can resume even if its transcript is too large to export.
                 // Keep the legacy list command for versions without the db command.
-                if let Some(record) = legacy_listed_session(binary, id) {
+                if let Some(record) = legacy_listed_session(binary, id, None).or_else(|| {
+                    let cached_project = project.filter(|path| {
+                        path.is_absolute()
+                            && !omnis_core::may_reach_network(path)
+                            && path.is_dir()
+                            && !same_file::is_same_file(path, ".").unwrap_or(false)
+                    })?;
+                    legacy_listed_session(binary, id, Some(cached_project))
+                }) {
                     return Ok(Some(record));
                 }
                 // A listing can omit a session. Export failures can also reflect unreadable messages.
@@ -1378,7 +1394,10 @@ mod tests {
                 r#"
 case "$2:$3" in
     db:*) exit 2 ;;
-    session:list) echo '[{"id":"ses_listed_other"},{"id":"ses_listed","directory":"/project"}]' ;;
+    session:list)
+        if [ -f ./fixture-sessions.json ]; then cat ./fixture-sessions.json
+        else echo '[{"id":"ses_listed_other"},{"id":"ses_listed","directory":"/project"}]'
+        fi ;;
     export:ses_hidden) echo '{"info":{"id":"ses_hidden","directory":"/project"}}' ;;
     export:ses_missing) echo 'Error: Session not found: ses_missing' >&2; exit 1 ;;
     export:ses_wrong) echo 'Error: Session not found: ses_other' >&2; exit 1 ;;
@@ -1431,11 +1450,7 @@ esac"#,
                 Some(std::path::Path::new("/project"))
             );
             if version == "1.0.0" {
-                let listed = adapter.find_native_session("ses_listed").unwrap().unwrap();
-                assert_eq!(
-                    listed.project_path.as_deref(),
-                    Some(std::path::Path::new("/project"))
-                );
+                assert_legacy_list_lookups(&adapter, directory.path());
                 assert!(
                     super::find_opencode_session_with_binary(&binary, "ses_listed", None).is_err()
                 );
@@ -1469,6 +1484,25 @@ esac"#,
                 assert!(adapter.find_native_session(id).is_err(), "{version} {id}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_legacy_list_lookups(adapter: &super::OpenCodeAdapter, workspace: &std::path::Path) {
+        use crate::ProviderAdapter;
+
+        let listed = adapter.find_native_session("ses_listed").unwrap().unwrap();
+        assert_eq!(
+            listed.project_path.as_deref(),
+            Some(std::path::Path::new("/project"))
+        );
+
+        let record = serde_json::json!([{"id": "ses_scoped", "directory": workspace}]);
+        std::fs::write(workspace.join("fixture-sessions.json"), record.to_string()).unwrap();
+        let scoped = adapter
+            .find_native_session_with_project("ses_scoped", Some(workspace))
+            .unwrap()
+            .unwrap();
+        assert_eq!(scoped.project_path.as_deref(), Some(workspace));
     }
 
     #[cfg(unix)]

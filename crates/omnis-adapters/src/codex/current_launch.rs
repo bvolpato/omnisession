@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 
 use super::{
-    CodexAdapter, CodexFileScan, SCAN_LIMIT, collect_jsonl, current_rollout, live_rollout_path,
-    rollout_file, validate_provider,
+    CodexAdapter, CodexFileScan, CodexHistoryMode, SCAN_LIMIT, collect_jsonl, current_rollout,
+    live_rollout_path, rollout_file, validate_provider,
 };
 use crate::{CodexLaunchOverrides, support::SqliteSourceStamp};
 
@@ -41,12 +41,23 @@ pub(super) fn verified_sqlite_home(
         .flatten()
         .filter(|scan| scan.active_entries_complete);
     let verified = adapter.read_selected(selected.session, |source, revision| {
+        if !source.native_header_is_usable()? {
+            return Ok(false);
+        }
         let database = destination.join("state_5.sqlite");
         let stamp = SqliteSourceStamp::read(&destination, &database);
         let lookup = || database_selects(adapter, home, &destination, id, &source.path, revision);
         let selected = lookup()?;
         let agrees = selected.map_or_else(
-            || filesystem_selects(home, id, &source.path, fresh.as_deref()),
+            || {
+                filesystem_selects(
+                    home,
+                    id,
+                    &source.path,
+                    fresh.as_deref(),
+                    source.history_mode == CodexHistoryMode::Paginated,
+                )
+            },
             Ok,
         )?;
         if !agrees
@@ -108,7 +119,7 @@ fn database_selects(
     Ok(None)
 }
 
-fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
+pub(super) fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
     Ok(candidate.extension() == selected.extension()
         && (candidate == selected || same_file::is_same_file(candidate, selected)?))
 }
@@ -118,7 +129,11 @@ fn native_codec(path: &Path) -> bool {
         .is_some_and(|ext| ext == "jsonl" || ext == "zst")
 }
 
-fn native_representation(home: &Path, canonical_home: &Path, path: &Path) -> Option<PathBuf> {
+pub(super) fn native_representation(
+    home: &Path,
+    canonical_home: &Path,
+    path: &Path,
+) -> Option<PathBuf> {
     let plain = path.with_file_name(rollout_file::jsonl_file_name(path)?);
     for candidate in [plain.clone(), plain.with_extension("jsonl.zst")] {
         match fs::symlink_metadata(&candidate) {
@@ -149,26 +164,45 @@ pub(super) fn source_filename_selects(
     adapter: &CodexAdapter,
     id: &str,
     source: &Path,
+    paginated: bool,
 ) -> Result<bool> {
     let home = adapter
         .codex_home
         .as_deref()
         .context("Codex home was not found")?;
-    let (scan, _) = adapter.session_scan(None);
+    let (scan, cached) = adapter.session_scan(None);
     // An ordinary fork can copy the selected history when the source inventory already shows a conflict.
-    let known = scan.active_entries_complete && scan.files.iter().any(|path| path == source);
-    filesystem_selects(home, id, source, known.then_some(&scan))
+    let known = (!paginated || !cached)
+        && scan.active_entries_complete
+        && scan.files.iter().any(|path| path == source);
+    filesystem_selects(home, id, source, known.then_some(&scan), paginated)
 }
 
-fn filesystem_selects(
+// Paginated history requires a Codex version that ranks active files by timestamp and rollout ID.
+fn native_rank<'a>(path: &'a Path, id: &str) -> Option<(&'a str, uuid::Uuid)> {
+    if !native_codec(path) {
+        return None;
+    }
+    let (thread, rollout) = current_rollout::ids(path)?;
+    if !thread.eq_ignore_ascii_case(id) {
+        return None;
+    }
+    Some((
+        current_rollout::timestamp(path)?,
+        uuid::Uuid::try_parse(rollout).ok()?,
+    ))
+}
+
+pub(super) fn filesystem_selects(
     home: &Path,
     id: &str,
     source: &Path,
     fresh: Option<&CodexFileScan>,
+    paginated: bool,
 ) -> Result<bool> {
-    if !current_rollout::canonical_name(source) {
+    let Some(rank) = native_rank(source, id) else {
         return Ok(false);
-    }
+    };
     let canonical_home = fs::canonicalize(home)?;
     if !native_representation(home, &canonical_home, source)
         .as_deref()
@@ -191,7 +225,7 @@ fn filesystem_selects(
             SCAN_LIMIT + 1,
             (&mut unreadable, &mut depth_limited),
             &mut Vec::new(),
-            Some(&mut walked_links),
+            (!paginated).then_some(&mut walked_links),
         );
         if unreadable != 0
             || depth_limited != 0
@@ -210,32 +244,47 @@ fn filesystem_selects(
     let different_recording = |path: &Path| {
         path.parent() != source.parent() || rollout_file::jsonl_file_name(path) != name
     };
-    for link in links {
+    if !paginated {
         // Codex 0.137 follows directory links during filename search. Their contents are outside this inventory.
-        match fs::metadata(link) {
-            Ok(target)
-                if target.is_dir()
-                    || (target.is_file() && matches_id(link) && different_recording(link)) =>
-            {
-                return Ok(false);
+        for link in links {
+            match fs::metadata(link) {
+                Ok(target)
+                    if target.is_dir()
+                        || (target.is_file() && matches_id(link) && different_recording(link)) =>
+                {
+                    return Ok(false);
+                }
+                Err(error)
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                _ => {}
             }
-            Err(error)
-                if !matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(false);
-            }
-            _ => {}
         }
     }
     let mut found = false;
     for path in files {
-        if !matches_id(path) {
-            continue;
-        }
-        if different_recording(path) {
+        let agrees = if paginated {
+            if !path.starts_with(&active) || native_rank(path, id).is_none_or(|other| other < rank)
+            {
+                continue;
+            }
+            if let Some(candidate) = native_representation(home, &canonical_home, path) {
+                same_native_copy(&candidate, source)?
+            } else {
+                false
+            }
+        } else {
+            if !matches_id(path) {
+                continue;
+            }
+            !different_recording(path)
+        };
+        if !agrees {
             if fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
@@ -358,7 +407,7 @@ mod tests {
             zstd::stream::encode_all(transcript.as_bytes(), 1)?,
         )?;
         fs::write(&archived, &transcript)?;
-        let selects = |path| filesystem_selects(&home, ID, path, None);
+        let selects = |path| filesystem_selects(&home, ID, path, None, false);
         let support = || {
             CodexAdapter::with_root(&home)
                 .native_resume_support(&SessionRef::new(Provider::Codex, ID))
@@ -399,18 +448,20 @@ mod tests {
         fs::write(&older, header)?;
         let check = |expected| -> Result<()> {
             let scan = super::super::scan_session_files(&home, SCAN_LIMIT);
-            assert_eq!(
-                filesystem_selects(&home, ID, &source, Some(&scan))?,
-                expected
-            );
-            assert_eq!(filesystem_selects(&home, ID, &source, None)?, expected);
+            for inventory in [Some(&scan), None] {
+                assert_eq!(
+                    filesystem_selects(&home, ID, &source, inventory, false)?,
+                    expected
+                );
+                assert!(filesystem_selects(&home, ID, &source, inventory, true)?);
+            }
             Ok(())
         };
         let directory_link = active.join("old.bak");
         symlink(&hidden, &directory_link)?;
         check(false)?;
         fs::remove_file(directory_link)?;
-        let file_link = active.join(older.file_name().unwrap());
+        let file_link = active.join(source.file_name().unwrap());
         symlink(&older, &file_link)?;
         check(false)?;
         fs::remove_file(file_link)?;
