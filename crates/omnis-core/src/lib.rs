@@ -54,7 +54,7 @@ pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::Antigravity => 11,
         Provider::OhMyPi | Provider::AntigravityDesktop => 9,
-        Provider::Pi => 7,
+        Provider::Pi | Provider::Codex => 7,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -844,6 +844,16 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
         .as_deref()
         .filter(|title| !title.trim().is_empty())
         .map_or_else(|| session_history_title(snapshot), compact_search_title)
+}
+
+/// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
+#[must_use]
+pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
+    if provider == Provider::Codex {
+        session_history_title(snapshot)
+    } else {
+        session_search_title(snapshot)
+    }
 }
 
 /// Returns the first visible user turn as a search title when the provider has no catalog title.

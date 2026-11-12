@@ -205,7 +205,6 @@ impl IndexedSessionReader for AdapterRegistry {
                         && selected.project_path == old.project_path
                         && selected.updated_at == old.updated_at
                     {
-                        selected.title = selected.title.or_else(|| old.title.clone());
                         selected.event_count = selected.event_count.max(old.event_count);
                     }
                     selected
@@ -475,6 +474,12 @@ fn store_search_document<'a>(
     native_registry: Option<&AdapterRegistry>,
     guard: TrajectorySourceGuard,
 ) -> Result<Option<String>> {
+    let target = target.into();
+    let provider = match target {
+        SearchDocumentTarget::Session(session) => session.provider,
+        SearchDocumentTarget::VisibleNative(native) => native.session.provider,
+        SearchDocumentTarget::Selected(selected, _) => selected.session.provider,
+    };
     let (snapshot, read) = match input {
         SearchDocumentInput::Read(read) => (&read.snapshot, Some(read)),
         SearchDocumentInput::Bundle(snapshot) => (snapshot, None),
@@ -491,8 +496,13 @@ fn store_search_document<'a>(
         || trajectory_search_document_in_records(snapshot, &[]),
         omnis_adapters::IndexRead::search_document,
     );
-    let mut title =
-        search_index::IndexedTitle::from_read(snapshot, source_complete, &document, rollback_title);
+    let mut title = search_index::IndexedTitle::from_read(
+        provider,
+        snapshot,
+        source_complete,
+        &document,
+        rollback_title,
+    );
     let origin = if let Some(registry) = native_registry {
         title.check_withdrawal(registry, store, &snapshot.session, source_revision)?;
         SessionTrajectoryOrigin::Native
@@ -524,7 +534,7 @@ fn store_search_document<'a>(
         title_is_verified: title.verified,
         local_opener: title.local_opener,
     };
-    let session = match target.into() {
+    let session = match target {
         SearchDocumentTarget::Session(session) => {
             store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
             session
@@ -632,7 +642,7 @@ fn store_verified_search_document(
         ),
     };
     let rewritten = if source_revision.file.is_some()
-        || TrajectorySourceGuard::uses_file_time(session.provider)
+        || TrajectorySourceGuard::verifies_search_file(session.provider)
     {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
         let metadata = indexed_session_metadata(native);
@@ -1160,6 +1170,7 @@ fn cached_native_catalog(
     registry: &AdapterRegistry,
     store: &Store,
     provider: Option<Provider>,
+    include_uncatalogued_documents: bool,
 ) -> Result<(
     Vec<IndexedSession>,
     Vec<IndexedTrajectoryTitle>,
@@ -1180,6 +1191,9 @@ fn cached_native_catalog(
                 rows.retain(|row| {
                     row.session.provider != selected || !excluded.contains(&row.session.id)
                 });
+                if include_uncatalogued_documents && !excluded.is_empty() {
+                    rows.extend(store.uncatalogued_search_documents(selected, &home)?);
+                }
             }
             Ok(None) => {}
             Err(error) if provider.is_none() => {
@@ -1199,7 +1213,8 @@ fn cached_search_sessions(
     args: &SearchArgs,
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>, Vec<IndexedTrajectoryTitle>)> {
-    let (indexed, titles, mut warnings) = cached_native_catalog(registry, store, args.provider)?;
+    let (indexed, titles, mut warnings) =
+        cached_native_catalog(registry, store, args.provider, args.all_projects)?;
     let sources = titles
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
@@ -1464,9 +1479,7 @@ fn selected_search_source(session: &NativeSession, cached: bool) -> Option<Sourc
     ) {
         return session.source_revision;
     }
-    if session.session.provider != Provider::Codex
-        && !TrajectorySourceGuard::uses_file_time(session.session.provider)
-    {
+    if !TrajectorySourceGuard::verifies_search_file(session.session.provider) {
         None
     } else if cached {
         session.source_revision
@@ -1544,9 +1557,17 @@ fn title_matches_search_source(
     {
         return expected.file == Some(file);
     }
-    if session.session.provider != Provider::Codex
-        && !TrajectorySourceGuard::uses_file_time(session.session.provider)
-    {
+    if session.session.provider == Provider::Codex {
+        if !cached && record.document_version < omnis_core::search_document_version(Provider::Codex)
+        {
+            return false;
+        }
+        if let Some(revision) = session.source_revision {
+            return revision.matches_file_contents(record.source_revision);
+        }
+        return record.source_revision.file.is_none();
+    }
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         return true;
     }
     match session.source_revision {
@@ -1567,6 +1588,7 @@ fn resolve_search_titles(
             (
                 entry.session,
                 omnis_store::IndexedTitle {
+                    document_version: entry.document_version,
                     source_revision: entry.source_revision,
                     title: entry.title,
                     verified_at: entry.verified_at,
@@ -2021,7 +2043,7 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
-    if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
+    if TrajectorySourceGuard::verifies_search_file(session.provider) {
         let adapter = registry.adapter(session.provider)?;
         let read = if full_read {
             adapter.read_full_index_at(session, None)?
@@ -2787,11 +2809,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         let updated = session
             .updated_at
             .map_or_else(|| "unknown".to_owned(), |time| time.to_rfc3339());
-        println!(
-            "{:<48}  {}",
-            safe_terminal_line(&session.session.to_string()),
-            updated
-        );
+        let reference = safe_terminal_line(&session.session.to_string());
+        if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+            println!("{name}  {reference:<48}  {updated}");
+        } else {
+            println!("{reference:<48}  {updated}");
+        }
     }
     for warning in warnings {
         eprintln!("warning: {}", safe_terminal_line(&warning));
@@ -2897,8 +2920,17 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
     }
 }
 
+fn codex_list_name(session: &SessionRef, title: Option<&str>) -> Option<String> {
+    if session.provider != Provider::Codex {
+        return None;
+    }
+    let name = safe_terminal_line(&redact_secrets(title?));
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn session_json(session: &NativeSession) -> Value {
-    json!({
+    let mut value = json!({
         "session": session.session,
         "project_path": session.project_path,
         "git_branch": session.git_branch,
@@ -2906,7 +2938,11 @@ fn session_json(session: &NativeSession) -> Value {
         "updated_at": session.updated_at,
         "event_count": session.event_count,
         "source_path": session.source_path,
-    })
+    });
+    if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+        value["title"] = Value::String(name);
+    }
+    value
 }
 
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {

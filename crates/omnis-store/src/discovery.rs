@@ -120,6 +120,54 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Returns verified search documents whose native catalog lost its home verification.
+    ///
+    /// These rows contain only the document identity. The catalog cannot establish a title or workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document receipts cannot be read.
+    pub fn uncatalogued_search_documents(
+        &self,
+        provider: Provider,
+        home: &Path,
+    ) -> Result<Vec<IndexedSession>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare_cached(
+            "SELECT doc.session_id, doc.source_file_id, doc.missing_ancestor_id, doc.source_contents_id
+             FROM native_catalog_homes c
+             JOIN session_index catalog USING(provider,session_id)
+             JOIN session_trajectories doc ON doc.provider=c.provider AND doc.session_id=c.session_id AND doc.origin='native'
+             JOIN native_search_document_homes h ON h.trajectory_id=doc.id AND h.source_home=c.home
+               AND h.source_file=doc.source_file_id AND h.verification=1
+             JOIN antigravity_read_catalogs r ON r.trajectory_id=doc.id AND r.source_home=h.source_home AND r.source_file=h.source_file
+               AND r.source_contents=doc.source_contents_id AND r.content_hash=doc.content_hash AND r.document_version=doc.document_version
+             WHERE c.provider=?1 AND c.home=?2 AND NOT c.verified
+               AND (catalog.source_file_id IS NULL OR catalog.source_file_id=doc.source_file_id)
+               AND (catalog.source_contents_id IS NULL OR catalog.source_contents_id=doc.source_contents_id)"
+        ).map_err(database_error)?;
+        statement
+            .query_map(
+                params![provider.to_string(), home.as_os_str().as_encoded_bytes()],
+                |row| {
+                    Ok(IndexedSession {
+                        session: SessionRef::new(provider, row.get::<_, String>(0)?),
+                        source_revision: Some(super::source_revision_from_row(row, 1)?),
+                        title: None,
+                        project_path: None,
+                        git_branch: None,
+                        created_at: None,
+                        updated_at: None,
+                        updated_at_approximate: true,
+                        event_count: 0,
+                    })
+                },
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
+    }
+
     /// Returns the stored revisions that belong to the selected native home.
     /// A selected file can identify a document from a reader that did not record its home.
     ///

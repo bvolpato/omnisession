@@ -16,10 +16,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, live_rollout_path,
+    CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, gui_names, live_rollout_path,
     representations, restored_rollout, rollout_file,
 };
 use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
+
+const COPY_COMPARISON_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) type CurrentRolloutStamp = (PathBuf, SqliteSourceStamp);
 
@@ -95,10 +97,28 @@ impl CurrentRollouts {
         self.rows_in(&self.root(home)?, ids)
     }
 
+    pub(super) fn rows_with_titles<'a>(
+        &self,
+        home: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+        titles: &HashMap<String, String>,
+    ) -> Result<HashMap<String, CurrentRollout>> {
+        self.read_rows(&self.root(home)?, ids, Some(titles))
+    }
+
     pub(super) fn rows_in<'a>(
         &self,
         root: &Path,
         ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, CurrentRollout>> {
+        self.read_rows(root, ids, None)
+    }
+
+    fn read_rows<'a>(
+        &self,
+        root: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+        titles: Option<&HashMap<String, String>>,
     ) -> Result<HashMap<String, CurrentRollout>> {
         let mut ids = ids.into_iter().peekable();
         if ids.peek().is_none() {
@@ -115,6 +135,8 @@ impl CurrentRollouts {
         }
         self.snapshot
             .read_stamped(root, &db, |conn| {
+                let txn = conn.unchecked_transaction()?;
+                let conn = &txn;
                 let threads: Option<String> = conn
                     .query_row(
                         "SELECT type FROM sqlite_schema WHERE name='threads' COLLATE NOCASE",
@@ -126,29 +148,50 @@ impl CurrentRollouts {
                     return Ok(HashMap::new());
                 };
                 ensure!(kind == "table", "Codex threads must be a table");
-                let (has_mode, has_archived): (bool, bool) = conn.query_row(
-                    "SELECT max(name='history_mode'), max(name='archived') FROM pragma_table_info('threads')",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                let mode = if has_mode {
+                let columns = conn
+                    .prepare("SELECT name, pk FROM pragma_table_info('threads')")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+                let mode = if columns.contains_key("history_mode") {
                     "CASE history_mode WHEN 'legacy' THEN 0 WHEN 'paginated' THEN 1 END"
                 } else {
                     "0"
                 };
-                let archived = if has_archived { "archived IS NOT 0" } else { "0" };
-                let query = format!("SELECT rollout_path, {mode}, {archived} FROM threads WHERE id=?1");
+                let archived = if columns.contains_key("archived") {
+                    "archived IS NOT 0"
+                } else {
+                    "0"
+                };
+                let names = gui_names::StateName::projection(&columns);
+                let query = format!(
+                    "SELECT rollout_path, {mode}, {archived}, {names} FROM threads WHERE id=?1"
+                );
                 let mut statement = conn.prepare(&query)?;
+                let parameter_count = statement.parameter_count();
                 let mut selected = HashMap::new();
                 for id in ids {
                     if let Some(pointer) = statement
-                        .query_row([id], |row| {
-                            Ok(CurrentRollout {
-                                path: PathBuf::from(row.get::<_, String>(0)?),
-                                paginated: row.get(1)?,
-                                archived: row.get(2)?,
-                            })
-                        })
+                        .query_row(
+                            rusqlite::params_from_iter(
+                                [
+                                    Some(id),
+                                    Some(gui_names::WHITESPACE),
+                                    titles.and_then(|names| names.get(id)).map(String::as_str),
+                                ]
+                                .into_iter()
+                                .take(parameter_count),
+                            ),
+                            |row| {
+                                Ok(CurrentRollout {
+                                    path: PathBuf::from(row.get::<_, String>(0)?),
+                                    paginated: row.get(1)?,
+                                    archived: row.get(2)?,
+                                    name: gui_names::StateName::from_row(row),
+                                })
+                            },
+                        )
                         .optional()?
                     {
                         selected.insert(id.to_owned(), pointer);
@@ -187,6 +230,7 @@ pub(super) struct CurrentRollout {
     path: PathBuf,
     paginated: Option<bool>,
     archived: bool,
+    name: gui_names::StateName,
 }
 
 #[derive(Debug)]
@@ -198,7 +242,77 @@ pub(super) struct CurrentFile {
     pub(super) native: bool,
 }
 
+impl CurrentFile {
+    fn source(&self) -> (&Path, SourceRevision) {
+        (&self.path, self.revision)
+    }
+}
+
+fn same_index_filename(a: &Path, b: &Path) -> bool {
+    let a_name = rollout_file::jsonl_file_name(a);
+    let b_name = rollout_file::jsonl_file_name(b);
+    a_name == b_name
+        || (canonical_name(a)
+            && canonical_name(b)
+            && a_name
+                .and_then(Path::to_str)
+                .zip(b_name.and_then(Path::to_str))
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
 impl CurrentRollout {
+    pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.name.title(indexed)
+    }
+
+    pub(super) fn corroborates_index(&self) -> bool {
+        matches!(self.name, gui_names::StateName::CorroboratedIndex)
+    }
+
+    pub(super) fn index_copies_match<'a>(
+        &self,
+        home: &Path,
+        id: &str,
+        selected: &Path,
+        candidates: impl Iterator<Item = &'a Path>,
+    ) -> Result<bool> {
+        let root = fs::canonicalize(home)?;
+        if !live_rollout_path(home, &root, selected) {
+            return Ok(false);
+        }
+        let Some(original) = self.check(selected, id)? else {
+            return Ok(false);
+        };
+        let mut digest = None;
+        let mut remaining = COPY_COMPARISON_BYTES;
+        let mut saw_selected = false;
+        let mut saw_copy = false;
+        for path in candidates {
+            if path == selected {
+                saw_selected = true;
+                continue;
+            }
+            if !same_index_filename(path, selected) || !live_rollout_path(home, &root, path) {
+                return Ok(false);
+            }
+            let Some(revision) = CodexAdapter::index_file_revision(path) else {
+                return Ok(false);
+            };
+            if !copies_match(
+                original.source(),
+                (path, revision),
+                &mut digest,
+                &mut remaining,
+            )? {
+                return Ok(false);
+            }
+            saw_copy = true;
+        }
+        Ok(saw_selected
+            && saw_copy
+            && CodexAdapter::index_file_revision(selected) == Some(original.revision))
+    }
+
     pub(super) fn archived_for_launch(&self) -> bool {
         self.archived
     }
@@ -399,7 +513,7 @@ impl CurrentRollout {
         copies.dedup();
         let mut selected: Option<CurrentFile> = None;
         let mut digest = None;
-        let mut bytes = 64 * 1024 * 1024;
+        let mut bytes = COPY_COMPARISON_BYTES;
         for path in copies {
             if !accessible(home, root, &path)? {
                 continue;
@@ -408,7 +522,7 @@ impl CurrentRollout {
                 continue;
             };
             if let Some(prior) = original.or(selected.as_ref())
-                && !copies_match(prior, &copy, &mut digest, &mut bytes)?
+                && !copies_match(prior.source(), copy.source(), &mut digest, &mut bytes)?
             {
                 ensure!(original.is_some(), CurrentRolloutUnavailable);
                 continue;
@@ -596,23 +710,22 @@ pub(super) fn canonical_name(path: &Path) -> bool {
 }
 
 fn copies_match(
-    reference: &CurrentFile,
-    copy: &CurrentFile,
+    reference @ (reference_path, _): (&Path, SourceRevision),
+    copy @ (copy_path, _): (&Path, SourceRevision),
     reference_digest: &mut Option<[u8; 32]>,
     remaining: &mut u64,
 ) -> Result<bool> {
-    if reference.path.extension() == copy.path.extension()
-        && same_file::is_same_file(&reference.path, &copy.path)
-            .context(CurrentRolloutUnconfirmed)?
+    if reference_path.extension() == copy_path.extension()
+        && same_file::is_same_file(reference_path, copy_path).context(CurrentRolloutUnconfirmed)?
     {
         return Ok(true);
     }
-    if !rollout_file::compressed(&reference.path)
-        && !rollout_file::compressed(&copy.path)
-        && fs::metadata(&reference.path)
+    if !rollout_file::compressed(reference_path)
+        && !rollout_file::compressed(copy_path)
+        && fs::metadata(reference_path)
             .context(CurrentRolloutUnconfirmed)?
             .len()
-            != fs::metadata(&copy.path)
+            != fs::metadata(copy_path)
                 .context(CurrentRolloutUnconfirmed)?
                 .len()
     {
@@ -629,13 +742,11 @@ fn copies_match(
     }
 }
 
-fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
-    let encoded = fs::metadata(&copy.path)
-        .context(CurrentRolloutUnconfirmed)?
-        .len();
+fn hash_copy((path, revision): (&Path, SourceRevision), remaining: &mut u64) -> Result<[u8; 32]> {
+    let encoded = fs::metadata(path).context(CurrentRolloutUnconfirmed)?.len();
     ensure!(encoded <= *remaining, CurrentRolloutUnconfirmed);
     let mut hash = Sha256::new();
-    let mut reader = rollout_file::open(&copy.path)
+    let mut reader = rollout_file::open(path)
         .context(CurrentRolloutUnconfirmed)?
         .take(*remaining + 1);
     let mut buffer = [0; 16 * 1024];
@@ -647,14 +758,14 @@ fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
                 decoded += size as u64;
                 hash.update(&buffer[..size]);
             }
-            Err(error) => break Err(copy_read_error(&copy.path, error)),
+            Err(error) => break Err(copy_read_error(path, error)),
         }
     };
     *remaining = remaining
         .checked_sub(encoded.max(decoded))
         .ok_or(CurrentRolloutUnconfirmed)?;
     ensure!(
-        Some(copy.revision) == CodexAdapter::index_file_revision(&copy.path),
+        Some(revision) == CodexAdapter::index_file_revision(path),
         CurrentRolloutUnconfirmed
     );
     result?;
@@ -679,6 +790,66 @@ mod tests {
         let item = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}});
         fs::write(&path, format!("{meta}\n{item}\n"))?;
         Ok(path)
+    }
+
+    #[test]
+    fn live_registry_reads_both_names_from_one_wal_transaction() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = home.path().join("state_5.sqlite");
+        let writer = rusqlite::Connection::open(&database)?;
+        writer.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT)")?;
+        for id in [THREAD, NEXT] {
+            writer.execute(
+                "INSERT INTO threads VALUES (?1, 'before.jsonl', 'paginated', 'before')",
+                [id],
+            )?;
+        }
+        writer.execute_batch(
+            "CREATE TABLE activity(tick INTEGER); INSERT INTO activity VALUES (0);
+            CREATE TABLE padding(bytes BLOB); INSERT INTO padding VALUES (zeroblob(33554432));
+            PRAGMA wal_checkpoint(TRUNCATE)",
+        )?;
+        let selector = CurrentRollouts::default();
+        let churn = rusqlite::Connection::open(&database)?;
+        churn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        let (ready, wait) = std::sync::mpsc::sync_channel(0);
+        let (stop, running) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || -> rusqlite::Result<()> {
+            churn.execute("UPDATE activity SET tick=1", [])?;
+            ready.send(()).unwrap();
+            while running.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty) {
+                churn.execute("UPDATE activity SET tick=1-tick", [])?;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(())
+        });
+        wait.recv()?;
+        let ids = [THREAD, NEXT].into_iter().inspect(|id| {
+            if *id == NEXT {
+                writer
+                    .execute(
+                        "UPDATE threads SET rollout_path='after.jsonl', name='after'",
+                        [],
+                    )
+                    .unwrap();
+            }
+        });
+        let before = selector.rows_in(home.path(), ids);
+        drop(stop);
+        worker.join().unwrap()?;
+        let before = before?;
+        let after = selector.rows_in(home.path(), [THREAD, NEXT])?;
+        for (rows, marker) in [(before, "before"), (after, "after")] {
+            for id in [THREAD, NEXT] {
+                assert_eq!(rows[id].path, PathBuf::from(format!("{marker}.jsonl")));
+                assert_eq!(rows[id].name.title(|| None).as_deref(), Some(marker));
+            }
+        }
+        drop(writer);
+        assert!(!database.with_extension("sqlite-wal").exists());
+        assert!(!database.with_extension("sqlite-shm").exists());
+        Ok(())
     }
 
     #[test]
@@ -749,6 +920,7 @@ mod tests {
             path: renamed,
             paginated: Some(true),
             archived: false,
+            name: gui_names::StateName::Index,
         };
         let verified = renamed_row.resolve(home.path(), THREAD, [], true)?.unwrap();
         assert_eq!(verified.session.id, THREAD);
@@ -785,6 +957,7 @@ mod tests {
             path: selected.clone(),
             paginated: Some(false),
             archived: false,
+            name: gui_names::StateName::Index,
         };
         let read = || row.resolve(&home, THREAD, [copy.as_path()], true);
         assert_eq!(read()?.unwrap().path, copy);
@@ -847,6 +1020,7 @@ mod tests {
             path: selected,
             paginated: Some(true),
             archived: false,
+            name: gui_names::StateName::Index,
         };
         let paths = [damaged.as_path(), archive.as_path()];
         assert_eq!(
@@ -867,7 +1041,7 @@ mod tests {
         let copy = row.check(&damaged, THREAD)?.unwrap();
         let mut budget = 64 * 1024;
         assert!(
-            hash_copy(&copy, &mut budget)
+            hash_copy(copy.source(), &mut budget)
                 .unwrap_err()
                 .is::<CurrentRolloutUnavailable>()
         );
@@ -885,6 +1059,7 @@ mod tests {
             path: active.join(path.file_name().unwrap()),
             paginated: Some(true),
             archived: false,
+            name: gui_names::StateName::Index,
         };
         let packed = path.with_extension("jsonl.gz");
         let source = fs::read(&path)?;
@@ -899,7 +1074,7 @@ mod tests {
         assert_eq!(selected.path, packed);
         assert!(!selected.native);
         assert!(
-            hash_copy(&selected, &mut 1)
+            hash_copy(selected.source(), &mut 1)
                 .unwrap_err()
                 .is::<CurrentRolloutUnconfirmed>()
         );

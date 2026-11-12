@@ -904,7 +904,7 @@ fn preview_write_guard(
     session: &SessionRef,
     sender: &Sender<PickerUpdate>,
 ) -> Option<TrajectorySourceGuard> {
-    let observed = if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
+    let observed = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         store.observe_verified_session(session)
     } else {
         search_index::observe_source(store, session)
@@ -983,7 +983,8 @@ fn read_provider_preview(
         return None;
     }
     let imported = key.session.provider == Provider::Imported;
-    let file_backed = omnis_store::TrajectorySourceGuard::uses_file_time(key.session.provider);
+    let file_backed =
+        omnis_store::TrajectorySourceGuard::verifies_search_file(key.session.provider);
     let mut retry = true;
     loop {
         let writer = store
