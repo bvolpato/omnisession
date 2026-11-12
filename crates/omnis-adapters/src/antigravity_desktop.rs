@@ -19,10 +19,10 @@ use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     antigravity::{
-        ProtoTimestamp, nonempty, proto_timestamp, push_database_steps, validate_id,
-        workspace_uri_path,
+        DatabaseCoverage, ProtoTimestamp, history_revision, nonempty, proto_timestamp,
+        push_database_steps, validate_id, workspace_uri_path,
     },
     support::{
         EventBuilder, nested_files_matching, paths_match, provider_file, provider_root,
@@ -53,6 +53,76 @@ impl AntigravityDesktopAdapter {
             .as_deref()
             .ok_or_else(|| anyhow!("Antigravity Desktop data root was not found"))
     }
+
+    fn selected(&self, id: &str) -> Result<NativeSession> {
+        let root = self.root()?;
+        let database = conversation_database(root, id)
+            .ok_or_else(|| anyhow!("Antigravity Desktop session `{id}` was not found"))?;
+        let summaries = read_summaries(root).unwrap_or_default();
+        Ok(native_session(id, database, summaries.get(id)))
+    }
+
+    fn snapshot(&self, native: &NativeSession) -> Result<(CanonicalSnapshot, DatabaseCoverage)> {
+        let database = native
+            .source_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("Antigravity Desktop history changed during the search read"))?;
+        let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &native.session.id);
+        let (_, coverage) =
+            push_database_steps(self.root()?, database, &mut builder, native.event_count)?;
+        Ok((
+            builder.snapshot(
+                native.session.clone(),
+                native.title.clone(),
+                native.project_path.clone(),
+                native.git_branch.clone(),
+                native.updated_at.unwrap_or_else(Utc::now),
+            ),
+            coverage,
+        ))
+    }
+
+    fn observed_index(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        budget: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::AntigravityDesktop)?;
+        validate_id(&session.id)?;
+        let native = self.selected(&session.id)?;
+        let hidden = archived(self.root()?, &session.id);
+        anyhow::ensure!(
+            path.is_none_or(|path| !hidden && native.source_path.as_deref() == Some(path))
+                && native.source_revision.is_some(),
+            "Antigravity Desktop history changed during the search read"
+        );
+        let read = self.snapshot(&native);
+        anyhow::ensure!(
+            self.selected(&session.id)? == native && archived(self.root()?, &session.id) == hidden,
+            "Antigravity Desktop history changed during the search read"
+        );
+        let complete = budget > 0
+            && native
+                .source_path
+                .as_deref()
+                .and_then(|path| path.metadata().ok())
+                .is_some_and(|metadata| metadata.len() <= budget);
+        let (snapshot, coverage) = read?;
+        Ok(IndexRead {
+            ownership_revision: None,
+            workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+            rollback_title: crate::RollbackTitle::Unknown,
+            verified_prefix_end: coverage.verified_prefix_end,
+            database_aliases: coverage.aliases.into(),
+            search_record_groups: Vec::new(),
+            snapshot,
+            source_complete: complete && coverage.omitted == 0,
+            provider_limited: complete && coverage.omitted > 0,
+            source_revision: native.source_revision.unwrap_or_default(),
+            native_session: (!hidden).then_some(native),
+        })
+    }
 }
 
 impl Default for AntigravityDesktopAdapter {
@@ -66,6 +136,10 @@ impl Default for AntigravityDesktopAdapter {
 impl ProviderAdapter for AntigravityDesktopAdapter {
     fn provider(&self) -> Provider {
         Provider::AntigravityDesktop
+    }
+
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        crate::support::discovery_home(self.root.as_deref())
     }
 
     fn probe(&self) -> ProviderInstallation {
@@ -123,26 +197,29 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::AntigravityDesktop)?;
         validate_id(&session.id)?;
+        self.snapshot(&self.selected(&session.id)?)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn read_full_index_at(&self, session: &SessionRef, path: Option<&Path>) -> Result<IndexRead> {
+        self.observed_index(session, path, u64::MAX)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        budget: u64,
+    ) -> Result<IndexRead> {
+        self.observed_index(session, path, budget)
+    }
+
+    fn selected_session_at(&self, id: &str, path: &Path) -> Result<Option<NativeSession>> {
         let root = self.root()?;
-        let database = conversation_database(root, &session.id)
-            .ok_or_else(|| anyhow!("Antigravity Desktop session `{}` was not found", session.id))?;
-        let summaries = read_summaries(root).unwrap_or_default();
-        let listed = native_session(&session.id, database.clone(), summaries.get(&session.id));
-        let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let decoded = push_database_steps(root, &database, &mut builder)?;
-        if decoded == 0 && listed.event_count > 0 && builder.checkpoint() == 0 {
-            return Err(anyhow!(
-                "Antigravity Desktop session `{}` declares history but has no readable steps",
-                session.id
-            ));
+        if conversation_database(root, id).as_deref() != Some(path) || archived(root, id) {
+            return Ok(None);
         }
-        Ok(builder.snapshot(
-            session.clone(),
-            listed.title,
-            listed.project_path,
-            listed.git_branch,
-            listed.updated_at.unwrap_or_else(Utc::now),
-        ))
+        Ok(Some(self.selected(id)?))
     }
 
     fn new_session_plan(&self, _target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -249,6 +326,11 @@ fn native_session(
     let git_branch = project_path
         .as_ref()
         .and_then(|_| summary.and_then(ProtoTrajectorySummary::git_branch));
+    let event_count = summary.map_or(0, |summary| {
+        usize::try_from(summary.step_count).unwrap_or(usize::MAX)
+    });
+    let source_revision = crate::source_file_revision(&database)
+        .and_then(|revision| history_revision(&database, revision, event_count));
     NativeSession {
         session: SessionRef::new(Provider::AntigravityDesktop, id),
         title: summary.and_then(|summary| nonempty(summary.summary.clone())),
@@ -259,11 +341,9 @@ fn native_session(
             .and_then(proto_timestamp),
         updated_at,
         updated_at_approximate: recorded_update.is_none(),
-        event_count: summary.map_or(0, |summary| {
-            usize::try_from(summary.step_count).unwrap_or(usize::MAX)
-        }),
+        event_count,
         source_path: Some(database),
-        source_revision: None,
+        source_revision,
     }
 }
 

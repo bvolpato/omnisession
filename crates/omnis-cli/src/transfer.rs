@@ -3633,6 +3633,7 @@ mod tests {
     #[test]
     fn picker_reads_the_rollout_only_when_its_workspace_receipt_is_missing_or_stale() {
         let revision = omnis_ir::SourceRevision {
+            legacy_file: None,
             file: Some(uuid::Uuid::from_u128(11)),
             contents: Some(uuid::Uuid::from_u128(12)),
             missing_ancestor: None,

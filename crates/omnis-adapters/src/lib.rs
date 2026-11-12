@@ -56,6 +56,7 @@ pub use provider_process::{
 };
 pub use source_file::source_file_revision;
 pub use support::TranscriptReadLimit;
+pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +174,11 @@ impl CodexWorkspaceProjection {
 pub struct IndexRead {
     /// Physical file whose ownership was checked independently of display metadata.
     pub ownership_revision: Option<SourceRevision>,
+    pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
+    /// Exclusive event sequence at the first gap in an otherwise sequential read.
+    pub verified_prefix_end: Option<u64>,
+    /// Sequence ranges for native records that produced multiple canonical events.
+    pub search_record_groups: Vec<std::ops::Range<u64>>,
     /// Catalog metadata verified by the reader of the selected native transcript.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
@@ -184,6 +190,53 @@ pub struct IndexRead {
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+}
+
+/// Search text previously indexed from the same physical transcript.
+#[derive(Clone, Copy)]
+pub enum PriorSearchDocument {
+    RequireCompleteTail(usize),
+    Complete {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+    },
+    Partial {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+        sampled_file_bytes: Option<u64>,
+        /// An older partial index lacks the location of its sampled windows.
+        recover_from_full_scan: bool,
+    },
+}
+
+/// The searchable result of a provider read, including its source time and coverage.
+pub struct IndexedSearchDocument {
+    pub document: omnis_core::SearchDocument,
+    /// Native metadata and the visible message used to derive a search title.
+    pub read: IndexRead,
+}
+
+impl IndexRead {
+    #[must_use]
+    pub fn search_document(&self) -> omnis_core::SearchDocument {
+        let mut document = omnis_core::trajectory_search_document_in_records(
+            &self.snapshot,
+            &self.search_record_groups,
+        );
+        if let Some(projection) = document.projection.as_mut() {
+            projection.database_aliases = std::sync::Arc::clone(&self.database_aliases);
+        }
+        document
+    }
+}
+
+impl From<IndexRead> for IndexedSearchDocument {
+    fn from(read: IndexRead) -> Self {
+        Self {
+            document: read.search_document(),
+            read,
+        }
+    }
 }
 
 /// Provider-specific launch input.
@@ -246,6 +299,9 @@ fn read_budgeted_transcript(
             Ok(snapshot) => {
                 return Ok(IndexRead {
                     ownership_revision: None,
+                    verified_prefix_end: None,
+                    database_aliases: std::sync::Arc::default(),
+                    search_record_groups: Vec::new(),
                     native_session: None,
                     rollback_title: RollbackTitle::Unknown,
                     workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -261,6 +317,9 @@ fn read_budgeted_transcript(
     }
     Ok(IndexRead {
         ownership_revision: None,
+        verified_prefix_end: None,
+        database_aliases: std::sync::Arc::default(),
+        search_record_groups: Vec::new(),
         native_session: None,
         rollback_title: RollbackTitle::Unknown,
         workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -408,6 +467,15 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Returns the canonical home whose native catalog this adapter uses for discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured home cannot be resolved.
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Whether the last listing observed every eligible session across all projects.
     ///
     /// Return false for bounded, incomplete, or structurally unverified listings. An omitted
@@ -463,6 +531,9 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<IndexRead> {
         Ok(IndexRead {
             ownership_revision: None,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session: None,
             rollback_title: RollbackTitle::Unknown,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -535,7 +606,7 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
-    /// Reads the conversation for its search document. Discovery supplies separately stored session names.
+    /// Builds the local search document with the provider's full-read or preview budget.
     ///
     /// # Errors
     ///
@@ -545,8 +616,10 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<IndexRead> {
+        _prior: Option<PriorSearchDocument>,
+    ) -> Result<IndexedSearchDocument> {
         self.index_session(session, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     /// Describes a fresh interactive provider launch.
@@ -618,6 +691,15 @@ impl AdapterRegistry {
     #[must_use]
     pub fn get(&self, provider: Provider) -> Option<&dyn ProviderAdapter> {
         self.adapters.get(&provider).map(Box::as_ref)
+    }
+
+    /// Returns the selected native home for providers with home-specific catalog caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolution error for an inaccessible or invalid native home.
+    pub fn discovery_cache_home(&self, provider: Provider) -> Result<Option<PathBuf>> {
+        Ok(self.adapter(provider)?.discovery_cache_home()?)
     }
 
     /// Returns registered provider adapter.

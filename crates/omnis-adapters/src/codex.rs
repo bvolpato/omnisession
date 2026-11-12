@@ -443,6 +443,9 @@ impl CodexAdapter {
             }
             Ok(Some(IndexRead {
                 ownership_revision: None,
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
                 rollback_title,
                 workspace_projection,
                 snapshot,
@@ -2063,6 +2066,9 @@ impl CodexSession {
         };
         Ok(IndexRead {
             ownership_revision: None,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session,
             snapshot,
             rollback_title,
@@ -2125,6 +2131,9 @@ impl CodexSession {
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
             ownership_revision: None,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session: None,
             workspace_projection,
             rollback_title,
@@ -3080,10 +3089,12 @@ impl ProviderAdapter for CodexAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<IndexRead> {
+        _prior: Option<crate::PriorSearchDocument>,
+    ) -> Result<crate::IndexedSearchDocument> {
         validate_provider(session, Provider::Codex)?;
         let native = self.require_rollout(&session.id, source_path)?.session;
         self.index_rollout(session, native, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

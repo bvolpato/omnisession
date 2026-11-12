@@ -2259,6 +2259,9 @@ impl ProviderAdapter for GrokAdapter {
         Ok(IndexRead {
             provider_limited,
             ownership_revision,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             snapshot,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,
