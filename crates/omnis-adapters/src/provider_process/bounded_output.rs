@@ -17,6 +17,8 @@ use wait_timeout::ChildExt;
 
 mod json_response;
 mod response;
+#[cfg(target_vendor = "apple")]
+mod retained_terminal;
 use response::{Response, ResponseState, piped_output};
 pub use response::{
     bounded_provider_help_output, bounded_provider_line_output, bounded_provider_text_output,
@@ -184,6 +186,8 @@ pub(crate) fn bounded_terminal_output(
     let mut attributes = tcgetattr(&terminal.user)?;
     attributes.make_raw();
     tcsetattr(&terminal.user, OptionalActions::Now, &attributes)?;
+    #[cfg(target_vendor = "apple")]
+    let retained = retained_terminal::retain(&terminal)?;
     command
         .stdout(terminal.user)
         .stderr(if stderr_limit.is_some() {
@@ -192,7 +196,7 @@ pub(crate) fn bounded_terminal_output(
             Stdio::null()
         });
     let child = spawn_group(command);
-    // Close the parent's copy of the writer so the reader sees the provider exit.
+    // Release the writer that the child inherited.
     command.stdout(Stdio::null());
     let progress = large_output_timeout.map(|maximum| {
         Arc::new(LargeOutputWait {
@@ -204,6 +208,8 @@ pub(crate) fn bounded_terminal_output(
         child?,
         Some(TerminalOutput {
             file: terminal.controller.into(),
+            #[cfg(target_vendor = "apple")]
+            retained: Arc::downgrade(&retained),
             bytes: 0,
             progress: progress.clone(),
         }),
@@ -217,6 +223,8 @@ pub(crate) fn bounded_terminal_output(
 
 #[cfg(unix)]
 struct TerminalOutput {
+    #[cfg(target_vendor = "apple")]
+    retained: std::sync::Weak<std::os::fd::OwnedFd>,
     file: std::fs::File,
     bytes: usize,
     progress: Option<Arc<LargeOutputWait>>,
@@ -226,7 +234,11 @@ struct TerminalOutput {
 impl Read for TerminalOutput {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         const MIB: usize = 1024 * 1024;
-        match self.file.read(buffer) {
+        #[cfg(target_vendor = "apple")]
+        let read = retained_terminal::read(&mut self.file, &self.retained, buffer);
+        #[cfg(not(target_vendor = "apple"))]
+        let read = self.file.read(buffer);
+        match read {
             Ok(read) => {
                 let previous = self.bytes;
                 self.bytes += read;

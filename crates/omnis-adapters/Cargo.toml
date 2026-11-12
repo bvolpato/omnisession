@@ -49,7 +49,7 @@ winapi-util.workspace = true
 winreg.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 rustix-openpty.workspace = true
 
 [dev-dependencies]
