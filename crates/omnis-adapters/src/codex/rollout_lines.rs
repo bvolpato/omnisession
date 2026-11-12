@@ -42,6 +42,7 @@ pub(super) enum OrdinalGap {
 pub(super) struct RolloutLines {
     timeline: realtime::Timeline,
     next: Option<u64>,
+    damaged_realtime_tail: Option<u64>,
     // A documentary record may decode in Codex without a locally known schema.
     possible_next: Option<u64>,
     contiguous_next: u64,
@@ -55,6 +56,7 @@ pub(super) struct RolloutLines {
 impl RolloutLines {
     /// Each physical file has its own cursor, including a child that starts after an inherited prefix.
     pub(super) fn start_segment(&mut self, header: &Value) {
+        self.finish_segment();
         self.possible_next = None;
         self.timeline.start = header["payload"]["subagent_history_start_ordinal"]
             .as_u64()
@@ -67,6 +69,17 @@ impl RolloutLines {
                     .unwrap_or(0)
             });
         self.contiguous_next = self.next.unwrap_or(0);
+    }
+
+    pub(super) fn finish_segment(&mut self) {
+        if self
+            .damaged_realtime_tail
+            .take()
+            .zip(self.next)
+            .is_some_and(|(last, next)| last >= next)
+        {
+            self.skipped += 1;
+        }
     }
 
     pub(super) fn project_realtime(
@@ -182,7 +195,18 @@ impl RolloutLines {
         // Ordinal admission and model reconstruction must see the same fields.
         let valid_content = match record["type"].as_str() {
             Some("realtime_item") => {
-                return Wire::checked(realtime::prepare(&mut record["payload"]));
+                let valid = realtime::prepare(&mut record["payload"]);
+                if !valid {
+                    if let (Some(next), Some(ordinal)) = (self.next, record["ordinal"].as_u64()) {
+                        if ordinal >= next {
+                            self.damaged_realtime_tail =
+                                Some(self.damaged_realtime_tail.unwrap_or(ordinal).max(ordinal));
+                        }
+                    } else {
+                        self.skipped += 1;
+                    }
+                }
+                return Wire::checked(valid);
             }
             Some("compacted") => {
                 let payload = &mut record["payload"];

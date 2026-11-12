@@ -1509,6 +1509,64 @@ fn repeated_commands_with_the_same_inputs_can_be_distinguished_by_their_original
     }
 }
 
+fn truncated_block_cases(
+    mcp: &Value,
+    header: &str,
+    diagnostic: &str,
+) -> Vec<(Value, Value, Value)> {
+    let text_part = |text: &str| json!({"type":"input_text","text":text});
+    let mixed = |lead: &str, middle: &str, tail: &str| {
+        json!([
+            text_part(header),
+            text_part(lead),
+            text_part(middle),
+            text_part(tail)
+        ])
+    };
+    let large_text = format!("{diagnostic}{}{}", "X".repeat(25_000), "Y".repeat(25_000));
+    let mut blocks = mcp.clone();
+    blocks["result"]["content"] = json!([{"type":"text","text":"start"},{"type":"text","text":large_text},{"type":"text","text":"end"}]);
+    let kept = 48_000 - (header.len().div_ceil(4) + "start".len().div_ceil(4)) * 4;
+    let rendered = format!(
+        "{}…{} tokens truncated…{}",
+        &large_text[..kept / 2],
+        (large_text.len() - kept).div_ceil(4),
+        &large_text[large_text.len() - kept / 2..]
+    );
+    let omitted_tail = "[omitted 1 text items ...]";
+    let mut single = mcp.clone();
+    single["result"]["content"] = json!([{"type":"text","text":large_text}]);
+    let kept = 48_000 - header.len().div_ceil(4) * 4;
+    let solo = format!(
+        "{}…{} tokens truncated…{}",
+        &large_text[..kept / 2],
+        (large_text.len() - kept).div_ceil(4),
+        &large_text[large_text.len() - kept / 2..]
+    );
+    vec![
+        (
+            single,
+            json!([text_part(header), text_part(&solo)]),
+            json!([text_part(header), text_part(&solo.replacen("YY", "ZY", 1))]),
+        ),
+        (
+            blocks.clone(),
+            mixed("start", &rendered, omitted_tail),
+            mixed("changed", &rendered, omitted_tail),
+        ),
+        (
+            blocks.clone(),
+            mixed("start", &rendered, omitted_tail),
+            mixed("start", &rendered, "[omitted 2 text items ...]"),
+        ),
+        (
+            blocks,
+            mixed("start", &rendered, omitted_tail),
+            mixed("start", &rendered.replacen("YY", "ZY", 1), omitted_tail),
+        ),
+    ]
+}
+
 fn writer_receipt_cases(diagnostic: &str) -> Vec<(Value, Value, Value)> {
     let header = "Wall time: 0.0420 seconds\nOutput:";
     let near_header = "Wall time: 0.042 seconds\nOutput:";
@@ -1539,7 +1597,8 @@ fn writer_receipt_cases(diagnostic: &str) -> Vec<(Value, Value, Value)> {
     structured["result"]["structuredContent"] = json!({"code":"missing_file"});
     let dynamic = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":diagnostic},{"type":"inputImage","imageUrl":image}]});
     let cancelled = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[],"error":cancel});
-    vec![
+    let mut cases = truncated_block_cases(&mcp, header, diagnostic);
+    cases.extend([
         (
             mcp,
             json!([text_part(header), text_part(diagnostic)]),
@@ -1571,7 +1630,8 @@ fn writer_receipt_cases(diagnostic: &str) -> Vec<(Value, Value, Value)> {
             json!(cancel),
             json!("different cancellation reason"),
         ),
-    ]
+    ]);
+    cases
 }
 
 #[test]

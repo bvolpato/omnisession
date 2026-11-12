@@ -2343,3 +2343,40 @@ fn agent_wait_preserves_each_receivers_report() {
         }
     }
 }
+
+#[test]
+fn paired_structured_mcp_failure_keeps_the_published_diagnostic_in_handoff() {
+    let published = turn_item(
+        "turn",
+        &json!({"type":"McpToolCall","id":"fixture","tool":"lookup","server":"fixture-server","arguments":{},"status":"failed","result":{"content":[{"type":"text","text":"HumanDiagnostic"},{"type":"text","text":"Retry from disk"}],"structuredContent":{"code":1},"isError":true}}),
+    );
+    let header = "Wall time: 0.0420 seconds\nOutput:";
+    let raw = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"fixture","output":format!("{header}\n{}",json!({"code":1}))}});
+    for order in [0, 1, 2] {
+        let mut records = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"mcp__fixture-server__lookup","call_id":"fixture","arguments":"{}"}}),
+        ];
+        match order {
+            0 => records.push(published.clone()),
+            1 => records.extend([raw.clone(), published.clone()]),
+            _ => records.extend([published.clone(), raw.clone()]),
+        }
+        for mode in [None, Some("paginated")] {
+            for preview in [false, true] {
+                let snap = read_with_history_mode(records.clone(), preview, mode).unwrap();
+                let plan = omnis_core::plan_semantic_handoff(&snap);
+                assert_eq!(plan.tool_outcomes.len(), 1, "{order} {mode:?}");
+                let summary = &plan.tool_outcomes[0].summary;
+                assert!(
+                    summary.starts_with("HumanDiagnostic\nRetry from disk"),
+                    "{order} {mode:?} {summary}"
+                );
+                if order > 0 {
+                    assert!(summary.contains("{\"code\":1}"), "{summary}");
+                }
+                assert!(omnis_core::render_semantic_handoff(&snap).contains("HumanDiagnostic"));
+            }
+        }
+    }
+}

@@ -16,6 +16,13 @@ struct RecentSources {
 impl ShellSources {
     pub(in crate::codex) fn remember(&self, display: &Value, item: &Value) {
         if item["type"] == "McpToolCall" {
+            let parts = &item["result"]["content"];
+            if let Some(key) = display[WITNESS]["body"].as_str()
+                && *parts != display["output"]["content"]
+                && parts.is_array()
+            {
+                self.insert(&format!("mcp_parts:{key}"), &parts.to_string());
+            }
             let source = &item["result"]["structuredContent"];
             if let Some(key) = display[WITNESS]["structured"].as_str()
                 && *source != display["output"]["structuredContent"]
@@ -62,6 +69,24 @@ impl ShellSources {
         recent
             .displays
             .push_back((key.to_owned(), source.to_owned()));
+    }
+
+    pub(super) fn blocks_agree(&self, display: &Value, witness: &Value) -> bool {
+        let Some(key) = display[WITNESS]["body"].as_str() else {
+            return false;
+        };
+        let recent = self.0.borrow();
+        let cache_key = format!("mcp_parts:{key}");
+        if let Some((_, parts)) = recent.displays.iter().rev().find(|(k, _)| *k == cache_key) {
+            return serde_json::from_str(parts)
+                .is_ok_and(|content| super::mcp_blocks::agrees(&content, witness));
+        }
+        let parts = &display["output"]["content"];
+        parts
+            .as_array()
+            .and_then(|p| super::mcp_parts_key(p, true))
+            .is_some_and(|digest| hex::encode(digest) == key)
+            && super::mcp_blocks::agrees(parts, witness)
     }
 
     pub(super) fn mcp_agrees(&self, display: &Value, cut: &Value) -> bool {

@@ -3208,6 +3208,7 @@ impl CodexHistory {
                 );
             }
         }
+        self.rollout_lines.finish_segment();
         let gap = self.rollout_lines.gap;
         if self.rollout_lines.skipped > 0 || gap != OrdinalGap::None {
             let reason = if self.rollout_lines.contested {
@@ -3262,9 +3263,8 @@ impl CodexHistory {
         }
         let mut has_positioned_replies = false;
         builder.visit_events_mut(|event| {
-            if event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT) {
-                return;
-            }
+            let realtime =
+                event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT);
             if !matches!(
                 event.kind,
                 EventKind::MessageUser
@@ -3281,7 +3281,9 @@ impl CodexHistory {
                 .get(&seq)
                 .copied()
                 .unwrap_or_else(|| self.withdrawn.get(&seq).copied());
-            let status = if self.paginated_checkpoint.is_empty() {
+            let status = if realtime {
+                self.paginated_checkpoint.status(seq, None, None)
+            } else if self.paginated_checkpoint.is_empty() {
                 baseline
             } else {
                 let physical = self.late_owners.get(&seq).copied().unwrap_or(seq);
@@ -3292,7 +3294,7 @@ impl CodexHistory {
                     .map(|index| self.turns[index].request_sequence);
                 self.paginated_checkpoint.status(seq, owner, baseline)
             };
-            let (status, prior) = if event.kind == EventKind::MessageAssistant {
+            let (status, prior) = if event.kind == EventKind::MessageAssistant && !realtime {
                 let projection =
                     self.paginated_answers
                         .project_answer(seq, &self.paginated_checkpoint, status);

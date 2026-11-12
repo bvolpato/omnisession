@@ -1314,8 +1314,7 @@ fn search_event_text(
             // as `db_passwd`.
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
-            codex_output_search_text(event, &mut payload)
-                .or_else(|| serde_json::to_string(&payload).ok())?
+            search_payload_text(event.source.provider, &payload)?
         }
     };
     let safe_text = safe_terminal_text(&raw_text);
@@ -1349,32 +1348,32 @@ fn search_event_text(
     })
 }
 
-fn codex_output_search_text(event: &OmniEvent, payload: &mut serde_json::Value) -> Option<String> {
-    if event.source.provider != Provider::Codex {
-        return None;
+// Retain whitespace between search terms in every Codex tool field, including nested text blocks.
+struct SearchTextFormatter;
+
+impl serde_json::ser::Formatter for SearchTextFormatter {
+    fn write_char_escape<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        escape: serde_json::ser::CharEscape,
+    ) -> std::io::Result<()> {
+        use serde_json::ser::CharEscape;
+        match escape {
+            CharEscape::LineFeed | CharEscape::CarriageReturn => writer.write_all(b"\n"),
+            CharEscape::Tab => writer.write_all(b" "),
+            other => serde_json::ser::CompactFormatter.write_char_escape(writer, other),
+        }
     }
-    let display = if payload["omnisession_codex_tool_display"]["type"] == "CommandExecution"
-        && payload["omnisession_codex_tool_display"]["output"].is_string()
-    {
-        &mut payload["omnisession_codex_tool_display"]
-    } else {
-        &mut *payload
-    };
-    if !matches!(
-        display["type"].as_str(),
-        Some("CommandExecution" | "function_call_output" | "custom_tool_call_output")
-    ) || !display["output"].as_str()?.contains(['\n', '\r'])
-    {
-        return None;
+}
+
+fn search_payload_text(provider: Provider, payload: &Value) -> Option<String> {
+    if provider != Provider::Codex {
+        return serde_json::to_string(payload).ok();
     }
-    // Preserve real line boundaries so the search tokenizer sees the first word on each line.
-    let serde_json::Value::String(output) = display.as_object_mut()?.remove("output")? else {
-        return None;
-    };
-    Some(format!(
-        "{}\n{output}",
-        serde_json::to_string(payload).ok()?
-    ))
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, SearchTextFormatter);
+    serde::Serialize::serialize(payload, &mut serializer).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 const fn search_truncation_strategy(
@@ -3607,6 +3606,26 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
                 .collect();
             if !text.is_empty() {
                 summary = text.join("\n");
+            }
+        }
+        if display["type"] == "McpToolCall" {
+            let content = display
+                .get("content")
+                .or_else(|| display["output"].get("content"));
+            if let Some(parts) = content.and_then(serde_json::Value::as_array) {
+                let diagnostic = parts
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|part| !part.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !diagnostic.is_empty() {
+                    if display.get("content").is_some() && diagnostic != summary {
+                        summary = format!("{diagnostic}\n{summary}");
+                    } else {
+                        summary = diagnostic;
+                    }
+                }
             }
         }
         if display["type"] == "CommandExecution"
@@ -6357,6 +6376,28 @@ mod tests {
         assert!(!document.text.contains("hidden reasoning phrase"));
         assert!(!document.text.contains("approval phrase"));
         assert!(!document.text.contains("secret event phrase"));
+    }
+
+    #[test]
+    fn codex_tool_search_preserves_nested_word_boundaries_and_literal_escapes() {
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::ToolFailed,
+            json!({
+                "agents_states": {"worker": {"errored":"first line\nDiskQuotaExceeded"}},
+                "output": [{"type":"input_text","text":"first block\r\nNextWord\tlast"}],
+                "path": r"fixture\nFolder",
+                "token": "sensitive-example",
+            }),
+        )]);
+        let text = trajectory_search_document(&snapshot).text;
+        assert!(
+            text.split_whitespace()
+                .any(|word| word.starts_with("DiskQuotaExceeded"))
+        );
+        assert!(text.split_whitespace().any(|word| word == "NextWord"));
+        assert!(text.contains(r"fixture\\nFolder"));
+        assert!(!text.contains("sensitive-example"));
     }
 
     #[test]

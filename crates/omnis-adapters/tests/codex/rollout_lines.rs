@@ -1803,6 +1803,9 @@ fn damaged_realtime_content_leaves_its_ordinal_available_for_a_verified_reply() 
             stamped(reply.clone(), 2),
         ];
         for preview in [false, true] {
+            let trailing =
+                read_with_history_mode(rows[..2].to_vec(), preview, Some("paginated")).unwrap();
+            assert!(!omnis_core::trajectory_search_document(&trailing).source_complete);
             let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
             let search = omnis_core::trajectory_search_document(&snap);
             assert!(search.source_complete);
@@ -1984,6 +1987,54 @@ fn exec_capture_limit_keeps_one_failed_result_with_matching_omission_evidence() 
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn realtime_timeline_preserves_speech_outside_the_active_checkpoint() {
+    let mut rows =
+        super::paginated_visibility::exchange("first", "RetainedQuestion", "RetainedReply", true);
+    let replacement: Vec<_> = rows
+        .iter()
+        .filter(|r| r["type"] == "response_item")
+        .map(|r| r["payload"].clone())
+        .collect();
+    let speech = |id, role, text| {
+        voice(
+            id,
+            &json!({"type":"transcript_segment","role":role,"text":text}),
+        )
+    };
+    rows.extend([
+        speech("q", "user", "EarlierVoiceQuestion"),
+        speech("a", "assistant", "EarlierVoiceReply"),
+    ]);
+    rows.extend(super::paginated_visibility::exchange(
+        "second",
+        "EarlierTypedQuestion",
+        "EarlierTypedReply",
+        false,
+    ));
+    rows.push(json!({"type":"compacted","payload":{"message":"checkpoint","window_number":1,"replacement_history":replacement}}));
+    rows.push(speech("after", "user", "NewVoiceQuestion"));
+    let rows: Vec<_> = rows
+        .into_iter()
+        .zip(1..)
+        .map(|(r, n)| stamped(r, n))
+        .collect();
+    for preview in [false, true] {
+        let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let handoff = omnis_core::render_semantic_handoff(&snap);
+        let native = omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snap));
+        for historical in ["EarlierVoiceQuestion", "EarlierVoiceReply"] {
+            assert!(snap.events.iter().any(|e| e.payload["text"] == historical));
+            assert!(!handoff.contains(historical));
+            assert!(!native.iter().any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Message{text,..} if text.contains(historical))));
+        }
+        for active in ["RetainedQuestion", "RetainedReply", "NewVoiceQuestion"] {
+            assert!(handoff.contains(active), "{handoff}");
+            assert!(native.iter().any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Message{text,..} if text.contains(active))));
         }
     }
 }
