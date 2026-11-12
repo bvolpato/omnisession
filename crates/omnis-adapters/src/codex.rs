@@ -6925,9 +6925,10 @@ mod tests {
             let cached_project = temporary.path().join("cached");
             let mut cached: Value =
                 serde_json::from_slice(&fs::read(&cache).expect("cache file")).expect("cache JSON");
-            let physical_rollout = fs::canonicalize(&rollout).expect("physical rollout path");
-            cached["rollouts"][physical_rollout.to_str().expect("rollout path")]["header"]["project_path"] =
-                json!(cached_project);
+            let rollouts = cached["rollouts"].as_object_mut().expect("cached rollouts");
+            assert_eq!(rollouts.len(), 1);
+            let entry = rollouts.values_mut().next().expect("cached rollout");
+            entry["header"]["project_path"] = json!(cached_project);
             fs::write(&cache, cached.to_string()).expect("edited cache");
             assert_eq!(listed_projects(), [Some(cached_project)]);
 
