@@ -2857,9 +2857,7 @@ impl ProviderAdapter for CodexAdapter {
                             unavailable.insert(id.clone());
                         }
                         Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
-                            if row.has_legacy_name() || row.outside_home(home) {
-                                unavailable.insert(id.clone());
-                            } else if let Some(selected) = row.generation(id)
+                            if let Some(selected) = row.generation(id)
                                 && let Some(file) = revision.and_then(|revision| revision.file)
                                 && scan.paths(id).any(|path| {
                                     current_rollout::ids(path)

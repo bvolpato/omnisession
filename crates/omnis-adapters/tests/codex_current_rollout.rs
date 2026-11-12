@@ -345,18 +345,34 @@ fn incomplete_restore_hides_only_a_cache_from_a_proven_different_generation() ->
     );
 
     fs::create_dir_all(home.join("sessions/nested/1/2/3/4/5/6"))?;
-    let limited = CodexAdapter::with_root(&home);
-    assert!(!limited.discovery_is_complete());
-    assert!(limited.read_session(&session).is_err());
-    assert_eq!(
-        limited
-            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(old_read.source_revision))])?,
-        HashSet::from([THREAD.to_owned()])
-    );
-    assert!(
-        limited
-            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(current_read.source_revision))])?
-            .is_empty()
-    );
+    let original_home = tempfile::tempdir()?;
+    let old_home = original_home.path().canonicalize()?.join("sessions");
+    fs::create_dir_all(&old_home)?;
+    let relocated = old_home.join(&filename);
+    fs::copy(&archive, &relocated)?;
+    for selected in [&pointer, &relocated] {
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            [selected.to_str().unwrap(), THREAD],
+        )?;
+        let limited = CodexAdapter::with_root(&home);
+        assert!(!limited.discovery_is_complete());
+        assert!(limited.read_session(&session).is_err());
+        assert_eq!(
+            limited.unavailable_codex_rollouts(&[(
+                THREAD.to_owned(),
+                Some(old_read.source_revision)
+            )])?,
+            HashSet::from([THREAD.to_owned()])
+        );
+        assert!(
+            limited
+                .unavailable_codex_rollouts(&[(
+                    THREAD.to_owned(),
+                    Some(current_read.source_revision)
+                )])?
+                .is_empty()
+        );
+    }
     Ok(())
 }

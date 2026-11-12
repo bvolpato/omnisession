@@ -244,11 +244,7 @@ impl CurrentRollout {
     }
 
     pub(super) fn requires_selection(&self, home: &Path) -> bool {
-        self.required() || self.outside_home(home)
-    }
-
-    pub(super) fn outside_home(&self, home: &Path) -> bool {
-        !self.path.starts_with(home)
+        self.required() || !self.path.starts_with(home)
     }
 
     pub(super) fn has_legacy_name(&self) -> bool {
