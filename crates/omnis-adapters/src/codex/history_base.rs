@@ -567,10 +567,15 @@ struct AttachmentPreamble {
     turn_hint: Option<String>,
     foreign_turn: Option<ForeignTurn>,
     request: Option<Value>,
-    pending_pair: Option<Value>,
+    pending_pair: Option<PendingPair>,
     settings: bool,
     gap: bool,
     responses: usize,
+}
+
+struct PendingPair {
+    raw: Value,
+    saved_turn: Option<super::MediaDigest>,
 }
 
 struct ForeignTurn {
@@ -723,15 +728,20 @@ impl AttachmentPreamble {
             if message_role(saved) == Some("user") || owned && turn.is_some() {
                 self.save_pair(&raw, saved);
             }
-        } else if owned && turn.is_none() && message_role(saved) == Some("user") {
-            self.pending_pair = Some(raw);
+        } else if message_role(saved) == Some("user") {
+            self.pending_pair = Some(PendingPair {
+                raw,
+                saved_turn: saved["payload"]["turn_id"]
+                    .as_str()
+                    .map(super::media_digest),
+            });
         }
     }
 
     fn confirm_opening(
         &mut self,
         receipt: &Value,
-        pair: Option<&Value>,
+        pair: Option<&PendingPair>,
         request: Option<&Value>,
     ) -> bool {
         if !self.start.owner.is_some_and(|id| {
@@ -739,7 +749,15 @@ impl AttachmentPreamble {
         }) {
             return false;
         }
-        let Some(raw) = pair.or(request) else {
+        if pair.and_then(|pair| pair.saved_turn).is_some_and(|turn| {
+            receipt["payload"]["turn_id"]
+                .as_str()
+                .map(super::media_digest)
+                != Some(turn)
+        }) {
+            return false;
+        }
+        let Some(raw) = pair.map(|pair| &pair.raw).or(request) else {
             return false;
         };
         let Some(ordinal) = raw["ordinal"].as_u64() else {

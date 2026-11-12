@@ -1890,6 +1890,9 @@ fn damaged_attachment_boundaries_use_the_surviving_item_and_turn_evidence() -> R
         "next parent item",
         "null turns",
         "pending receipt",
+        "unscoped matching receipt",
+        "unscoped missing receipt",
+        "unscoped conflicting turn",
         "wrong receipt",
         "child reply",
         "missing abort turn",
@@ -1907,16 +1910,13 @@ fn damaged_attachment_boundaries_use_the_surviving_item_and_turn_evidence() -> R
                 complete["payload"]["type"] = json!("item_completed");
                 rows.insert(3, complete);
             }
-            "pending receipt" | "wrong receipt" | "null turns" => {
-                for row in &mut rows[2..4] {
-                    row["payload"]["turn_id"] = Value::Null;
-                }
-                if case != "null turns" {
-                    rows.insert(2,json!({"type":"event_msg","payload":{"type":"item_started","thread_id":PARENT,"turn_id":"parent","item":{"id":"parent item"}}}));
-                    if case == "wrong receipt" {
-                        rows[5]["payload"]["item"]["id"] = json!("different");
-                    }
-                }
+            "pending receipt"
+            | "wrong receipt"
+            | "null turns"
+            | "unscoped matching receipt"
+            | "unscoped missing receipt"
+            | "unscoped conflicting turn" => {
+                set_attachment_receipt_scope(&mut rows, case);
             }
             "child reply" => {
                 rows.insert(4,json!({"type":"response_item","payload":{"type":"message","role":"assistant","thread_id":CHILD,"turn_id":"scope","id":"reply","content":[{"type":"output_text","text":"paired answer"}]}}));
@@ -1949,7 +1949,10 @@ fn damaged_attachment_boundaries_use_the_surviving_item_and_turn_evidence() -> R
             let contains = |text| conversation.messages.iter().any(|m| m.text == text);
             assert_eq!(
                 contains("paired request"),
-                matches!(case, "null turns" | "pending receipt" | "child reply"),
+                matches!(
+                    case,
+                    "null turns" | "pending receipt" | "unscoped matching receipt" | "child reply"
+                ),
                 "{id} {case}"
             );
             assert_eq!(
@@ -1963,4 +1966,28 @@ fn damaged_attachment_boundaries_use_the_surviving_item_and_turn_evidence() -> R
         }
     }
     Ok(())
+}
+
+fn set_attachment_receipt_scope(rows: &mut Vec<Value>, case: &str) {
+    for row in &mut rows[2..4] {
+        if case.starts_with("unscoped") {
+            let payload = row["payload"].as_object_mut().unwrap();
+            payload.remove("thread_id");
+            payload.remove("turn_id");
+        } else {
+            row["payload"]["turn_id"] = Value::Null;
+        }
+    }
+    if case != "null turns" {
+        rows.insert(2,json!({"type":"event_msg","payload":{"type":"item_started","thread_id":PARENT,"turn_id":"parent","item":{"id":"parent item"}}}));
+        if case == "unscoped missing receipt" {
+            rows.pop();
+        }
+        if case == "unscoped conflicting turn" {
+            rows[4]["payload"]["turn_id"] = json!("other");
+        }
+        if case == "wrong receipt" {
+            rows[5]["payload"]["item"]["id"] = json!("different");
+        }
+    }
 }
