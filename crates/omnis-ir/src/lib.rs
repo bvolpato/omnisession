@@ -12,6 +12,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 
 /// Tool payloads can contain entire files or logs. Search retains both edges.
 pub const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
+pub const ANTIGRAVITY_DATABASE_STEP_LIMIT: usize = 100_000;
 pub const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 pub const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
@@ -34,6 +35,8 @@ pub struct SearchProjection {
     pub legacy_damage_sample: Option<([u8; 32], usize)>,
     pub torn_final: bool,
     pub verified_append: bool,
+    pub database_gap: bool,
+    pub database_steps: Option<Vec<Uuid>>,
     /// Physical length scanned from start to end, including unreadable native records.
     pub fully_scanned_bytes: Option<u64>,
     state: sha2::Sha256,
@@ -52,6 +55,8 @@ impl SearchProjection {
             legacy_damage_sample: None,
             torn_final: false,
             verified_append: false,
+            database_gap: false,
+            database_steps: None,
             fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
             before_last_record: before_last_record.finalize().into(),
@@ -84,6 +89,8 @@ impl PartialEq for SearchProjection {
             && self.legacy_damage_sample == other.legacy_damage_sample
             && self.torn_final == other.torn_final
             && self.verified_append == other.verified_append
+            && self.database_gap == other.database_gap
+            && self.database_steps == other.database_steps
             && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
 }

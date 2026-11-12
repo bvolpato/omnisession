@@ -283,6 +283,39 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
         assert_eq!(search("nextreply", true), "preview");
         assert_eq!(index()["stale"], 0);
         assert_eq!(index()["stale"], 0);
+        database
+            .execute_batch(
+                "INSERT INTO steps VALUES (4,x'80'),(5,x'080fa2010b0a096d6f726576616c7565');",
+            )
+            .unwrap();
+        let reference = format!("{provider}:{id}");
+        let show = || state_json(&env, "state", &["show", &reference]);
+        assert!(
+            show()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["text"] == "morevalue")
+        );
+        assert_eq!(search("morevalue", true), "preview");
+        assert_eq!(search("morevalue", false), "preview");
+        assert_eq!(search("nextreply", true), "preview");
+        database
+            .execute_batch(
+                "UPDATE steps SET step_payload=x'080fa2010b0a096e6578747265706c792008' WHERE idx=3;
+             INSERT INTO steps VALUES (6,x'080fa2010b0a096c61746572776f7264');",
+            )
+            .unwrap();
+        assert!(
+            show()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["text"] == "laterword")
+        );
+        assert!(search("laterword", true).is_null());
+        assert!(search("laterword", false).is_null());
+        assert_eq!(search("morevalue", true), "preview");
     }
 }
 
@@ -663,15 +696,18 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
         )["results"][0]["coverage"]
             .clone()
     };
+    fs::write(&path, "{\"type\":\"CHECKPOINT\"}\n").unwrap();
+    assert_eq!(coverage("empty", "firstreply"), serde_json::Value::Null);
     fs::write(
         &path,
-        "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"firstreply\"}\n",
+        "{\"type\":\"CHECKPOINT\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"firstreply\"}\n",
     )
     .unwrap();
     assert_eq!(coverage("full", "firstreply"), "complete");
     fs::write(
         &path,
         concat!(
+            "{\"type\":\"CHECKPOINT\"}\n",
             r#"{"type":"PLANNER_RESPONSE","content":"firstreply"}"#,
             "\n",
             r#"{"type":"PLANNER_RESPONSE","content":"nextreply"#,
@@ -683,7 +719,7 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
     file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
         .unwrap();
     drop(file);
-    for state in ["warm", "cold", "full"] {
+    for state in ["warm", "cold", "full", "empty"] {
         assert_eq!(coverage(state, "nextreply"), "preview", "{state}");
         assert_eq!(coverage(state, "firstreply"), "preview", "{state}");
     }

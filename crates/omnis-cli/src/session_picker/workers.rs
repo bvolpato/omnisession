@@ -1026,15 +1026,13 @@ fn read_provider_preview(
         if !preview_source_matches(key, read.native_session.as_ref(), revision) {
             return None;
         }
-        let complete = (strict || imported) && read.source_complete;
-        let (snapshot, prefix_end) = (read.snapshot, read.verified_prefix_end);
         if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
             let stored = crate::store_verified_search_document(
                 store,
                 &key.session,
-                (&snapshot, &read.search_record_groups, prefix_end),
-                complete,
-                (source_time, revision),
+                &read,
+                strict || imported,
+                source_time,
                 guard,
                 read.native_session
                     .as_ref()
@@ -1075,19 +1073,21 @@ fn read_provider_preview(
             return None;
         }
         return Some((
-            PreviewValue::from_snapshot(snapshot, key.continuation_after, complete, prefix_end),
+            PreviewValue::from_read(read, key.continuation_after, strict || imported),
             revision.file.map(|_| revision),
         ));
     }
 }
 
 impl PreviewValue {
-    fn from_snapshot(
-        mut snapshot: omnis_ir::CanonicalSnapshot,
+    fn from_read(
+        read: omnis_adapters::IndexRead,
         continuation_after: Option<DateTime<Utc>>,
-        complete: bool,
-        verified_prefix_end: Option<u64>,
+        full_read: bool,
     ) -> Self {
+        let complete = full_read && read.source_complete;
+        let verified_prefix_end = read.verified_prefix_end;
+        let mut snapshot = read.snapshot;
         let preview = Box::new(session_preview(&snapshot));
         let continuation = continuation_after.and_then(|at| {
             if let Some(end) = verified_prefix_end {

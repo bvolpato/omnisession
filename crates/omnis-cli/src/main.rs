@@ -252,7 +252,11 @@ fn read_verified_session(
                 .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
         };
         let (read, source_time) = match read_search_snapshot(registry, session, true) {
-            Ok((read, _)) if session.provider == Provider::Antigravity && !read.source_complete => {
+            Ok((read, _))
+                if session.provider == Provider::Antigravity
+                    && !read.source_complete
+                    && !read.provider_limited =>
+            {
                 return Ok(read);
             }
             Ok(read) => read,
@@ -308,13 +312,9 @@ fn read_verified_session(
             && let Err(error) = store_verified_search_document(
                 &store,
                 session,
-                (
-                    snapshot,
-                    &read.search_record_groups,
-                    read.verified_prefix_end,
-                ),
+                &read,
                 true,
-                (source_time, read.source_revision),
+                source_time,
                 guard,
                 read.native_session
                     .as_ref()
@@ -570,14 +570,18 @@ fn store_search_document<'a>(
 fn store_verified_search_document(
     store: &Store,
     session: &SessionRef,
-    (snapshot, groups, prefix_end): (&CanonicalSnapshot, &[std::ops::Range<u64>], Option<u64>),
+    read: &omnis_adapters::IndexRead,
     full_read: bool,
-    source: (chrono::DateTime<Utc>, SourceRevision),
+    source_updated_at: chrono::DateTime<Utc>,
     guard: TrajectorySourceGuard,
     native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
+    let snapshot = &read.snapshot;
+    let source_complete = full_read && read.source_complete;
+    let provider_limited = full_read && read.provider_limited;
     // Let the indexer verify a damaged picker sample or update a previous full read.
-    if (!full_read
+    if (!source_complete
+        && !provider_limited
         && session.provider == Provider::Antigravity
         && (snapshot
             .events
@@ -597,14 +601,14 @@ fn store_verified_search_document(
     {
         return Ok(false);
     }
-    let (source_updated_at, source_revision) = source;
+    let source_revision = read.source_revision;
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let document = trajectory_search_document_in_records(snapshot, groups);
-    let derived_title = search_index::indexed_title(session, snapshot, prefix_end);
+    let document = trajectory_search_document_in_records(snapshot, &read.search_record_groups);
+    let derived_title = search_index::indexed_title(session, snapshot, read.verified_prefix_end);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at,
@@ -613,15 +617,18 @@ fn store_verified_search_document(
         projection: document.projection.as_ref(),
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
-        source_complete: full_read,
-        provider_limited: false,
+        source_complete,
+        provider_limited,
         origin,
         document_version: search_version(session, snapshot),
         derived_title: derived_title.as_deref(),
         withdrawn_title: None,
         local_opener: omnis_store::LocalOpenerEvidence::Unknown,
         title_is_verified: false,
-        title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
+        title_authoritative: omnis_core::session_search_title_is_authoritative(
+            snapshot,
+            source_complete,
+        ),
     };
     let rewritten = if source_revision.file.is_some()
         || TrajectorySourceGuard::uses_file_time(session.provider)

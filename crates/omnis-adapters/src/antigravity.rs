@@ -150,7 +150,7 @@ impl AntigravityAdapter {
             source_complete: !preview
                 && history.omitted_database_rows == 0
                 && tail.damage().is_none_or(|damage| damage.count() == 0),
-            provider_limited: false,
+            provider_limited: !preview && history.omitted_database_rows > 0,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: Some(native),
         })
@@ -307,6 +307,12 @@ impl PreviousSearchPrefix {
             ) => Some((n, indexed_hash)),
             _ => None,
         };
+        if let Some((0, hash)) = expected {
+            return Self {
+                expected: None,
+                verified: sha2::Sha256::digest(b"").as_slice() == hash,
+            };
+        }
         Self {
             expected,
             verified: expected.is_none(),
@@ -1197,7 +1203,7 @@ impl Default for DatabaseReadLimits {
             row_bytes: 16 * 1024 * 1024,
             wire_bytes: 64 * 1024 * 1024,
             history_bytes: 64 * 1024 * 1024,
-            records: 100_000,
+            records: omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT,
         }
     }
 }
@@ -1266,12 +1272,19 @@ fn push_database_steps_with_limits(
             continue;
         };
         decoded += 1;
-        let event = database_step_event(step, &payload);
+        let mut event = database_step_event(step, &payload);
         unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
         let bytes = estimated_event_bytes(&event.payload);
         if bytes <= remaining_history {
             remaining_history -= bytes;
-            retained.push((position, event));
+            event.hash = index.map(|idx| {
+                builder.database_step_hash(
+                    idx,
+                    event.replay_policy == ReplayPolicy::HistoricalOnly,
+                    &payload,
+                )
+            });
+            retained.push((position, index, event));
         }
     }
     if decoded == 0 && damaged > 0 {
@@ -1283,7 +1296,8 @@ fn push_database_steps_with_limits(
     let prefix_end = push_ordered_steps(
         builder,
         retained,
-        stored.max(declared_steps),
+        stored,
+        declared_steps > stored,
         oldest_ambiguous_row,
     );
     let coverage = DatabaseCoverage {
@@ -1302,13 +1316,18 @@ fn push_database_steps_with_limits(
 
 fn push_ordered_steps(
     builder: &mut EventBuilder,
-    retained: Vec<(usize, DatabaseStepEvent)>,
-    mut position: usize,
+    retained: Vec<(usize, Option<i64>, DatabaseStepEvent)>,
+    stored: usize,
+    missing_rows: bool,
     oldest_ambiguous_row: Option<usize>,
 ) -> Option<u64> {
     let mut prefix_end = None;
-    for (row, event) in retained.into_iter().rev() {
-        if row != position
+    let mut position = stored;
+    for (row, index, event) in retained.into_iter().rev() {
+        let missing_before =
+            missing_rows && index.and_then(|idx| usize::try_from(idx).ok()) != Some(stored - row);
+        if missing_before
+            || row != position
             || oldest_ambiguous_row.is_none_or(|oldest| row <= oldest)
             || event.replay_policy == ReplayPolicy::HistoricalOnly
         {
@@ -1323,8 +1342,9 @@ fn push_ordered_steps(
             Some(event.record_type),
             None,
         );
+        builder.set_last_database_step_hash(event.hash);
     }
-    if position > 0 {
+    if position > 0 || missing_rows {
         prefix_end.get_or_insert_with(|| builder.checkpoint());
     }
     prefix_end
@@ -1352,6 +1372,7 @@ fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static st
 }
 
 struct DatabaseStepEvent {
+    hash: Option<uuid::Uuid>,
     kind: EventKind,
     payload: Value,
     timestamp: Option<DateTime<Utc>>,
@@ -1408,6 +1429,7 @@ fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
         _ => opaque(),
     };
     DatabaseStepEvent {
+        hash: None,
         kind,
         payload,
         timestamp,
@@ -1771,7 +1793,7 @@ mod tests {
             push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap();
         assert_eq!(
             (decoded, coverage.verified_prefix_end, coverage.omitted),
-            (1, Some(0), 5)
+            (1, Some(1), 5)
         );
         let snapshot = builder.snapshot(
             SessionRef::new(Provider::Antigravity, id),

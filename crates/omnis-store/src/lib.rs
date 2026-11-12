@@ -33,6 +33,7 @@ use thiserror::Error;
 
 use uuid::Uuid;
 
+mod database_receipts;
 mod discovery;
 use discovery::{
     initialize_discovery_checks, initialize_session_index_checks, record_discovery_home,
@@ -1215,14 +1216,20 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                     revision.missing_ancestor.map(Uuid::into_bytes),
                     revision.contents.map(Uuid::into_bytes),
                     self.verified_metadata.is_some(),
-                    self.session.provider == Provider::Antigravity
-                        && self.verified_metadata.is_some()
+                    self.verified_metadata.is_some()
                         && revision.file.is_some()
-                        && (self.guard.matches_document_file(revision) != Some(true)
-                            || self
-                                .document
-                                .projection
-                                .is_some_and(|p| p.interior_damage.is_some() || p.verified_append)),
+                        && ((self.session.provider == Provider::Antigravity
+                            && (self.guard.matches_document_file(revision) != Some(true)
+                                || self
+                                    .document
+                                    .projection
+                                    .is_some_and(
+                                        |p| p.interior_damage.is_some() || p.verified_append
+                                    )))
+                            || (matches!(
+                                self.session.provider,
+                                Provider::Antigravity | Provider::AntigravityDesktop
+                            ) && self.document.projection.is_some_and(|p| p.database_gap))),
                     self.document
                         .projection
                         .map(|p| i64::try_from(p.byte_count))
@@ -1283,6 +1290,9 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         guard?;
+        if let Some(accept) = database_receipts::accept_gap(transaction, self, home)? {
+            return Ok(accept);
+        }
         Ok(!self.retains_verified_antigravity_text(transaction, home)?)
     }
 
@@ -3212,14 +3222,13 @@ impl Store {
                 }
                 LegacySampleUpdate::Restore(record) => Some(record),
             };
-            let verified_metadata = write.verified_metadata;
             let reuse_chunks = write.reuses_antigravity_chunks(&transaction)?;
             let trajectory_id = if write.session.provider == Provider::Codex {
                 write.publish_codex_parent(&transaction, selected_metadata)?
             } else {
                 write.upsert_parent(&mut upsert_parent)?
             };
-            if let Some(metadata) = verified_metadata {
+            if let Some(metadata) = write.verified_metadata {
                 if trajectory_id.is_none() && !write.matches_stored(&transaction)? {
                     if write.source_complete || write.document.provider_limited {
                         return Err(StoreError::TrajectorySourceChanged);
@@ -3248,6 +3257,7 @@ impl Store {
                         write.document.source_revision,
                         home,
                     )?;
+                    database_receipts::record_verified(&transaction, write, home)?;
                 }
             }
             if let Some(trajectory_id) = trajectory_id {
@@ -4018,6 +4028,7 @@ impl Store {
         ensure_session_index_columns(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
+        database_receipts::initialize(&transaction)?;
         ensure_source_time_columns(&transaction)?;
         initialize_source_revision_schema(&transaction)?;
         initialize_discovery_checks(&transaction)?;

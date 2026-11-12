@@ -116,7 +116,7 @@ impl AntigravityDesktopAdapter {
             search_record_groups: Vec::new(),
             snapshot,
             source_complete: complete && coverage.omitted == 0,
-            provider_limited: false,
+            provider_limited: complete && coverage.omitted > 0,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: (!hidden).then_some(native),
         })

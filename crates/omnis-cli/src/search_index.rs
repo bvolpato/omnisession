@@ -570,7 +570,7 @@ fn read_budget(
                         && !fully_scanned
                         && !candidate.can_upgrade_preview(),
                 },
-                (true, Some(indexed_hash)) if byte_count > 0 => PriorSearchDocument::Complete {
+                (true, Some(indexed_hash)) => PriorSearchDocument::Complete {
                     byte_count,
                     indexed_hash,
                 },
@@ -2794,13 +2794,9 @@ mod tests {
         crate::store_verified_search_document(
             &store,
             &session,
-            (
-                &read.snapshot,
-                &read.search_record_groups,
-                read.verified_prefix_end,
-            ),
+            &read,
             true,
-            (source_time.unwrap(), read.source_revision),
+            source_time.unwrap(),
             guard,
             read.native_session
                 .as_ref()

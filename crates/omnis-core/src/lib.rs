@@ -52,7 +52,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::OhMyPi | Provider::Antigravity => 9,
+        Provider::Antigravity => 10,
+        Provider::OhMyPi => 9,
         Provider::AntigravityDesktop => 8,
         Provider::Pi => 7,
         _ => SEARCH_DOCUMENT_VERSION,
@@ -1208,7 +1209,41 @@ fn trajectory_search_document_with_limits(
             .filter(|range| range.contains(&event.sequence));
         builder.push_text(event, group.map_or(event.sequence, |range| range.start));
     }
-    builder.finish()
+    let mut document = builder.finish();
+    if matches!(
+        snapshot.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) && (1..=omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT + 1).contains(&snapshot.events.len())
+    {
+        let rows = snapshot.events.iter().filter(|event| {
+            event.source.raw_record_type.as_deref() != Some("omnisession.antigravity_step_limit")
+        });
+        let proof = rows
+            .map(|event| {
+                if event.source.provider != snapshot.session.provider
+                    || event.source.native_session_id != snapshot.session.id
+                {
+                    return None;
+                }
+                event.raw_blob_hash.as_ref()?.parse().ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|rows| rows.len() <= omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT);
+        let database_gap = snapshot.events.iter().any(|event| {
+            event.source.raw_record_type.as_deref() == Some("omnisession.antigravity_step_limit")
+                && event.payload["omitted_events"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+        });
+        if proof.is_some() || database_gap {
+            let projection = document.projection.get_or_insert_with(|| {
+                omnis_ir::SearchProjection::new(0, Sha256::new(), Sha256::new())
+            });
+            projection.database_steps = proof;
+            projection.database_gap = database_gap;
+        }
+    }
+    document
 }
 
 /// Builds one bounded search document from canonical events in conversation order.
@@ -1267,7 +1302,12 @@ impl SearchDocumentBuilder {
         if text.text.trim().is_empty() {
             return;
         }
-        if !self.has_text && event.source.provider == Provider::Antigravity {
+        if !self.has_text
+            && matches!(
+                event.source.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            )
+        {
             self.projection_hashes = Some((Sha256::new(), Sha256::new(), record));
         }
         if let Some((full, preceding, previous_record)) = &mut self.projection_hashes {

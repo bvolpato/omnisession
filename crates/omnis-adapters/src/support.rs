@@ -2008,22 +2008,16 @@ pub(crate) fn json_lines_preview_at(
     if prefix.at_eof {
         return Ok((prefix.records, prefix.verified_records));
     }
-    let (tail, tail_suffix) =
-        verified_json_lines_tail_with_offsets(file, sample_records, tail_policy, end)?;
+    let (tail, verified_end) =
+        verified_json_lines_tail_with_offsets(file, sample_records, tail_policy, end, prefix.end)?;
     let overlap = tail.partition_point(|(offset, _)| *offset < prefix.end);
-    let appended = tail.len() - overlap;
-    let verified_records = if prefix.verified_records == prefix.records.len()
-        && tail
-            .get(overlap)
-            .is_some_and(|(offset, _)| *offset == prefix.end)
-        && tail_suffix >= appended
-    {
-        prefix.verified_records + appended
-    } else {
-        prefix.verified_records
-    };
+    let appended = tail.into_iter().skip(overlap);
+    let mut verified_records = prefix.verified_records;
     let mut records = prefix.records;
-    records.extend(tail.into_iter().skip(overlap).map(|(_, record)| record));
+    for (offset, record) in appended {
+        verified_records += usize::from(prefix.fully_verified && offset < verified_end);
+        records.push(record);
+    }
     Ok((records, verified_records))
 }
 
@@ -2032,7 +2026,8 @@ fn verified_json_lines_tail_with_offsets(
     limit: usize,
     tail_policy: JsonLineTail<'_>,
     end: u64,
-) -> Result<(Vec<(u64, Value)>, usize)> {
+    prefix_end: u64,
+) -> Result<(Vec<(u64, Value)>, u64)> {
     let start = end.saturating_sub(MAX_PREVIEW_TAIL_SIZE);
     let mut leading_fragment = start > 0;
     if leading_fragment && tail_policy.checked_end(true) {
@@ -2054,7 +2049,11 @@ fn verified_json_lines_tail_with_offsets(
         }
     }
     let mut records = VecDeque::with_capacity(limit);
-    let mut suffix = 0;
+    let mut verified_end = if offset <= prefix_end {
+        end
+    } else {
+        prefix_end
+    };
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -2069,25 +2068,30 @@ fn verified_json_lines_tail_with_offsets(
             if tail_policy.checked_end(offset == end) {
                 tail_policy.parse(&line, offset, true)?;
             }
-            suffix = 0;
+            if line_offset >= prefix_end {
+                verified_end = verified_end.min(line_offset);
+            }
             continue;
         }
         if let Some(record) = tail_policy.parse(&line, offset, offset == end)?
             && limit > 0
         {
-            if records.len() == limit {
-                records.pop_front();
+            if records.len() == limit
+                && let Some((evicted, _)) = records.pop_front()
+                && evicted >= prefix_end
+            {
+                verified_end = verified_end.min(evicted);
             }
             records.push_back((line_offset, record));
-            suffix = (suffix + 1).min(limit);
-        } else {
-            suffix = 0;
+        } else if line_offset >= prefix_end && !line.iter().all(u8::is_ascii_whitespace) {
+            verified_end = verified_end.min(line_offset);
         }
     }
-    Ok((records.into_iter().collect(), suffix))
+    Ok((records.into_iter().collect(), verified_end))
 }
 
 struct JsonLinesPrefix {
+    fully_verified: bool,
     records: Vec<Value>,
     end: u64,
     verified_records: usize,
@@ -2157,6 +2161,7 @@ fn read_verified_json_lines_prefix(
         }
     }
     Ok(JsonLinesPrefix {
+        fully_verified: contiguous,
         records,
         end: consumed,
         verified_records,
@@ -2676,6 +2681,21 @@ impl EventBuilder {
         }
         if retained {
             self.events.push(event);
+        }
+    }
+
+    pub(crate) fn database_step_hash(&self, index: i64, opaque: bool, wire: &[u8]) -> Uuid {
+        let mut key = [0; 9];
+        key[..8].copy_from_slice(&index.to_be_bytes());
+        key[8] = u8::from(opaque);
+        Uuid::new_v5(&Uuid::new_v5(&self.thread_id, &key), wire)
+    }
+
+    pub(crate) fn set_last_database_step_hash(&mut self, hash: Option<Uuid>) {
+        if let Some(event) = self.events.last_mut()
+            && event.sequence + 1 == self.next_sequence
+        {
+            event.raw_blob_hash = hash.map(|hash| hash.to_string());
         }
     }
 
@@ -3668,6 +3688,7 @@ mod tests {
             2,
             JsonLineTail::SkipMalformed,
             std::fs::metadata(&path).unwrap().len(),
+            0,
         )
         .expect("tail records")
         .0
@@ -3712,6 +3733,33 @@ mod tests {
             records,
             [((contents.len() - last.len() - 1) as u64, json!({"index":2}))]
         );
+    }
+
+    #[test]
+    fn sampled_opener_uses_the_contiguous_prefix_across_overlapping_windows() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sample.jsonl");
+        let padding = json!({"padding": "x".repeat(768 * 1024)}).to_string() + "\n";
+        let prefix = padding.repeat(6);
+        for (tail, confirmed) in [
+            ("\n1\n2\n", 8),
+            ("1\n \t\r\n2\n", 8),
+            ("1\n2\n\n", 8),
+            ("broken\n1\n2\n", 6),
+            ("1\nbroken\n2\n", 7),
+            ("1\n2\nbroken\n", 8),
+        ] {
+            std::fs::write(&path, format!("{prefix}{tail}")).unwrap();
+            let damage = super::JsonLineDamage::default();
+            let (records, verified) = super::json_lines_preview_with_prefix(
+                &path,
+                6,
+                JsonLineTail::ReportIncomplete(&damage),
+            )
+            .unwrap();
+            assert_eq!(&records[6..], &[json!(1), json!(2)]);
+            assert_eq!(verified, confirmed, "{tail:?}");
+        }
     }
 
     #[test]
@@ -3879,7 +3927,7 @@ mod tests {
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = super::verified_json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records, JsonLineTail::SkipMalformed, bytes.len() as u64);
+            let _ = super::verified_json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records, JsonLineTail::SkipMalformed, bytes.len() as u64, 0);
         }
 
         #[test]
