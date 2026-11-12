@@ -284,10 +284,10 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
                  AND eligible.contents = hex({SEARCH_ACTIVE_CONTENTS})))
             AND (all_projections.trajectory_id IS NULL OR
                  (chunks.chunk_index>=all_projections.first_chunk)=(active_projection.trajectory_id IS NOT NULL))
-            AND (eligible.file IS NOT NULL OR NOT EXISTS (
-                 SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_CODEX_CATALOG})))
+            AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
+                 SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_NATIVE_CATALOG})))
             AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed
-                            WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_CODEX_FAILURE}))"
+                            WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_NATIVE_FAILURE}))"
     )
 }
 
@@ -312,7 +312,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         missing_ancestor_id = excluded.missing_ancestor_id,
         source_contents_id = excluded.source_contents_id,
         source_complete = excluded.source_complete,
-        provider_limited = excluded.provider_limited,
+        provider_limited = excluded.provider_limited OR (
+            excluded.provider = 'grok' AND session_trajectories.provider_limited AND NOT excluded.source_complete
+            AND excluded.document_version = session_trajectories.document_version
+            AND excluded.source_updated_at = session_trajectories.source_updated_at
+            AND excluded.source_file_id IS session_trajectories.source_file_id
+            AND excluded.source_contents_id IS session_trajectories.source_contents_id),
         title_authoritative = excluded.title_authoritative,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
@@ -1165,6 +1170,35 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         })
     }
 
+    fn refresh_grok_timestamp(&self, transaction: &Transaction<'_>) -> Result<bool> {
+        let document = &self.document;
+        if self.session.provider != Provider::Grok
+            || document.origin != SessionTrajectoryOrigin::Native
+            || self.source_complete
+            || !matches!(self.guard, TrajectorySourceGuard::ObservedRevision(_))
+        {
+            return Ok(false);
+        }
+        let revision = document.source_revision;
+        let updated = transaction
+            .execute(
+                "UPDATE session_trajectories SET source_updated_at = ?1
+             WHERE provider = 'grok' AND session_id = ?2 AND origin = 'native'
+               AND source_updated_at <> ?1 AND document_version = ?3
+               AND source_file_id = ?4 AND source_contents_id = ?5
+               AND (source_complete OR provider_limited)",
+                params![
+                    document.source_updated_at.timestamp_millis(),
+                    self.session.id,
+                    document.document_version,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(updated != 0)
+    }
+
     fn observed_full_source(&self) -> bool {
         self.source_complete
             && self.document.origin == SessionTrajectoryOrigin::Native
@@ -1961,6 +1995,20 @@ impl Store {
     /// Returns an error when state-root creation, validation, or store initialization fails.
     pub fn open_default() -> Result<Self> {
         Self::open_state_root(&state_root()?)
+    }
+
+    /// Opens the existing default store without creating a state directory for a dry run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing store cannot be opened.
+    pub fn open_existing_default() -> Result<Option<Self>> {
+        let root = state_root()?;
+        if root.join(DATABASE_FILE_NAME).is_file() {
+            Self::open_state_root(&root).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Creates, selects, and optionally binds a task in one transaction.
@@ -3550,8 +3598,14 @@ impl Store {
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
+            if let Some(metadata) = selected_metadata {
+                metadata.check(&transaction, write.session, &write.content_hash)?;
+            }
             let home = homes.get(&write.session.provider).map(PathBuf::as_path);
             if !write.should_publish(&transaction, home)? {
+                continue;
+            }
+            if write.refresh_grok_timestamp(&transaction)? {
                 continue;
             }
             let recovered = match write.legacy_sample_update(&transaction, home)? {
@@ -3861,9 +3915,52 @@ impl Store {
         guard: TrajectorySourceGuard,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<()> {
+        self.record_index_failure(session, failure, guard, None, verify)
+    }
+
+    /// Records a rejection only while the metadata, document, and previous failure still match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a concurrent reader changed the selection or the database write fails.
+    pub fn record_selected_trajectory_index_failure(
+        &self,
+        session: &SessionRef,
+        failure: &TrajectoryIndexFailure,
+        observed: &SelectedSessionObservation,
+    ) -> Result<()> {
+        self.record_index_failure(
+            session,
+            failure,
+            TrajectorySourceGuard::ObservedRevision(observed.state),
+            Some(observed),
+            |_, _| true,
+        )
+    }
+
+    fn record_index_failure(
+        &self,
+        session: &SessionRef,
+        failure: &TrajectoryIndexFailure,
+        guard: TrajectorySourceGuard,
+        observed: Option<&SelectedSessionObservation>,
+        verify: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> Result<()> {
         validate_session_ref(session)?;
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        if let Some(observed) = observed {
+            if cached_trajectory_state(&transaction, session)? != observed.state
+                || cached_session(&transaction, session)? != observed.metadata
+                || index_failure(&transaction, session)? != observed.failure
+                || cached_content_hash(&transaction, session)? != observed.content_hash
+            {
+                return Err(StoreError::TrajectorySourceChanged);
+            }
+            if let Some(log) = observed.ownership_revision {
+                grok_updates::record(&transaction, session, log)?;
+            }
+        }
         guard.check(
             &transaction,
             session,
@@ -3903,6 +4000,18 @@ impl Store {
         };
         if revision.file.is_some() && !verify(session, revision) {
             return Err(StoreError::TrajectorySourceChanged);
+        }
+        if observed.is_some()
+            && session.provider == Provider::Grok
+            && failure.source_contents.is_none()
+        {
+            // The UUID directory has no selectable source. Retain the document for verified recovery.
+            transaction
+                .execute(
+                    "DELETE FROM session_index WHERE provider = 'grok' AND session_id = ?1",
+                    [&session.id],
+                )
+                .map_err(database_error)?;
         }
         transaction.commit().map_err(database_error)
     }
@@ -4027,8 +4136,8 @@ impl Store {
                       OR (catalog.source_updated_submillis IS NULL AND trajectories.source_complete))) END,
             trajectories.source_file_id, trajectories.missing_ancestor_id, {SEARCH_ACTIVE_CONTENTS}
             FROM visible_trajectories AS trajectories {SEARCH_GAP_JOIN}
-            WHERE NOT EXISTS (SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_CODEX_CATALOG}))
-              AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_CODEX_FAILURE})) ");
+            WHERE NOT EXISTS (SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_NATIVE_CATALOG}))
+              AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_NATIVE_FAILURE})) ");
         let scope = if let Some(session) = session {
             validate_session_ref(session)?;
             sql.push_str("AND provider = ?1 AND session_id = ?2");
@@ -4183,19 +4292,21 @@ impl Store {
         let mut eligibility = eligible_sessions
             .iter()
             .filter(|selection| {
-                selection
-                    .source
-                    .is_none_or(|revision| revision.file.is_some())
+                selection.session.provider == Provider::Grok
+                    || selection
+                        .source
+                        .is_none_or(|revision| revision.file.is_some())
             })
             .map(|selection| {
                 let encode = |id: Uuid| id.simple().to_string().to_ascii_uppercase();
                 (
                     selection.session.provider.to_string(),
                     &selection.session.id,
+                    // A selected legacy Grok cache row matches only a receipt-free document.
+                    // SQLite hex(NULL) is the empty string. NULL here means unrestricted.
                     selection
                         .source
-                        .and_then(|revision| revision.file)
-                        .map(encode),
+                        .map(|revision| revision.file.map(encode).unwrap_or_default()),
                     selection
                         .source
                         .map(|revision| revision.contents.map(encode).unwrap_or_default()),
@@ -4438,7 +4549,7 @@ impl Store {
                AND catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL
                AND trajectories.provider=catalog.provider AND trajectories.session_id=catalog.session_id
                AND trajectories.origin='native'
-             LEFT JOIN scoped_trajectory_failures failed ON {CONFLICTING_CODEX_FAILURE}
+             LEFT JOIN scoped_trajectory_failures failed ON {CONFLICTING_NATIVE_FAILURE}
              LEFT JOIN codex_indexed_workspaces w ON failed.session_id IS NULL AND w.trajectory_id=trajectories.id
                AND w.source_file_id=trajectories.source_file_id AND w.source_contents_id=trajectories.source_contents_id
              LEFT JOIN codex_workspace_rechecks pending ON failed.session_id IS NULL AND pending.trajectory_id=trajectories.id
@@ -4528,6 +4639,7 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = connection.transaction().map_err(database_error)?;
         let observation = SelectedSessionObservation {
+            ownership_revision: None,
             state: cached_trajectory_state(&transaction, session)?,
             metadata: cached_session(&transaction, session)?,
             failure: index_failure(&transaction, session)?,
@@ -4634,8 +4746,28 @@ impl Store {
         observed_metadata: Option<&IndexedSession>,
         failure: Option<TrajectoryIndexFailure>,
     ) -> Result<()> {
+        self.restore_indexed_source_with_log(selected, expected, observed_metadata, failure, None)
+    }
+
+    /// Restores an unchanged cached source if its selected physical update log is still eligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a concurrent writer changed the selection or the log is rejected.
+    pub fn restore_indexed_source_with_log(
+        &self,
+        selected: &IndexedSession,
+        expected: TrajectoryIndexState,
+        observed_metadata: Option<&IndexedSession>,
+        failure: Option<TrajectoryIndexFailure>,
+        ownership_revision: Option<SourceRevision>,
+    ) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        if grok_updates::requires_verification(&transaction, &selected.session, ownership_revision)?
+        {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
         if !selected
             .source_revision
             .is_some_and(|revision| revision.matches_file_contents(expected.source_revision))
@@ -4851,15 +4983,29 @@ impl Store {
     ///
     /// Returns an error if the index cannot be read.
     pub fn conflicting_codex_catalog_rows(&self) -> Result<std::collections::HashSet<SessionRef>> {
+        self.conflicting_native_catalog_rows(Provider::Codex)
+    }
+
+    /// Returns native documents whose cached metadata no longer identifies their physical source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be read.
+    pub fn conflicting_native_catalog_rows(
+        &self,
+        provider: Provider,
+    ) -> Result<std::collections::HashSet<SessionRef>> {
         let connection = self.connection.borrow();
         let sql = format!(
             "SELECT trajectories.session_id FROM visible_trajectories AS trajectories
-                          INNER JOIN observed_session_index AS catalog ON {CONFLICTING_CODEX_CATALOG}"
+             LEFT JOIN observed_session_index AS catalog ON catalog.provider = trajectories.provider AND catalog.session_id = trajectories.session_id
+             WHERE trajectories.provider = ?1 AND ({CONFLICTING_NATIVE_CATALOG}
+                OR (?1 = 'grok' AND catalog.session_id IS NULL AND trajectories.source_file_id IS NOT NULL))"
         );
         let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         statement
-            .query_map([], |row| {
-                Ok(SessionRef::new(Provider::Codex, row.get::<_, String>(0)?))
+            .query_map([provider.to_string()], |row| {
+                Ok(SessionRef::new(provider, row.get::<_, String>(0)?))
             })
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
@@ -5704,6 +5850,7 @@ fn remove_codex_workspace(
 }
 
 fn initialize_trajectory_schema(transaction: &Transaction<'_>, stored_format: i64) -> Result<()> {
+    grok_updates::initialize(transaction)?;
     transaction
         .execute_batch(
             "
@@ -7338,6 +7485,7 @@ fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
 }
 
 mod codex_title_recheck;
+mod grok_updates;
 
 use codex_title_recheck::schedule_legacy_codex_title_proofs;
 
@@ -7346,15 +7494,15 @@ mod codex_workspace;
 pub use codex_workspace::{CodexWorkspace, CodexWorkspaceIndex, CodexWorkspaceUpdate};
 
 // A failed replacement hides the old native text until that rollout is selected again.
-const CONFLICTING_CODEX_FAILURE: &str = "trajectories.provider = 'codex'
+const CONFLICTING_NATIVE_FAILURE: &str = "trajectories.provider IN ('codex', 'grok')
     AND trajectories.origin = 'native' AND failed.provider = trajectories.provider
     AND failed.session_id = trajectories.session_id AND failed.source_file_id IS NOT NULL
-    AND (failed.source_file_id IS NOT trajectories.source_file_id
+    AND (trajectories.provider = 'grok' OR failed.source_file_id IS NOT trajectories.source_file_id
         OR failed.source_contents_id IS NOT trajectories.source_contents_id
         OR failed.source_updated_at IS NOT trajectories.source_updated_at)";
 
 // Discovery can select a replacement before its first transcript read succeeds.
-const CONFLICTING_CODEX_CATALOG: &str = "trajectories.provider = 'codex'
+const CONFLICTING_NATIVE_CATALOG: &str = "trajectories.provider IN ('codex', 'grok')
     AND trajectories.origin = 'native' AND catalog.provider = trajectories.provider
     AND catalog.session_id = trajectories.session_id AND catalog.source_file_id IS NOT NULL
     AND (catalog.source_file_id IS NOT trajectories.source_file_id
@@ -7383,7 +7531,13 @@ impl SelectedMetadata<'_> {
         session: &SessionRef,
         content_hash: &[u8],
     ) -> Result<()> {
-        if index_failure(transaction, session)? != self.observation.failure {
+        if index_failure(transaction, session)? != self.observation.failure
+            || grok_updates::requires_verification(
+                transaction,
+                session,
+                self.observation.ownership_revision,
+            )?
+        {
             return Err(StoreError::TrajectorySourceChanged);
         }
         let current = cached_session(transaction, session)?;
@@ -7399,7 +7553,10 @@ impl SelectedMetadata<'_> {
 }
 
 /// The document and catalog state before an explicit selected-source read.
+#[derive(Clone)]
 pub struct SelectedSessionObservation {
+    /// Independent physical update log observed with a Grok read.
+    pub ownership_revision: Option<SourceRevision>,
     pub state: Option<TrajectoryIndexState>,
     pub metadata: Option<IndexedSession>,
     pub failure: Option<TrajectoryIndexFailure>,
@@ -7460,9 +7617,6 @@ impl PreparedTrajectoryWrite<'_, '_> {
         selected_metadata: Option<SelectedMetadata<'_>>,
     ) -> Result<Option<i64>> {
         let revision = self.document.source_revision;
-        if let Some(metadata) = selected_metadata {
-            metadata.check(transaction, self.session, &self.content_hash)?;
-        }
         codex_title_recheck::accept(transaction, self, selected_metadata)?;
         let observed = matches!(self.guard, TrajectorySourceGuard::ObservedRevision(_));
         let title = self.title_evidence(observed);
@@ -7653,8 +7807,8 @@ fn indexed_titles_sql() -> String {
                       (c.source_updated_submillis=trajectories.source_updated_submillis OR
                        (c.source_updated_submillis IS NULL AND trajectories.source_complete))) END
              FROM visible_trajectories AS trajectories {SEARCH_GAP_JOIN}
-             LEFT JOIN scoped_trajectory_failures AS failed ON ({CONFLICTING_CODEX_FAILURE}) OR ({HIDDEN_FAILED_TRAJECTORY})
-             LEFT JOIN observed_session_index AS catalog ON ({CONFLICTING_CODEX_CATALOG}) OR ({CONFLICTING_FILE_CATALOG})")
+             LEFT JOIN scoped_trajectory_failures AS failed ON ({CONFLICTING_NATIVE_FAILURE}) OR ({HIDDEN_FAILED_TRAJECTORY})
+             LEFT JOIN observed_session_index AS catalog ON ({CONFLICTING_NATIVE_CATALOG}) OR ({CONFLICTING_FILE_CATALOG})")
 }
 
 fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTrajectoryTitle> {
@@ -9917,6 +10071,52 @@ mod tests {
             derived_title: Some(text),
             title_authoritative: true,
         }
+    }
+
+    #[test]
+    fn grok_catalog_changes_cannot_republish_a_rejected_update_log() -> super::Result<()> {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3"))?;
+        let time = DateTime::from_timestamp(1000, 0).unwrap();
+        let revision = SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..SourceRevision::default()
+        };
+        let mut catalog = indexed_session(Provider::Grok, "same", "original title");
+        catalog.source_revision = Some(revision);
+        let session = &catalog.session;
+        let mut initial = store.observe_selected_session(session)?;
+        initial.ownership_revision = Some(revision);
+        let failure = super::TrajectoryIndexFailure {
+            source_time_precise: false,
+            source_updated_at: Some(time),
+            source_file: revision.file,
+            source_contents: revision.contents,
+            document_version: 6,
+        };
+        store.record_selected_trajectory_index_failure(session, &failure, &initial)?;
+
+        let mut observed = store.observe_selected_session(session)?;
+        observed.ownership_revision = Some(revision);
+        let renamed = SourceRevision {
+            contents: Some(uuid::Uuid::new_v4()),
+            ..revision
+        };
+        catalog.source_revision = Some(renamed);
+        let document = physical_document("verified turn", time, renamed);
+        assert!(matches!(
+            store.upsert_selected_session_document(&catalog, &observed, document),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(store.trajectory_index_state(session)?, None);
+        store.record_verified_grok_updates(session, revision)?;
+        store.upsert_selected_session_document(&catalog, &observed, document)?;
+        assert_eq!(
+            store.search_session_trajectories("verified", 1)?.as_slice(),
+            std::slice::from_ref(session)
+        );
+        Ok(())
     }
 
     #[test]

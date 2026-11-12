@@ -1,4 +1,4 @@
-//! Drives `omni search` end to end against synthetic Claude and Codex stores.
+//! Drives `omni search` end to end against synthetic provider stores.
 
 use std::{
     fs,
@@ -544,6 +544,469 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
         assert_eq!(fs::read(&active).unwrap(), bytes);
         assert_eq!(fs::read(&archived).unwrap(), original);
     }
+}
+
+fn write_grok_log_with_mixed_owners(
+    directory: &Path,
+    id: &str,
+    other: &str,
+    update: &impl Fn(&str, &str) -> Value,
+) {
+    use std::io::Write;
+    let mut log =
+        std::io::BufWriter::new(fs::File::create(directory.join("updates.jsonl")).unwrap());
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}}).to_string();
+    // Leave the different owner outside both search samples.
+    for owner in [other, id] {
+        for _ in 0..140 {
+            writeln!(log, "{padding}").unwrap();
+        }
+        writeln!(log, "{}", update(owner, "tangerinecobalt")).unwrap();
+    }
+    log.flush().unwrap();
+    drop(log);
+}
+
+fn check_bare_id_rejects_replacement(fixture: &Fixture, id: &str, other: &str, replacement: &Path) {
+    fs::create_dir(replacement).unwrap();
+    fs::write(
+        replacement.join("summary.json"),
+        json!({"info":{"id":other,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let rejected = fixture.command().args(["show", id]).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        result_sessions(&fixture.search_json(&[
+            "marjoramquartz",
+            "--cached",
+            "--provider",
+            "grok"
+        ]))
+        .is_empty()
+    );
+    fs::remove_dir_all(replacement).unwrap();
+}
+
+#[test]
+fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let group = fixture.root.join("grok/sessions/restore");
+    let backup = group.join(format!("{id}.backup"));
+    let replacement = group.join(id);
+    let update = |owner: &str, text: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
+        }}})
+    };
+    let show = || {
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+    };
+    let cached =
+        |term| result_sessions(&fixture.search_json(&[term, "--cached", "--provider", "grok"]));
+    let index = |retry| {
+        let mut command = fixture.command();
+        command.args(["index", "--provider", "grok"]);
+        if retry {
+            command.arg("--retry-failed");
+        }
+        assert!(command.output().unwrap().status.success());
+    };
+    fs::create_dir_all(&backup).unwrap();
+    let summary = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(backup.join("summary.json"), summary.to_string()).unwrap();
+    write_jsonl(
+        &backup.join("updates.jsonl"),
+        &[update(id, "marjoramquartz")],
+    );
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
+
+    let other = "22222222-2222-4222-8222-222222222222";
+    check_bare_id_rejects_replacement(&fixture, id, other, &replacement);
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
+
+    fs::create_dir(&replacement).unwrap();
+    fs::copy(
+        backup.join("summary.json"),
+        replacement.join("summary.json"),
+    )
+    .unwrap();
+    write_grok_log_with_mixed_owners(&replacement, id, other, &update);
+    index(false);
+    assert!(!show().status.success());
+    for retry in [false, true] {
+        assert!(cached("marjoramquartz").is_empty());
+        assert!(cached("tangerinecobalt").is_empty());
+        index(retry);
+    }
+    assert!(cached("tangerinecobalt").is_empty());
+
+    let mut renamed = summary.clone();
+    renamed["generated_title"] = json!("Renamed while the update log was unchanged");
+    fs::write(replacement.join("summary.json"), renamed.to_string()).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::write(replacement.join("summary.json"), "{").unwrap();
+    index(false);
+    fs::write(replacement.join("summary.json"), summary.to_string()).unwrap();
+    index(true);
+    assert!(cached("tangerinecobalt").is_empty());
+
+    let original = fixture.root.join("saved-original");
+    fs::rename(&backup, &original).unwrap();
+    fs::rename(&replacement, &backup).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::rename(&backup, &replacement).unwrap();
+    fs::rename(original, &backup).unwrap();
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(replacement.join("updates.jsonl"))
+        .unwrap();
+    writeln!(log, "{}", update(id, " recentapricot")).unwrap();
+    drop(log);
+    index(false);
+    assert!(cached("recentapricot").is_empty());
+
+    let displaced = json!({"info":{"id":other,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(replacement.join("summary.json"), displaced.to_string()).unwrap();
+    write_jsonl(
+        &replacement.join("updates.jsonl"),
+        &[update(other, "tangerinecobalt")],
+    );
+    index(false);
+    assert!(cached("marjoramquartz").is_empty());
+    assert_eq!(cached("tangerinecobalt"), [format!("grok:{other}")]);
+
+    fs::remove_dir_all(replacement).unwrap();
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference]);
+}
+
+#[test]
+fn grok_partial_export_recovers_explicitly_owned_turns_after_a_foreign_log() {
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let replacement = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&replacement).unwrap();
+    let update = |owner: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"user_message_chunk","content":{"type":"text","text":"violetcedar"}
+        }}})
+    };
+    let partial = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2});
+    fs::write(replacement.join("summary.json"), partial.to_string()).unwrap();
+    for (last, detail) in [
+        (
+            json!({"params":{"sessionId":id}}).to_string(),
+            "found_updates",
+        ),
+        ("{".to_owned(), "malformed_records"),
+    ] {
+        write_jsonl(
+            &replacement.join("updates.jsonl"),
+            &[update("22222222-2222-4222-8222-222222222222")],
+        );
+        let rejected = fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8(rejected.stderr)
+                .unwrap()
+                .contains("different session ID")
+        );
+        fs::write(
+            replacement.join("updates.jsonl"),
+            format!("{}\n{last}", update(id)),
+        )
+        .unwrap();
+        let shown = fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap();
+        assert!(shown.status.success());
+        let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert!(
+            snapshot["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["omitted_events"] == 1
+                    && event["payload"][detail] == 1)
+        );
+        let markdown = fixture
+            .command()
+            .args(["markdown", &reference])
+            .output()
+            .unwrap();
+        assert!(markdown.status.success());
+        assert!(
+            String::from_utf8(markdown.stdout)
+                .unwrap()
+                .contains("violetcedar")
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "violetcedar",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+    fs::write(
+        replacement.join("updates.jsonl"),
+        format!(
+            "{}\n{{\n{}",
+            update(id),
+            update("22222222-2222-4222-8222-222222222222")
+        ),
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn grok_search_refreshes_when_only_its_plan_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    fs::write(dir.join("updates.jsonl"), "").unwrap();
+    let plan = dir.join("plan.json");
+    let search = |text| result_sessions(&fixture.search_json(&[text, "--provider", "grok"]));
+    let mut previous = "absentterm";
+    for text in ["orangeclover", "silverthistle"] {
+        fs::write(
+            &plan,
+            json!([{"content":text,"status":"pending"}]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(search(text), [format!("grok:{id}")]);
+        assert!(search(previous).is_empty());
+        previous = text;
+    }
+    fs::remove_file(plan).unwrap();
+    assert!(search(previous).is_empty());
+}
+
+#[test]
+fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"amberquince"}}}});
+    let half = format!("{padding}\n").repeat(132);
+    fs::write(dir.join("updates.jsonl"), format!("{half}{marker}\n{half}")).unwrap();
+    let reference = format!("grok:{id}");
+    assert!(
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let search = |term| result_sessions(&fixture.search_json(&[term, "--provider", "grok"]));
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET source_file_id = NULL, source_contents_id = NULL WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::write(dir.join("usage.json"), r#"{"total_tokens":17}"#).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    for timestamp in ["2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"] {
+        fs::write(
+            dir.join("summary.json"),
+            json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(search("amberquince"), [reference.as_str()]);
+        let (complete, source_time): (bool, i64) = db.query_row(
+            "SELECT source_complete,source_updated_at FROM session_trajectories WHERE provider = 'grok' AND session_id = ?1",
+            [id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert!(complete);
+        assert_eq!(
+            source_time,
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .timestamp_millis()
+        );
+    }
+    let plan = dir.join("plan.json");
+    fs::write(
+        &plan,
+        json!([{"content":"juniperviolet","status":"pending"}]).to_string(),
+    )
+    .unwrap();
+    assert_eq!(search("juniperviolet"), [reference.as_str()]);
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::remove_file(plan).unwrap();
+    assert!(search("juniperviolet").is_empty());
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+}
+
+#[test]
+fn grok_timestamp_refresh_keeps_a_valid_turn_larger_than_the_preview_line_limit() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"amberquince"},"padding":"x".repeat(2*1024*1024)}}});
+    fs::write(dir.join("updates.jsonl"), marker.to_string()).unwrap();
+    let reference = format!("grok:{id}");
+    for timestamp in [
+        "2026-01-01T00:00:00Z",
+        "2025-01-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+    ] {
+        fs::write(dir.join("summary.json"),json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp,"num_messages":1}).to_string()).unwrap();
+        assert_eq!(
+            result_sessions(&fixture.search_json(&["amberquince", "--provider", "grok"])),
+            [reference.as_str()]
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "amberquince",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+}
+
+#[test]
+fn grok_ownership_scan_continues_after_an_oversized_record() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":3}).to_string(),
+    )
+    .unwrap();
+    let update = |owner: &str, kind: &str, text: &str| json!({"params":{"sessionId":owner,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}});
+    let foreign = update(
+        "22222222-2222-4222-8222-222222222222",
+        "agent_message_chunk",
+        "foreignlemon",
+    );
+    let path = dir.join("updates.jsonl");
+    let reference = format!("grok:{id}");
+    let show = || {
+        fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap()
+    };
+    fs::write(&path, foreign.to_string()).unwrap();
+    assert!(!show().status.success());
+    let question = update(id, "user_message_chunk", "ownedmint");
+    let reply = update(id, "agent_message_chunk", "ownedpear");
+    let oversized = "x".repeat(16 * 1024 * 1024 + 1);
+    fs::write(&path, format!("{question}\n{oversized}\n{reply}")).unwrap();
+    let result = show();
+    assert!(result.status.success());
+    let snapshot: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    for turn in ["ownedmint", "ownedpear"] {
+        assert!(events.iter().any(|row| row["payload"]["text"] == turn));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|row| row["payload"]["omitted_events"] == 1)
+    );
+    fs::write(&path, format!("{question}\n{oversized}\n{foreign}")).unwrap();
+    let result = show();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("different session ID"));
+}
+
+#[test]
+fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2}).to_string(),
+    )
+    .unwrap();
+    let event = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update"}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"coralplum"}}}});
+    let updates = dir.join("updates.jsonl");
+    fs::write(
+        &updates,
+        format!("{event}\n").repeat(100_001) + &marker.to_string(),
+    )
+    .unwrap();
+    assert!(fs::metadata(&updates).unwrap().len() < 16 * 1024 * 1024);
+    let index = || {
+        let out = fixture
+            .command()
+            .args(["--json", "index", "--provider", "grok"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    assert_eq!(
+        result_sessions(&fixture.search_json(&["coralplum", "--provider", "grok"])),
+        [format!("grok:{id}")]
+    );
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET document_version = document_version - 1 WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    fs::write(&updates, marker.to_string()).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    let (complete, limited): (bool, bool) = db.query_row("SELECT source_complete, provider_limited FROM session_trajectories WHERE provider = 'grok'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert!(complete && !limited);
 }
 
 #[test]
@@ -1783,12 +2246,12 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
             .env("CODEX_SQLITE_HOME", self.root.join("codex"))
+            .env("GROK_HOME", self.root.join("grok"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
         #[cfg(unix)]
         command.env("PATH", "/usr/bin:/bin");
         for variable in [
-            "GROK_HOME",
             "HERMES_HOME",
             "ANTIGRAVITY_CLI_HOME",
             "ANTIGRAVITY_IDE_HOME",

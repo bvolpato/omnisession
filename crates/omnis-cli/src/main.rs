@@ -135,13 +135,17 @@ fn full_index_read(
     session: &SessionRef,
     expected: Option<SourceRevision>,
 ) -> Result<omnis_adapters::IndexRead> {
-    if session.provider == Provider::Codex {
+    if matches!(session.provider, Provider::Codex | Provider::Grok) {
         let read = registry.index_session(session, None, u64::MAX)?;
-        if let Some(expected) = expected {
-            anyhow::ensure!(
-                expected.matches_file_contents(read.source_revision),
-                "selected Codex rollout changed before the continuation could read it"
-            );
+        if let Some(expected) = expected
+            && !expected.matches_file_contents(read.source_revision)
+        {
+            let source = if session.provider == Provider::Codex {
+                "Codex rollout"
+            } else {
+                "Grok source"
+            };
+            bail!("selected {source} changed before the continuation could read it");
         }
         Ok(read)
     } else if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
@@ -150,6 +154,7 @@ fn full_index_read(
             .read_full_index_at(session, None)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            ownership_revision: None,
             native_session: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
@@ -170,7 +175,7 @@ impl IndexedSessionReader for AdapterRegistry {
         session: &SessionRef,
         expected: Option<SourceRevision>,
     ) -> Result<omnis_adapters::IndexRead> {
-        if session.provider != Provider::Codex {
+        if !matches!(session.provider, Provider::Codex | Provider::Grok) {
             return read_verified_session(self, session);
         }
         let cache = Store::open_default().and_then(|store| {
@@ -178,8 +183,15 @@ impl IndexedSessionReader for AdapterRegistry {
             Ok((store, observed))
         });
         let read = full_index_read(self, session, expected).inspect_err(|error| {
-            if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error)
-                && let Ok((store, observed)) = &cache
+            let Ok((store, observed)) = &cache else {
+                return;
+            };
+            if session.provider == Provider::Grok
+                && let Err(error) =
+                    search_index::record_grok_rejection(self, store, session, observed, error)
+            {
+                eprintln!("warning: local trajectory index refresh: {error}");
+            } else if omnis_adapters::CodexAdapter::is_current_rollout_unavailable(error)
                 && let Some(metadata) = &observed.metadata
                 && let Err(error) =
                     remove_confirmed_unavailable(self, store, vec![metadata.clone()])
@@ -187,9 +199,20 @@ impl IndexedSessionReader for AdapterRegistry {
                 eprintln!("warning: local trajectory index write: {error}");
             }
         })?;
+        if session.provider == Provider::Grok
+            && let Ok((store, observed)) = &cache
+        {
+            search_index::check_grok_preview(store, &read, observed.failure).inspect_err(
+                |error| {
+                    let _ =
+                        search_index::record_grok_rejection(self, store, session, observed, error);
+                },
+            )?;
+        }
         let snapshot = &read.snapshot;
         match cache {
-            Ok((store, observation)) => {
+            Ok((store, mut observation)) => {
+                observation.ownership_revision = read.ownership_revision;
                 let prior = observation.state;
                 let selected = read.native_session.as_ref().map(|native| {
                     let mut selected = indexed_session_metadata(native);
@@ -1465,9 +1488,11 @@ fn selected_search_source(session: &NativeSession, cached: bool) -> Option<Sourc
     ) {
         return session.source_revision;
     }
-    if !TrajectorySourceGuard::verifies_search_file(session.session.provider) {
+    if session.session.provider != Provider::Grok
+        && !TrajectorySourceGuard::verifies_search_file(session.session.provider)
+    {
         None
-    } else if cached {
+    } else if cached && session.session.provider != Provider::Grok {
         session.source_revision
     } else {
         Some(session.source_revision.unwrap_or_default())
@@ -1553,12 +1578,17 @@ fn title_matches_search_source(
         }
         return record.source_revision.file.is_none();
     }
-    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+    if session.session.provider != Provider::Grok
+        && !TrajectorySourceGuard::uses_file_time(session.session.provider)
+    {
         return true;
     }
     match session.source_revision {
         Some(revision) => revision.matches_file_contents(record.source_revision),
-        None => cached && record.source_revision.file.is_none(),
+        None => {
+            record.source_revision.file.is_none()
+                && (cached || session.session.provider == Provider::Grok)
+        }
     }
 }
 
@@ -2015,6 +2045,7 @@ fn read_search_snapshot(
         let updated_at = snapshot.captured_at;
         return Ok((
             omnis_adapters::IndexRead {
+                ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
@@ -2047,6 +2078,7 @@ fn read_search_snapshot(
             adapter.read_full_index_at(session, path)?
         } else {
             omnis_adapters::IndexRead {
+                ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
@@ -2975,6 +3007,25 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         match result {
             Ok(session) => matches.extend(session.map(|session| session.session)),
             Err(error) => {
+                if provider == Provider::Grok
+                    && let Err(cause) = search_index::reject_cached_grok_preflight(
+                        registry,
+                        &SessionRef::new(provider, selector),
+                        &error,
+                    )
+                {
+                    eprintln!("warning: local trajectory index refresh: {cause}");
+                }
+                if error
+                    .downcast_ref::<omnis_adapters::GrokReadRejection>()
+                    .is_some_and(omnis_adapters::GrokReadRejection::has_conflicting_summaries)
+                {
+                    bail!(
+                        "session ID `{}` is ambiguous ({}); use provider:id",
+                        safe_terminal_line(selector),
+                        safe_terminal_line(&error.to_string())
+                    );
+                }
                 codex_unavailable |= provider == Provider::Codex
                     && omnis_adapters::CodexAdapter::is_current_rollout_unavailable(&error);
                 failures.push(format!("{provider}: {error}"));

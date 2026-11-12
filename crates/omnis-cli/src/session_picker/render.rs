@@ -1236,15 +1236,8 @@ pub(super) fn selected_detail_lines(
     let title = display_title(entry, preview);
     let location = session_location(state, entry, ready_preview);
     let cache_state = if entry.cached { " · indexed" } else { "" };
-    let activity = match preview {
-        Some(PreviewValue::Ready { preview, .. }) if preview.message_count > 0 => {
-            format!(" · {} messages", preview.message_count)
-        }
-        _ if entry.session.event_count > 0 => {
-            format!(" · {} events", entry.session.event_count)
-        }
-        _ => String::new(),
-    };
+    let sampled_grok = entry.session.session.provider == Provider::Grok && !preview_complete;
+    let activity = preview_activity(ready_preview, sampled_grok, entry.session.event_count);
     let mut lines = vec![
         detail_line("SELECTED SESSION", DetailStyle::Accent),
         detail_line(title, DetailStyle::Strong),
@@ -1264,7 +1257,14 @@ pub(super) fn selected_detail_lines(
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     match preview {
         Some(PreviewValue::Ready { preview, .. }) => {
-            append_preview_lines(&mut lines, preview, width, height);
+            append_preview_lines(
+                &mut lines,
+                preview,
+                preview_complete,
+                sampled_grok,
+                width,
+                height,
+            );
         }
         Some(PreviewValue::Unavailable) => {
             lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
@@ -1279,6 +1279,7 @@ pub(super) fn selected_detail_lines(
             &mut lines,
             preview,
             preview_complete,
+            sampled_grok,
             entry.session.event_count,
             width,
             usize::MAX,
@@ -1289,10 +1290,34 @@ pub(super) fn selected_detail_lines(
     lines
 }
 
+fn preview_activity(
+    preview: Option<&SessionPreview>,
+    sampled_grok: bool,
+    event_count: usize,
+) -> String {
+    match preview {
+        Some(preview) if sampled_grok && preview.message_count > 0 => format!(
+            " · {} in preview",
+            counted(preview.message_count, "message")
+        ),
+        Some(preview) if preview.message_count > 0 => {
+            format!(" · {} messages", preview.message_count)
+        }
+        _ if event_count > 0 => format!(" · {event_count} events"),
+        _ => String::new(),
+    }
+}
+
+fn counted(value: usize, noun: &str) -> String {
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{} {noun}{suffix}", grouped_number(value))
+}
+
 pub(super) fn append_session_metadata(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     preview_complete: bool,
+    sampled_grok: bool,
     discovered_event_count: usize,
     width: usize,
     height: usize,
@@ -1301,11 +1326,21 @@ pub(super) fn append_session_metadata(
         return;
     }
     let event_count = discovered_event_count.max(preview.event_count);
-    let trajectory = format!(
-        "{} messages · {} tools · {event_count} events",
-        grouped_number(preview.message_count),
-        grouped_number(preview.tool_event_count),
-    );
+    let trajectory = if sampled_grok {
+        if preview.message_count == 0 {
+            "Message count unknown".to_owned()
+        } else {
+            format!("{} in preview", counted(preview.message_count, "message"))
+        }
+    } else if !preview_complete && preview.message_count == 0 {
+        "Message count unknown".to_owned()
+    } else {
+        format!(
+            "{} messages · {} tools · {event_count} events",
+            grouped_number(preview.message_count),
+            grouped_number(preview.tool_event_count),
+        )
+    };
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_field(
         "Trajectory",
@@ -1313,6 +1348,19 @@ pub(super) fn append_session_metadata(
         width,
         DetailStyle::Normal,
     ));
+    if sampled_grok || (!preview_complete && preview.message_count == 0) {
+        let activity = format!(
+            "{} · {}",
+            counted(preview.tool_event_count, "tool"),
+            counted(preview.event_count, "event")
+        );
+        lines.push(detail_field(
+            "In preview",
+            &activity,
+            width,
+            DetailStyle::Normal,
+        ));
+    }
     if let Some(tokens) = preview.total_tokens {
         let coverage = if preview.token_usage_is_cumulative || preview_complete {
             "total"
@@ -1595,6 +1643,8 @@ pub(super) fn format_timestamp(timestamp: Option<DateTime<Utc>>, approximate: bo
 pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
+    complete: bool,
+    sampled_grok: bool,
     width: usize,
     height: usize,
 ) {
@@ -1605,20 +1655,39 @@ pub(super) fn append_preview_lines(
     } else {
         2
     };
+    let first_label = if sampled_grok {
+        "FIRST IN PREVIEW"
+    } else {
+        "FIRST MESSAGE"
+    };
+    let latest_label = if sampled_grok {
+        "LATEST IN PREVIEW"
+    } else {
+        "LATEST MESSAGE"
+    };
     match (&preview.first, &preview.latest) {
+        (None, _) if !complete => lines.push(detail_line(
+            "Preview incomplete. No messages were visible in the sample.",
+            DetailStyle::Muted,
+        )),
         (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
         (Some(first), Some(_)) if preview.message_count == 1 => {
-            append_message_excerpt(lines, "ONLY MESSAGE", first, width, excerpt_lines);
+            let label = if sampled_grok {
+                "SAMPLED MESSAGE"
+            } else {
+                "ONLY MESSAGE"
+            };
+            append_message_excerpt(lines, label, first, width, excerpt_lines);
         }
         (Some(first), Some(latest)) => {
-            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+            append_message_excerpt(lines, first_label, first, width, excerpt_lines);
             if height >= 15 {
                 lines.push(detail_line(String::new(), DetailStyle::Normal));
             }
-            append_message_excerpt(lines, "LATEST MESSAGE", latest, width, excerpt_lines);
+            append_message_excerpt(lines, latest_label, latest, width, excerpt_lines);
         }
         (Some(first), None) => {
-            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+            append_message_excerpt(lines, first_label, first, width, excerpt_lines);
         }
     }
 }

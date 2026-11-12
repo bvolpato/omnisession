@@ -150,7 +150,10 @@ struct PickerEntry {
 
 impl PickerEntry {
     fn source_revision(&self) -> Option<SourceRevision> {
-        if self.session.session.provider != Provider::Codex {
+        if !matches!(
+            self.session.session.provider,
+            Provider::Codex | Provider::Grok
+        ) {
             return None;
         }
         self.session
@@ -703,6 +706,9 @@ impl PickerState {
         let mut changed = false;
         for index in rows {
             let entry = &mut self.entries[index];
+            if entry.session.session.provider != Provider::Codex {
+                continue;
+            }
             let Some(revision) = entry.source_revision() else {
                 continue;
             };
@@ -1050,7 +1056,12 @@ impl PickerState {
             session: entry.session.session.clone(),
             source: if let Some(revision) = entry.source_revision() {
                 Some(PreviewSource::File(revision))
-            } else if entry.cached && entry.session.session.provider == Provider::Codex {
+            } else if entry.cached
+                && matches!(
+                    entry.session.session.provider,
+                    Provider::Codex | Provider::Grok
+                )
+            {
                 Some(PreviewSource::Workspace(entry.session.project_path.clone()))
             } else if TrajectorySourceGuard::uses_file_time(entry.session.session.provider) {
                 Some(entry.session.source_revision.map_or_else(
@@ -1128,6 +1139,7 @@ impl PickerState {
             .filter_map(|key| {
                 let index = self.entry_positions.get(&key.session.to_string())?;
                 Some(PreviewRequest {
+                    cached: self.entries[*index].cached,
                     key: key.clone(),
                     source_path: self.entries[*index].session.source_path.clone(),
                 })
@@ -1176,6 +1188,7 @@ impl PreviewKey {
 }
 
 struct PreviewRequest {
+    cached: bool,
     key: PreviewKey,
     source_path: Option<PathBuf>,
 }
@@ -4149,7 +4162,7 @@ mod tests {
         picker.refresh_preview_window(1);
         picker.preview_deadline = Some(Instant::now());
         let request = picker.due_preview_request().unwrap().pop().unwrap();
-        let read = workers::read_codex_preview(
+        let read = workers::read_selected_preview(
             &worker,
             &request.key,
             request.source_path.as_deref(),
@@ -4186,7 +4199,7 @@ mod tests {
             state.preview_key(&state.entries[0])
         };
         assert!(
-            workers::read_codex_preview(
+            workers::read_selected_preview(
                 &registry,
                 &request(&home.path().join("old")),
                 None,
@@ -4195,7 +4208,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            workers::read_codex_preview(
+            workers::read_selected_preview(
                 &registry,
                 &request(&current),
                 None,
@@ -4610,7 +4623,7 @@ mod tests {
             continuation: None,
             complete: false,
         };
-        for provider in [Provider::Pi, Provider::OhMyPi] {
+        for provider in [Provider::Pi, Provider::OhMyPi, Provider::Grok] {
             let mut native = session(provider, "selected", root, None);
             native.source_revision = Some(source);
             let mut state = PickerState::new(vec![native.clone()], root, None, true);
@@ -5081,6 +5094,48 @@ mod tests {
         assert!(path.starts_with("/users/demo/"));
         assert!(path.ends_with("very-long-project-name"));
         assert_eq!(UnicodeWidthStr::width(path.as_str()), 38);
+    }
+
+    #[test]
+    fn selected_detail_distinguishes_empty_samples_from_empty_conversations() {
+        let project = Path::new("/workspace");
+        for (provider, complete) in [
+            (Provider::Grok, true),
+            (Provider::Grok, false),
+            (Provider::Claude, false),
+        ] {
+            let mut state = PickerState::new(
+                vec![session(provider, "session", project, None)],
+                project,
+                None,
+                false,
+            );
+            let key = state.preview_key(&state.entries[0]);
+            let preview = SessionPreview {
+                first: None,
+                latest: None,
+                message_count: 0,
+                tool_event_count: 1,
+                event_count: 3,
+                ..synthetic_preview("unused")
+            };
+            state.previews.insert(
+                key,
+                PreviewValue::Ready {
+                    preview: Box::new(preview),
+                    continuation: None,
+                    complete,
+                },
+                &[],
+            );
+            let lines = selected_detail_lines(&state, 100, 40);
+            let contains = |text: &str| lines.iter().any(|line| line.text.contains(text));
+            assert_eq!(contains("Preview incomplete"), !complete);
+            assert_eq!(contains("Message count unknown"), !complete);
+            assert_eq!(contains("No visible messages"), complete);
+            assert_eq!(contains("0 messages"), complete);
+            assert_eq!(contains("1 tool · 3 events"), !complete);
+        }
     }
 
     #[test]

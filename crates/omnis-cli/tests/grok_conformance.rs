@@ -51,6 +51,12 @@ fn assert_grok_round_trip(require_auth_load: bool) {
     for directory in [&home, &grok_home, &workspace, &sessions] {
         fs::create_dir_all(directory).expect("isolated conformance directory");
     }
+    #[cfg(unix)]
+    let workspace = {
+        let alias = temporary.path().join("workspace-link");
+        std::os::unix::fs::symlink(&workspace, &alias).expect("synthetic workspace alias");
+        alias
+    };
     configure_offline_grok_home(&grok_home);
     let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
     fs::write(&rollout, synthetic_codex_rollout(&workspace)).expect("synthetic Codex rollout");
@@ -101,11 +107,12 @@ fn assert_grok_round_trip(require_auth_load: bool) {
         fs::read_to_string(&rollout).expect("source read-back"),
         synthetic_codex_rollout(&workspace)
     );
+    let native_workspace = omnis_core::canonicalize_path(&workspace).expect("physical workspace");
     assert_native_import_and_fork(
         &grok_binary,
         &home,
         &grok_home,
-        &workspace,
+        &native_workspace,
         require_auth_load,
     );
     assert_eq!(
@@ -337,6 +344,7 @@ fn assert_native_import_and_fork(
         .expect("imported native summary");
     let summary: Value = serde_json::from_slice(&fs::read(summary_path).expect("native summary"))
         .expect("native summary JSON");
+    assert_eq!(summary.pointer("/info/cwd"), Some(&json!(workspace)));
     let id = summary
         .pointer("/info/id")
         .and_then(Value::as_str)

@@ -495,6 +495,7 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
@@ -2350,6 +2351,7 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
@@ -2420,6 +2422,7 @@ impl CodexSession {
         );
         let snapshot = self.snapshot(session, events, project, captured_at);
         Ok(IndexRead {
+            ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),
