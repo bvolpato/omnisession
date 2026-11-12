@@ -31,6 +31,7 @@ known-folders = "1.4.2"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 md-5 = "0.11"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFPreferences", "CFString"] }
+percent-encoding = "2"
 prost = "0.14"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }

@@ -1436,8 +1436,11 @@ fn shell_command_receipts_match_the_executed_command_in_each_record_order() {
     for (command, code, body) in [
         ("cat absent-fixture", 1, diagnostic),
         ("printf first", 0, "first output"),
+        ("cat absent-fixture", 0, "first output"),
+        ("cat absent-fixture", 1, "first output"),
+        ("cat absent-fixture", 0, diagnostic),
     ] {
-        let paired = code == 1;
+        let paired = code == 1 && body == diagnostic;
         let call = physical_call(
             "shell_command",
             &json!({"command":command,"workdir":"/workspace"}),
@@ -1463,12 +1466,19 @@ fn shell_command_receipts_match_the_executed_command_in_each_record_order() {
                     let snapshot =
                         read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
                     let search = omnis_core::trajectory_search_document(&snapshot);
-                    assert_eq!(search.source_complete, paired, "{command} {mode}");
+                    assert_eq!(
+                        search.source_complete, paired,
+                        "{command} {mode} {code} {body} {order:?}"
+                    );
                     for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
-                        assert_eq!(text.matches(diagnostic).count(), 1, "{text}");
+                        assert_eq!(
+                            text.matches(diagnostic).count(),
+                            1 + usize::from(!paired && body == diagnostic),
+                            "{text}"
+                        );
                         assert_eq!(
                             text.matches("first output").count(),
-                            usize::from(!paired),
+                            usize::from(body == "first output"),
                             "{text}"
                         );
                     }
@@ -1491,6 +1501,59 @@ fn shell_command_receipts_match_the_executed_command_in_each_record_order() {
                         paired
                     );
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_shell_command_matches_each_native_exit_receipt() {
+    let command = "cat trial.txt";
+    let call = physical_call("shell_command", &json!({"command":command}));
+    let mut first = command_display(command, "completed", "trial contents");
+    first["payload"]["item"]["exit_code"] = 0.into();
+    let mut second = command_display(command, "failed", "trial missing");
+    second["payload"]["item"]["exit_code"] = 1.into();
+    let result = |code, body| {
+        physical_result(&format!(
+            "Exit code: {code}\nWall time: 0.1 seconds\nOutput:\n{body}"
+        ))
+    };
+    for display_first in [true, false] {
+        let raw = result(1, "trial missing");
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "user", "request"),
+            call.clone(),
+            result(0, "trial contents"),
+            first.clone(),
+            call.clone(),
+        ];
+        rows.extend(if display_first {
+            [second.clone(), raw]
+        } else {
+            [raw, second.clone()]
+        });
+        for mode in ["paginated", "legacy"] {
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(search.source_complete, "{mode} {display_first}");
+                for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                    for output in ["trial contents", "trial missing"] {
+                        assert_eq!(text.matches(output).count(), 1, "{text}");
+                    }
+                }
+                let items =
+                    omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snapshot));
+                let statuses: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        omnis_core::NativeTrajectoryItem::Tool { is_error, .. } => Some(*is_error),
+                        omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                    })
+                    .collect();
+                assert_eq!(statuses, [false, true], "{mode} {display_first}");
             }
         }
     }

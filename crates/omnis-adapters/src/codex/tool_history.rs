@@ -6,6 +6,8 @@ use serde_json::Value;
 
 use super::paginated_rollback::json_digest;
 
+mod directory;
+
 #[derive(Default)]
 pub(super) struct PendingOutcomes {
     model: HashMap<String, VecDeque<ScopedRecord>>,
@@ -176,10 +178,8 @@ impl CommandIdentity {
             }
             _ => return None,
         };
-        let directory = item["cwd"]
-            .as_str()
-            .and_then(|cwd| url::Url::parse(cwd).ok()?.to_file_path().ok());
-        Some(Self::new(command, directory.as_deref()))
+        let directory = item["cwd"].as_str().and_then(directory::from_uri);
+        Some(Self::new(command, directory))
     }
 
     fn from_call(payload: &Value) -> Option<(String, Self)> {
@@ -197,20 +197,17 @@ impl CommandIdentity {
         };
         let directory = match &args["workdir"] {
             Value::Null => None,
-            Value::String(path) => Some(std::path::Path::new(path)),
+            Value::String(path) => directory::from_path(path),
             _ => return None,
         };
         let identity = Self::new(&command, directory);
         Some((command, identity))
     }
 
-    fn new(command: &str, directory: Option<&std::path::Path>) -> Self {
+    fn new(command: &str, directory: Option<[u8; 32]>) -> Self {
         Self {
-            command: super::paginated_rollback::json_digest(&command),
-            directory: directory.filter(|path| path.is_absolute()).map(|path| {
-                let path = super::workspace_settings::normalized_directory(path);
-                super::paginated_rollback::json_digest(&path.as_os_str().as_encoded_bytes())
-            }),
+            command: json_digest(&command),
+            directory,
         }
     }
 

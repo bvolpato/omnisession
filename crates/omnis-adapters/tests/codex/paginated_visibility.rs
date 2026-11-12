@@ -2010,3 +2010,104 @@ fn a_late_function_output_correction_survives_only_with_its_owning_turn() {
         }
     }
 }
+
+#[test]
+fn later_results_settle_a_pending_function_output_only_when_one_body_matches() {
+    let function = |body| {
+        turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"shared","name":"lookup","output":body}),
+        )
+    };
+    let [mut call, first, _] = command_rows("turn", "shared", "ALPHA");
+    call["payload"]["name"] = "lookup".into();
+    for mode in ["legacy", "paginated"] {
+        for output in ["ALPHA", "GAMMA"] {
+            let mut second = first.clone();
+            second["payload"]["output"] = output.into();
+            for display_first in [true, false] {
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":"turn"})),
+                    page_user("turn", "u", "request"),
+                    call.clone(),
+                    first.clone(),
+                    call.clone(),
+                ];
+                rows.extend(if display_first {
+                    [function("ALPHA"), second.clone()]
+                } else {
+                    [second.clone(), function("ALPHA")]
+                });
+                for preview in [false, true] {
+                    let snapshot =
+                        read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    let distinct = output == "GAMMA";
+                    assert_eq!(
+                        search.source_complete, distinct,
+                        "{mode} {output} {display_first}"
+                    );
+                    let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                    assert_eq!(
+                        handoff.matches("ALPHA").count(),
+                        if distinct { 1 } else { 3 }
+                    );
+                    assert_eq!(handoff.matches("GAMMA").count(), usize::from(distinct));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn superseded_and_rolled_back_function_displays_do_not_keep_provisional_uncertainty() {
+    let display = |body| {
+        turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"shared","name":"lookup","output":body}),
+        )
+    };
+    let [mut call, alpha, _] = command_rows("turn", "shared", "ALPHA");
+    call["payload"]["name"] = "lookup".into();
+    let mut gamma = alpha.clone();
+    gamma["payload"]["output"] = "GAMMA".into();
+    for (mode, rollback) in [("legacy", true), ("legacy", false), ("paginated", false)] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "u", "first request"),
+            call.clone(),
+            alpha.clone(),
+        ];
+        if rollback {
+            rows.push(page_user("turn", "steer", "superseded request"));
+        }
+        rows.extend([call.clone(), display("ALPHA")]);
+        if rollback {
+            rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        } else {
+            rows.extend([display("GAMMA"), gamma.clone()]);
+        }
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            assert_eq!(
+                handoff.matches("ALPHA").count(),
+                1,
+                "{mode} {rollback} {handoff}"
+            );
+            assert_eq!(
+                handoff.matches("GAMMA").count(),
+                usize::from(!rollback),
+                "{mode} {rollback}: {handoff}"
+            );
+            assert!(
+                !snapshot
+                    .events
+                    .iter()
+                    .any(|e| e.source.raw_record_type.as_deref()
+                        == Some("omnisession.codex_ambiguous_receipt")),
+                "{mode} {rollback}"
+            );
+        }
+    }
+}

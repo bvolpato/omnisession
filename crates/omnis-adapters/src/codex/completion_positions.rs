@@ -76,7 +76,8 @@ pub(super) struct Projection {
     pub(super) scope: CompletionScope,
     pub(super) original: Option<u64>,
     pub(super) peer: Option<u64>,
-    display_identity: Option<super::tool_history::DisplayCallIdentity>,
+    pub(super) display_identity: Option<super::tool_history::DisplayCallIdentity>,
+    pub(super) reconsider: Option<u64>,
     receipt: Option<Receipt>,
     pending: Option<u64>,
     deferred_output: Option<[u8; 32]>,
@@ -94,6 +95,28 @@ impl Projection {
             ambiguous: self.ambiguous,
             matched_turn: None,
         }
+    }
+}
+
+fn completed_display_match(
+    builder: &mut EventBuilder,
+    item: &Value,
+    known: Match,
+    last_result: Option<u64>,
+) -> Match {
+    let chosen = match known {
+        Match::One(seq) => Some(seq),
+        Match::Missing => last_result,
+        Match::DifferentCommand => return Match::Multiple,
+        _ => return known,
+    };
+    if chosen
+        .and_then(|seq| builder.event_at_mut(seq))
+        .is_some_and(|event| super::completed_item::shell_output_conflicts(item, &event.payload))
+    {
+        Match::Multiple
+    } else {
+        known
     }
 }
 
@@ -140,11 +163,7 @@ impl CodexHistory {
             return Match::Multiple;
         }
         let Some(candidate) = candidate else {
-            return if matches!(known, Match::DifferentCommand) {
-                Match::Multiple
-            } else {
-                known
-            };
+            return completed_display_match(builder, item, known, last_result);
         };
         let Some(next) = candidate.sequence() else {
             return Match::Multiple;
@@ -261,10 +280,14 @@ impl CodexHistory {
         let compatible = slot
             .display_identity
             .and_then(|identity| self.calls.display_matches_call(identity, call.sequence));
-        if compatible.unwrap_or_else(|| {
-            event.payload["type"] == "CommandExecution"
-                && super::completed_item::pending_command_output_matches(&event.payload, output)
-        }) {
+        let shell_agrees = event.payload["type"] != "CommandExecution"
+            || super::completed_item::pending_shell_agrees(&event.payload, output) != Some(false);
+        if shell_agrees
+            && compatible.unwrap_or_else(|| {
+                event.payload["type"] == "CommandExecution"
+                    && super::completed_item::pending_command_output_matches(&event.payload, output)
+            })
+        {
             return false;
         }
         slot.ambiguous = true;
@@ -294,7 +317,11 @@ impl CodexHistory {
         let Some(expected) = slot.deferred_output.take() else {
             return false;
         };
-        if super::completed_item::model_body(output) == Some(expected) {
+        if builder.event_at_mut(slot.sequence).is_some_and(|event| {
+            event.payload["type"] == "CommandExecution"
+                && super::completed_item::pending_shell_agrees(&event.payload, output) == Some(true)
+        }) || super::completed_item::model_body(output) == Some(expected)
+        {
             return false;
         }
         slot.ambiguous = true;
@@ -317,10 +344,7 @@ impl CodexHistory {
         let (_, matches_output) = super::completed_item::model_output_matcher(item);
         let matches_name = |event: &OmniEvent| {
             event.payload["name"] == item["name"]
-                && event.payload["namespace"]
-                    .as_str()
-                    .zip(item["namespace"].as_str())
-                    .is_none_or(|(left, right)| left == right)
+                && event.payload["namespace"].as_str() == item["namespace"].as_str()
         };
         let mut best = 0;
         let mut selected = Match::Missing;
@@ -352,7 +376,7 @@ impl CodexHistory {
                 .event_at_mut(call)
                 .is_some_and(|event| matches_name(event));
             return match (best, pending_name) {
-                (2, true) => Match::Multiple,
+                (2, true) | (1, false) => Match::Multiple,
                 (2, false) => selected,
                 _ => Match::Missing,
             };
@@ -406,6 +430,13 @@ impl CodexHistory {
             rejected || previous.is_some_and(|p| p.ambiguous)
         };
         let mut projection = Projection {
+            reconsider: pending.filter(|_| {
+                ambiguous
+                    && matches!(
+                        item["type"].as_str(),
+                        Some("FunctionCallOutput" | "DynamicToolCall")
+                    )
+            }),
             display_identity: super::tool_history::DisplayCallIdentity::from_item(item),
             scope: historical,
             original: None,
@@ -422,28 +453,14 @@ impl CodexHistory {
             ambiguous,
         };
         if !self.paginated {
-            if !display && legacy_output.is_some_and(|slot| Some(slot.sequence) == history) {
-                projection.wait_for_call = true;
-                projection.pending = None;
-                return projection;
-            }
-            if let Some(slot) = legacy_output.filter(|_| item["type"] == "FunctionCallOutput") {
-                projection.scope = CompletionScope::LegacyOutput;
-                projection.original = Some(slot.sequence);
-                if let Some(result) = prior {
-                    projection.pending = self.calls.result_calls.get(&result).copied();
-                }
-                return projection;
-            }
-            projection.original = prior.or(history).filter(|_| display && !wait_for_call);
-            projection.peer = history.filter(|seq| {
-                !display
-                    && !wait_for_call
-                    && builder.event_at_mut(*seq).is_some_and(|e| {
-                        e.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
-                            && super::completed_item::model_receipt(&e.payload)
-                    })
-            });
+            return self.legacy_projection(
+                builder,
+                projection,
+                payload,
+                history,
+                legacy_output,
+                prior,
+            );
         } else if display {
             projection.scope = CompletionScope::Published;
             projection.original = published.map(|p| p.sequence);
@@ -465,13 +482,51 @@ impl CodexHistory {
         projection
     }
 
+    fn legacy_projection(
+        &self,
+        builder: &mut EventBuilder,
+        mut projection: Projection,
+        payload: &Value,
+        history: Option<u64>,
+        legacy_output: Option<super::CompletedPosition>,
+        prior: Option<u64>,
+    ) -> Projection {
+        let display = payload["type"] == "item_completed";
+        let item = &payload["item"];
+        let wait_for_call = projection.wait_for_call;
+        if !display && legacy_output.is_some_and(|slot| Some(slot.sequence) == history) {
+            projection.wait_for_call = true;
+            projection.pending = None;
+            return projection;
+        }
+        if let Some(slot) = legacy_output.filter(|_| item["type"] == "FunctionCallOutput") {
+            projection.scope = CompletionScope::LegacyOutput;
+            projection.original = Some(slot.sequence);
+            if let Some(result) = prior {
+                projection.pending = self.calls.result_calls.get(&result).copied();
+            }
+            return projection;
+        }
+        projection.original = prior.or(history).filter(|_| display && !wait_for_call);
+        projection.peer = history.filter(|seq| {
+            !display
+                && !wait_for_call
+                && builder.event_at_mut(*seq).is_some_and(|e| {
+                    e.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+                        && super::completed_item::model_receipt(&e.payload)
+                })
+        });
+        projection
+    }
+
     pub(super) fn detach_tool_display(
         &mut self,
         builder: &mut EventBuilder,
         projection: Projection,
         actual_peer: Option<u64>,
     ) {
-        self.ambiguous_receipts += usize::from(projection.ambiguous);
+        self.ambiguous_receipts +=
+            usize::from(projection.ambiguous && projection.reconsider.is_none());
         if let Some(old) = projection.detach.filter(|old| Some(*old) != actual_peer) {
             if let Some(event) = builder.event_at_mut(old).filter(|e| model_output(e)) {
                 restore_model_output(event);

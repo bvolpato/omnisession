@@ -14,7 +14,8 @@ mod receipts;
 
 pub(super) use receipts::{
     annotate_model_receipt, clear_source_receipt, equivalent_model_receipt, model_body,
-    model_output_matcher, pending_command_output_matches, with_source_receipt,
+    model_output_matcher, pending_command_output_matches, pending_shell_agrees,
+    shell_output_conflicts, with_source_receipt,
 };
 mod status;
 

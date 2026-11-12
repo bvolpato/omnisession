@@ -2158,10 +2158,11 @@ fn repeated_dynamic_calls_use_the_full_recorded_output_in_either_order() {
         )
     };
     for prior_display in [false, true] {
-        for (second, published, matched) in [
-            ("second result", "second result", true),
-            ("second result", "unassociated failure", false),
-            ("first result", "first result", false),
+        for (second, published, failed_result) in [
+            ("second result", "second result", Some("second result")),
+            ("second result", "first result", Some("first result")),
+            ("second result", "unassociated failure", None),
+            ("first result", "first result", None),
         ] {
             let mut prefix = vec![
                 event("task_started", json!({"turn_id":"turn"})),
@@ -2182,31 +2183,100 @@ fn repeated_dynamic_calls_use_the_full_recorded_output_in_either_order() {
                         let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
                         let search = omnis_core::trajectory_search_document(&snap);
                         assert_eq!(
-                            search.source_complete, matched,
+                            search.source_complete,
+                            failed_result.is_some(),
                             "{prior_display} {second} {published} {mode:?} {preview}"
                         );
-                        let expected = if matched {
-                            EventKind::ToolFailed
-                        } else {
-                            EventKind::ToolCompleted
+                        let kind = |output| {
+                            if failed_result == Some(output) {
+                                &EventKind::ToolFailed
+                            } else {
+                                &EventKind::ToolCompleted
+                            }
                         };
                         assert_eq!(
                             results(&snap),
                             [
-                                (&EventKind::ToolCompleted, "first result"),
-                                (&expected, second)
+                                (kind("first result"), "first result"),
+                                (kind(second), second)
                             ]
                         );
                         let handoff = omnis_core::render_semantic_handoff(&snap);
                         assert!(handoff.contains(published));
-                        if matched {
+                        if let Some(failed) = failed_result {
                             assert_eq!(handoff.matches(published).count(), 1);
                             assert!(omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snap)).iter()
-                                .any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Tool{output,is_error:true,..} if output==second)));
+                                .any(|item|matches!(item,omnis_core::NativeTrajectoryItem::Tool{output,is_error:true,..} if output==failed)));
                         } else {
                             assert!(snap.events.iter().any(|e| e.kind == EventKind::ToolFailed
                                 && e.payload["type"] == "DynamicToolCall"));
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conflicting_function_output_evidence_and_qualified_names_agree_in_either_order() {
+    let named = |name, ns: Option<&str>| {
+        let mut row = call(Some("turn"));
+        row["payload"]["name"] = json!(name);
+        if let Some(ns) = ns {
+            row["payload"]["namespace"] = json!(ns);
+        }
+        row
+    };
+    for conflict in [false, true] {
+        let (first, second, ns) = if conflict {
+            ("first", "second", None)
+        } else {
+            ("lookup", "lookup", Some("catalog"))
+        };
+        for raw_first in [false, true] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                named(first, None),
+                model_result(if conflict { "alpha cue" } else { "gamma cue" }),
+                named(second, ns),
+            ];
+            let raw = model_result("gamma cue");
+            let display = turn_item(
+                "turn",
+                &json!({"type":"FunctionCallOutput","id":"cmd","name":first,"namespace":ns,"output":"gamma cue"}),
+            );
+            rows.extend(if raw_first {
+                [raw, display]
+            } else {
+                [display, raw]
+            });
+            for mode in [None, Some("paginated")] {
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snap);
+                    let context = format!("{conflict} {raw_first} {mode:?} {preview}");
+                    assert_eq!(search.source_complete, !conflict, "{context}");
+                    let raw: Vec<_> = snap
+                        .events
+                        .iter()
+                        .filter(|e| {
+                            e.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .collect();
+                    assert!(
+                        raw[0].payload["omnisession_codex_tool_display"].is_null(),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        raw[1].payload["omnisession_codex_tool_display"]["namespace"].as_str(),
+                        ns,
+                        "{context}"
+                    );
+                    assert_eq!(results(&snap).len(), 2 + usize::from(conflict), "{context}");
+                    for text in [search.text, omnis_core::render_semantic_handoff(&snap)] {
+                        assert_eq!(text.matches("gamma cue").count(), 2, "{context} {text}");
                     }
                 }
             }

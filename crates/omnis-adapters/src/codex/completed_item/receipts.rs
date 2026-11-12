@@ -33,6 +33,10 @@ pub(in super::super) fn with_source_receipt(mut payload: Value, source: &Value) 
     if body.is_some() || structured.is_some() {
         let mut witness =
             json!({"body":body.map(hex::encode),"structured":structured.map(hex::encode)});
+        if model && let Some((code, body)) = shell_output(&source["output"]) {
+            witness["shell_code"] = code.into();
+            witness["shell_body"] = hex::encode(body).into();
+        }
         if model && let Some((field, key)) = mcp_writer_body(&source["output"]) {
             witness[field] = hex::encode(key).into();
         }
@@ -247,6 +251,46 @@ fn mcp_time(line: &str) -> bool {
     })
 }
 
+fn shell_output(output: &Value) -> Option<(i32, Key)> {
+    let (code, tail) = output
+        .as_str()?
+        .strip_prefix("Exit code: ")?
+        .split_once('\n')?;
+    let exit: i32 = code.parse().ok()?;
+    let (duration, tail) = tail.strip_prefix("Wall time: ")?.split_once(" seconds\n")?;
+    let seconds: f32 = duration.parse().ok()?;
+    if exit.to_string() != code
+        || !seconds.is_finite()
+        || seconds < 0.0
+        || ((seconds * 10.0).round() / 10.0).to_string() != duration
+    {
+        return None;
+    }
+    let tail = if let Some(lines) = tail.strip_prefix("Total output lines: ") {
+        let (count, tail) = lines.split_once('\n')?;
+        (count.parse::<usize>().ok()?.to_string() == count).then_some(tail)?
+    } else {
+        tail
+    };
+    let text = tail.strip_prefix("Output:\n")?;
+    Some((exit, single_key(0, Sha256::digest(text).into())))
+}
+
+fn shell_agrees(display: &Value, expected: Option<&str>, code: i64, body: Option<&str>) -> bool {
+    if display["exit_code"]
+        .as_i64()
+        .is_some_and(|value| value != code)
+    {
+        return false;
+    }
+    let status_agrees = match display["status"].as_str() {
+        Some("completed") => code == 0,
+        Some("failed") => code != 0,
+        _ => true,
+    };
+    status_agrees && expected.is_some() && expected == body
+}
+
 fn body_matches(witness: &Value, body: Option<&str>, structured: Option<&str>, mcp: bool) -> bool {
     let exact = witness["body"].as_str();
     body.is_some_and(|key| exact == Some(key) || (mcp && witness["mcp_parts"] == key))
@@ -261,13 +305,57 @@ pub(in super::super) fn model_output_matcher(
     let structured = structured.map(hex::encode);
     let mcp = source["type"] == "McpToolCall";
     let sanitized = sanitized_mcp_key(source).map(hex::encode);
+    let command = (source["type"] == "CommandExecution").then(|| {
+        json!({
+            "status":source["status"], "exit_code":source["exit_code"]
+        })
+    });
     (body_key, move |model: &Value| {
+        if let Some(command) = &command
+            && let Some(code) = model[WITNESS]["shell_code"].as_i64()
+        {
+            return shell_agrees(
+                command,
+                body.as_deref(),
+                code,
+                model[WITNESS]["shell_body"].as_str(),
+            );
+        }
         body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
             || body_matches(&model[WITNESS], sanitized.as_deref(), None, mcp)
     })
 }
 
+pub(in super::super) fn shell_output_conflicts(item: &Value, model: &Value) -> bool {
+    if item["type"] != "CommandExecution" {
+        return false;
+    }
+    let Some(code) = model[WITNESS]["shell_code"].as_i64() else {
+        return false;
+    };
+    let (body, _) = display_keys(item);
+    !shell_agrees(
+        item,
+        body.map(hex::encode).as_deref(),
+        code,
+        model[WITNESS]["shell_body"].as_str(),
+    )
+}
+
+pub(in super::super) fn pending_shell_agrees(display: &Value, output: &Value) -> Option<bool> {
+    let (code, body) = shell_output(output)?;
+    Some(shell_agrees(
+        display,
+        display[WITNESS]["body"].as_str(),
+        i64::from(code),
+        Some(&hex::encode(body)),
+    ))
+}
+
 pub(in super::super) fn pending_command_output_matches(display: &Value, output: &Value) -> bool {
+    if let Some(agrees) = pending_shell_agrees(display, output) {
+        return agrees;
+    }
     model_body(output)
         .map(hex::encode)
         .is_some_and(|key| display[WITNESS]["body"] == key)
@@ -275,7 +363,14 @@ pub(in super::super) fn pending_command_output_matches(display: &Value, output: 
 
 pub(in super::super) fn equivalent_model_receipt(display: &Value, model: &Value) -> bool {
     match display["type"].as_str() {
-        Some("CommandExecution") => true,
+        Some("CommandExecution") => model[WITNESS]["shell_code"].as_i64().is_none_or(|code| {
+            shell_agrees(
+                display,
+                display[WITNESS]["body"].as_str(),
+                code,
+                model[WITNESS]["shell_body"].as_str(),
+            )
+        }),
         Some("FunctionCallOutput") => body_matches(
             &model[WITNESS],
             display[WITNESS]["body"].as_str(),

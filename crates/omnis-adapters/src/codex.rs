@@ -31,6 +31,7 @@ mod attachments;
 mod checkpoint_wire;
 mod completed_item;
 mod completion_positions;
+mod deferred_receipts;
 mod display_text;
 mod message_mirrors;
 mod model_cut;
@@ -2241,6 +2242,7 @@ struct CodexHistory {
     late_owners: HashMap<u64, u64>,
     display_positions: HashMap<u64, (u64, u64)>,
     ambiguous_receipts: usize,
+    deferred_receipts: deferred_receipts::DeferredReceipts,
     omitted_tool_events: usize,
     omitted_events: usize,
 }
@@ -2282,6 +2284,7 @@ impl CodexHistory {
             late_owners: HashMap::new(),
             display_positions: HashMap::new(),
             ambiguous_receipts: 0,
+            deferred_receipts: deferred_receipts::DeferredReceipts::default(),
             omitted_tool_events: 0,
             omitted_events: 0,
         }
@@ -2363,6 +2366,8 @@ impl CodexHistory {
     }
 
     fn prune_completed(&mut self, builder: &mut EventBuilder) {
+        self.deferred_receipts
+            .retain(|seq, _| builder.event_at_mut(seq).is_some());
         self.items
             .outcomes
             .retain(|seq| builder.event_at_mut(seq).is_some());
@@ -2444,6 +2449,8 @@ impl CodexHistory {
             self.omitted_tool_events = self.omitted_tool_events.min(self.items.tool_events);
             self.display_revisions
                 .rollback(builder, checkpoint.sequence);
+            self.deferred_receipts
+                .retain(|_, owner| owner < checkpoint.sequence);
             self.last_rollback_boundary = Some(checkpoint.sequence);
             self.workspace.record = checkpoint
                 .workspace_record
@@ -2864,6 +2871,7 @@ impl CodexHistory {
             });
         self.plan_receipts.report(builder, missing);
         self.display_revisions.finish(builder);
+        self.finish_deferred_receipts(builder);
         if !self.paginated {
             self.finish_legacy_outputs(builder);
         }
@@ -3411,21 +3419,9 @@ impl CodexHistory {
         } else {
             &mut self.items
         };
-        let user = payload["item"]["type"] == "UserMessage";
-        items.identity = MessageIdentity::completed(turn, id, user);
-        let scoped = MessageIdentity::completed(&native_turn, id, user);
-        items.tool_projection = projection.tool_projection(self.paginated);
-        items.tool_turn = Some(native_turn.clone());
+        let message_id =
+            items.prepare_identified(payload, turn, id, &native_turn, projection, self.paginated);
         items.tool_owner = self.named_turns.get(&native_turn).copied();
-        items.cited_display = matches!(
-            payload["item"]["memory_citation"],
-            Value::Object(_) | Value::Array(_)
-        );
-        let message_id = match payload["item"]["type"].as_str() {
-            Some("AgentMessage") => scoped.scoped(true),
-            Some("UserMessage") => scoped.scoped(false),
-            _ => None,
-        };
         items.update =
             original.or_else(|| message_id.and_then(|key| self.message_ids.get(&key).copied()));
         items.projected = None;
@@ -3439,6 +3435,15 @@ impl CodexHistory {
         }
         let sequence = projected?;
         self.detach_tool_display(builder, projection, peer);
+        if display {
+            self.deferred_receipts.observe(
+                (&native_turn, id),
+                sequence,
+                revision_input.or(owner).unwrap_or(sequence),
+                projection.reconsider,
+                projection.display_identity,
+            );
+        }
         if let Some(input) = revision_input {
             self.display_revisions
                 .observe(builder, sequence, input, previous_display);
@@ -4138,6 +4143,30 @@ impl CodexItems {
         self.finish_tool_projection(builder, sequence, display, mirror);
     }
 
+    fn prepare_identified(
+        &mut self,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        native_turn: &str,
+        projection: completion_positions::Projection,
+        paginated: bool,
+    ) -> Option<message_mirrors::ScopedMessageId> {
+        let user = payload["item"]["type"] == "UserMessage";
+        self.identity = MessageIdentity::completed(turn, id, user);
+        let scoped = MessageIdentity::completed(native_turn, id, user);
+        self.tool_projection = projection.tool_projection(paginated);
+        self.tool_turn = Some(native_turn.to_owned());
+        self.cited_display = matches!(
+            payload["item"]["memory_citation"],
+            Value::Object(_) | Value::Array(_)
+        );
+        match payload["item"]["type"].as_str() {
+            Some("AgentMessage") => scoped.scoped(true),
+            Some("UserMessage") => scoped.scoped(false),
+            _ => None,
+        }
+    }
     fn finish_tool_projection(
         &mut self,
         builder: &mut EventBuilder,
