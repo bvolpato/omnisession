@@ -333,7 +333,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
-      AND (excluded.provider NOT IN ('pi','omp') OR excluded.origin <> 'native'
+      AND (excluded.provider NOT IN ('pi','omp','codex') OR excluded.origin <> 'native'
            OR session_trajectories.origin <> 'native' OR (
                (excluded.source_file_id IS NOT NULL OR session_trajectories.source_file_id IS NULL)
                AND (excluded.source_file_id IS NULL OR session_trajectories.source_file_id IS NOT NULL
@@ -377,6 +377,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                            (excluded.complete = session_trajectories.complete OR ?19)
                            AND (
                                excluded.content_hash <> session_trajectories.content_hash
+                               OR (session_trajectories.tail_reader_version = 0 AND ?24)
                                OR excluded.source_byte_count <>
                                    session_trajectories.source_byte_count
                                OR excluded.indexed_byte_count <>
@@ -431,12 +432,12 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
             SELECT CASE WHEN replace_title THEN excluded.derived_title
                         ELSE session_trajectories.derived_title END,
                    CASE WHEN replace_title THEN excluded.derived_title_is_verified
-                            OR (excluded.derived_title IS NOT NULL AND session_trajectories.derived_title_is_verified
+                            OR (NOT upgrading_title AND excluded.derived_title IS NOT NULL AND session_trajectories.derived_title_is_verified
                                 AND excluded.source_file_id IS session_trajectories.source_file_id
                                 AND excluded.derived_title IS session_trajectories.derived_title)
                         ELSE session_trajectories.derived_title_is_verified END,
                    CASE WHEN NOT coalesce(replace_title, 0) THEN session_trajectories.derived_title_is_local_opener
-                        WHEN same_title AND session_trajectories.derived_title_is_verified AND (
+                        WHEN same_title AND NOT upgrading_title AND session_trajectories.derived_title_is_verified AND (
                              NOT excluded.derived_title_is_verified OR
                              (session_trajectories.derived_title_is_local_opener IS 0 AND ?22 AND NOT ?24))
                           THEN session_trajectories.derived_title_is_local_opener
@@ -444,7 +445,8 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
             FROM (SELECT
                 excluded.source_file_id IS session_trajectories.source_file_id
                 AND excluded.derived_title IS NOT NULL AND excluded.derived_title IS session_trajectories.derived_title AS same_title,
-                CASE WHEN ?17 AND excluded.source_file_id IS NOT NULL
+                CASE WHEN upgrading_title THEN 1
+                     WHEN ?17 AND excluded.source_file_id IS NOT NULL
                           AND excluded.source_file_id IS NOT session_trajectories.source_file_id THEN 1
                      WHEN ?17 AND ?24 THEN 1
                      WHEN ?23 THEN session_trajectories.origin = 'native'
@@ -457,7 +459,10 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
                     AND NOT session_trajectories.derived_title_is_verified
                     AND session_trajectories.origin = 'native'
                     AND excluded.source_file_id = session_trajectories.source_file_id)
-                END AS replace_title)
+                END AS replace_title, upgrading_title
+                FROM (SELECT ?17 AND session_trajectories.origin = 'native' AND excluded.origin = 'native'
+                    AND session_trajectories.document_version < 7 AND excluded.document_version >= 7
+                    AND session_trajectories.derived_title_is_local_opener IS NOT 1 AS upgrading_title))
         )
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        excluded.document_version > session_trajectories.document_version
@@ -490,6 +495,7 @@ const UPSERT_CODEX_PARENT_SQL: &str = "
                            excluded.complete = session_trajectories.complete
                            AND (
                                excluded.content_hash <> session_trajectories.content_hash
+                               OR (session_trajectories.tail_reader_version = 0 AND ?26)
                                OR excluded.source_byte_count <>
                                    session_trajectories.source_byte_count
                                OR excluded.indexed_byte_count <>
@@ -796,6 +802,12 @@ impl TrajectorySourceGuard {
         matches!(provider, Provider::Pi | Provider::OhMyPi)
     }
 
+    /// Whether an index read returns the selected native file and its revision.
+    #[must_use]
+    pub const fn verifies_search_file(provider: Provider) -> bool {
+        matches!(provider, Provider::Codex) || Self::uses_file_time(provider)
+    }
+
     /// Whether the stored document, catalog, or failure identifies another physical file for this session.
     #[must_use]
     pub fn has_competing_file(self, file: Option<Uuid>) -> bool {
@@ -811,6 +823,11 @@ impl TrajectorySourceGuard {
         let Self::ObservedRevision(prior) = self else {
             return Ok(());
         };
+        if let Some(receipt) = prior.and_then(|state| state.legacy_tail_receipt)
+            && document_receipt(transaction, session)? != Some(receipt)
+        {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
         let mut statement = transaction
             .prepare_cached(
                 "SELECT source_updated_at, source_file_id, missing_ancestor_id, source_contents_id
@@ -899,9 +916,25 @@ impl TrajectorySourceGuard {
     }
 }
 
+fn samples_jsonl_tail(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Codex
+            | Provider::Claude
+            | Provider::Grok
+            | Provider::Antigravity
+            | Provider::AntigravityIde
+            | Provider::AntigravityDesktop
+            | Provider::Pi
+            | Provider::OhMyPi
+    )
+}
+
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
+    /// Receipt of a native JSONL preview that needs a tail refresh.
+    pub legacy_tail_receipt: Option<[u8; 32]>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     /// False for historical rows written before the index recorded file time below a millisecond.
@@ -917,6 +950,7 @@ pub struct TrajectoryIndexState {
 /// A derived title and the document revision that verified it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexedTitle {
+    pub document_version: u32,
     pub source_revision: SourceRevision,
     pub title: Option<String>,
     pub verified_at: Option<(u32, DateTime<Utc>)>,
@@ -1070,11 +1104,18 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                     revision.missing_ancestor.map(Uuid::into_bytes),
                     revision.contents.map(Uuid::into_bytes),
                     self.verified_metadata.is_some(),
+                    self.is_jsonl_preview(),
                 ],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(database_error)
+    }
+
+    fn is_jsonl_preview(&self) -> bool {
+        !self.source_complete
+            && self.document.origin == SessionTrajectoryOrigin::Native
+            && samples_jsonl_tail(self.session.provider)
     }
 
     fn observed_full_source(&self) -> bool {
@@ -1169,7 +1210,7 @@ fn validate_selected_catalog(
 ) -> Result<()> {
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
-        || !TrajectorySourceGuard::uses_file_time(session.provider)
+        || !TrajectorySourceGuard::verifies_search_file(session.provider)
         || !matches!(guard, TrajectorySourceGuard::Verified { .. })
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete
@@ -1185,17 +1226,29 @@ fn validate_selected_catalog(
     Ok(())
 }
 
-const DOCUMENT_RECEIPT_SQL: &str =
-    "SELECT json_array(id, indexed_at, hex(content_hash), source_updated_at,
+const DOCUMENT_RECEIPT_FIELDS: &str =
+    "json_array(id, indexed_at, hex(content_hash), source_updated_at,
          source_updated_submillis, source_complete, provider_limited, complete,
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
-         hex(source_contents_id))
-     FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
+         hex(source_contents_id), tail_reader_version)";
+
+fn document_receipt_sql() -> String {
+    format!(
+        "SELECT {DOCUMENT_RECEIPT_FIELDS} FROM session_trajectories WHERE provider = ?1 AND session_id = ?2"
+    )
+}
+
+fn trajectory_state_columns() -> String {
+    format!("source_updated_at, source_complete, document_version, source_updated_submillis,
+             provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id,
+             CASE WHEN origin = 'native' AND source_complete = 0 AND tail_reader_version = 0
+                  THEN {DOCUMENT_RECEIPT_FIELDS} END")
+}
 
 fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
     connection
-        .prepare_cached(DOCUMENT_RECEIPT_SQL)
+        .prepare_cached(&document_receipt_sql())
         .map_err(database_error)?
         .query_row(params![session.provider.to_string(), session.id], |row| {
             Ok(Sha256::digest(row.get::<_, String>(0)?).into())
@@ -1218,8 +1271,9 @@ fn observed_file_state(
 ) -> Result<(TrajectorySourceGuard, bool)> {
     // A restored file can reuse its modification time. Observe content, coverage and catalog
     // together so another full reader cannot restore an obsolete title or workspace.
+    let document = document_receipt_sql();
     let sql = format!(
-        "SELECT json_array(?1, ?2, ({DOCUMENT_RECEIPT_SQL}),
+        "SELECT json_array(?1, ?2, ({document}),
             CASE WHEN catalog.provider IS NOT NULL THEN json_array(catalog.title, catalog.project_path,
                 catalog.git_branch, catalog.created_at, catalog.updated_at, catalog.updated_at_approximate,
                 catalog.event_count, catalog.source_updated_submillis, hex(catalog.source_file_id),
@@ -2822,6 +2876,14 @@ impl Store {
                 }
             }
             if let Some(trajectory_id) = trajectory_id {
+                if write.is_jsonl_preview() {
+                    transaction
+                        .execute(
+                            "UPDATE session_trajectories SET tail_reader_version = 1 WHERE id = ?1",
+                            [trajectory_id],
+                        )
+                        .map_err(database_error)?;
+                }
                 // A later write of the same session replaces an earlier one in this batch.
                 rewritten.retain(|(other, _)| *other != trajectory_id);
                 rewritten.push((trajectory_id, write.document.redacted_text));
@@ -2960,11 +3022,10 @@ impl Store {
     ) -> Result<std::collections::HashMap<SessionRef, TrajectoryIndexState>> {
         let connection = self.connection.borrow();
         let mut statement = connection
-            .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version,
-                    source_updated_submillis, provider_limited, title_authoritative, source_file_id,
-                    missing_ancestor_id, source_contents_id FROM session_trajectories",
-            )
+            .prepare(&format!(
+                "SELECT provider, session_id, {} FROM session_trajectories",
+                trajectory_state_columns()
+            ))
             .map_err(database_error)?;
         let mut rows = statement.query([]).map_err(database_error)?;
         let mut states = std::collections::HashMap::new();
@@ -2976,7 +3037,10 @@ impl Store {
                 .map_err(|_| StoreError::CorruptStore)?;
             let session =
                 SessionRef::new(provider, row.get::<_, String>(1).map_err(database_error)?);
-            states.insert(session, state_from_row(row, 2).map_err(database_error)?);
+            states.insert(
+                session,
+                state_from_row(row, 2, provider).map_err(database_error)?,
+            );
         }
         Ok(states)
     }
@@ -3172,6 +3236,70 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Checks whether this home's GUI assignment was verified for this rollout revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the assignment cannot be read.
+    pub fn is_gui_codex_name(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+    ) -> Result<bool> {
+        if session.provider != Provider::Codex {
+            return Ok(false);
+        }
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_gui_catalog_sources WHERE session_id=?1
+             AND codex_home=(SELECT home FROM current_codex_home)
+             AND source_file_id=?2 AND source_contents_id=?3)",
+                params![
+                    session.id,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    /// Reads verified opening messages for the requested current Codex rollout revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the indexed messages cannot be read.
+    pub fn codex_local_openers(
+        &self,
+        sessions: &[(String, SourceRevision)],
+    ) -> Result<HashMap<String, String>> {
+        let connection = self.connection.borrow();
+        let mut query=connection.prepare_cached("SELECT derived_title FROM session_trajectories
+            WHERE provider='codex' AND session_id=?1 AND origin='native' AND source_file_id=?2 AND source_contents_id=?3
+            AND derived_title_is_local_opener=1 AND derived_title IS NOT NULL AND document_version>=?4").map_err(database_error)?;
+        let mut openers = HashMap::new();
+        for (id, revision) in sessions {
+            if let (Some(file), Some(contents)) = (revision.file, revision.contents)
+                && let Some(title) = query
+                    .query_row(
+                        params![
+                            id,
+                            file.into_bytes(),
+                            contents.into_bytes(),
+                            omnis_core::search_document_version(Provider::Codex)
+                        ],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(database_error)?
+            {
+                openers.insert(id.clone(), title);
+            }
+        }
+        Ok(openers)
+    }
+
     /// Reads a provider assignment retained for the selected revision in this home.
     ///
     /// # Errors
@@ -3249,7 +3377,9 @@ impl Store {
             self.connection.borrow().execute("INSERT INTO codex_name_source_prefixes(session_id,codex_home,source_file_id,source_contents_id,source_bytes,digest,full_name)
               SELECT ?1,home,?2,?3,?4,?5,?6 FROM current_codex_home h WHERE EXISTS (
                 SELECT 1 FROM session_index i WHERE i.provider='codex' AND i.session_id=?1 AND i.codex_home=h.home
-                  AND i.source_file_id=?2 AND i.source_contents_id=?3 AND i.title=?6 AND NOT i.codex_legacy_name)
+                  AND i.source_file_id=?2 AND i.source_contents_id=?3 AND i.title=?6 AND NOT i.codex_legacy_name
+                  AND NOT EXISTS (SELECT 1 FROM codex_gui_catalog_sources g WHERE g.session_id=i.session_id
+                    AND g.codex_home=h.home AND g.source_file_id=?2 AND g.source_contents_id=?3))
               ON CONFLICT(session_id,codex_home) DO UPDATE SET source_file_id=excluded.source_file_id,
               source_contents_id=excluded.source_contents_id,source_bytes=excluded.source_bytes,digest=excluded.digest,full_name=excluded.full_name",
               params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(bytes).map_err(|_| StoreError::InvalidSessionReference)?,digest,omnis_core::redact_secrets(name)]).map_err(database_error)?;
@@ -3422,6 +3552,7 @@ impl Store {
             titles.insert(
                 SessionRef::new(provider, session_id),
                 IndexedTitle {
+                    document_version: row.get(3).map_err(database_error)?,
                     source_revision: source_revision_from_row(row, 8).map_err(database_error)?,
                     title: row.get(2).map_err(database_error)?,
                     verified_at,
@@ -3997,16 +4128,17 @@ impl Store {
             .map_err(database_error)
     }
 
-    /// Reads the SHA-256 digest of a full Codex projection that predates file and contents revisions.
-    /// Version 5 rows must match the digest and source time recorded during the schema upgrade.
+    /// Reads the digest of a Codex projection that can be verified against the selected rollout.
+    /// A partial projection must still refer to the same physical file and contents.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid session reference or a failed database read.
-    pub fn legacy_codex_projection_hash(
+    pub fn codex_projection_hash(
         &self,
         session: &SessionRef,
         source_updated_at: DateTime<Utc>,
+        revision: SourceRevision,
     ) -> Result<Option<[u8; 32]>> {
         validate_session_ref(session)?;
         if session.provider != Provider::Codex {
@@ -4017,18 +4149,33 @@ impl Store {
             .query_row(
                 "SELECT t.content_hash FROM session_trajectories AS t
                  WHERE t.provider = 'codex' AND t.session_id = ?1 AND t.source_updated_at = ?2
-                   AND t.origin = 'native' AND t.source_complete = 1
-                   AND t.source_file_id IS NULL AND t.source_contents_id IS NULL AND t.missing_ancestor_id IS NULL
-                   AND typeof(t.content_hash) = 'blob' AND length(t.content_hash) = 32
-                   AND (t.document_version = 4 OR (t.document_version = 5 AND EXISTS (
-                       SELECT 1 FROM legacy_codex_v5_projections AS old
-                       WHERE old.trajectory_id = t.id AND old.source_updated_at = t.source_updated_at
-                         AND old.content_hash = t.content_hash)))",
-                params![session.id, source_updated_at.timestamp_millis()],
+                   AND t.origin = 'native' AND typeof(t.content_hash) = 'blob' AND length(t.content_hash) = 32
+                   AND t.source_file_id IS ?3 AND t.source_contents_id IS ?4 AND t.missing_ancestor_id IS NULL
+                   AND ((?3 IS NOT NULL AND ?4 IS NOT NULL AND t.source_complete = 0)
+                     OR (?3 IS NULL AND ?4 IS NULL AND t.source_complete = 1
+                       AND (t.document_version = 4 OR (t.document_version = 5 AND EXISTS (
+                           SELECT 1 FROM legacy_codex_v5_projections AS old
+                           WHERE old.trajectory_id = t.id AND old.source_updated_at = t.source_updated_at
+                             AND old.content_hash = t.content_hash)))))",
+                params![session.id, source_updated_at.timestamp_millis(), revision.file.map(Uuid::into_bytes),
+                        revision.contents.map(Uuid::into_bytes)],
                 |row| row.get(0),
             )
             .optional()
             .map_err(database_error)
+    }
+
+    /// Reads the digest of a full Codex projection that predates file and contents revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or a failed database read.
+    pub fn legacy_codex_projection_hash(
+        &self,
+        session: &SessionRef,
+        source_updated_at: DateTime<Utc>,
+    ) -> Result<Option<[u8; 32]>> {
+        self.codex_projection_hash(session, source_updated_at, SourceRevision::default())
     }
 
     /// Allows the indexer to retry a failed source while its revision still hides the old text.
@@ -4223,7 +4370,10 @@ impl Store {
              WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home) AND p.evidence<>'unattributed'
              UNION ALL SELECT t.session_id,p.source_file_id,p.source_contents_id,p.title,p.trajectory_id,p.evidence,1
              FROM codex_inactive_pending_names p JOIN session_trajectories t ON t.id=p.trajectory_id
-             WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home)"
+             WHERE t.provider='codex' AND p.codex_home=(SELECT home FROM current_codex_home)
+             UNION ALL SELECT session_id,source_file_id,source_contents_id,title,NULL,NULL,2 FROM session_index
+             WHERE provider='codex' AND codex_home=(SELECT home FROM current_codex_home) AND NOT codex_legacy_name
+             AND source_file_id IS NOT NULL AND source_contents_id IS NOT NULL"
         ).map_err(database_error)?;
         inventory.saved_names = statement
             .query_map([], |row| {
@@ -4232,16 +4382,17 @@ impl Store {
                     file: row.get(1)?,
                     contents: row.get(2)?,
                     name: row.get(3)?,
-                    projection: row
-                        .get::<_, Option<i64>>(4)?
-                        .map(|id| -> rusqlite::Result<_> {
-                            Ok(SavedNameProjection {
-                                trajectory: id,
-                                evidence: row.get(5)?,
-                                inactive: row.get(6)?,
-                            })
+                    source: if let Some(trajectory) = row.get(4)? {
+                        SavedNameSource::Projection(SavedNameProjection {
+                            trajectory,
+                            evidence: row.get(5)?,
+                            inactive: row.get::<_, i64>(6)? == 1,
                         })
-                        .transpose()?,
+                    } else if row.get::<_, i64>(6)? == 2 {
+                        SavedNameSource::Catalog
+                    } else {
+                        SavedNameSource::Prefix
+                    },
                 })
             })
             .map_err(database_error)?
@@ -4314,8 +4465,9 @@ impl Store {
                 observed,
                 complete: names_complete,
                 prior_assignments: &HashMap::new(),
+                gui_names: &HashMap::new(),
                 unstamped_documents: None,
-                withdrawn_names: &[],
+                unlisted_name_changes: &[],
             },
         )
     }
@@ -4333,6 +4485,30 @@ impl Store {
         inventory: &CodexCatalogInventory,
         prior_assignments: &HashMap<String, String>,
     ) -> Result<()> {
+        self.refresh_codex_catalog_with_gui_names(
+            sessions,
+            complete,
+            names_complete,
+            inventory,
+            prior_assignments,
+            &HashMap::new(),
+        )
+    }
+
+    /// Reconciles the catalog with GUI assignments verified for the selected rollouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog changed during discovery.
+    pub fn refresh_codex_catalog_with_gui_names(
+        &self,
+        sessions: &[IndexedSession],
+        complete: bool,
+        names_complete: bool,
+        inventory: &CodexCatalogInventory,
+        prior_assignments: &HashMap<String, String>,
+        gui_names: &HashMap<String, Option<String>>,
+    ) -> Result<()> {
         self.persist_codex_catalog(
             sessions,
             complete,
@@ -4340,8 +4516,9 @@ impl Store {
                 observed: &inventory.observed,
                 complete: names_complete,
                 prior_assignments,
+                gui_names,
                 unstamped_documents: Some(&inventory.unstamped_documents),
-                withdrawn_names: &inventory.withdrawn_names,
+                unlisted_name_changes: &inventory.unlisted_name_changes,
             },
         )
     }
@@ -4394,6 +4571,28 @@ impl Store {
         observed: &[IndexedSession],
         prior_assignments: &HashMap<String, String>,
     ) -> Result<()> {
+        self.merge_codex_search_catalog_with_gui_names(
+            sessions,
+            names_complete,
+            observed,
+            prior_assignments,
+            &HashMap::new(),
+        )
+    }
+
+    /// Reconciles the catalog with GUI assignments verified for the selected rollouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog changed during discovery.
+    pub fn merge_codex_search_catalog_with_gui_names(
+        &self,
+        sessions: &[IndexedSession],
+        names_complete: bool,
+        observed: &[IndexedSession],
+        prior_assignments: &HashMap<String, String>,
+        gui_names: &HashMap<String, Option<String>>,
+    ) -> Result<()> {
         self.persist_codex_catalog_rows(
             sessions,
             CatalogScope::Search,
@@ -4401,8 +4600,9 @@ impl Store {
                 observed,
                 complete: names_complete,
                 prior_assignments,
+                gui_names,
                 unstamped_documents: None,
-                withdrawn_names: &[],
+                unlisted_name_changes: &[],
             }),
         )
     }
@@ -5206,6 +5406,11 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
                 codex_home TEXT,
                 evidence TEXT NOT NULL DEFAULT 'uncataloged' CHECK (evidence IN ('uncataloged', 'provider_name', 'unattributed'))
             );
+            CREATE TABLE IF NOT EXISTS codex_gui_catalog_sources (
+                session_id TEXT NOT NULL, codex_home TEXT NOT NULL,
+                source_file_id BLOB NOT NULL, source_contents_id BLOB NOT NULL,
+                PRIMARY KEY(session_id,codex_home)
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS codex_name_source_prefixes (
                 session_id TEXT NOT NULL,codex_home TEXT NOT NULL,source_file_id BLOB NOT NULL,
                 source_contents_id BLOB NOT NULL,source_bytes INTEGER NOT NULL,digest BLOB NOT NULL,full_name TEXT,
@@ -5235,6 +5440,17 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
     ).map_err(database_error)?;
     ensure_trajectory_title_provenance(transaction)?;
     codex_title_recheck::schedule_tool_catalog_title_rechecks(transaction)?;
+    // Older writers replace the content without recording which reader produced it.
+    // A current writer restores the marker after the upsert in the same transaction.
+    transaction
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS reset_tail_reader_after_write
+             AFTER UPDATE OF content_hash ON session_trajectories WHEN OLD.tail_reader_version <> 0
+             BEGIN
+                 UPDATE session_trajectories SET tail_reader_version = 0 WHERE id = NEW.id;
+             END;",
+        )
+        .map_err(database_error)?;
     migrate_pending_catalog_names(transaction)?;
     initialize_trajectory_chunk_schema(transaction)?;
     migrate_legacy_codex_titles(transaction)
@@ -5255,6 +5471,14 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
         || !has_column("indexed_byte_count")
         || !has_column("truncation_strategy")
         || !has_column("source_complete");
+    if !has_column("tail_reader_version") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE session_trajectories
+                 ADD COLUMN tail_reader_version INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(database_error)?;
+    }
     if !has_column("content_hash") {
         transaction
             .execute_batch(
@@ -5937,6 +6161,7 @@ fn write_indexed_session_row(
 fn state_from_row(
     row: &rusqlite::Row<'_>,
     column: usize,
+    provider: Provider,
 ) -> rusqlite::Result<TrajectoryIndexState> {
     let remainder: Option<u32> = row.get(column + 3)?;
     let time: i64 = row.get(column)?;
@@ -5944,6 +6169,12 @@ fn state_from_row(
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })?;
     Ok(TrajectoryIndexState {
+        legacy_tail_receipt: if samples_jsonl_tail(provider) {
+            row.get::<_, Option<String>>(column + 9)?
+                .map(|receipt| Sha256::digest(receipt).into())
+        } else {
+            None
+        },
         source_revision: source_revision_from_row(row, column + 6)?,
         source_updated_at,
         source_complete: row.get(column + 1)?,
@@ -6416,6 +6647,7 @@ pub struct LegacyCodexOpenerCandidate {
 /// An indexed title and the physical source that supplied it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedTrajectoryTitle {
+    pub document_version: u32,
     pub verified_at: Option<(u32, DateTime<Utc>)>,
     pub cached_at: Option<DateTime<Utc>>,
     pub session: SessionRef,
@@ -6451,11 +6683,9 @@ impl PreparedTrajectoryWrite<'_, '_> {
                     || self.document.title_authoritative,
                 false,
             )?;
-        }
-        if let Some(metadata) = selected_metadata
-            && native
-        {
-            metadata.reconcile_name(transaction)?;
+            if let Some(metadata) = selected_metadata {
+                metadata.reconcile_name(transaction)?;
+            }
         }
         if native && observed {
             transaction.execute("UPDATE session_trajectories AS t SET derived_title=NULL,
@@ -6500,6 +6730,7 @@ impl PreparedTrajectoryWrite<'_, '_> {
                     title.local == LocalOpenerEvidence::Withdrawn,
                     title.authoritative,
                     self.document.provider_limited,
+                    self.is_jsonl_preview(),
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -6796,6 +7027,7 @@ fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTr
     let time = |fraction: u32| millis + chrono::Duration::nanoseconds(i64::from(fraction));
     let version = row.get(6)?;
     Ok(IndexedTrajectoryTitle {
+        document_version: version,
         verified_at: row
             .get::<_, Option<u32>>(7)?
             .map(|fraction| (version, time(fraction))),
@@ -7051,12 +7283,17 @@ fn cached_trajectory_state(
     session: &SessionRef,
 ) -> Result<Option<TrajectoryIndexState>> {
     validate_session_ref(session)?;
-    connection.query_row(
-            "SELECT source_updated_at, source_complete, document_version, source_updated_submillis,
-                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id
-             FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
-            params![session.provider.to_string(), session.id], |row| state_from_row(row, 0),
-        ).optional().map_err(database_error)
+    connection
+        .query_row(
+            &format!(
+                "SELECT {} FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+                trajectory_state_columns()
+            ),
+            params![session.provider.to_string(), session.id],
+            |row| state_from_row(row, 0, session.provider),
+        )
+        .optional()
+        .map_err(database_error)
 }
 
 fn cached_session(
@@ -7089,7 +7326,7 @@ pub struct CodexCatalogInventory {
     unscoped: HashMap<SessionRef, usize>,
     unstamped_documents: HashMap<SessionRef, String>,
     saved_names: Vec<SavedCodexName>,
-    withdrawn_names: Vec<SavedCodexName>,
+    unlisted_name_changes: Vec<NameAssignmentChange>,
 }
 
 struct SavedCodexName {
@@ -7097,7 +7334,18 @@ struct SavedCodexName {
     file: [u8; 16],
     contents: [u8; 16],
     name: Option<String>,
-    projection: Option<SavedNameProjection>,
+    source: SavedNameSource,
+}
+
+enum SavedNameSource {
+    Prefix,
+    Catalog,
+    Projection(SavedNameProjection),
+}
+
+struct NameAssignmentChange {
+    saved: SavedCodexName,
+    replacement: Option<String>,
 }
 
 struct SavedNameProjection {
@@ -7110,21 +7358,26 @@ impl CodexCatalogInventory {
     /// Compares each saved assignment with a readable native assignment for that ID.
     /// A complete index also confirms that omitted IDs have no name.
     pub fn observe_name_assignments(&mut self, assigned: &HashMap<String, String>, complete: bool) {
-        self.withdrawn_names = self
+        self.unlisted_name_changes = self
             .saved_names
             .drain(..)
-            .filter(|saved| {
-                let Some(name) = assigned.get(&saved.id) else {
-                    return complete;
-                };
-                let Some(old) = saved.name.as_deref() else {
-                    return false;
-                };
-                if saved.projection.is_some() {
-                    omnis_core::compact_search_title(name).as_deref() != Some(old)
-                } else {
-                    omnis_core::redact_secrets(name) != old
+            .filter_map(|saved| {
+                let assignment = assigned.get(&saved.id);
+                if assignment.is_none() && !complete {
+                    return None;
                 }
+                let replacement = assignment.map(|name| omnis_core::redact_secrets(name));
+                let projected = match (&saved.source, &replacement) {
+                    (SavedNameSource::Projection(_), Some(name)) => {
+                        omnis_core::compact_search_title(name)
+                    }
+                    _ => replacement.clone(),
+                };
+                let clear_legacy_prefix = complete
+                    && assignment.is_none()
+                    && matches!(&saved.source, SavedNameSource::Prefix);
+                (projected != saved.name || clear_legacy_prefix)
+                    .then_some(NameAssignmentChange { saved, replacement })
             })
             .collect();
     }
@@ -7160,8 +7413,9 @@ struct CatalogNameObservations<'a> {
     observed: &'a [IndexedSession],
     complete: bool,
     prior_assignments: &'a HashMap<String, String>,
+    gui_names: &'a HashMap<String, Option<String>>,
     unstamped_documents: Option<&'a HashMap<SessionRef, String>>,
-    withdrawn_names: &'a [SavedCodexName],
+    unlisted_name_changes: &'a [NameAssignmentChange],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7405,6 +7659,8 @@ fn remove_codex_catalog_row(
     prior: &IndexedSession,
     unstamped: Option<&str>,
 ) -> Result<()> {
+    connection.execute("DELETE FROM codex_gui_catalog_sources WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+        [&prior.session.id]).map_err(database_error)?;
     let revision = prior.source_revision.unwrap_or_default();
     if let Some(receipt) = unstamped {
         let delete = format!(
@@ -7512,7 +7768,6 @@ fn reconcile_codex_catalog(
     names: CatalogNameObservations<'_>,
     scope: CatalogScope,
 ) -> Result<CodexCatalogChanges> {
-    let names_complete = names.complete;
     let complete = scope == CatalogScope::Replace;
     let observed: HashMap<_, _> = names
         .observed
@@ -7528,15 +7783,27 @@ fn reconcile_codex_catalog(
     let mut changes = CodexCatalogChanges::default();
     for incoming_row in incoming {
         let id = incoming_row.session.id.as_str();
+        if !seen.insert(id) && complete {
+            return Err(StoreError::InvalidSessionReference);
+        }
         let prior = if complete {
-            if !seen.insert(id) {
-                return Err(StoreError::InvalidSessionReference);
-            }
             current.remove(id)
         } else {
             current.get(id).copied()
         };
         let mut row = incoming_row.clone();
+        let raw_old = prior.map(|prior| &prior.metadata);
+        let observed_old = observed.get(id).copied();
+        if raw_old != observed_old && raw_old != Some(&row) {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
+        let gui = names.gui_names.get(id).is_some_and(|title| {
+            title.as_deref().map(omnis_core::redact_secrets) == row.title
+                && row
+                    .source_revision
+                    .is_some_and(|r| r.file.is_some() && r.contents.is_some())
+        });
+        let names_complete = names.complete || gui;
         if row.title.is_some() || names_complete {
             discard_superseded_name_source(transaction, &row)?;
         }
@@ -7547,58 +7814,17 @@ fn reconcile_codex_catalog(
             row.title.is_some() || names_complete,
             true,
         )?;
-        let raw_old = prior.map(|prior| &prior.metadata);
-        let observed_old = observed.get(id).copied();
-        if raw_old != observed_old && raw_old != Some(&row) {
-            return Err(StoreError::TrajectorySourceChanged);
-        }
-        let old = prior.and_then(ScopedCatalogRow::verified_metadata);
-        if old.is_none() && row.title.is_none() {
-            reconcile_unowned_name(transaction, &mut row, names)?;
-        }
-        let mut new_pending = false;
-        if let Some(prior) = old
-            && row.title.is_none()
-        {
-            if same_codex_catalog_source(prior, &row) {
-                if names_complete {
-                    withdraw_catalog_name(transaction, prior, true)?;
-                } else {
-                    row.title.clone_from(&prior.title);
-                }
-            } else if !names_complete
-                && prior.title.is_some()
-                && let Some(name) = unindexed_codex_name(
-                    prior,
-                    &row,
-                    cached_trajectory_state(transaction, &row.session)?,
-                )
-            {
-                row.title = Some(name.to_owned());
-            } else {
-                new_pending = remember_provider_name(transaction, prior, &row)?;
-            }
-        }
-        let existing_pending = pending_codex_catalog_title(transaction, &row.session)?;
-        if new_pending || existing_pending.is_some() {
-            if names_complete
-                || row.title.is_some()
-                || (!new_pending && existing_pending == Some(false))
-            {
-                resolve_pending_catalog_title(transaction, &row, true)?;
-            }
-        } else if old.is_none()
-            && row.title.is_none()
-            && let Some(title) = uncataloged_trajectory_title(transaction, &row)?
-        {
-            withdraw_trajectory_name(transaction, &row, &title, true)?;
+        if gui {
+            record_gui_catalog_source(transaction, &row)?;
+        } else {
+            reconcile_ordinary_catalog_name(transaction, &mut row, prior, names)?;
         }
         if prior.is_none_or(|prior| prior.needs_update(observed_old, &row)) {
             changes.updated.push(row);
         }
     }
+    reconcile_unlisted_names(transaction, names.unlisted_name_changes, &seen)?;
     if complete {
-        withdraw_unlisted_names(transaction, names.withdrawn_names, &seen)?;
         for (id, prior) in current {
             if observed.get(id).copied() != Some(&prior.metadata) {
                 return Err(StoreError::TrajectorySourceChanged);
@@ -7611,32 +7837,183 @@ fn reconcile_codex_catalog(
     Ok(changes)
 }
 
-fn withdraw_unlisted_names(
+fn reconcile_ordinary_catalog_name(
     transaction: &Transaction<'_>,
-    withdrawn_names: &[SavedCodexName],
+    row: &mut IndexedSession,
+    prior: Option<&ScopedCatalogRow>,
+    names: CatalogNameObservations<'_>,
+) -> Result<()> {
+    let previous_gui = transaction.execute(
+        "DELETE FROM codex_gui_catalog_sources WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+        [&row.session.id],
+    ).map_err(database_error)? != 0;
+    if previous_gui {
+        return Ok(());
+    }
+    let old = prior.and_then(ScopedCatalogRow::verified_metadata);
+    if old.is_none() && row.title.is_none() {
+        reconcile_unowned_name(transaction, row, names)?;
+    }
+    let mut new_pending = false;
+    if let Some(prior) = old
+        && row.title.is_none()
+    {
+        if same_codex_catalog_source(prior, row) {
+            if names.complete {
+                withdraw_catalog_name(transaction, prior, true)?;
+            } else {
+                row.title.clone_from(&prior.title);
+            }
+        } else if !names.complete
+            && prior.title.is_some()
+            && let Some(name) = unindexed_codex_name(
+                prior,
+                row,
+                cached_trajectory_state(transaction, &row.session)?,
+            )
+        {
+            row.title = Some(name.to_owned());
+        } else {
+            new_pending = remember_provider_name(transaction, prior, row)?;
+        }
+    }
+    let existing_pending = pending_codex_catalog_title(transaction, &row.session)?;
+    if new_pending || existing_pending.is_some() {
+        if names.complete
+            || row.title.is_some()
+            || (!new_pending && existing_pending == Some(false))
+        {
+            resolve_pending_catalog_title(transaction, row, true)?;
+        }
+    } else if old.is_none()
+        && row.title.is_none()
+        && let Some(title) = uncataloged_trajectory_title(transaction, row)?
+    {
+        withdraw_trajectory_name(transaction, row, &title, true)?;
+    }
+    Ok(())
+}
+
+fn record_gui_catalog_source(connection: &Connection, row: &IndexedSession) -> Result<()> {
+    let revision = row.source_revision.unwrap_or_default();
+    let file = revision.file.map(Uuid::into_bytes);
+    let contents = revision.contents.map(Uuid::into_bytes);
+    let changed = connection.execute(
+        "INSERT INTO codex_gui_catalog_sources(session_id,codex_home,source_file_id,source_contents_id)
+         SELECT ?1,home,?2,?3 FROM current_codex_home WHERE home IS NOT NULL
+         ON CONFLICT(session_id,codex_home) DO UPDATE SET source_file_id=excluded.source_file_id,
+         source_contents_id=excluded.source_contents_id WHERE source_file_id<>excluded.source_file_id
+         OR source_contents_id<>excluded.source_contents_id",
+        params![row.session.id,file,contents]).map_err(database_error)?;
+    if changed != 0 {
+        connection.execute(
+            "UPDATE session_trajectories SET derived_title=NULL,derived_title_is_verified=0,
+              derived_title_is_local_opener=NULL,document_version=0 WHERE provider='codex' AND session_id=?1
+              AND origin='native' AND source_file_id=?2 AND source_contents_id=?3
+              AND derived_title IS NOT NULL AND derived_title_is_local_opener IS NOT 1",
+            params![row.session.id,file,contents]).map_err(database_error)?;
+    }
+    connection
+        .execute(
+            "DELETE FROM codex_name_source_prefixes WHERE session_id=?1
+        AND codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2",
+            params![row.session.id, file],
+        )
+        .map_err(database_error)?;
+    for table in [
+        "codex_pending_catalog_titles",
+        "codex_inactive_pending_names",
+    ] {
+        connection.execute(&format!("DELETE FROM {table} WHERE trajectory_id=(SELECT id FROM session_trajectories
+            WHERE provider='codex' AND session_id=?1) AND codex_home=(SELECT home FROM current_codex_home)
+            AND source_file_id=?2"),params![row.session.id,file]).map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn reconcile_unlisted_names(
+    transaction: &Transaction<'_>,
+    changes: &[NameAssignmentChange],
     listed: &HashSet<&str>,
 ) -> Result<()> {
-    let mut remove = transaction.prepare_cached(
-        "DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
-         AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS ?4"
-    ).map_err(database_error)?;
-    for saved in withdrawn_names {
+    for change in changes {
+        let saved = &change.saved;
         if listed.contains(saved.id.as_str()) {
             continue;
         }
-        if let Some(projection) = &saved.projection {
-            projection.withdraw(transaction, saved)?;
-        } else {
-            remove
-                .execute(params![saved.id, saved.file, saved.contents, saved.name])
-                .map_err(database_error)?;
+        let updated = match &saved.source {
+            SavedNameSource::Prefix => {
+                saved.update_prefix(transaction, change.replacement.as_deref())?
+            }
+            SavedNameSource::Catalog => {
+                saved.update_catalog(transaction, change.replacement.as_deref())?
+            }
+            SavedNameSource::Projection(projection) => projection.withdraw(transaction, saved)?,
+        };
+        if updated == 0 {
+            return Err(StoreError::TrajectorySourceChanged);
+        }
+        if let SavedNameSource::Catalog = &saved.source
+            && let Some(name) = &change.replacement
+        {
+            transaction.prepare_cached(
+                "INSERT INTO codex_name_source_prefixes(session_id,codex_home,source_file_id,source_contents_id,source_bytes,digest,full_name)
+                 SELECT ?1,home,?2,?3,0,zeroblob(32),?4 FROM current_codex_home WHERE home IS NOT NULL
+                 ON CONFLICT(session_id,codex_home) DO NOTHING"
+            ).map_err(database_error)?.execute(params![saved.id,saved.file,saved.contents,name]).map_err(database_error)?;
         }
     }
     Ok(())
 }
 
+impl SavedCodexName {
+    fn update_prefix(
+        &self,
+        transaction: &Transaction<'_>,
+        replacement: Option<&str>,
+    ) -> Result<usize> {
+        let scope = "WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+                     AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS ?4";
+        if let Some(name) = replacement {
+            transaction
+                .prepare_cached(&format!(
+                    "UPDATE codex_name_source_prefixes SET full_name=?5 {scope}"
+                ))
+                .map_err(database_error)?
+                .execute(params![self.id, self.file, self.contents, self.name, name])
+                .map_err(database_error)
+        } else {
+            transaction
+                .prepare_cached(&format!("DELETE FROM codex_name_source_prefixes {scope}"))
+                .map_err(database_error)?
+                .execute(params![self.id, self.file, self.contents, self.name])
+                .map_err(database_error)
+        }
+    }
+
+    fn update_catalog(
+        &self,
+        transaction: &Transaction<'_>,
+        replacement: Option<&str>,
+    ) -> Result<usize> {
+        let updated = transaction.prepare_cached("UPDATE session_index SET title=?5
+            WHERE provider='codex' AND session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+            AND source_file_id=?2 AND source_contents_id=?3 AND title IS ?4 AND NOT codex_legacy_name")
+            .map_err(database_error)?.execute(params![self.id,self.file,self.contents,self.name,replacement]).map_err(database_error)?;
+        if updated != 0 {
+            transaction.prepare_cached("UPDATE session_trajectories SET derived_title=NULL,derived_title_is_verified=0,
+                derived_title_is_local_opener=NULL,document_version=0
+                WHERE provider='codex' AND session_id=?1 AND origin='native'
+                AND source_file_id=?2 AND source_contents_id=?3 AND derived_title=omnis_compact_search_title(?4)
+                AND derived_title_is_local_opener IS 0")
+                .map_err(database_error)?.execute(params![self.id,self.file,self.contents,self.name]).map_err(database_error)?;
+        }
+        Ok(updated)
+    }
+}
+
 impl SavedNameProjection {
-    fn withdraw(&self, transaction: &Transaction<'_>, saved: &SavedCodexName) -> Result<()> {
+    fn withdraw(&self, transaction: &Transaction<'_>, saved: &SavedCodexName) -> Result<usize> {
         let table = if self.inactive {
             "codex_inactive_pending_names"
         } else {
@@ -7653,7 +8030,7 @@ impl SavedNameProjection {
                  AND derived_title=?4 AND derived_title_is_local_opener IS NOT 1"
             ).map_err(database_error)?.execute(params![self.trajectory,saved.file,saved.contents,saved.name]).map_err(database_error)?;
         }
-        Ok(())
+        Ok(removed)
     }
 }
 
@@ -7982,6 +8359,8 @@ fn reconcile_named_trajectories(
            AND t.provider = i.provider AND t.session_id = i.session_id
            AND t.source_updated_at = i.updated_at AND t.source_file_id = i.source_file_id
            AND t.source_contents_id = i.source_contents_id AND i.title IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM codex_gui_catalog_sources g WHERE g.session_id=i.session_id
+               AND g.codex_home=i.codex_home AND g.source_file_id=i.source_file_id AND g.source_contents_id=i.source_contents_id)
            AND (i.title IS NOT t.derived_title OR NOT t.derived_title_is_verified OR t.derived_title_is_local_opener IS NOT 0)
            AND omnis_compact_search_title(i.title) IS NOT NULL
            AND (omnis_compact_search_title(i.title) IS NOT t.derived_title OR NOT t.derived_title_is_verified OR t.derived_title_is_local_opener IS NOT 0)";
@@ -11940,6 +12319,44 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn partial_codex_upgrade_replaces_a_legacy_display_name_with_the_observed_opener() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Codex, "named");
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(42)),
+            contents: Some(Uuid::from_u128(43)),
+            ..SourceRevision::default()
+        };
+        let old = TrajectoryDocument {
+            derived_title: Some("GUI name"),
+            title_is_verified: true,
+            ..rollout_document("older preview", Utc::now(), revision, false, 6)
+        };
+        save_observed_title(&store, &session, old);
+        let receipt = || store.indexed_trajectory_title(&session).unwrap().unwrap();
+        assert_eq!(receipt().document_version, 6);
+        let upgraded = TrajectoryDocument {
+            document_version: 7,
+            derived_title: Some("actual opening prompt"),
+            local_opener: LocalOpenerEvidence::Current,
+            ..old
+        };
+        assert_eq!(
+            save_observed_title(&store, &session, upgraded).as_deref(),
+            upgraded.derived_title
+        );
+        assert_eq!(receipt().document_version, 7);
+        let withdrawn = TrajectoryDocument {
+            derived_title: None,
+            withdrawn_title: upgraded.derived_title,
+            local_opener: LocalOpenerEvidence::Withdrawn,
+            ..upgraded
+        };
+        assert!(save_observed_title(&store, &session, withdrawn).is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
@@ -1995,5 +1995,634 @@ fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> an
         ),
         ["active"]
     );
+    Ok(())
+}
+
+#[test]
+fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let path = sessions.join(format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl"));
+    fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta", "payload": {"id": SESSION_ID, "cwd": "/synthetic/project", "history_mode":"paginated"}
+            })
+        ),
+    )?;
+    let path = path.canonicalize()?;
+    let index = home.path().join("session_index.jsonl");
+    let db_path = home.path().join("state_5.sqlite");
+    let db = rusqlite::Connection::open(&db_path)?;
+    db.execute_batch("PRAGMA journal_mode=WAL;
+        CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, cwd TEXT);
+    ")?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated', ' 🛰️ Orbital notes ', '/synthetic/project')",
+        rusqlite::params![SESSION_ID, path.to_str()],
+    )?;
+    let check = |expected: Option<&str>| check_gui_title(home.path(), &path, expected);
+    check(Some("🛰️ Orbital notes"))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert_eq!(
+        adapter.gui_session_names(&listed).get(SESSION_ID),
+        Some(&Some("🛰️ Orbital notes".to_owned()))
+    );
+    fs::write(
+        &index,
+        json!({"id": SESSION_ID, "thread_name": "Earlier sidebar name"}).to_string(),
+    )?;
+    db.execute(
+        "UPDATE threads SET name = 'Renamed', cwd = '/changed/workspace'",
+        [],
+    )?;
+    check(Some("Renamed"))?;
+    db.execute("UPDATE threads SET name = NULL", [])?;
+    assert!(adapter.gui_session_names(&listed).is_empty());
+    let cleared = adapter.list_sessions(None)?;
+    assert_eq!(
+        adapter.gui_session_names(&cleared).get(SESSION_ID),
+        Some(&None)
+    );
+    check(None)?;
+    drop(db);
+    check(None)?;
+    assert!(!db_path.with_extension("sqlite-wal").exists());
+    assert!(!db_path.with_extension("sqlite-shm").exists());
+
+    let db = rusqlite::Connection::open(&db_path)?;
+    check_foreign_gui_rollout(home.path(), &path, &db)?;
+    db.execute_batch(
+        "ALTER TABLE threads ADD COLUMN title TEXT;
+        ALTER TABLE threads ADD COLUMN first_user_message TEXT;
+        ALTER TABLE threads ADD COLUMN source TEXT;
+        UPDATE threads SET history_mode='legacy', title='Assigned legacy name',
+            first_user_message='Synthetic private opening', source='\"cli\"';",
+    )?;
+    fs::write(&path, json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic/project","history_mode":"legacy"}}).to_string())?;
+    check(Some("Assigned legacy name"))?;
+    db.execute("UPDATE threads SET title='Guardian review'", [])?;
+    check(Some("Guardian review"))?;
+    db.execute(
+        "UPDATE threads SET source=?1",
+        [r#"{"subagent":{"other":"guardian"}}"#],
+    )?;
+    check(Some("Earlier sidebar name"))?;
+    db.execute(
+        "UPDATE threads SET title=char(160)||first_user_message||char(9)",
+        [],
+    )?;
+    check(Some("Earlier sidebar name"))?;
+    fs::remove_file(index)?;
+    check(None)?;
+    drop(db);
+    fs::create_dir(home.path().join("alternate"))?;
+    fs::rename(&db_path, home.path().join("alternate/state_5.sqlite"))?;
+    fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
+    let db = rusqlite::Connection::open(home.path().join("alternate/state_5.sqlite"))?;
+    db.execute("UPDATE threads SET title='Configured name'", [])?;
+    check(Some("Configured name"))?;
+    #[cfg(unix)]
+    check_linked_gui_config(home.path(), &path)?;
+    check_archived_gui_name(home.path(), &path, &db)?;
+    Ok(())
+}
+
+fn check_foreign_gui_rollout(
+    home: &Path,
+    path: &Path,
+    db: &rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let other = tempfile::tempdir()?;
+    let other_path = other.path().join(path.file_name().unwrap());
+    fs::copy(path, &other_path)?;
+    db.execute(
+        "UPDATE threads SET rollout_path = ?1, name = 'Foreign title'",
+        [other_path.to_str()],
+    )?;
+    assert!(
+        CodexAdapter::with_root(home)
+            .list_sessions(None)?
+            .is_empty()
+    );
+    db.execute("UPDATE threads SET rollout_path=?1", [path.to_str()])?;
+    Ok(())
+}
+
+fn check_gui_title(home: &Path, path: &Path, expected: Option<&str>) -> anyhow::Result<()> {
+    check_gui_title_for(home, path, expected, SESSION_ID)
+}
+
+fn check_gui_title_for(
+    home: &Path,
+    path: &Path,
+    expected: Option<&str>,
+    id: &str,
+) -> anyhow::Result<()> {
+    let session = SessionRef::new(Provider::Codex, id);
+    let adapter = CodexAdapter::with_root(home);
+    let mut rows = adapter.list_sessions(None)?;
+    assert_eq!(rows[0].title.as_deref(), expected);
+    rows[0].source_path = None;
+    assert!(
+        rows[0]
+            .source_revision
+            .and_then(|revision| revision.file)
+            .is_some()
+    );
+    rows[0].title = Some("Old assigned name".into());
+    adapter.refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), expected);
+    rows[0].source_revision = None;
+    rows[0].title = Some("Cached old opener".into());
+    adapter.refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), expected);
+    assert_eq!(rows[0].source_path.as_ref().unwrap().canonicalize()?, path);
+    assert_eq!(
+        adapter.find_native_session(id)?.unwrap().title.as_deref(),
+        expected
+    );
+    assert_eq!(adapter.read_session(&session)?.title.as_deref(), expected);
+    assert_eq!(
+        adapter.preview_session(&session)?.title.as_deref(),
+        expected
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_linked_gui_config(home: &Path, path: &Path) -> anyhow::Result<()> {
+    let config = home.join("config.toml");
+    fs::rename(&config, home.join("profile.toml"))?;
+    std::os::unix::fs::symlink("profile.toml", &config)?;
+    check_gui_title(home, path, Some("Configured name"))?;
+    fs::remove_file(&config)?;
+    let dotfiles = tempfile::tempdir()?;
+    let profile = dotfiles.path().join("profile.toml");
+    fs::rename(home.join("profile.toml"), &profile)?;
+    std::os::unix::fs::symlink(&profile, &config)?;
+    check_gui_title(home, path, Some("Configured name"))?;
+    fs::remove_file(&config)?;
+    fs::rename(&profile, home.join("auth.json"))?;
+    std::os::unix::fs::symlink("auth.json", &config)?;
+    let adapter = CodexAdapter::with_root(home);
+    assert!(adapter.list_sessions(None)?.is_empty());
+    assert!(
+        adapter
+            .discovery_notes()
+            .iter()
+            .any(|note| note.contains("could not verify the current rollouts"))
+    );
+    fs::remove_file(&config)?;
+    fs::rename(home.join("auth.json"), config)?;
+    Ok(())
+}
+
+fn check_archived_gui_name(
+    home: &Path,
+    path: &Path,
+    db: &rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let mut rows = CodexAdapter::with_root(home).list_sessions(None)?;
+    rows[0].source_path = None;
+    let archive = home.join("archived_sessions");
+    fs::create_dir(&archive)?;
+    let archived = archive.join(path.file_name().unwrap());
+    fs::rename(path, &archived)?;
+    db.execute("UPDATE threads SET rollout_path = ?1", [archived.to_str()])?;
+    CodexAdapter::with_root(home).refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), Some("Configured name"));
+    assert_eq!(rows[0].source_path.as_deref(), Some(archived.as_path()));
+    Ok(())
+}
+
+#[test]
+fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let rollout = |name: &str, project: &str| -> anyhow::Result<_> {
+        let path = sessions.join(format!("rollout-{name}-{SESSION_ID}.jsonl"));
+        let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":project}});
+        fs::write(&path, format!("{header}\n"))?;
+        Ok(path.canonicalize()?)
+    };
+    let original = rollout("2026-10-02T00-00-00", "/one")?;
+    fs::write(
+        home.path().join("session_index.jsonl"),
+        json!({"id":SESSION_ID,"thread_name":"Original name"}).to_string(),
+    )?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&original)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+    let mut warm = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    assert_eq!(warm[0].title.as_deref(), Some("Original name"));
+    warm[0].source_path = None;
+    let duplicate = rollout("2026-10-01T00-00-00", "/two")?;
+    let check = |expected_path: &Path, project: &str, title: Option<&str>| -> anyhow::Result<()> {
+        let adapter = CodexAdapter::with_root(home.path());
+        assert_eq!(adapter.list_sessions(None)?[0].title.as_deref(), title);
+        let mut cached = warm.clone();
+        adapter.refresh_session_titles(&mut cached);
+        assert_eq!(cached[0].title.as_deref(), title);
+        let preview = adapter.preview_session(&cached[0].session)?;
+        assert_eq!(preview.title, cached[0].title);
+        assert_eq!(preview.workspace.current_dir, Path::new(project));
+        assert_eq!(
+            cached[0].project_path.as_ref(),
+            Some(&preview.workspace.current_dir)
+        );
+        assert_eq!(
+            cached[0].source_path.as_ref().unwrap().canonicalize()?,
+            expected_path
+        );
+        Ok(())
+    };
+    check(&original, "/one", None)?;
+    let state = home.path().join("alternate");
+    fs::create_dir(&state)?;
+    fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
+    let db = rusqlite::Connection::open(state.join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
+    check(&original, "/one", None)?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,'Private opener','Private opener')",
+        rusqlite::params![SESSION_ID, original.to_str()],
+    )?;
+    check(&original, "/one", None)?;
+    db.execute(
+        "UPDATE threads SET history_mode='paginated', name='SQLite original name'",
+        [],
+    )?;
+    for (path, project) in [(&original, "/one"), (&duplicate, "/two")] {
+        fs::write(path, json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":project,"history_mode":"paginated"}}).to_string())?;
+    }
+    check(&original, "/one", Some("SQLite original name"))?;
+    db.execute(
+        "UPDATE threads SET rollout_path=?1, name='SQLite second name'",
+        [duplicate.to_str()],
+    )?;
+    check(&duplicate, "/two", Some("SQLite second name"))?;
+    drop(db);
+    fs::remove_file(state.join("state_5.sqlite"))?;
+    fs::remove_file(duplicate)?;
+    check_gui_title(home.path(), &original, Some("Original name"))?;
+    let archive = home.path().join("archived_sessions");
+    fs::create_dir(&archive)?;
+    let archive_path = archive.join(original.file_name().unwrap());
+    fs::rename(&original, &archive_path)?;
+    let adapter = CodexAdapter::with_root(home.path());
+    adapter.refresh_session_titles(&mut warm);
+    assert_eq!(warm[0].source_path.as_ref(), Some(&archive_path));
+    assert_eq!(warm[0].title.as_deref(), Some("Original name"));
+    let preview = adapter.preview_session(&warm[0].session)?;
+    assert_eq!(preview.title, warm[0].title);
+    assert_eq!(preview.workspace.current_dir, Path::new("/one"));
+    Ok(())
+}
+
+#[test]
+fn cached_picker_reads_an_appended_reply_from_the_same_rollout() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let path = sessions.join(format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl"));
+    let header = json!({"type": "session_meta", "payload": {"id": SESSION_ID, "cwd": "/project"}});
+    fs::write(&path, format!("{header}\n"))?;
+    let mut cached = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    cached[0].source_path = None;
+    let old = cached[0].source_revision.unwrap();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path)?,
+        "{}",
+        message("assistant", "Additional reply")
+    )?;
+
+    let adapter = CodexAdapter::with_root(home.path());
+    adapter.refresh_session_titles(&mut cached);
+    let read = adapter.index_session(&cached[0].session, None, 0)?;
+    assert_eq!(old.file, read.source_revision.file);
+    assert_ne!(old.contents, read.source_revision.contents);
+    assert_eq!(cached[0].source_revision, Some(read.source_revision));
+    assert!(
+        visible_text(&read.snapshot)
+            .iter()
+            .any(|text| text.contains("Additional reply"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let file = format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl");
+    let write = |directory: &str, project: &str, replies: &[&str]| -> anyhow::Result<_> {
+        let dir = home.path().join(directory);
+        fs::create_dir(&dir)?;
+        let path = dir.join(&file);
+        let mut text =
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":project}}).to_string();
+        for reply in replies {
+            text.push('\n');
+            text.push_str(&json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":reply}]}}).to_string());
+        }
+        fs::write(&path, text)?;
+        Ok(path)
+    };
+    let active = write("sessions", "/active", &["First reply", "Final reply"])?;
+    let mut cached = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    cached[0].source_path = None;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&active)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+    write("archived_sessions", "/archive", &["First reply"])?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    adapter.refresh_session_titles(&mut cached);
+    for row in [&listed[0], &cached[0]] {
+        assert_eq!(row.source_path.as_ref(), Some(&active));
+        assert_eq!(row.project_path.as_deref(), Some(Path::new("/active")));
+    }
+    for snapshot in [
+        adapter.read_session(&cached[0].session)?,
+        adapter.preview_session(&cached[0].session)?,
+    ] {
+        assert_eq!(snapshot.workspace.current_dir, Path::new("/active"));
+        assert!(serde_json::to_string(&snapshot.events)?.contains("Final reply"));
+    }
+    Ok(())
+}
+
+#[test]
+fn index_reads_bind_revision_and_budget_to_the_selected_rollout() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let create = |directory: &str, project: &str, reply: &str| -> anyhow::Result<_> {
+        let dir = home.path().join(directory);
+        fs::create_dir(&dir)?;
+        let path = dir.join(format!("rollout-2026-10-01T00-00-00-{SESSION_ID}.jsonl"));
+        let meta = json!({"type": "session_meta", "payload": {"id":SESSION_ID, "cwd":project}});
+        let msg = json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":reply}]}});
+        fs::write(&path, format!("{meta}\n{msg}\n"))?;
+        Ok(path)
+    };
+    let archived = create("archived_sessions", "/archive", "Obsolete response")?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let first = adapter.list_sessions(None)?;
+    assert_eq!(first[0].source_path.as_ref(), Some(&archived));
+    let original = adapter.read_full_index_at(&session, None)?;
+    assert_eq!(Some(original.source_revision), first[0].source_revision);
+    let active = create("sessions", "/active", "Current response")?;
+    let revision = omnis_adapters::source_file_revision(&active).unwrap();
+    assert_ne!(revision.file, original.source_revision.file);
+    for hint in [None, Some(archived.as_path())] {
+        for (read, complete) in [
+            (adapter.index_session(&session, hint, 0)?, false),
+            (adapter.read_full_index_at(&session, hint)?, true),
+        ] {
+            let meta = read.native_session.unwrap();
+            assert_eq!(read.source_revision, revision);
+            assert_eq!(meta.source_revision, Some(revision));
+            assert_eq!(meta.source_path.as_ref(), Some(&active));
+            assert_eq!(meta.project_path.as_deref(), Some(Path::new("/active")));
+            assert_eq!(meta.updated_at, Some(read.snapshot.captured_at));
+            assert_eq!(read.source_complete, complete);
+            assert!(!read.provider_limited);
+            let events = serde_json::to_string(&read.snapshot.events)?;
+            assert!(events.contains("Current response"));
+            assert!(!events.contains("Obsolete response"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_archive_uses_the_name_and_reply_of_the_registered_generation() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let active = home.path().join("sessions");
+    let archive = home.path().join("archived_sessions");
+    fs::create_dir(&active)?;
+    fs::create_dir(&archive)?;
+    let write = |dir: &Path,
+                 generation: &str,
+                 reply: &str,
+                 compressed: bool|
+     -> anyhow::Result<_> {
+        let path = dir.join(format!(
+            "rollout-2026-10-01T00-00-00-{SESSION_ID}_{generation}.jsonl"
+        ));
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/project","history_mode":"paginated"}});
+        let text = format!("{header}\n{}\n", message("assistant", reply));
+        if compressed {
+            fs::write(
+                path.with_extension("jsonl.zst"),
+                encode_rollout(text.as_bytes(), "zst"),
+            )?;
+        } else {
+            fs::write(&path, text)?;
+        }
+        Ok(path)
+    };
+    write(
+        &active,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "Superseded reply",
+        false,
+    )?;
+    let recorded = write(
+        &archive,
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "Archived reply",
+        true,
+    )?;
+    let compressed = recorded.with_extension("jsonl.zst");
+    let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, archived INTEGER)")?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated', 'Archived GUI name', 1)",
+        rusqlite::params![SESSION_ID, recorded.to_str()],
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let mut rows = adapter.list_sessions(None)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_path.as_deref(), Some(compressed.as_path()));
+    assert_eq!(rows[0].title.as_deref(), Some("Archived GUI name"));
+    db.execute("UPDATE threads SET name='Renamed archive'", [])?;
+    let adapter = CodexAdapter::with_root(home.path());
+    adapter.refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), Some("Renamed archive"));
+    let read = adapter.index_session(&rows[0].session, None, 0)?;
+    assert_eq!(read.snapshot.title, rows[0].title);
+    assert_eq!(
+        read.native_session.unwrap().source_revision,
+        rows[0].source_revision
+    );
+    assert_eq!(visible_text(&read.snapshot), ["Archived reply"]);
+    Ok(())
+}
+
+#[test]
+fn assigned_legacy_opener_survives_only_agreeing_archive_copies() -> anyhow::Result<()> {
+    let id = "abcdefab-1234-4234-8234-123456789abc";
+    let canonical = format!("rollout-2026-10-02T00-00-00-{id}.jsonl");
+    for file in [&canonical[..], "orchard-history.jsonl"] {
+        for compressed in [false, true] {
+            check_assigned_legacy_opener(id, file, compressed)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_assigned_legacy_opener(id: &str, file: &str, compressed: bool) -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().canonicalize()?;
+    let active_dir = home.join("sessions");
+    let archived_dir = home.join("archived_sessions");
+    fs::create_dir(&active_dir)?;
+    fs::create_dir(&archived_dir)?;
+    let recorded = active_dir.join(file);
+    let active = if compressed {
+        recorded.with_extension("jsonl.zst")
+    } else {
+        recorded.clone()
+    };
+    let archived = archived_dir.join(file.replace(id, &id.to_ascii_uppercase()));
+    let opener = "Synthetic first question";
+    let header =
+        json!({"type":"session_meta","payload":{"id":id,"cwd":"/example","history_mode":"legacy"}});
+    let text = format!(
+        "{header}\n{}\n{}\n",
+        message("user", opener),
+        message("assistant", "Reply A")
+    );
+    if compressed {
+        fs::write(&active, encode_rollout(text.as_bytes(), "zst"))?;
+    } else {
+        fs::write(&active, &text)?;
+    }
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,?3,?3)",
+        rusqlite::params![id, recorded.to_str(), opener],
+    )?;
+    let index = home.join("session_index.jsonl");
+    fs::write(&index, json!({"id":id,"thread_name":opener}).to_string())?;
+    check_gui_title_for(&home, &active, Some(opener), id)?;
+    fs::write(&archived, &text)?;
+    check_gui_title_for(&home, &active, Some(opener), id)?;
+    fs::write(&archived, text.replace("Reply A", "Reply B"))?;
+    check_gui_title_for(&home, &active, None, id)?;
+    let renamed = archived_dir.join("independent-history.jsonl");
+    fs::rename(&archived, &renamed)?;
+    check_gui_title_for(&home, &active, None, id)?;
+    fs::remove_file(renamed)?;
+    fs::write(&archived, &text)?;
+    fs::write(
+        &index,
+        json!({"id":id,"thread_name":"Unrelated stale name"}).to_string(),
+    )?;
+    check_gui_title_for(&home, &active, None, id)?;
+    fs::remove_file(&index)?;
+    check_gui_title_for(&home, &active, None, id)?;
+    Ok(())
+}
+
+#[test]
+fn legacy_rollouts_with_a_shared_basename_keep_their_own_titles() -> anyhow::Result<()> {
+    for file in [
+        "rollout-imported.jsonl",
+        "rollout-imported-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+        "rollout-imported-12345678-1234-4234-8234-123456789abc.jsonl",
+    ] {
+        check_legacy_owners(file)?;
+    }
+    Ok(())
+}
+
+fn check_legacy_owners(file: &str) -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().canonicalize()?;
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
+    let mut index = fs::File::create(home.join("session_index.jsonl"))?;
+    let threads = [
+        (
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "01",
+            "First assigned opener",
+        ),
+        (
+            "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF",
+            "02",
+            "Second assigned opener",
+        ),
+    ];
+    for (id, day, title) in threads {
+        let dir = home.join("sessions/2026/10").join(day);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(file);
+        let header =
+            json!({"type":"session_meta","payload":{"id":id,"cwd":dir,"history_mode":"legacy"}});
+        fs::write(&path, format!("{header}\n{}\n", message("user", title)))?;
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,NULL,?3)",
+            rusqlite::params![id, path.to_str(), title],
+        )?;
+        writeln!(index, "{}", json!({"id":id, "thread_name":title}))?;
+    }
+    let persistent = CodexAdapter::with_root(&home);
+    let warm = persistent.list_sessions(None)?;
+    let check = |expected: [Option<&str>; 2]| -> anyhow::Result<()> {
+        let adapter = CodexAdapter::with_root(&home);
+        let listed = adapter.list_sessions(None)?;
+        let reused = persistent.list_sessions(None)?;
+        let mut cached = warm.clone();
+        for row in &mut cached {
+            row.source_path = None;
+        }
+        adapter.refresh_session_titles(&mut cached);
+        for ((id, _, _), name) in threads.into_iter().zip(expected) {
+            for rows in [&listed, &cached, &reused] {
+                assert_eq!(rows.len(), threads.len());
+                assert_eq!(
+                    rows.iter()
+                        .find(|row| row.session.id == id)
+                        .unwrap()
+                        .title
+                        .as_deref(),
+                    name
+                );
+            }
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            assert_eq!(snapshot.title.as_deref(), name);
+        }
+        Ok(())
+    };
+    check([Some(threads[0].2), Some(threads[1].2)])?;
+    let archive = home.join("archived_sessions");
+    fs::create_dir(&archive)?;
+    let shadow = archive.join(file);
+    fs::write(&shadow, "{")?;
+    check([None, None])?;
+    let header = json!({"type":"session_meta","payload":{"id":threads[0].0.to_uppercase(),"cwd":"/another","history_mode":"legacy"}});
+    fs::write(&shadow, format!("{header}\n"))?;
+    check([None, Some(threads[1].2)])?;
+    fs::write(
+        &shadow,
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":"c1234567-1234-4234-8234-123456789abc","cwd":"/other"}})
+        ),
+    )?;
+    check([Some(threads[0].2), Some(threads[1].2)])?;
+    fs::write(&shadow, "{")?;
+    check([None, None])?;
     Ok(())
 }

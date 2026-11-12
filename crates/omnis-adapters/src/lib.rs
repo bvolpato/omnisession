@@ -70,6 +70,8 @@ pub struct ProviderInstallation {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum NativeSessionName {
     Named(String),
+    /// The selected SQLite thread owns this name or explicitly has no GUI name.
+    Gui(Option<String>),
     /// A complete name index has no assignment for this session.
     Absent,
     /// The available index cannot establish this session's current name.
@@ -86,11 +88,19 @@ pub struct ObservedSessionNames {
 }
 
 impl NativeSessionName {
+    fn into_title(self) -> Option<String> {
+        match self {
+            Self::Named(title) | Self::Gui(Some(title)) => Some(title),
+            Self::Gui(None) | Self::Absent | Self::Unknown => None,
+        }
+    }
+
     /// Checks whether the observed name agrees with the session metadata.
     #[must_use]
     pub fn confirms(&self, expected: Option<&str>) -> bool {
         match self {
             Self::Named(current) => expected == Some(current.as_str()),
+            Self::Gui(current) => current.as_deref() == expected,
             Self::Absent => expected.is_none(),
             Self::Unknown => false,
         }
@@ -445,6 +455,49 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Reads selected name observations for a batch of session IDs, paths, and file revisions.
+    fn listed_session_names(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Rechecks the named rows selected by discovery before their search documents are published.
+    fn listed_session_names_still_current(
+        &self,
+        _sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        HashMap::new()
+    }
+
+    /// Returns GUI assignments and clears that match the selected sessions.
+    fn gui_session_names(&self, sessions: &[NativeSession]) -> HashMap<String, Option<String>> {
+        let requested: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .filter_map(|s| {
+                Some((
+                    s.session.id.as_str(),
+                    s.source_path.as_deref()?,
+                    s.source_revision?,
+                ))
+            })
+            .collect();
+        let mut names = self.listed_session_names(&requested);
+        sessions
+            .iter()
+            .filter(|session| session.session.provider == Provider::Codex)
+            .filter_map(|session| {
+                let id = &session.session.id;
+                let NativeSessionName::Gui(name) = names.remove(id)? else {
+                    return None;
+                };
+                (session.title == name).then(|| (id.clone(), name))
+            })
+            .collect()
+    }
+
     /// Returns the individually confirmed assignments in the name index used for discovery.
     /// Only a complete index also confirms that omitted IDs have no assignment.
     fn observed_session_names(&self) -> Option<ObservedSessionNames> {
@@ -583,6 +636,20 @@ pub trait ProviderAdapter: Send + Sync {
                 self.read_session_at(session, source_path)
             }
         })
+    }
+
+    /// Reads the conversation for its search document. Discovery supplies separately stored session names.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, full_read_bytes)
     }
 
     /// Describes a fresh interactive provider launch.

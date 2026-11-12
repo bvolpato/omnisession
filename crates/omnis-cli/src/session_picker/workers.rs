@@ -39,6 +39,7 @@ pub(super) struct CatalogNames {
     pub(super) inventory: omnis_store::CodexCatalogInventory,
     pub(super) unavailable: Vec<IndexedSession>,
     pub(super) prior_assignments: std::collections::HashMap<String, String>,
+    pub(super) gui_names: std::collections::HashMap<String, Option<String>>,
     pub(super) complete: bool,
 }
 
@@ -63,12 +64,13 @@ impl SessionCacheUpdate {
     pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
         if self.catalog.provider == Provider::Codex {
             if let Some(names) = self.names {
-                store.refresh_codex_catalog_with_name_history(
+                store.refresh_codex_catalog_with_gui_names(
                     &self.catalog.sessions,
                     self.catalog.complete,
                     names.complete,
                     &names.inventory,
                     &names.prior_assignments,
+                    &names.gui_names,
                 )?;
                 store.remove_unavailable_codex_sessions(&names.unavailable)?;
             }
@@ -566,6 +568,27 @@ fn unavailable_catalog_rows(
         .collect()
 }
 
+fn codex_catalog_names(
+    adapter: &dyn ProviderAdapter,
+    sessions: &[NativeSession],
+    mut inventory: omnis_store::CodexCatalogInventory,
+    sender: &Sender<PickerUpdate>,
+) -> Arc<CatalogNames> {
+    if let Some(assignments) = adapter.observed_session_names() {
+        inventory.observe_name_assignments(&assignments.names, assignments.complete);
+    }
+    let unavailable = unavailable_catalog_rows(adapter, sessions, &inventory, sender);
+    let complete = adapter.session_titles_are_complete();
+    let prior_assignments = crate::prior_codex_assignments(adapter, sessions, &inventory, complete);
+    Arc::new(CatalogNames {
+        inventory,
+        unavailable,
+        prior_assignments,
+        gui_names: adapter.gui_session_names(sessions),
+        complete,
+    })
+}
+
 pub(super) fn spawn_provider_update(
     sender: Sender<PickerUpdate>,
     index_sender: Sender<SessionCacheUpdate>,
@@ -591,24 +614,9 @@ pub(super) fn spawn_provider_update(
                     let complete = registry
                         .adapter(provider)
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let names = observed.and_then(|mut inventory| {
+                    let names = observed.and_then(|inventory| {
                         let adapter = registry.adapter(provider).ok()?;
-                        if complete && let Some(assignments) = adapter.observed_session_names() {
-                            inventory
-                                .observe_name_assignments(&assignments.names, assignments.complete);
-                        }
-                        let unavailable =
-                            unavailable_catalog_rows(adapter, &sessions, &inventory, &sender);
-                        let complete = adapter.session_titles_are_complete();
-                        let prior_assignments = crate::prior_codex_assignments(
-                            adapter, &sessions, &inventory, complete,
-                        );
-                        Some(Arc::new(CatalogNames {
-                            inventory,
-                            unavailable,
-                            prior_assignments,
-                            complete,
-                        }))
+                        Some(codex_catalog_names(adapter, &sessions, inventory, &sender))
                     });
                     for note in notes {
                         if sender.send(PickerUpdate::Warning(note)).is_err() {
@@ -1065,7 +1073,9 @@ fn record_preview(
             && (row.title.is_some() || name.is_some() || name != previous_name)
         {
             anyhow::ensure!(
-                row.title == name || row.title == previous_name,
+                row.title == name
+                    || row.title == previous_name
+                    || (row.title.is_none() && name == previous_name),
                 "Codex session name changed before its preview"
             );
             let mut selected = row.clone();
@@ -1073,7 +1083,7 @@ fn record_preview(
             selection = Some((selected, observation, None));
         }
         metadata.provider_name = Some(ProviderNameChange {
-            previous: previous_name,
+            previous: previous_name.clone(),
             current: name,
         });
     } else if session.provider == Provider::Codex {
@@ -1083,7 +1093,7 @@ fn record_preview(
             }
             read.snapshot.title.clone_from(&row.title);
         } else if observed.is_none() {
-            read.snapshot.title = previous_name;
+            read.snapshot.title.clone_from(&previous_name);
         }
     }
     if prior.is_none()
@@ -1115,6 +1125,14 @@ fn record_preview(
         };
         metadata.indexed_title =
             writer.publish(registry, target, read, name_observation.as_ref())?;
+        if name_observation == Some(omnis_adapters::NativeSessionName::Unknown)
+            && let Some(retained) = writer.store.retained_codex_name(session, revision)?
+        {
+            metadata.provider_name = Some(ProviderNameChange {
+                previous: previous_name,
+                current: Some(retained),
+            });
+        }
     }
     Ok(metadata)
 }
@@ -1234,7 +1252,7 @@ fn preview_write_guard(
     session: &SessionRef,
     sender: &Sender<PickerUpdate>,
 ) -> Option<TrajectorySourceGuard> {
-    let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let observed = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         store.observe_verified_session(session)
     } else {
         search_index::observe_source(store, session)
@@ -1298,7 +1316,8 @@ fn read_provider_preview(
         return None;
     }
     let imported = key.session.provider == Provider::Imported;
-    let file_backed = omnis_store::TrajectorySourceGuard::uses_file_time(key.session.provider);
+    let file_backed =
+        omnis_store::TrajectorySourceGuard::verifies_search_file(key.session.provider);
     let mut retry = true;
     loop {
         let writer = store

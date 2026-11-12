@@ -23,9 +23,9 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession, NativeSessionName, RollbackTitle};
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, search_document_version,
-    session_message_prefix_is_known, session_message_search_title, session_search_title,
-    trajectory_search_document, workspace_paths_match,
+    SearchDocument, search_document_version, session_message_prefix_is_known,
+    session_message_search_title, session_search_title, trajectory_search_document,
+    workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -53,9 +53,17 @@ pub(crate) struct IndexCandidate {
     source_revision: SourceRevision,
     document_version: u32,
     metadata: Option<IndexedSession>,
+    listed_name: Option<NativeSessionName>,
 }
 
 impl IndexCandidate {
+    fn observed_name(&self, registry: &AdapterRegistry) -> Result<Option<NativeSessionName>> {
+        match &self.listed_name {
+            Some(name) => Ok(Some(name.clone())),
+            None => native_codex_name(registry, &self.session),
+        }
+    }
+
     fn selected_codex(
         &self,
         registry: &AdapterRegistry,
@@ -128,8 +136,9 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
-            source_revision: session.source_revision.unwrap_or_default(),
+            source_revision: crate::selected_search_source(session, false).unwrap_or_default(),
             document_version: search_document_version(provider),
+            listed_name: None,
             metadata: (provider == Provider::Codex)
                 .then(|| crate::indexed_session_metadata(session)),
         })
@@ -241,7 +250,7 @@ pub(crate) fn projection_read_budget(
         return FULL_READ_SOURCE_BYTES;
     };
     if prior.source_complete
-        && prior.document_version < SEARCH_DOCUMENT_VERSION
+        && prior.document_version < search_document_version(Provider::Codex)
         && updated_at
             .is_some_and(|timestamp| !source_time_changed(Provider::Codex, timestamp, &prior))
         && revision.contents.is_some()
@@ -253,17 +262,30 @@ pub(crate) fn projection_read_budget(
     }
 }
 
-fn needs_legacy_projection_check(
+fn legacy_projection_source(
     guard: TrajectorySourceGuard,
     updated_at: Option<DateTime<Utc>>,
-) -> bool {
+    revision: SourceRevision,
+) -> Option<SourceRevision> {
     let TrajectorySourceGuard::ObservedRevision(Some(prior)) = guard else {
-        return false;
+        return None;
     };
-    matches!(prior.document_version, 4 | 5)
+    if updated_at.is_some_and(|time| source_time_changed(Provider::Codex, time, &prior)) {
+        return None;
+    }
+    if matches!(prior.document_version, 4 | 5)
         && prior.source_complete
         && prior.source_revision == SourceRevision::default()
-        && updated_at.is_none_or(|time| !source_time_changed(Provider::Codex, time, &prior))
+    {
+        return Some(prior.source_revision);
+    }
+    // Retries and picker previews can revisit a wider partial projection after its tail repair.
+    (!prior.source_complete
+        && (6..=search_document_version(Provider::Codex)).contains(&prior.document_version)
+        && revision.file.is_some()
+        && revision.contents.is_some()
+        && revision.matches_file_contents(prior.source_revision))
+    .then_some(prior.source_revision)
 }
 
 pub(crate) fn verify_legacy_search_read(
@@ -278,13 +300,22 @@ pub(crate) fn verify_legacy_search_read(
         || session.provider != Provider::Codex
         || read.source_revision.file.is_none()
         || read.source_revision.contents.is_none()
-        || !needs_legacy_projection_check(guard, Some(time))
     {
         return Ok(read);
     }
-    let Some(hash) = store.legacy_codex_projection_hash(session, time)? else {
+    let Some(source) = legacy_projection_source(guard, Some(time), read.source_revision) else {
         return Ok(read);
     };
+    let Some(hash) = store.codex_projection_hash(session, time, source)? else {
+        return Ok(read);
+    };
+    if source.file.is_some() {
+        use sha2::{Digest, Sha256};
+        let sample = trajectory_search_document(&read.snapshot);
+        if Sha256::digest(sample.text.as_bytes())[..] == hash {
+            return Ok(read);
+        }
+    }
     let selected_path = || -> Result<PathBuf> {
         registry
             .find_native_session(Provider::Codex, &session.id)?
@@ -338,7 +369,8 @@ pub(crate) fn needs_index(
     if state.document_version > version {
         return false;
     }
-    state.document_version < version
+    state.legacy_tail_receipt.is_some()
+        || state.document_version < version
         || (candidate.session.provider == Provider::Codex && (candidate.source_revision.file != state.source_revision.file || candidate.source_revision.contents != state.source_revision.contents))
         || (candidate.source_revision.file.is_some()
             && !candidate.source_revision.matches_file_contents(state.source_revision))
@@ -445,7 +477,8 @@ fn read_budget(
     // Read the full source when upgrading a document from a full or provider-limited read.
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
-            && (state.document_version < candidate.document_version
+            && (state.legacy_tail_receipt.is_some()
+                || state.document_version < candidate.document_version
                 || (candidate.source_revision.file.is_some()
                     && (state.source_revision.file.is_none()
                         || state.source_revision.contents.is_none()))
@@ -483,6 +516,55 @@ fn imported_document_versions(store: &Store) -> Result<HashMap<String, u32>> {
     Ok(versions)
 }
 
+fn listed_codex_names<'a>(
+    registry: &AdapterRegistry,
+    candidates: impl Iterator<Item = &'a IndexCandidate>,
+    recheck: bool,
+) -> Result<HashMap<String, NativeSessionName>> {
+    let selected: Vec<_> = candidates
+        .filter(|candidate| candidate.session.provider == Provider::Codex)
+        .filter_map(|candidate| {
+            Some((
+                candidate.session.id.as_str(),
+                candidate.source_path.as_deref()?,
+                candidate.source_revision,
+            ))
+        })
+        .collect();
+    if selected.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let adapter = registry.adapter(Provider::Codex)?;
+    Ok(if recheck {
+        adapter.listed_session_names_still_current(&selected)
+    } else {
+        adapter.listed_session_names(&selected)
+    })
+}
+
+fn bind_listed_codex_names(
+    registry: &AdapterRegistry,
+    candidates: &mut [IndexCandidate],
+) -> Result<()> {
+    let mut names = listed_codex_names(registry, candidates.iter(), false)?;
+    let mut seen = HashSet::new();
+    for candidate in candidates
+        .iter()
+        .filter(|row| row.session.provider == Provider::Codex)
+    {
+        if !seen.insert(&candidate.session.id) {
+            names.remove(&candidate.session.id);
+        }
+    }
+    for candidate in candidates
+        .iter_mut()
+        .filter(|row| row.session.provider == Provider::Codex)
+    {
+        candidate.listed_name = names.remove(&candidate.session.id);
+    }
+    Ok(())
+}
+
 fn verify_cached_codex_name(
     registry: &AdapterRegistry,
     store: &Store,
@@ -496,8 +578,10 @@ fn verify_cached_codex_name(
                 .codex_name_prefix_length(&candidate.session, candidate.source_revision)?
                 .is_some()
         };
-        if needs_observation {
-            let name = native_codex_name(registry, &candidate.session)?;
+        if needs_observation
+            && !store.is_gui_codex_name(&candidate.session, candidate.source_revision)?
+        {
+            let name = candidate.observed_name(registry)?;
             verify_codex_name_source(
                 store,
                 &candidate.session,
@@ -556,6 +640,10 @@ fn pending(
     let mut stale = Vec::new();
     let mut recovered = Vec::new();
     let mut titles = Vec::new();
+    let mut candidates = candidates;
+    if verify_current_names {
+        bind_listed_codex_names(registry, &mut candidates)?;
+    }
     for mut candidate in candidates {
         if candidate.session.provider == Provider::Imported
             && let Some(&version) = imported_versions.get(&candidate.session.id)
@@ -565,7 +653,10 @@ fn pending(
         let prior = states.get(&candidate.session);
         let failure = failures.get(&candidate.session);
         let retry_name = deferred_names.get(&candidate.session) == Some(&candidate.source_revision)
-            && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Absent);
+            && matches!(
+                candidate.observed_name(registry)?,
+                Some(NativeSessionName::Absent | NativeSessionName::Gui(None))
+            );
         let current_failure =
             failure.is_some_and(|failure| failure_is_current(&candidate, failure));
         let reconcile = candidate.source_revision.file.is_some()
@@ -718,6 +809,9 @@ fn guard_index_reads(
                 continue;
             }
             guard
+        } else if let Some(receipt) = prior.and_then(|state| state.legacy_tail_receipt) {
+            // The repaired sample can reveal an earlier timestamp. Replace only the observed preview.
+            TrajectorySourceGuard::ObservedDocument(Some(receipt))
         } else if prior.is_none()
             && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
         {
@@ -773,7 +867,8 @@ pub(crate) fn index_candidates(
     let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
         // Read an oversized full transcript on the calling thread to bound peak memory.
         (reads_transcript_file(candidate.session.provider)
-            && !needs_legacy_projection_check(*guard, candidate.updated_at)
+            && legacy_projection_source(*guard, candidate.updated_at, candidate.source_revision)
+                .is_none()
             && (*budget == FULL_READ_SOURCE_BYTES || candidate.can_upgrade_preview()))
         .then(|| prepare_session(registry, candidate, *guard, *budget, None))
     };
@@ -848,15 +943,6 @@ fn finish_preparation(
     let mut read = prepared
         .unwrap_or_else(|| prepare_session(registry, candidate, guard, budget, Some(store)))?;
     if candidate.session.provider == Provider::Codex {
-        if let Some(path) = candidate.source_path.as_deref() {
-            verify_codex_name_source(
-                store,
-                &candidate.session,
-                path,
-                read.candidate.source_revision,
-                read.native_name.as_ref(),
-            )?;
-        }
         read.title.check_withdrawal(
             registry,
             store,
@@ -965,6 +1051,11 @@ fn publish_selected_read(
         .selected_codex(registry, revision)
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
     let name_observed = verified_name_coverage(read.native_name.as_ref(), Some(&selected))?;
+    anyhow::ensure!(
+        native_codex_name(registry, &read.candidate.session)? == read.native_name,
+        omnis_store::StoreError::TrajectorySourceChanged
+    );
+    read.verify_name_source(store)?;
     let mut metadata = crate::indexed_session_metadata(&selected);
     let history = corroborated_codex_name(
         registry,
@@ -1188,6 +1279,33 @@ fn flush_batch(
     }
 }
 
+fn verify_codex_batch_names(
+    registry: &AdapterRegistry,
+    store: &Store,
+    batch: &[PreparedIndex],
+) -> HashSet<SessionRef> {
+    let current = listed_codex_names(
+        registry,
+        batch
+            .iter()
+            .filter(|read| read.candidate.listed_name.is_some())
+            .map(|read| &read.candidate),
+        true,
+    );
+    batch
+        .iter()
+        .filter(|read| {
+            let unchanged = read.candidate.listed_name.as_ref().is_none_or(|name| {
+                current
+                    .as_ref()
+                    .is_ok_and(|names| names.get(&read.candidate.session.id) == Some(name))
+            });
+            !unchanged || read.verify_name_source(store).is_err()
+        })
+        .map(|read| read.candidate.session.clone())
+        .collect()
+}
+
 fn flush_codex_batch(
     registry: &AdapterRegistry,
     store: &Store,
@@ -1198,6 +1316,7 @@ fn flush_codex_batch(
     if batch.is_empty() {
         return;
     }
+    let changed = verify_codex_batch_names(registry, store, batch);
     let documents = batch
         .iter()
         .map(|prepared| {
@@ -1213,8 +1332,11 @@ fn flush_codex_batch(
         .iter()
         .filter_map(|read| read.candidate.metadata.as_ref())
         .collect::<Vec<_>>();
-    let stored = store.upsert_discovered_trajectory_documents(&documents, &names);
-    if stored.is_ok() {
+    if changed.is_empty()
+        && store
+            .upsert_discovered_trajectory_documents(&documents, &names)
+            .is_ok()
+    {
         summary.indexed += batch.len();
         for prepared in batch.drain(..) {
             updates.record_workspace(&prepared);
@@ -1222,7 +1344,11 @@ fn flush_codex_batch(
         }
     } else {
         for mut prepared in batch.drain(..) {
-            let mut stored = prepared.store_codex(store);
+            let mut stored = if changed.contains(&prepared.candidate.session) {
+                Err(omnis_store::StoreError::TrajectorySourceChanged)
+            } else {
+                prepared.store_codex(store)
+            };
             if matches!(
                 stored,
                 Err(omnis_store::StoreError::TrajectorySourceChanged)
@@ -1334,7 +1460,7 @@ fn reread_after_conflict(
 ) -> anyhow::Result<PreparedIndex> {
     let registry = selections.registry;
     let session = &candidate.session;
-    let guard = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let guard = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         store.observe_verified_session(session)?
     } else {
         observe_source(store, session)?
@@ -1529,13 +1655,17 @@ fn legacy_opener_name(
     prior: &omnis_store::LegacyCodexOpenerCandidate,
     selected_path: impl Fn() -> Result<PathBuf>,
 ) -> Result<Option<NativeSessionName>> {
-    let Some(name @ (NativeSessionName::Absent | NativeSessionName::Unknown)) =
-        native_codex_name(registry, session)?
+    let Some(
+        name @ (NativeSessionName::Absent
+        | NativeSessionName::Gui(None)
+        | NativeSessionName::Unknown),
+    ) = native_codex_name(registry, session)?
     else {
         return Ok(None);
     };
+    let path = selected_path()?;
     if !omnis_adapters::CodexAdapter::verify_legacy_local_opener(
-        &selected_path()?,
+        &path,
         session,
         revision,
         &prior.title,
@@ -1543,9 +1673,8 @@ fn legacy_opener_name(
     )? {
         return Ok(None);
     }
-    selected_path()?;
     anyhow::ensure!(
-        native_codex_name(registry, session)?.as_ref() == Some(&name),
+        selected_path()? == path && native_codex_name(registry, session)?.as_ref() == Some(&name),
         omnis_store::StoreError::TrajectorySourceChanged
     );
     Ok(Some(name))
@@ -1563,13 +1692,14 @@ pub(crate) struct IndexedTitle {
 
 impl IndexedTitle {
     pub(crate) fn from_read(
+        provider: Provider,
         snapshot: &CanonicalSnapshot,
         full_read: bool,
         document: &SearchDocument,
         rollback_title: &RollbackTitle,
         native_name: Option<&NativeSessionName>,
     ) -> Self {
-        if snapshot.session.provider != Provider::Codex {
+        if provider != Provider::Codex {
             return Self {
                 current: session_search_title(snapshot),
                 authoritative: omnis_core::session_search_title_is_authoritative(
@@ -1605,11 +1735,13 @@ impl IndexedTitle {
                 .as_deref()
                 .is_some_and(|title| rollback_title.withdraws(title))
         {
-            // A readable local opener can replace a provider name only after verified catalog removal.
-            let name_absent = matches!(native_name, Some(NativeSessionName::Absent));
+            let opener_authoritative = matches!(
+                native_name,
+                Some(NativeSessionName::Absent | NativeSessionName::Gui(_))
+            );
             return Self {
                 current,
-                authoritative: name_absent,
+                authoritative: opener_authoritative,
                 local_opener: LocalOpenerEvidence::Current,
                 ..Self::default()
             };
@@ -1630,7 +1762,9 @@ impl IndexedTitle {
                     && event.payload["native_history_unverified"].as_bool() == Some(true)
             });
         let unresolved_prefix = authoritative
-            && native_name.is_some_and(|name| !matches!(name, NativeSessionName::Absent));
+            && native_name.is_some_and(|name| {
+                !matches!(name, NativeSessionName::Absent | NativeSessionName::Gui(_))
+            });
         Self {
             current: if snapshot.session.provider == Provider::Codex && !authoritative {
                 None
@@ -1640,6 +1774,8 @@ impl IndexedTitle {
             authoritative: authoritative && !unresolved_prefix,
             local_opener: if unresolved_prefix {
                 LocalOpenerEvidence::VisiblePrefix
+            } else if authoritative && matches!(native_name, Some(NativeSessionName::Gui(_))) {
+                LocalOpenerEvidence::Current
             } else {
                 LocalOpenerEvidence::Unknown
             },
@@ -1753,6 +1889,19 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
+    fn verify_name_source(&self, store: &Store) -> Result<()> {
+        if let Some(path) = self.candidate.source_path.as_deref() {
+            verify_codex_name_source(
+                store,
+                &self.candidate.session,
+                path,
+                self.candidate.source_revision,
+                self.native_name.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn report_codex_title(&self, store: &Store, titles: &mut Vec<IndexedTrajectoryTitle>) {
         if let Ok(Some(title)) = store.indexed_trajectory_title(&self.candidate.session) {
             titles.push(title);
@@ -1848,11 +1997,13 @@ fn read_candidate(
             Some(updated_at),
         )
     } else if candidate.session.provider == Provider::Codex {
-        let read = registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            full_read_bytes,
-        )?;
+        let adapter = registry.adapter(Provider::Codex)?;
+        let path = candidate.source_path.as_deref();
+        let read = if candidate.listed_name.is_some() {
+            adapter.index_search_document(&candidate.session, path, full_read_bytes)?
+        } else {
+            adapter.index_session(&candidate.session, path, full_read_bytes)?
+        };
         anyhow::ensure!(
             candidate.source_revision.file.is_none()
                 || read
@@ -1913,9 +2064,21 @@ fn prepare_session(
         Some(store) => verify_legacy_search_read(registry, store, guard, read)?,
         None => read,
     };
-    let native_name = native_codex_name(registry, &candidate.session)?;
-    let name_observed = verified_name_coverage(native_name.as_ref(), native_session.as_ref())?;
-    if name_observed
+    let native_name = candidate.observed_name(registry)?;
+    if let (Some(name), Some(discovered)) = (&candidate.listed_name, &candidate.metadata) {
+        let title = match name {
+            NativeSessionName::Named(name) | NativeSessionName::Gui(Some(name)) => {
+                Some(omnis_core::redact_secrets(name))
+            }
+            NativeSessionName::Gui(None)
+            | NativeSessionName::Absent
+            | NativeSessionName::Unknown => None,
+        };
+        anyhow::ensure!(
+            title == discovered.title,
+            omnis_store::StoreError::TrajectorySourceChanged
+        );
+    } else if verified_name_coverage(native_name.as_ref(), native_session.as_ref())?
         && let (Some(discovered), Some(native)) = (&candidate.metadata, &native_session)
         && discovered.title != native.title.as_deref().map(omnis_core::redact_secrets)
     {
@@ -1937,6 +2100,7 @@ fn prepare_session(
             .and_then(|native| native.source_path.clone());
     }
     let title = IndexedTitle::from_read(
+        candidate.session.provider,
         &snapshot,
         source_complete,
         &document,
@@ -2041,6 +2205,7 @@ mod tests {
         source_path: Option<PathBuf>,
     ) -> IndexCandidate {
         IndexCandidate {
+            listed_name: None,
             metadata: None,
             source_revision: source_path
                 .as_deref()
@@ -2114,22 +2279,30 @@ mod tests {
             contents: Some(uuid::Uuid::from_u128(2)),
             ..SourceRevision::default()
         };
-        let budget = |stored, selected, updated_at| {
+        let budget = |stored, selected, updated_at, document_version| {
             projection_read_budget(
                 TrajectorySourceGuard::ObservedRevision(Some(TrajectoryIndexState {
+                    legacy_tail_receipt: None,
                     source_updated_at: time,
                     title_authoritative: Some(true),
                     source_time_precise: true,
                     provider_limited: false,
                     source_revision: stored,
                     source_complete: true,
-                    document_version: 4,
+                    document_version,
                 })),
                 Some(updated_at),
                 selected,
             )
         };
-        assert_eq!(budget(revision, revision, time), u64::MAX);
+        let current_version = search_document_version(Provider::Codex);
+        for previous_version in [4, current_version - 1] {
+            assert_eq!(budget(revision, revision, time, previous_version), u64::MAX);
+        }
+        assert_eq!(
+            budget(revision, revision, time, current_version),
+            FULL_READ_SOURCE_BYTES
+        );
         for other in [
             SourceRevision::default(),
             SourceRevision {
@@ -2149,19 +2322,87 @@ mod tests {
                 ..revision
             },
         ] {
-            assert_eq!(budget(other, revision, time), FULL_READ_SOURCE_BYTES);
-            assert_eq!(budget(revision, other, time), FULL_READ_SOURCE_BYTES);
+            assert_eq!(budget(other, revision, time, 4), FULL_READ_SOURCE_BYTES);
+            assert_eq!(budget(revision, other, time, 4), FULL_READ_SOURCE_BYTES);
         }
         assert_eq!(
-            budget(revision, revision, time - chrono::Duration::seconds(1)),
+            budget(revision, revision, time - chrono::Duration::seconds(1), 4),
             FULL_READ_SOURCE_BYTES
         );
+    }
+
+    #[test]
+    fn a_delayed_tail_repair_cannot_replace_a_concurrent_repair() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("store.sqlite3");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        let candidate = candidate(Some(now), None);
+        let session = candidate.session.clone();
+        let old = TrajectoryDocument {
+            source_revision: SourceRevision::default(),
+            redacted_text: "old",
+            source_updated_at: now,
+            source_byte_count: 3,
+            indexed_byte_count: 3,
+            truncation_strategy: "none",
+            source_complete: false,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: candidate.document_version,
+            derived_title: None,
+            withdrawn_title: None,
+            title_is_verified: false,
+            local_opener: LocalOpenerEvidence::Unknown,
+            title_authoritative: false,
+        };
+        store.upsert_trajectory_document(&session, &old)?;
+        // A legacy writer assigns the content hash without recording a tail reader version.
+        rusqlite::Connection::open(path)?.execute(
+            "UPDATE session_trajectories SET content_hash = content_hash",
+            [],
+        )?;
+        let registry = AdapterRegistry::new();
+        let pending = pending(&registry, &store, vec![candidate], false, false)?;
+        let guards = || {
+            guard_index_reads(
+                &mut FileSelections::new(&registry),
+                &store,
+                pending.stale.clone(),
+                &pending.failures,
+            )
+        };
+        let guard = guards()?[0].1;
+        let winner = TrajectoryDocument {
+            redacted_text: "new",
+            source_updated_at: now - chrono::Duration::seconds(2),
+            ..old
+        };
+        assert_eq!(
+            store.upsert_observed_trajectory_documents_counted(&[(&session, winner, guard)])?,
+            1
+        );
+        let delayed = TrajectoryDocument {
+            redacted_text: "bad",
+            ..winner
+        };
+        assert!(matches!(
+            store.upsert_observed_trajectory_documents_counted(&[(
+                &session,
+                delayed,
+                guards()?[0].1
+            )]),
+            Err(omnis_store::StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(store.search_session_trajectories("new", 1)?, [session]);
+        Ok(())
     }
 
     #[test]
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            legacy_tail_receipt: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(true),
             source_updated_at: now,
@@ -2209,13 +2450,14 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            legacy_tail_receipt: None,
             source_updated_at: now,
             source_revision: candidate(Some(now), Some(path.clone())).source_revision,
             source_complete: false,
             provider_limited: false,
             title_authoritative: Some(false),
             source_time_precise: true,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(!needs_index(
@@ -3076,6 +3318,7 @@ mod tests {
                     updated_at: Some(now),
                     source_path: None,
                     source_revision: SourceRevision::default(),
+                    listed_name: None,
                     metadata: None,
                     document_version: search_document_version(Provider::Codex),
                 },
@@ -3350,6 +3593,7 @@ mod tests {
             )
             .unwrap();
         let archive = IndexCandidate {
+            listed_name: None,
             metadata: None,
             source_revision: SourceRevision::default(),
             session: session.clone(),
@@ -3401,6 +3645,7 @@ mod tests {
                 readers,
                 candidates: (0..48)
                     .map(|index| IndexCandidate {
+                        listed_name: None,
                         metadata: None,
                         source_revision: SourceRevision::default(),
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),

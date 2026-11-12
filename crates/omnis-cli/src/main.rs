@@ -559,6 +559,12 @@ fn store_search_document<'a>(
     native_registry: Option<&AdapterRegistry>,
     guard: TrajectorySourceGuard,
 ) -> Result<Option<IndexedTrajectoryTitle>> {
+    let target = target.into();
+    let provider = match target {
+        SearchDocumentTarget::Session(session) => session.provider,
+        SearchDocumentTarget::VisibleNative(native) => native.session.provider,
+        SearchDocumentTarget::Selected(selected, _, _) => selected.session.provider,
+    };
     let (snapshot, read, native_name, name_observed) = match input {
         SearchDocumentInput::Read(read, name) => {
             let observed =
@@ -577,6 +583,7 @@ fn store_search_document<'a>(
     });
     let document = trajectory_search_document(snapshot);
     let mut title = search_index::IndexedTitle::from_read(
+        provider,
         snapshot,
         source_complete,
         &document,
@@ -606,7 +613,7 @@ fn store_search_document<'a>(
         title_authoritative: title.authoritative,
         local_opener: title.local_opener,
     };
-    let session = match target.into() {
+    let session = match target {
         SearchDocumentTarget::Session(session) => {
             store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
             session
@@ -668,7 +675,7 @@ fn store_verified_search_document(
         SessionTrajectoryOrigin::Native
     };
     let document = trajectory_search_document(snapshot);
-    let derived_title = omnis_core::session_search_title(snapshot);
+    let derived_title = omnis_core::indexed_search_title(session.provider, snapshot);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at,
@@ -686,7 +693,7 @@ fn store_verified_search_document(
         title_is_verified: false,
         title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
     };
-    let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let rewritten = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
         let check = search_index::FileCheck {
             session,
@@ -1110,16 +1117,18 @@ fn cache_discovered_codex_sessions(
     };
     let names_complete = adapter.session_titles_are_complete();
     let prior_names = prior_codex_assignments(adapter, sessions, inventory, names_complete);
+    let gui_names = adapter.gui_session_names(sessions);
     if !project_search {
-        if complete && let Some(assignments) = adapter.observed_session_names() {
+        if let Some(assignments) = adapter.observed_session_names() {
             inventory.observe_name_assignments(&assignments.names, assignments.complete);
         }
-        store.refresh_codex_catalog_with_name_history(
+        store.refresh_codex_catalog_with_gui_names(
             &indexed,
             complete,
             names_complete,
             inventory,
             &prior_names,
+            &gui_names,
         )?;
         if !complete && project.is_none() {
             remove_unavailable_search_sessions(
@@ -1131,11 +1140,12 @@ fn cache_discovered_codex_sessions(
         }
         return Ok(());
     }
-    let merged = store.merge_codex_search_catalog_with_name_history(
+    let merged = store.merge_codex_search_catalog_with_gui_names(
         &indexed,
         names_complete,
         &inventory.observed,
         &prior_names,
+        &gui_names,
     );
     if matches!(
         merged,
@@ -1422,12 +1432,19 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let store = Store::open_default().context("opening OmniSession state")?;
-    let (mut sessions, mut warnings, cached_titles) = if args.cached {
+    let (mut sessions, mut warnings, cached_titles, live_gui_names) = if args.cached {
         let (sessions, warnings, titles) = cached_search_sessions(&store, args, &project)?;
-        (sessions, warnings, Some(titles))
+        (sessions, warnings, Some(titles), HashMap::new())
     } else {
         let (sessions, warnings) = live_search_sessions(registry, &store, args, &project);
-        (sessions, warnings, None)
+        let gui_names = if args.no_index && args.provider.is_none_or(|p| p == Provider::Codex) {
+            registry
+                .adapter(Provider::Codex)?
+                .gui_session_names(&sessions)
+        } else {
+            HashMap::new()
+        };
+        (sessions, warnings, None, gui_names)
     };
     if args.cached {
         warnings.push(
@@ -1458,7 +1475,10 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         Some(titles) => titles,
         None => store.trajectory_titles_with_sources()?,
     };
-    let titles = resolve_search_titles(&mut sessions, titles, args.cached);
+    let mut titles = resolve_search_titles(&mut sessions, titles, args.cached);
+    if !live_gui_names.is_empty() {
+        apply_live_gui_search_titles(&store, &mut sessions, live_gui_names, &mut titles)?;
+    }
     let (hits, has_more) =
         rank_search_hits(&store, &query, &sessions, &titles, args.limit, args.cached)?;
     if json_output {
@@ -1533,9 +1553,7 @@ fn refresh_search_workspaces(
 }
 
 fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
-    if session.session.provider != Provider::Codex
-        && !TrajectorySourceGuard::uses_file_time(session.session.provider)
-    {
+    if !TrajectorySourceGuard::verifies_search_file(session.session.provider) {
         None
     } else if cached {
         session.source_revision
@@ -1549,9 +1567,17 @@ fn title_matches_search_source(
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
-    if session.session.provider != Provider::Codex
-        && !TrajectorySourceGuard::uses_file_time(session.session.provider)
-    {
+    if session.session.provider == Provider::Codex {
+        if !cached && record.document_version < omnis_core::search_document_version(Provider::Codex)
+        {
+            return false;
+        }
+        if let Some(revision) = session.source_revision {
+            return revision.matches_file_contents(record.source_revision);
+        }
+        return record.source_revision.file.is_none();
+    }
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         return true;
     }
     match session.source_revision {
@@ -1571,6 +1597,7 @@ fn resolve_search_titles(
             (
                 entry.session,
                 omnis_store::IndexedTitle {
+                    document_version: entry.document_version,
                     source_revision: entry.source_revision,
                     title: entry.title,
                     verified_at: entry.verified_at,
@@ -1606,6 +1633,30 @@ fn resolve_search_titles(
         .collect()
 }
 
+fn apply_live_gui_search_titles(
+    store: &Store,
+    sessions: &mut [NativeSession],
+    mut gui_names: HashMap<String, Option<String>>,
+    titles: &mut HashMap<SessionRef, String>,
+) -> Result<()> {
+    let mut selected = Vec::with_capacity(gui_names.len());
+    for session in sessions {
+        if session.session.provider == Provider::Codex
+            && let Some(name) = gui_names.remove(&session.session.id)
+        {
+            session.title = name;
+            titles.remove(&session.session);
+            if let Some(revision) = session.source_revision {
+                selected.push((session.session.id.clone(), revision));
+            }
+        }
+    }
+    for (id, opener) in store.codex_local_openers(&selected)? {
+        titles.insert(SessionRef::new(Provider::Codex, id), opener);
+    }
+    Ok(())
+}
+
 fn omp_title_is_current(
     record: &omnis_store::IndexedTitle,
     session: &NativeSession,
@@ -1618,12 +1669,13 @@ fn omp_title_is_current(
         .verified_at
         .zip(session.updated_at)
         .is_some_and(|((version, stored), listed)| {
-            version == omnis_core::search_document_version(Provider::OhMyPi)
-                && if cached {
-                    record.cached_at == Some(listed)
-                } else {
-                    stored == listed
-                }
+            let current = omnis_core::search_document_version(Provider::OhMyPi);
+            if cached {
+                // Version 8 already verified the active branch title, including explicit clears.
+                (8..=current).contains(&version) && record.cached_at == Some(listed)
+            } else {
+                version == current && stored == listed
+            }
         })
 }
 
@@ -2025,7 +2077,7 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
-    if TrajectorySourceGuard::uses_file_time(session.provider) {
+    if TrajectorySourceGuard::verifies_search_file(session.provider) {
         let adapter = registry.adapter(session.provider)?;
         let read = if full_read {
             adapter.read_full_index_at(session, None)?
@@ -2788,11 +2840,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         let updated = session
             .updated_at
             .map_or_else(|| "unknown".to_owned(), |time| time.to_rfc3339());
-        println!(
-            "{:<48}  {}",
-            safe_terminal_line(&session.session.to_string()),
-            updated
-        );
+        let reference = safe_terminal_line(&session.session.to_string());
+        if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+            println!("{name}  {reference:<48}  {updated}");
+        } else {
+            println!("{reference:<48}  {updated}");
+        }
     }
     for warning in warnings {
         eprintln!("warning: {}", safe_terminal_line(&warning));
@@ -2898,8 +2951,17 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
     }
 }
 
+fn codex_list_name(session: &SessionRef, title: Option<&str>) -> Option<String> {
+    if session.provider != Provider::Codex {
+        return None;
+    }
+    let name = safe_terminal_line(&redact_secrets(title?));
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn session_json(session: &NativeSession) -> Value {
-    json!({
+    let mut value = json!({
         "session": session.session,
         "project_path": session.project_path,
         "git_branch": session.git_branch,
@@ -2907,7 +2969,11 @@ fn session_json(session: &NativeSession) -> Value {
         "updated_at": session.updated_at,
         "event_count": session.event_count,
         "source_path": session.source_path,
-    })
+    });
+    if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+        value["title"] = Value::String(name);
+    }
+    value
 }
 
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {

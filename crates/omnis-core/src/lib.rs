@@ -58,7 +58,7 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::OhMyPi => 9,
-        Provider::Pi => 7,
+        Provider::Pi | Provider::Codex => 7,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -910,6 +910,16 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
 pub fn session_message_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     let events = visible_events(snapshot);
     title_opener(events).and_then(|(_, title)| title)
+}
+
+/// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
+#[must_use]
+pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
+    if provider == Provider::Codex {
+        session_message_search_title(snapshot)
+    } else {
+        session_search_title(snapshot)
+    }
 }
 
 /// Returns the first visible message's sequence and its redacted title, if it provides one.
