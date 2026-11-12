@@ -608,6 +608,27 @@ struct CopiedRejection {
     affected: bool,
 }
 
+/// Tracks visible continuations after a checkpoint. Rebuilding a branch invalidates this index.
+struct VisibleContinuation {
+    summary: usize,
+    revision: usize,
+    indexed: usize,
+    leaf: Option<usize>,
+    forked: bool,
+}
+
+impl VisibleContinuation {
+    fn new(summary: usize, revision: usize) -> Self {
+        Self {
+            summary,
+            revision,
+            indexed: summary + 1,
+            leaf: None,
+            forked: false,
+        }
+    }
+}
+
 /// A progress or attachment record points to its nearest conversation ancestor in the UUID map.
 #[derive(Default)]
 pub(super) struct Branch {
@@ -649,8 +670,7 @@ pub(super) struct Branch {
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
-    fork_parents: HashSet<usize>,
-    suffix_children: HashMap<(usize, Uuid), usize>,
+    visible_continuation: Option<VisibleContinuation>,
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
@@ -726,6 +746,7 @@ impl Branch {
                         .by_summary
                         .get(&summary)
                         .is_some_and(|header| header.retained_tail == Some(id)),
+                    records,
                 )
             {
                 self.select_retained_position(summary, id, record.branch);
@@ -748,29 +769,23 @@ impl Branch {
         summary: usize,
         original: usize,
         tail: bool,
+        records: &HashMap<Uuid, ClaudeRecord>,
     ) -> bool {
         if self.selected_summary() != Some(summary) {
             return false;
         }
         self.index_parents();
         let mut cursor = self.tip;
-        let mut linear = true;
         while let Some(node) = cursor {
-            linear &= !self.fork_parents.contains(&node);
             if let Some(retained) = self.suffix_parents.get(&node) {
-                return retained.node.is_some_and(|node| {
-                    self.copy_paths.distance(original, node).is_some_and(|n| {
-                        n > 0
-                            || (linear
-                                && tail
-                                && self
-                                    .suffix_children
-                                    .get(&(summary, retained.uuid))
-                                    .copied()
-                                    .unwrap_or_default()
-                                    <= 1)
-                    })
-                });
+                return match retained
+                    .node
+                    .and_then(|node| self.copy_paths.distance(original, node))
+                {
+                    Some(0) => tail && self.single_visible_continuation(summary, records),
+                    Some(_) => true,
+                    None => false,
+                };
             }
             if node == summary {
                 return true;
@@ -778,6 +793,46 @@ impl Branch {
             cursor = self.nodes[node].parent;
         }
         false
+    }
+
+    fn single_visible_continuation(
+        &mut self,
+        summary: usize,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) -> bool {
+        let state = self
+            .visible_continuation
+            .get_or_insert_with(|| VisibleContinuation::new(summary, self.marker_revision));
+        if state.summary != summary || state.revision != self.marker_revision {
+            *state = VisibleContinuation::new(summary, self.marker_revision);
+        }
+        for index in state.indexed..self.nodes.len() {
+            let node = &self.nodes[index];
+            if node.summary != Some(summary)
+                || node.events.is_empty()
+                || self.hidden_parents.contains_key(&index)
+                || node.uuid.is_some_and(|id| {
+                    records
+                        .get(&id)
+                        .is_none_or(|r| r.branch.node != Some(index))
+                })
+            {
+                continue;
+            }
+            if state
+                .leaf
+                .is_some_and(|leaf| self.copy_paths.distance(leaf, index).is_none())
+            {
+                state.forked = true;
+            }
+            state.leaf = Some(index);
+        }
+        state.indexed = self.nodes.len();
+        !state.forked
+            && state.leaf.is_none_or(|leaf| {
+                self.tip
+                    .is_some_and(|tip| self.copy_paths.distance(leaf, tip).is_some())
+            })
     }
 
     fn raw_copy_parent(
@@ -864,7 +919,7 @@ impl Branch {
                     .branch
                     .node
                     .is_some_and(|i| self.nodes[i].uuid == Some(id))
-                    && (clock.is_none() || clock != request_clock || record.millis != clock)
+                    && (clock.is_none() || clock != request_clock || record.millis > clock)
                 {
                     let rank = (record.millis, record.order, id);
                     latest = Some(latest.map_or(rank, |old| std::cmp::max(old, rank)));
@@ -1095,6 +1150,7 @@ impl Branch {
         if let Some(&index) = self.rebased_nodes.get(&(child, parent)) {
             return index;
         }
+        self.visible_continuation = None;
         let index = self.nodes.len();
         let mut node = self.nodes[child].clone();
         node.parent = Some(parent);
@@ -1646,9 +1702,6 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
     ) {
         if let Some(id) = parent.suffix {
-            if let Some(summary) = parent.node {
-                *self.suffix_children.entry((summary, id)).or_default() += 1;
-            }
             let retained = records
                 .get(&id)
                 .filter(|_| !duplicates.contains(&id))
@@ -1818,9 +1871,6 @@ impl Branch {
             self.parent_turn(parent).unwrap_or(index)
         };
         if let Some(index) = parent.node {
-            if self.nodes[index].has_children {
-                self.fork_parents.insert(index);
-            }
             self.nodes[index].has_children = true;
         } else if let Some(opaque) = parent.opaque {
             self.root_attachments.insert(index, opaque);
@@ -3245,6 +3295,9 @@ impl Branch {
                             continue;
                         }
                         MatchedOutput::Unresolved => {
+                            if declared.retained && declared.source == ToolSource::Absent {
+                                documentary_transport = declared.issuer;
+                            }
                             transport = None;
                             continue;
                         }
@@ -3278,8 +3331,7 @@ impl Branch {
                         call,
                         priority,
                         paired,
-                        direct: call_parent == Some(call.node)
-                            && declared.source == ToolSource::Absent,
+                        direct: call_parent == Some(call.node),
                         epoch: epoch[index],
                     },
                     selected.then_some(declared.source),

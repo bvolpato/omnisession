@@ -2897,21 +2897,23 @@ fn linear_retries_keep_distinct_native_pairs_and_original_provider_ids() {
 
 #[test]
 fn selected_results_with_equal_provenance_and_conflicting_outputs_are_omitted() {
-    for linked in [true, false] {
-        let mut first = linked_result(3, 2, 2, "id", "first outcome");
-        let mut second = linked_result(4, 3, 2, "id", "other outcome");
-        if !linked {
-            for row in [&mut first, &mut second] {
-                row.as_object_mut()
-                    .unwrap()
-                    .remove("sourceToolAssistantUUID");
-            }
+    for linked in [false, true] {
+        let mut output = message(
+            3,
+            2,
+            "user",
+            json!([
+                result("id", "first outcome", false),
+                result("id", "other outcome", false)
+            ]),
+        );
+        if linked {
+            output["sourceToolAssistantUUID"] = json!(Uuid::from_u128(2));
         }
         let snapshot = read(&[
             message(1, 0, "user", json!("Inspect")),
             block(2, 1, "r", json!([call("id")])),
-            first,
-            second,
+            output,
         ]);
         assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
         assert!(import_trajectory(&snapshot).truncated);
@@ -6142,5 +6144,174 @@ fn continuing_from_a_repaired_hidden_row_has_complete_parent_coverage() {
         );
         assert!(!handoff.truncated);
         assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+    }
+}
+
+fn retained_hidden_tail(hidden: &Value) -> Vec<Value> {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Retained reply")),
+        hidden.clone(),
+    ];
+    rows.extend(compaction(6, 3, &[2, 3]));
+    rows
+}
+
+fn check_copied_tail(rows: &[Value], keep: bool, discarded: &[&str]) {
+    for preview in [false, true] {
+        let snapshot = read_session(rows, preview);
+        let expected: &[&str] = if keep {
+            &[
+                "Summary 6",
+                "Retained reply",
+                "Current request",
+                "Current answer",
+            ]
+        } else {
+            &["Summary 6", "Retained reply"]
+        };
+        assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            assert!(text.contains("Retained reply"));
+            for marker in ["Current request", "Current answer"] {
+                assert_eq!(text.contains(marker), keep);
+            }
+            for marker in discarded {
+                assert!(!text.contains(marker));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_duration_sibling_does_not_fork_the_selected_reply() {
+    let hidden = meta_user(3, 2);
+    let mut rows = retained_hidden_tail(&hidden);
+    rows.extend([
+        message(8, 3, "user", json!("Current request")),
+        turn_duration(9, 8),
+        message(10, 8, "assistant", json!("Current answer")),
+        hidden,
+    ]);
+    check_copied_tail(&rows, true, &[]);
+}
+
+#[test]
+fn competing_exchanges_under_different_retained_rows_rewind_together() {
+    let hidden = meta_user(3, 2);
+    let mut rows = retained_hidden_tail(&hidden);
+    rows.extend([
+        message(8, 2, "user", json!("Other request")),
+        message(9, 8, "assistant", json!("Other answer")),
+        message(10, 3, "user", json!("Current request")),
+        message(11, 10, "assistant", json!("Current answer")),
+        hidden,
+    ]);
+    check_copied_tail(&rows, false, &["Other request", "Other answer"]);
+}
+
+#[test]
+fn a_direct_explicit_tool_result_precedes_a_later_explicit_claim() {
+    let rows = [
+        message(1, 0, "user", json!("Read file")),
+        file_calls(2, 1, "file.txt", &["x"]),
+        linked_result(3, 2, 2, "x", "First output"),
+        linked_result(4, 3, 2, "x", "Later output"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert_eq!(tool_outcomes(&snapshot), [("First output".into(), false)]);
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            assert!(text.contains("First output") && text.contains("Later output"));
+        }
+    }
+}
+
+#[test]
+fn an_unknown_only_result_row_does_not_hide_a_known_compacted_output() {
+    for split in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read file")),
+            file_calls(2, 1, "file.txt", &["y"]),
+            meta_user(3, 2),
+        ];
+        rows.extend(compaction(6, 3, &[3]));
+        rows.push(meta_user(8, 3));
+        let unknown = result("unknown", "Unknown output", false);
+        let known = result("y", "Known output", false);
+        if split {
+            rows.extend([
+                message(9, 8, "user", json!([unknown])),
+                message(10, 9, "user", json!([known])),
+            ]);
+        } else {
+            rows.push(message(9, 8, "user", json!([unknown, known])));
+        }
+        rows.push(message(
+            11,
+            if split { 10 } else { 9 },
+            "assistant",
+            json!("Done"),
+        ));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert!(tool_outcomes(&snapshot).is_empty());
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Known output"));
+            }
+            assert!(import_trajectory(&snapshot).truncated);
+        }
+    }
+}
+
+#[test]
+fn a_duration_repair_preserves_a_fork_below_the_retained_tail() {
+    let hidden = meta_user(3, 2);
+    let duration = turn_duration(9, 8);
+    let mut rows = retained_hidden_tail(&hidden);
+    rows.extend([
+        duration.clone(),
+        message(10, 9, "assistant", json!("Other answer")),
+        message(11, 9, "assistant", json!("Current answer")),
+        message(8, 3, "user", json!("Current request")),
+        duration,
+        hidden,
+    ]);
+    check_copied_tail(&rows, false, &["Other answer"]);
+}
+
+#[test]
+fn an_older_follow_up_cannot_select_a_tied_duration_reply() {
+    for second in [7, 3] {
+        let duration = at_second(turn_duration(2, 1), 5);
+        let rows = [
+            duration.clone(),
+            at_second(message(3, 2, "assistant", json!("Known reply")), 5),
+            at_second(message(4, 3, "user", json!("Follow-up request")), second),
+            at_second(message(1, 0, "user", json!("Known request")), 5),
+            duration,
+        ];
+        if second > 5 {
+            check_selected_messages(
+                &rows,
+                &["Known request", "Known reply", "Follow-up request"],
+                &[],
+            );
+        } else {
+            check_selected_messages(
+                &rows,
+                &["Known request"],
+                &["Known reply", "Follow-up request"],
+            );
+        }
     }
 }
