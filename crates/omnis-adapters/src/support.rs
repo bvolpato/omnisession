@@ -224,7 +224,15 @@ pub(crate) fn nested_files_matching(
     depth: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
-    nested_files_with_limit(
+    nested_file_inventory(root, depth, include).0
+}
+
+pub(crate) fn nested_file_inventory(
+    root: &Path,
+    depth: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
+    nested_inventory_with_limit(
         root,
         depth,
         MAX_DISCOVERED_FILES,
@@ -233,6 +241,7 @@ pub(crate) fn nested_files_matching(
     )
 }
 
+#[cfg(test)]
 fn nested_files_with_limit(
     root: &Path,
     depth: usize,
@@ -240,6 +249,16 @@ fn nested_files_with_limit(
     entry_limit: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
+    nested_inventory_with_limit(root, depth, file_limit, entry_limit, include).0
+}
+
+fn nested_inventory_with_limit(
+    root: &Path,
+    depth: usize,
+    file_limit: usize,
+    entry_limit: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
@@ -301,7 +320,8 @@ fn nested_files_with_limit(
         );
     }
     output.sort();
-    output
+    let limited = output.len() == file_limit || entries_left == 0;
+    (output, limited)
 }
 
 pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {

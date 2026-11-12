@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Transaction};
 
-use super::{Result, STORE_FORMAT, StoreError, database_error, immediate_transaction};
+use super::{Result, StoreError, database_error, immediate_transaction};
 
 /// Replaces the format 1 unique keys without changing the trajectory IDs that own FTS chunks.
 pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
@@ -28,12 +28,10 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     let version: i64 = transaction
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(database_error)?;
-    if version == STORE_FORMAT {
+    if version >= 2 {
         return Ok(());
     }
-    if version > STORE_FORMAT {
-        return Err(StoreError::NewerStoreFormat);
-    }
+
     for (table, key) in [
         ("session_trajectories", "unique"),
         ("session_index", "primarykey"),
@@ -73,7 +71,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         return Err(StoreError::CorruptStore);
     }
     transaction
-        .pragma_update(None, "user_version", STORE_FORMAT)
+        .pragma_update(None, "user_version", 2)
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)
 }
@@ -188,7 +186,7 @@ mod tests {
             .borrow()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(format, STORE_FORMAT);
+        assert_eq!(format, crate::STORE_FORMAT);
         assert_eq!(
             store
                 .search_session_trajectories("transitionalmarker", 5)

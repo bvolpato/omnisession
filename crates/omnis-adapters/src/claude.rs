@@ -20,7 +20,7 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles, json_lines_preview,
-        nested_files_matching, omitted_images_text, parse_timestamp, paths_match,
+        nested_file_inventory, omitted_images_text, parse_timestamp, paths_match,
         provider_executable, provider_file, provider_root, sample_files_concurrently,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
         visit_json_lines,
@@ -37,9 +37,15 @@ const MAX_PROMPT_TITLE_CHARACTERS: usize = 200;
 #[derive(Clone, Debug)]
 pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
-    session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
+    session_files: Arc<OnceLock<ClaudeFiles>>,
     notes: Arc<Mutex<Vec<String>>>,
     listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeFiles {
+    paths: Vec<(String, PathBuf)>,
+    limited: bool,
 }
 
 impl ClaudeAdapter {
@@ -53,12 +59,12 @@ impl ClaudeAdapter {
         }
     }
 
-    fn discover_session_files(&self) -> Vec<(String, PathBuf)> {
+    fn discover_session_files(&self) -> ClaudeFiles {
         let Some(root) = self.projects_root.as_deref() else {
-            return Vec::new();
+            return ClaudeFiles::default();
         };
         // Subagent logs and tool results outnumber transcripts, so skip them before the budgets apply.
-        nested_files_matching(root, 8, &|path, is_dir| {
+        let (paths, limited) = nested_file_inventory(root, 8, &|path, is_dir| {
             if is_dir {
                 return path
                     .file_name()
@@ -70,13 +76,17 @@ impl ClaudeAdapter {
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .is_some_and(|stem| Uuid::parse_str(stem).is_ok())
-        })
-        .into_iter()
-        .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path)))
-        .collect()
+        });
+        ClaudeFiles {
+            paths: paths
+                .into_iter()
+                .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path)))
+                .collect(),
+            limited,
+        }
     }
 
-    fn session_files(&self) -> &[(String, PathBuf)] {
+    fn session_files(&self) -> &ClaudeFiles {
         self.session_files
             .get_or_init(|| self.discover_session_files())
     }
@@ -109,10 +119,10 @@ impl ClaudeAdapter {
                     .filter_map(|(_, path)| provider_file(root, path)),
             )
         };
-        if let Some(path) = from_listing(self.session_files())? {
+        if let Some(path) = from_listing(&self.session_files().paths)? {
             return Ok(path);
         }
-        from_listing(&self.discover_session_files())?
+        from_listing(&self.discover_session_files().paths)?
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
@@ -129,6 +139,57 @@ impl ClaudeAdapter {
             }
         }
         self.find_session(id)
+    }
+
+    fn listed_transcripts(&self, notes: &mut Vec<String>) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.projects_root.as_deref() else {
+            return Vec::new();
+        };
+        let inventory = self.session_files();
+        let mut by_id: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for (id, path) in &inventory.paths {
+            by_id.entry(id).or_default().push(path.clone());
+        }
+        if inventory.limited {
+            let projects = std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path());
+            for directory in std::iter::once(root.to_owned()).chain(projects) {
+                for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl")
+                        && let Some(paths) = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .and_then(|id| by_id.get_mut(id))
+                        && entry.file_type().is_ok_and(|kind| kind.is_file())
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        let mut selected = Vec::with_capacity(by_id.len());
+        for (id, mut paths) in by_id {
+            paths.sort();
+            paths.dedup();
+            let direct = |path: &PathBuf| {
+                path.strip_prefix(root)
+                    .is_ok_and(|p| p.components().count() <= 2)
+            };
+            if paths.iter().any(direct) {
+                paths.retain(direct);
+            }
+            if paths.len() == 1 {
+                selected.push((id.to_owned(), paths.remove(0)));
+            } else {
+                notes.push(format!("multiple transcripts match Claude session `{id}`"));
+            }
+        }
+        selected
     }
 
     fn history_index(&self) -> ClaudeHistory {
@@ -1068,29 +1129,7 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut history = self.history_index();
-        let mut candidates = HashMap::<&str, &PathBuf>::new();
-        let mut exact = HashSet::new();
-        for (id, path) in self.session_files() {
-            let direct = self
-                .projects_root
-                .as_deref()
-                .and_then(|root| path.strip_prefix(root).ok())
-                .is_some_and(|relative| relative.components().count() <= 2);
-            if candidates.insert(id, path).is_some() || !direct {
-                exact.insert(id.as_str());
-            }
-        }
-        let mut selected = Vec::with_capacity(candidates.len());
-        for (id, path) in candidates {
-            if exact.contains(id) {
-                match self.find_session(id) {
-                    Ok(path) => selected.push((id.to_owned(), path)),
-                    Err(error) => history.notes.push(error.to_string()),
-                }
-            } else {
-                selected.push((id.to_owned(), path.clone()));
-            }
-        }
+        let selected = self.listed_transcripts(&mut history.notes);
         let mut sessions = sample_files_concurrently(&selected, |session_files| {
             let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);

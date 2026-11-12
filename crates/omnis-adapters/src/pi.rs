@@ -36,6 +36,7 @@ pub struct PiAdapter {
     provider: Provider,
     sessions_root: Option<PathBuf>,
     listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+    workspace_copies: Arc<Mutex<HashSet<String>>>,
 }
 
 impl PiAdapter {
@@ -43,6 +44,7 @@ impl PiAdapter {
     pub fn with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
             listed_paths: Arc::default(),
+            workspace_copies: Arc::default(),
             provider: Provider::Pi,
             sessions_root: Some(sessions_root.into()),
         }
@@ -52,6 +54,7 @@ impl PiAdapter {
     pub fn oh_my_pi() -> Self {
         Self {
             listed_paths: Arc::default(),
+            workspace_copies: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: crate::oh_my_pi_sessions_root(),
         }
@@ -61,6 +64,7 @@ impl PiAdapter {
     pub fn oh_my_pi_with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
             listed_paths: Arc::default(),
+            workspace_copies: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: Some(sessions_root.into()),
         }
@@ -132,6 +136,7 @@ impl Default for PiAdapter {
             });
         Self {
             listed_paths: Arc::default(),
+            workspace_copies: Arc::default(),
             provider: Provider::Pi,
             sessions_root,
         }
@@ -1035,10 +1040,13 @@ impl ProviderAdapter for PiAdapter {
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
         let mut listed_paths = HashMap::new();
+        let mut global_ids = HashSet::new();
+        let mut workspace_copies = HashSet::new();
         for path in self.session_files() {
             let Ok(header) = read_header(&path, self.provider) else {
                 continue;
             };
+            let first = global_ids.insert(header.id.clone());
             if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
                 continue;
             }
@@ -1048,6 +1056,9 @@ impl ProviderAdapter for PiAdapter {
                 continue;
             };
             entry.insert(path.clone());
+            if !first {
+                workspace_copies.insert(header.id.clone());
+            }
             let file_updated_at = fs::metadata(&path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
@@ -1068,8 +1079,19 @@ impl ProviderAdapter for PiAdapter {
             .listed_paths
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = listed_paths;
+        *self
+            .workspace_copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = workspace_copies;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn is_workspace_copy(&self, session: &SessionRef) -> bool {
+        self.workspace_copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&session.id)
     }
 
     fn search_transcript_path(

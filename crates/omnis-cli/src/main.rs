@@ -441,11 +441,25 @@ fn cached_search_sessions(
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
     let mut warnings = Vec::new();
-    let indexed = match args.provider {
+    let mut indexed = match args.provider {
         Some(Provider::Imported) => Vec::new(),
         Some(provider) => store.indexed_sessions_for_provider(provider)?,
         None => store.indexed_sessions()?,
     };
+    if !args.all_projects
+        && args
+            .provider
+            .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
+    {
+        let copies = store.cached_pi_copies(project)?;
+        let keys = copies.iter().map(|s| &s.session).collect::<HashSet<_>>();
+        indexed.retain(|s| !keys.contains(&s.session));
+        indexed.extend(
+            copies
+                .into_iter()
+                .filter(|s| args.provider.is_none_or(|p| p == s.session.provider)),
+        );
+    }
     let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
@@ -511,6 +525,17 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             None,
         )
     };
+    if !args.cached && !args.all_projects {
+        for session in &sessions {
+            if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
+                && registry
+                    .adapter(session.session.provider)?
+                    .is_workspace_copy(&session.session)
+            {
+                store.select_pi_copy(&project, &indexed_session_metadata(session))?;
+            }
+        }
+    }
     if args.cached {
         warnings.push(
             "Cached results only. Provider stores were not checked. Run `omni index` to refresh."

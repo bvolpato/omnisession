@@ -35,7 +35,8 @@ const DATABASE_FILE_NAME: &str = "store.sqlite3";
 /// store, because it cannot tell what a later version changed. Versions before format 1 do not
 /// read the number. They fail when they open a format 1 store, because the chunk table is a view.
 /// Format 2 keeps separate search documents for Codex homes that contain the same session ID.
-const STORE_FORMAT: i64 = 2;
+/// Format 3 isolates Pi search documents when different workspaces contain the same native ID.
+const STORE_FORMAT: i64 = 3;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -229,8 +230,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         provider, session_id, redacted_text, content_hash,
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
-        truncation_strategy, origin, protected_by_bundle, document_version, derived_title, codex_home, source_revision, provider_limited, source_file_bytes
-    ) SELECT ?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19
+        truncation_strategy, origin, protected_by_bundle, document_version, derived_title, codex_home, source_revision, provider_limited, source_file_bytes, pi_workspace
+    ) SELECT ?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19, coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2), '')
     WHERE ?20 = 0
       OR (?17 IS NOT NULL AND EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2 AND source_revision = ?17))
       OR (?20 = 1 AND NOT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2))
@@ -430,7 +431,7 @@ pub struct HandoffRecord {
 }
 
 /// Cached provider metadata used to render session discovery without transcript reads.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexedSession {
     pub session: SessionRef,
     pub title: Option<String>,
@@ -621,10 +622,12 @@ impl Store {
         connection
             .execute_batch(
                 "CREATE TEMP TABLE current_codex_home (home TEXT);
+             CREATE TEMP TABLE selected_pi_copies(provider TEXT, session_id TEXT, project TEXT, PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
              CREATE TEMP VIEW visible_trajectories AS SELECT * FROM main.session_trajectories AS t
-             WHERE t.provider <> 'codex'
+             WHERE t.pi_workspace = CASE WHEN t.provider IN ('pi','omp') THEN coalesce((SELECT project FROM selected_pi_copies AS p WHERE p.provider=t.provider AND p.session_id=t.session_id),'') ELSE '' END
+               AND (t.provider <> 'codex'
                 OR (t.origin = 'native' AND t.codex_workspace_current
-                    AND t.codex_home = (SELECT home FROM current_codex_home));",
+                    AND t.codex_home = (SELECT home FROM current_codex_home)));",
             )
             .map_err(database_error)?;
         connection
@@ -634,6 +637,51 @@ impl Store {
             )
             .map_err(database_error)?;
         Ok(())
+    }
+
+    /// Selects the previously indexed Pi copies for this project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the saved metadata cannot be read.
+    pub fn cached_pi_copies(&self, project: &Path) -> Result<Vec<IndexedSession>> {
+        let project = workspace_root_to_string(project)?;
+        let db = self.connection.borrow();
+        db.execute("INSERT OR REPLACE INTO selected_pi_copies SELECT provider,session_id,project FROM pi_search_copies WHERE project=?1", [&project]).map_err(database_error)?;
+        let mut query = db
+            .prepare("SELECT metadata FROM pi_search_copies WHERE project=?1")
+            .map_err(database_error)?;
+        let rows = query
+            .query_map([project], |r| r.get::<_, String>(0))
+            .map_err(database_error)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(database_error)?)
+                .map_err(|_| StoreError::CorruptStore)
+        })
+        .collect()
+    }
+
+    /// Associates a workspace-specific Pi copy with its own searchable document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project or metadata cannot be saved.
+    pub fn select_pi_copy(&self, project: &Path, session: &IndexedSession) -> Result<()> {
+        if !matches!(session.session.provider, Provider::Pi | Provider::OhMyPi) {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        let project = workspace_root_to_string(project)?;
+        let provider = session.session.provider.to_string();
+        let metadata = serde_json::to_string(session).map_err(|_| StoreError::CorruptStore)?;
+        let mut db = self.connection.borrow_mut();
+        let tx = immediate_transaction(&mut db)?;
+        tx.execute("INSERT OR REPLACE INTO pi_search_copies(provider,session_id,project,metadata) VALUES(?1,?2,?3,?4)", params![provider,session.session.id,project,metadata]).map_err(database_error)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO selected_pi_copies VALUES(?1,?2,?3)",
+            params![provider, session.session.id, project],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)
     }
 
     /// Opens `OMNISESSION_HOME` or `~/.omnisession` as state root.
@@ -2144,6 +2192,7 @@ impl Store {
     ) -> Result<bool> {
         self.connection.borrow().query_row(
             "SELECT EXISTS (SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
+                AND pi_workspace = coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'')
                 AND (provider <> 'codex' OR (origin = 'native' AND codex_home = (SELECT home FROM current_codex_home)))
                 AND source_complete AND ((?5 IS NOT NULL AND source_revision IS NOT ?5 AND (source_file_bytes IS NULL OR source_file_bytes >= ?6 OR ?6 <= ?7))
                 OR (document_version < ?3 AND (CASE WHEN ?5 IS NOT NULL THEN source_revision = ?5
@@ -2224,7 +2273,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, document_version
-                 FROM trajectory_index_failures WHERE provider <> 'codex' OR codex_home = ?1",
+                 FROM trajectory_index_failures AS f WHERE (provider <> 'codex' OR codex_home = ?1) AND pi_workspace = coalesce((SELECT project FROM selected_pi_copies AS s WHERE s.provider=f.provider AND s.session_id=f.session_id),'')",
             )
             .map_err(database_error)?;
         let rows = statement
@@ -2271,8 +2320,8 @@ impl Store {
         connection
             .execute(
                 "INSERT INTO trajectory_index_failures (
-                     provider, session_id, source_updated_at, document_version, failed_at, codex_home
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     provider, session_id, source_updated_at, document_version, failed_at, codex_home, pi_workspace
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),''))
                  ON CONFLICT DO UPDATE SET
                      source_updated_at = excluded.source_updated_at,
                      document_version = excluded.document_version,
@@ -2304,7 +2353,7 @@ impl Store {
         connection
             .execute(
                 "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2
-                 AND (provider <> 'codex' OR codex_home = ?3)",
+                 AND pi_workspace=coalesce((SELECT project FROM selected_pi_copies WHERE provider=?1 AND session_id=?2),'') AND (provider <> 'codex' OR codex_home = ?3)",
                 params![
                     session.provider.to_string(),
                     session.id,
@@ -2629,10 +2678,7 @@ impl Store {
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction, stored_format)?;
         transaction.commit().map_err(database_error)?;
-        if stored_format < STORE_FORMAT {
-            codex_document_home::initialize(&mut connection)?;
-        }
-        Ok(())
+        upgrade_trajectory_keys(&mut connection, stored_format)
     }
 
     fn open_state_root(state_root: &Path) -> Result<Self> {
@@ -3116,6 +3162,43 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
              CHECK (updated_at_approximate IN (0, 1));",
         )
         .map_err(database_error)
+}
+
+fn upgrade_trajectory_keys(connection: &mut Connection, format: i64) -> Result<()> {
+    if format < 2 {
+        codex_document_home::initialize(connection)?;
+    }
+    if format < STORE_FORMAT {
+        initialize_pi_workspace_documents(connection)?;
+    }
+    Ok(())
+}
+
+fn initialize_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(database_error)?;
+    if version >= STORE_FORMAT {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE session_trajectories ADD COLUMN pi_workspace TEXT NOT NULL DEFAULT '';
+        DROP INDEX session_trajectory_codex_home;
+        CREATE UNIQUE INDEX session_trajectory_codex_home ON session_trajectories
+        (provider,session_id,provider='codex' AND origin='native',
+         CASE WHEN provider='codex' AND origin='native' THEN coalesce(codex_home,'') ELSE '' END, pi_workspace);
+        CREATE TABLE pi_search_copies(provider TEXT NOT NULL, session_id TEXT NOT NULL, project TEXT NOT NULL,
+             metadata TEXT NOT NULL, PRIMARY KEY(provider,session_id,project)) WITHOUT ROWID;
+        CREATE TRIGGER prune_pi_search_copy AFTER DELETE ON session_trajectories WHEN old.pi_workspace <> '' BEGIN
+           DELETE FROM pi_search_copies WHERE provider=old.provider AND session_id=old.session_id AND project=old.pi_workspace;
+        END;
+        ALTER TABLE trajectory_index_failures ADD COLUMN pi_workspace TEXT NOT NULL DEFAULT '';
+        DROP INDEX trajectory_index_failure_home;
+        CREATE UNIQUE INDEX trajectory_index_failure_home ON trajectory_index_failures
+        (provider,session_id,CASE WHEN provider='codex' THEN coalesce(codex_home,'') ELSE '' END,pi_workspace);").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", STORE_FORMAT)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
 }
 
 fn initialize_codex_workspace_schema(transaction: &Transaction<'_>) -> Result<()> {
