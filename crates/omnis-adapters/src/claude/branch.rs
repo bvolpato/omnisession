@@ -697,8 +697,7 @@ impl Branch {
                 .latest_attachment_checkpoint(compactions)
                 .is_some_and(|s| compactions.precedes_cutoff(s, record.order))
         {
-            self.tip = Some(node);
-            self.active_rejection = self.unverified_retention();
+            self.observe_existing(record.branch, compactions);
         }
     }
 
@@ -2620,7 +2619,7 @@ impl Branch {
     ) -> bool {
         let result = &self.nodes[result];
         let issuer = match source {
-            ToolSource::Missing => return true,
+            ToolSource::Missing | ToolSource::Unresolved => return true,
             ToolSource::Record(issuer) => issuer,
             ToolSource::Duplicate { uuid, .. } => {
                 let writer = result.writer.as_deref();
@@ -2647,7 +2646,7 @@ impl Branch {
                 };
                 issuer
             }
-            _ => return false,
+            ToolSource::Absent => return false,
         };
         if self.nodes[issuer].writer != result.writer
             || id.is_some_and(|id| calls.by_record.contains_key(&(issuer, id)))
@@ -2670,6 +2669,16 @@ impl Branch {
                 .flatten()
                 .any(|unit| calls.by_response.contains_key(&(unit, id)))
         })
+    }
+
+    fn call_parent(&self, parent: Option<usize>, issuer: Option<usize>) -> Option<usize> {
+        // A hidden record carries the assistant parent's identity. A tool result can
+        // instead precede another parallel result explicitly naming a different assistant.
+        if parent.is_some_and(|p| self.hidden_nodes.contains(&p)) {
+            issuer
+        } else {
+            parent
+        }
     }
 
     /// Resolve outcomes against the calls that already existed when Claude wrote each result.
@@ -2698,6 +2707,7 @@ impl Branch {
             let parent = self.issuing_parent(index);
             let source = self.tool_source(index);
             let issuer = parent.map(|p| *transports.get(&p).unwrap_or(&p));
+            let call_parent = self.call_parent(parent, issuer);
             let origin = issuer.and_then(|p| self.response_unit(p));
             // A verified outcome can link the next parallel result to its original response.
             // An ordinary user message supplies no such evidence.
@@ -2734,7 +2744,7 @@ impl Branch {
                     }
                 };
                 let Some((call, mut priority)) =
-                    calls.resolve(self, parent, source, node, id, ambiguous)
+                    calls.resolve(self, call_parent, source, node, id, ambiguous)
                 else {
                     transport = None;
                     continue;

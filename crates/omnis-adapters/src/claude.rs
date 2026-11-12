@@ -423,7 +423,7 @@ impl RecordCopies {
             }
             _ => tracked_link && record_uuid(record, "parentUuid").is_some(),
         };
-        if !fixed_parent || record["isMeta"] == true {
+        if !fixed_parent || (record["isMeta"] == true && !is_meta_message(record)) {
             return None;
         }
         Some(RecordDigest::of(record))
@@ -2288,7 +2288,7 @@ impl ClaudeTranscript {
         if ambiguity.missing_source {
             report_unverified(
                 "omnisession.missing_tool_source",
-                "The transcript is missing the issuing call for a selected Claude tool result",
+                "The transcript does not verify the declared issuing call for a selected Claude tool result",
             );
         }
         if ambiguity.results {

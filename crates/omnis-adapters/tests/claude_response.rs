@@ -1183,6 +1183,134 @@ fn a_final_hidden_user_preserves_a_linked_exchange_with_a_missing_ancestor() {
 }
 
 #[test]
+fn a_copy_of_a_hidden_user_displaced_by_compaction_preserves_the_new_request() {
+    let hidden = meta_user(4, 1);
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        hidden.clone(),
+        message(3, 1, "assistant", json!("Retained reply")),
+    ];
+    rows.extend(compaction(6, 3, &[3]));
+    rows.push(message(8, 7, "user", json!("New request")));
+    for copied in [false, true] {
+        if copied {
+            rows.push(hidden.clone());
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                ["Summary 6", "Retained reply", "New request"]
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("New request") && !text.contains("Internal meta text"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_hidden_tool_parent_cannot_verify_a_conflicting_declared_issuer() {
+    for conflict in [false, true] {
+        let mut first = call("lookup");
+        first["input"] = json!({"file_path":"first.txt"});
+        let mut second = call("lookup");
+        second["input"] = json!({"file_path":"second.txt"});
+        let mut retry = block(3, 1, "retry", json!([second]));
+        retry["message"]["id"] = json!("second-response");
+        let rows = [
+            message(1, 0, "user", json!("Read the selected file")),
+            block(2, 1, "first", json!([first])),
+            retry,
+            meta_user(4, if conflict { 2 } else { 3 }),
+            linked_result(5, 4, 3, "lookup", "Documented output"),
+            message(6, 3, "assistant", json!("Finished")),
+        ];
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            if conflict {
+                assert!(tool_outcomes(&snapshot).is_empty());
+            } else {
+                assert_eq!(
+                    tool_outcomes(&snapshot),
+                    [("Documented output".to_owned(), false)]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_result_with_a_nonassistant_declared_issuer_remains_available_as_evidence() {
+    for source in [2, 1] {
+        let rows = [
+            message(1, 0, "user", json!("Read file")),
+            block(2, 1, "first", json!([call("lookup")])),
+            linked_result(3, 2, source, "lookup", "Observed output"),
+            message(4, 3, "assistant", json!("Finished")),
+        ];
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(active.truncated, source != 2);
+            if source != 2 {
+                assert!(tool_outcomes(&snapshot).is_empty());
+            }
+            assert!(
+                active
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("Observed output"))
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Observed output"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_repeated_duration_preserves_the_visible_child_of_its_original_occurrence() {
+    let duration = turn_duration(50, 10);
+    let mut rows = vec![
+        message(10, 0, "user", json!("Independent A")),
+        duration.clone(),
+        message(12, 50, "assistant", json!("First reply")),
+        message(11, 0, "user", json!("Independent B")),
+        message(13, 11, "assistant", json!("Second reply")),
+    ];
+    for copied in [false, true] {
+        if copied {
+            rows.push(duration.clone());
+        }
+        let (task, reply, other) = if copied {
+            ("Independent A", "First reply", "Second reply")
+        } else {
+            ("Independent B", "Second reply", "First reply")
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                [task, reply]
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains(reply) && !text.contains(other));
+            }
+        }
+    }
+}
+
+#[test]
 fn a_repeated_duration_reselects_its_parent_after_an_independent_reply() {
     let duration = turn_duration(50, 10);
     let mut rows = vec![
@@ -1255,10 +1383,19 @@ fn a_final_meta_user_selects_its_surviving_parent() {
 
 #[test]
 fn a_duration_without_a_uuid_in_a_preview_gap_preserves_the_linked_exchange() {
-    for (missing_uuid, missing_parent) in
-        [(false, false), (true, false), (true, true), (false, true)]
-    {
-        let mut duration = turn_duration(30, 2);
+    for (progress, missing_uuid, missing_parent) in [
+        (false, false, false),
+        (false, true, false),
+        (false, true, true),
+        (false, false, true),
+        (true, false, false),
+        (true, false, true),
+    ] {
+        let mut duration = if progress {
+            opaque(30, 2, "progress")
+        } else {
+            turn_duration(30, 2)
+        };
         if missing_uuid {
             duration.as_object_mut().unwrap().remove("uuid");
         }

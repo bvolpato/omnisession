@@ -207,7 +207,9 @@ fn read_gap_links(
             let parent = match record.parent_uuid {
                 GapParent::Explicit(parent) => parent,
                 GapParent::Missing
-                    if record.kind == Some("system") && record.subtype == Some("turn_duration") =>
+                    if record.kind == Some("progress")
+                        || (record.kind == Some("system")
+                            && record.subtype == Some("turn_duration")) =>
                 {
                     None
                 }
@@ -235,12 +237,13 @@ fn read_gap_links(
                 row["isSidechain"] = Value::Bool(side);
             }
             // A copied link must match its complete original record.
-            let definition: Option<Value> =
-                if super::RecordCopies::compares_link(record.kind.or(role), &row) {
-                    serde_json::from_slice(&line).ok()
-                } else {
-                    None
-                };
+            let definition: Option<Value> = if record.is_meta
+                || super::RecordCopies::compares_link(record.kind.or(role), &row)
+            {
+                serde_json::from_slice(&line).ok()
+            } else {
+                None
+            };
             if record.kind == Some("attachment")
                 && let Some(kind) = definition
                     .as_ref()
