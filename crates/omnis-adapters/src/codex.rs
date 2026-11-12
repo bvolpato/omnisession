@@ -206,7 +206,7 @@ struct CachedListing {
 
 #[derive(Debug, Default)]
 struct TitleIndex {
-    titles: HashMap<String, String>,
+    titles: Arc<HashMap<String, String>>,
     prior_titles: HashMap<String, String>,
     notes: Vec<String>,
     complete: bool,
@@ -626,7 +626,7 @@ impl CodexAdapter {
                     );
                 }
                 TitleIndex {
-                    titles,
+                    titles: Arc::new(titles),
                     prior_titles,
                     complete: notes.is_empty(),
                     notes,
@@ -2762,14 +2762,19 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn session_titles_are_complete(&self) -> bool {
+        self.complete_session_names().is_some()
+    }
+
+    fn complete_session_names(&self) -> Option<Arc<HashMap<String, String>>> {
         let current = self.title_index();
-        current.complete
+        (current.complete
             && self
                 .listing
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current))
+                .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current)))
+        .then(|| Arc::clone(&current.titles))
     }
 
     fn native_session_name(&self, id: &str) -> NativeSessionName {

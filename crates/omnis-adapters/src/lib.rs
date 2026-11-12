@@ -437,6 +437,11 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Returns the complete native name index used by the last listing, including absent rollouts.
+    fn complete_session_names(&self) -> Option<std::sync::Arc<HashMap<String, String>>> {
+        None
+    }
+
     /// Reads the latest name assignment for one session.
     fn native_session_name(&self, _id: &str) -> NativeSessionName {
         NativeSessionName::Unknown

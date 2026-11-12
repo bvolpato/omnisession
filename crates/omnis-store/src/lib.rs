@@ -3185,16 +3185,21 @@ impl Store {
         if session.provider != Provider::Codex {
             return Ok(None);
         }
-        self.connection.borrow().query_row("SELECT full_name FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
-            AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS NOT NULL
-            UNION ALL SELECT title FROM (
-            SELECT title,source_file_id,source_contents_id,codex_home FROM codex_inactive_pending_names
-             WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
-               AND codex_home=(SELECT home FROM current_codex_home) AND evidence='provider_name'
-            UNION ALL SELECT title,source_file_id,source_contents_id,codex_home FROM codex_pending_catalog_titles
-             WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1) AND evidence='provider_name')
-            WHERE length(title)<240 AND codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2 AND source_contents_id=?3 LIMIT 1",
-            params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)],|r|r.get(0)).optional().map_err(database_error)
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT full_name FROM codex_name_source_prefixes
+                 WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+                   AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS NOT NULL",
+                params![
+                    session.id,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)
     }
 
     /// Checks whether this home's name source already has a digest for the selected revision.
@@ -3322,7 +3327,7 @@ impl Store {
                     AND source_file_id=?2 AND source_contents_id=?4"),
                     params![session.id,file.into_bytes(),contents.into_bytes(),previous]).map_err(database_error)?;
             }
-            let (length, digest) = current.unwrap_or((0, [0; 32]));
+            let (length, digest) = current.unwrap_or(prior);
             tx.execute("UPDATE codex_name_source_prefixes SET source_contents_id=?2,source_bytes=?3,digest=?4
                 WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
                 params![session.id,contents.into_bytes(),i64::try_from(length).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
@@ -4201,6 +4206,34 @@ impl Store {
         Ok((sessions, self.read_trajectory_titles(true)?))
     }
 
+    /// Captures the saved names that a complete provider listing can withdraw.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or its name receipts cannot be read.
+    pub fn observe_codex_catalog_for_refresh(&self) -> Result<CodexCatalogInventory> {
+        let connection = self.connection.borrow();
+        let _snapshot = connection.unchecked_transaction().map_err(database_error)?;
+        let mut inventory = self.observe_codex_catalog_inventory()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT session_id,source_file_id,source_contents_id,full_name FROM codex_name_source_prefixes
+             WHERE codex_home=(SELECT home FROM current_codex_home)"
+        ).map_err(database_error)?;
+        inventory.saved_names = statement
+            .query_map([], |row| {
+                Ok(SavedCodexName {
+                    id: row.get(0)?,
+                    file: row.get(1)?,
+                    contents: row.get(2)?,
+                    name: row.get(3)?,
+                })
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)?;
+        Ok(inventory)
+    }
+
     /// Reads raw catalog membership and source receipts for legacy names in one snapshot.
     ///
     /// # Errors
@@ -4266,6 +4299,7 @@ impl Store {
                 complete: names_complete,
                 prior_assignments: &HashMap::new(),
                 unstamped_documents: None,
+                withdrawn_names: &[],
             },
         )
     }
@@ -4291,6 +4325,7 @@ impl Store {
                 complete: names_complete,
                 prior_assignments,
                 unstamped_documents: Some(&inventory.unstamped_documents),
+                withdrawn_names: &inventory.withdrawn_names,
             },
         )
     }
@@ -4351,6 +4386,7 @@ impl Store {
                 complete: names_complete,
                 prior_assignments,
                 unstamped_documents: None,
+                withdrawn_names: &[],
             }),
         )
     }
@@ -6665,7 +6701,7 @@ impl PreparedTrajectoryWrite<'_, '_> {
     }
 }
 
-const INACTIVE_HOME_TITLE: &str = "SELECT omnis_compact_search_title(b.full_name) FROM codex_name_source_prefixes b
+const INACTIVE_HOME_TITLE: &str = "SELECT b.full_name FROM codex_name_source_prefixes b
     WHERE trajectories.provider='codex' AND trajectories.origin='native' AND b.session_id=trajectories.session_id
       AND b.codex_home=(SELECT home FROM current_codex_home) AND b.source_file_id=trajectories.source_file_id
       AND b.source_contents_id=trajectories.source_contents_id AND b.full_name IS NOT NULL
@@ -7024,9 +7060,34 @@ pub struct CodexCatalogInventory {
     /// Legacy names whose source and prior native assignment can be checked.
     unscoped: HashMap<SessionRef, usize>,
     unstamped_documents: HashMap<SessionRef, String>,
+    saved_names: Vec<SavedCodexName>,
+    withdrawn_names: Vec<SavedCodexName>,
+}
+
+struct SavedCodexName {
+    id: String,
+    file: [u8; 16],
+    contents: [u8; 16],
+    name: Option<String>,
 }
 
 impl CodexCatalogInventory {
+    /// Compares the saved assignments with a complete native name index from the same listing.
+    pub fn observe_complete_name_index(&mut self, assigned: &HashMap<String, String>) {
+        self.withdrawn_names = self
+            .saved_names
+            .drain(..)
+            .filter(|saved| {
+                assigned.get(&saved.id).is_none_or(|name| {
+                    saved
+                        .name
+                        .as_ref()
+                        .is_some_and(|old| *old != omnis_core::redact_secrets(name))
+                })
+            })
+            .collect();
+    }
+
     /// Reports whether this inventory contains legacy names that a native scan could corroborate.
     #[must_use]
     pub fn has_legacy_codex_names(&self) -> bool {
@@ -7059,6 +7120,7 @@ struct CatalogNameObservations<'a> {
     complete: bool,
     prior_assignments: &'a HashMap<String, String>,
     unstamped_documents: Option<&'a HashMap<SessionRef, String>>,
+    withdrawn_names: &'a [SavedCodexName],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7495,6 +7557,9 @@ fn reconcile_codex_catalog(
         }
     }
     if complete {
+        if names_complete {
+            withdraw_unlisted_names(transaction, names.withdrawn_names, &seen)?;
+        }
         for (id, prior) in current {
             if observed.get(id).copied() != Some(&prior.metadata) {
                 return Err(StoreError::TrajectorySourceChanged);
@@ -7505,6 +7570,25 @@ fn reconcile_codex_catalog(
         }
     }
     Ok(changes)
+}
+
+fn withdraw_unlisted_names(
+    transaction: &Transaction<'_>,
+    withdrawn_names: &[SavedCodexName],
+    listed: &HashSet<&str>,
+) -> Result<()> {
+    let mut remove = transaction.prepare_cached(
+        "DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+         AND source_file_id=?2 AND source_contents_id=?3 AND full_name IS ?4"
+    ).map_err(database_error)?;
+    for saved in withdrawn_names {
+        if !listed.contains(saved.id.as_str()) {
+            remove
+                .execute(params![saved.id, saved.file, saved.contents, saved.name])
+                .map_err(database_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_unowned_name(
@@ -7925,6 +8009,26 @@ fn migrate_legacy_codex_titles(transaction: &Transaction<'_>) -> Result<()> {
             )
             .map_err(database_error)
     };
+    if mark("restore_verified_codex_prefix_names")? != 0 {
+        transaction.execute_batch(
+            "UPDATE codex_name_source_prefixes AS receipt SET full_name=(
+                SELECT min(title) FROM (
+                    SELECT i.title FROM session_index i
+                    WHERE i.provider='codex' AND i.session_id=receipt.session_id
+                      AND i.codex_home=receipt.codex_home AND NOT i.codex_legacy_name
+                      AND i.source_file_id=receipt.source_file_id AND i.source_contents_id=receipt.source_contents_id
+                    UNION ALL SELECT n.title FROM codex_inactive_pending_names n
+                    WHERE n.trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=receipt.session_id)
+                      AND n.codex_home=receipt.codex_home AND n.evidence='provider_name' AND length(n.title)<240
+                      AND n.source_file_id=receipt.source_file_id AND n.source_contents_id=receipt.source_contents_id
+                    UNION ALL SELECT n.title FROM codex_pending_catalog_titles n
+                    WHERE n.trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=receipt.session_id)
+                      AND n.codex_home=receipt.codex_home AND n.evidence='provider_name' AND length(n.title)<240
+                      AND n.source_file_id=receipt.source_file_id AND n.source_contents_id=receipt.source_contents_id)
+                HAVING count(DISTINCT title)=1)
+             WHERE full_name IS NULL AND source_bytes>0 AND length(digest)=32;"
+        ).map_err(database_error)?;
+    }
     // Keep the old version only when the next read can verify the saved projection.
     let legacy_version = "CASE WHEN doc.source_complete AND doc.source_file_id IS NULL
         AND doc.source_contents_id IS NULL AND doc.missing_ancestor_id IS NULL
@@ -14103,6 +14207,7 @@ mod tests {
                 .as_deref(),
             doc.derived_title
         );
+        let saved_name = |revision| outer.retained_codex_name(&row.session, revision).unwrap();
         let oversized = SourceRevision {
             contents: Some(Uuid::from_u128(101)),
             ..appended
@@ -14110,19 +14215,19 @@ mod tests {
         outer
             .verify_codex_name_append(&row.session, oversized, (12, [2; 32]), None)
             .unwrap();
+        assert_eq!(saved_name(oversized).as_deref(), doc.derived_title);
+        let later = SourceRevision {
+            contents: Some(Uuid::from_u128(102)),
+            ..oversized
+        };
         assert_eq!(
-            outer
-                .retained_codex_name(&row.session, oversized)
-                .unwrap()
-                .as_deref(),
-            doc.derived_title
+            outer.codex_name_prefix_length(&row.session, later).unwrap(),
+            Some(12)
         );
-        assert_eq!(
-            outer
-                .codex_name_prefix_length(&row.session, appended)
-                .unwrap(),
-            None
-        );
+        outer
+            .verify_codex_name_append(&row.session, later, (12, [2; 32]), None)
+            .unwrap();
+        assert_eq!(saved_name(later).as_deref(), doc.derived_title);
         row.source_revision = Some(oversized);
         refresh(&outer, &row, true);
         outer

@@ -577,7 +577,7 @@ pub(super) fn spawn_provider_update(
         let registry = AdapterRegistry::with_local_adapters();
         if provider == Provider::Codex {
             let observed = match Store::open_default()
-                .and_then(|store| store.observe_codex_catalog_inventory())
+                .and_then(|store| store.observe_codex_catalog_for_refresh())
             {
                 Ok(inventory) => Some(inventory),
                 Err(error) => {
@@ -591,8 +591,11 @@ pub(super) fn spawn_provider_update(
                     let complete = registry
                         .adapter(provider)
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let names = observed.and_then(|inventory| {
+                    let names = observed.and_then(|mut inventory| {
                         let adapter = registry.adapter(provider).ok()?;
+                        if complete && let Some(assignments) = adapter.complete_session_names() {
+                            inventory.observe_complete_name_index(&assignments);
+                        }
                         let unavailable =
                             unavailable_catalog_rows(adapter, &sessions, &inventory, &sender);
                         let complete = adapter.session_titles_are_complete();
@@ -957,6 +960,45 @@ impl<'a> PreviewWriter<'a> {
             && row.updated_at?.timestamp_millis() == read.snapshot.captured_at.timestamp_millis())
         .then_some((row, observation))
     }
+
+    fn publish(
+        &self,
+        registry: &AdapterRegistry,
+        target: crate::SearchDocumentTarget<'_>,
+        read: &omnis_adapters::IndexRead,
+        name: Option<&omnis_adapters::NativeSessionName>,
+    ) -> anyhow::Result<Option<IndexedTrajectoryTitle>> {
+        use omnis_adapters::NativeSessionName;
+        let native = read.native_session.as_ref();
+        if name == Some(&NativeSessionName::Unknown)
+            && let Some(native) = native
+        {
+            search_index::observe_codex_name_source(
+                self.store,
+                native,
+                read.source_revision,
+                name,
+            )?;
+        }
+        let title = crate::store_search_document(
+            self.store,
+            target,
+            crate::SearchDocumentInput::Read(read, name),
+            Some(registry),
+            self.guard,
+        )?;
+        if let (Some(assigned @ NativeSessionName::Named(_)), Some(native)) = (name, native)
+            && assigned.confirms(native.title.as_deref())
+        {
+            search_index::observe_codex_name_source(
+                self.store,
+                native,
+                read.source_revision,
+                name,
+            )?;
+        }
+        Ok(title)
+    }
 }
 
 fn record_bundle_preview(
@@ -1070,13 +1112,8 @@ fn record_preview(
                 crate::SearchDocumentTarget::VisibleNative,
             ),
         };
-        metadata.indexed_title = crate::store_search_document(
-            writer.store,
-            target,
-            crate::SearchDocumentInput::Read(read, name_observation.as_ref()),
-            Some(registry),
-            writer.guard,
-        )?;
+        metadata.indexed_title =
+            writer.publish(registry, target, read, name_observation.as_ref())?;
     }
     Ok(metadata)
 }

@@ -917,6 +917,18 @@ impl<'a> DiscoveryUse<'a> {
         }
     }
 
+    fn codex_inventory(
+        self,
+        store: &Store,
+        project: Option<&Path>,
+    ) -> omnis_store::Result<omnis_store::CodexCatalogInventory> {
+        if matches!(self, Self::Index(_)) && project.is_none() {
+            store.observe_codex_catalog_for_refresh()
+        } else {
+            store.observe_codex_catalog_inventory()
+        }
+    }
+
     fn candidate_project(self, project: Option<&Path>) -> Option<&Path> {
         project.filter(|_| {
             matches!(
@@ -958,11 +970,11 @@ fn discover_sessions(
     };
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    let observed_codex = cache
+    let mut observed_codex = cache
         .filter(|_| providers.contains(&Provider::Codex))
         .and_then(|store| {
-            store
-                .observe_codex_catalog_inventory()
+            purpose
+                .codex_inventory(store, project)
                 .inspect_err(|error| warnings.push(format!("codex session cache: {error}")))
                 .ok()
         });
@@ -1017,7 +1029,7 @@ fn discover_sessions(
                 store,
                 adapter,
                 found,
-                observed_codex.as_ref(),
+                observed_codex.as_mut(),
                 complete,
                 search,
                 project,
@@ -1084,7 +1096,7 @@ fn cache_discovered_codex_sessions(
     store: &Store,
     adapter: &dyn ProviderAdapter,
     sessions: &mut [NativeSession],
-    observed_codex: Option<&omnis_store::CodexCatalogInventory>,
+    observed_codex: Option<&mut omnis_store::CodexCatalogInventory>,
     complete: bool,
     project_search: bool,
     project: Option<&Path>,
@@ -1099,6 +1111,9 @@ fn cache_discovered_codex_sessions(
     let names_complete = adapter.session_titles_are_complete();
     let prior_names = prior_codex_assignments(adapter, sessions, inventory, names_complete);
     if !project_search {
+        if complete && let Some(assignments) = adapter.complete_session_names() {
+            inventory.observe_complete_name_index(&assignments);
+        }
         store.refresh_codex_catalog_with_name_history(
             &indexed,
             complete,

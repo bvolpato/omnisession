@@ -467,7 +467,7 @@ struct Pending {
         TrajectoryIndexState,
         Option<TrajectoryIndexFailure>,
     )>,
-    hidden: Vec<IndexedTrajectoryTitle>,
+    titles: Vec<IndexedTrajectoryTitle>,
     summary: IndexSummary,
 }
 
@@ -487,7 +487,7 @@ fn verify_cached_codex_name(
     registry: &AdapterRegistry,
     store: &Store,
     candidate: &IndexCandidate,
-) -> Result<()> {
+) -> Result<Option<IndexedTrajectoryTitle>> {
     if let (Some(row), Some(path)) = (&candidate.metadata, candidate.source_path.as_deref()) {
         let needs_observation = if let Some(name) = row.title.as_deref() {
             !store.has_codex_name_source(&candidate.session, candidate.source_revision, name)?
@@ -505,9 +505,10 @@ fn verify_cached_codex_name(
                 candidate.source_revision,
                 name.as_ref(),
             )?;
+            return Ok(store.indexed_trajectory_title(&candidate.session)?);
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn pending(
@@ -554,7 +555,7 @@ fn pending(
     };
     let mut stale = Vec::new();
     let mut recovered = Vec::new();
-    let mut hidden = Vec::new();
+    let mut titles = Vec::new();
     for mut candidate in candidates {
         if candidate.session.provider == Provider::Imported
             && let Some(&version) = imported_versions.get(&candidate.session.id)
@@ -577,7 +578,7 @@ fn pending(
             && let Some(&prior) = prior
         {
             if verify_current_names {
-                verify_cached_codex_name(registry, store, &candidate)?;
+                titles.extend(verify_cached_codex_name(registry, store, &candidate)?);
             }
             if conflicts.contains(&candidate.session) || (failure.is_some() && !current_failure) {
                 recovered.push((candidate, prior, failure.copied()));
@@ -590,7 +591,7 @@ fn pending(
         if !retry_failed && current_failure {
             summary.failed_skipped += 1;
             if candidate.session.provider == Provider::Codex {
-                hidden.extend(store.indexed_trajectory_title(&candidate.session)?);
+                titles.extend(store.indexed_trajectory_title(&candidate.session)?);
             }
         } else {
             stale.push((candidate, prior.copied()));
@@ -601,7 +602,7 @@ fn pending(
         stale,
         failures,
         recovered,
-        hidden,
+        titles,
         summary,
     })
 }
@@ -750,12 +751,12 @@ pub(crate) fn index_candidates(
         stale,
         failures,
         recovered,
-        mut hidden,
+        mut titles,
         mut summary,
     } = pending(registry, store, candidates, retry_failed, true)?;
-    hidden.extend(restore_cached_sources(registry, store, recovered)?);
+    titles.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
-        titles: hidden,
+        titles,
         total: stale.len(),
         ..IndexProgress::default()
     });
