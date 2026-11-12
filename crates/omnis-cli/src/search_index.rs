@@ -47,6 +47,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) session: SessionRef,
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
+    pi_metadata: Option<omnis_store::IndexedSession>,
     revision: Option<omnis_adapters::TranscriptRevision>,
     expected: omnis_store::TrajectoryWriteGuard,
     upgrade_full_document: bool,
@@ -63,6 +64,8 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
+            pi_metadata: matches!(provider, Provider::Pi | Provider::OhMyPi)
+                .then(|| crate::indexed_session_metadata(session)),
             revision: if matches!(
                 provider,
                 Provider::Claude | Provider::Codex | Provider::Pi | Provider::OhMyPi
@@ -197,6 +200,23 @@ struct Pending {
 }
 
 fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+    let mut roots = std::collections::HashMap::new();
+    let sources = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let metadata = candidate.pi_metadata.as_ref()?;
+            let path = metadata.project_path.as_ref()?;
+            let root = roots
+                .entry(path.clone())
+                .or_insert_with(|| crate::pi_workspace_key(path));
+            Some((
+                root.clone(),
+                metadata.clone(),
+                candidate.revision.map(|r| r.key),
+            ))
+        })
+        .collect::<Vec<_>>();
+    store.select_pi_workspaces(&sources)?;
     let states = store.trajectory_index_states()?;
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
@@ -707,6 +727,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
             source_path,
+            pi_metadata: None,
             revision: None,
             expected: omnis_store::TrajectoryWriteGuard::Unchecked,
             upgrade_full_document: false,
@@ -1393,6 +1414,7 @@ mod tests {
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
                         source_path: None,
+                        pi_metadata: None,
                         revision: None,
                         expected: omnis_store::TrajectoryWriteGuard::Unchecked,
                         upgrade_full_document: false,

@@ -140,9 +140,9 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
-    /// Reports whether scoped discovery selected a different physical copy of this session.
-    fn is_workspace_copy(&self, _session: &SessionRef) -> bool {
-        false
+    /// Returns other physical copies found by an unscoped discovery pass.
+    fn additional_search_sessions(&self) -> Vec<NativeSession> {
+        Vec::new()
     }
 
     /// Returns the selected physical transcript for providers with file-based search revisions.

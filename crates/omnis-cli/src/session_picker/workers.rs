@@ -489,8 +489,14 @@ impl PickerPreviewRead {
             .map(|r| r.modified)
             .or(key.updated_at)
             .unwrap_or(snapshot.captured_at);
+        let guard = if matches!(key.session.provider, Provider::Pi | Provider::OhMyPi) {
+            crate::select_pi_snapshot(store, snapshot, self.revision)?;
+            store.trajectory_write_guard(&key.session)?
+        } else {
+            self.guard
+        };
         let source = omnis_store::TrajectorySource {
-            expected: self.guard,
+            expected: guard,
             file_bytes: self.revision.map(|r| r.bytes),
             revision: self.revision.map(|r| r.key),
             provider_limited: self.read.provider_limited,

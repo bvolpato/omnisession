@@ -36,7 +36,7 @@ pub struct PiAdapter {
     provider: Provider,
     sessions_root: Option<PathBuf>,
     listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
-    workspace_copies: Arc<Mutex<HashSet<String>>>,
+    workspace_copies: Arc<Mutex<Vec<NativeSession>>>,
 }
 
 impl PiAdapter {
@@ -88,10 +88,27 @@ impl PiAdapter {
         paths
     }
 
+    fn exact_session(&self, id: &str) -> Result<Option<PathBuf>> {
+        let mut found: Option<(PathBuf, PathBuf)> = None;
+        for path in self.session_files() {
+            if let Ok(header) = read_header(&path, self.provider)
+                && header.id == id
+            {
+                if let Some((_, workspace)) = &found {
+                    anyhow::ensure!(
+                        paths_match(workspace, &header.cwd),
+                        "multiple Pi workspaces contain session `{id}`"
+                    );
+                } else {
+                    found = Some((path, header.cwd));
+                }
+            }
+        }
+        Ok(found.map(|(path, _)| path))
+    }
+
     fn find_session(&self, id: &str) -> Result<PathBuf> {
-        self.session_files()
-            .into_iter()
-            .find(|path| read_header(path, self.provider).is_ok_and(|header| header.id == id))
+        self.exact_session(id)?
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
     }
 
@@ -116,6 +133,17 @@ impl PiAdapter {
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned();
+        if let Some(hint) = source_path
+            && self
+                .workspace_copies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|copy| copy.session.id == id && copy.source_path.as_deref() == Some(hint))
+            && let Some(path) = validate(hint)
+        {
+            return Ok(path);
+        }
         if let Some(path) = listed.as_deref().and_then(validate) {
             return Ok(path);
         }
@@ -1040,30 +1068,29 @@ impl ProviderAdapter for PiAdapter {
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
         let mut listed_paths = HashMap::new();
-        let mut global_ids = HashSet::new();
-        let mut workspace_copies = HashSet::new();
+        let mut workspace_copies = Vec::new();
+        let mut workspaces: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in self.session_files() {
             let Ok(header) = read_header(&path, self.provider) else {
                 continue;
             };
-            let first = global_ids.insert(header.id.clone());
             if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
                 continue;
             }
-            let std::collections::hash_map::Entry::Vacant(entry) =
-                listed_paths.entry(header.id.clone())
-            else {
+            let seen = workspaces.entry(header.id.clone()).or_default();
+            if seen.iter().any(|cwd| paths_match(cwd, &header.cwd)) {
                 continue;
-            };
-            entry.insert(path.clone());
-            if !first {
-                workspace_copies.insert(header.id.clone());
+            }
+            let first = seen.is_empty();
+            seen.push(header.cwd.clone());
+            if first {
+                listed_paths.insert(header.id.clone(), path.clone());
             }
             let file_updated_at = fs::metadata(&path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from);
-            sessions.push(NativeSession {
+            let selected = NativeSession {
                 session: SessionRef::new(self.provider, header.id),
                 title: header.title,
                 project_path: Some(header.cwd),
@@ -1073,7 +1100,12 @@ impl ProviderAdapter for PiAdapter {
                 updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path),
-            });
+            };
+            if first {
+                sessions.push(selected);
+            } else {
+                workspace_copies.push(selected);
+            }
         }
         *self
             .listed_paths
@@ -1087,11 +1119,11 @@ impl ProviderAdapter for PiAdapter {
         Ok(sessions)
     }
 
-    fn is_workspace_copy(&self, session: &SessionRef) -> bool {
+    fn additional_search_sessions(&self) -> Vec<NativeSession> {
         self.workspace_copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(&session.id)
+            .clone()
     }
 
     fn search_transcript_path(
@@ -1099,17 +1131,12 @@ impl ProviderAdapter for PiAdapter {
         session: &SessionRef,
         hint: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        self.session_path(&session.id, None)
-            .or_else(|error| {
-                hint.map_or(Err(error), |path| {
-                    self.session_path(&session.id, Some(path))
-                })
-            })
-            .map(Some)
+        self.session_path(&session.id, hint).map(Some)
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        self.read_session_at(session, None)
+        validate_provider(session, self.provider)?;
+        snapshot_from_open_file(session, &self.find_session(&session.id)?)
     }
 
     fn read_session_at(
@@ -1162,8 +1189,10 @@ impl ProviderAdapter for PiAdapter {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, self.provider)?;
+        let source = self.exact_session(&session.id)?;
         let reference = if self.provider == Provider::OhMyPi {
-            self.find_session(&session.id)?
+            source
+                .context("Oh My Pi session was not found")?
                 .into_os_string()
                 .into_string()
                 .map_err(|_| anyhow!("Oh My Pi session path is not UTF-8"))?

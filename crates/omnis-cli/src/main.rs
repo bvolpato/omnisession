@@ -122,12 +122,18 @@ trait IndexedSessionReader {
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let store = Store::open_default();
-        let guard = store
+        let mut guard = store
             .as_ref()
             .ok()
             .and_then(|store| store.trajectory_write_guard(session).ok());
         let revision = self.search_revision(session, None)?;
         let snapshot = read_session(self, session)?;
+        if let Ok(store) = &store
+            && matches!(session.provider, Provider::Pi | Provider::OhMyPi)
+        {
+            select_pi_snapshot(store, &snapshot, revision)?;
+            guard = Some(store.trajectory_write_guard(session)?);
+        }
         anyhow::ensure!(
             revision == self.search_revision(session, None)?,
             "selected transcript changed during indexing"
@@ -252,6 +258,59 @@ fn confirm_search_write(
     anyhow::bail!("concurrent trajectory updates prevented publishing the search document")
 }
 
+fn pi_workspace_key(path: &Path) -> PathBuf {
+    if omnis_core::may_reach_network(path) {
+        path.to_owned()
+    } else {
+        omnis_core::workspace_root(path).unwrap_or_else(|_| path.to_owned())
+    }
+}
+
+fn select_pi_snapshot(
+    store: &Store,
+    snapshot: &CanonicalSnapshot,
+    revision: Option<omnis_adapters::TranscriptRevision>,
+) -> Result<()> {
+    let project = &snapshot.workspace.current_dir;
+    store.select_pi_workspaces(&[(
+        pi_workspace_key(project),
+        IndexedSession {
+            session: snapshot.session.clone(),
+            title: snapshot.title.as_deref().map(redact_secrets),
+            project_path: Some(project.clone()),
+            git_branch: snapshot.workspace.git.branch.clone(),
+            created_at: None,
+            updated_at: revision.map(|r| r.modified),
+            updated_at_approximate: true,
+            event_count: snapshot.events.len(),
+        },
+        revision.map(|r| r.key),
+    )])?;
+    Ok(())
+}
+
+fn pi_index_batches(
+    registry: &AdapterRegistry,
+    filter: Option<Provider>,
+) -> Result<Vec<Vec<NativeSession>>> {
+    let mut batches = Vec::<Vec<NativeSession>>::new();
+    let mut counts = HashMap::<SessionRef, usize>::new();
+    for provider in [Provider::Pi, Provider::OhMyPi]
+        .into_iter()
+        .filter(|p| filter.is_none_or(|f| f == *p))
+    {
+        for copy in registry.adapter(provider)?.additional_search_sessions() {
+            let batch = counts.entry(copy.session.clone()).or_default();
+            if *batch == batches.len() {
+                batches.push(Vec::new());
+            }
+            batches[*batch].push(copy);
+            *batch += 1;
+        }
+    }
+    Ok(batches)
+}
+
 fn build_search_index(
     registry: &AdapterRegistry,
     args: &IndexArgs,
@@ -262,13 +321,31 @@ fn build_search_index(
     let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store));
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
-    let summary = index_with_interrupt(
+    let mut summary = index_with_interrupt(
         registry,
         &store,
         candidates,
         args.retry_failed,
         !json_output,
     )?;
+    for copies in pi_index_batches(registry, args.provider)? {
+        if summary.stopped {
+            break;
+        }
+        let extra = index_with_interrupt(
+            registry,
+            &store,
+            search_index::ordered_candidates(&copies, current.as_deref()),
+            args.retry_failed,
+            !json_output,
+        )?;
+        summary.candidates += extra.candidates;
+        summary.stale += extra.stale;
+        summary.indexed += extra.indexed;
+        summary.failed += extra.failed;
+        summary.failed_skipped += extra.failed_skipped;
+        summary.stopped |= extra.stopped;
+    }
     let seconds = started.elapsed().as_secs_f64();
     if json_output {
         println!(
@@ -451,7 +528,7 @@ fn cached_search_sessions(
             .provider
             .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
     {
-        let copies = store.cached_pi_copies(project)?;
+        let copies = store.cached_pi_copies(&pi_workspace_key(project))?;
         let keys = copies.iter().map(|s| &s.session).collect::<HashSet<_>>();
         indexed.retain(|s| !keys.contains(&s.session));
         indexed.extend(
@@ -525,17 +602,6 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             None,
         )
     };
-    if !args.cached && !args.all_projects {
-        for session in &sessions {
-            if matches!(session.session.provider, Provider::Pi | Provider::OhMyPi)
-                && registry
-                    .adapter(session.session.provider)?
-                    .is_workspace_copy(&session.session)
-            {
-                store.select_pi_copy(&project, &indexed_session_metadata(session))?;
-            }
-        }
-    }
     if args.cached {
         warnings.push(
             "Cached results only. Provider stores were not checked. Run `omni index` to refresh."
