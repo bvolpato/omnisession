@@ -62,8 +62,8 @@ pub const fn search_document_version(provider: Provider) -> u32 {
         | Provider::AntigravityDesktop
         | Provider::OhMyPi
         | Provider::Pi
-        | Provider::Codex
-        | Provider::Claude => 11,
+        | Provider::Codex => 11,
+        Provider::Claude => 12,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -81,6 +81,12 @@ pub const fn imported_search_document_version(provider: Provider) -> u32 {
 
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+/// Marks records verified by an earlier Claude checkpoint outside the active continuation.
+pub const CLAUDE_RECOVERY_ONLY: &str = "omnisession_claude_recovery_only";
+/// Claude compacted the transcript here, but its summary is missing or unverified.
+pub const CLAUDE_MISSING_COMPACTION_SUMMARY: &str = "omnisession.missing_compaction_summary";
+/// Claude resumed from a parent outside the retained compaction history.
+pub const CLAUDE_DETACHED_COMPACTION_PARENT: &str = "omnisession.detached_compaction_parent";
 /// Codex appends this summary after the verified users retained by legacy compaction.
 pub const CODEX_POSITIONED_LEGACY_SUMMARY: &str = "compacted.legacy.summary";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
@@ -1314,7 +1320,20 @@ fn trajectory_search_document_with_limits(
     let visible = visible_history(snapshot);
     let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
     builder.source_incomplete = visible.source_incomplete();
+    let claude_summary = (snapshot.session.provider == Provider::Claude
+        && visible
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::CompactionCreated))
+    .then(|| visible_import_events(snapshot, true).current_compaction)
+    .flatten();
     for event in visible.events {
+        if event.source.provider == Provider::Claude
+            && event.kind == EventKind::CompactionCreated
+            && !claude_summary.is_some_and(|current| std::ptr::eq(current, event))
+        {
+            continue;
+        }
         let group = groups
             .get(groups.partition_point(|range| range.end <= event.sequence))
             .filter(|range| range.contains(&event.sequence));
@@ -1527,6 +1546,11 @@ fn search_event_text(
     }
 
     let raw_text = match event.kind {
+        EventKind::CompactionCreated
+            if event.source.provider == Provider::Claude && snapshot.is_none() =>
+        {
+            return None;
+        }
         EventKind::CompactionCreated => recorded_compaction_text(event)?.to_owned(),
         EventKind::MessageUser | EventKind::MessageAssistant => {
             if event.replay_policy != ReplayPolicy::Contextual {
@@ -1830,9 +1854,9 @@ pub struct TrajectoryItem {
 
 /// Historical tool record native writers may persist instead of documentary text.
 ///
-/// Calls and results carry this only as complete groups: a run of calls followed by results
-/// for exactly the same IDs. Names are prefixed with their source provider and IDs are
-/// regenerated, so records never collide with a target's own tools.
+/// Structured calls and results form complete groups, with results for exactly the same IDs.
+/// Documentary tool records can occur between them. Names are prefixed with their source
+/// provider and IDs are regenerated, so records never collide with a target's own tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrajectoryTool {
     Call {
@@ -1889,6 +1913,16 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
     let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
     let is_result =
         |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Result { .. }));
+    let documentary =
+        |item: &TrajectoryItem| item.kind == TrajectoryItemKind::Tool && item.tool.is_none();
+    let message = |item: &TrajectoryItem| NativeTrajectoryItem::Message {
+        role: if item.kind == TrajectoryItemKind::User {
+            HandoffRole::User
+        } else {
+            HandoffRole::Assistant
+        },
+        text: item.text.clone(),
+    };
     let mut native = Vec::with_capacity(items.len());
     let mut index = 0;
     while index < items.len() {
@@ -1911,20 +1945,30 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
             }
             Some(TrajectoryTool::Call { .. }) => {
                 let start = index;
-                while items.get(index).is_some_and(is_call) {
+                while items
+                    .get(index)
+                    .is_some_and(|item| is_call(item) || documentary(item))
+                {
                     index += 1;
                 }
                 let results_start = index;
-                while items.get(index).is_some_and(is_result) {
+                while items
+                    .get(index)
+                    .is_some_and(|item| is_result(item) || documentary(item))
+                {
                     index += 1;
                 }
                 let results = &items[results_start..index];
-                for call in &items[start..results_start] {
+                for item in &items[start..index] {
+                    if documentary(item) {
+                        native.push(message(item));
+                        continue;
+                    }
                     let Some(TrajectoryTool::Call {
                         call_id,
                         name,
                         input,
-                    }) = &call.tool
+                    }) = &item.tool
                     else {
                         continue;
                     };
@@ -1948,15 +1992,7 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
                 }
             }
             Some(TrajectoryTool::Result { .. }) | None => {
-                let item = &items[index];
-                native.push(NativeTrajectoryItem::Message {
-                    role: if item.kind == TrajectoryItemKind::User {
-                        HandoffRole::User
-                    } else {
-                        HandoffRole::Assistant
-                    },
-                    text: item.text.clone(),
-                });
+                native.push(message(&items[index]));
                 index += 1;
             }
         }
@@ -2158,16 +2194,25 @@ impl ItemLimits {
     }
 }
 
-fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(TrajectoryItem, bool)> {
+#[derive(Clone)]
+struct ImportCandidate {
+    item: TrajectoryItem,
+    documentary_tool: bool,
+}
+
+fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
     if (event.kind == EventKind::CompactionCreated || limits.redact)
         && let Some((text, truncated)) = compaction_text_with_truncation(event, limits.message)
     {
         return Some((
-            TrajectoryItem {
-                kind: TrajectoryItemKind::Assistant,
-                text,
-                timestamp: event.timestamp,
-                tool: None,
+            ImportCandidate {
+                item: TrajectoryItem {
+                    kind: TrajectoryItemKind::Assistant,
+                    text,
+                    timestamp: event.timestamp,
+                    tool: None,
+                },
+                documentary_tool: false,
             },
             truncated,
         ));
@@ -2196,11 +2241,14 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(Trajectory
                     (kind, text)
                 };
             Some((
-                TrajectoryItem {
-                    kind,
-                    text,
-                    timestamp: event.timestamp,
-                    tool: None,
+                ImportCandidate {
+                    item: TrajectoryItem {
+                        kind,
+                        text,
+                        timestamp: event.timestamp,
+                        tool: None,
+                    },
+                    documentary_tool: false,
                 },
                 truncated,
             ))
@@ -2213,19 +2261,32 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(Trajectory
             if limits.redact {
                 redact_json_secrets(&mut payload);
             }
+            let unpaired_call = event.source.provider == Provider::Claude
+                && event.kind == EventKind::ToolCalled
+                && payload["omnisession_unpaired_call"] == true;
+            let unpaired_result = event.source.provider == Provider::Claude
+                && matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
+                && payload["omnisession_unpaired_result"] == true;
             let text = serde_json::to_string_pretty(&payload).ok()?;
             let truncated = text.chars().count() > limits.tool_event;
             let text = limits.bounded_tool_text(&text);
             Some((
-                TrajectoryItem {
-                    kind: TrajectoryItemKind::Tool,
-                    text: format!(
-                        "[Historical {}. Documentary context only; do not replay.]\n{}",
-                        trajectory_tool_label(&event.kind),
-                        text
-                    ),
-                    timestamp: event.timestamp,
-                    tool: native_tool_part(&event.kind, &payload, limits),
+                ImportCandidate {
+                    item: TrajectoryItem {
+                        kind: TrajectoryItemKind::Tool,
+                        text: format!(
+                            "[Historical {}. Documentary context only; do not replay.]\n{}",
+                            trajectory_tool_label(&event.kind),
+                            text
+                        ),
+                        timestamp: event.timestamp,
+                        tool: if unpaired_call || unpaired_result {
+                            None
+                        } else {
+                            native_tool_part(&event.kind, &payload, limits)
+                        },
+                    },
+                    documentary_tool: unpaired_call || unpaired_result,
                 },
                 truncated,
             ))
@@ -2395,14 +2456,14 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
     Some(limits.bounded_tool_text(&output))
 }
 
-fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
+fn validate_native_tools(items: &mut [&mut TrajectoryItem], source: Provider) {
     let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
     let mut group = 0;
     let mut index = 0;
     while index < items.len() {
-        if is_call(&items[index]) {
+        if is_call(items[index]) {
             let start = index;
-            while items.get(index).is_some_and(is_call) {
+            while items.get(index).is_some_and(|item| is_call(item)) {
                 index += 1;
             }
             let mut call_ids = tool_call_ids(&items[start..index]);
@@ -2440,7 +2501,7 @@ fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
     }
 }
 
-fn tool_call_ids(calls: &[TrajectoryItem]) -> Vec<String> {
+fn tool_call_ids(calls: &[&mut TrajectoryItem]) -> Vec<String> {
     calls
         .iter()
         .filter_map(|item| match &item.tool {
@@ -2450,7 +2511,7 @@ fn tool_call_ids(calls: &[TrajectoryItem]) -> Vec<String> {
         .collect()
 }
 
-fn normalize_tool_group(span: &mut [TrajectoryItem], source: Provider, group: usize) {
+fn normalize_tool_group(span: &mut [&mut TrajectoryItem], source: Provider, group: usize) {
     for item in span {
         match &mut item.tool {
             Some(
@@ -2500,7 +2561,7 @@ fn collect_import_candidates(
     history_character_limit: usize,
     tool_event_limit: usize,
     item_limits: ItemLimits,
-) -> (Vec<TrajectoryItem>, bool, Option<usize>) {
+) -> (Vec<ImportCandidate>, bool, Option<usize>) {
     let ImportEvents {
         mut events,
         incomplete: mut truncated,
@@ -2526,11 +2587,13 @@ fn collect_import_candidates(
         };
         truncated |= item_truncated;
         if reverse_candidates {
-            if candidate.kind == TrajectoryItemKind::Tool && candidate_tools >= tool_event_limit {
+            if candidate.item.kind == TrajectoryItemKind::Tool
+                && candidate_tools >= tool_event_limit
+            {
                 truncated = true;
                 continue;
             }
-            let length = candidate.text.chars().count();
+            let length = candidate.item.text.chars().count();
             if length > candidate_remaining {
                 // Older candidates cannot be retained, and their truncation flags cannot
                 // change the omission already recorded by this budget break.
@@ -2538,7 +2601,7 @@ fn collect_import_candidates(
                 break;
             }
             candidate_remaining -= length;
-            candidate_tools += usize::from(candidate.kind == TrajectoryItemKind::Tool);
+            candidate_tools += usize::from(candidate.item.kind == TrajectoryItemKind::Tool);
         } else if current_compaction
             .is_some_and(|current| std::ptr::eq(current, event.recorded_event()))
         {
@@ -2624,7 +2687,7 @@ fn import_trajectory_with_limits(
         history_character_limit,
         tool_event_limit,
         |i| {
-            let item = &candidates[i];
+            let item = &candidates[i].item;
             (
                 item.text.chars().count(),
                 item.kind == TrajectoryItemKind::Tool,
@@ -2640,7 +2703,7 @@ fn import_trajectory_with_limits(
             let Some(&i) = indices.get(remove_at) else {
                 break;
             };
-            remaining += candidates[i].text.chars().count();
+            remaining += candidates[i].item.text.chars().count();
             indices.remove(remove_at);
         }
     }
@@ -2667,9 +2730,14 @@ fn import_trajectory_with_limits(
             truncated = true;
         }
     }
-    items.extend(indices.into_iter().map(|i| candidates[i].clone()));
-
-    validate_native_tools(&mut items, snapshot.session.provider);
+    let offset = items.len();
+    items.extend(indices.iter().map(|&i| candidates[i].item.clone()));
+    let mut native = items[offset..]
+        .iter_mut()
+        .zip(indices)
+        .filter_map(|(item, i)| (!candidates[i].documentary_tool).then_some(item))
+        .collect::<Vec<_>>();
+    validate_native_tools(&mut native, snapshot.session.provider);
     let tool_events = items
         .iter()
         .filter(|item| item.kind == TrajectoryItemKind::Tool)
@@ -3563,7 +3631,12 @@ impl ContextEvents<'_> {
 
     /// Spend the tool budget on current context before earlier history. Writers emit selected entries in conversation order.
     fn prioritized_tool_events(&self) -> impl Iterator<Item = usize> {
-        (self.start..self.events.len()).chain(0..self.start)
+        let current = self.start..self.events.len();
+        current
+            .clone()
+            .filter(|&index| !claude_recovery_only(self.events[index]))
+            .chain(0..self.start)
+            .chain(current.filter(|&index| claude_recovery_only(self.events[index])))
     }
 }
 
@@ -3726,7 +3799,9 @@ fn visible_import_events(
         history.start = history
             .events
             .iter()
-            .rposition(|event| is_source_compaction_boundary(event))
+            .rposition(|event| {
+                is_source_compaction_boundary(event) && !is_claude_history_marker(event)
+            })
             .unwrap_or(0);
         history
     };
@@ -3737,13 +3812,21 @@ fn visible_import_events(
         uncertain,
         ..
     } = context;
+    if use_latest_compaction
+        && let Some(marker) = events.get(start)
+        && let Some(summary) = detached_claude_summary(snapshot, &events[..start], marker)
+    {
+        events[start] = summary;
+    }
     let boundary = events
         .get(start)
         .copied()
         .filter(|event| is_source_compaction_boundary(event));
     if start > 0 {
         // A Pi extension can compact without supplying summary text for the displaced turns.
-        if boundary.and_then(source_compaction_text).is_none() {
+        if matches!(snapshot.session.provider, Provider::Pi | Provider::OhMyPi)
+            && boundary.and_then(source_compaction_text).is_none()
+        {
             source_incomplete |= events[..start]
                 .iter()
                 .any(|event| recovery::has_recovery_content(event));
@@ -3752,12 +3835,66 @@ fn visible_import_events(
             events.drain(..start);
         }
     }
+    if use_latest_compaction && snapshot.session.provider == Provider::Claude {
+        events.retain(|event| !claude_recovery_only(event));
+    }
     ImportEvents {
         events: events.into_iter().map(Occurrence::recorded).collect(),
         incomplete: source_incomplete,
         uncertain_order: uncertain,
         current_compaction: boundary.filter(|_| !uncertain),
     }
+}
+
+fn detached_claude_summary<'a>(
+    snapshot: &CanonicalSnapshot,
+    before: &[&'a OmniEvent],
+    marker: &OmniEvent,
+) -> Option<&'a OmniEvent> {
+    let detached = |event: &OmniEvent| {
+        event.kind == EventKind::ProviderEvent
+            && event.source.raw_record_type.as_deref() == Some(CLAUDE_DETACHED_COMPACTION_PARENT)
+    };
+    let same_source = |event: &OmniEvent| {
+        event.source.provider == Provider::Claude
+            && event.source.native_session_id == snapshot.session.id
+            && event.thread_id == snapshot.thread_id
+            && event.branch_id == snapshot.branch_id
+    };
+    if !detached(marker) || snapshot.session.provider != Provider::Claude || !same_source(marker) {
+        return None;
+    }
+    let sequence = marker.payload["summary_sequence"].as_u64()?;
+    if sequence >= marker.sequence {
+        return None;
+    }
+    let start = before.partition_point(|event| event.sequence < sequence);
+    let (&summary, intervening) = before[start..].split_first()?;
+    if summary.sequence != sequence
+        || !same_source(summary)
+        || source_compaction_text(summary).is_none()
+        || intervening
+            .first()
+            .is_some_and(|event| event.sequence == sequence)
+        || intervening
+            .iter()
+            .any(|event| !detached(event) && is_source_compaction_boundary(event))
+    {
+        return None;
+    }
+    Some(summary)
+}
+
+fn is_claude_history_marker(event: &OmniEvent) -> bool {
+    event.kind == EventKind::ProviderEvent
+        && event.source.provider == Provider::Claude
+        && event.replay_policy == ReplayPolicy::HistoricalOnly
+        && !is_secret(event)
+        && match event.source.raw_record_type.as_deref() {
+            Some(CLAUDE_DETACHED_COMPACTION_PARENT) => true,
+            Some(CLAUDE_MISSING_COMPACTION_SUMMARY) => reports_omitted_events(event),
+            _ => false,
+        }
 }
 
 fn codex_import_events(
@@ -3891,6 +4028,10 @@ fn compaction_text_with_truncation(
     Some(bounded_text_with_truncation(&text, character_limit))
 }
 
+fn claude_recovery_only(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Claude && event.payload[CLAUDE_RECOVERY_ONLY] == true
+}
+
 fn positioned_codex_summary(event: &OmniEvent) -> Option<&str> {
     if event.kind != EventKind::MessageAssistant
         || event.source.provider != Provider::Codex
@@ -3908,6 +4049,9 @@ fn positioned_codex_summary(event: &OmniEvent) -> Option<&str> {
 }
 
 fn is_source_compaction_boundary(event: &OmniEvent) -> bool {
+    if claude_recovery_only(event) {
+        return false;
+    }
     if matches!(event.source.provider, Provider::Pi | Provider::OhMyPi) {
         return event.kind == EventKind::CompactionCreated
             && event.replay_policy == ReplayPolicy::Contextual
@@ -3918,7 +4062,7 @@ fn is_source_compaction_boundary(event: &OmniEvent) -> bool {
                 .and_then(serde_json::Value::as_bool)
                 != Some(true);
     }
-    starts_compacted_history(event)
+    starts_compacted_history(event) || is_claude_history_marker(event)
 }
 
 fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
@@ -3932,11 +4076,9 @@ fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
         &event.payload,
         &["summary", "text", "content", "message", "prompt"],
     )?;
-    let text = if event.source.provider == Provider::Claude {
-        claude_compaction_body(text)
-    } else {
-        text
-    };
+    if event.source.provider == Provider::Claude {
+        return claude_compaction_summary(text, true);
+    }
     (!text.trim().is_empty()).then_some(text)
 }
 
@@ -3978,45 +4120,44 @@ fn recorded_compaction_text(event: &OmniEvent) -> Option<&str> {
     }
 }
 
-fn claude_compaction_body(text: &str) -> &str {
+/// Reads a nonempty Claude summary. An unmarked anchor needs a recognized summary envelope.
+#[must_use]
+pub fn claude_compaction_summary(text: &str, is_compact_summary: bool) -> Option<&str> {
+    let body = claude_envelope_body(text).or_else(|| is_compact_summary.then_some(text))?;
+    (!body.trim().is_empty()).then_some(body)
+}
+
+fn claude_envelope_body(text: &str) -> Option<&str> {
     const INTRO: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
     const TRANSCRIPT_FOOTER: &str = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at:";
     const CONTINUATION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
     const RECENT_MESSAGES_FOOTER: &str = "The messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written without seeing them, so something it says has not happened yet may already have happened in them.";
 
-    let Some(rest) = text.strip_prefix(INTRO) else {
-        return text;
-    };
+    let rest = text.strip_prefix(INTRO)?;
     let rest = rest.trim_start();
     let rest = if let Some(reminder) =
         rest.strip_prefix("<system-reminder>\n<tools-used-before-summary>")
     {
-        let Some((_, rest)) =
-            reminder.split_once("</tools-used-before-summary>\n</system-reminder>")
-        else {
-            return text;
-        };
+        let (_, rest) = reminder.split_once("</tools-used-before-summary>\n</system-reminder>")?;
         rest.trim_start()
     } else {
         rest
     };
-    let Some(summary) = rest.strip_prefix("Summary:\n") else {
-        return text;
-    };
+    let summary = rest.strip_prefix("Summary:\n")?;
     let Some((body, footer)) = summary.rsplit_once(TRANSCRIPT_FOOTER) else {
-        return summary.trim();
+        return Some(summary.trim());
     };
     let Some((_, continuation)) = footer.trim_start().split_once('\n') else {
-        return summary.trim();
+        return Some(summary.trim());
     };
     if continuation
         .trim_start()
         .strip_prefix(CONTINUATION)
         .is_some_and(|recent| recent.trim() == RECENT_MESSAGES_FOOTER)
     {
-        body.trim()
+        Some(body.trim())
     } else {
-        summary.trim()
+        Some(summary.trim())
     }
 }
 
@@ -7122,6 +7263,54 @@ mod tests {
     }
 
     #[test]
+    fn current_claude_tools_survive_interleaved_recovery_history_at_the_export_limit() {
+        for archived in [127_u64, 128] {
+            let mut events = Vec::new();
+            for pair in 0..=archived {
+                let active = pair == archived;
+                let name = if active {
+                    "current".to_owned()
+                } else {
+                    format!("archived-{pair:03}")
+                };
+                for (offset, kind, label) in [
+                    (0, EventKind::ToolCalled, "call"),
+                    (1, EventKind::ToolCompleted, "result"),
+                ] {
+                    let mut tool = event(
+                        pair * 2 + offset,
+                        kind,
+                        json!({"text": format!("{name}-{label}")}),
+                    );
+                    tool.source.provider = Provider::Claude;
+                    if !active {
+                        tool.payload[super::CLAUDE_RECOVERY_ONLY] = json!(true);
+                    }
+                    events.push(tool);
+                }
+            }
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::Claude;
+            let mut recovery = Vec::new();
+            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            for document in [
+                String::from_utf8(recovery).unwrap(),
+                render_markdown_export(&snapshot),
+            ] {
+                let selected = [
+                    "archived-000-call",
+                    "archived-126-result",
+                    "current-call",
+                    "current-result",
+                ]
+                .map(|label| document.find(label).expect(label));
+                assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(!document.contains("archived-127-"));
+            }
+        }
+    }
+
+    #[test]
     fn native_trajectory_keeps_ordered_documentary_tools_and_redacts_secrets() {
         let snapshot = snapshot_with_events(vec![
             event(1, EventKind::MessageUser, json!({"text": "question"})),
@@ -7541,6 +7730,63 @@ mod tests {
 
         assert_eq!(trajectory.tool_events, 5);
         assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+    }
+
+    #[test]
+    fn documentary_claude_results_preserve_verified_pairs_in_both_arrival_orders() {
+        for documentary_first in [true, false] {
+            let mut events = Vec::new();
+            for verified_output in ["first round", "second round"] {
+                let call = (
+                    EventKind::ToolCalled,
+                    json!({"id":"kept", "name":"Read", "input":{}}),
+                );
+                let verified = (
+                    EventKind::ToolCompleted,
+                    json!({"tool_use_id":"kept", "content":verified_output}),
+                );
+                let retained = (
+                    EventKind::ToolFailed,
+                    json!({"tool_use_id":"earlier", "content":"retained failure", "omnisession_unpaired_result":true}),
+                );
+                let records = if documentary_first {
+                    [call, retained, verified]
+                } else {
+                    [call, verified, retained]
+                };
+                for (kind, payload) in records {
+                    let mut record = event(events.len() as u64, kind, payload);
+                    record.source.provider = Provider::Claude;
+                    events.push(record);
+                }
+            }
+
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::Claude;
+            let trajectory = import_trajectory(&snapshot);
+            let positions: Vec<_> = trajectory
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    (item.tool.is_none() && item.text.contains("retained failure")).then_some(i)
+                })
+                .collect();
+            assert_eq!(positions, if documentary_first { [1, 4] } else { [2, 5] });
+            let native = native_trajectory_signature(&trajectory);
+            let outputs: Vec<_> = native
+                .iter()
+                .filter_map(|item| match item {
+                    NativeTrajectoryItem::Tool { output, .. } => Some(output.as_str()),
+                    NativeTrajectoryItem::Message { .. } => None,
+                })
+                .collect();
+            assert_eq!(outputs, ["first round", "second round"]);
+            assert_eq!(
+                native.iter().filter(|item| matches!(item, NativeTrajectoryItem::Message { text, .. } if text.contains("retained failure"))).count(),
+                2
+            );
+        }
     }
 
     #[test]
@@ -8209,7 +8455,8 @@ mod tests {
             "\n\nKeep this user-authored qualification.\n\nThe messages after this summary",
         );
         assert!(
-            super::claude_compaction_body(&extra_footer_content)
+            super::claude_compaction_summary(&extra_footer_content, true)
+                .unwrap()
                 .contains("Keep this user-authored qualification.")
         );
     }
@@ -8255,6 +8502,57 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_claude_reference_can_only_restore_its_current_summary() {
+        let mut marker = event(
+            3,
+            EventKind::ProviderEvent,
+            json!({"summary_sequence":1,"native_history_unverified":true}),
+        );
+        marker.source.raw_record_type = Some(super::CLAUDE_DETACHED_COMPACTION_PARENT.to_owned());
+        let mut snapshot = snapshot_with_events(vec![
+            compaction(0, Provider::Claude, "Superseded summary"),
+            compaction(1, Provider::Claude, "Current summary"),
+            event(2, EventKind::MessageUser, json!({"text":"Discarded turn"})),
+            marker,
+            event(
+                4,
+                EventKind::MessageAssistant,
+                json!({"text":"Continuation"}),
+            ),
+        ]);
+        snapshot.session.provider = Provider::Claude;
+        for event in &mut snapshot.events {
+            event.source.provider = Provider::Claude;
+        }
+
+        let selected = import_conversation(&snapshot);
+        assert!(selected.truncated);
+        assert_eq!(selected.messages.len(), 2);
+        assert_eq!(selected.messages[0].role, HandoffRole::Assistant);
+        assert!(selected.messages[0].text.ends_with("\nCurrent summary"));
+        assert_eq!(selected.messages[1].text, "Continuation");
+        let tail = &selected.messages[1..];
+
+        for reference in [json!(0), json!(2), json!(4), json!("1"), json!(null)] {
+            let mut invalid = snapshot.clone();
+            invalid.events[3].payload["summary_sequence"] = reference;
+            assert_eq!(import_conversation(&invalid).messages.as_slice(), tail);
+        }
+        let invalid_sources: [fn(&mut OmniEvent); 5] = [
+            |event| event.source.provider = Provider::Codex,
+            |event| event.source.native_session_id.push_str("-other"),
+            |event| event.thread_id = Uuid::from_u128(99),
+            |event| event.branch_id = Uuid::from_u128(99),
+            |event| event.replay_policy = ReplayPolicy::HistoricalOnly,
+        ];
+        for alter in invalid_sources {
+            let mut invalid = snapshot.clone();
+            alter(&mut invalid.events[1]);
+            assert_eq!(import_conversation(&invalid).messages.as_slice(), tail);
+        }
+    }
+
+    #[test]
     fn compaction_fidelity_distinguishes_provider_summary_from_import_omissions() {
         let snapshot = snapshot_with_events(vec![compaction(0, Provider::Claude, "Task summary.")]);
 
@@ -8286,10 +8584,16 @@ mod tests {
         let known_intro = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
         let unknown_footer = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /synthetic/transcript.jsonl\nKeep this user-authored explanation.";
         let unknown = "An unknown compaction envelope.\nSummary:\nRetain all source text.";
-        assert_eq!(super::claude_compaction_body(unknown), unknown);
+        assert_eq!(
+            super::claude_compaction_summary(unknown, true),
+            Some(unknown)
+        );
         let body = format!("Retain these constraints.{unknown_footer}");
         let wrapped = format!("{known_intro}\n\nSummary:\n{body}");
-        assert_eq!(super::claude_compaction_body(&wrapped), body);
+        assert_eq!(
+            super::claude_compaction_summary(&wrapped, true),
+            Some(body.as_str())
+        );
         let other_provider = compaction(0, Provider::Codex, &wrapped);
         assert_eq!(
             super::source_compaction_text(&other_provider),

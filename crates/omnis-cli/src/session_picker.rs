@@ -6769,7 +6769,7 @@ mod tests {
                 .send(PickerUpdate::Preview {
                     read_revision: None,
                     workspace: None,
-                    key,
+                    key: Box::new(key),
                     value: PreviewValue::Ready {
                         preview: Box::new(SessionPreview {
                             workspace_root: Some(workspace.to_path_buf()),

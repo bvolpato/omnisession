@@ -886,28 +886,33 @@ fn native_resume_workspace(
             return Ok((current, true));
         }
     }
-    let session = registry
-        .find_native_session(request.source.provider, &request.source.id)?
-        .with_context(|| format!("finding `{}` metadata", request.source))?;
+    let recorded = if matches!(request.source.provider, Provider::Pi | Provider::OhMyPi) {
+        registry
+            .adapter(request.source.provider)?
+            .native_workspace(&request.source)?
+            .and_then(|workspace| workspace.directory)
+    } else {
+        registry
+            .find_native_session(request.source.provider, &request.source.id)?
+            .with_context(|| format!("finding `{}` metadata", request.source))?
+            .project_path
+    };
     if request.target == Provider::CursorCli {
         return cursor_session_workspace(
             request.target,
-            session.project_path.as_deref(),
+            recorded.as_deref(),
             &current,
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
         );
     }
-    let matches = session
-        .project_path
+    let matches = recorded
         .as_deref()
         .is_some_and(|recorded| workspace_paths_match(recorded, &current));
     if matches || args.allow_workspace_mismatch {
         return Ok((current, matches));
     }
-    let recorded = session
-        .project_path
-        .context("source session has no recorded workspace")?;
+    let recorded = recorded.context("source session has no recorded workspace")?;
     bail!(
         "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
         safe_terminal_line(&recorded.display().to_string()),

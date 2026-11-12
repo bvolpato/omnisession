@@ -97,7 +97,7 @@ pub(super) enum PickerUpdate {
     ResumeIndex(Vec<NativeSession>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
-        key: PreviewKey,
+        key: Box<PreviewKey>,
         value: PreviewValue,
         read_revision: Option<SourceRevision>,
         workspace: Option<Box<omnis_store::CodexWorkspaceUpdate>>,
@@ -895,7 +895,7 @@ fn codex_preview_update(
         }
     });
     PickerUpdate::Preview {
-        key,
+        key: Box::new(key),
         value,
         read_revision,
         workspace,
@@ -945,7 +945,7 @@ pub(super) fn spawn_preview_updates(
                     )
                     .unwrap_or((PreviewValue::Unavailable, None));
                     PickerUpdate::Preview {
-                        key,
+                        key: Box::new(key),
                         value,
                         read_revision,
                         workspace: None,
@@ -1382,7 +1382,7 @@ pub(super) fn receive_updates(
                 workspace,
             } => {
                 let session = key.session.clone();
-                if state.accept_preview(key, value, read_revision)
+                if state.accept_preview(*key, value, read_revision)
                     && let Some(workspace) = workspace
                 {
                     state.remember_codex_workspaces([(session, *workspace)]);

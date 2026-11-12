@@ -105,7 +105,7 @@ fn rebuilding_claude_search_removes_a_title_from_an_ambiguous_turn() {
     let search = || fixture.search_json(&["oldtitleneedle", "--provider", "claude"]);
     assert!(result_sessions(&search()).is_empty());
     let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    for version in [7, 8] {
+    for version in [7, 8, 11] {
         database.execute("UPDATE session_trajectories SET derived_title='oldtitleneedle', document_version=?1 WHERE provider='claude'", [version]).unwrap();
         let rebuilt = search();
         assert_eq!(rebuilt["index"]["indexed"], 1);
