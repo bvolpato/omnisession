@@ -280,7 +280,15 @@ pub(crate) fn nested_files_matching(
     depth: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
-    nested_files_with_limit(
+    nested_file_inventory(root, depth, include).0
+}
+
+pub(crate) fn nested_file_inventory(
+    root: &Path,
+    depth: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
+    nested_inventory_with_limit(
         root,
         depth,
         MAX_DISCOVERED_FILES,
@@ -289,6 +297,7 @@ pub(crate) fn nested_files_matching(
     )
 }
 
+#[cfg(test)]
 fn nested_files_with_limit(
     root: &Path,
     depth: usize,
@@ -296,6 +305,16 @@ fn nested_files_with_limit(
     entry_limit: usize,
     include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
+    nested_inventory_with_limit(root, depth, file_limit, entry_limit, include).0
+}
+
+fn nested_inventory_with_limit(
+    root: &Path,
+    depth: usize,
+    file_limit: usize,
+    entry_limit: usize,
+    include: &dyn Fn(&Path, bool) -> bool,
+) -> (Vec<PathBuf>, bool) {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
@@ -357,7 +376,8 @@ fn nested_files_with_limit(
         );
     }
     output.sort();
-    output
+    let limited = output.len() == file_limit || entries_left == 0;
+    (output, limited)
 }
 
 pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
@@ -603,6 +623,52 @@ impl SnapshotFileStamp {
         let mut copy = File::create(target)?;
         let bytes = io::copy(&mut (&mut source).take(self.len), &mut copy)?;
         Ok(bytes == self.len && *self == Self::from_metadata(&source.metadata()?)?)
+    }
+}
+
+/// Physical identity of a selected transcript for search cache validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptRevision {
+    pub bytes: i64,
+    pub modified: DateTime<Utc>,
+    pub key: i64,
+}
+
+impl TranscriptRevision {
+    /// Reads the path, size, write time and platform file identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file metadata cannot be read.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let path = path.canonicalize()?;
+        let stamp = SnapshotFileStamp::read(&path)?;
+        let modified = DateTime::<Utc>::from(stamp.modified);
+        let mut hash = Sha256::new();
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update(stamp.len.to_le_bytes());
+        hash.update(modified.timestamp().to_le_bytes());
+        hash.update(modified.timestamp_subsec_nanos().to_le_bytes());
+        if let Some((device, inode, seconds, nanos)) = stamp.unix_identity {
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+            hash.update(nanos.to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        if let Some(created) = stamp.created {
+            let created = DateTime::<Utc>::from(created);
+            hash.update(created.timestamp().to_le_bytes());
+            hash.update(created.timestamp_subsec_nanos().to_le_bytes());
+        }
+        let digest = hash.finalize();
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            bytes: i64::try_from(stamp.len).map_err(io::Error::other)?,
+            modified,
+            key: i64::from_le_bytes(prefix),
+        })
     }
 }
 

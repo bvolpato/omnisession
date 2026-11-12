@@ -2803,6 +2803,11 @@ impl Branch {
         (!node.events.is_empty()).then_some(ResponseUnit::Record(index))
     }
 
+    pub(super) fn response_identity(&self, node: usize) -> Option<(&ResponseId, Option<&str>)> {
+        let node = &self.nodes[node];
+        Some((node.response.as_ref()?, node.writer.as_deref()))
+    }
+
     pub(super) fn fold_response_metadata(&self, events: &mut Vec<ClaudeEvent>) {
         let mut first = HashMap::<_, usize>::new();
         let mut kept = 0;

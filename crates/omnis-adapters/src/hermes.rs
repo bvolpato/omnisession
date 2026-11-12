@@ -135,38 +135,12 @@ impl HermesAdapter {
             })
         })
     }
-}
 
-impl Default for HermesAdapter {
-    fn default() -> Self {
-        Self {
-            root: provider_root("HERMES_HOME", &[".hermes"]),
-            snapshots: Arc::default(),
-        }
-    }
-}
-
-impl ProviderAdapter for HermesAdapter {
-    fn provider(&self) -> Provider {
-        Provider::Hermes
-    }
-
-    fn probe(&self) -> ProviderInstallation {
-        let executable = provider_executable(Provider::Hermes);
-        ProviderInstallation {
-            provider: Provider::Hermes,
-            installed: executable.is_some() || self.database().is_ok(),
-            executable,
-            data_root: self.root.clone(),
-        }
-    }
-
-    fn discovery_is_complete(&self) -> bool {
-        // A missing database is not evidence that previously cached sessions were deleted.
-        self.database().is_ok()
-    }
-
-    fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+    fn native_sessions(
+        &self,
+        project: Option<&Path>,
+        id: Option<&str>,
+    ) -> Result<Vec<NativeSession>> {
         let Some(root) = self.root.as_deref() else {
             return Ok(Vec::new());
         };
@@ -175,7 +149,7 @@ impl ProviderAdapter for HermesAdapter {
         }
         self.with_snapshot(|connection| {
             validate_schema(connection)?;
-            let mut statement = connection.prepare(
+            let mut query = String::from(
                 "SELECT s.id, s.title, s.cwd, s.git_branch, s.started_at, s.ended_at, \
                     s.message_count, \
                     (SELECT MAX(m.timestamp) FROM messages m \
@@ -185,12 +159,13 @@ impl ProviderAdapter for HermesAdapter {
                        AND m.content IS NOT NULL AND TRIM(m.content) != '' \
                      ORDER BY m.id LIMIT 1) \
              FROM sessions s \
-             WHERE COALESCE(s.archived, 0) = 0 \
-             ORDER BY COALESCE((SELECT MAX(m.timestamp) FROM messages m \
-                                WHERE m.session_id = s.id AND m.active = 1), \
-                               s.ended_at, s.started_at) DESC, s.id",
-            )?;
-            let rows = statement.query_map([], |row| {
+             WHERE COALESCE(s.archived, 0) = 0",
+            );
+            if id.is_some() {
+                query.push_str(" AND s.id = ?1");
+            }
+            let mut statement = connection.prepare(&query)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(id), |row| {
                 Ok(SessionMetadata {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -249,6 +224,44 @@ impl ProviderAdapter for HermesAdapter {
             sort_sessions(&mut sessions);
             Ok(sessions)
         })
+    }
+}
+
+impl Default for HermesAdapter {
+    fn default() -> Self {
+        Self {
+            root: provider_root("HERMES_HOME", &[".hermes"]),
+            snapshots: Arc::default(),
+        }
+    }
+}
+
+impl ProviderAdapter for HermesAdapter {
+    fn provider(&self) -> Provider {
+        Provider::Hermes
+    }
+
+    fn probe(&self) -> ProviderInstallation {
+        let executable = provider_executable(Provider::Hermes);
+        ProviderInstallation {
+            provider: Provider::Hermes,
+            installed: executable.is_some() || self.database().is_ok(),
+            executable,
+            data_root: self.root.clone(),
+        }
+    }
+
+    fn discovery_is_complete(&self) -> bool {
+        // A missing database is not evidence that previously cached sessions were deleted.
+        self.database().is_ok()
+    }
+
+    fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        self.native_sessions(project, None)
+    }
+
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        Ok(self.native_sessions(None, Some(id))?.pop())
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {

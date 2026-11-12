@@ -188,8 +188,11 @@ impl IndexCandidate {
             source_revision: crate::selected_search_source(session, false).unwrap_or_default(),
             document_version: search_document_version(provider),
             listed_name: None,
-            metadata: matches!(provider, Provider::Codex | Provider::Grok)
-                .then(|| crate::indexed_session_metadata(session)),
+            metadata: matches!(
+                provider,
+                Provider::Codex | Provider::Pi | Provider::OhMyPi | Provider::Grok
+            )
+            .then(|| crate::indexed_session_metadata(session)),
         })
     }
 
@@ -231,6 +234,7 @@ impl IndexCandidate {
         store: &Store,
         guard: TrajectorySourceGuard,
     ) -> omnis_store::Result<()> {
+        select_pi_candidates(store, std::slice::from_ref(self))?;
         selections.write(&[self.file_check(guard)], |verify| {
             store.record_observed_trajectory_index_failure_checked(
                 &self.session,
@@ -903,6 +907,38 @@ fn database_catalogs_needing_read(
     Ok(stale)
 }
 
+fn select_pi_candidates<'a>(
+    store: &Store,
+    candidates: impl IntoIterator<Item = &'a IndexCandidate>,
+) -> omnis_store::Result<()> {
+    let copies = candidates
+        .into_iter()
+        .filter(|c| matches!(c.session.provider, Provider::Pi | Provider::OhMyPi))
+        .filter_map(|c| {
+            let metadata = c.metadata.as_ref()?;
+            let workspace = metadata.project_path.clone()?;
+            let revision = c
+                .source_path
+                .as_deref()
+                .filter(|p| {
+                    omnis_adapters::source_file_revision(p)
+                        .is_some_and(|current| current.matches_file_contents(c.source_revision))
+                })
+                .and_then(|p| omnis_adapters::TranscriptRevision::read(p).ok())
+                .map(|r| r.key);
+            Some((
+                workspace,
+                IndexedSession {
+                    source_path: c.source_path.clone(),
+                    ..metadata.clone()
+                },
+                revision,
+            ))
+        })
+        .collect::<Vec<_>>();
+    store.select_pi_workspaces(&copies)
+}
+
 fn listed_codex_names<'a>(
     registry: &AdapterRegistry,
     candidates: impl Iterator<Item = &'a IndexCandidate>,
@@ -1030,10 +1066,11 @@ fn indexed_database_catalogs(
 fn pending(
     registry: &AdapterRegistry,
     store: &Store,
-    candidates: Vec<IndexCandidate>,
+    mut candidates: Vec<IndexCandidate>,
     retry_failed: bool,
     verify_current_names: bool,
 ) -> Result<Pending> {
+    select_pi_candidates(store, &candidates)?;
     hide_unavailable_grok_sources(registry, store)?;
     let includes_provider = |provider| {
         candidates
@@ -1063,7 +1100,6 @@ fn pending(
     let mut stale = Vec::new();
     let mut recovered = Vec::new();
     let mut titles = Vec::new();
-    let mut candidates = candidates;
     if verify_current_names {
         bind_listed_codex_names(registry, &mut candidates)?;
     }
@@ -1204,6 +1240,9 @@ fn observe_replacements(
         .map(|row| (&row.session, row))
         .collect::<HashMap<_, _>>();
     for (candidate, guard, _) in stale {
+        if !matches!(candidate.session.provider, Provider::Codex | Provider::Grok) {
+            continue;
+        }
         let Some(metadata) = &candidate.metadata else {
             continue;
         };
@@ -1231,6 +1270,7 @@ fn guard_index_reads(
     failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
 ) -> Result<Vec<(IndexCandidate, TrajectorySourceGuard, ReadBudget)>> {
     let mut jobs = Vec::with_capacity(stale.len());
+    select_pi_candidates(store, stale.iter().map(|(candidate, _)| candidate))?;
     for (candidate, prior) in stale {
         if matches!(candidate.session.provider, Provider::Codex | Provider::Grok) {
             let provider = candidate.session.provider;
@@ -1293,6 +1333,46 @@ fn guard_index_reads(
 ///
 /// Returns an error only when the index state cannot be read. Unreadable sessions are counted.
 pub(crate) fn index_candidates(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+    stop: &dyn Fn() -> bool,
+    report: &mut dyn FnMut(IndexProgress),
+) -> Result<IndexSummary> {
+    let mut counts = HashMap::<SessionRef, usize>::new();
+    let mut batches = Vec::<Vec<IndexCandidate>>::new();
+    for candidate in candidates {
+        let index = if matches!(candidate.session.provider, Provider::Pi | Provider::OhMyPi) {
+            let n = counts.entry(candidate.session.clone()).or_default();
+            *n += 1;
+            *n - 1
+        } else {
+            0
+        };
+        if index == batches.len() {
+            batches.push(Vec::new());
+        }
+        batches[index].push(candidate);
+    }
+    let mut result = IndexSummary::default();
+    for batch in batches {
+        let indexed =
+            index_distinct_candidates(registry, store, batch, retry_failed, stop, report)?;
+        result.candidates += indexed.candidates;
+        result.indexed += indexed.indexed;
+        result.stale += indexed.stale;
+        result.failed += indexed.failed;
+        result.failed_skipped += indexed.failed_skipped;
+        result.stopped |= indexed.stopped;
+        if result.stopped {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn index_distinct_candidates(
     registry: &AdapterRegistry,
     store: &Store,
     candidates: Vec<IndexCandidate>,
@@ -1744,7 +1824,8 @@ fn flush_batch(
             prepared.verified_metadata.as_ref(),
         )
     });
-    let stored = selections.write_documents(store, &checks, documents);
+    let stored = select_pi_candidates(store, batch.iter().map(|prepared| &prepared.candidate))
+        .and_then(|()| selections.write_documents(store, &checks, documents));
     if let Ok(indexed) = stored {
         summary.indexed += indexed;
         for prepared in batch.drain(..) {
@@ -2468,11 +2549,19 @@ impl PreparedIndex {
         store: &Store,
         titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
     ) {
-        titles.extend(stored_title_update(
-            registry,
-            store,
-            &self.candidate.session,
-        ));
+        if let Some((mut session, record)) =
+            stored_title_update(registry, store, &self.candidate.session)
+        {
+            if matches!(session.provider, Provider::Pi | Provider::OhMyPi)
+                && let Some(path) = Store::pi_file_key(
+                    Some(self.candidate.source_revision),
+                    self.candidate.source_path.as_deref(),
+                )
+            {
+                session.id = crate::pi_copy_selector(&session.id, &path);
+            }
+            titles.push((session, record));
+        }
     }
 
     fn store(
@@ -2480,6 +2569,7 @@ impl PreparedIndex {
         selections: &mut FileSelections<'_>,
         store: &Store,
     ) -> omnis_store::Result<usize> {
+        select_pi_candidates(store, std::slice::from_ref(&self.candidate))?;
         selections.write_documents(
             store,
             &[self.candidate.file_check(self.guard)],
@@ -3465,6 +3555,11 @@ mod tests {
                     }
                 },
             )?;
+            let first = adapter
+                .selected_session_at("same", &root.join("first.jsonl"))?
+                .unwrap();
+            let failed_copy = IndexCandidate::from_session(&first).unwrap();
+            select_pi_candidates(&store, &[failed_copy])?;
             let failure = store.trajectory_index_failures()?[&original.session];
             assert_eq!(
                 failure.source_file,
@@ -3546,15 +3641,15 @@ mod tests {
                 .is_empty()
         );
 
+        let failed_copy = selected()?;
         let withdrawn = temp.path().join("withdrawn");
         fs::rename(&duplicate_dir, &withdrawn)?;
+        select_pi_candidates(&store, std::slice::from_ref(&original))?;
         let guard = store.observe_verified_session(&original.session)?;
         let delayed = prepare_session(&registry, &original, guard, full, Some(&store))?;
         fs::rename(&withdrawn, &duplicate_dir)?;
-        assert!(matches!(
-            delayed.store(&mut FileSelections::new(&registry), &store),
-            Err(omnis_store::StoreError::TrajectorySourceChanged)
-        ));
+        delayed.store(&mut FileSelections::new(&registry), &store)?;
+        select_pi_candidates(&store, &[failed_copy])?;
         assert!(store.trajectory_index_failure(&original.session)?.is_some());
 
         fs::remove_file(duplicate)?;

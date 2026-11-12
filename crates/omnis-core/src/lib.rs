@@ -88,16 +88,16 @@ impl NativeSessionName {
 }
 
 /// Base version of the indexed search document.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 7;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 10;
 
 /// Version of the searchable content produced for this provider.
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity | Provider::Codex => 11,
-        Provider::OhMyPi => 10,
-        Provider::AntigravityDesktop => 9,
-        Provider::Pi | Provider::Claude => 8,
+        Provider::Antigravity | Provider::AntigravityDesktop | Provider::OhMyPi | Provider::Pi => {
+            11
+        }
+        Provider::Claude | Provider::Codex => 12,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -106,7 +106,7 @@ pub const fn search_document_version(provider: Provider) -> u32 {
 #[must_use]
 pub const fn imported_search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Claude | Provider::Pi | Provider::OhMyPi | Provider::Codex => {
+        Provider::Pi | Provider::OhMyPi | Provider::Codex | Provider::Claude => {
             search_document_version(provider)
         }
         _ => SEARCH_DOCUMENT_VERSION,

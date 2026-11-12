@@ -21,6 +21,157 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
+    for upgrade in [false, true] {
+        let fixture = Fixture::new();
+        let transcript = fixture
+            .root
+            .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+        let direct = |text: &str| json!({"type":"user", "cwd":fixture.workspace, "message":{"role":"user","content":text}});
+        let mut ambiguous = direct("ambiguousneedle");
+        ambiguous["isSidechain"] = json!("broken");
+        write_jsonl(
+            &transcript,
+            &[
+                direct("Synthetic opening"),
+                direct("firstneedle"),
+                ambiguous.clone(),
+                direct("lastneedle"),
+            ],
+        );
+        if upgrade {
+            let state = fixture.root.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let store = omnis_store::Store::open(state.join("store.sqlite3")).unwrap();
+            let cached = "ambiguousneedle";
+            store
+                .upsert_trajectory_document(
+                    &omnis_ir::SessionRef::new(omnis_ir::Provider::Claude, CLAUDE_ID),
+                    &omnis_store::TrajectoryDocument {
+                        projection: None,
+                        source_revision: omnis_ir::SourceRevision::default(),
+                        provider_limited: false,
+                        title_authoritative: false,
+                        title_is_verified: false,
+                        local_opener: omnis_store::LocalOpenerEvidence::Unknown,
+                        withdrawn_title: None,
+                        redacted_text: cached,
+                        source_updated_at: chrono::Utc::now(),
+                        source_byte_count: cached.len(),
+                        indexed_byte_count: cached.len(),
+                        truncation_strategy: "none",
+                        source_complete: true,
+                        origin: omnis_store::SessionTrajectoryOrigin::Native,
+                        document_version: 7,
+                        derived_title: None,
+                    },
+                )
+                .unwrap();
+        }
+        let search = |text: &str| fixture.search_json(&[text, "--provider", "claude"]);
+        let excluded = search("ambiguousneedle");
+        assert_eq!(excluded["index"]["indexed"], 1);
+        assert!(result_sessions(&excluded).is_empty());
+        for marker in ["firstneedle", "lastneedle"] {
+            let found = search(marker);
+            assert_eq!(found["index"]["indexed"], 0);
+            assert_eq!(found["results"][0]["coverage"], "preview", "{found}");
+        }
+        write_jsonl(&transcript, &[ambiguous]);
+        let output = fixture
+            .command()
+            .args(["show", "--json", &format!("claude:{CLAUDE_ID}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["events"][0]["payload"]["omitted_events"], 1);
+        assert!(!shown.to_string().contains("ambiguousneedle"));
+    }
+}
+
+#[test]
+fn rebuilding_claude_search_removes_a_title_from_an_ambiguous_turn() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    write_jsonl(
+        &path,
+        &[
+            json!({"type":"user","teamName":42,"cwd":fixture.workspace,"message":{"role":"user","content":"oldtitleneedle"}}),
+        ],
+    );
+    let search = || fixture.search_json(&["oldtitleneedle", "--provider", "claude"]);
+    assert!(result_sessions(&search()).is_empty());
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    for version in [7, 8, 11] {
+        database.execute("UPDATE session_trajectories SET derived_title='oldtitleneedle', document_version=?1 WHERE provider='claude'", [version]).unwrap();
+        let rebuilt = search();
+        assert_eq!(rebuilt["index"]["indexed"], 1);
+        assert!(result_sessions(&rebuilt).is_empty());
+    }
+}
+
+#[test]
+fn unknown_ownership_on_an_invisible_metadata_row_keeps_complete_search_coverage() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    let mut rows: Vec<Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows.push(json!({"type":"user","isMeta":true,"isSidechain":"broken","message":{"role":"user","content":"invisiblemarker"}}));
+    rows.push(json!({"type":"progress","isSidechain":"broken","data":{"type":"hook_progress"}}));
+    let mut chunk = json!({"type":"assistant","message":{"id":"response","role":"assistant","model":"synthetic","usage":{"output_tokens":15}}});
+    let confirmed = chunk.clone();
+    chunk["teamName"] = json!(42);
+    rows.push(chunk.clone());
+    rows.push(confirmed);
+    rows.push(chunk);
+    rows.push(json!({"type":"system","subtype":"compact_boundary","isSidechain":"unknown"}));
+    write_jsonl(&path, &rows);
+    let result = fixture.search_json(&["zebracorn", "--provider", "claude"]);
+    assert_eq!(result["results"][0]["coverage"], "complete");
+}
+
+#[test]
+fn cached_search_repairs_titles_saved_by_an_older_picker() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("state");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("store.sqlite3");
+    omnis_store::Store::open(&path).unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute(
+            "INSERT INTO session_index (provider, session_id, title, event_count, indexed_at)
+             VALUES ('claude', ?1, ?3, 0, 0), ('codex', ?2, ?3, 0, 0)",
+            [CLAUDE_ID, CODEX_ID, "Archived example, password=fixture"],
+        )
+        .unwrap();
+
+    let result = fixture.search_json(&["Archived", "--all-projects", "--cached", "--show-text"]);
+    let expected = "Archived example, password=[REDACTED: PASSWORD]";
+    // Legacy Codex metadata has no verified provider home. Its stored title is still redacted.
+    assert_eq!(result_sessions(&result), [format!("claude:{CLAUDE_ID}")]);
+    assert_eq!(result["results"][0]["title"], expected);
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM session_index WHERE title = ?1",
+                [expected],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
 fn a_missing_current_rollout_revokes_only_its_cached_session_after_incomplete_discovery() {
     let source = format!("codex:{CODEX_ID}");
     for command in [
@@ -1709,6 +1860,7 @@ fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
     let store = Store::open(state.join("store.sqlite3")).unwrap();
     store
         .upsert_indexed_session(&IndexedSession {
+            source_path: None,
             session: native.session.clone(),
             source_revision: native.source_revision,
             title: Some("Amber Heron".into()),

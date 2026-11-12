@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Transaction};
 
-use super::{Result, STORE_FORMAT, StoreError, database_error, immediate_transaction};
+use super::{Result, StoreError, database_error, immediate_transaction};
 
 /// Replaces the format 1 unique keys without changing the trajectory IDs that own FTS chunks.
 pub(super) fn initialize(
@@ -34,11 +34,8 @@ fn migrate(
     let version: i64 = transaction
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(database_error)?;
-    if version == STORE_FORMAT {
+    if version >= 2 {
         return Ok(());
-    }
-    if version > STORE_FORMAT {
-        return Err(StoreError::NewerStoreFormat);
     }
     // Format 1 clients still use the old receipt keys if the parent-table swap rolls back.
     prepare_receipts(&transaction)?;
@@ -81,7 +78,7 @@ fn migrate(
         return Err(StoreError::CorruptStore);
     }
     transaction
-        .pragma_update(None, "user_version", STORE_FORMAT)
+        .pragma_update(None, "user_version", 2)
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)
 }
@@ -201,7 +198,7 @@ mod tests {
             .borrow()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(format, STORE_FORMAT);
+        assert_eq!(format, crate::STORE_FORMAT);
         assert_eq!(
             store
                 .connection
