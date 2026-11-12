@@ -843,3 +843,77 @@ fn only_a_supported_flat_header_can_resume_as_legacy() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn codex_launch_rechecks_the_selected_thread_after_a_concurrent_database_write() -> Result<()> {
+    use omnis_adapters::{CodexLaunchOverrides, EnvChange};
+    use std::cell::Cell;
+
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().canonicalize()?;
+    let day = home.join("sessions/2026/01/01");
+    fs::create_dir_all(&day)?;
+    let selected = day.join(format!(
+        "rollout-2026-01-01T00-00-00-{THREAD}_{SELECTED}.jsonl"
+    ));
+    let other = day.join(format!(
+        "rollout-2026-01-01T01-00-00-{THREAD}_{ABANDONED}.jsonl"
+    ));
+    fs::write(&selected, rollout("selected history"))?;
+    fs::write(&other, rollout("other history"))?;
+    let state = home.join("~/state");
+    fs::create_dir_all(&state)?;
+    for directory in [&home, &state] {
+        let db = rusqlite::Connection::open(directory.join("state_5.sqlite"))?;
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)")?;
+        db.execute(
+            "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+            [THREAD, selected.to_str().unwrap()],
+        )?;
+    }
+    let db = rusqlite::Connection::open(state.join("state_5.sqlite"))?;
+    let adapter = CodexAdapter::with_root(&home);
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let options = CodexLaunchOverrides {
+        environment: Some(EnvChange::Set {
+            name: "CODEX_SQLITE_HOME".into(),
+            value: "~/state".into(),
+        }),
+        ..Default::default()
+    };
+    let launch_during = |write: &dyn Fn() -> Result<()>| -> Result<Option<std::path::PathBuf>> {
+        // Resolving the literal tilde a second time puts the write just before the final lookup.
+        let resolutions = Cell::new(0);
+        let launch =
+            adapter.codex_continuation_sqlite_home(Some(&session), &home, &options, &|| {
+                resolutions.set(resolutions.get() + 1);
+                if resolutions.get() == 2 {
+                    write()?;
+                }
+                Ok(false)
+            })?;
+        assert!(resolutions.get() >= 2);
+        Ok(launch)
+    };
+    let update = |id: &str| -> Result<()> {
+        db.execute(
+            "INSERT OR REPLACE INTO threads VALUES (?1, ?2, 'paginated')",
+            [id, other.to_str().unwrap()],
+        )?;
+        Ok(())
+    };
+    assert_eq!(launch_during(&|| update(ABANDONED))?, Some(state.clone()));
+    assert_eq!(launch_during(&|| update(THREAD))?, None);
+
+    db.execute("DELETE FROM threads WHERE id = ?1", [THREAD])?;
+    fs::remove_file(&other)?;
+    assert_eq!(launch_during(&|| update(ABANDONED))?, Some(state));
+    assert_eq!(
+        launch_during(&|| {
+            fs::write(&other, rollout("new filename selection"))?;
+            update(ABANDONED)
+        })?,
+        None
+    );
+    Ok(())
+}
