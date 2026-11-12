@@ -523,12 +523,24 @@ fn cached_search_sessions(
         Some(provider) => store.indexed_sessions_for_provider(provider)?,
         None => store.indexed_sessions()?,
     };
-    if !args.all_projects
-        && args
-            .provider
-            .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
+    if args
+        .provider
+        .is_none_or(|p| matches!(p, Provider::Pi | Provider::OhMyPi))
     {
-        let copies = store.cached_pi_copies(&pi_workspace_key(project))?;
+        let copies = if args.all_projects {
+            let mut copies = Vec::new();
+            let projects: HashSet<_> = store
+                .duplicate_pi_projects()?
+                .into_values()
+                .flatten()
+                .collect();
+            for copy_project in projects {
+                copies.extend(store.cached_pi_copies(&copy_project)?);
+            }
+            copies
+        } else {
+            store.cached_pi_copies(&pi_workspace_key(project))?
+        };
         let keys = copies.iter().map(|s| &s.session).collect::<HashSet<_>>();
         indexed.retain(|s| !keys.contains(&s.session));
         indexed.extend(
@@ -578,6 +590,48 @@ struct SearchHit<'a> {
     conversation: Option<SessionTrajectoryMatch>,
 }
 
+fn select_pi_search_copies(
+    registry: &AdapterRegistry,
+    store: &Store,
+    args: &SearchArgs,
+    project: &Path,
+    sessions: &mut Vec<NativeSession>,
+    index: &mut search_index::IndexSummary,
+    json_output: bool,
+) -> Result<()> {
+    if args.all_projects && !args.cached {
+        for copies in pi_index_batches(registry, args.provider)? {
+            if !index.stopped {
+                let candidates = search_index::ordered_candidates(&copies, Some(project));
+                let extra = if args.no_index {
+                    search_index::pending_summary(store, candidates)?
+                } else {
+                    index_with_interrupt(registry, store, candidates, false, !json_output)?
+                };
+                index.candidates += extra.candidates;
+                index.stale += extra.stale;
+                index.indexed += extra.indexed;
+                index.failed += extra.failed;
+                index.failed_skipped += extra.failed_skipped;
+                index.stopped |= extra.stopped;
+            }
+            sessions.extend(copies);
+        }
+    }
+    let duplicates = store.duplicate_pi_projects()?;
+    for session in sessions {
+        if duplicates.contains_key(&session.session)
+            && let Some(path) = &session.project_path
+        {
+            let workspace = pi_workspace_key(path);
+            let id = pi_copy_selector(&session.session.id, &workspace);
+            store.alias_pi_document(&session.session, &workspace, &id)?;
+            session.session.id = id;
+        }
+    }
+    Ok(())
+}
+
 fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: bool) -> Result<()> {
     let query = args.query.join(" ");
     if query.trim().is_empty() {
@@ -610,8 +664,8 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     let mut seen = HashSet::new();
-    sessions.retain(|session| seen.insert(session.session.clone()));
-    let index = if args.cached {
+    sessions.retain(|session| seen.insert((session.session.clone(), session.project_path.clone())));
+    let mut index = if args.cached {
         search_index::IndexSummary {
             candidates: sessions.len(),
             ..search_index::IndexSummary::default()
@@ -624,6 +678,15 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
+    select_pi_search_copies(
+        registry,
+        &store,
+        args,
+        &project,
+        &mut sessions,
+        &mut index,
+        json_output,
+    )?;
     let titles = store
         .trajectory_titles()
         .context("reading derived session titles")?;
@@ -1889,6 +1952,38 @@ fn session_json(session: &NativeSession) -> Value {
     })
 }
 
+fn pi_copy_selector(id: &str, workspace: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{id}@workspace={}",
+        hex::encode(Sha256::digest(workspace.as_os_str().as_encoded_bytes()))
+    )
+}
+
+fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Result<SessionRef> {
+    if !matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
+        return Ok(session);
+    }
+    let qualified = session
+        .id
+        .rsplit_once("@workspace=")
+        .map(|(id, _)| id.to_owned());
+    let selector = session.id.clone();
+    if let Some(id) = &qualified {
+        session.id.clone_from(id);
+    }
+    let projects = Store::open_default()?.duplicate_pi_projects()?;
+    if let Some(projects) = projects.get(&session) {
+        let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;
+        registry
+            .adapter(session.provider)?
+            .bind_workspace_copy(&session, workspace)?;
+    } else if qualified.is_some() {
+        bail!("the selected Pi workspace copy is unavailable");
+    }
+    Ok(session)
+}
+
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {
     if selector.contains(':') {
         let mut session = selector.parse::<SessionRef>()?;
@@ -1902,7 +1997,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
                 })?
                 .to_string();
         }
-        return Ok(session);
+        return resolve_pi_copy(registry, session);
     }
     if selector.trim().is_empty() {
         bail!("session ID cannot be empty");
@@ -1947,7 +2042,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
             safe_terminal_line(&selected.to_string())
         ))?;
     }
-    Ok(selected)
+    resolve_pi_copy(registry, selected)
 }
 
 fn select_discovered_session(

@@ -37,7 +37,8 @@ const DATABASE_FILE_NAME: &str = "store.sqlite3";
 /// Format 2 keeps separate search documents for Codex homes that contain the same session ID.
 /// Format 3 isolates Pi search documents when different workspaces contain the same native ID.
 /// Format 4 preserves the first workspace owner and hides secondary keys from open older readers.
-const STORE_FORMAT: i64 = 4;
+/// Format 5 consolidates legacy Pi search scopes by the workspace recorded in each copy.
+const STORE_FORMAT: i64 = 5;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -625,16 +626,17 @@ impl Store {
             .execute_batch(
                 "CREATE TEMP TABLE current_codex_home (home TEXT);
              CREATE TEMP TABLE selected_pi_copies(provider TEXT, session_id TEXT, project TEXT, PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
-             INSERT INTO selected_pi_copies
+             INSERT OR REPLACE INTO selected_pi_copies
                SELECT i.provider,i.session_id,c.project FROM main.session_index i
                JOIN main.pi_search_copies c ON c.provider=i.provider AND c.session_id=i.session_id
                JOIN main.pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id
                WHERE json_extract(c.metadata,'$.project_path')=i.project_path AND c.project<>p.project;
-             CREATE TEMP VIEW visible_trajectories AS SELECT t.id,t.provider,coalesce(t.pi_native_id,t.session_id) AS session_id,
+             CREATE TEMP TABLE pi_document_aliases(id INTEGER PRIMARY KEY, selector TEXT NOT NULL);
+             CREATE TEMP VIEW visible_trajectories AS SELECT t.id,t.provider,coalesce(a.selector,t.pi_native_id,t.session_id) AS session_id,
                  t.source_complete,t.source_updated_at,t.source_revision,t.provider_limited,t.source_file_bytes,t.document_version,
                  t.derived_title,t.complete,t.origin,t.indexed_byte_count,t.source_byte_count,t.truncation_strategy,t.codex_home
-              FROM main.session_trajectories AS t
-             WHERE t.pi_workspace = CASE WHEN t.provider IN ('pi','omp') THEN coalesce((SELECT project FROM selected_pi_copies AS p WHERE p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id)),'') ELSE '' END
+              FROM main.session_trajectories AS t LEFT JOIN pi_document_aliases a ON a.id=t.id
+             WHERE (a.id IS NOT NULL OR t.pi_workspace = CASE WHEN t.provider IN ('pi','omp') THEN coalesce((SELECT project FROM selected_pi_copies AS p WHERE p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id)),'') ELSE '' END)
                AND (t.provider <> 'codex'
                 OR (t.origin = 'native' AND t.codex_workspace_current
                     AND t.codex_home = (SELECT home FROM current_codex_home)));",
@@ -646,6 +648,44 @@ impl Store {
                 [&self.codex_home],
             )
             .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Returns known workspaces for native IDs that identify multiple Pi conversations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the copy catalog cannot be read.
+    pub fn duplicate_pi_projects(&self) -> Result<HashMap<SessionRef, Vec<PathBuf>>> {
+        let db = self.connection.borrow();
+        let mut query = db.prepare("SELECT c.provider,c.session_id,c.project FROM pi_search_copies c JOIN (SELECT provider,session_id FROM pi_search_copies GROUP BY provider,session_id HAVING count(*)>1 UNION SELECT provider,session_id FROM pi_search_primary WHERE project='') USING(provider,session_id)").map_err(database_error)?;
+        let mut result = HashMap::<SessionRef, Vec<PathBuf>>::new();
+        let mut rows = query.query([]).map_err(database_error)?;
+        while let Some(row) = rows.next().map_err(database_error)? {
+            let provider: String = row.get(0).map_err(database_error)?;
+            let session = SessionRef {
+                provider: provider.parse().map_err(|_| StoreError::CorruptStore)?,
+                id: row.get(1).map_err(database_error)?,
+            };
+            result.entry(session).or_default().push(PathBuf::from(
+                row.get::<_, String>(2).map_err(database_error)?,
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Selects a physical search document under its workspace-qualified reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary search scope cannot be set.
+    pub fn alias_pi_document(
+        &self,
+        session: &SessionRef,
+        project: &Path,
+        selector: &str,
+    ) -> Result<()> {
+        self.connection.borrow().execute("INSERT OR REPLACE INTO pi_document_aliases SELECT t.id,?4 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id) WHERE p.provider=?1 AND p.session_id=?2 AND t.pi_workspace=CASE WHEN p.project=?3 THEN '' ELSE ?3 END",params![session.provider.to_string(),session.id,workspace_root_to_string(project)?,selector]).map_err(database_error)?;
         Ok(())
     }
 
@@ -2945,7 +2985,7 @@ fn single_clause_page_sql(
              {candidate_chunks}
              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
          )
-         SELECT trajectories.provider, coalesce(trajectories.pi_native_id,trajectories.session_id),
+         SELECT trajectories.provider, coalesce((SELECT selector FROM pi_document_aliases WHERE id=trajectories.id),trajectories.pi_native_id,trajectories.session_id),
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy, ranked_chunks.chunk_id, 0
@@ -3028,7 +3068,7 @@ fn multi_clause_page_sql(
                     best_clause_matches.trajectory_id
              WHERE clause_rank_order = 1
          )
-         SELECT trajectories.provider, coalesce(trajectories.pi_native_id,trajectories.session_id),
+         SELECT trajectories.provider, coalesce((SELECT selector FROM pi_document_aliases WHERE id=trajectories.id),trajectories.pi_native_id,trajectories.session_id),
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy,
@@ -3193,8 +3233,11 @@ fn upgrade_trajectory_keys(connection: &mut Connection, format: i64) -> Result<(
     if format < 3 {
         initialize_pi_workspace_documents(connection)?;
     }
-    if format < STORE_FORMAT {
+    if format < 4 {
         isolate_pi_workspace_documents(connection)?;
+    }
+    if format < STORE_FORMAT {
+        normalize_pi_workspace_documents(connection)?;
     }
     Ok(())
 }
@@ -3231,7 +3274,7 @@ fn isolate_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
     let version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(database_error)?;
-    if version >= STORE_FORMAT {
+    if version >= 4 {
         return Ok(());
     }
     tx.execute_batch("ALTER TABLE session_trajectories ADD COLUMN pi_native_id TEXT;
@@ -3242,6 +3285,70 @@ fn isolate_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
         CREATE TRIGGER prune_pi_search_copy AFTER DELETE ON session_trajectories WHEN old.pi_workspace<>'' BEGIN
             DELETE FROM pi_search_copies WHERE provider=old.provider AND session_id=old.pi_native_id AND project=old.pi_workspace;
         END;").map_err(database_error)?;
+    tx.pragma_update(None, "user_version", 4)
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)
+}
+
+fn normalize_pi_workspace_documents(connection: &mut Connection) -> Result<()> {
+    let tx = immediate_transaction(connection)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(database_error)?;
+    if version >= STORE_FORMAT {
+        return Ok(());
+    }
+    let copies = {
+        let mut query = tx.prepare("SELECT provider, session_id, project, metadata FROM pi_search_copies ORDER BY project").map_err(database_error)?;
+        query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?
+    };
+    for (provider, id, old, metadata) in copies {
+        let session: IndexedSession =
+            serde_json::from_str(&metadata).map_err(|_| StoreError::CorruptStore)?;
+        let Some(path) = session.project_path else {
+            continue;
+        };
+        let root = if omnis_core::may_reach_network(&path) {
+            path
+        } else {
+            omnis_core::workspace_root(&path).unwrap_or(path)
+        };
+        let project = workspace_root_to_string(&root)?;
+        if project == old {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO pi_search_copies VALUES (?1,?2,?3,?4)",
+            params![provider, id, project, metadata],
+        )
+        .map_err(database_error)?;
+        tx.execute("DELETE FROM session_trajectories WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace IN (?3,?4) AND id<>(SELECT id FROM session_trajectories WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace IN (?3,?4) ORDER BY source_updated_at DESC,source_complete DESC,id DESC LIMIT 1)",params![provider,id,project,old]).map_err(database_error)?;
+        tx.execute("UPDATE session_trajectories SET pi_workspace=?3, session_id=?2||char(0)||?3 WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace=?4",params![provider,id,project,old]).map_err(database_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO pi_search_copies VALUES (?1,?2,?3,?4)",
+            params![provider, id, project, metadata],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "DELETE FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3",
+            params![provider, id, old],
+        )
+        .map_err(database_error)?;
+        tx.execute("DELETE FROM trajectory_index_failures WHERE provider=?1 AND session_id=?2 AND pi_workspace=?3", params![provider,id,old]).map_err(database_error)?;
+    }
+    // A format 3 list observation could name the secondary copy even after its read failed.
+    tx.execute("UPDATE pi_search_primary SET project='' WHERE EXISTS (SELECT 1 FROM session_trajectories t WHERE t.provider=pi_search_primary.provider AND t.pi_native_id=pi_search_primary.session_id AND t.pi_workspace=pi_search_primary.project)", []).map_err(database_error)?;
     tx.pragma_update(None, "user_version", STORE_FORMAT)
         .map_err(database_error)?;
     tx.commit().map_err(database_error)

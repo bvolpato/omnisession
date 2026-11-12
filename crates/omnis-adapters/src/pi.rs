@@ -30,13 +30,16 @@ const PREVIEW_RECORDS: usize = 1_024;
 const MAX_HEADER_SCAN_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
 
+type ListedPiFiles = HashMap<String, (PathBuf, PathBuf)>;
+
 /// Read-only Pi coding-agent session adapter.
 #[derive(Clone, Debug)]
 pub struct PiAdapter {
     provider: Provider,
     sessions_root: Option<PathBuf>,
-    listed_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+    listed_paths: Arc<Mutex<ListedPiFiles>>,
     workspace_copies: Arc<Mutex<Vec<NativeSession>>>,
+    bound_workspace: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl PiAdapter {
@@ -45,6 +48,7 @@ impl PiAdapter {
         Self {
             listed_paths: Arc::default(),
             workspace_copies: Arc::default(),
+            bound_workspace: Arc::default(),
             provider: Provider::Pi,
             sessions_root: Some(sessions_root.into()),
         }
@@ -55,6 +59,7 @@ impl PiAdapter {
         Self {
             listed_paths: Arc::default(),
             workspace_copies: Arc::default(),
+            bound_workspace: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: crate::oh_my_pi_sessions_root(),
         }
@@ -65,6 +70,7 @@ impl PiAdapter {
         Self {
             listed_paths: Arc::default(),
             workspace_copies: Arc::default(),
+            bound_workspace: Arc::default(),
             provider: Provider::OhMyPi,
             sessions_root: Some(sessions_root.into()),
         }
@@ -89,10 +95,19 @@ impl PiAdapter {
     }
 
     fn exact_session(&self, id: &str) -> Result<Option<PathBuf>> {
+        let bound = self
+            .bound_workspace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned();
         let mut found: Option<(PathBuf, PathBuf)> = None;
         for path in self.session_files() {
             if let Ok(header) = read_header(&path, self.provider)
                 && header.id == id
+                && bound
+                    .as_ref()
+                    .is_none_or(|workspace| paths_match(workspace, &header.cwd))
             {
                 if let Some((_, workspace)) = &found {
                     anyhow::ensure!(
@@ -113,7 +128,15 @@ impl PiAdapter {
     }
 
     fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
-        let validate = |source_path: &Path| {
+        if self
+            .bound_workspace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
+        {
+            return self.find_session(id);
+        }
+        let validate = |source_path: &Path, workspace: Option<&Path>| {
             let root = self.sessions_root.as_deref()?;
             let path = provider_file(root, source_path)?;
             if !path
@@ -124,7 +147,10 @@ impl PiAdapter {
             }
             read_header(&path, self.provider)
                 .ok()
-                .filter(|header| header.id == id)
+                .filter(|header| {
+                    header.id == id
+                        && workspace.is_none_or(|expected| paths_match(expected, &header.cwd))
+                })
                 .map(|_| path)
         };
         let listed = self
@@ -133,22 +159,33 @@ impl PiAdapter {
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned();
-        if let Some(hint) = source_path
-            && self
-                .workspace_copies
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|copy| copy.session.id == id && copy.source_path.as_deref() == Some(hint))
-            && let Some(path) = validate(hint)
-        {
-            return Ok(path);
+        if let Some(hint) = source_path {
+            let workspace = listed
+                .as_ref()
+                .filter(|(path, _)| path == hint)
+                .map(|(_, cwd)| cwd.clone())
+                .or_else(|| {
+                    self.workspace_copies
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .iter()
+                        .find(|copy| {
+                            copy.session.id == id && copy.source_path.as_deref() == Some(hint)
+                        })
+                        .and_then(|copy| copy.project_path.clone())
+                });
+            if let Some(workspace) = workspace {
+                return validate(hint, Some(&workspace))
+                    .ok_or_else(|| anyhow!("Pi session file changed during discovery"));
+            }
         }
-        if let Some(path) = listed.as_deref().and_then(validate) {
-            return Ok(path);
+        if let Some((path, workspace)) = listed
+            && let Some(verified) = validate(&path, Some(&workspace))
+        {
+            return Ok(verified);
         }
         source_path
-            .and_then(validate)
+            .and_then(|hint| validate(hint, None))
             .map_or_else(|| self.find_session(id), Ok)
     }
 }
@@ -165,6 +202,7 @@ impl Default for PiAdapter {
         Self {
             listed_paths: Arc::default(),
             workspace_copies: Arc::default(),
+            bound_workspace: Arc::default(),
             provider: Provider::Pi,
             sessions_root,
         }
@@ -1084,7 +1122,7 @@ impl ProviderAdapter for PiAdapter {
             let first = seen.is_empty();
             seen.push(header.cwd.clone());
             if first {
-                listed_paths.insert(header.id.clone(), path.clone());
+                listed_paths.insert(header.id.clone(), (path.clone(), header.cwd.clone()));
             }
             let file_updated_at = fs::metadata(&path)
                 .ok()
@@ -1117,6 +1155,16 @@ impl ProviderAdapter for PiAdapter {
             .unwrap_or_else(PoisonError::into_inner) = workspace_copies;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn bind_workspace_copy(&self, session: &SessionRef, workspace: &Path) -> Result<()> {
+        self.bound_workspace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session.id.clone(), workspace.to_owned());
+        self.find_session(&session.id)
+            .context("the selected Pi workspace copy is unavailable")?;
+        Ok(())
     }
 
     fn additional_search_sessions(&self) -> Vec<NativeSession> {
@@ -1190,7 +1238,13 @@ impl ProviderAdapter for PiAdapter {
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, self.provider)?;
         let source = self.exact_session(&session.id)?;
-        let reference = if self.provider == Provider::OhMyPi {
+        let reference = if self.provider == Provider::OhMyPi
+            || self
+                .bound_workspace
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&session.id)
+        {
             source
                 .context("Oh My Pi session was not found")?
                 .into_os_string()
@@ -1288,6 +1342,26 @@ mod tests {
 
         assert!(snapshot.events.is_empty());
         assert!(adapter.read_session(&session).is_err());
+    }
+
+    #[test]
+    fn disappeared_listed_copy_cannot_resolve_to_another_workspace() {
+        let root = tempfile::tempdir().expect("Pi store");
+        for name in ["first", "second"] {
+            let workspace = root.path().join(name);
+            fs::create_dir(&workspace).unwrap();
+            let header = json!({"type":"session","version":3,"id":"shared","cwd":workspace});
+            fs::write(workspace.join("session.jsonl"), format!("{header}\n")).unwrap();
+        }
+        let adapter = PiAdapter::with_root(root.path());
+        adapter.list_sessions(None).unwrap();
+        let copy = adapter
+            .additional_search_sessions()
+            .pop()
+            .expect("secondary copy");
+        let path = copy.source_path.unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(adapter.read_session_at(&copy.session, Some(&path)).is_err());
     }
 
     #[test]

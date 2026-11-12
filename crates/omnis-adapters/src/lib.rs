@@ -140,6 +140,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Binds an explicit source workspace for a native ID shared by multiple files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot select that workspace.
+    fn bind_workspace_copy(&self, _session: &SessionRef, _workspace: &Path) -> Result<()> {
+        anyhow::bail!("this provider does not support workspace-qualified sessions")
+    }
+
     /// Returns other physical copies found by an unscoped discovery pass.
     fn additional_search_sessions(&self) -> Vec<NativeSession> {
         Vec::new()
