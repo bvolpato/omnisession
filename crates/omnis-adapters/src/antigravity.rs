@@ -139,6 +139,7 @@ impl AntigravityAdapter {
         let history = read?;
         Ok(IndexRead {
             ancestor_revisions: Vec::new(),
+            ownership_revision: None,
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
             verified_prefix_end: history.verified_prefix_end.or_else(|| {
@@ -781,6 +782,7 @@ impl ProviderAdapter for AntigravityAdapter {
             document,
             read: IndexRead {
                 ancestor_revisions: Vec::new(),
+                ownership_revision: None,
                 workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 rollback_title: crate::RollbackTitle::Unknown,
                 verified_prefix_end: torn.verified_prefix_end(),

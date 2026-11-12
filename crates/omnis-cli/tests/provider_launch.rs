@@ -43,6 +43,30 @@ fn codex_sqlite_override(root: &std::path::Path) -> String {
 
 #[cfg(unix)]
 #[test]
+fn bare_fork_refuses_conflicting_grok_sources_and_a_matching_codex_session() {
+    let fixture = Fixture::new();
+    let grok = fixture.root.join("grok");
+    for workspace in ["one", "two"] {
+        let source = grok.join("sessions").join(workspace).join(SOURCE_ID);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("summary.json"),
+            json!({"info": {"id": SOURCE_ID, "cwd": fixture.workspace}}).to_string(),
+        )
+        .unwrap();
+    }
+    let output = fixture
+        .command()
+        .env("GROK_HOME", grok)
+        .args(["fork", SOURCE_ID, "--in", "grok", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is ambiguous"));
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
     let fixture = Fixture::new();
     let subdirectory = fixture.workspace.join("nested");
@@ -99,6 +123,44 @@ fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
         ])
     );
     assert_eq!(plan(&["--allow-workspace-mismatch"])["cwd"], json!(caller));
+
+    let probe = fixture.root.join("codex-probe");
+    fs::write(
+        &probe,
+        r#"#!/bin/sh
+case "$1" in
+  --version) echo 'codex-cli 0.167.1' ;;
+  --help) pwd -P >> "$LAUNCH_CAPTURE/codex-probes"; echo '  --approve-for-me' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output_after_write(Command::new(&probe).arg("--version"))
+            .status
+            .success()
+    );
+    let inspection = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", probe)
+        .args([
+            "--json", "inspect", SOURCE_ID, "--target", "codex", "--mode", "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inspection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let probes = fs::read_to_string(fixture.capture.join("codex-probes")).unwrap();
+    let directories = probes.lines().map(std::path::Path::new).collect::<Vec<_>>();
+    assert_eq!(
+        directories,
+        [subdirectory.as_path(), subdirectory.as_path()]
+    );
 }
 
 #[cfg(unix)]
@@ -855,21 +917,37 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         }
 
         fn write_grok_source(&self) {
+            let group: String = self
+                .workspace
+                .to_str()
+                .unwrap()
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                        char::from(byte).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect();
             let session = self
                 .root
                 .join("grok")
                 .join("sessions")
-                .join("workspace-hash")
+                .join(group)
                 .join(GROK_SOURCE_ID);
             fs::create_dir_all(&session).expect("Grok source directory");
             fs::write(
                 session.join("summary.json"),
-                json!({"id": GROK_SOURCE_ID, "cwd": self.workspace, "num_messages": 2}).to_string(),
+                json!({"info": {"id": GROK_SOURCE_ID, "cwd": self.workspace}, "session_summary":"Synthetic Grok session", "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:01Z", "current_model_id":"synthetic", "num_messages": 2}).to_string(),
             )
             .expect("write synthetic Grok summary");
             let update = |kind: &str, text: &str| {
-                json!({"params": {"update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}}})
-                    .to_string()
+                json!({"params": {
+                    "sessionId": GROK_SOURCE_ID,
+                    "update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+                }})
+                .to_string()
             };
             fs::write(
                 session.join("updates.jsonl"),

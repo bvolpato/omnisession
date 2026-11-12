@@ -1075,11 +1075,14 @@ mod tests {
             "2026-01-02T00-00-00",
             "",
         )?;
-        for (path, label) in [(&active, "active"), (&archive, "archived")] {
+        let active_project = home.path().join("active");
+        let archived_project = home.path().join("archived");
+        for (path, project) in [(&active, &active_project), (&archive, &archived_project)] {
+            fs::create_dir(project)?;
             fs::write(
                 path,
                 serde_json::json!({"type":"session_meta", "payload":{
-                    "id": THREAD, "cwd": label
+                    "id": THREAD, "cwd": project
                 }})
                 .to_string(),
             )?;
@@ -1100,29 +1103,32 @@ mod tests {
         let candidate = adapter.list_sessions(None)?.pop().unwrap();
         assert_eq!(
             candidate.project_path.as_deref(),
-            Some(Path::new("archived"))
+            Some(archived_project.as_path())
         );
         let session = SessionRef::new(Provider::Codex, THREAD);
         let batch = adapter.index_batch(&[THREAD]).unwrap();
         let read = || batch(&session, Some(&active), u64::MAX);
         assert_eq!(
             read()?.snapshot.workspace.current_dir,
-            Path::new("archived")
+            archived_project.as_path()
         );
         database.execute(
             "UPDATE threads SET rollout_path = ?1",
             [active.to_str().unwrap()],
         )?;
-        assert_eq!(read()?.snapshot.workspace.current_dir, Path::new("active"));
+        assert_eq!(
+            read()?.snapshot.workspace.current_dir,
+            active_project.as_path()
+        );
         let refreshed =
             adapter.index_batch(&[THREAD]).unwrap()(&session, Some(&archive), u64::MAX)?;
         assert_eq!(
             refreshed.snapshot.workspace.current_dir,
-            Path::new("active")
+            active_project.as_path()
         );
         assert_eq!(
             adapter.read_session(&session)?.workspace.current_dir,
-            Path::new("active")
+            active_project.as_path()
         );
         Ok(())
     }

@@ -34,6 +34,9 @@ impl<'a> SessionWorkspaceMatcher<'a> {
 
     /// Uses the exact OS spelling so that network paths stay distinct from local paths.
     pub fn matches(&mut self, provider: Provider, recorded: &Path) -> bool {
+        if provider == Provider::Codex && recorded.is_relative() {
+            return false;
+        }
         if provider != Provider::CursorIde && recorded.as_os_str() == self.requested.as_os_str() {
             return true;
         }
@@ -56,6 +59,8 @@ impl<'a> SessionWorkspaceMatcher<'a> {
 pub fn session_workspace_matches(provider: Provider, recorded: &Path, requested: &Path) -> bool {
     if provider == Provider::CursorIde {
         cursor_workspace_matches(recorded, requested)
+    } else if provider == Provider::Codex && recorded.is_relative() {
+        false
     } else {
         workspace_paths_match(recorded, requested)
     }

@@ -111,6 +111,7 @@ impl AntigravityDesktopAdapter {
         let (snapshot, coverage) = read?;
         Ok(IndexRead {
             ancestor_revisions: Vec::new(),
+            ownership_revision: None,
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
             verified_prefix_end: coverage.verified_prefix_end,

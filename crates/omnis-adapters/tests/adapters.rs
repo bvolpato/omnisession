@@ -14,6 +14,178 @@ const CODEX_ID: &str = "44444444-4444-4444-8444-444444444444";
 const CODEX_SUBAGENT_ID: &str = "55555555-5555-4555-8555-555555555555";
 
 #[test]
+fn claude_progress_records_do_not_hide_the_final_reply() {
+    use std::io::{BufWriter, Write};
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let mut writer = BufWriter::new(fs::File::create(source).unwrap());
+    let user = uuid::Uuid::from_u128(1);
+    let reply = uuid::Uuid::from_u128(2);
+    writeln!(
+        writer,
+        r#"{{"type":"user","uuid":"{user}","parentUuid":null,"message":{{"content":"request"}}}}"#
+    )
+    .unwrap();
+    writeln!(writer, r#"{{"type":"assistant","uuid":"{reply}","parentUuid":"{user}","message":{{"content":"working"}}}}"#).unwrap();
+    let mut parent = reply;
+    for sequence in 3..100_004 {
+        if sequence == 50_000 {
+            let attachment = uuid::Uuid::from_u128(200_001);
+            writeln!(
+                writer,
+                r#"{{"type":"attachment","uuid":"{attachment}","parentUuid":"{parent}"}}"#
+            )
+            .unwrap();
+            writeln!(writer, r#"{{"type":"assistant","isSidechain":true,"message":{{"content":"worker reply"}}}}"#).unwrap();
+            parent = attachment;
+        }
+        let id = uuid::Uuid::from_u128(sequence);
+        writeln!(
+            writer,
+            r#"{{"type":"progress","uuid":"{id}","parentUuid":"{parent}"}}"#
+        )
+        .unwrap();
+        parent = id;
+    }
+    writeln!(writer, r#"{{"type":"assistant","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1","parentUuid":"{parent}","message":{{"content":"finished"}}}}"#).unwrap();
+    writer.flush().unwrap();
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for snapshot in [
+        adapter.read_session(&session),
+        adapter.preview_session(&session),
+    ] {
+        let snapshot = snapshot.expect("progress-heavy Claude session");
+        let texts = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["request", "working", "finished"]);
+    }
+}
+
+#[test]
+fn claude_sampled_preview_keeps_only_the_selected_tail_branch() {
+    use std::io::Write;
+
+    use serde_json::json;
+    use uuid::Uuid;
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let mut file = fs::File::create(&source).unwrap();
+    let id = Uuid::from_u128;
+    let message = |role: &str, n, parent, text: &str| json!({"type": role, "uuid": id(n), "parentUuid": parent, "message": {"content": text}});
+    let bridge = |kind, n, parent| json!({"type": kind, "uuid": id(n), "parentUuid": id(parent)});
+    let padding = json!({"type": "progress", "padding": "x".repeat(4 * 1024 * 1024)});
+    for record in [
+        message("user", 1, None, "head"),
+        message("assistant", 12, Some(id(1)), "first head reply"),
+        message("assistant", 13, Some(id(1)), "abandoned head reply"),
+        bridge("attachment", 14, 12),
+        padding.clone(),
+        message("user", 2, Some(id(14)), "middle request"),
+        message("user", 3, Some(id(1)), "other request"),
+        bridge("progress", 11, 1),
+        padding,
+        message("assistant", 4, Some(id(2)), "discarded reply"),
+        bridge("attachment", 5, 3),
+        message("assistant", 6, Some(id(5)), "other reply"),
+        bridge("progress", 7, 2),
+        bridge("attachment", 8, 7),
+        message("assistant", 9, Some(id(8)), "selected reply"),
+        bridge("progress", 10, 11),
+    ] {
+        writeln!(file, "{record}").unwrap();
+    }
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for (budget, expected) in [
+        (
+            u64::MAX,
+            vec![
+                "head",
+                "first head reply",
+                "middle request",
+                "selected reply",
+            ],
+        ),
+        (1, vec!["selected reply"]),
+    ] {
+        let indexed = adapter
+            .index_session(&session, Some(&source), budget)
+            .unwrap();
+        assert_eq!(indexed.source_complete, budget == u64::MAX);
+        let text = indexed
+            .snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, expected);
+    }
+    // A tail link can identify a head branch directly, through an attachment.
+    writeln!(file, "{}", bridge("progress", 15, 14)).unwrap();
+    writeln!(
+        file,
+        "{}",
+        message("user", 16, Some(id(15)), "explicit rewind")
+    )
+    .unwrap();
+    let preview = adapter.preview_session(&session).unwrap();
+    let text = preview
+        .events
+        .iter()
+        .filter_map(|event| event.payload["text"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(text, ["head", "first head reply", "explicit rewind"]);
+}
+
+#[test]
+fn claude_empty_or_sidechain_samples_cannot_classify_the_unread_middle() {
+    use std::io::Write;
+
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    let padding = " ".repeat(4 * 1024 * 1024);
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for edge in [
+        "",
+        r#"{"type":"assistant","isSidechain":true,"message":{"content":"worker"}}"#,
+    ] {
+        let mut file = fs::File::create(&source).unwrap();
+        writeln!(file, "{edge}\n{padding}\n{{\"type\":\"user\",\"message\":{{\"content\":\"main request\"}}}}\n{padding}\n{edge}").unwrap();
+        let full = adapter.read_session(&session).unwrap();
+        assert_eq!(full.events[0].payload["text"], "main request");
+        let sampled = adapter.preview_session(&session).unwrap();
+        assert_eq!(sampled.events.len(), 1);
+        assert_eq!(sampled.events[0].payload["native_history_unverified"], true);
+    }
+}
+
+#[test]
+fn claude_reports_malformed_records_and_an_incomplete_tail() {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join(format!("{CLAUDE_ID}.jsonl"));
+    fs::write(source, b"{\"type\":\"user\",\"message\":{\"content\":\"question\"}}\nnot-json\n \t\r\n{\"type\":\"assistant\",\"message\":{\"content\":").unwrap();
+    let adapter = ClaudeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Claude, CLAUDE_ID);
+    for snapshot in [
+        adapter.read_session(&session),
+        adapter.preview_session(&session),
+    ] {
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.events[0].payload["text"], "question");
+        let notice = &snapshot.events.last().unwrap().payload;
+        assert_eq!(notice["omitted_events"], 2);
+        assert_eq!(notice["incomplete_final_record"], true);
+    }
+}
+
+#[test]
 fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
     let fixture = include_bytes!("fixtures/claude-session.jsonl");
     let temporary = TempDir::new().expect("temporary directory");
@@ -52,7 +224,7 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
         .expect("Claude read");
     let after = fs::read(&source).expect("fixture after read");
     assert_eq!(before, after);
-    assert_eq!(snapshot.events.len(), 5);
+    assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
     let metadata = snapshot
         .events
         .iter()
@@ -89,11 +261,15 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
 #[test]
 fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let temporary = TempDir::new().expect("temporary directory");
+    let old = temporary.path().join("old");
+    let new = temporary.path().join("new");
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
     fs::write(
         sessions.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl")),
-        include_bytes!("fixtures/codex-session.jsonl"),
+        include_str!("fixtures/codex-session.jsonl")
+            .replace(r#""/workspace/old""#, &serde_json::to_string(&old).unwrap())
+            .replace(r#""/workspace/new""#, &serde_json::to_string(&new).unwrap()),
     )
     .expect("Codex fixture");
     fs::write(
@@ -115,9 +291,7 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     .expect("Codex index fixture");
 
     let adapter = CodexAdapter::with_root(temporary.path());
-    let discovered = adapter
-        .list_sessions(Some(Path::new("/workspace/old")))
-        .expect("Codex discovery");
+    let discovered = adapter.list_sessions(Some(&old)).expect("Codex discovery");
     assert_eq!(discovered.len(), 1);
     assert_eq!(discovered[0].title.as_deref(), Some("New title"));
     assert_eq!(discovered[0].event_count, 0);
@@ -125,7 +299,7 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let snapshot = adapter
         .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
         .expect("Codex read");
-    assert_eq!(snapshot.workspace.current_dir, Path::new("/workspace/new"));
+    assert_eq!(snapshot.workspace.current_dir, new);
     assert_eq!(snapshot.events.len(), 6);
     let omission = snapshot.events.last().expect("malformed row notice");
     assert_eq!(
@@ -133,6 +307,12 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         Some("omnisession.codex_malformed_records")
     );
     assert_eq!(omission.payload["malformed_records"], 1);
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| event.payload["workspace_unknown"] == true)
+    );
     assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
     assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);
@@ -217,51 +397,47 @@ fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
     let source = SessionRef::new(Provider::Codex, CODEX_ID);
+    let workspace = temporary.path().join("demo");
+    let other = temporary.path().join("other");
     let started_at = "2026-01-02T12:00:00Z"
         .parse::<DateTime<Utc>>()
         .expect("launch timestamp");
     let matching_id = "66666666-6666-4666-8666-666666666666";
 
     for (id, timestamp, cwd, agent_role, parent) in [
-        (
-            CODEX_ID,
-            "2026-01-02T11:59:59Z",
-            "/workspace/demo",
-            None,
-            None,
-        ),
+        (CODEX_ID, "2026-01-02T11:59:59Z", &workspace, None, None),
         (
             matching_id,
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             Some(CODEX_ID),
         ),
         (
             "55555555-5555-4555-8555-555555555555",
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             None,
         ),
         (
             "99999999-9999-4999-8999-999999999999",
             "2026-01-02T12:00:01Z",
-            "/workspace/demo",
+            &workspace,
             None,
             Some(matching_id),
         ),
         (
             "77777777-7777-4777-8777-777777777777",
             "2026-01-02T12:00:02Z",
-            "/workspace/other",
+            &other,
             None,
             Some(CODEX_ID),
         ),
         (
             "88888888-8888-4888-8888-888888888888",
             "2026-01-02T12:00:03Z",
-            "/workspace/demo",
+            &workspace,
             Some("worker"),
             Some(CODEX_ID),
         ),
@@ -276,7 +452,7 @@ fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     }
 
     let candidates = CodexAdapter::with_root(temporary.path())
-        .fork_candidates_created_since(&source, Path::new("/workspace/demo"), started_at)
+        .fork_candidates_created_since(&source, &workspace, started_at)
         .expect("Codex fork discovery");
     assert_eq!(candidates, [SessionRef::new(Provider::Codex, matching_id)]);
 }

@@ -15,13 +15,14 @@ use omnis_ir::SourceRevision;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::CodexHistoryMode;
 use super::workspace_check::{WorkspaceScan, same_thread};
 use super::workspace_damage::{self, DamagedWorkspace};
 use crate::support::WorkspaceGap;
 use crate::support::{
-    JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-    MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
-    visit_json_reader,
+    JsonLineLocation, JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE,
+    MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE,
+    json_lines_prefix, visit_json_reader, visit_json_reader_with_locations,
 };
 
 pub(super) const SAMPLE_RECORDS: usize = 1_024;
@@ -318,31 +319,53 @@ pub(super) const LEGACY_PROJECTION_LIMITS: JsonLinesLimits = JsonLinesLimits {
 pub(super) fn visit_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records_with_limits(open(path)?, limits, visit)
+    read_records_with_limits(
+        open(path)?,
+        limits,
+        (!compressed(path)).then_some(path),
+        visit,
+    )
 }
 
 pub(super) fn visit(
     path: &Path,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records(open(path)?, visit)
+    visit_with_limits(path, LIMITS, visit)
 }
 
 /// Returns whether every nonblank record could be read and the visitor accepted it.
+pub(super) fn visit_all_records(
+    path: &Path,
+    mut visit: impl FnMut(Value, bool) -> Result<bool>,
+) -> Result<bool> {
+    let mut accepted = true;
+    let (omissions, _) = visit_json_reader(
+        &mut BufReader::new(open(path)?),
+        LIMITS,
+        workspace_record_candidate,
+        |location, record, _| {
+            accepted &= visit(record, location.terminated)?;
+            Ok(())
+        },
+    )?;
+    Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
+}
+
 pub(super) fn visit_all_projected_records(
     path: &Path,
     owner: &str,
     mut accepts: impl FnMut(Value, bool) -> Result<bool>,
 ) -> Result<bool> {
     let mut accepted = true;
-    let mut receipts = super::RequestReceipts::new(owner, true);
+    let mut receipts = super::history_base::replay_messages::RequestReceipts::new(owner, true);
     let mut project = |record, _, confirmed| {
         accepted &= accepts(record, confirmed)?;
         Ok(())
     };
-    let omissions = visit(path, |record, skipped| {
+    let omissions = visit(path, |record, skipped, _| {
         receipts.observe_confirmed(record, skipped, &mut project)
     })?;
     receipts.flush(|record, mark| project(record, mark, false))?;
@@ -351,22 +374,31 @@ pub(super) fn visit_all_projected_records(
 
 pub(super) fn read_records(
     reader: impl Read,
-    visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    read_records_with_limits(reader, LIMITS, visit)
+    read_records_with_limits(reader, LIMITS, None, visit)
 }
 
 fn read_records_with_limits(
     reader: impl Read,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    plain: Option<&Path>,
+    mut visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     let session = OnceCell::<Option<String>>::new();
-    visit_json_reader(
+    visit_json_reader_with_locations(
         &mut BufReader::new(reader),
         limits,
-        |line, oversized| workspace_gap(line, oversized, session.get().and_then(Option::as_deref)),
-        |_, record, skipped_before| {
+        |location, line, oversized| {
+            workspace_gap_at(
+                plain,
+                location,
+                line,
+                oversized,
+                session.get().and_then(Option::as_deref),
+            )
+        },
+        |location, record, skipped_before| {
             session.get_or_init(|| {
                 (record["type"] == "session_meta")
                     .then(|| {
@@ -375,7 +407,7 @@ fn read_records_with_limits(
                     .flatten()
                     .map(str::to_owned)
             });
-            visit(record, skipped_before)
+            visit(record, skipped_before, location.terminated)
         },
     )
     .map(|(omissions, _)| omissions)
@@ -406,12 +438,43 @@ pub(super) fn workspace_record_candidate(line: &[u8], oversized: bool) -> Worksp
     workspace_gap(line, oversized, None)
 }
 
+pub(super) fn workspace_gap_at(
+    plain: Option<&Path>,
+    location: JsonLineLocation,
+    line: &[u8],
+    oversized: bool,
+    session: Option<&str>,
+) -> Result<WorkspaceGap> {
+    let kind = gap_kind(line, oversized);
+    if oversized
+        && kind == Some(DamagedWorkspace::Unclassified)
+        && let Some(path) = plain
+        && !super::oversized_settings_marker(path, &[location])?
+    {
+        // This row could have changed the turn directory but did not contain saved settings.
+        return Ok(WorkspaceGap::TurnOrRollback);
+    }
+    Ok(classify_gap(kind, line, oversized, session))
+}
+
 pub(super) fn workspace_gap(line: &[u8], oversized: bool, session: Option<&str>) -> WorkspaceGap {
-    let kind = if oversized {
+    classify_gap(gap_kind(line, oversized), line, oversized, session)
+}
+
+fn gap_kind(line: &[u8], oversized: bool) -> Option<DamagedWorkspace> {
+    if oversized {
         workspace_damage::oversized_workspace_record(line)
     } else {
         workspace_damage::damaged_workspace_record(line)
-    };
+    }
+}
+
+fn classify_gap(
+    kind: Option<DamagedWorkspace>,
+    line: &[u8],
+    oversized: bool,
+    session: Option<&str>,
+) -> WorkspaceGap {
     match kind {
         Some(DamagedWorkspace::TurnOrRollback) => WorkspaceGap::TurnOrRollback,
         Some(DamagedWorkspace::PossibleSettings) => {
@@ -433,12 +496,13 @@ pub(super) fn workspace_gap(line: &[u8], oversized: bool, session: Option<&str>)
     }
 }
 
-pub(super) fn workspace_record_kind(line: &[u8]) -> WorkspaceRecord {
+pub(super) fn workspace_record_kind(line: &[u8], inspect_displays: bool) -> WorkspaceRecord {
     if !line.trim_ascii_start().starts_with(b"{") {
         return WorkspaceRecord::Other;
     }
     match string_field(line, "type").as_deref() {
         Some("compacted") => WorkspaceRecord::Compacted,
+        Some("response_item" | "event_msg") if inspect_displays => WorkspaceRecord::Candidate,
         None | Some("turn_context" | "session_meta") => WorkspaceRecord::Candidate,
         Some("event_msg") => match field(line, "payload")
             .and_then(|payload| string_field(payload, "type"))
@@ -489,6 +553,7 @@ pub(super) fn sample(
     budget: u64,
     creation_directory: Option<&Path>,
     session: &str,
+    history_mode: CodexHistoryMode,
 ) -> Result<Sample> {
     let mut reader = open(path)?;
     let mut prefix = Vec::new();
@@ -497,6 +562,9 @@ pub(super) fn sample(
     reader.by_ref().take(budget + 1).read_to_end(&mut prefix)?;
     if u64::try_from(prefix.len())? <= budget {
         return Ok(Sample::Complete(prefix));
+    }
+    if history_mode != CodexHistoryMode::Legacy {
+        return Ok(Sample::Reconstruct);
     }
     let mut head = Vec::new();
     let mut tail = VecDeque::new();
@@ -512,7 +580,7 @@ pub(super) fn sample(
             let ordinal = count + skipped.total();
             count += 1;
             workspace.settings.observe_gaps(skipped);
-            workspace.observe(session, &record)?;
+            workspace.observe(session, &record);
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push((ordinal, record));
                 if ordinal == prefix_records {

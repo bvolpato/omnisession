@@ -101,18 +101,23 @@ fn malformed_ancestor_directory_preserves_recoverable_fork_messages() -> anyhow:
 #[test]
 fn codex_forks_and_reverts_read_only_the_referenced_prefix_of_each_rollout() {
     let home = tempfile::tempdir().unwrap();
+    let session_header = |id, ordinal, base| {
+        let mut record = header(id, ordinal, base);
+        record["payload"]["cwd"] = json!(home.path().join(id));
+        record
+    };
     let parent = [
-        header(PARENT, 0, None),
+        session_header(PARENT, 0, None),
         turn(1, "user", "inherited request"),
         turn(2, "assistant", "reply beyond fork"),
     ];
     let middle = [
-        header(CHILD, 2, Some(bookmark(PARENT, &parent[..2]))),
+        session_header(CHILD, 2, Some(bookmark(PARENT, &parent[..2]))),
         turn(3, "assistant", "retained fork reply"),
         turn(4, "user", "request before revert"),
     ];
     let leaf = [
-        header(CHILD, 4, Some(bookmark(CHILD, &middle[..2]))),
+        session_header(CHILD, 4, Some(bookmark(CHILD, &middle[..2]))),
         turn(5, "user", "request after revert"),
     ];
     let leaf_path = write(
@@ -251,10 +256,7 @@ fn assert_active_history(home: &Path, leaf: &Path, retired: &Path, parent: Paren
             }),
             missing
         );
-        assert_eq!(
-            snapshot.workspace.root,
-            PathBuf::from(format!("/workspace/{CHILD}"))
-        );
+        assert_eq!(snapshot.workspace.root, home.join(CHILD));
     }
 }
 
@@ -309,10 +311,11 @@ fn a_large_inherited_prefix_keeps_the_surviving_edges_within_the_preview_byte_li
             &format!("turn {n}: {}", "x".repeat(64 * 1024)),
         ));
     }
-    parent.push(json!({"type":"turn_context","ordinal":163,"payload":{"cwd":"/inherited/last"}}));
+    let surviving_directory = temp.path().join("inherited").join("last");
+    parent.push(json!({"type":"turn_context","ordinal":163,"payload":{"cwd":surviving_directory}}));
     parent.push(turn(164, "user", "last inherited request"));
     parent.push(json!({"type":"event_msg","ordinal":165,"payload":{"type":"turn_started"}}));
-    parent.push(json!({"type":"turn_context","ordinal":166,"payload":{"cwd":"/discarded"}}));
+    parent.push(json!({"type":"turn_context","ordinal":166,"payload":{"cwd":temp.path().join("discarded")}}));
     parent.push(turn(167, "user", "discarded inherited turn"));
     let mark = bookmark(PARENT, &parent);
     parent.push(turn(168, "assistant", "after cutoff"));
@@ -365,7 +368,7 @@ fn a_large_inherited_prefix_keeps_the_surviving_edges_within_the_preview_byte_li
     assert!(!messages.contains(&"discarded local turn"));
     assert!(!messages.contains(&"after cutoff"));
     assert!(messages.iter().map(|m| m.len()).sum::<usize>() <= 8 * 1024 * 1024);
-    assert_eq!(read.snapshot.workspace.root, Path::new("/inherited/last"));
+    assert_eq!(read.snapshot.workspace.root, surviving_directory);
 }
 
 #[test]
@@ -2488,4 +2491,72 @@ fn a_fork_keeps_its_own_rollback_boundary_after_an_open_parent_task() -> anyhow:
         ],
     );
     check_parent_messages(home.path(), &["parent task"], false)
+}
+
+#[test]
+fn a_fork_inherits_published_tools_and_the_active_compaction_at_its_bookmark() {
+    let home = tempfile::tempdir().unwrap();
+    let stamp = "2026-01-05T09-00-00";
+    let timed = |mut row: Value| {
+        row["timestamp"] = "2026-01-05T09:00:00Z".into();
+        row
+    };
+    let published = |index: u64, owner: &str, item: Value| {
+        timed(json!({"ordinal":index,"type":"event_msg","payload":{
+            "type":"item_completed","turn_id":"turn","thread_id":owner,"item":item
+        }}))
+    };
+    let user = |index, owner, id: &str, text: &str| {
+        published(
+            index,
+            owner,
+            json!({
+                "type":"UserMessage","id":id,"content":[{"type":"text","text":text}]
+            }),
+        )
+    };
+    let parent = [
+        timed(header(PARENT, 0, None)),
+        user(1, PARENT, "old", "before compaction"),
+        timed(
+            json!({"ordinal":2,"type":"compacted","payload":{"message":"summarized","replacement_history":[]}}),
+        ),
+        published(
+            3,
+            PARENT,
+            json!({"type":"CommandExecution","id":"cmd","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","aggregated_output":"published output","status":"completed","exit_code":0}),
+        ),
+        user(4, PARENT, "outside", "beyond the bookmark"),
+    ];
+    let child = [
+        timed(header(CHILD, 4, Some(bookmark(PARENT, &parent[..4])))),
+        user(5, CHILD, "new", "child request"),
+    ];
+    write(home.path(), "sessions", PARENT, PARENT, stamp, &parent);
+    write(home.path(), "sessions", CHILD, CHILD, stamp, &child);
+    for preview in [false, true] {
+        let snapshot = read(home.path(), preview).unwrap();
+        let all = snapshot
+            .events
+            .iter()
+            .filter_map(|e| e.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(all.contains(&"before compaction"));
+        assert!(!all.contains(&"beyond the bookmark"));
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|e| e.payload["output"] == "published output")
+        );
+        let active = omnis_core::import_conversation(&snapshot);
+        assert_eq!(
+            active
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["child request"]
+        );
+    }
 }

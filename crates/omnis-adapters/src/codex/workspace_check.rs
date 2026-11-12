@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use omnis_ir::{Provider, SessionRef, SourceRevision};
+use omnis_ir::{GitState, Provider, SessionRef, SourceRevision};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ use super::{
     rollout_file,
 };
 use crate::support::{
-    BoundedLine, JsonLineSkips, read_bounded_line_with_budget, validate_provider,
+    BoundedLine, JsonLineLocation, JsonLineSkips, read_bounded_line_with_budget, validate_provider,
 };
 use crate::{CodexWorkspaceProjection, IndexRead};
 
@@ -100,6 +100,8 @@ pub(super) struct WorkspaceScan {
     pub(super) reconstruct_history: bool,
     pub(super) saved_messages: usize,
     rolled_back: bool,
+    inherited: bool,
+    display_replay: super::DisplayReplay,
 }
 
 impl WorkspaceScan {
@@ -110,6 +112,8 @@ impl WorkspaceScan {
             reconstruct_history: false,
             saved_messages: 0,
             rolled_back: false,
+            inherited: false,
+            display_replay: super::DisplayReplay::default(),
         }
     }
 
@@ -120,27 +124,32 @@ impl WorkspaceScan {
         self.reconstruct_history = true;
     }
 
-    pub(super) fn observe(&mut self, session: &str, record: &Value) -> Result<()> {
+    pub(super) fn observe(&mut self, session: &str, record: &Value) {
+        self.reconstruct_history |= self.display_replay.observe(record);
         self.saved_messages += usize::from(super::saved_message(record));
         self.settings.observe(session, record);
         if records_history_base(record) {
+            self.inherited = true;
             self.directory = None;
             self.rolled_back = false;
             self.reconstruct_history = true;
         } else if record["type"] == "turn_context" {
-            self.directory = super::turn_context_cwd(record).map(PathBuf::from);
+            self.directory = super::history_base::replay_messages::turn_context_cwd(record)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
             self.rolled_back = false;
-        } else if record["type"] == "event_msg" && record["payload"]["type"] == "thread_rolled_back"
-        {
-            let count = record["payload"]["num_turns"]
-                .as_u64()
-                .context("Codex rollback marker has no valid num_turns")?;
-            self.rolled_back |= count > 0;
+        } else if super::encoded_rollback(record) {
+            let turns = super::rollout_lines::rollback_turns(&record["payload"]);
+            if self.settings.gaps.workspace_gaps() > 0 && turns.is_none() {
+                self.directory = None;
+                self.rolled_back = false;
+            } else {
+                self.rolled_back |= turns != Some(0);
+            }
             self.reconstruct_history = true;
         } else if record["type"] == "compacted" {
             self.reconstruct_history = true;
         }
-        Ok(())
     }
 }
 
@@ -178,6 +187,33 @@ impl CodexAdapter {
         path: &Path,
         revision: SourceRevision,
     ) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+        let native = Self::verified_workspace_header(session, path, revision)?;
+        native.read_unchanged(|native, _| {
+            let workspace = native.live_workspace()?;
+            Ok((workspace.directory, workspace.startup_directory))
+        })
+    }
+
+    /// Returns the Git evidence recorded for the selected rollout's creation directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the revision or session ID differs, or the header cannot be read.
+    pub fn rollout_git(
+        session: &SessionRef,
+        path: &Path,
+        revision: SourceRevision,
+        directory: Option<&Path>,
+    ) -> Result<GitState> {
+        let native = Self::verified_workspace_header(session, path, revision)?;
+        Ok(native.git_at(directory))
+    }
+
+    fn verified_workspace_header(
+        session: &SessionRef,
+        path: &Path,
+        revision: SourceRevision,
+    ) -> Result<CodexSession> {
         validate_provider(session, Provider::Codex)?;
         ensure!(
             revision.file.is_some() && revision.contents.is_some(),
@@ -190,10 +226,9 @@ impl CodexAdapter {
         let observed = ObservedRollout::read(path)
             .filter(|observed| observed.revision.matches_file_contents(revision))
             .context("selected Codex rollout changed before checking its workspace")?;
-        let native = CodexSession::parse_with_observation(path, observed)?
+        CodexSession::parse_with_observation(path, observed)?
             .filter(|native| native.id == session.id)
-            .context("selected Codex rollout has a different session header")?;
-        native.read_unchanged(|native, _| native.effective_and_startup_directories())
+            .context("selected Codex rollout has a different session header")
     }
 }
 
@@ -213,21 +248,45 @@ impl CodexSession {
         Ok(lineage)
     }
 
-    fn effective_and_startup_directories(&self) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-        let workspace = self.scan_workspace()?;
+    pub(super) fn effective_and_startup_directories(
+        &self,
+    ) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+        let workspace = self.scan_workspace(false)?;
         let effective = if workspace.rolled_back && !workspace.settings.has_owned() {
-            let (_, project, verified) = self.reconstructed_preview(rollout_file::LIMITS)?;
-            project.filter(|_| verified)
+            let source;
+            let session = if workspace.inherited {
+                source = Self {
+                    project_path: None,
+                    ..self.clone()
+                };
+                &source
+            } else {
+                self
+            };
+            if session.needs_visible_projection() {
+                let (_, project, verified) =
+                    session.canonical_events_with(&session.visible_leaf()?, |visit| {
+                        rollout_file::visit_with_limits(&session.path, rollout_file::LIMITS, visit)
+                    })?;
+                project.filter(|_| verified)
+            } else {
+                let (_, project, verified) = session.reconstructed_preview(rollout_file::LIMITS)?;
+                project.filter(|_| verified)
+            }
         } else {
             workspace.directory
         };
-        Ok((effective, workspace.settings.startup))
+        Ok((
+            effective.filter(|path| path.is_absolute()),
+            workspace.settings.startup,
+        ))
     }
 
-    pub(super) fn scan_workspace(&self) -> Result<WorkspaceScan> {
+    pub(super) fn scan_workspace(&self, inspect_displays: bool) -> Result<WorkspaceScan> {
         let limits = rollout_file::LIMITS;
         let lineage = self.visible_leaf()?;
         let mut remaining = limits.file_bytes;
+        let plain = (!rollout_file::compressed(&self.path)).then_some(self.path.as_path());
         let mut reader = BufReader::new(rollout_file::open(&self.path)?);
         let mut line = Vec::new();
         let mut workspace = WorkspaceScan::new(self.project_path.as_deref());
@@ -242,10 +301,18 @@ impl CodexSession {
             else {
                 break;
             };
+            let location = JsonLineLocation {
+                offset: limits.file_bytes - remaining,
+                length: bytes,
+                terminated: line.ends_with(b"\n"),
+            };
             remaining -= bytes;
             let oversized = matches!(kind, BoundedLine::Oversized);
             if !oversized {
-                match rollout_file::workspace_record_kind(&line) {
+                match rollout_file::workspace_record_kind(
+                    &line,
+                    inspect_displays && !workspace.reconstruct_history,
+                ) {
                     rollout_file::WorkspaceRecord::Other => continue,
                     rollout_file::WorkspaceRecord::SavedMessage => {
                         workspace.saved_messages += 1;
@@ -266,10 +333,13 @@ impl CodexSession {
                                 {
                                     workspace.settings.startup = None;
                                 }
-                            } else if record["type"] != "session_meta"
-                                || lineage.unavailable.is_some()
+                            } else if (record["type"] != "session_meta"
+                                || lineage.unavailable.is_some())
+                                && (self.history_mode != super::CodexHistoryMode::Paginated
+                                    || super::records_history_base(&record)
+                                    || super::WorkspaceRecords::accepts(true, &record))
                             {
-                                workspace.observe(&self.id, &record)?;
+                                workspace.observe(&self.id, &record);
                             }
                             continue;
                         }
@@ -278,7 +348,7 @@ impl CodexSession {
             }
             let previous = skipped.workspace_gaps();
             skipped.observe(
-                rollout_file::workspace_gap(&line, oversized, Some(&self.id)),
+                rollout_file::workspace_gap_at(plain, location, &line, oversized, Some(&self.id))?,
                 oversized,
             );
             if skipped.workspace_gaps() > previous {

@@ -9,6 +9,11 @@ use omnis_core::{
 use omnis_ir::{Provider, SessionRef};
 use serde_json::{Value, json};
 
+const WORKSPACE: &str = if cfg!(windows) {
+    "C:/workspace"
+} else {
+    "/workspace"
+};
 const STAMP: &str = "2026-01-01T00:00:00Z";
 const PARENT: &str = "11111111-1111-4111-8111-111111111111";
 const CHILD: &str = "22222222-2222-4222-8222-222222222222";
@@ -17,7 +22,7 @@ const REVERT: &str = "33333333-3333-4333-8333-333333333333";
 fn header(id: &str, ordinal: usize, base: Option<Value>, attached: bool) -> Value {
     json!({"timestamp":STAMP,"type":"session_meta", "ordinal": ordinal, "payload":{
         "id": id, "session_id": PARENT, "history_mode": "paginated", "history_base": base.unwrap_or(Value::Null),
-        "timestamp":STAMP,"cwd":"/workspace","originator":"fixture","cli_version":"0.167.1",
+        "timestamp":STAMP,"cwd":WORKSPACE,"originator":"fixture","cli_version":"0.167.1",
         "attached_thread": attached, "forked_from_id": (id == CHILD).then_some(PARENT)
     }})
 }
@@ -123,17 +128,26 @@ fn paginated_native_resume_requires_a_string_creation_directory() -> Result<()> 
         write(
             &folder,
             &name,
-            &[header, message(1, "available local request")],
+            &[
+                header,
+                message(1, "unpublished model input"),
+                json!({"timestamp":STAMP,"ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":PARENT}}),
+                json!({"timestamp":STAMP,"ordinal":3,"type":"event_msg","payload":{
+                    "type":"item_completed","thread_id":PARENT,"turn_id":PARENT,
+                    "item":{"type":"UserMessage","id":"request","content":[{"type":"text","text":"available local request"}]}
+                }}),
+                json!({"timestamp":STAMP,"ordinal":4,"type":"event_msg","payload":{"type":"task_complete","turn_id":PARENT}}),
+            ],
         )?;
         let adapter = CodexAdapter::with_root(home.path());
         assert_eq!(adapter.native_resume_support(&session)?, expected);
-        assert!(
-            adapter
-                .read_session(&session)?
-                .events
-                .iter()
-                .any(|event| event.payload["text"] == "available local request")
-        );
+        let snapshot = adapter.read_session(&session)?;
+        let messages: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect();
+        assert_eq!(messages, ["available local request"]);
     }
     Ok(())
 }
@@ -1097,10 +1111,7 @@ fn an_inherited_abort_preserves_only_the_childs_owned_workspace() -> Result<()> 
     let dir = home.path().join("sessions");
     let child_dir = home.path().join("child");
     fs::create_dir(&child_dir)?;
-    for (owner, expected) in [
-        (CHILD, child_dir.as_path()),
-        (PARENT, Path::new("/workspace")),
-    ] {
+    for (owner, expected) in [(CHILD, child_dir.as_path()), (PARENT, Path::new(WORKSPACE))] {
         let mut rows = interrupted_fork(&dir)?;
         rows[1] = settings(3, &child_dir);
         rows[1]["payload"]["thread_id"] = json!(owner);

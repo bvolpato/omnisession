@@ -1,5 +1,9 @@
 //! Reads the immutable prefixes that Codex records in paginated fork and revert rollouts.
 
+pub(super) mod recovered;
+pub(super) mod replay;
+pub(super) mod replay_messages;
+
 mod copies;
 mod observed;
 
@@ -135,13 +139,13 @@ struct AttachmentStart {
 struct SavedPair {
     row: usize,
     record: usize,
-    child_turn: Option<super::MediaDigest>,
+    child_turn: Option<replay_messages::MediaDigest>,
 }
 
 #[derive(Clone)]
 struct LiteralTags {
     ordinal: u64,
-    request_digest: super::MediaDigest,
+    request_digest: replay_messages::MediaDigest,
     indices: Vec<usize>,
 }
 
@@ -153,7 +157,7 @@ impl VisibleStart {
             .as_ref()
             .filter(|proof| {
                 record["ordinal"].as_u64() == Some(proof.ordinal)
-                    && super::media_digest(&record.to_string()) == proof.request_digest
+                    && replay_messages::media_digest(&record.to_string()) == proof.request_digest
             })
     }
 
@@ -575,7 +579,7 @@ struct AttachmentPreamble {
 
 struct PendingPair {
     raw: Value,
-    saved_turn: Option<super::MediaDigest>,
+    saved_turn: Option<replay_messages::MediaDigest>,
 }
 
 struct ForeignTurn {
@@ -607,11 +611,11 @@ impl AttachmentPreamble {
             .or_else(|| record.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok());
-        match super::history_event_type(payload) {
+        match replay_messages::history_event_type(payload) {
             Some("task_started" | "turn_started" | "item_started") => {
                 if let Some(owner) = owner.filter(|id| {
                     Some(*id) != self.start.owner
-                        && super::event_scope_matches(record, &id.to_string())
+                        && replay_messages::event_scope_matches(record, &id.to_string())
                 }) {
                     self.foreign_turn = Some(ForeignTurn {
                         owner,
@@ -622,7 +626,7 @@ impl AttachmentPreamble {
             Some("task_complete" | "turn_complete")
                 if self.foreign_turn.as_ref().is_some_and(|active| {
                     active.turn == turn
-                        && super::event_scope_matches(record, &active.owner.to_string())
+                        && replay_messages::event_scope_matches(record, &active.owner.to_string())
                 }) =>
             {
                 self.foreign_turn = None;
@@ -638,7 +642,7 @@ impl AttachmentPreamble {
             .then(|| {
                 record["payload"]["turn_id"]
                     .as_str()
-                    .map(super::media_digest)
+                    .map(replay_messages::media_digest)
             })
             .flatten();
         let confirmed = child_turn.is_some()
@@ -664,7 +668,7 @@ impl AttachmentPreamble {
                     .or_else(|| saved["payload"]["turn_id"].as_str())
             })
             .flatten()
-            .map(super::media_digest);
+            .map(replay_messages::media_digest);
         self.start.save_pair(self.row, self.records, child_turn);
     }
 
@@ -702,11 +706,11 @@ impl AttachmentPreamble {
                 ),
                 "assistant" => (
                     omnis_ir::EventKind::MessageAssistant,
-                    super::message_parts(&row["payload"]).0.join("\n"),
+                    replay_messages::message_parts(&row["payload"]).0.join("\n"),
                 ),
                 _ => return None,
             };
-            Some(super::VisibleMessage::new(row, kind, &text))
+            Some(replay_messages::VisibleMessage::new(row, kind, &text))
         };
         identity(raw)
             .zip(identity(saved))
@@ -733,7 +737,7 @@ impl AttachmentPreamble {
                 raw,
                 saved_turn: saved["payload"]["turn_id"]
                     .as_str()
-                    .map(super::media_digest),
+                    .map(replay_messages::media_digest),
             });
         }
     }
@@ -745,14 +749,14 @@ impl AttachmentPreamble {
         request: Option<&Value>,
     ) -> bool {
         if !self.start.owner.is_some_and(|id| {
-            super::receipt_in_turn(receipt, &id.to_string(), self.turn_hint.as_deref())
+            replay_messages::receipt_in_turn(receipt, &id.to_string(), self.turn_hint.as_deref())
         }) {
             return false;
         }
         if pair.and_then(|pair| pair.saved_turn).is_some_and(|turn| {
             receipt["payload"]["turn_id"]
                 .as_str()
-                .map(super::media_digest)
+                .map(replay_messages::media_digest)
                 != Some(turn)
         }) {
             return false;
@@ -770,7 +774,7 @@ impl AttachmentPreamble {
         };
         self.start.literal_tags = Some(LiteralTags {
             ordinal,
-            request_digest: super::media_digest(&raw.to_string()),
+            request_digest: replay_messages::media_digest(&raw.to_string()),
             indices,
         });
         if pair.is_some() {
@@ -779,7 +783,7 @@ impl AttachmentPreamble {
                 self.records - 1,
                 receipt["payload"]["turn_id"]
                     .as_str()
-                    .map(super::media_digest),
+                    .map(replay_messages::media_digest),
             );
         }
         pair.is_none()
@@ -792,7 +796,10 @@ impl AttachmentPreamble {
         let request = self.request.take();
         let pending = self.pending_pair.take();
         self.observe_foreign_turn(&record);
-        match (record["type"].as_str(), super::history_event_type(payload)) {
+        match (
+            record["type"].as_str(),
+            replay_messages::history_event_type(payload),
+        ) {
             (Some("session_meta"), _) if self.row == 1 => {
                 self.observe_header(payload);
             }
@@ -813,7 +820,7 @@ impl AttachmentPreamble {
                 if payload["reason"].is_string()
                     && (self.start.matches_scope(&record)
                         || self.parent.is_some_and(|parent| {
-                            super::event_scope_matches(&record, &parent.to_string())
+                            replay_messages::event_scope_matches(&record, &parent.to_string())
                         })) =>
             {
                 if let (Some(prev), Some(abort)) = (previous_ordinal, self.previous_ordinal) {
@@ -870,7 +877,12 @@ impl AttachmentPreamble {
 }
 
 impl AttachmentStart {
-    fn save_pair(&mut self, row: usize, record: usize, child_turn: Option<super::MediaDigest>) {
+    fn save_pair(
+        &mut self,
+        row: usize,
+        record: usize,
+        child_turn: Option<replay_messages::MediaDigest>,
+    ) {
         if self.saved_pairs.len() < super::MAX_CANONICAL_EVENTS {
             self.saved_pairs.push(SavedPair {
                 row,
@@ -884,7 +896,7 @@ impl AttachmentStart {
 
     fn matches_scope(&self, record: &Value) -> bool {
         self.owner
-            .is_some_and(|owner| super::event_scope_matches(record, &owner.to_string()))
+            .is_some_and(|owner| replay_messages::event_scope_matches(record, &owner.to_string()))
     }
 
     fn owns(&self, record: &Value) -> bool {
@@ -949,23 +961,27 @@ fn receipt_literal_parts_at(
         let before = index.checked_sub(1).and_then(|previous| raw.get(previous));
         let image_tag = part["type"] == "input_text"
             && part["text"].as_str().is_some_and(|text| {
-                super::is_image_wrapper(text, is_image(before), is_image(raw.get(index + 1)))
+                replay_messages::is_image_wrapper(
+                    text,
+                    is_image(before),
+                    is_image(raw.get(index + 1)),
+                )
             });
         if saved
             .next_if(|candidate| same_input_part(part, candidate))
             .is_some()
         {
             if image_tag
-                || super::local_audio_path(raw, index + 1).is_some()
+                || replay_messages::local_audio_path(raw, index + 1).is_some()
                 || index
                     .checked_sub(1)
-                    .is_some_and(|audio| super::local_audio_path(raw, audio).is_some())
+                    .is_some_and(|audio| replay_messages::local_audio_path(raw, audio).is_some())
             {
                 literal_tags.push(index);
             }
             continue;
         }
-        if let Some(path) = super::local_image_path(raw, index + 1)
+        if let Some(path) = replay_messages::local_image_path(raw, index + 1)
             && let Some(image) = raw.get(index + 1)
             && image["type"] == "input_image"
             && media_reference(image, "image_url").is_some()
@@ -984,7 +1000,7 @@ fn receipt_literal_parts_at(
             parts.nth(1);
             continue;
         }
-        if let Some(path) = super::local_audio_path(raw, index + 1)
+        if let Some(path) = replay_messages::local_audio_path(raw, index + 1)
             && saved
                 .next_if(|candidate| {
                     candidate["type"] == "local_audio" && candidate["path"].as_str() == Some(path)
@@ -1360,41 +1376,38 @@ impl Lineage {
         record["ordinal"].as_u64().map(|ordinal| ordinal >= start)
     }
 
-    pub(super) fn visit_leaf(
+    pub(super) fn visit_confirmed_leaf_lines(
         &self,
         session: &str,
-        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
-        mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+        read: impl FnOnce(
+            &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+        ) -> Result<JsonLineSkips>,
+        mut visit: impl FnMut(Value, JsonLineSkips, bool, bool) -> Result<()>,
     ) -> Result<JsonLineSkips> {
-        self.visit_confirmed_leaf(session, read, |row, mark, _| visit(row, mark))
-    }
-
-    pub(super) fn visit_confirmed_leaf(
-        &self,
-        session: &str,
-        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
-        mut visit: impl FnMut(Value, JsonLineSkips, bool) -> Result<()>,
-    ) -> Result<JsonLineSkips> {
-        let read = |visit: &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>| {
-            let mut receipts = super::RequestReceipts::new(session, true);
-            let skipped =
-                read(&mut |record, mark| receipts.observe_confirmed(record, mark, &mut *visit))?;
-            receipts.flush(|row, mark| visit(row, mark, false))?;
+        let read = |visit: &mut dyn FnMut(Value, JsonLineSkips, bool, bool) -> Result<()>| {
+            let mut receipts = replay_messages::RequestReceipts::new(session, true);
+            let skipped = read(&mut |record, mark, terminated| {
+                receipts.observe_confirmed(record, (mark, terminated), |row, (mark, end), proof| {
+                    visit(row, mark, end, proof)
+                })
+            })?;
+            receipts.flush(|row, (mark, end)| visit(row, mark, end, false))?;
             Ok(skipped)
         };
         if self.visible_leaf_start.ordinal().is_none() {
-            return read(&mut |row, mark, confirmed| {
-                visit(row, mark, confirmed && self.attached_leaf())
+            return read(&mut |row, mark, end, confirmed| {
+                visit(row, mark, end, confirmed && self.attached_leaf())
             });
         }
         let mut unplaced = JsonLineSkips::default();
         let mut row = 0;
-        let skipped = read(&mut |record, skipped, confirmed| {
+        let skipped = read(&mut |record, skipped, terminated, confirmed| {
             row += 1;
             match self.leaf_record_visibility(&record, row) {
                 Some(true) => visit(
                     self.visible_leaf_start.project_request(record),
                     skipped.combined(unplaced),
+                    terminated,
                     confirmed && self.attached_leaf(),
                 )?,
                 Some(false) => {}
@@ -1460,7 +1473,7 @@ impl Lineage {
             budget
                 .contains_prefix(&segment.path, segment.position.end_byte_offset, |reader| {
                     Ok(matches!(
-                        read_prefix_from(segment, reader, &mut |_, _| Ok(()))?,
+                        read_prefix_from(segment, reader, &mut |_, _, _| Ok(()))?,
                         PrefixRead::Complete(0)
                     ))
                 })
@@ -1470,13 +1483,13 @@ impl Lineage {
 
     pub(super) fn visit(
         &self,
-        mut visit: impl FnMut(InheritedRecord, usize, bool) -> Result<()>,
+        mut visit: impl FnMut(InheritedRecord, usize, bool, bool) -> Result<()>,
     ) -> Result<usize> {
         let mut skipped = 0;
         let mut damage = Vec::new();
         for (index, segment) in self.segments.iter().enumerate().skip(self.first_available) {
             let prefix = if damage.is_empty() {
-                read_prefix(segment, &mut |record, local| {
+                read_prefix(segment, &mut |record, local, terminated| {
                     if let InheritedRecord::Native(value) = &record
                         && value["type"] == "event_msg"
                         && matches!(
@@ -1493,11 +1506,16 @@ impl Lineage {
                     {
                         return Ok(());
                     }
-                    visit(record, skipped + local, segment.recovery.is_some())
+                    visit(
+                        record,
+                        skipped + local,
+                        segment.recovery.is_some(),
+                        terminated,
+                    )
                 })
             } else {
                 // Check every newer bookmark in this pass. Multiple damaged sources need one retry.
-                read_prefix(segment, &mut |_, _| Ok(()))
+                read_prefix(segment, &mut |_, _, _| Ok(()))
             }?;
             match prefix {
                 PrefixRead::Complete(count) => {
@@ -1507,6 +1525,7 @@ impl Lineage {
                             InheritedRecord::SegmentEnd(segment.position.end_ordinal_exclusive),
                             skipped,
                             segment.recovery.is_some(),
+                            true,
                         )?;
                     }
                 }
@@ -1554,6 +1573,7 @@ fn access_denied(error: &anyhow::Error) -> bool {
 }
 
 pub(super) enum InheritedRecord {
+    SegmentStart(Value),
     SegmentEnd(u64),
     Native(Value),
     ConfirmedRequest(Value),
@@ -1582,7 +1602,7 @@ enum PrefixRead {
 /// too, so an inconsistent bookmark never imports a turn after the fork.
 fn read_prefix(
     segment: &Segment,
-    visit: &mut dyn FnMut(InheritedRecord, usize) -> Result<()>,
+    visit: &mut dyn FnMut(InheritedRecord, usize, bool) -> Result<()>,
 ) -> Result<PrefixRead> {
     let revision = CodexAdapter::index_file_revision(&segment.path);
     ensure!(
@@ -1596,28 +1616,35 @@ fn read_prefix(
         result => result?,
     };
     let owner = rollout_identity::thread_id(&segment.path).unwrap_or_default();
-    let mut receipts = super::RequestReceipts::new(owner, false);
-    let mut projection = read_prefix_from(segment, &mut source, &mut |record, skipped| {
-        if let InheritedRecord::Native(row) = record {
-            receipts.observe_confirmed(row, skipped, |row, mark, confirmed| {
-                visit(
-                    InheritedRecord::request(
-                        row,
-                        confirmed
-                            && segment
-                                .visible_start
-                                .as_ref()
-                                .is_some_and(|start| start.attached.is_some()),
-                    ),
-                    mark,
+    let mut receipts = replay_messages::RequestReceipts::new(owner, false);
+    let mut projection =
+        read_prefix_from(segment, &mut source, &mut |record, skipped, terminated| {
+            if let InheritedRecord::Native(row) = record {
+                receipts.observe_confirmed(
+                    row,
+                    (skipped, terminated),
+                    |row, (mark, end), confirmed| {
+                        visit(
+                            InheritedRecord::request(
+                                row,
+                                confirmed
+                                    && segment
+                                        .visible_start
+                                        .as_ref()
+                                        .is_some_and(|start| start.attached.is_some()),
+                            ),
+                            mark,
+                            end,
+                        )
+                    },
                 )
-            })
-        } else {
-            receipts.flush(|row, mark| visit(InheritedRecord::Native(row), mark))?;
-            visit(record, skipped)
-        }
-    })?;
-    receipts.flush(|row, mark| visit(InheritedRecord::Native(row), mark))?;
+            } else {
+                receipts
+                    .flush(|row, (mark, end)| visit(InheritedRecord::Native(row), mark, end))?;
+                visit(record, skipped, terminated)
+            }
+        })?;
+    receipts.flush(|row, (mark, end)| visit(InheritedRecord::Native(row), mark, end))?;
     if let PrefixRead::Partial(_, plan) = &mut projection {
         let Some(revision) = revision else {
             return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE));
@@ -1711,7 +1738,7 @@ impl RecoveryPlan {
     ) -> Option<InheritedRecord> {
         if self.withheld_request(row, start) {
             Some(InheritedRecord::WithheldRequest {
-                client_submission: super::client_submission(record),
+                client_submission: replay_messages::client_submission(record),
             })
         } else if self.withheld_reply(row, start, record, path) {
             Some(InheritedRecord::WithheldReply)
@@ -1741,7 +1768,7 @@ struct SequenceEvidence {
     unnumbered_messages: Vec<(usize, bool)>,
     candidates: Vec<(usize, bool, usize, bool)>,
     request_slots: Vec<(usize, bool, usize)>,
-    last_request: Option<super::MirrorGroup>,
+    last_request: Option<replay_messages::MirrorGroup>,
 }
 
 impl SequenceEvidence {
@@ -1800,7 +1827,7 @@ impl SequenceEvidence {
     fn observe_turn(&mut self, path: &Path, record: &Value, row: usize, numbered: bool) {
         let payload = &record["payload"];
         if is_owned_turn_start(record, path) {
-            self.last_request = Some(super::MirrorGroup::new(true));
+            self.last_request = Some(replay_messages::MirrorGroup::new(true));
             self.turn = payload["turn_id"]
                 .as_str()
                 .map(|id| (row, id.to_owned(), numbered));
@@ -1829,18 +1856,21 @@ impl SequenceEvidence {
             if let Some(message) = request_text(record) {
                 self.observe_request(record, row, numbered, &message);
             } else {
-                super::MirrorGroup::barrier(&mut self.last_request);
+                replay_messages::MirrorGroup::barrier(&mut self.last_request);
             }
         }
     }
 
     fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: &str) {
-        let identity = super::VisibleMessage::new(record, omnis_ir::EventKind::MessageUser, text);
-        if let super::MirrorObservation::Paired(prior) = super::MirrorGroup::observe(
-            &mut self.last_request,
-            identity,
-            (!numbered).then_some(row),
-        ) {
+        let identity =
+            replay_messages::VisibleMessage::new(record, omnis_ir::EventKind::MessageUser, text);
+        if let replay_messages::MirrorObservation::Paired(prior) =
+            replay_messages::MirrorGroup::observe(
+                &mut self.last_request,
+                identity,
+                (!numbered).then_some(row),
+            )
+        {
             match (prior, numbered) {
                 (Some(prior_row), true) => self.plan.corroborated_mirrors.push(prior_row),
                 (None, false) => self.plan.corroborated_mirrors.push(row),
@@ -1896,10 +1926,10 @@ fn request_text(record: &Value) -> Option<String> {
             if let Some(text) = payload["content"].as_str() {
                 (text.to_owned(), 0)
             } else {
-                let (parts, images) = super::message_parts(payload);
+                let (parts, images) = replay_messages::message_parts(payload);
                 if parts
                     .iter()
-                    .any(|part| super::is_contextual_user_text(part))
+                    .any(|part| replay_messages::is_contextual_user_text(part))
                 {
                     return None;
                 }
@@ -1918,11 +1948,11 @@ fn request_text(record: &Value) -> Option<String> {
         _ => return None,
     };
     if text.is_empty()
-        && let Some(placeholder) = super::omitted_media_text(payload, images)
+        && let Some(placeholder) = replay_messages::omitted_media_text(payload, images)
     {
         return Some(placeholder);
     }
-    (!super::is_contextual_user_text(&text)).then_some(text)
+    (!replay_messages::is_contextual_user_text(&text)).then_some(text)
 }
 
 fn message_role(record: &Value) -> Option<&str> {
@@ -2189,7 +2219,7 @@ fn is_owned_turn_start(record: &Value, path: &Path) -> bool {
 fn is_owned_rollback(record: &Value, path: &Path) -> bool {
     record["type"] == "event_msg"
         && record["payload"]["type"] == "thread_rolled_back"
-        && record["payload"]["num_turns"].is_u64()
+        && super::rollout_lines::rollback_turns(&record["payload"]).is_some()
         && owned_event(record, path)
 }
 
@@ -2204,10 +2234,37 @@ fn owned_event(record: &Value, path: &Path) -> bool {
     })
 }
 
+impl Segment {
+    fn inherited_record(
+        &self,
+        start: &VisibleStart,
+        mut record: Value,
+        row: usize,
+        visible: bool,
+    ) -> Option<InheritedRecord> {
+        if row == 1 {
+            return Some(InheritedRecord::SegmentStart(record));
+        }
+        if visible {
+            if let Some(proof) = start.confirmed_request(&record) {
+                project_literal_parts(&mut record, &proof.indices);
+                return Some(InheritedRecord::ConfirmedRequest(record));
+            }
+            return Some(InheritedRecord::Native(record));
+        }
+        if start.hides_parsed_row(row, &record) {
+            return None;
+        }
+        self.recovery
+            .as_ref()?
+            .withheld_record(row, start, &record, &self.path)
+    }
+}
+
 fn read_prefix_from(
     segment: &Segment,
     source: &mut dyn Read,
-    visit: &mut dyn FnMut(InheritedRecord, usize) -> Result<()>,
+    visit: &mut dyn FnMut(InheritedRecord, usize, bool) -> Result<()>,
 ) -> Result<PrefixRead> {
     let Some(visible_start) = segment.visible_start.as_ref() else {
         return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
@@ -2273,23 +2330,10 @@ fn read_prefix_from(
                     }
                 };
                 let record = super::saved_message::project(record);
-                if cursor.observe(segment, visible_start, &record, row)? {
-                    visit(
-                        if let Some(proof) = visible_start.confirmed_request(&record) {
-                            let mut record = record;
-                            project_literal_parts(&mut record, &proof.indices);
-                            InheritedRecord::ConfirmedRequest(record)
-                        } else {
-                            InheritedRecord::Native(record)
-                        },
-                        skipped,
-                    )?;
-                } else if !visible_start.hides_parsed_row(row, &record)
-                    && let Some(withheld) = segment.recovery.as_ref().and_then(|plan| {
-                        plan.withheld_record(row, visible_start, &record, &segment.path)
-                    })
+                let visible = cursor.observe(segment, visible_start, &record, row)?;
+                if let Some(record) = segment.inherited_record(visible_start, record, row, visible)
                 {
-                    visit(withheld, skipped)?;
+                    visit(record, skipped, line.ends_with(b"\n"))?;
                 }
             }
         }

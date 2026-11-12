@@ -116,6 +116,7 @@ impl HermesAdapter {
             }
             Ok(IndexRead {
                 ancestor_revisions: Vec::new(),
+                ownership_revision: None,
                 verified_prefix_end: None,
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),

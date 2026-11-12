@@ -55,19 +55,35 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     )
     .map_err(database_error)?;
     for (provider, table) in RECEIPT_TABLES {
+        let legacy_key: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1) WHERE \"table\"='session_trajectories' AND \"to\"='session_id')",
+            [table], |row| row.get(0),
+        ).map_err(database_error)?;
+        if legacy_key {
+            tx.execute_batch(&format!("ALTER TABLE {table} RENAME TO previous_{table}"))
+                .map_err(database_error)?;
+        }
         tx.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {table} (
              provider TEXT NOT NULL DEFAULT '{provider}' CHECK(provider='{provider}'),
              session_id TEXT NOT NULL,
+             trajectory_id INTEGER NOT NULL REFERENCES session_trajectories(id) ON DELETE CASCADE,
              source_home BLOB NOT NULL,
              source_file BLOB NOT NULL CHECK(length(source_file)=16),
              source_contents BLOB NOT NULL CHECK(length(source_contents)=16),
              content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
              step_proof BLOB NOT NULL CHECK(length(step_proof)%16=0 AND length(step_proof)<=1600000),
-             PRIMARY KEY(session_id, source_home, source_file),
-             FOREIGN KEY(provider, session_id) REFERENCES session_trajectories(provider, session_id) ON DELETE CASCADE
+             PRIMARY KEY(session_id, source_home, source_file)
          ) WITHOUT ROWID;",
     )).map_err(database_error)?;
+        if legacy_key {
+            tx.execute_batch(&format!(
+                "INSERT INTO {table}(provider,session_id,trajectory_id,source_home,source_file,source_contents,content_hash,step_proof)
+                 SELECT r.provider,r.session_id,(SELECT id FROM session_trajectories WHERE provider=r.provider AND session_id=r.session_id),
+                        r.source_home,r.source_file,r.source_contents,r.content_hash,r.step_proof FROM previous_{table} r;
+                 DROP TABLE previous_{table};"
+            )).map_err(database_error)?;
+        }
     }
     Ok(())
 }
@@ -102,6 +118,7 @@ pub(super) fn promote_gap_projections(tx: &Transaction<'_>) -> Result<()> {
          DELETE FROM antigravity_search_gaps WHERE trajectory_id IN (
              SELECT trajectory_id FROM antigravity_gap_projections
          );
+         DELETE FROM antigravity_gap_projections;
          DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id IN (SELECT id FROM promoted_gap_documents);
          INSERT INTO session_trajectory_chunk_rows (trajectory_id,chunk_index,stored_text)
          SELECT id,chunk_index,stored_text FROM promoted_gap_chunks;
@@ -231,14 +248,14 @@ pub(crate) fn save(
         }
         let bytes: Vec<u8> = proof.iter().flat_map(Uuid::as_bytes).copied().collect();
         tx.prepare_cached(&format!(
-            "INSERT INTO {table}(session_id, source_home, source_file, source_contents, content_hash, step_proof)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO {table}(session_id, trajectory_id, source_home, source_file, source_contents, content_hash, step_proof)
+             VALUES(?1, (SELECT id FROM session_trajectories WHERE provider=?7 AND session_id=?1), ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id, source_home, source_file) DO UPDATE SET
                  source_contents=excluded.source_contents, content_hash=excluded.content_hash, step_proof=excluded.step_proof",
         ))
         .and_then(|mut statement| {
             statement.execute(params![
-                session.id, home, file.as_bytes(), contents.as_bytes(), content_hash, bytes
+                session.id, home, file.as_bytes(), contents.as_bytes(), content_hash, bytes, session.provider.to_string(),
             ])
         })
     } else {
@@ -412,15 +429,82 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn a_format_one_database_keeps_its_receipts_until_the_session_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA user_version=1;
+             CREATE TABLE session_trajectories(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,session_id TEXT NOT NULL,
+                redacted_text TEXT NOT NULL,source_updated_at INTEGER NOT NULL,complete INTEGER NOT NULL,indexed_at INTEGER NOT NULL,
+                UNIQUE(provider,session_id));
+             CREATE TABLE session_index(provider TEXT NOT NULL,session_id TEXT NOT NULL,title TEXT,project_path TEXT,
+                git_branch TEXT,created_at INTEGER,updated_at INTEGER,event_count INTEGER NOT NULL,indexed_at INTEGER NOT NULL,
+                PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
+             CREATE TABLE native_catalog_homes(provider TEXT,session_id TEXT,home BLOB NOT NULL,verified INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(provider,session_id),FOREIGN KEY(provider,session_id) REFERENCES session_index(provider,session_id) ON DELETE CASCADE) WITHOUT ROWID;
+             CREATE TABLE desktop_search_receipts(provider TEXT,session_id TEXT,source_home BLOB,source_file BLOB,source_contents BLOB,content_hash BLOB,step_proof BLOB,
+                PRIMARY KEY(session_id,source_home,source_file),FOREIGN KEY(provider,session_id) REFERENCES session_trajectories(provider,session_id) ON DELETE CASCADE) WITHOUT ROWID;
+             CREATE TABLE session_index_reader_checks(provider TEXT,reader_version INTEGER,source_home BLOB,checked_at INTEGER,attempt_id BLOB,
+                PRIMARY KEY(provider,reader_version)) WITHOUT ROWID;
+             CREATE TABLE session_index_discovery_results(provider TEXT,reader_version INTEGER,attempt_id BLOB,succeeded INTEGER,
+                PRIMARY KEY(provider,reader_version),FOREIGN KEY(provider,reader_version) REFERENCES session_index_reader_checks(provider,reader_version) ON DELETE CASCADE) WITHOUT ROWID;
+             CREATE TABLE session_index_upgrade_sources(provider TEXT,reader_version INTEGER,session_id TEXT,source_path TEXT,
+                PRIMARY KEY(provider,reader_version,session_id),FOREIGN KEY(provider,reader_version) REFERENCES session_index_reader_checks(provider,reader_version) ON DELETE CASCADE) WITHOUT ROWID;
+             INSERT INTO session_index(provider,session_id,event_count,indexed_at) VALUES('antigravity-desktop','saved',1,1);
+             INSERT INTO session_trajectories VALUES(81,'antigravity-desktop','saved','',1,1,1);
+             INSERT INTO native_catalog_homes VALUES('antigravity-desktop','saved',X'61',1);
+             INSERT INTO desktop_search_receipts VALUES('antigravity-desktop','saved',X'61',zeroblob(16),zeroblob(16),zeroblob(32),zeroblob(16));
+             INSERT INTO session_index_reader_checks VALUES('antigravity-desktop',6,X'61',42,zeroblob(16));
+             INSERT INTO session_index_discovery_results VALUES('antigravity-desktop',6,zeroblob(16),1);
+             INSERT INTO session_index_upgrade_sources VALUES('antigravity-desktop',6,'saved','transcript');",
+        ).unwrap();
+        drop(old);
+
+        let store = crate::Store::open(path).unwrap();
+        let session = SessionRef::new(Provider::AntigravityDesktop, "saved");
+        let proof = || {
+            let mut connection = store.connection.borrow_mut();
+            let tx = connection.transaction().unwrap();
+            read(&tx, &session, b"a", Uuid::nil(), Uuid::nil(), &[0; 32]).unwrap()
+        };
+        let excluded = || {
+            store
+                .excluded_catalog_ids(session.provider, std::path::Path::new("b"))
+                .unwrap()
+        };
+        assert_eq!(proof(), Some(vec![Uuid::nil()]));
+        assert!(excluded().contains("saved"));
+        let original = std::path::Path::new("a");
+        assert_eq!(
+            store
+                .completed_discovery_at(session.provider, 6, original)
+                .unwrap(),
+            chrono::DateTime::from_timestamp_millis(42)
+        );
+        let pending = || {
+            store
+                .pending_discovery_sources(session.provider, 6, original)
+                .unwrap()
+        };
+        assert_eq!(pending(), [("saved".to_owned(), Some("transcript".into()))]);
+        store.forget_session(&session).unwrap();
+        assert_eq!(proof(), None);
+        assert!(excluded().is_empty());
+        assert!(pending().is_empty());
+    }
+
+    #[test]
     fn receipt_follows_its_saved_projection_and_source() {
         let mut connection = Connection::open_in_memory().unwrap();
         let tx = connection.transaction().unwrap();
         tx.execute_batch(
             "CREATE TABLE session_trajectories (
-                provider TEXT, session_id TEXT, PRIMARY KEY(provider, session_id)
+                id INTEGER PRIMARY KEY, provider TEXT, session_id TEXT
              );
              CREATE TABLE session_trajectory_chunk_rows (trajectory_id INTEGER, chunk_index INTEGER);
-             INSERT INTO session_trajectories VALUES('antigravity-desktop','session'), ('antigravity','session');",
+             INSERT INTO session_trajectories(provider,session_id) VALUES('antigravity-desktop','session'), ('antigravity','session');",
         )
         .unwrap();
         initialize(&tx).unwrap();

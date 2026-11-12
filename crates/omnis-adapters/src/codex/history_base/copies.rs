@@ -86,7 +86,7 @@ impl Segment {
             reader: rollout_file::open(&self.path)?,
             hash: &mut hash,
         };
-        let result = read_prefix_from(&self, &mut reader, &mut |_, _| Ok(()))?;
+        let result = read_prefix_from(&self, &mut reader, &mut |_, _, _| Ok(()))?;
         ensure!(
             CodexAdapter::index_file_revision(&self.path) == Some(revision),
             "alternate Codex source rollout changed while verifying its bookmark"

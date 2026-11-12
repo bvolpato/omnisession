@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -36,7 +36,7 @@ pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use cursor_identity::{
     cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
 };
-pub use grok::GrokAdapter;
+pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
@@ -186,6 +186,8 @@ impl CodexWorkspaceProjection {
 pub struct IndexRead {
     /// Physical ancestor rollout IDs and the inventory revisions observed during this projection.
     pub ancestor_revisions: Vec<(uuid::Uuid, uuid::Uuid)>,
+    /// Physical file whose ownership was checked independently of display metadata.
+    pub ownership_revision: Option<SourceRevision>,
     pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
     /// Exclusive event sequence at the first gap in an otherwise sequential read.
     pub verified_prefix_end: Option<u64>,
@@ -281,6 +283,14 @@ pub enum EnvChange {
     Remove(String),
 }
 
+/// Workspace evidence for a session whose active directory can change between turns.
+pub struct NativeWorkspace {
+    pub directory: Option<PathBuf>,
+    /// Directory the native client can safely infer when it opens the session.
+    pub startup_directory: Option<PathBuf>,
+    pub git: GitState,
+}
+
 /// State database settings that a Codex launch profile supplies.
 #[derive(Debug, Default)]
 pub struct CodexLaunchOverrides {
@@ -316,6 +326,7 @@ fn read_budgeted_transcript(
             Ok(snapshot) => {
                 return Ok(IndexRead {
                     ancestor_revisions: Vec::new(),
+                    ownership_revision: None,
                     verified_prefix_end: None,
                     database_aliases: std::sync::Arc::default(),
                     search_record_groups: Vec::new(),
@@ -334,6 +345,7 @@ fn read_budgeted_transcript(
     }
     Ok(IndexRead {
         ancestor_revisions: Vec::new(),
+        ownership_revision: None,
         verified_prefix_end: None,
         database_aliases: std::sync::Arc::default(),
         search_record_groups: Vec::new(),
@@ -427,6 +439,15 @@ pub trait ProviderAdapter: Send + Sync {
             .find(|session| session.session.id == id))
     }
 
+    /// Reads the effective workspace when it can differ from the discovery metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot determine the effective directory.
+    fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+        Ok(None)
+    }
+
     /// Describes whether the provider can continue the stored representation by its session ID.
     ///
     /// # Errors
@@ -434,6 +455,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error if the adapter cannot identify the source representation.
     fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
         Ok(NativeResumeSupport::Direct)
+    }
+
+    /// IDs with a conflicting or unreadable native source in the last discovery pass.
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Resolves the local Codex database directory for a continuation. An existing ID must select the displayed session there.
@@ -629,6 +655,7 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<IndexRead> {
         Ok(IndexRead {
             ancestor_revisions: Vec::new(),
+            ownership_revision: None,
             verified_prefix_end: None,
             database_aliases: std::sync::Arc::default(),
             search_record_groups: Vec::new(),

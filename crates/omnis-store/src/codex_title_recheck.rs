@@ -10,7 +10,7 @@ use uuid::Uuid;
 // The catalog can advance to an appended revision while the old document still awaits its read.
 const MATCHING_PROOF: &str = "
     FROM legacy_codex_title_proofs p
-    JOIN session_trajectories t ON t.id=p.trajectory_id
+    JOIN visible_trajectories t ON t.id=p.trajectory_id
     JOIN scoped_session_catalog c ON c.provider=t.provider AND c.session_id=t.session_id AND c.name_observable
     LEFT JOIN legacy_codex_name_retries r ON r.trajectory_id=p.trajectory_id
     WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle
@@ -40,13 +40,18 @@ pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) 
         transaction.execute_batch(
             "INSERT OR IGNORE INTO legacy_codex_title_proofs(trajectory_id,source_file_id,source_contents_id,previous_title)
              SELECT t.id,t.source_file_id,t.source_contents_id,t.derived_title
-             FROM session_trajectories t JOIN session_index c ON c.provider=t.provider AND c.session_id=t.session_id
+             FROM session_trajectories t JOIN session_index c ON c.provider=t.provider AND c.session_id=t.session_id AND c.codex_home IS t.codex_home
              WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle AND t.document_version=6
                AND t.source_file_id=c.source_file_id AND t.source_contents_id=c.source_contents_id AND c.title IS NULL
                AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown' AND t.derived_title_is_verified AND t.derived_title_is_local_opener IS 0
                AND length(t.derived_title)>0;"
         ).map_err(database_error)?;
     }
+    Ok(())
+}
+
+/// The old index could stop following the opening message at a tool catalog update.
+pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>) -> Result<()> {
     for (name, operation) in [
         ("insert", "INSERT"),
         (
@@ -55,19 +60,16 @@ pub(super) fn schedule_legacy_codex_title_proofs(transaction: &Transaction<'_>) 
         ),
     ] {
         transaction.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS legacy_codex_title_catalog_{name} AFTER {operation} ON session_index
+            "DROP TRIGGER IF EXISTS legacy_codex_title_catalog_{name};
+             CREATE TRIGGER IF NOT EXISTS scoped_codex_title_catalog_{name} AFTER {operation} ON session_index
              WHEN NEW.provider='codex' AND EXISTS(SELECT 1 FROM legacy_codex_title_proofs)
              BEGIN DELETE FROM legacy_codex_title_proofs WHERE trajectory_id=(
-                 SELECT id FROM session_trajectories WHERE provider=NEW.provider AND session_id=NEW.session_id)
+                 SELECT id FROM session_trajectories WHERE provider=NEW.provider AND session_id=NEW.session_id
+                   AND origin='native' AND codex_home IS NEW.codex_home)
                AND (NEW.title IS NOT NULL OR NEW.source_file_id IS NOT source_file_id OR NEW.source_contents_id IS NULL);
              END;"
         )).map_err(database_error)?;
     }
-    Ok(())
-}
-
-/// The old index could stop following the opening message at a tool catalog update.
-pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>) -> Result<()> {
     let seen: bool = transaction.query_row(
         "SELECT EXISTS (SELECT 1 FROM pragma_table_info('legacy_codex_title_proofs') WHERE name='requires_tool_catalog')",
         [], |row| row.get(0),
@@ -81,7 +83,7 @@ pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>
          CREATE TEMP TABLE tool_catalog_title_candidates(id INTEGER PRIMARY KEY);
          INSERT INTO tool_catalog_title_candidates
              SELECT t.id FROM session_trajectories t LEFT JOIN session_index c
-               ON c.provider=t.provider AND c.session_id=t.session_id
+               ON c.provider=t.provider AND c.session_id=t.session_id AND c.codex_home IS t.codex_home
              WHERE t.provider='codex' AND t.origin='native' AND NOT t.protected_by_bundle AND t.document_version=6
                AND t.source_file_id IS NOT NULL AND t.source_contents_id IS NOT NULL
                AND t.missing_ancestor_id IS NULL AND t.truncation_strategy!='legacy_unknown'
@@ -98,7 +100,7 @@ pub(super) fn schedule_tool_catalog_title_rechecks(transaction: &Transaction<'_>
              WHERE t.source_complete AND t.truncation_strategy NOT GLOB 'source_incomplete*');
          UPDATE trajectory_index_failures AS f SET document_version=5 WHERE f.provider='codex' AND f.document_version=6
            AND EXISTS (SELECT 1 FROM session_trajectories t JOIN tool_catalog_title_candidates n ON t.id=n.id
-               WHERE t.provider=f.provider AND t.session_id=f.session_id AND t.source_file_id=f.source_file_id
+               WHERE t.provider=f.provider AND t.session_id=f.session_id AND t.codex_home IS f.codex_home AND t.source_file_id=f.source_file_id
                  AND t.source_contents_id=f.source_contents_id AND t.source_updated_at IS f.source_updated_at);
          UPDATE session_trajectories SET document_version=5 WHERE id IN (SELECT id FROM tool_catalog_title_candidates);
          DROP TABLE tool_catalog_title_candidates;"
@@ -232,17 +234,18 @@ pub(super) fn retire(
     write: &PreparedTrajectoryWrite<'_, '_>,
 ) -> Result<()> {
     let document = &write.document;
-    if write.session.provider != Provider::Codex {
+    if write.session.provider != Provider::Codex
+        || document.origin != SessionTrajectoryOrigin::Native
+    {
         return Ok(());
     }
     let named = document.local_opener == LocalOpenerEvidence::Unknown
         && document.title_is_verified
-        && document.derived_title.is_some()
-        && document.origin == SessionTrajectoryOrigin::Native;
+        && document.derived_title.is_some();
     let revision = document.source_revision;
     transaction.prepare_cached(
         "DELETE FROM legacy_codex_title_proofs AS p WHERE trajectory_id=(
-             SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
+             SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?1)
          AND (?2 OR NOT EXISTS (SELECT 1 FROM session_trajectories t WHERE t.id=p.trajectory_id
               AND t.origin='native' AND NOT t.protected_by_bundle AND t.missing_ancestor_id IS NULL
               AND ((t.derived_title=p.previous_title AND t.derived_title_is_local_opener IS 0)

@@ -9,14 +9,41 @@ const THREAD: &str = "11111111-1111-4111-8111-111111111111";
 const SELECTED: &str = "22222222-2222-4222-8222-222222222222";
 const ABANDONED: &str = "33333333-3333-4333-8333-333333333333";
 
+const STAMP: &str = "2026-01-01T00:00:00.000Z";
+
+fn transcript(messages: &[&str]) -> String {
+    let metadata = json!({"timestamp":STAMP,"type":"session_meta","ordinal":0,"payload":{
+        "id":THREAD,"history_mode":"paginated","cwd":"/workspace","model_provider":"fixture",
+        "timestamp":STAMP,"originator":"codex_cli_rs","cli_version":"0.167.1","source":"cli"
+    }});
+    let mut source = format!("{metadata}\n");
+    for (index, text) in messages.iter().enumerate() {
+        let turn = format!("019f0000-0000-7000-8000-{index:012}");
+        let id = format!("request-{index}");
+        let payloads = [
+            ("event_msg", json!({"type":"task_started","turn_id":turn})),
+            (
+                "response_item",
+                json!({"type":"message","id":id,"role":"user","content":[{"type":"input_text","text":text}],
+                "internal_chat_message_metadata_passthrough":{"turn_id":turn}}),
+            ),
+            (
+                "event_msg",
+                json!({"type":"item_completed","thread_id":THREAD,"turn_id":turn,"item":{
+                "type":"UserMessage","id":id,"content":[{"type":"text","text":text}]}}),
+            ),
+            ("event_msg", json!({"type":"task_complete","turn_id":turn})),
+        ];
+        for (offset, (kind, payload)) in payloads.into_iter().enumerate() {
+            let row = json!({"timestamp":STAMP,"ordinal":index * 4 + offset + 1,"type":kind,"payload":payload});
+            writeln!(source, "{row}").unwrap();
+        }
+    }
+    source
+}
+
 fn rollout(text: &str) -> String {
-    let metadata = json!({"type":"session_meta","ordinal":0,"payload":{
-        "id":THREAD,"history_mode":"paginated","cwd":"/workspace","model_provider":"fixture"
-    }});
-    let message = json!({"type":"response_item","ordinal":1,"payload":{
-        "type":"message","role":"user","content":[{"type":"input_text","text":text}]
-    }});
-    format!("{metadata}\n{message}\n")
+    transcript(&[text])
 }
 
 fn assert_selected(home: &Path, chosen: &Path, hint: &Path, text: &str) -> Result<()> {
@@ -223,26 +250,6 @@ fn a_damaged_selected_revert_recovers_only_from_its_own_physical_rollout() -> Re
 
 #[test]
 fn a_damaged_current_mode_keeps_every_local_turn_until_a_complete_copy_agrees() -> Result<()> {
-    fn transcript(messages: &[&str]) -> String {
-        let header = json!({"type":"session_meta","ordinal":0,"payload":{
-            "id":THREAD,"cwd":"/workspace","history_mode":"paginated"
-        }});
-        let mut source = format!("{header}\n");
-        for (index, message) in messages.iter().enumerate() {
-            let id = format!("request-{index}");
-            let raw = json!({"type":"response_item","ordinal":index * 2 + 1,"payload":{
-                "type":"message","id":id,"role":"user","content":[{"type":"input_text","text":message}]
-            }});
-            let visible = json!({"type":"event_msg","ordinal":index * 2 + 2,"payload":{
-                "type":"item_completed","turn_id":id,"item":{
-                    "type":"UserMessage","id":id,"content":[{"type":"text","text":message}]
-                }
-            }});
-            writeln!(source, "{raw}\n{visible}").unwrap();
-        }
-        source
-    }
-
     let home = tempfile::tempdir()?;
     let active = home.path().join("sessions/2026/01/01");
     let archived = home.path().join("archived_sessions");
@@ -426,9 +433,7 @@ fn a_relocated_paginated_rollout_checks_the_body_of_an_owned_damaged_copy() -> R
         [THREAD, &format!(r"C:\Retired\Codex\sessions\{name}")],
     )?;
     let short = rollout("opening request");
-    let tail = json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"user",
-        "content":[{"type":"input_text","text":"latest request"}]}});
-    let long = format!("{short}{tail}\n");
+    let long = transcript(&["opening request", "latest request"]);
     for (field, changed) in [
         (r#""history_mode":"paginated","#, ""),
         (r#""history_mode":"paginated""#, r#""history_mode":null"#),
