@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -705,17 +706,7 @@ fn native_message_content(update: &Value) -> bool {
     if body.is_some_and(|body| std::ptr::eq(content, body)) {
         return true;
     }
-    for candidate in message_bodies(update) {
-        if message_blocks(candidate).iter().any(|block| {
-            !block.is_null() && !matches!(classify_message_block(block), MessageBlock::Text(_))
-        }) {
-            return false;
-        }
-        if body.is_some_and(|body| std::ptr::eq(candidate, body)) {
-            break;
-        }
-    }
-    body.is_none() || cumulative_fallback(update).is_some()
+    body.is_none() || (content["type"] == "text" && content["text"] == "")
 }
 
 fn native_tool_content(value: &Value) -> bool {
@@ -766,34 +757,78 @@ fn grok_message_id(update: &Value) -> Option<&str> {
 struct NativeMessageGroup {
     kind: Option<EventKind>,
     message_id: Option<String>,
+    native_id: Option<String>,
+    attachments: HashMap<[u8; 32], (usize, usize)>,
     has_chunk: bool,
     has_fallback: bool,
 }
 
 impl NativeMessageGroup {
     fn needs_fallback(&self) -> bool {
-        self.has_fallback && !self.has_chunk
+        (self.has_fallback && !self.has_chunk)
+            || self
+                .attachments
+                .values()
+                .any(|(copied, needed)| copied < needed)
     }
 
     fn observe(&mut self, update: &Value) -> bool {
         let kind = update["sessionUpdate"].as_str().and_then(message_kind);
         let id = grok_message_id(update);
-        if kind != self.kind || id != self.message_id.as_deref() {
+        let native_id = update["messageId"].as_str();
+        let changed = id != self.message_id.as_deref();
+        if kind.is_some()
+            && kind == self.kind
+            && changed != (native_id != self.native_id.as_deref())
+        {
+            return false;
+        }
+        if kind != self.kind || changed {
             if self.needs_fallback() {
                 return false;
             }
             *self = Self {
                 kind,
                 message_id: id.map(str::to_owned),
+                native_id: native_id.map(str::to_owned),
                 ..Self::default()
             };
         }
         if self.kind.is_some() {
+            let canonical = &update["content"];
+            if attachment_block(canonical) {
+                self.attachments
+                    .entry(block_digest(canonical))
+                    .or_default()
+                    .0 += 1;
+            }
+            for body in message_bodies(update).filter(|body| !std::ptr::eq(*body, canonical)) {
+                let mut occurrences = HashMap::<_, usize>::new();
+                for block in message_blocks(body) {
+                    if block.is_null()
+                        || matches!(classify_message_block(block), MessageBlock::Text(_))
+                    {
+                        continue;
+                    }
+                    if !attachment_block(block) {
+                        return false;
+                    }
+                    let digest = block_digest(block);
+                    let count = occurrences.entry(digest).or_default();
+                    *count += 1;
+                    let (_, needed) = self.attachments.entry(digest).or_default();
+                    *needed = (*needed).max(*count);
+                }
+            }
             self.has_fallback |= cumulative_fallback(update).is_some();
             self.has_chunk |= block_text(&update["content"]).is_some_and(|text| !text.is_empty());
         }
-        true
+        self.attachments.len() <= MAX_GROK_PRESERVED_RECORDS
     }
+}
+
+fn block_digest(block: &Value) -> [u8; 32] {
+    Sha256::digest(serde_json::to_vec(block).expect("JSON values serialize")).into()
 }
 
 // A native fork rekeys every update it copies. Check the source owners before handing it to Grok.
@@ -999,7 +1034,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v9");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v10");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1113,11 +1148,13 @@ struct GrokPreservationBudget {
     omitted_events: usize,
 }
 
+const MAX_GROK_PRESERVED_RECORDS: usize = 100_000;
+
 impl Default for GrokPreservationBudget {
     fn default() -> Self {
         Self {
             bytes_left: 64 * 1024 * 1024,
-            records_left: 100_000,
+            records_left: MAX_GROK_PRESERVED_RECORDS,
             omitted_events: 0,
         }
     }
@@ -1484,21 +1521,6 @@ fn message_content(
                 .get("content")
                 .filter(|block| block["type"] == "text" && block["text"] == "")
         });
-    if let Some(body) = body {
-        for value in message_bodies(update).take_while(|value| !std::ptr::eq(*value, body)) {
-            for block in message_blocks(value)
-                .iter()
-                .filter(|block| historical_block(block))
-            {
-                if partial_attachment_block(block) {
-                    content_unreadable = true;
-                }
-                if preservation.retain(block) {
-                    historical_content.push(block.clone());
-                }
-            }
-        }
-    }
     if let Some(content) = body {
         for block in message_blocks(content) {
             match classify_message_block(block) {
@@ -1538,6 +1560,23 @@ fn message_content(
             }
             if preservation.retain(block) {
                 historical_content.push(block.clone());
+            }
+        }
+        let mut seen: HashSet<_> = message_blocks(content)
+            .iter()
+            .filter(|block| historical_block(block))
+            .collect();
+        for alternate in message_bodies(update).filter(|value| !std::ptr::eq(*value, content)) {
+            for block in message_blocks(alternate)
+                .iter()
+                .filter(|block| historical_block(block))
+            {
+                if seen.insert(block) {
+                    content_unreadable |= partial_attachment_block(block);
+                    if preservation.retain(block) {
+                        historical_content.push(block.clone());
+                    }
+                }
             }
         }
     } else {
@@ -2273,6 +2312,25 @@ mod tests {
     }
 
     #[test]
+    fn alternate_bodies_keep_distinct_historical_blocks() {
+        let mime = json!({"type":"image","mimeType":"image/png","text":""});
+        let data = json!({"type":"image","data":"YWJj"});
+        let update = json!({"content":mime,"message":{"content":[mime,data]}});
+        let (_, retained, partial, _) =
+            message_content(&update, &mut GrokPreservationBudget::default());
+        assert!(partial);
+        assert_eq!(retained, [mime, data]);
+        let resource =
+            json!({"type":"resource","resource":{"uri":"fixture:item","text":"embedded"}});
+        let update = json!({"content":{"type":"text","text":""},"text":"reply",
+            "message":{"content":[{"type":"text","text":"reply"},resource]}});
+        let (text, retained, _, _) =
+            message_content(&update, &mut GrokPreservationBudget::default());
+        assert_eq!(text, "reply");
+        assert_eq!(retained, [resource]);
+    }
+
+    #[test]
     fn attachment_evidence_is_distinct_from_recovered_text() {
         let incomplete = json!({"type":"image","data":"YWJj"});
         assert!(partial_attachment_block(&incomplete));
@@ -2354,6 +2412,60 @@ mod tests {
             assert_eq!(
                 omnis_core::import_conversation(&snapshot).truncated,
                 partial
+            );
+        }
+    }
+
+    #[test]
+    fn native_message_groups_compare_copied_attachments_and_message_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("updates.jsonl");
+        let chunk = |content| json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":content});
+        let resource =
+            json!({"type":"resource","resource":{"uri":"file:///sample","text":"contents"}});
+        let text = chunk(json!({"type":"text","text":"first"}));
+        let fallback = |blocks| {
+            let mut update = chunk(json!({"type":"text","text":""}));
+            update["text"] = json!("first");
+            update["message"] = json!({"content":blocks});
+            update
+        };
+        let borrowed = fallback(json!(["first", resource]));
+        let mut nested = text.clone();
+        nested.as_object_mut().unwrap().remove("messageId");
+        nested["message"] = json!({"id":"a"});
+        for (updates, direct) in [
+            (
+                vec![chunk(resource.clone()), text.clone(), borrowed.clone()],
+                true,
+            ),
+            (
+                vec![text.clone(), borrowed.clone(), chunk(resource.clone())],
+                true,
+            ),
+            (vec![text.clone(), borrowed], false),
+            (
+                vec![
+                    chunk(resource.clone()),
+                    text.clone(),
+                    fallback(json!(["first", resource, resource])),
+                ],
+                false,
+            ),
+            (vec![text, nested], false),
+        ] {
+            let lines = updates
+                .iter()
+                .map(|update| {
+                    json!({"params":{"sessionId":SESSION_ID,"update":update}}).to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&log, lines).unwrap();
+            assert_eq!(
+                native_update_headers(&log, SESSION_ID, updates.len() as u64).unwrap()
+                    == NativeResumeSupport::Direct,
+                direct
             );
         }
     }
