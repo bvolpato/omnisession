@@ -17,6 +17,14 @@ fn receipt_table(provider: Provider) -> Option<&'static str> {
 }
 
 pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS antigravity_search_gaps (
+            trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+            source_home BLOB NOT NULL, source_file BLOB NOT NULL, indexed_contents BLOB NOT NULL,
+            indexed_hash BLOB NOT NULL, observed_contents BLOB NOT NULL
+        )",
+    )
+    .map_err(database_error)?;
     for (provider, table) in RECEIPT_TABLES {
         tx.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {table} (
@@ -132,6 +140,18 @@ pub(super) fn record_verified(
             |row| row.get(0),
         ).map_err(database_error)?;
         if matches {
+            tx.execute(
+                "DELETE FROM antigravity_search_gaps WHERE trajectory_id=(
+                SELECT id FROM session_trajectories WHERE provider=?1 AND session_id=?2)
+                AND source_home=?3 AND source_file=?4",
+                params![
+                    write.session.provider.to_string(),
+                    write.session.id,
+                    home.as_os_str().as_encoded_bytes(),
+                    file.as_bytes()
+                ],
+            )
+            .map_err(database_error)?;
             let canonical;
             let steps = if projection.database_aliases.is_empty() {
                 steps
@@ -185,8 +205,8 @@ pub(super) fn accept_gap(
     let prior = tx.query_row(
         "SELECT doc.id,doc.indexed_byte_count,doc.source_contents_id,doc.content_hash,doc.truncation_strategy
         FROM session_trajectories doc JOIN native_search_document_homes receipt ON doc.id=receipt.trajectory_id AND doc.source_file_id=receipt.source_file
-        WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id=?3 AND receipt.verification=1 AND receipt.source_home=?4",
-        params![write.session.provider.to_string(), write.session.id, file.as_bytes(), home],
+        WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id=?3 AND receipt.verification=1 AND receipt.source_home=?4 AND doc.document_version<=?5",
+        params![write.session.provider.to_string(), write.session.id, file.as_bytes(), home,write.document.document_version],
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -200,8 +220,21 @@ pub(super) fn accept_gap(
     let Some((id, len, Some(contents), hash, strategy)) = prior else {
         return Ok(Some(false));
     };
+    let decision = |accepted: bool| -> Result<Option<bool>> {
+        if !accepted && let Some(observed) = revision.contents {
+            tx.execute("INSERT INTO antigravity_search_gaps
+                (trajectory_id,source_home,source_file,indexed_contents,indexed_hash,observed_contents)
+                VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(trajectory_id) DO UPDATE SET
+                source_home=excluded.source_home,source_file=excluded.source_file,
+                indexed_contents=excluded.indexed_contents,indexed_hash=excluded.indexed_hash,
+                observed_contents=excluded.observed_contents",
+                params![id,home,file.as_bytes(),contents.as_bytes(),hash,observed.as_bytes()]
+            ).map_err(database_error)?;
+        }
+        Ok(Some(accepted))
+    };
     let Some(rows) = projection.database_steps.as_deref() else {
-        return Ok(Some(false));
+        return decision(false);
     };
     if let Some(previous) = read(tx, write.session, home, file, contents, &hash)? {
         let aliases = &projection.database_aliases;
@@ -219,7 +252,7 @@ pub(super) fn accept_gap(
                 })
             })
         };
-        return Ok(Some(retains(false) || retains(true)));
+        return decision(retains(false) || retains(true));
     }
     if hash == write.content_hash {
         return Ok(Some(true));
@@ -231,16 +264,16 @@ pub(super) fn accept_gap(
             .truncation_strategy
             .contains("document_head_tail")
     {
-        return Ok(Some(false));
+        return decision(false);
     }
     let prior = stored_projection_text(tx, id, len)?;
-    Ok(Some(prior.is_some_and(|old| {
+    decision(prior.is_some_and(|old| {
         let mut observed = write.document.redacted_text.split("\n\n");
         old.is_empty()
             || old
                 .split("\n\n")
                 .all(|part| observed.any(|current| current == part))
-    })))
+    }))
 }
 
 #[cfg(test)]

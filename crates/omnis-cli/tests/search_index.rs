@@ -270,6 +270,22 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
         assert_eq!(search("firstrepl", true), "complete");
         database
             .execute_batch(
+                "UPDATE steps SET step_payload=x'080fa2010b0a096368616e6765647878' WHERE idx=1;
+             INSERT INTO steps VALUES (2,x'80'),(3,x'080fa2010b0a096e6578747265706c79');",
+            )
+            .unwrap();
+        assert!(search("nextreply", false).is_null());
+        assert_eq!(search("firstrepl", true), "preview");
+        database
+            .execute_batch(
+                "DELETE FROM steps WHERE idx>=2;
+             UPDATE steps SET step_payload=x'080fa2010b0a0966697273747265706c' WHERE idx=1;",
+            )
+            .unwrap();
+        assert_eq!(search("firstrepl", false), "complete");
+        assert_eq!(search("firstrepl", true), "complete");
+        database
+            .execute_batch(
                 "INSERT INTO steps VALUES (2,x'082a2003'),(3,x'080fa2010b0a096e6578747265706c79');",
             )
             .unwrap();

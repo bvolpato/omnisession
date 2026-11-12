@@ -38,6 +38,7 @@ enum Value<'a> {
 struct Field<'a> {
     tag: u32,
     prefix: &'a [u8],
+    span: std::ops::Range<usize>,
     value: Value<'a>,
 }
 
@@ -90,7 +91,13 @@ impl Schema {
 }
 
 impl<'a> Node<'a> {
-    fn parse(mut wire: &'a [u8], schema: Schema, remaining: &mut usize) -> Option<Self> {
+    fn parse(
+        mut wire: &'a [u8],
+        schema: Schema,
+        remaining: &mut usize,
+        offset: usize,
+    ) -> Option<Self> {
+        let end = offset + wire.len();
         let mut fields = Vec::new();
         let mut ordered = true;
         let mut prior_tag = 0;
@@ -131,15 +138,23 @@ impl<'a> Node<'a> {
                 wire = rest;
                 (prefix, body)
             };
-            let value = if let FieldType::Message(child) = child {
-                let nested = Self::parse(body, child, remaining)?;
+            let span = end - start.len()..end - wire.len();
+            let value = if let FieldType::Message(child) = child
+                && let Some(nested) = Self::parse(body, child, remaining, span.end - body.len())
+            {
                 layouts = layouts.saturating_mul(nested.layouts);
                 ordered &= nested.ordered;
                 Value::Message(nested)
             } else {
+                // Keep unsupported child messages byte-for-byte when their enclosing fields move.
                 Value::Bytes(body)
             };
-            fields.push(Field { tag, prefix, value });
+            fields.push(Field {
+                tag,
+                prefix,
+                span,
+                value,
+            });
         }
         if !ordered {
             fields.sort_by_key(|field| field.tag);
@@ -158,6 +173,26 @@ impl<'a> Node<'a> {
             layouts,
             ordered,
         })
+    }
+
+    fn adjacent_swaps(
+        &self,
+        visit: &mut impl FnMut(usize, usize, usize) -> std::ops::ControlFlow<bool>,
+    ) -> std::ops::ControlFlow<bool> {
+        // Native offsets preserve the observed order even after the parser sorts fields by tag.
+        let mut fields: Vec<_> = self.fields.iter().collect();
+        fields.sort_unstable_by_key(|field| field.span.start);
+        for pair in fields.windows(2) {
+            if pair[0].tag != pair[1].tag {
+                visit(pair[0].span.start, pair[0].span.end, pair[1].span.end)?;
+            }
+        }
+        for field in fields {
+            if let Value::Message(nested) = &field.value {
+                nested.adjacent_swaps(visit)?;
+            }
+        }
+        std::ops::ControlFlow::Continue(())
     }
 
     // Rank zero emits sorted fields. Other ranks reproduce possible orders for older raw receipts.
@@ -194,7 +229,7 @@ impl DatabaseStepAlias {
         large: &mut usize,
     ) -> Option<Self> {
         let mut fields = MAX_FIELDS;
-        let node = Node::parse(&wire, Schema::Step, &mut fields)?;
+        let node = Node::parse(&wire, Schema::Step, &mut fields, 0)?;
         if node.layouts == 1 {
             return None;
         }
@@ -207,16 +242,14 @@ impl DatabaseStepAlias {
         if keep {
             *budget -= wire.len();
         }
-        let (canonical, legacy_wire) = if node.ordered {
-            (raw, keep.then_some(wire))
+        let canonical = if node.ordered {
+            raw
         } else {
             let mut canonical = Vec::with_capacity(wire.len());
             node.write(0, &mut canonical);
-            (
-                Uuid::new_v5(&namespace, &canonical),
-                keep.then_some(canonical),
-            )
+            Uuid::new_v5(&namespace, &canonical)
         };
+        let legacy_wire = keep.then_some(wire);
         Some(Self {
             canonical,
             namespace,
@@ -233,11 +266,34 @@ impl DatabaseStepAlias {
             return false;
         }
         let mut fields = MAX_FIELDS;
-        let Some(node) = Node::parse(wire, Schema::Step, &mut fields) else {
+        let Some(node) = Node::parse(wire, Schema::Step, &mut fields, 0) else {
             return false;
         };
         let mut encoded = Vec::with_capacity(wire.len());
-        for rank in 1..node.layouts.min(MAX_LAYOUTS) {
+        let mut attempts = MAX_LAYOUTS - 1;
+        if node.layouts > MAX_LAYOUTS {
+            let result = node.adjacent_swaps(&mut |start, middle, end| {
+                if attempts == 0 || *layouts == 0 || wire.len() > *bytes {
+                    return std::ops::ControlFlow::Break(false);
+                }
+                attempts -= 1;
+                *layouts -= 1;
+                *bytes -= wire.len();
+                encoded.clear();
+                encoded.extend_from_slice(&wire[..start]);
+                encoded.extend_from_slice(&wire[middle..end]);
+                encoded.extend_from_slice(&wire[start..middle]);
+                encoded.extend_from_slice(&wire[end..]);
+                if Uuid::new_v5(&self.namespace, &encoded) == old {
+                    return std::ops::ControlFlow::Break(true);
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            if let std::ops::ControlFlow::Break(matched) = result {
+                return matched;
+            }
+        }
+        for rank in 1..node.layouts.min(attempts + 1) {
             if *layouts == 0 || wire.len() > *bytes {
                 break;
             }
@@ -279,12 +335,42 @@ mod tests {
         assert!(!first.matches_legacy(old, &mut 0, &mut 10));
         assert!(first.matches_legacy(old, &mut 1024, &mut 10));
         for row in [
-            &[8, 15, 162, 1, 3, 18, 1, b'a'][..],
-            &[8, 15, 8, 15, 162, 1, 0],
+            &[8, 15, 8, 15, 162, 1, 0][..],
             &[8, 15, 154, 1, 0, 162, 1, 0],
         ] {
             assert!(receipt(row).is_none());
         }
+    }
+
+    #[test]
+    fn outer_fields_can_move_around_an_exact_unknown_child() {
+        let first = [8, 15, 32, 1, 162, 1, 3, 18, 1, b'a'];
+        let second = [32, 1, 8, 15, 162, 1, 3, 18, 1, b'a'];
+        assert_eq!(
+            receipt(&first).unwrap().canonical,
+            receipt(&second).unwrap().canonical
+        );
+        let mut changed = first;
+        changed[9] = b'b';
+        assert_ne!(
+            receipt(&changed).unwrap().canonical,
+            receipt(&second).unwrap().canonical
+        );
+    }
+
+    #[test]
+    fn old_metadata_order_is_checked_before_exhausting_the_layout_budget() {
+        let first = [
+            8, 15, 32, 1, 42, 6, 10, 2, 8, 1, 24, 2, 162, 1, 3, 10, 1, b'x',
+        ];
+        let second = [
+            8, 15, 32, 1, 42, 6, 24, 2, 10, 2, 8, 1, 162, 1, 3, 10, 1, b'x',
+        ];
+        assert!(receipt(&first).unwrap().matches_legacy(
+            Uuid::new_v5(&Uuid::nil(), &second),
+            &mut 1024,
+            &mut 5
+        ));
     }
 
     #[test]

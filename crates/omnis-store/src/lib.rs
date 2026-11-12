@@ -1675,7 +1675,8 @@ const DOCUMENT_RECEIPT_SQL: &str =
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
          hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes, fully_scanned_bytes, verified_record_time, recovered_anchor_bytes,
-         recovered_gap_start, observed_text_bytes, hex(observed_text_hash))
+         recovered_gap_start, observed_text_bytes, hex(observed_text_hash),
+         (SELECT hex(observed_contents) FROM antigravity_search_gaps WHERE trajectory_id=session_trajectories.id))
      FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
 
 fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
@@ -4746,6 +4747,16 @@ fn with_trajectory_excerpts(
     Ok(matches)
 }
 
+const SEARCH_GAP_JOIN: &str = "LEFT JOIN antigravity_search_gaps gap
+    ON gap.trajectory_id=trajectories.id AND gap.source_file=trajectories.source_file_id
+    AND gap.indexed_contents=trajectories.source_contents_id AND gap.indexed_hash=trajectories.content_hash
+    AND EXISTS (SELECT 1 FROM native_search_document_homes h WHERE h.trajectory_id=trajectories.id
+                AND h.verification=1 AND h.source_file=gap.source_file AND h.source_home=gap.source_home)";
+
+const SEARCH_COVERAGE_COLUMNS: &str = "trajectories.source_complete AND gap.trajectory_id IS NULL,
+    trajectories.complete AND gap.trajectory_id IS NULL, trajectories.indexed_byte_count, trajectories.source_byte_count,
+    CASE WHEN gap.trajectory_id IS NULL THEN trajectories.truncation_strategy ELSE 'source_incomplete' END";
+
 fn single_clause_page_sql(
     mut sql: String,
     clause: &TrajectoryClause,
@@ -4766,12 +4777,11 @@ fn single_clause_page_sql(
              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
          )
          SELECT trajectories.provider, trajectories.session_id,
-                trajectories.source_complete, trajectories.complete,
-                trajectories.indexed_byte_count, trajectories.source_byte_count,
-                trajectories.truncation_strategy, ranked_chunks.chunk_id, 0
+                {SEARCH_COVERAGE_COLUMNS}, ranked_chunks.chunk_id, 0
          FROM ranked_chunks
          INNER JOIN session_trajectories AS trajectories
              ON trajectories.id = ranked_chunks.trajectory_id
+         {SEARCH_GAP_JOIN}
          WHERE chunk_rank = 1
          ORDER BY match_rank, trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id
@@ -4849,9 +4859,7 @@ fn multi_clause_page_sql(
              WHERE clause_rank_order = 1
          )
          SELECT trajectories.provider, trajectories.session_id,
-                trajectories.source_complete, trajectories.complete,
-                trajectories.indexed_byte_count, trajectories.source_byte_count,
-                trajectories.truncation_strategy,
+                {SEARCH_COVERAGE_COLUMNS},
                 best_snippets.chunk_id, best_snippets.clause_index
          FROM ranked_trajectories
          INNER JOIN best_snippets
@@ -4859,6 +4867,7 @@ fn multi_clause_page_sql(
             AND best_snippets.snippet_rank = 1
          INNER JOIN session_trajectories AS trajectories
              ON trajectories.id = ranked_trajectories.trajectory_id
+         {SEARCH_GAP_JOIN}
          ORDER BY ranked_trajectories.trajectory_rank,
                   trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id"
