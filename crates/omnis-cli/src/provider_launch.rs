@@ -61,8 +61,9 @@ fn resolve_real_binary(provider: Provider, excluded_directory: &Path) -> Result<
         if !override_path.is_absolute() {
             bail!("{variable} must contain an absolute executable path");
         }
-        let binary = validate_real_binary(&override_path, excluded_directory, &current_exe)
-            .with_context(|| format!("validating {variable}"))?;
+        let binary =
+            validated_provider_command(provider, &override_path, excluded_directory, &current_exe)
+                .with_context(|| format!("validating {variable}"))?;
         if provider == Provider::CursorCli && !cursor_agent_binary_name_matches(&binary) {
             bail!("{variable} does not identify a Cursor Agent executable");
         }
@@ -79,7 +80,7 @@ fn resolve_real_binary(provider: Provider, excluded_directory: &Path) -> Result<
         }
         for candidate in executable_candidates(&directory, command_name) {
             if let Ok(candidate) =
-                validate_real_binary(&candidate, excluded_directory, &current_exe)
+                validated_provider_command(provider, &candidate, excluded_directory, &current_exe)
             {
                 return Ok(candidate);
             }
@@ -147,55 +148,527 @@ pub(super) fn same_executable(left: &Path, right: &Path) -> std::io::Result<bool
     same_file::is_same_file(left, right)
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExecutableRevision {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl From<&fs::Metadata> for ExecutableRevision {
+    fn from(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+static LAST_COMPARISON: std::sync::Mutex<Option<([ExecutableRevision; 2], bool)>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn is_codex_executable_copy(candidate: &Path, provider: &Path) -> bool {
+    compare_codex_executables(candidate, provider).unwrap_or(false)
+}
+
+fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Result<bool> {
+    let paths = [candidate, provider];
+    let metadata = [fs::metadata(candidate)?, fs::metadata(provider)?];
+    if metadata[0].len() != metadata[1].len() || metadata.iter().any(|meta| !meta.is_file()) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.iter().any(|meta| {
+            let mode = meta.permissions().mode();
+            mode & 0o444 == 0 || mode & 0o111 == 0
+        }) {
+            return Ok(false);
+        }
+    }
+    #[cfg(windows)]
+    if paths.iter().any(|path| {
+        !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    }) {
+        return Ok(false);
+    }
+
+    if !is_standalone_codex_entrypoint(provider) {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        compare_windows_copy(paths, metadata[0].len())
+    }
+    #[cfg(not(windows))]
+    {
+        compare_native_copy(paths, &metadata)
+    }
+}
+
+#[cfg(not(windows))]
+fn compare_native_copy(paths: [&Path; 2], metadata: &[fs::Metadata; 2]) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    let revisions = metadata.each_ref().map(ExecutableRevision::from);
+    #[cfg(unix)]
+    if let Some((known, result)) = *LAST_COMPARISON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        && known == revisions
+    {
+        return Ok(result);
+    }
+
+    let open = |path: &Path| {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+        }
+        options.open(path)
+    };
+    let files = [open(paths[0])?, open(paths[1])?];
+    let matches = compare_open_copy(files.each_ref(), metadata[0].len())?;
+    #[cfg(unix)]
+    {
+        for ((path, file), before) in paths.iter().zip(&files).zip(revisions) {
+            if ExecutableRevision::from(&file.metadata()?) != before
+                || ExecutableRevision::from(&fs::metadata(path)?) != before
+            {
+                return Ok(false);
+            }
+        }
+        *LAST_COMPARISON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((revisions, matches));
+    }
+    Ok(matches)
+}
+
+fn compare_open_copy(files: [&fs::File; 2], size: u64) -> std::io::Result<bool> {
+    if files[0].metadata()?.len() != size || files[1].metadata()?.len() != size {
+        return Ok(false);
+    }
+    Ok(native_executable(files[0])? && equal_executable_contents(files, size)?)
+}
+
+#[cfg(windows)]
+fn compare_windows_copy(paths: [&Path; 2], size: u64) -> std::io::Result<bool> {
+    let handles = [
+        open_release_handle(paths[0])?,
+        open_release_handle(paths[1])?,
+    ];
+    let paths_match = || {
+        paths.iter().zip(&handles).all(|(path, held)| {
+            same_file::Handle::from_path(path).is_ok_and(|current| &current == held)
+        })
+    };
+    if !paths_match() {
+        return Ok(false);
+    }
+    let matches = scoped_verdict(ProofKind::Copy, &handles, || {
+        compare_open_copy([handles[0].as_file(), handles[1].as_file()], size)
+    })?;
+    Ok(matches && is_standalone_codex_entrypoint(paths[1]) && paths_match())
+}
+
+fn native_executable(mut file: &fs::File) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut header = [0; 64];
+    file.read_exact(&mut header)?;
+    #[cfg(target_os = "macos")]
+    {
+        let magic = u32::from_be_bytes(header[..4].try_into().unwrap());
+        Ok(match magic {
+            0xfeed_face | 0xfeed_facf => header[12..16] == 2u32.to_be_bytes(),
+            0xcefa_edfe | 0xcffa_edfe => header[12..16] == 2u32.to_le_bytes(),
+            0xcafe_babe | 0xcafe_babf => {
+                (1..=64).contains(&u32::from_be_bytes(header[4..8].try_into().unwrap()))
+                    && matches!(
+                        u32::from_be_bytes(header[8..12].try_into().unwrap()) & 0x00ff_ffff,
+                        7 | 12 | 18
+                    )
+            }
+            _ => false,
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::io::{Seek, SeekFrom};
+        if &header[..2] != b"MZ" {
+            return Ok(false);
+        }
+        let offset = u32::from_le_bytes(header[60..64].try_into().unwrap());
+        file.seek(SeekFrom::Start(u64::from(offset)))?;
+        let mut signature = [0; 4];
+        file.read_exact(&mut signature)?;
+        Ok(&signature == b"PE\0\0")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(&header[..4] == b"\x7fELF"
+            && matches!(header[4], 1 | 2)
+            && matches!(header[5], 1 | 2)
+            && header[6] == 1)
+    }
+}
+
+fn equal_executable_contents(mut files: [&fs::File; 2], mut size: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek};
+    files[0].rewind()?;
+    let mut left = vec![0; 64 * 1024];
+    let mut right = vec![0; left.len()];
+    while size != 0 {
+        let len = usize::try_from(size.min(left.len() as u64)).expect("bounded read");
+        files[0].read_exact(&mut left[..len])?;
+        files[1].read_exact(&mut right[..len])?;
+        if left[..len] != right[..len] {
+            return Ok(false);
+        }
+        size -= len as u64;
+    }
+    Ok(true)
+}
+
+pub(super) fn same_invocation_name(candidate: &Path, target: &Path) -> bool {
+    candidate
+        .file_name()
+        .zip(target.file_name())
+        .is_some_and(|(candidate, target)| {
+            if cfg!(windows) {
+                candidate.eq_ignore_ascii_case(target)
+            } else {
+                candidate == target
+            }
+        })
+}
+
+pub(super) fn manifestless_target(candidate: &Path, provider: &Path) -> Option<PathBuf> {
+    let target = provider.canonicalize().ok()?;
+    (same_invocation_name(candidate, &target) && same_executable(candidate, &target).ok()?)
+        .then_some(target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) -> bool {
+    use std::sync::{Mutex, PoisonError};
+    static SIGNATURE: Mutex<Option<(ExecutableRevision, bool)>> = Mutex::new(None);
+    let observe = || {
+        let target = manifestless_target(candidate, provider)?;
+        let meta = fs::metadata(&target).ok()?;
+        meta.is_file()
+            .then(|| (target, ExecutableRevision::from(&meta)))
+    };
+    let Some((target, revision)) = observe() else {
+        return false;
+    };
+    if let Some((known, verified)) = *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner)
+        && known == revision
+    {
+        return verified;
+    }
+    #[cfg(target_os = "macos")]
+    let verified = verify_signed_codex(&target);
+    #[cfg(target_os = "linux")]
+    let verified = release_digest(revision.size).and_then(|digest| {
+        let file = fs::File::open(&target).ok()?;
+        if ExecutableRevision::from(&file.metadata().ok()?) != revision {
+            return None;
+        }
+        let matches = matches_release_digest(&file, revision.size, digest).ok()?;
+        (ExecutableRevision::from(&file.metadata().ok()?) == revision).then_some(matches)
+    });
+    let Some(verified) = verified else {
+        return false;
+    };
+    if observe() != Some((target, revision)) {
+        return false;
+    }
+    *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner) = Some((revision, verified));
+    verified
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signed_codex(target: &Path) -> Option<bool> {
+    use super::interrupt::{HelperProcess, wait_or_kill};
+    use std::{
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    const CODEX_REQUIREMENT: &str = r#"-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2""#;
+    if !fs::File::open(target)
+        .and_then(|file| native_executable(&file))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let Ok(mut child) = Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--strict",
+            "--all-architectures",
+            CODEX_REQUIREMENT,
+        ])
+        .arg(target)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .outside_terminal_group()
+        .spawn()
+    else {
+        return None;
+    };
+    let Ok(Some(status)) = wait_or_kill(&mut child, Duration::from_secs(5)) else {
+        return None;
+    };
+    Some(status.success())
+}
+
+#[cfg(windows)]
+struct CodexIdentityCache {
+    scopes: usize,
+    proofs: [Option<(Vec<same_file::Handle>, bool)>; 2],
+}
+
+#[cfg(windows)]
+thread_local! {
+    static CODEX_IDENTITY: std::cell::RefCell<CodexIdentityCache> = const {
+        std::cell::RefCell::new(CodexIdentityCache {scopes:0,proofs:[None,None]})
+    };
+}
+
+#[cfg(windows)]
+#[must_use]
+pub(super) struct CodexIdentityScope(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(windows)]
+pub(super) fn codex_identity_scope() -> CodexIdentityScope {
+    CODEX_IDENTITY.with_borrow_mut(|cache| cache.scopes += 1);
+    CodexIdentityScope(std::marker::PhantomData)
+}
+
+#[cfg(windows)]
+impl Drop for CodexIdentityScope {
+    fn drop(&mut self) {
+        CODEX_IDENTITY.with_borrow_mut(|cache| {
+            cache.scopes -= 1;
+            if cache.scopes == 0 {
+                cache.proofs = [None, None];
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn release_codex_identity() {
+    CODEX_IDENTITY.with_borrow_mut(|cache| cache.proofs = [None, None]);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ProofKind {
+    Release,
+    Copy,
+}
+
+#[cfg(windows)]
+fn scoped_verdict(
+    kind: ProofKind,
+    handles: &[same_file::Handle],
+    verify: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let slot = kind as usize;
+    let cached = CODEX_IDENTITY.with_borrow(|cache| {
+        cache.proofs[slot]
+            .as_ref()
+            .filter(|(known, _)| known.as_slice() == handles)
+            .map(|(_, verified)| *verified)
+    });
+    if let Some(verified) = cached {
+        return Ok(verified);
+    }
+    let verified = verify()?;
+    CODEX_IDENTITY.with_borrow_mut(|cache| {
+        if cache.scopes != 0 {
+            let retained = handles
+                .iter()
+                .map(|handle| {
+                    handle
+                        .as_file()
+                        .try_clone()
+                        .and_then(same_file::Handle::from_file)
+                })
+                .collect::<std::io::Result<Vec<_>>>();
+            cache.proofs[slot] = retained.ok().map(|files| (files, verified));
+        }
+    });
+    Ok(verified)
+}
+
+#[cfg(windows)]
+fn scoped_release_verdict(
+    handle: &same_file::Handle,
+    verify: impl FnOnce(&fs::File) -> std::io::Result<bool>,
+) -> bool {
+    scoped_verdict(ProofKind::Release, std::slice::from_ref(handle), || {
+        verify(handle.as_file())
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn open_release_handle(path: &Path) -> std::io::Result<same_file::Handle> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Allow the installer to replace this file while the current command checks its contents.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 4)
+        .open(path)?;
+    same_file::Handle::from_file(file)
+}
+
+#[cfg(windows)]
+pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) -> bool {
+    let Some(target) = manifestless_target(candidate, provider) else {
+        return false;
+    };
+    if !target
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
+    let Ok(handle) = open_release_handle(&target) else {
+        return false;
+    };
+    let Ok(meta) = handle.as_file().metadata() else {
+        return false;
+    };
+    let Some(digest) = release_digest(meta.len()) else {
+        return false;
+    };
+    let paths_match = || {
+        manifestless_target(candidate, provider).is_some_and(|current| {
+            current == target
+                && same_file::Handle::from_path(current).is_ok_and(|current| current == handle)
+        })
+    };
+    meta.is_file()
+        && paths_match()
+        && scoped_release_verdict(&handle, |file| {
+            matches_release_digest(file, meta.len(), digest)
+        })
+        && paths_match()
+}
+
+// The Linux Sigstore bundles and Windows raw executable assets identify these SHA-256 digests.
+// https://github.com/openai/codex/releases/tag/rust-v0.167.1
+#[cfg(any(target_os = "linux", windows))]
+fn release_digest(size: u64) -> Option<&'static str> {
+    match size {
+        #[cfg(target_os = "linux")]
+        279_384_472 => Some("c912f1179d0d8b8e18ee8c4dd856d92bd54a98f1b430b243da819f2a4e63841f"),
+        #[cfg(target_os = "linux")]
+        320_186_856 => Some("dd5bfdf19d794dcc6fb482d2d5a2d9fb31d11f6caa44b303bb72890d461e8a02"),
+        #[cfg(windows)]
+        311_500_592 => Some("91a28945eff7e22562f0541989b24a5033525271624ac90bbdd8c46752c9d3cf"),
+        #[cfg(windows)]
+        369_078_064 => Some("c12aca02de615a9fcb76f955bf005a33f4b10b577f8a1730161953f57a1155b3"),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn matches_release_digest(file: &fs::File, size: u64, digest: &str) -> std::io::Result<bool> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = file.take(size + 1);
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 128 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(reader.limit() == 1 && hex::encode(hash.finalize()) == digest)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub(super) fn is_manifestless_codex_target(_candidate: &Path, _provider: &Path) -> bool {
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexPackage {
+    Standalone,
+    Npm,
+}
+
+pub(super) fn is_standalone_codex_entrypoint(program: &Path) -> bool {
+    codex_package(program) == Some(CodexPackage::Standalone)
+        && fs::File::open(program)
+            .and_then(|file| native_executable(&file))
+            .unwrap_or(false)
+}
+
 /// An off-PATH Codex installation identifies its executable in the standalone or npm manifest.
 pub(super) fn is_codex_package_entrypoint(program: &Path) -> bool {
-    use std::io::Read;
-    const MANIFEST_LIMIT: u64 = 64 * 1024;
+    // A validated Windows npm launcher passes its package script to Node as the first argument.
     let Ok(command) = provider_process(program) else {
         return false;
     };
-    // A validated Windows npm launcher passes its package script to Node as the first argument.
     let entrypoint = command
         .get_args()
         .next()
         .unwrap_or_else(|| command.get_program());
-    let Ok(program) = fs::canonicalize(entrypoint) else {
-        return false;
-    };
-    let Some(bin) = program
-        .parent()
-        .filter(|directory| directory.ends_with("bin"))
-    else {
-        return false;
-    };
-    let Some(root) = bin.parent() else {
-        return false;
-    };
-    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
+    codex_package(Path::new(entrypoint)).is_some()
+}
+
+fn codex_package(program: &Path) -> Option<CodexPackage> {
+    use std::io::Read;
+    const MANIFEST_LIMIT: u64 = 64 * 1024;
+    let program = fs::canonicalize(program).ok()?;
+    let bin = program.parent().filter(|dir| dir.ends_with("bin"))?;
+    let root = bin.parent()?;
+    let name = program.file_name()?.to_str()?;
     let manifest = match name {
         "codex" | "codex.exe" => root.join("codex-package.json"),
         "codex.js" => root.join("package.json"),
-        _ => return false,
+        _ => return None,
     };
     if !manifest
         .symlink_metadata()
         .is_ok_and(|meta| meta.is_file() && meta.len() <= MANIFEST_LIMIT)
     {
-        return false;
+        return None;
     }
-    let Some(metadata) = fs::File::open(manifest).ok().and_then(|file| {
-        serde_json::from_reader::<_, serde_json::Value>(file.take(MANIFEST_LIMIT)).ok()
-    }) else {
-        return false;
-    };
+    let metadata: serde_json::Value =
+        serde_json::from_reader(fs::File::open(manifest).ok()?.take(MANIFEST_LIMIT)).ok()?;
     if name == "codex.js" {
-        metadata["name"] == "@openai/codex" && metadata["bin"]["codex"] == "bin/codex.js"
+        (metadata["name"] == "@openai/codex" && metadata["bin"]["codex"] == "bin/codex.js")
+            .then_some(CodexPackage::Npm)
     } else {
-        metadata["layoutVersion"] == 1
+        (metadata["layoutVersion"] == 1
             && metadata["variant"] == "codex"
-            && metadata["entrypoint"] == format!("bin/{name}")
+            && metadata["entrypoint"] == format!("bin/{name}"))
+        .then_some(CodexPackage::Standalone)
     }
 }
 
@@ -342,6 +815,21 @@ pub(super) fn runnable_target_providers() -> Vec<Provider> {
         .collect()
 }
 
+fn validated_provider_command(
+    provider: Provider,
+    invocation: &Path,
+    excluded_directory: &Path,
+    current_exe: &Path,
+) -> Result<PathBuf> {
+    let executable = validate_real_binary(invocation, excluded_directory, current_exe)?;
+    // A Codex dispatcher can select its command from the name used to invoke it.
+    if provider == Provider::Codex {
+        Ok(std::path::absolute(invocation)?)
+    } else {
+        Ok(executable)
+    }
+}
+
 fn validate_real_binary(
     candidate: &Path,
     excluded_directory: &Path,
@@ -430,6 +918,201 @@ pub(super) use omnis_adapters::provider_process;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_proof_checks_the_invocation_identity_size_and_complete_digest() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let primary = temp.path().join("codex.exe");
+        let aliases = temp.path().join("aliases");
+        fs::create_dir(&aliases)?;
+        let alias = aliases.join("codex.exe");
+        fs::write(&primary, b"abc")?;
+        fs::copy(&primary, &alias)?;
+        assert!(manifestless_target(&alias, &primary).is_none());
+        fs::remove_file(&alias)?;
+        fs::hard_link(&primary, &alias)?;
+        assert_eq!(
+            manifestless_target(&alias, &primary),
+            Some(primary.canonicalize()?)
+        );
+        let other = aliases.join("wrapper.exe");
+        fs::rename(&alias, &other)?;
+        assert!(manifestless_target(&other, &primary).is_none());
+
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let verify = |size| matches_release_digest(&fs::File::open(&primary)?, size, digest);
+        assert!(verify(3)?);
+        assert!(!verify(2)?);
+        assert!(!verify(4)?);
+        fs::write(&primary, b"abd")?;
+        assert!(!verify(3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_names_follow_platform_case_rules() {
+        let provider = Path::new("install/codex.exe");
+        assert!(same_invocation_name(
+            Path::new("profiles/codex.exe"),
+            provider
+        ));
+        assert_eq!(
+            same_invocation_name(Path::new("profiles/codex.EXE"), provider),
+            cfg!(windows)
+        );
+        assert!(!same_invocation_name(
+            Path::new("profiles/agent.exe"),
+            provider
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn release_verification_reuses_only_the_open_file_during_preparation() -> Result<()> {
+        use std::cell::Cell;
+        use std::io::Read;
+        let temp = tempfile::tempdir()?;
+        let program = temp.path().join("codex.exe");
+        let upper = program.with_extension("EXE");
+        fs::write(&program, b"abc")?;
+        assert_eq!(
+            manifestless_target(&upper, &program),
+            Some(program.canonicalize()?)
+        );
+        let reads = Cell::new(0);
+        let check = || -> Result<bool> {
+            let handle = open_release_handle(&program)?;
+            Ok(scoped_release_verdict(&handle, |mut file| {
+                reads.set(reads.get() + 1);
+                let mut text = String::new();
+                file.read_to_string(&mut text)?;
+                Ok(text == "abc")
+            }))
+        };
+        assert!(check()?);
+        assert!(check()?);
+        assert_eq!(reads.get(), 2);
+        {
+            let _scope = codex_identity_scope();
+            assert!(check()?);
+            assert!(check()?);
+            assert_eq!(reads.get(), 3);
+            fs::rename(&program, temp.path().join("previous.exe"))?;
+            fs::write(&program, b"abd")?;
+            assert!(!check()?);
+            assert_eq!(reads.get(), 4);
+            release_codex_identity();
+            fs::write(&program, b"abc")?;
+            assert!(check()?);
+            assert_eq!(reads.get(), 5);
+        }
+        fs::write(&program, b"abd")?;
+        assert!(!check()?);
+        assert_eq!(reads.get(), 6);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparation_reuses_the_copy_comparison_until_either_file_is_replaced() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let candidate = temp.path().join("candidate.exe");
+        let provider = temp.path().join("provider.exe");
+        fs::write(&candidate, b"one")?;
+        fs::write(&provider, b"one")?;
+        let reads = std::cell::Cell::new(0);
+        let compare = || -> Result<bool> {
+            let handles = [
+                open_release_handle(&candidate)?,
+                open_release_handle(&provider)?,
+            ];
+            Ok(scoped_verdict(ProofKind::Copy, &handles, || {
+                reads.set(reads.get() + 1);
+                equal_executable_contents([handles[0].as_file(), handles[1].as_file()], 3)
+            })?)
+        };
+        {
+            let _scope = codex_identity_scope();
+            assert!(compare()?);
+            assert!(compare()?);
+            assert_eq!(reads.get(), 1);
+            fs::rename(&candidate, temp.path().join("old-candidate.exe"))?;
+            fs::write(&candidate, b"two")?;
+            assert!(!compare()?);
+            assert_eq!(reads.get(), 2);
+            fs::rename(&provider, temp.path().join("old-provider.exe"))?;
+            fs::write(&provider, b"two")?;
+            assert!(compare()?);
+            assert_eq!(reads.get(), 3);
+            release_codex_identity();
+            fs::write(&candidate, b"six")?;
+            assert!(!compare()?);
+        }
+        fs::write(&provider, b"six")?;
+        assert!(compare()?);
+        assert_eq!(reads.get(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn native_copy_comparison_observes_the_last_byte_and_file_replacements() -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let temp = tempfile::tempdir()?;
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin)?;
+        let provider_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let provider = bin.join(provider_name);
+        let copy = temp.path().join("candidate.exe");
+        #[cfg(unix)]
+        fs::copy("/usr/bin/true", &provider)?;
+        #[cfg(windows)]
+        {
+            let source =
+                PathBuf::from(env::var_os("SystemRoot").context("Windows system directory")?)
+                    .join("System32")
+                    .join("where.exe");
+            fs::copy(source, &provider)?;
+        }
+        fs::copy(&provider, &copy)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        let manifest = temp.path().join("codex-package.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(
+                &serde_json::json!({"layoutVersion":1,"variant":"codex","entrypoint":format!("bin/{provider_name}")}),
+            )?,
+        )?;
+        assert!(is_standalone_codex_entrypoint(&provider));
+        assert!(is_codex_executable_copy(&copy, &provider));
+        assert!(is_codex_executable_copy(&copy, &provider));
+        let saved_manifest = fs::read(&manifest)?;
+        fs::remove_file(&manifest)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        fs::write(&manifest, saved_manifest)?;
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(&copy)?;
+        let modified = file.metadata()?.modified()?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        file.seek(SeekFrom::End(-1))?;
+        file.write_all(&[!tail[0]])?;
+        file.set_modified(modified)?;
+        drop(file);
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        fs::copy(&provider, &copy)?;
+        assert!(is_codex_executable_copy(&copy, &provider));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o111))?;
+            assert!(!is_codex_executable_copy(&copy, &provider));
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o700))?;
+        }
+        fs::write(&copy, b"#!/bin/sh\nexec ./runtime\n")?;
+        fs::copy(&copy, &provider)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        Ok(())
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {

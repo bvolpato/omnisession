@@ -6,6 +6,9 @@ use serde_json::Value;
 use super::{checkpoint_wire, completed_item};
 
 mod events;
+mod realtime;
+pub(super) const TRANSCRIPT_SEGMENT: &str = "realtime_item.transcript_segment";
+pub(super) use events::{ROLLBACK_TAG, rollback_turns};
 
 pub(super) use events::classify as classify_event;
 
@@ -39,6 +42,7 @@ pub(super) enum OrdinalGap {
 
 #[derive(Default)]
 pub(super) struct RolloutLines {
+    timeline: realtime::Timeline,
     next: Option<u64>,
     // A documentary record may decode in Codex without a locally known schema.
     possible_next: Option<u64>,
@@ -54,6 +58,9 @@ impl RolloutLines {
     /// Each physical file has its own cursor, including a child that starts after an inherited prefix.
     pub(super) fn start_segment(&mut self, header: &Value) {
         self.possible_next = None;
+        self.timeline.start = header["payload"]["subagent_history_start_ordinal"]
+            .as_u64()
+            .unwrap_or_default();
         self.next = (header["type"] == "session_meta"
             && header["payload"]["history_mode"] == "paginated")
             .then(|| {
@@ -62,6 +69,18 @@ impl RolloutLines {
                     .unwrap_or(0)
             });
         self.contiguous_next = self.next.unwrap_or(0);
+    }
+
+    pub(super) fn project_realtime(
+        &mut self,
+        record: &Value,
+        index: u64,
+        builder: &mut super::EventBuilder,
+    ) {
+        let ordinal = record["ordinal"].as_u64().unwrap_or(index);
+        if !self.timeline.project(record, ordinal, builder) {
+            self.skipped += 1;
+        }
     }
 
     pub(super) fn paginated(&self) -> bool {
@@ -131,7 +150,7 @@ impl RolloutLines {
             .get("type")
             .or_else(|| payload.get(0))
             .and_then(Value::as_str);
-        let needs_timestamp = record["type"] == "realtime_item"
+        let needs_timestamp = (record["type"] == "realtime_item" && ordinal >= self.timeline.start)
             || (record["type"] == "event_msg"
                 && event == Some("item_completed")
                 && payload
@@ -158,19 +177,41 @@ impl RolloutLines {
             self.skipped += 1;
             return Wire::Invalid;
         }
-        // Neither reader consumes the ordinal of an item it could not decode.
-        if !completed_item::prepare_record(record) {
+        // Vintage named events can predate the current wire schema. Numeric and positional
+        // events use the pinned Serde layout in both legacy and paginated history.
+        let encoded_event = record["type"] == "event_msg"
+            && (record["payload"].is_array() || record["payload"]["type"].is_number());
+        // Ordinal admission and model reconstruction must see the same fields.
+        let valid_content = match record["type"].as_str() {
+            Some("realtime_item") => {
+                return Wire::checked(realtime::prepare(&mut record["payload"]));
+            }
+            Some("compacted") => {
+                let payload = &mut record["payload"];
+                if !checkpoint_wire::prepare(payload)
+                    || checkpoint_mode.is_some_and(|mode| !checkpoint_wire::valid(payload, mode))
+                {
+                    self.invalid_checkpoints += 1;
+                    return Wire::Invalid;
+                }
+                true
+            }
+            Some("event_msg") => {
+                let payload = &mut record["payload"];
+                if !events::prepare(payload) {
+                    self.skipped += 1;
+                    return Wire::Invalid;
+                }
+                completed_item::prepare_event(payload)
+            }
+            Some("response_item") => checkpoint_wire::prepare_response_item(&mut record["payload"]),
+            _ => true,
+        };
+        if !valid_content {
             self.invalid_messages += 1;
             return Wire::Invalid;
         }
-        if let Some(paginated) = checkpoint_mode
-            && record["type"] == "compacted"
-            && !checkpoint_wire::valid(&record["payload"], paginated)
-        {
-            self.invalid_checkpoints += 1;
-            return Wire::Invalid;
-        }
-        if !paginated {
+        if !paginated && !encoded_event {
             return Wire::Decoded;
         }
         let wire = match record["type"].as_str() {
@@ -208,4 +249,36 @@ pub(super) fn valid_envelope(record: &Value) -> bool {
                     | "realtime_item"
             )
         )
+}
+
+/// Normalize a known numeric tag before the reader classifies or uses an event.
+pub(super) fn name_numeric_tag<'a>(value: &mut Value, name: impl FnOnce(u64) -> Option<&'a str>) {
+    let tag = match value {
+        Value::Array(parts) => parts.first_mut(),
+        Value::Object(fields) => fields.get_mut("type"),
+        _ => None,
+    };
+    if let Some(tag) = tag
+        && let Some(name) = tag.as_u64().and_then(name)
+    {
+        *tag = name.into();
+    }
+}
+
+/// Move a positional payload into its named representation without copying its contents.
+pub(super) fn name_fields(value: &mut Value, names: &[&str]) -> bool {
+    let Some(parts) = value.as_array_mut() else {
+        return true;
+    };
+    if parts.len() > names.len() {
+        return false;
+    }
+    *value = Value::Object(
+        names
+            .iter()
+            .zip(std::mem::take(parts))
+            .map(|(&name, part)| (name.to_owned(), part))
+            .collect(),
+    );
+    true
 }

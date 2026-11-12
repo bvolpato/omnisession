@@ -45,7 +45,8 @@ enum Prefix {
 
 /// Reads the discriminators that precede a JSON error. Only the immediate payload can name an event.
 pub(super) fn damaged_workspace_record(line: &[u8]) -> Option<DamagedWorkspace> {
-    classify(line, false)
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    classify(line.strip_suffix(b"\r").unwrap_or(line), false)
 }
 
 pub(super) fn oversized_workspace_record(prefix: &[u8]) -> Option<DamagedWorkspace> {
@@ -206,6 +207,8 @@ mod tests {
             (br#"{"payload":{"cwd":"example""#, Some(Unclassified)),
             (br#"{"payload":{"type":"thread_settings_appl"#, Some(Unclassified)),
             (br#"{"t"#, Some(Unclassified)),
+            (b"{\"t\n", Some(Unclassified)),
+            (b"{\"t\r\n", Some(Unclassified)),
             (b"{", Some(Unclassified)),
             (b"{\"type\":\"turn_context\",\"payload\":\xff", Some(TurnOrRollback)),
             (br#"{"type":"response_item","payload":{"type":"thread_settings_applied","#, None),

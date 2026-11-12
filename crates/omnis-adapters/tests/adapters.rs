@@ -135,7 +135,12 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         Some("omnisession.codex_malformed_records")
     );
     assert_eq!(omission.payload["malformed_records"], 1);
-    assert_eq!(omission.payload["workspace_unknown"], false);
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| event.payload["workspace_unknown"] == true)
+    );
     assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
     assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);

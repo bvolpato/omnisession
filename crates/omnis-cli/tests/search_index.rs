@@ -22,6 +22,68 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[test]
+fn list_leads_with_the_assigned_codex_name_and_keeps_unnamed_sessions_metadata_only() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = root.path().join("codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let named = Uuid::from_u128(1);
+    let unnamed = Uuid::from_u128(2);
+    for id in [named, unnamed] {
+        let meta = json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta",
+            "payload":{"id":id,"cwd":root.path()}});
+        let request = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"private first prompt"}]}});
+        fs::write(
+            home.join(format!("sessions/rollout-{id}.jsonl")),
+            format!("{meta}\n{request}\n"),
+        )
+        .unwrap();
+    }
+    let index = json!({"id":named,"thread_name":format!("🛰️ Orbit\n{SECRET_VALUE}")});
+    fs::write(home.join("session_index.jsonl"), index.to_string()).unwrap();
+    let list = |json_output| {
+        let mut cmd = environment.command();
+        cmd.env("CODEX_HOME", &home).env_remove("CODEX_SQLITE_HOME");
+        if json_output {
+            cmd.arg("--json");
+        }
+        let output = cmd
+            .args(["list", "--provider", "codex", "--all-projects"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains(SECRET_VALUE));
+        assert!(!text.contains("private first prompt"));
+        text
+    };
+    let text = list(false);
+    let named_row = text
+        .lines()
+        .find(|line| line.contains(&named.to_string()))
+        .unwrap();
+    assert!(named_row.starts_with("🛰️ Orbit "));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&format!("codex:{unnamed}")))
+    );
+    let rows: serde_json::Value = serde_json::from_str(&list(true)).unwrap();
+    let rows = rows["sessions"].as_array().unwrap();
+    let named_row = rows
+        .iter()
+        .find(|row| row["session"]["id"] == named.to_string())
+        .unwrap();
+    let title = named_row["title"].as_str().unwrap();
+    assert!(title.starts_with("🛰️ Orbit "));
+    assert!(!title.contains('\n'));
+    assert!(
+        rows.iter()
+            .any(|row| row["session"]["id"] == unnamed.to_string() && row.get("title").is_none())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
@@ -41,9 +103,10 @@ fn check_opencode_search_upgrade(previous_version: u32) {
         &binary,
         r##"#!/bin/sh
 case "$*" in
-  --version) echo 1.18.18 ;;
-  *export*) echo '{"id":"ses_guide","updated_at":"2026-01-01T00:00:00Z","messages":[{"role":"assistant","text":"# AGENTS.md instructions for receiptguide"}]}' ;;
-  *) echo '[]' ;;
+  --version) echo 2.0.0 ;;
+  "session export ses_guide --standalone")
+    echo '{"info":{"id":"ses_guide","time":{"updated":1767225600000}},"messages":[{"type":"assistant","content":[{"type":"text","text":"# AGENTS.md instructions for receiptguide"}]}]}' ;;
+  *) exit 1 ;;
 esac
 "##,
     )
@@ -141,8 +204,87 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
         temporary_directory.path(),
     );
     assert_task_and_resume(&environment, &imported);
+    #[cfg(unix)]
+    assert_first_run_codex_probes(&environment, &imported);
     assert_missing_uuid(&environment);
     assert_uuid_collision_fails(&environment, bundle, temporary_directory.path());
+}
+
+#[test]
+fn imported_documents_refresh_at_their_source_providers_version() {
+    let temporary = tempdir().unwrap();
+    let environment = TestEnvironment::new(temporary.path(), temporary.path().to_owned());
+    let path = temporary.path().join("bundle.json");
+    let providers = [Provider::OhMyPi, Provider::Pi, Provider::Claude];
+    let mut locators = Vec::new();
+    for provider in providers {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.session.provider = provider;
+        for event in &mut snapshot.events {
+            event.source.provider = provider;
+        }
+        let bundle_id = Uuid::new_v4();
+        let bundle = PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.into(),
+                bundle_id,
+                created_at: snapshot.captured_at,
+                source: snapshot.session.clone(),
+                event_count: snapshot.events.len(),
+                redactions: Vec::new(),
+            },
+            snapshot,
+            fidelity: None,
+        };
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert_import_succeeds(&environment, &path, "seed imported locator");
+        locators.push(SessionRef::new(Provider::Imported, bundle_id.to_string()));
+    }
+    let database = environment.state_root.join("store.sqlite3");
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET document_version = 4, derived_title = 'Old title'
+         WHERE provider = 'imported'",
+            [],
+        )
+        .unwrap();
+    let shown = environment
+        .command()
+        .args(["show", &locators[0].to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let indexed = environment
+        .command()
+        .args(["--json", "index", "--provider", "imported"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let expected = providers[1..]
+        .iter()
+        .filter(|&&provider| omnis_core::search_document_version(provider) > 4)
+        .count();
+    assert_eq!(summary["stale"], expected);
+    assert_eq!(summary["indexed"], expected);
+    let store = Store::open(&database).unwrap();
+    for (provider, locator) in providers.into_iter().zip(&locators) {
+        let version = omnis_core::search_document_version(provider);
+        let state = store.trajectory_index_state(locator).unwrap().unwrap();
+        assert_eq!(state.document_version, version);
+        assert!(state.source_complete);
+        let title = store.trajectory_title(locator).unwrap().unwrap();
+        assert_eq!(title == "Old title", version == 4);
+    }
 }
 
 #[test]
@@ -178,6 +320,7 @@ fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
     let store = Store::open(environment.state_root.join("store.sqlite3")).expect("open CLI store");
     store
         .upsert_indexed_session(&IndexedSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Imported, missing_id.to_string()),
             title: Some("missing bundle".to_owned()),
             project_path: Some(temporary_directory.path().join("elsewhere")),
@@ -278,7 +421,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     );
 
     let switched = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&workspace)
         .args(["--json", "switch", "codex", "--dry-run"])
         .output()
@@ -289,6 +432,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         String::from_utf8_lossy(&switched.stderr)
     );
     assert!(!String::from_utf8_lossy(&switched.stdout).contains("Cross-Workspace Override"));
+    environment.assert_first_run_handoff(&serde_json::from_slice(&switched.stdout).unwrap());
     let listed = environment
         .command()
         .current_dir(&workspace)
@@ -753,7 +897,7 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
 
     assert!(!environment.home.join(".codex").exists());
     let resume = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&environment.workspace)
         .args(["--json", "resume", &source, "--dry-run"])
         .output()
@@ -767,10 +911,68 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
     assert_eq!(resumed["source"], json!(imported));
     assert_eq!(resumed["target"], "codex");
     assert_eq!(resumed["dry_run"], true);
+    environment.assert_first_run_handoff(&resumed);
     let resumed_text = String::from_utf8_lossy(&resume.stdout);
     assert!(!resumed_text.contains(SECRET_VALUE));
     assert!(!resumed_text.contains(HIDDEN_REASONING_MARKER));
     assert!(!resumed_text.contains(HIDDEN_APPROVAL_MARKER));
+}
+
+#[cfg(unix)]
+fn assert_first_run_codex_probes(environment: &TestEnvironment, imported: &SessionRef) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = environment.home.join("codex-cli");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+store=${CODEX_HOME:-$HOME/.codex}
+case "$1" in
+    --version|--help)
+        mkdir -p "$store" || exit 1
+        echo "$1" >> "$HOME/probes"
+        if [ "$1" = --version ]; then echo 'codex-cli 0.137.0';
+        else echo '  --dangerously-bypass-approvals-and-sandbox  Skip approvals'; fi ;;
+    *) printf '%s\n' "$store" "$@" > "$HOME/launch" ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = imported.to_string();
+    let run = |dry_run| {
+        let mut command = environment.first_run_codex_command();
+        command
+            .current_dir(&environment.workspace)
+            .env("OMNI_CODEX_BIN", &executable)
+            .env("TMPDIR", &environment.home)
+            .args(["resume", &source, "--in", "codex", "--mode", "yolo"]);
+        if dry_run {
+            command.args(["--json", "--dry-run"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    environment.assert_first_run_handoff(&serde_json::from_slice(&run(true).stdout).unwrap());
+    let probes = fs::read_to_string(environment.home.join("probes")).unwrap();
+    for flag in ["--version", "--help"] {
+        assert!(probes.lines().any(|probe| probe == flag), "{probes}");
+    }
+    assert!(!environment.home.join("launch").exists());
+    run(false);
+    let launch = fs::read_to_string(environment.home.join("launch")).unwrap();
+    let mut args = launch.lines();
+    assert_eq!(
+        Path::new(args.next().unwrap()),
+        environment.home.join(".codex")
+    );
+    assert!(args.any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
 }
 
 fn assert_missing_uuid(environment: &TestEnvironment) {
@@ -834,6 +1036,8 @@ impl TestEnvironment {
             .env("OMNISESSION_HOME", &self.state_root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
+            .env("CODEX_HOME", self.home.join(".codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("ANTIGRAVITY_CLI_HOME", self.home.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.home.join("antigravity-ide"))
             .env(
@@ -847,6 +1051,53 @@ impl TestEnvironment {
             .env("OMNI_CODEX_BIN", &self.missing_codex)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command
+    }
+
+    fn first_run_codex_command(&self) -> Command {
+        let mut command = self.command();
+        #[cfg(windows)]
+        {
+            // Windows can resolve its profile through the OS even when USERPROFILE is redirected.
+            let probe = self
+                .command()
+                .env_remove("CODEX_HOME")
+                .args(["--json", "adapters"])
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let providers: Vec<serde_json::Value> = serde_json::from_slice(&probe.stdout).unwrap();
+            let codex = providers
+                .iter()
+                .find(|row| row["provider"] == "codex")
+                .unwrap();
+            let default = Path::new(codex["data_root"].as_str().expect("first-run Codex home"));
+            assert!(default.is_absolute() && default.ends_with(".codex"));
+            if default != self.home.join(".codex") {
+                return command;
+            }
+        }
+        command.env_remove("CODEX_HOME");
+        command
+    }
+
+    fn assert_first_run_handoff(&self, plan: &serde_json::Value) {
+        assert_eq!(plan["fidelity"]["mode"], "semantic_handoff");
+        let args = plan["launch"]["args"].as_array().unwrap();
+        let pin = args
+            .windows(2)
+            .find(|pair| pair[0] == "-c")
+            .expect("SQLite home in launch plan");
+        let settings: toml::Table = toml::from_str(pin[1].as_str().unwrap()).unwrap();
+        let expected = self.home.join(".codex");
+        assert_eq!(
+            Path::new(settings["sqlite_home"].as_str().unwrap()),
+            expected
+        );
+        assert!(!expected.exists());
     }
 }
 

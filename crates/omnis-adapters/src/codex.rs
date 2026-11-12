@@ -1,42 +1,48 @@
-use sha2::Digest as _;
 use std::{
     borrow::Cow,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
-    io::{BufRead, ErrorKind, Read, Seek, SeekFrom},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
-use omnis_ir::{CanonicalSnapshot, EventKind, GitState, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{
+    CanonicalSnapshot, EventKind, GitState, Provider, ReplayPolicy, SessionRef, SourceRevision,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    EnvChange, LaunchPlan, LaunchTarget, NativeSession, NativeWorkspace, ProviderAdapter,
-    ProviderInstallation,
+    CodexWorkspaceProjection, EnvChange, IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport,
+    NativeSession, NativeWorkspace, ProviderAdapter, ProviderInstallation, RollbackTitle,
     support::{
-        EventBuilder, JsonLine, JsonlRecord, MAX_PREVIEW_TAIL_SIZE,
-        MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
-        json_lines_preview, omitted_images_text, parse_timestamp, paths_match, provider_executable,
-        provider_file, provider_root, sort_sessions, string_at, validate_provider, value_at,
-        visit_filtered_streamed_json_lines, visit_index_json_lines, visit_json_lines_tail,
+        EventBuilder, JsonLine, JsonLineSkips, JsonlRecord, MAX_PREVIEW_TAIL_SIZE,
+        MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        json_lines_preview_with_omissions, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, provider_file, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines, visit_json_lines_tail,
     },
 };
 
 mod attachments;
 mod checkpoint_wire;
-mod rollout_lines;
-use rollout_lines::{Admission, OrdinalGap, RolloutLines, Wire};
 mod completed_item;
+mod completion_positions;
+mod deferred_receipts;
 mod display_text;
 mod message_mirrors;
 mod model_cut;
 use message_mirrors::{MessageIdentity, MessageMatch, MessageMirrors};
+mod current_launch;
+mod current_rollout;
+mod gui_names;
 mod paginated_answers;
 mod paginated_checkpoint;
 mod paginated_compaction;
@@ -44,27 +50,39 @@ mod paginated_preview;
 mod paginated_rollback;
 mod paginated_workspace;
 mod rollout_cache;
+mod rollout_file;
+mod rollout_lines;
 mod tool_history;
+mod tool_occurrences;
 mod tool_revisions;
 mod turn_aliases;
+mod wire_enums;
 mod workspace_catalog;
+mod workspace_check;
 mod workspace_damage;
 mod workspace_records;
+mod workspace_search;
 mod workspace_settings;
 
+use current_rollout::{
+    CurrentFile, CurrentRolloutStamp, CurrentRolloutUnavailable, CurrentRollouts,
+};
 use paginated_answers::{PaginatedAnswers, ToolId};
 use paginated_compaction::{
     DisplayEvidence, PaginatedCompactions, ProjectedReplacement, WindowKind,
 };
 use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};
-use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_lines::{Admission, OrdinalGap, RolloutLines, Wire};
 use tool_history::{NativeCalls, PendingOutcomes};
 use tool_revisions::{DisplayRevisions, PreviousDisplay};
 use turn_aliases::{MessageIds, TurnAliases};
 use workspace_catalog::WorkspaceCatalog;
+use workspace_check::WorkspaceSettings;
 use workspace_records::WorkspaceRecords;
 
 const SCAN_LIMIT: usize = 10_000;
+const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
 const MAX_CANONICAL_EVENTS: usize = 100_000;
@@ -84,44 +102,239 @@ const LOCAL_SUMMARY_PREFIX: &str = concat!(
 
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
+    directories: Vec<(PathBuf, Option<RolloutStamp>)>,
     files: Vec<PathBuf>,
     candidates: HashMap<String, Vec<usize>>,
-    without_id: usize,
     notes: Vec<String>,
+    active_entries_complete: bool,
+    // Native filename verification checks these link targets before authorizing an in-place resume.
+    active_links: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct LegacyPaths<'a> {
+    native_ids: HashSet<String>,
+    by_id: HashMap<Uuid, Vec<&'a Path>>,
+    revisions: Vec<(PathBuf, Option<SourceRevision>)>,
+    unidentified: HashMap<&'a Path, Vec<&'a Path>>,
+}
+
+impl<'a> LegacyPaths<'a> {
+    fn add_filename(&mut self, path: &'a Path) {
+        if let Some((thread, _)) = current_rollout::ids(path)
+            && let Ok(owner) = Uuid::parse_str(thread)
+        {
+            self.by_id.entry(owner).or_default().push(path);
+        }
+    }
+
+    fn title_paths(&self, id: &str) -> &[&'a Path] {
+        Uuid::parse_str(id)
+            .ok()
+            .and_then(|owner| self.by_id.get(&owner))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+impl CodexFileScan {
+    fn current(&self) -> bool {
+        self.directories.len() <= SCAN_LIMIT
+            && self
+                .directories
+                .iter()
+                .all(|(dir, stamp)| match fs::symlink_metadata(dir) {
+                    Ok(metadata) => stamp.is_some() && RolloutStamp::new(&metadata) == *stamp,
+                    Err(error) => stamp.is_none() && error.kind() == ErrorKind::NotFound,
+                })
+    }
+
+    fn legacy_paths(&self, home: &Path, mut cache: Option<&mut RolloutCache>) -> LegacyPaths<'_> {
+        let mut legacy = LegacyPaths::default();
+        let root = fs::canonicalize(home).ok();
+        for path in &self.files {
+            if current_rollout::canonical_name(path) {
+                legacy.add_filename(path);
+                continue;
+            }
+            if root
+                .as_ref()
+                .is_some_and(|root| live_rollout_path(home, root, path))
+                && let Ok(Some(session)) = listed_session(path, cache.as_deref_mut())
+                && let Ok(owner) = Uuid::parse_str(&session.id)
+            {
+                // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
+                legacy.native_ids.insert(session.id);
+                legacy.by_id.entry(owner).or_default().push(path);
+                legacy
+                    .revisions
+                    .push((path.clone(), session.observed_revision));
+            } else if let Some(name) = rollout_file::jsonl_file_name(path) {
+                legacy.add_filename(path);
+                legacy.unidentified.entry(name).or_default().push(path);
+                legacy.revisions.push((path.clone(), None));
+            }
+        }
+        legacy
+    }
+
+    fn thread_ids<'a>(&'a self, legacy: &'a LegacyPaths<'_>) -> impl Iterator<Item = &'a String> {
+        self.candidates.keys().chain(
+            legacy
+                .native_ids
+                .iter()
+                .filter(|id| !self.candidates.contains_key(*id)),
+        )
+    }
+
+    fn listed_rollout(
+        &self,
+        home: &Path,
+        id: &str,
+        row: Option<&current_rollout::CurrentRollout>,
+        mut cache: Option<&mut RolloutCache>,
+        invalid: &mut InvalidHeaders,
+    ) -> Result<Option<SelectedRollout>> {
+        if let Some(row) = row
+            && !matches!(self.candidates.get(id).map(Vec::as_slice), Some([i]) if row.ordinary_path_is(&self.files[*i]))
+            && let Some(file) = row.resolve(home, id, self.paths(id), self.notes.is_empty())?
+        {
+            return Ok(Some(file.into()));
+        }
+        anyhow::ensure!(!ambiguous_generations(self, id), CurrentRolloutUnavailable);
+        Ok(select_rollout(
+            self.paths(id),
+            |path| listed_session(path, cache.as_deref_mut()),
+            invalid,
+        ))
+    }
+
+    fn unique_path(&self, id: &str) -> Option<&Path> {
+        let [index] = self.candidates.get(id)?.as_slice() else {
+            return None;
+        };
+        self.notes.is_empty().then(|| self.files[*index].as_path())
+    }
+
+    fn index_paths(
+        &self,
+        selected: &SelectedRollout,
+        legacy: &LegacyPaths<'_>,
+    ) -> Option<Vec<PathBuf>> {
+        if !self.notes.is_empty() {
+            return None;
+        }
+        let session = &selected.session;
+        let mut paths: Vec<_> = legacy
+            .title_paths(&session.id)
+            .iter()
+            .copied()
+            .map(Path::to_owned)
+            .collect();
+        if selected.from_registry {
+            // SQLite can select a physical representation whose filename has no thread ID.
+            paths.push(session.path.clone());
+        }
+        if let Some(name) = rollout_file::jsonl_file_name(&session.path)
+            && let Some(unknown) = legacy.unidentified.get(name)
+        {
+            paths.extend(unknown.iter().map(|path| path.to_path_buf()));
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths)
+    }
+
+    fn paths(&self, id: &str) -> impl Iterator<Item = &Path> {
+        self.candidates
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|&i| self.files[i].as_path())
+    }
+
+    fn remember(&mut self, id: &str, path: &Path, active: &Path) {
+        let indices = self.candidates.entry(id.to_owned()).or_default();
+        let rank = rollout_priority(path, active);
+        let position =
+            indices.partition_point(|&i| rollout_priority(&self.files[i], active) > rank);
+        indices.insert(position, self.files.len());
+        self.files.push(path.to_owned());
+    }
 }
 
 #[derive(Default)]
 struct InvalidHeaders {
-    without_metadata: usize,
     unreadable: usize,
+    without_metadata: usize,
     first_error: Option<anyhow::Error>,
 }
 
-impl CodexFileScan {
-    fn select(
-        &self,
-        candidates: &[usize],
-        mut cache: Option<&mut RolloutCache>,
-        invalid: &mut InvalidHeaders,
-    ) -> Option<CodexSession> {
-        for &index in candidates {
-            match listed_session(&self.files[index], cache.as_deref_mut()) {
-                Ok(Some(session)) => return Some(session),
-                Ok(None) => invalid.without_metadata += 1,
-                Err(error) => {
-                    invalid.unreadable += 1;
-                    invalid.first_error.get_or_insert(error);
-                }
-            }
+struct SelectedRollout {
+    session: CodexSession,
+    shadowed: bool,
+    from_registry: bool,
+}
+
+impl From<CurrentFile> for SelectedRollout {
+    fn from(file: CurrentFile) -> Self {
+        debug_assert_eq!(file.session.observed_revision, Some(file.revision));
+        Self {
+            session: file.session,
+            shadowed: !file.native,
+            from_registry: true,
         }
-        None
     }
 }
 
-#[derive(Debug)]
+fn select_rollout<'a>(
+    candidates: impl IntoIterator<Item = &'a Path>,
+    mut read: impl FnMut(&Path) -> Result<Option<CodexSession>>,
+    invalid: &mut InvalidHeaders,
+) -> Option<SelectedRollout> {
+    let mut shadowed = false;
+    for path in candidates {
+        match read(path) {
+            Ok(Some(session)) => {
+                let Some((thread, file)) = current_rollout::ids(path) else {
+                    continue;
+                };
+                if session.id != thread {
+                    // A suffix on a manual filename can name an unrelated thread.
+                    continue;
+                }
+                let dual = thread != file;
+                return Some(SelectedRollout {
+                    session,
+                    shadowed: shadowed || dual,
+                    from_registry: false,
+                });
+            }
+            Ok(None) => invalid.without_metadata += 1,
+            Err(error) => {
+                invalid.unreadable += 1;
+                invalid.first_error.get_or_insert(error);
+            }
+        }
+        // A native lookup by ID can still open the malformed file before its valid sibling.
+        shadowed |= path.extension().is_some_and(|ext| ext != "gz");
+    }
+    None
+}
+
+#[derive(Debug, Default)]
 struct CodexListing {
+    scan: Arc<CodexFileScan>,
     sessions: Vec<CodexSession>,
     notes: Vec<String>,
+    selected_files: HashMap<String, (PathBuf, SourceRevision)>,
+    legacy_revisions: Vec<(PathBuf, Option<SourceRevision>)>,
+    requires_scan: bool,
+}
+
+#[derive(Debug)]
+struct CachedListing {
+    database: Option<CurrentRolloutStamp>,
+    listing: Arc<CodexListing>,
 }
 
 #[derive(Debug, Default)]
@@ -133,40 +346,57 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
-    pin_relative_home: bool,
+    relative_home: bool,
+    current: Arc<CurrentRollouts>,
+    use_workspace_index: bool,
+    workspace_catalog: Option<Arc<WorkspaceCatalog>>,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
-    workspace_catalog: Option<Arc<WorkspaceCatalog>>,
-    session_scan: Arc<OnceLock<CodexFileScan>>,
-    listing: Arc<OnceLock<CodexListing>>,
+    session_scan: Arc<Mutex<Option<Arc<CodexFileScan>>>>,
+    listing: Arc<Mutex<Option<CachedListing>>>,
     titles: Arc<OnceLock<TitleIndex>>,
 }
 
 impl CodexAdapter {
+    /// Returns the verified treatment of a leading tilde in `CODEX_SQLITE_HOME` for this Codex release.
     #[must_use]
-    pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
-        let home = codex_home.into();
-        Self {
-            pin_relative_home: home.is_relative(),
-            codex_home: Some(canonical_home(home)),
-            rollout_cache: None,
-            workspace_catalog: None,
-            session_scan: Arc::default(),
-            listing: Arc::default(),
-            titles: Arc::default(),
+    pub fn expands_sqlite_env_tilde(version: &str) -> Option<bool> {
+        match version {
+            "0.137.0" => Some(false),
+            "0.167.1" => Some(true),
+            _ => None,
         }
+    }
+
+    /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller's directory or an existing relative path cannot be resolved.
+    pub fn absolute_home(home: &Path) -> Result<PathBuf> {
+        if home.is_absolute() {
+            return Ok(home.to_owned());
+        }
+        match omnis_core::canonicalize_path(home) {
+            Err(error) if error.kind() == ErrorKind::NotFound => std::path::absolute(home),
+            result => result,
+        }
+        .context("resolving the selected Codex home")
+    }
+
+    fn selected_home(home: PathBuf) -> (Option<PathBuf>, bool) {
+        let relative = home.is_relative();
+        (Some(Self::absolute_home(&home).unwrap_or(home)), relative)
     }
 
     fn native_launch(&self, target: &LaunchTarget, args: Vec<String>) -> Result<LaunchPlan> {
         let mut env = Vec::new();
-        if let Some(home) = self
-            .codex_home
-            .as_deref()
-            .filter(|_| self.pin_relative_home)
-        {
-            let absolute =
-                std::path::absolute(home).context("resolving the selected Codex home")?;
-            let value = absolute
+        if let Some(home) = self.codex_home.as_deref().filter(|_| self.relative_home) {
+            anyhow::ensure!(
+                home.is_absolute(),
+                "could not resolve the selected Codex home"
+            );
+            let value = home
                 .to_str()
                 .context("Codex requires a Unicode path in CODEX_HOME")?;
             env.push(EnvChange::Set {
@@ -182,6 +412,195 @@ impl CodexAdapter {
         })
     }
 
+    /// Returns the directory Codex uses when `CODEX_HOME` is unset. It can be absent before the first launch.
+    #[must_use]
+    pub fn default_home() -> Option<PathBuf> {
+        #[cfg(windows)]
+        let profile = known_folders::get_known_folder_path(known_folders::KnownFolder::Profile)?;
+        #[cfg(not(windows))]
+        let profile = directories::BaseDirs::new()?.home_dir().to_owned();
+        Some(profile.join(".codex"))
+    }
+
+    /// Returns whether Codex selected a rollout that could not be verified.
+    #[must_use]
+    pub fn is_current_rollout_unavailable(error: &anyhow::Error) -> bool {
+        error.is::<CurrentRolloutUnavailable>()
+            || error.is::<current_rollout::CurrentRolloutUnconfirmed>()
+    }
+
+    /// Identifies a rollout file across appends and distinguishes same-path replacements.
+    #[must_use]
+    pub fn index_file_id(path: &Path) -> Option<Uuid> {
+        Self::index_file_revision(path)?.file
+    }
+
+    /// Observes which file and contents a reader can use without reading the transcript.
+    #[must_use]
+    pub fn index_file_revision(path: &Path) -> Option<SourceRevision> {
+        Some(ObservedRollout::read(path)?.revision)
+    }
+
+    /// Checks a legacy search document against the currently selected rollout with bounded memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source changes during the check or cannot be read.
+    pub fn verify_legacy_search_projection(
+        session: &SessionRef,
+        path: &Path,
+        read: &IndexRead,
+        expected_hash: &[u8],
+    ) -> Result<Option<IndexRead>> {
+        validate_provider(session, Provider::Codex)?;
+        if read.source_complete || read.source_revision.contents.is_none() {
+            return Ok(None);
+        }
+        let observed = ObservedRollout::read(path)
+            .filter(|observed| {
+                observed
+                    .revision
+                    .matches_file_contents(read.source_revision)
+            })
+            .context("selected Codex rollout changed before verifying its previous search text")?;
+        let native = CodexSession::parse_with_observation(path, observed)?
+            .filter(|native| native.id == session.id && read.snapshot.session == *session)
+            .context("selected Codex rollout has a different session header")?;
+        native.read_unchanged(|native, _| {
+            let (events, project, workspace_reconstructed) =
+                native.reconstructed_preview(rollout_file::LEGACY_PROJECTION_LIMITS)?;
+            let project = project.filter(|path| path.is_absolute());
+            let workspace_projection = match &read.workspace_projection {
+                CodexWorkspaceProjection::Unchecked => {
+                    CodexWorkspaceProjection::from_reconstruction(
+                        workspace_reconstructed,
+                        project.as_deref(),
+                    )
+                }
+                observed @ CodexWorkspaceProjection::Observed(_) => observed.clone(),
+            };
+            let rollback_title = events.rollback_title();
+            let mut snapshot = native.snapshot(session, events, project, read.snapshot.captured_at);
+            snapshot.title.clone_from(&read.snapshot.title);
+            let document = omnis_core::trajectory_search_document(&snapshot);
+            if Sha256::digest(document.text.as_bytes())[..] != *expected_hash {
+                return Ok(None);
+            }
+            Ok(Some(IndexRead {
+                rollback_title,
+                workspace_projection,
+                snapshot,
+                source_complete: document.source_complete,
+                provider_limited: read.provider_limited,
+                source_revision: read.source_revision,
+                native_session: read.native_session.clone(),
+            }))
+        })
+    }
+
+    /// Checks whether an applied rollback removed the local opener that supplied a saved title.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected rollout changes or cannot be read.
+    pub fn rollout_withdrew_search_title(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior_title: &str,
+    ) -> Result<bool> {
+        Self::verify_selected_title(path, session, revision, |native| {
+            native.withdrew_search_title(prior_title)
+        })
+    }
+
+    /// Checks one saved title when an ordinary rollout withdrew more openers than the receipt retains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected rollout changes or cannot be read.
+    pub fn verify_earlier_opener_withdrawal(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior_title: &str,
+    ) -> Result<bool> {
+        Self::verify_selected_title(path, session, revision, |native| {
+            native.check_saved_opener(prior_title, SavedOpenerCheck::Withdrawal)
+        })
+    }
+
+    /// Rechecks an old opening title against the source records that its prior reader misclassified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected rollout changes or cannot be read.
+    pub fn verify_legacy_local_opener(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior_title: &str,
+        requires_tool_catalog: bool,
+    ) -> Result<bool> {
+        Self::verify_selected_title(path, session, revision, |native| {
+            let check = if requires_tool_catalog {
+                SavedOpenerCheck::ToolCatalog
+            } else {
+                SavedOpenerCheck::LegacyOrToolCatalog
+            };
+            native.check_saved_opener(prior_title, check)
+        })
+    }
+
+    fn verify_selected_title(
+        path: &Path,
+        session: &SessionRef,
+        revision: SourceRevision,
+        read: impl FnOnce(CodexSession) -> Result<bool>,
+    ) -> Result<bool> {
+        validate_provider(session, Provider::Codex)?;
+        if revision.contents.is_none() {
+            return Ok(false);
+        }
+        let observed = ObservedRollout::read(path)
+            .filter(|observed| observed.revision.matches_file_contents(revision))
+            .context("selected Codex rollout changed before checking its search title")?;
+        let native = CodexSession::parse_with_observation(path, observed)?
+            .filter(|native| native.id == session.id)
+            .context("selected Codex rollout has a different session header")?;
+        native.read_unchanged(|native, _| read(native))
+    }
+
+    /// The decoded size of a compressed rollout can differ from its filesystem metadata.
+    #[must_use]
+    pub fn is_compressed_rollout(path: &Path) -> bool {
+        rollout_file::jsonl_file_name(path).is_some() && rollout_file::compressed(path)
+    }
+
+    #[must_use]
+    pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
+        let (codex_home, relative_home) = Self::selected_home(codex_home.into());
+        Self {
+            codex_home,
+            relative_home,
+            current: Arc::default(),
+            use_workspace_index: false,
+            workspace_catalog: None,
+            rollout_cache: None,
+            session_scan: Arc::default(),
+            listing: Arc::default(),
+            titles: Arc::default(),
+        }
+    }
+
+    /// Selects existing threads from the SQLite directory used for the native import.
+    #[must_use]
+    pub fn for_import(codex_home: &Path, sqlite_home: &Path) -> Self {
+        let mut adapter = Self::with_root(codex_home);
+        adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
+        adapter
+    }
+
     fn discover_session_scan(&self) -> CodexFileScan {
         let Some(home) = self.codex_home.as_deref() else {
             return CodexFileScan::default();
@@ -189,9 +608,65 @@ impl CodexAdapter {
         scan_session_files(home, SCAN_LIMIT)
     }
 
-    fn session_scan(&self) -> &CodexFileScan {
-        self.session_scan
-            .get_or_init(|| self.discover_session_scan())
+    /// Returns the scan and whether this caller reused a cached snapshot.
+    /// Readers that rejected the same snapshot share one refresh.
+    fn session_scan(&self, rejected: Option<&Arc<CodexFileScan>>) -> (Arc<CodexFileScan>, bool) {
+        let mut entry = self
+            .session_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = entry.as_ref()
+            && !rejected.is_some_and(|old| Arc::ptr_eq(old, cached))
+        {
+            return (Arc::clone(cached), true);
+        }
+        let scan = Arc::new(self.discover_session_scan());
+        *entry = Some(Arc::clone(&scan));
+        (scan, false)
+    }
+
+    fn current_session_scan(&self) -> (Arc<CodexFileScan>, bool) {
+        let (scan, reused) = self.session_scan(None);
+        if reused && !scan.current() {
+            self.session_scan(Some(&scan))
+        } else {
+            (scan, reused)
+        }
+    }
+
+    fn scan_for_lookup(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+        home: &Path,
+        canonical_home: &Path,
+    ) -> (Arc<CodexFileScan>, bool) {
+        let (scan, reused) = self.current_session_scan();
+        let Some(path) = source_path else {
+            return (scan, reused);
+        };
+        if scan.paths(id).any(|known| known == path)
+            || path_uuid(path).as_deref() != Some(id)
+            || !live_rollout_path(home, canonical_home, path)
+        {
+            return (scan, reused);
+        }
+
+        // Another picker can discover a new active file while this worker still has a readable archive.
+        drop(scan);
+        let mut entry = self
+            .session_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scan = entry.as_mut().expect("the session scan was initialized");
+        // Limit the number of paths that a long-running picker can add between scans.
+        if scan.files.len() >= SCAN_LIMIT * 2 {
+            *scan = Arc::new(self.discover_session_scan());
+        }
+        if !scan.paths(id).any(|known| known == path) {
+            Arc::make_mut(scan).remember(id, path, &home.join("sessions"));
+        }
+        (Arc::clone(scan), reused)
     }
 
     fn title_index(&self) -> &TitleIndex {
@@ -241,87 +716,356 @@ impl CodexAdapter {
         })
     }
 
-    fn listing(&self) -> &CodexListing {
-        self.listing.get_or_init(|| self.build_listing())
+    fn named_rows<'a>(
+        &self,
+        home: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, current_rollout::CurrentRollout>> {
+        self.current
+            .rows_with_titles(home, ids, &self.title_index().titles)
     }
 
-    fn sessions(&self) -> &[CodexSession] {
-        &self.listing().sessions
+    fn header_cache(&self, home: &Path) -> Option<RolloutCache> {
+        self.rollout_cache
+            .as_deref()
+            .filter(|_| cfg!(unix))
+            .and_then(|path| RolloutCache::load(path, home))
+    }
+
+    fn selected_title(
+        &self,
+        selected: &SelectedRollout,
+        row: Option<&current_rollout::CurrentRollout>,
+        candidates: impl FnOnce() -> Option<Vec<PathBuf>>,
+    ) -> Option<String> {
+        let session = &selected.session;
+        let indexed = || {
+            let title = self.title_index().titles.get(&session.id)?;
+            let paths = candidates()?;
+            if paths.as_slice() == [session.path.as_path()] {
+                return Some(title.clone());
+            }
+            if let Some(row) = row
+                && row.corroborates_index()
+                && let Some(home) = self.codex_home.as_deref()
+                && row
+                    .index_copies_match(
+                        home,
+                        &session.id,
+                        &session.path,
+                        paths.iter().map(PathBuf::as_path),
+                    )
+                    .unwrap_or(false)
+            {
+                return Some(title.clone());
+            }
+            None
+        };
+        match row {
+            Some(row) if selected.from_registry || row.ordinary_path_is(&session.path) => {
+                row.title(indexed)
+            }
+            Some(_) => None,
+            None => indexed(),
+        }
+    }
+
+    /// Refreshes cached names and metadata from the currently selected rollouts.
+    pub fn refresh_session_titles(&self, sessions: &mut [NativeSession]) {
+        if !sessions
+            .iter()
+            .any(|s| s.session.provider == Provider::Codex)
+        {
+            return;
+        }
+        let Some(home) = self.codex_home.as_deref() else {
+            return;
+        };
+        let (scan, _) = self.current_session_scan();
+        let ids = sessions
+            .iter()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .map(|s| s.session.id.as_str());
+        let rows = self.named_rows(home, ids);
+        let mut cache = self.header_cache(home);
+        let legacy = scan.legacy_paths(home, cache.as_mut());
+        for cached in sessions
+            .iter_mut()
+            .filter(|s| s.session.provider == Provider::Codex)
+        {
+            let id = cached.session.id.as_str();
+            let Ok(rows) = &rows else {
+                cached.title = None;
+                continue;
+            };
+            let row = rows.get(id);
+            if let Some(path) = scan.unique_path(id)
+                && current_rollout::canonical_name(path)
+                && legacy.title_paths(id).iter().all(|&file| file == path)
+                && row.is_none_or(|row| row.ordinary_path_is(path))
+                && cached
+                    .source_revision
+                    .zip(Self::index_file_revision(path))
+                    .is_some_and(|(old, new)| old.matches_file_contents(new))
+            {
+                let indexed = || self.title_index().titles.get(id).cloned();
+                cached.title = match row {
+                    Some(row) => row.title(indexed),
+                    None => indexed(),
+                };
+                cached.source_path = Some(path.to_owned());
+                continue;
+            }
+            let Ok(Some(selected)) = scan.listed_rollout(
+                home,
+                id,
+                row,
+                cache.as_mut(),
+                &mut InvalidHeaders::default(),
+            ) else {
+                cached.title = None;
+                continue;
+            };
+            let title =
+                self.selected_title(&selected, row, || scan.index_paths(&selected, &legacy));
+            let current = selected.session;
+            if cached
+                .source_revision
+                .zip(current.observed_revision)
+                .is_some_and(|(old, new)| old.matches_file_contents(new))
+            {
+                cached.source_path = Some(current.path);
+            } else {
+                *cached = current.native_session();
+            }
+            cached.title = title;
+        }
+    }
+
+    fn listing(&self, refresh: bool) -> (Arc<CodexListing>, bool) {
+        let mut cache = self
+            .listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = || {
+            self.codex_home
+                .as_deref()
+                .and_then(|home| self.current.stamp(home))
+        };
+        let database = stamp();
+        if let Some(cached) = cache.as_ref() {
+            if !refresh
+                || (database.is_some()
+                    && cached.database == database
+                    && !cached.listing.requires_scan
+                    && cached.listing.scan.current()
+                    && cached
+                        .listing
+                        .legacy_revisions
+                        .iter()
+                        .all(|(path, previous)| {
+                            previous.is_some() && Self::index_file_revision(path) == *previous
+                        })
+                    && cached.listing.sessions.iter().all(|session| {
+                        cached.listing.selected_files.contains_key(&session.id)
+                            || Self::index_file_revision(&session.path) == session.observed_revision
+                    })
+                    && cached
+                        .listing
+                        .selected_files
+                        .values()
+                        .all(|(path, revision)| Self::index_file_revision(path) == Some(*revision)))
+            {
+                return (Arc::clone(&cached.listing), true);
+            }
+            let (scan, _) = self.session_scan(None);
+            self.session_scan(Some(&scan));
+        }
+        let listing = Arc::new(self.build_listing());
+        let database = database.filter(|before| stamp().as_ref() == Some(before));
+        *cache = Some(CachedListing {
+            database,
+            listing: Arc::clone(&listing),
+        });
+        (listing, false)
     }
 
     fn build_listing(&self) -> CodexListing {
-        let scan = self.session_scan();
-        let title_index = self.title_index();
-        let mut cache = self
-            .rollout_cache
-            .as_deref()
-            .filter(|_| cfg!(unix))
-            .zip(self.codex_home.as_deref())
-            .and_then(|(path, home)| RolloutCache::load(path, home));
-        let mut sessions = Vec::with_capacity(scan.candidates.len());
-        let mut subagents = 0;
-        let mut invalid = InvalidHeaders {
-            without_metadata: scan.without_id,
-            ..InvalidHeaders::default()
+        let (scan, _) = self.session_scan(None);
+        let Some(home) = self.codex_home.as_deref() else {
+            return CodexListing::default();
         };
-        for (id, candidates) in &scan.candidates {
-            if let Some(mut session) = scan.select(candidates, cache.as_mut(), &mut invalid) {
-                if session.is_subagent {
-                    subagents += 1;
-                } else {
-                    session.title = title_index.titles.get(id).cloned();
-                    sessions.push(session);
+        let mut cache = self.header_cache(home);
+        let legacy = scan.legacy_paths(home, cache.as_mut());
+        let rows = match self.named_rows(home, scan.thread_ids(&legacy).map(String::as_str)) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return CodexListing {
+                    notes: vec![format!(
+                        "Codex could not verify the current rollouts: {}.",
+                        compact_discovery_error(&anyhow!("{error:#}"))
+                    )],
+                    requires_scan: true,
+                    ..CodexListing::default()
+                };
+            }
+        };
+        let mut sessions = Vec::new();
+        let mut selected_files = HashMap::new();
+        let mut requires_scan = false;
+        let mut subagents = 0_usize;
+        let mut invalid = InvalidHeaders {
+            without_metadata: scan.files.len()
+                - scan.candidates.values().map(Vec::len).sum::<usize>(),
+            ..Default::default()
+        };
+        for id in scan.thread_ids(&legacy) {
+            let row = rows.get(id);
+            let selected = match scan.listed_rollout(home, id, row, cache.as_mut(), &mut invalid) {
+                Ok(Some(selected)) => selected,
+                Ok(None) => continue,
+                Err(error) => {
+                    requires_scan = true;
+                    invalid.unreadable += 1;
+                    invalid.first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
+                && (scan.unique_path(id).is_none()
+                    || !current_rollout::canonical_name(&selected.session.path)
+                    || legacy.title_paths(id).len() > 1)
+            {
+                requires_scan = true;
+            }
+            let title =
+                self.selected_title(&selected, row, || scan.index_paths(&selected, &legacy));
+            let mut session = selected.session;
+            if current_rollout::ids(&session.path).is_none()
+                && legacy.title_paths(id).contains(&session.path.as_path())
+            {
+                invalid.without_metadata -= 1;
+            }
+            if row.is_some_and(|row| row.requires_selection(home)) {
+                requires_scan |= selected.shadowed;
+                if !selected.shadowed
+                    && let Some(revision) = session.observed_revision
+                {
+                    selected_files.insert(id.clone(), (session.path.clone(), revision));
                 }
             }
+            if session.is_subagent {
+                subagents += 1;
+                continue;
+            }
+            session.title = title;
+            sessions.push(session);
         }
         if let Some(cache) = cache {
             cache.save();
         }
-        let first_error = invalid.first_error.as_ref().map(compact_discovery_error);
         let mut notes = listing_notes(
-            scan,
+            &scan,
             sessions.len(),
             subagents,
             invalid.unreadable,
             invalid.without_metadata,
-            first_error.as_deref(),
+            invalid
+                .first_error
+                .as_ref()
+                .map(compact_discovery_error)
+                .as_deref(),
         );
-        notes.extend(title_index.notes.iter().cloned());
-        CodexListing { sessions, notes }
-    }
-
-    fn find_session(&self, id: &str) -> Result<CodexSession> {
-        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
-        self.selected_session(id)?.ok_or_else(|| {
-            anyhow!("Codex session `{id}` was not found or has no readable metadata")
-        })
-    }
-
-    fn selected_session(&self, id: &str) -> Result<Option<CodexSession>> {
-        if Uuid::parse_str(id).is_err() {
-            return Ok(None);
+        notes.extend(self.title_index().notes.iter().cloned());
+        CodexListing {
+            legacy_revisions: legacy.revisions,
+            scan,
+            sessions,
+            notes,
+            selected_files,
+            requires_scan,
         }
-        let cached = self.session_scan();
-        let fresh;
-        let scan = if cached.candidates.contains_key(id) {
-            cached
+    }
+
+    fn index_rollout(
+        &self,
+        session: &SessionRef,
+        native: CodexSession,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        let changed = source_path.is_some_and(|path| path != native.path);
+        let read = self.read_selected(native, |native, revision| {
+            let selected_path = native.path.clone();
+            let mut read = native.index(session, full_read_bytes, revision)?;
+            read.observe_inherited_workspace(&selected_path)?;
+            Ok(read)
+        });
+        if changed {
+            read.context("selected Codex rollout changed during indexing")
         } else {
-            // A native fork may create a new session after discovery.
-            fresh = self.discover_session_scan();
-            &fresh
-        };
-        let Some(candidates) = scan.candidates.get(id) else {
-            return Ok(None);
-        };
-        let mut invalid = InvalidHeaders::default();
-        if let Some(mut session) = scan.select(candidates, None, &mut invalid) {
-            session.title = self.title_index().titles.get(id).cloned();
-            return Ok(Some(session));
+            read
         }
-        if let Some(error) = invalid.first_error {
-            return Err(error);
-        }
-        Ok(None)
+    }
+
+    fn remember_workspace(
+        &self,
+        native: &CodexSession,
+        snapshot: &CanonicalSnapshot,
+        projection: &CodexWorkspaceProjection,
+        complete: bool,
+    ) {
+        let Some(catalog) = self.workspace_catalog.as_deref() else {
+            return;
+        };
+        let directory = match projection {
+            CodexWorkspaceProjection::Observed(directory) => directory.as_deref(),
+            CodexWorkspaceProjection::Unchecked if complete => {
+                let directory = snapshot.workspace.current_dir.as_path();
+                (!directory.as_os_str().is_empty()).then_some(directory)
+            }
+            CodexWorkspaceProjection::Unchecked => return,
+        };
+        let directory = directory.filter(|path| path.is_absolute());
+        catalog.record(
+            native,
+            directory,
+            native.git_at(directory).branch.as_deref(),
+        );
+    }
+
+    fn find_session(&self, id: &str, source_path: Option<&Path>) -> Result<CodexSession> {
+        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
+        self.resolve_rollout(id, source_path, true)?
+            .map(|s| s.session)
+            .ok_or_else(|| anyhow!("Codex session {id} was not found"))
+    }
+
+    fn require_rollout(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedRollout> {
+        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
+        self.selected_rollout(id, source_path)?
+            .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
+    }
+
+    fn read_selected<T>(
+        &self,
+        native: CodexSession,
+        read: impl FnOnce(CodexSession, SourceRevision) -> Result<T>,
+    ) -> Result<T> {
+        let id = native.id.clone();
+        let path = native.path.clone();
+        let revision = native.observed_revision;
+        let value = native.read_unchanged(read);
+        let selected = self
+            .selected_rollout(&id, Some(&path))
+            .context("selected Codex rollout changed during the read")?;
+        anyhow::ensure!(
+            selected.is_some_and(|selected| {
+                selected.session.path == path && selected.session.observed_revision == revision
+            }),
+            "selected Codex rollout changed during the read"
+        );
+        value
     }
 
     /// Reads the model provider that a session records.
@@ -333,11 +1077,14 @@ impl CodexAdapter {
     /// Returns an error when the rollout cannot be read. A missing session or a rollout that
     /// records no provider is `Ok(None)`.
     pub fn recorded_model_provider(&self, id: &str) -> Result<Option<String>> {
-        let Some(selected) = self.selected_session(id)? else {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(selected) = self.selected_rollout(id, None)? else {
             return Ok(None);
         };
-        selected.read_unchanged(|_| {
-            let records = json_lines_prefix(&selected.path, 1)?;
+        self.read_selected(selected.session, |native, _| {
+            let records = rollout_file::header(&native.path)?;
             Ok(records
                 .first()
                 .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
@@ -346,6 +1093,85 @@ impl CodexAdapter {
                 .and_then(|payload| string_at(payload, &[&["model_provider"]]))
                 .map(str::to_owned))
         })
+    }
+
+    fn selected_rollout(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+    ) -> Result<Option<SelectedRollout>> {
+        self.resolve_rollout(id, source_path, false)
+    }
+
+    fn resolve_rollout(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+        with_title: bool,
+    ) -> Result<Option<SelectedRollout>> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(canonical_home) = fs::canonicalize(home) else {
+            return Ok(None);
+        };
+        let rows = if with_title {
+            self.named_rows(home, [id])?
+        } else {
+            self.current.rows(home, [id])?
+        };
+        let row = rows.get(id);
+        let finish = |mut selected: SelectedRollout| {
+            if with_title {
+                selected.session.title = self.selected_title(&selected, row, || {
+                    let (scan, _) = self.current_session_scan();
+                    let legacy = scan.legacy_paths(home, None);
+                    scan.index_paths(&selected, &legacy)
+                });
+            }
+            Ok(Some(selected))
+        };
+        if let Some(row) = row {
+            match row.resolve(home, id, std::iter::empty(), false) {
+                Ok(Some(file)) => return finish(file.into()),
+                Err(error) if row.has_legacy_name() => return Err(error),
+                _ => {}
+            }
+        }
+        let mut invalid = InvalidHeaders::default();
+        let (mut scan, cached) = self.scan_for_lookup(id, source_path, home, &canonical_home);
+        if let Some(row) = row {
+            if cached && row.requires_selection(home) {
+                // A restored copy can appear outside the recorded directory between lookups.
+                scan = self.session_scan(Some(&scan)).0;
+            }
+            if let Some(file) = row.resolve(home, id, scan.paths(id), scan.notes.is_empty())? {
+                return finish(file.into());
+            }
+        }
+        anyhow::ensure!(!ambiguous_generations(&scan, id), CurrentRolloutUnavailable);
+        if let Some(selected) =
+            select_live_rollout(home, &canonical_home, scan.paths(id), &mut invalid)
+        {
+            return finish(selected);
+        }
+        if cached {
+            // A remaining malformed sibling does not prove that the last valid file is still here.
+            let (fresh, _) = self.session_scan(Some(&scan));
+            if !fresh.paths(id).eq(scan.paths(id)) {
+                anyhow::ensure!(
+                    !ambiguous_generations(&fresh, id),
+                    CurrentRolloutUnavailable
+                );
+                invalid = InvalidHeaders::default();
+                if let Some(selected) =
+                    select_live_rollout(home, &canonical_home, fresh.paths(id), &mut invalid)
+                {
+                    return finish(selected);
+                }
+            }
+        }
+        invalid.first_error.map_or(Ok(None), Err)
     }
 
     /// Finds user sessions created after a native fork command started.
@@ -362,7 +1188,8 @@ impl CodexAdapter {
         started_at: DateTime<Utc>,
     ) -> Result<Vec<SessionRef>> {
         validate_provider(source, Provider::Codex)?;
-        let parent = Uuid::parse_str(&source.id).context("Codex fork parent must be a UUID")?;
+        let parent =
+            Uuid::parse_str(&source.id).context("Codex parent session ID must be a UUID")?;
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(Vec::new());
         };
@@ -382,6 +1209,18 @@ impl CodexAdapter {
         }
 
         let mut candidates = Vec::new();
+        let matches = |session: &CodexSession| {
+            session.id != source.id
+                && session.forked_from_id == Some(parent)
+                && !session.is_subagent
+                && session
+                    .created_at
+                    .is_some_and(|created| created >= started_at)
+                && session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| path.is_absolute() && paths_match(path, project))
+        };
         for directory in directories {
             let mut paths = Vec::new();
             let mut unreadable_dirs = 0;
@@ -391,27 +1230,29 @@ impl CodexAdapter {
                 0,
                 &mut paths,
                 SCAN_LIMIT,
-                &mut unreadable_dirs,
-                &mut depth_limited_dirs,
+                (&mut unreadable_dirs, &mut depth_limited_dirs),
+                &mut Vec::new(),
+                None,
             );
-            for path in paths {
-                let Some(session) = CodexSession::parse_metadata_path_result(&path)? else {
+            for indices in ranked_rollouts(&paths, &home.join("sessions")).into_values() {
+                let mut invalid = InvalidHeaders::default();
+                let Some(selected) = select_rollout(
+                    indices.iter().map(|&i| paths[i].as_path()),
+                    CodexSession::parse_observed_metadata,
+                    &mut invalid,
+                ) else {
+                    if let Some(error) = invalid.first_error {
+                        return Err(error);
+                    }
                     continue;
                 };
-                if session.id == source.id
-                    || session.forked_from_id != Some(parent)
-                    || session.is_subagent
-                    || session
-                        .created_at
-                        .is_none_or(|created_at| created_at < started_at)
-                    || session
-                        .project_path
-                        .as_deref()
-                        .is_none_or(|recorded| !paths_match(recorded, project))
-                {
-                    continue;
+                if matches(&selected.session) {
+                    let current =
+                        self.find_session(&selected.session.id, Some(&selected.session.path))?;
+                    if matches(&current) {
+                        candidates.push(current);
+                    }
                 }
-                candidates.push(session);
             }
         }
         candidates.sort_by_key(|session| session.created_at);
@@ -423,23 +1264,88 @@ impl CodexAdapter {
     }
 }
 
-fn canonical_home(home: PathBuf) -> PathBuf {
-    omnis_core::canonicalize_path(&home).unwrap_or(home)
+impl NativeSession {
+    /// Applies the surviving Codex workspace when it belongs to this exact file revision.
+    /// Returns whether the project or branch changed.
+    pub fn apply_codex_workspace(&mut self, workspace: &omnis_store::CodexWorkspace) -> bool {
+        let directory = workspace
+            .project_path
+            .as_deref()
+            .filter(|path| path.is_absolute());
+        let branch = directory.and(workspace.git_branch.as_deref());
+        if self.session.provider == Provider::Codex
+            && self.source_revision.is_some_and(|revision| {
+                revision.contents.is_some()
+                    && revision.matches_file_contents(workspace.source_revision)
+            })
+            && (self.project_path.as_deref() != directory || self.git_branch.as_deref() != branch)
+        {
+            self.project_path = directory.map(Path::to_path_buf);
+            self.git_branch = branch.map(str::to_owned);
+            return true;
+        }
+        false
+    }
+
+    /// Applies the workspace recorded for this exact Codex source. A pending recheck hides the old directory.
+    /// Returns true only for a verified observation, including one that established an unknown workspace.
+    pub fn apply_codex_workspace_index(
+        &mut self,
+        index: &omnis_store::CodexWorkspaceIndex,
+        cached_header: bool,
+    ) -> bool {
+        let Some(revision) = self
+            .source_revision
+            .filter(|_| self.session.provider == Provider::Codex)
+        else {
+            return false;
+        };
+        let Some(file) = revision.file else {
+            return false;
+        };
+        let verified = index
+            .verified
+            .get(&file)
+            .filter(|entry| revision.matches_file_contents(entry.source_revision));
+        let pending = index.needs_recheck(revision);
+        if verified.is_none() && !pending {
+            return false;
+        }
+        if cached_header
+            && !self
+                .source_path
+                .as_deref()
+                .and_then(CodexAdapter::index_file_revision)
+                .is_some_and(|current| current.matches_file_contents(revision))
+        {
+            return false;
+        }
+        if let Some(workspace) = verified {
+            self.apply_codex_workspace(workspace);
+            return true;
+        }
+        self.project_path = None;
+        self.git_branch = None;
+        false
+    }
 }
 
 impl Default for CodexAdapter {
     fn default() -> Self {
-        let selected = provider_root("CODEX_HOME", &[".codex"]);
-        let pin_relative_home = selected.as_deref().is_some_and(Path::is_relative);
-        let codex_home = selected.map(canonical_home);
+        let (codex_home, relative_home) = std::env::var_os("CODEX_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map_or_else(|| (Self::default_home(), false), Self::selected_home);
         Self {
-            pin_relative_home,
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             workspace_catalog: codex_home
                 .as_deref()
                 .and_then(WorkspaceCatalog::new)
                 .map(Arc::new),
+            current: Arc::new(CurrentRollouts::from_env()),
             codex_home,
+            relative_home,
+            use_workspace_index: true,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
@@ -449,50 +1355,51 @@ impl Default for CodexAdapter {
 
 /// Reads a rollout's listing metadata, reusing the cached header while the rollout is unchanged.
 fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Option<CodexSession>> {
-    let Some(cache) = cache else {
-        return CodexSession::parse_metadata_path_result(path);
-    };
-    // Stat before reading, so a rollout written in between is parsed again next time.
-    let Some((metadata, stamp)) = fs::metadata(path)
-        .ok()
-        .and_then(|metadata| RolloutStamp::new(&metadata).map(|stamp| (metadata, stamp)))
-    else {
-        return CodexSession::parse_metadata_path_result(path);
+    let observed =
+        ObservedRollout::read(path).context("selected Codex rollout changed during discovery")?;
+    let (Some(cache), Some(stamp)) = (cache, observed.stamp) else {
+        return CodexSession::parse_with_observation(path, observed);
     };
     if let Some(cached) = cache.get(path, stamp) {
-        let updated_at = metadata.modified().ok().map(DateTime::<Utc>::from);
         return Ok(cached
             .header
             .clone()
-            .map(|header| CodexSession::from_header(path, header, updated_at, stamp)));
+            .map(|header| CodexSession::from_header(path, header, observed)));
     }
-    let session = CodexSession::parse_metadata_path_result(path)?;
+    let session = CodexSession::parse_with_observation(path, observed)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
     Ok(session)
 }
 
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut files = Vec::new();
+    let mut active_links = Vec::new();
+    let mut directories = Vec::new();
     let mut unreadable_dirs = 0_usize;
     let mut depth_limited_dirs = 0_usize;
     let collect_limit = limit.saturating_add(1);
-    let active = home.join("sessions");
     collect_jsonl(
-        &active,
+        &home.join("sessions"),
         5,
         &mut files,
         collect_limit,
-        &mut unreadable_dirs,
-        &mut depth_limited_dirs,
+        (&mut unreadable_dirs, &mut depth_limited_dirs),
+        &mut directories,
+        Some(&mut active_links),
     );
+    let active_entries_complete = unreadable_dirs == 0
+        && depth_limited_dirs == 0
+        && files.len() <= limit
+        && active_links.len() <= limit;
     if files.len() <= limit {
         collect_jsonl(
             &home.join("archived_sessions"),
             5,
             &mut files,
             collect_limit,
-            &mut unreadable_dirs,
-            &mut depth_limited_dirs,
+            (&mut unreadable_dirs, &mut depth_limited_dirs),
+            &mut directories,
+            None,
         );
     }
     let truncated = files.len() > limit;
@@ -513,28 +1420,129 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             "Codex scan stopped after {limit} newest jsonl files; older sessions are omitted."
         ));
     }
-    let mut candidates = HashMap::<String, Vec<usize>>::new();
-    let mut without_id = 0;
-    for (index, path) in files.iter().enumerate() {
-        if let Some(id) = path_uuid(path) {
-            candidates.entry(id).or_default().push(index);
-        } else {
-            without_id += 1;
-        }
-    }
-    // A restored archive can have a newer filesystem timestamp than its active rollout.
-    for group in candidates.values_mut().filter(|group| group.len() > 1) {
-        group.sort_unstable_by_key(|&index| {
-            let path = &files[index];
-            Reverse((path.starts_with(&active), path.file_name(), path))
-        });
-    }
+    let candidates = ranked_rollouts(&files, &home.join("sessions"));
     CodexFileScan {
+        directories,
         files,
         candidates,
-        without_id,
         notes,
+        active_entries_complete,
+        active_links,
     }
+}
+
+fn ranked_rollouts(files: &[PathBuf], active: &Path) -> HashMap<String, Vec<usize>> {
+    let mut candidates = HashMap::<String, Vec<usize>>::new();
+    for (i, path) in files.iter().enumerate() {
+        let Some(id) = path_uuid(path) else {
+            continue;
+        };
+        candidates.entry(id).or_default().push(i);
+    }
+    for indices in candidates.values_mut() {
+        indices.sort_unstable_by(|&a, &b| {
+            rollout_priority(&files[b], active).cmp(&rollout_priority(&files[a], active))
+        });
+    }
+    candidates
+}
+
+fn ambiguous_generations(scan: &CodexFileScan, id: &str) -> bool {
+    let mut paths = scan.paths(id);
+    let Some(first) = paths.next().and_then(current_rollout::ids) else {
+        return false;
+    };
+    if paths.all(|path| current_rollout::ids(path) == Some(first)) {
+        return false;
+    }
+    let mut live = scan
+        .paths(id)
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+        .filter_map(current_rollout::ids);
+    live.next()
+        .is_some_and(|first| live.any(|other| other != first))
+}
+
+fn select_live_rollout<'a>(
+    home: &Path,
+    canonical_home: &Path,
+    candidates: impl Iterator<Item = &'a Path>,
+    invalid: &mut InvalidHeaders,
+) -> Option<SelectedRollout> {
+    let active = home.join("sessions");
+    let archive = home.join("archived_sessions");
+    let mut paths = Vec::new();
+    for path in candidates {
+        let Some(name) = rollout_file::jsonl_file_name(path) else {
+            continue;
+        };
+        paths.extend(representations(&path.with_file_name(name)));
+        if path.starts_with(&active) {
+            paths.extend(representations(&archive.join(name)));
+        } else if path.starts_with(&archive)
+            && let Some(plain) = restored_rollout(home, path)
+        {
+            paths.extend(representations(&plain));
+        }
+    }
+    paths.sort_unstable_by(|a, b| rollout_priority(b, &active).cmp(&rollout_priority(a, &active)));
+    paths.dedup();
+    let live = paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| live_rollout_path(home, canonical_home, path));
+    select_rollout(live, CodexSession::parse_observed_metadata, invalid)
+}
+
+fn live_rollout_path(home: &Path, canonical_home: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(home) else {
+        return false;
+    };
+    let Ok(tail) = relative
+        .strip_prefix("sessions")
+        .or_else(|_| relative.strip_prefix("archived_sessions"))
+    else {
+        return false;
+    };
+    // Discovery accepts a file below at most five directories in either rollout root.
+    tail.components().count() <= 6
+        && tail
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path.is_file()
+        && fs::canonicalize(path).is_ok_and(|actual| actual == canonical_home.join(relative))
+}
+
+// Codex restores archived files into the active directory named by their original date.
+fn restored_rollout(home: &Path, archived: &Path) -> Option<PathBuf> {
+    let name = rollout_file::jsonl_file_name(archived)?;
+    let stamp = name.to_str()?.strip_prefix("rollout-")?.get(..10)?;
+    let day = stamp.parse::<chrono::NaiveDate>().ok()?;
+    Some(
+        home.join("sessions")
+            .join(day.format("%Y/%m/%d").to_string())
+            .join(name),
+    )
+}
+
+fn representations(plain: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    ["jsonl", "jsonl.zst", "jsonl.gz"]
+        .into_iter()
+        .map(|ext| plain.with_extension(ext))
+}
+
+// The provider opens active, native rollouts. A backup's mtime does not change that choice.
+fn rollout_priority<'a>(
+    path: &'a Path,
+    active: &Path,
+) -> (bool, bool, Option<&'a Path>, bool, &'a Path) {
+    (
+        path.starts_with(active),
+        path.extension().is_some_and(|ext| ext != "gz"),
+        rollout_file::jsonl_file_name(path),
+        !rollout_file::compressed(path),
+        path,
+    )
 }
 
 fn listing_notes(
@@ -584,10 +1592,23 @@ fn collect_jsonl(
     depth: usize,
     output: &mut Vec<PathBuf>,
     limit: usize,
-    unreadable_dirs: &mut usize,
-    depth_limited_dirs: &mut usize,
+    errors: (&mut usize, &mut usize),
+    stamps: &mut Vec<(PathBuf, Option<RolloutStamp>)>,
+    mut skipped_links: Option<&mut Vec<PathBuf>>,
 ) {
     if output.len() >= limit {
+        return;
+    }
+    let (unreadable_dirs, depth_limited_dirs) = errors;
+    let metadata = fs::symlink_metadata(root);
+    if stamps.len() <= SCAN_LIMIT {
+        stamps.push((
+            root.to_owned(),
+            metadata.as_ref().ok().and_then(RolloutStamp::new),
+        ));
+    }
+    if metadata.is_ok_and(|meta| meta.file_type().is_symlink()) {
+        *unreadable_dirs = unreadable_dirs.saturating_add(1);
         return;
     }
     let entries = match fs::read_dir(root) {
@@ -615,17 +1636,18 @@ fn collect_jsonl(
             continue;
         };
         if file_type.is_symlink() {
+            if let Some(links) = skipped_links.as_deref_mut()
+                && links.len() < limit
+            {
+                links.push(entry.path());
+            }
             continue;
         }
 
         let name = entry.file_name();
         if file_type.is_dir() {
             directories.push(name);
-        } else if file_type.is_file()
-            && Path::new(&name)
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
-        {
+        } else if file_type.is_file() && rollout_file::jsonl_file_name(Path::new(&name)).is_some() {
             if files.len() < file_limit {
                 files.push(Reverse(name));
             } else if files
@@ -660,8 +1682,9 @@ fn collect_jsonl(
                     depth - 1,
                     output,
                     limit,
-                    unreadable_dirs,
-                    depth_limited_dirs,
+                    (unreadable_dirs, depth_limited_dirs),
+                    stamps,
+                    skipped_links.as_deref_mut(),
                 );
             } else {
                 *depth_limited_dirs = depth_limited_dirs.saturating_add(1);
@@ -675,111 +1698,118 @@ fn collect_jsonl(
 }
 
 fn path_uuid(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let start = stem.len().checked_sub(36)?;
-    let id = stem.get(start..)?;
-    Uuid::parse_str(id).ok().map(|_| id.to_owned())
+    current_rollout::ids(path).map(|(thread, _)| thread.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexHistoryMode {
+    Legacy,
+    Paginated,
+    Unknown,
+}
+
+impl CodexHistoryMode {
+    fn declared(payload: &Value) -> Self {
+        payload.get("history_mode").map_or(Self::Legacy, |value| {
+            Self::deserialize(value).unwrap_or(Self::Unknown)
+        })
+    }
+
+    fn from_payload(payload: &Value) -> Self {
+        let mode = Self::declared(payload);
+        let prefix = &payload["history_base"];
+        match mode {
+            // A native legacy resume reads only this file and drops any inherited prefix.
+            Self::Legacy if prefix.is_null() => mode,
+            Self::Paginated if Self::valid_prefix(prefix) => mode,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn valid_prefix(prefix: &Value) -> bool {
+        #[derive(Deserialize)]
+        struct HistoryPosition<'a> {
+            thread_id: &'a str,
+            end_ordinal_exclusive: u64,
+            end_byte_offset: u64,
+        }
+
+        prefix.is_null()
+            || HistoryPosition::deserialize(prefix).is_ok_and(|position| {
+                Uuid::parse_str(position.thread_id).is_ok()
+                    && position.end_ordinal_exclusive > 0
+                    && position.end_byte_offset > 0
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SavedOpenerCheck {
+    Withdrawal,
+    LegacyOrToolCatalog,
+    ToolCatalog,
 }
 
 #[derive(Default)]
 struct RolloutWorkspace {
     directory: Option<PathBuf>,
     settings: WorkspaceSettings,
-    rolled_back: bool,
     recent_records: Option<VecDeque<JsonlRecord>>,
 }
 
-#[derive(Default)]
-enum OwnedWorkspace {
-    #[default]
-    Absent,
-    Known(PathBuf),
-    Unknown,
-}
-
-#[derive(Default)]
-struct WorkspaceSettings {
-    owned: OwnedWorkspace,
-    startup: Option<PathBuf>,
-}
-
-impl WorkspaceSettings {
-    fn from_header(directory: Option<PathBuf>) -> Self {
-        Self {
-            owned: OwnedWorkspace::Absent,
-            startup: directory,
-        }
-    }
-
-    fn observe(&mut self, session: &str, record: &Value) {
-        let payload = &record["payload"];
-        if record["type"] != "event_msg" || payload["type"] != "thread_settings_applied" {
-            return;
-        }
-        let settings = &payload["thread_settings"];
-        let cwd = settings["cwd"].as_str().map(Path::new);
-        // Codex can offer the directory of a copied settings record when the TUI starts.
-        if self.startup.as_deref() != cwd {
-            self.startup = None;
-        }
-        if workspace_settings::belongs_to(payload, session) {
-            self.owned = workspace_settings::saved_directory(settings)
-                .map_or(OwnedWorkspace::Unknown, OwnedWorkspace::Known);
-        }
-    }
-
-    fn has_owned(&self) -> bool {
-        !matches!(self.owned, OwnedWorkspace::Absent)
-    }
-
-    fn directory(&self, fallback: Option<PathBuf>) -> Option<PathBuf> {
-        match &self.owned {
-            OwnedWorkspace::Absent => fallback,
-            OwnedWorkspace::Known(path) => Some(path.clone()),
-            OwnedWorkspace::Unknown => None,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CodexSession {
-    stamp: Option<RolloutStamp>,
     id: String,
+    forked_from_id: Option<Uuid>,
     title: Option<String>,
     path: PathBuf,
+    observed_revision: Option<SourceRevision>,
+    stamp: Option<RolloutStamp>,
     project_path: Option<PathBuf>,
     git: GitState,
-    forked_from_id: Option<Uuid>,
     cli_version: Option<String>,
+    history_mode: CodexHistoryMode,
     is_subagent: bool,
-    paginated: bool,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
 }
 
 impl CodexSession {
-    fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
-        let file = fs::File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(anyhow!("provider path is not a file"));
-        }
-        let mut line = Vec::new();
-        std::io::BufReader::new(file.take(MAX_TRANSCRIPT_LINE_SIZE + 1))
-            .read_until(b'\n', &mut line)?;
-        if line.len() as u64 > MAX_TRANSCRIPT_LINE_SIZE {
-            return Ok(None);
-        }
-        Ok(serde_json::from_slice(&line)
-            .ok()
-            .as_ref()
-            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, &metadata)))
+    fn parse_observed_metadata(path: &Path) -> Result<Option<Self>> {
+        let observed = ObservedRollout::read(path)
+            .context("selected Codex rollout changed during header lookup")?;
+        Self::parse_with_observation(path, observed)
+    }
+
+    fn read_unchanged<T>(self, read: impl FnOnce(Self, SourceRevision) -> Result<T>) -> Result<T> {
+        let path = self.path.clone();
+        let revision = self
+            .observed_revision
+            .context("selected Codex rollout changed during lookup")?;
+        let result = read(self, revision);
+        anyhow::ensure!(
+            CodexAdapter::index_file_revision(&path) == Some(revision),
+            "selected Codex rollout changed during the read"
+        );
+        result
+    }
+
+    fn parse_with_observation(path: &Path, observed: ObservedRollout) -> Result<Option<Self>> {
+        let records = rollout_file::header(path)?;
+        anyhow::ensure!(
+            CodexAdapter::index_file_revision(path) == Some(observed.revision),
+            "selected Codex rollout changed during header lookup"
+        );
+        Ok(records
+            .first()
+            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, observed)))
     }
 
     fn parse_metadata_record(
         path: PathBuf,
         record: &Value,
-        metadata: &fs::Metadata,
+        observed: ObservedRollout,
     ) -> Option<Self> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
@@ -787,15 +1817,19 @@ impl CodexSession {
         let payload = record.get("payload")?;
         let id = string_at(payload, &[&["id"], &["session_id"]])?;
         Uuid::parse_str(id).ok()?;
-        if path_uuid(&path).as_deref() != Some(id) {
+        if current_rollout::ids(&path).is_some_and(|(thread, _)| thread != id)
+            && current_rollout::canonical_name(&path)
+        {
             return None;
         }
-        let updated_at = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
-            stamp: RolloutStamp::new(metadata),
             id: id.to_owned(),
+            forked_from_id: string_at(payload, &[&["forked_from_id"]])
+                .and_then(|parent| Uuid::parse_str(parent).ok()),
             title: None,
             path,
+            observed_revision: Some(observed.revision),
+            stamp: observed.stamp,
             project_path: string_at(payload, &[&["cwd"]])
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute()),
@@ -813,10 +1847,8 @@ impl CodexSession {
                     .map(|url| omnis_core::fingerprint(url.as_bytes())),
                 ..GitState::default()
             },
-            forked_from_id: string_at(payload, &[&["forked_from_id"]])
-                .and_then(|parent| Uuid::parse_str(parent).ok()),
             cli_version: string_at(payload, &[&["cli_version"]]).map(str::to_owned),
-            paginated: payload["history_mode"] == "paginated",
+            history_mode: CodexHistoryMode::from_payload(payload),
             is_subagent: string_at(
                 payload,
                 &[
@@ -828,41 +1860,37 @@ impl CodexSession {
             .is_some()
                 || value_at(payload, &[&["source", "subagent"]]).is_some(),
             created_at: parse_timestamp(record.get("timestamp")),
-            updated_at,
+            updated_at: observed.modified,
         })
     }
 
-    fn from_header(
-        path: &Path,
-        header: RolloutHeader,
-        updated_at: Option<DateTime<Utc>>,
-        stamp: RolloutStamp,
-    ) -> Self {
+    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Self {
         Self {
-            stamp: Some(stamp),
             id: header.id,
+            forked_from_id: header.forked_from_id,
             title: None,
             path: path.to_path_buf(),
+            observed_revision: Some(observed.revision),
+            stamp: observed.stamp,
             project_path: header.project_path,
             git: header.git,
-            forked_from_id: header.forked_from_id,
             cli_version: header.cli_version,
+            history_mode: header.history_mode,
             is_subagent: header.is_subagent,
-            paginated: header.paginated,
             created_at: header.created_at,
-            updated_at,
+            updated_at: observed.modified,
         }
     }
 
     fn header(&self) -> RolloutHeader {
         RolloutHeader {
             id: self.id.clone(),
+            forked_from_id: self.forked_from_id,
             project_path: self.project_path.clone(),
             git: self.git.clone(),
-            forked_from_id: self.forked_from_id,
             cli_version: self.cli_version.clone(),
+            history_mode: self.history_mode,
             is_subagent: self.is_subagent,
-            paginated: self.paginated,
             created_at: self.created_at,
         }
     }
@@ -872,55 +1900,177 @@ impl CodexSession {
             session: SessionRef::new(Provider::Codex, self.id.clone()),
             title: self.title.clone(),
             project_path: self.project_path.clone(),
-            git_branch: self
-                .project_path
-                .as_ref()
-                .and(self.git.branch.as_ref())
-                .cloned(),
+            git_branch: self.git_at(self.project_path.as_deref()).branch,
             created_at: self.created_at,
             updated_at: self.updated_at,
             updated_at_approximate: false,
             event_count: 0,
             source_path: Some(self.path.clone()),
+            source_revision: self.observed_revision,
         }
     }
 
-    fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+    fn check_saved_opener(&self, prior_title: &str, check: SavedOpenerCheck) -> Result<bool> {
         let mut builder = self.event_builder();
-        let mut history = CodexHistory::new(self.project_path.clone());
-        let mut records_seen = 0_usize;
-        let mut workspace =
-            WorkspaceRecords::from_header(self.project_path.clone(), self.paginated);
-        let mut has_history_base = false;
-        let oversized_records = visit_filtered_streamed_json_lines(
-            &self.path,
-            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-            |_| true,
-            |line| {
-                if workspace.observe(&self.id, &line) {
-                    history.clear_workspace_before_gap(builder.checkpoint());
-                }
-                let (mut record, terminated) = match line {
-                    JsonLine::Record(record) => (record, true),
-                    JsonLine::Unterminated(record) => (record, false),
-                    JsonLine::Malformed(_) => {
-                        history.rollout_lines.malformed();
-                        return Ok(());
-                    }
-                    JsonLine::Oversized(..) => return Ok(()),
-                };
-                if records_seen == 0 {
-                    has_history_base = declares_history_base(&record);
-                }
-                history.push(&mut builder, &mut record, terminated)?;
-                records_seen += 1;
-                if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
-                    history.compact(&mut builder);
-                }
-                Ok(())
-            },
+        builder.plan_preview(None);
+        builder.track_saved_opener(prior_title);
+        let mut matched_source = false;
+        let (events, _) =
+            self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
+                rollout_file::visit(&self.path, |record, skipped, terminated| {
+                    matched_source |= match check {
+                        SavedOpenerCheck::LegacyOrToolCatalog => {
+                            (record["type"] == "session_meta"
+                                && record["payload"]["history_mode"] == "legacy")
+                                || is_dynamic_tool_catalog(&record)
+                        }
+                        SavedOpenerCheck::ToolCatalog => is_dynamic_tool_catalog(&record),
+                        SavedOpenerCheck::Withdrawal => false,
+                    };
+                    visit(record, skipped, terminated)
+                })
+            })?;
+        Ok(match check {
+            SavedOpenerCheck::Withdrawal => events.rollback_title().withdraws(prior_title),
+            _ => matched_source && events.confirms_saved_local_opener(prior_title),
+        })
+    }
+
+    fn withdrew_search_title(&self, prior_title: &str) -> Result<bool> {
+        if self.history_mode == CodexHistoryMode::Paginated {
+            return match self.canonical_events_with(|visit| {
+                rollout_file::visit_with_limits(
+                    &self.path,
+                    rollout_file::LEGACY_PROJECTION_LIMITS,
+                    visit,
+                )
+            }) {
+                Ok((events, _)) => Ok(events.withdrew_saved_opener(prior_title)),
+                Err(error) if error.is::<crate::TranscriptReadLimit>() => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        let mut builder = self.event_builder();
+        let mut history = CodexHistory::preview();
+        let mut opener: Option<(u64, bool)> = None;
+        let mut withdrew = false;
+        let complete = rollout_file::visit_all_records(&self.path, |mut record, terminated| {
+            if history.records_seen == 0 {
+                anyhow::ensure!(
+                    record["type"] == "session_meta"
+                        && string_at(&record, &[&["payload", "id"], &["payload", "session_id"]])
+                            == Some(self.id.as_str()),
+                    "selected Codex rollout has a different session header"
+                );
+            }
+            // An unknown record or an unreconstructed compaction can change the visible opener.
+            if !matches!(
+                record["type"].as_str(),
+                Some("session_meta" | "turn_context" | "response_item" | "event_msg")
+            ) && !is_dynamic_tool_catalog(&record)
+            {
+                return Ok(false);
+            }
+            let rollback = history.push(&mut builder, &mut record, terminated)?;
+            if let Some(boundary) = rollback
+                && let Some((_, matched)) = opener.take_if(|(sequence, _)| *sequence >= boundary)
+            {
+                withdrew |= matched;
+            }
+            let events = builder.drain_events();
+            if opener.is_none() {
+                opener = omnis_core::search_title_opener_from_messages(events.as_slice())
+                    .map(|(sequence, title)| (sequence, title.as_deref() == Some(prior_title)));
+            }
+            drop(events);
+            if history
+                .records_seen
+                .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
+            {
+                history.compact(&mut builder);
+            }
+            Ok(true)
+        })?;
+        Ok(complete && withdrew && !opener.is_some_and(|(_, matches)| matches))
+    }
+
+    fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+        self.canonical_events_with(|visit| rollout_file::visit(&self.path, visit))
+    }
+
+    fn canonical_events_with(
+        &self,
+        read: impl FnOnce(
+            &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+        ) -> Result<JsonLineSkips>,
+    ) -> Result<(EventBuilder, Option<PathBuf>)> {
+        let mut builder = self.event_builder();
+        builder.track_rollback_opener(true);
+        let (mut events, history) = self.canonical_events_into(
+            builder,
+            CodexHistory::new(self.project_path.clone()),
+            read,
         )?;
+        let unknown = history.workspace.unknown() || history.settings.has_owned();
+        let project = history.settings.directory(history.workspace.path);
+        if unknown && project.is_none() {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
+        Ok((events, project))
+    }
+
+    fn canonical_events_into(
+        &self,
+        mut builder: EventBuilder,
+        mut history: CodexHistory,
+        read: impl FnOnce(
+            &mut dyn FnMut(Value, JsonLineSkips, bool) -> Result<()>,
+        ) -> Result<JsonLineSkips>,
+    ) -> Result<(EventBuilder, CodexHistory)> {
+        let mut unread_ancestor = false;
+        let mut first_gap = None;
+        let mut malformed = 0;
+        let unreadable = read(&mut |mut record, skipped_before, terminated| {
+            history.observe_malformed(&mut malformed, skipped_before);
+            if builder.tracks_rollback_opener()
+                && !ordinary_rollback_record(&record, history.records_seen == 0)
+            {
+                builder.discard_rollback_opener();
+            }
+            if skipped_before.total() > 0 && first_gap.is_none() {
+                first_gap = Some(builder.checkpoint());
+                builder.note_rollback_history_gap();
+            }
+            history.observe_workspace_gaps(skipped_before.workspace_gaps(), builder.checkpoint());
+            // The latest settings for this thread survive conversation rollback.
+            history.settings.observe_gaps(skipped_before);
+            if self.history_mode != CodexHistoryMode::Paginated
+                || WorkspaceRecords::accepts(true, &record)
+            {
+                history.settings.observe(&self.id, &record);
+            }
+            unread_ancestor |= records_history_base(&record);
+            history.push(&mut builder, &mut record, terminated)?;
+            if history
+                .records_seen
+                .checked_rem(TOOL_COMPACTION_RECORD_INTERVAL)
+                == Some(0)
+            {
+                history.compact(&mut builder);
+            }
+            Ok(())
+        })?;
+        history.observe_malformed(&mut malformed, unreadable);
+        history.observe_workspace_gaps(unreadable.workspace_gaps(), builder.checkpoint());
+        history.settings.observe_gaps(unreadable);
+        let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
+        if unreadable.total() != 0 {
+            builder.note_rollback_history_gap();
+        }
+        if unread_ancestor || self.is_subagent {
+            builder.discard_rollback_opener();
+        }
         if history.omitted_events > 0 {
             builder.push(
                 EventKind::ProviderEvent,
@@ -950,72 +2100,27 @@ impl CodexSession {
                 None,
             );
         }
-        if has_history_base {
-            self.report_unread_history_base(&mut builder);
+        builder.push_json_line_omissions(
+            unreadable,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            Some(prefix_end),
+            self.updated_at,
+        );
+        if unread_ancestor {
+            history.workspace.incomplete |=
+                history.workspace.record.is_none_or(|record| record <= 1);
+            report_unread_ancestor(&mut builder, self.updated_at);
         }
         history.finish(&mut builder);
-        let restored = history.paginated || history.restored_workspace();
-        workspace.use_history(history.project_path, restored);
-        let damaged = workspace.had_gap();
-        let malformed = workspace.malformed;
-        let directory = workspace.finish(&self.path)?.directory;
-        let unknown = damaged && directory.is_none();
-        let sequence = builder.checkpoint();
-        builder.push_oversized_record_notice(oversized_records, self.updated_at);
-        if unknown && let Some(event) = builder.event_at_mut(sequence) {
-            event.payload["workspace_unknown"] = true.into();
+        if !self.is_subagent && history.paginated && !history.withdrawn.is_empty() {
+            builder.record_paginated_opener_withdrawal(unread_ancestor);
         }
-        if malformed > 0 {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"omitted_events":malformed,"malformed_records":malformed,"workspace_unknown":unknown}),
-                self.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.codex_malformed_records".to_owned()),
-                None,
-            );
-        }
-        Ok((builder, directory))
-    }
-
-    fn workspace_metadata(&self, for_preview: bool) -> Result<RolloutWorkspace> {
-        let size = fs::metadata(&self.path)?.len();
-        if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
-            let mut recent = self.recent_workspace(for_preview)?;
-            if !recent.settings.has_owned() {
-                recent.directory = None;
-            }
-            return Ok(recent);
-        }
-        if !for_preview && size > MAX_PREVIEW_TAIL_SIZE {
-            let mut recent = self.recent_workspace(false)?;
-            if recent.settings.has_owned() {
-                return Ok(recent);
-            }
-            if recent.directory.is_some() && !contains_settings_marker(&self.path)? {
-                recent.settings.startup.clone_from(&self.project_path);
-                return Ok(recent);
-            }
-        }
-        let mut records = WorkspaceRecords::from_header(self.project_path.clone(), self.paginated);
-        let oversized = visit_filtered_streamed_json_lines(
-            &self.path,
-            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-            workspace_record_filter(),
-            |line| {
-                records.observe(&self.id, &line);
-                Ok(())
-            },
-        )?;
-        let mut workspace = records.finish(&self.path)?;
-        if for_preview && oversized > 0 && !self.paginated {
-            workspace.recent_records = self.recent_workspace(true)?.recent_records;
-        }
-        Ok(workspace)
+        Ok((builder, history))
     }
 
     fn recent_workspace(&self, keep_preview: bool) -> Result<RolloutWorkspace> {
-        let mut workspace = WorkspaceRecords::from_header(None, self.paginated);
+        let mut workspace =
+            WorkspaceRecords::from_header(None, self.history_mode == CodexHistoryMode::Paginated);
         let mut records = VecDeque::new();
         let is_workspace_record = workspace_record_filter();
         visit_json_lines_tail(
@@ -1027,12 +2132,11 @@ impl CodexSession {
                 if !keep_preview {
                     return;
                 }
-                if !self.paginated
+                if self.history_mode != CodexHistoryMode::Paginated
                     && let JsonLine::Record(record) | JsonLine::Unterminated(record) = &line
-                    && record["type"] == "event_msg"
-                    && record["payload"]["type"] == "thread_rolled_back"
+                    && encoded_rollback(record)
                 {
-                    if record["payload"]["num_turns"].as_u64() != Some(0) {
+                    if rollout_lines::rollback_turns(&record["payload"]) != Some(0) {
                         records.clear();
                     }
                 } else if let Some(record) = line.into_record() {
@@ -1044,7 +2148,6 @@ impl CodexSession {
             },
         )?;
         let mut workspace = workspace.finish(&self.path)?;
-        workspace.rolled_back = false;
         workspace.recent_records = keep_preview.then_some(records);
         Ok(workspace)
     }
@@ -1052,17 +2155,18 @@ impl CodexSession {
     fn recent_preview(&self, records: VecDeque<JsonlRecord>) -> Result<EventBuilder> {
         let mut events = self.event_builder();
         let mut history = CodexHistory::new(None);
-        history.paginated = self.paginated;
+        history.paginated = self.history_mode == CodexHistoryMode::Paginated;
         for line in records {
             let (mut record, terminated) = match line {
                 JsonlRecord::Complete(record) => (record, true),
                 JsonlRecord::Unterminated(record) => (record, false),
                 JsonlRecord::Malformed => {
-                    history.rollout_lines.skipped += usize::from(self.paginated);
+                    history.rollout_lines.skipped +=
+                        usize::from(self.history_mode == CodexHistoryMode::Paginated);
                     continue;
                 }
             };
-            if self.paginated {
+            if self.history_mode == CodexHistoryMode::Paginated {
                 // An unread prefix can contain a higher display ordinal than any row in the suffix.
                 if history
                     .rollout_lines
@@ -1076,7 +2180,7 @@ impl CodexSession {
             }
         }
         history.finish(&mut events);
-        let reason = if self.paginated {
+        let reason = if self.history_mode == CodexHistoryMode::Paginated {
             "The source prefix was unavailable, so the public display ordinals in its suffix could not be verified."
         } else {
             "Only the recent Codex records were available."
@@ -1092,6 +2196,38 @@ impl CodexSession {
         Ok(events)
     }
 
+    fn live_workspace(&self) -> Result<NativeWorkspace> {
+        if !rollout_file::compressed(&self.path)
+            && let Some(stamp) = self.stamp
+            && stamp.len > MAX_PREVIEW_TAIL_SIZE
+        {
+            let mut recent = self.recent_workspace(false)?;
+            if stamp.len > MAX_STREAMED_TRANSCRIPT_FILE_SIZE || recent.settings.has_owned() {
+                if !recent.settings.has_owned() {
+                    recent.directory = None;
+                }
+                return Ok(NativeWorkspace {
+                    git: self.git_at(recent.directory.as_deref()),
+                    directory: recent.directory,
+                    startup_directory: recent.settings.startup,
+                });
+            }
+            if recent.directory.is_some() && !contains_settings_marker(&self.path)? {
+                return Ok(NativeWorkspace {
+                    git: self.git_at(recent.directory.as_deref()),
+                    directory: recent.directory,
+                    startup_directory: self.project_path.clone(),
+                });
+            }
+        }
+        let (directory, startup_directory) = self.effective_and_startup_directories()?;
+        Ok(NativeWorkspace {
+            git: self.git_at(directory.as_deref()),
+            directory,
+            startup_directory,
+        })
+    }
+
     fn git_at(&self, directory: Option<&Path>) -> GitState {
         // Codex records Git only for the creation directory.
         if directory.is_some()
@@ -1103,36 +2239,19 @@ impl CodexSession {
         }
     }
 
-    fn live_workspace(&self) -> Result<NativeWorkspace> {
-        let workspace = self.workspace_metadata(false)?;
-        let directory = if workspace.rolled_back && !workspace.settings.has_owned() {
-            self.canonical_events()?.1
-        } else {
-            workspace.directory
-        };
-        Ok(NativeWorkspace {
-            git: self.git_at(directory.as_deref()),
-            directory,
-            startup_directory: workspace.settings.startup,
-        })
-    }
-
     fn snapshot(
         &self,
-        catalog: Option<&WorkspaceCatalog>,
         session: &SessionRef,
         events: EventBuilder,
-        project_path: Option<PathBuf>,
+        project: Option<PathBuf>,
         captured_at: DateTime<Utc>,
     ) -> CanonicalSnapshot {
-        let git = self.git_at(project_path.as_deref());
-        if let Some(catalog) = catalog {
-            catalog.record(self, project_path.as_deref(), git.branch.as_deref());
-        }
+        let project = project.filter(|path| path.is_absolute());
+        let git = self.git_at(project.as_deref());
         let mut snapshot = events.snapshot(
             session.clone(),
             self.title.clone(),
-            project_path,
+            project,
             None,
             captured_at,
         );
@@ -1140,18 +2259,292 @@ impl CodexSession {
         snapshot
     }
 
-    fn preview_events(&self) -> Result<EventBuilder> {
-        const SAMPLE_RECORDS: usize = 1_024;
-        let records = if self.paginated {
-            let Some(records) = crate::support::complete_small_json_records(&self.path)? else {
-                return paginated_preview::read(self, SAMPLE_RECORDS);
-            };
-            records
+    fn read(self, session: &SessionRef) -> Result<(omnis_ir::CanonicalSnapshot, RollbackTitle)> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        let (events, project_path) = self.canonical_events()?;
+        let title = events.rollback_title();
+        Ok((
+            self.snapshot(session, events, project_path, captured_at),
+            title,
+        ))
+    }
+
+    fn preview(
+        self,
+        session: &SessionRef,
+    ) -> Result<(
+        omnis_ir::CanonicalSnapshot,
+        RollbackTitle,
+        CodexWorkspaceProjection,
+    )> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        if rollout_file::compressed(&self.path) {
+            let read = self.compressed_sample(session, MAX_PREVIEW_TAIL_SIZE)?;
+            return Ok((
+                read.snapshot,
+                read.rollback_title,
+                read.workspace_projection,
+            ));
+        }
+        let (events, project, reconstructed) = if self
+            .stamp
+            .is_some_and(|stamp| stamp.len > MAX_STREAMED_TRANSCRIPT_FILE_SIZE)
+        {
+            let mut workspace = self.recent_workspace(true)?;
+            if !workspace.settings.has_owned() {
+                workspace.directory = None;
+            }
+            (
+                self.recent_preview(workspace.recent_records.unwrap_or_default())?,
+                workspace.directory,
+                true,
+            )
+        } else if self.history_mode == CodexHistoryMode::Paginated {
+            let workspace = self.live_workspace()?;
+            (self.preview_paginated_events()?, workspace.directory, true)
+        } else if self.history_mode == CodexHistoryMode::Legacy {
+            let scan = self.scan_workspace(true)?;
+            if scan.reconstruct_history || contains_rollback_marker(&self.path)? {
+                self.reconstructed_preview(rollout_file::LIMITS)?
+            } else {
+                self.preview_events(scan.directory)?
+            }
         } else {
-            json_lines_preview(&self.path, SAMPLE_RECORDS)?
-                .into_iter()
-                .map(JsonlRecord::Complete)
-                .collect()
+            self.reconstructed_preview(rollout_file::LIMITS)?
+        };
+        let project = project.filter(|path| path.is_absolute());
+        let title = events.rollback_title();
+        let workspace =
+            CodexWorkspaceProjection::from_reconstruction(reconstructed, project.as_deref());
+        Ok((
+            self.snapshot(session, events, project, captured_at),
+            title,
+            workspace,
+        ))
+    }
+
+    fn index(
+        self,
+        session: &SessionRef,
+        full_read_bytes: u64,
+        source_revision: SourceRevision,
+    ) -> Result<IndexRead> {
+        let native_session = (!self.is_subagent).then(|| self.native_session());
+        if full_read_bytes != u64::MAX && rollout_file::compressed(&self.path) {
+            let mut read = self.compressed_sample(session, full_read_bytes)?;
+            read.source_revision = source_revision;
+            read.native_session = native_session;
+            return Ok(read);
+        }
+        let source_complete = fs::metadata(&self.path)?.len() <= full_read_bytes;
+        let (snapshot, rollback_title, workspace_projection) = if source_complete {
+            let (snapshot, title) = self.read(session)?;
+            (snapshot, title, CodexWorkspaceProjection::Unchecked)
+        } else {
+            self.preview(session)?
+        };
+        Ok(IndexRead {
+            native_session,
+            snapshot,
+            rollback_title,
+            workspace_projection,
+            source_complete,
+            provider_limited: false,
+            source_revision,
+        })
+    }
+
+    fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        let (events, project, source_complete, workspace_reconstructed) =
+            match rollout_file::sample(
+                &self.path,
+                budget,
+                self.project_path.as_deref(),
+                &self.id,
+                self.history_mode,
+            )
+            .context("sampling compressed Codex rollout")?
+            {
+                rollout_file::Sample::Complete(bytes) => {
+                    let (events, project) = self.canonical_events_with(|visit| {
+                        rollout_file::read_records(bytes.as_slice(), visit)
+                    })?;
+                    (events, project, true, false)
+                }
+                rollout_file::Sample::Reconstruct => {
+                    let (events, project, workspace_reconstructed) =
+                        self.reconstructed_preview(rollout_file::LIMITS)?;
+                    (events, project, false, workspace_reconstructed)
+                }
+                rollout_file::Sample::Edges {
+                    records,
+                    omitted,
+                    unreadable,
+                    directory,
+                } => {
+                    let mut events = self.events_from_records(records)?;
+                    events.push_json_line_omissions(
+                        unreadable,
+                        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+                        None,
+                        self.updated_at,
+                    );
+                    if omitted > 0 {
+                        events.push(
+                            EventKind::ProviderEvent,
+                            json!({"omitted_events": omitted}),
+                            self.updated_at,
+                            ReplayPolicy::HistoricalOnly,
+                            Some("omnisession.preview_limit".to_owned()),
+                            None,
+                        );
+                    }
+                    (events, directory, false, true)
+                }
+            };
+        let project = project.filter(|path| path.is_absolute());
+        let rollback_title = events.rollback_title();
+        let workspace_projection = CodexWorkspaceProjection::from_reconstruction(
+            workspace_reconstructed,
+            project.as_deref(),
+        );
+        let snapshot = self.snapshot(session, events, project, captured_at);
+        Ok(IndexRead {
+            native_session: None,
+            workspace_projection,
+            rollback_title,
+            snapshot,
+            source_complete,
+            provider_limited: false,
+            source_revision: SourceRevision::default(),
+        })
+    }
+
+    fn materialized_preview(
+        &self,
+        limits: crate::support::JsonLinesLimits,
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+        let mut builder = self.event_builder();
+        builder.track_rollback_opener(true);
+        let (mut events, history) = self.canonical_events_into(
+            builder,
+            CodexHistory::new(self.project_path.clone()),
+            |visit| rollout_file::visit_with_limits(&self.path, limits, visit),
+        )?;
+        let verified = history.settings.has_owned() || !history.workspace.incomplete;
+        let unknown = history.workspace.unknown() || history.settings.has_owned();
+        let project = history.settings.directory(history.workspace.path);
+        if project.is_none() && unknown {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
+        events.retain_bounded_preview(
+            rollout_file::SAMPLE_RECORDS,
+            usize::try_from(MAX_PREVIEW_TAIL_SIZE)?,
+            self.updated_at.unwrap_or_else(Utc::now),
+        );
+        Ok((events, project, verified))
+    }
+
+    fn reconstructed_preview(
+        &self,
+        limits: crate::support::JsonLinesLimits,
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+        if self.history_mode != CodexHistoryMode::Legacy {
+            return self.materialized_preview(limits);
+        }
+        let stamp = || fs::metadata(&self.path).map(|metadata| RolloutStamp::new(&metadata));
+        let before = stamp()?;
+        let per_edge = usize::try_from(MAX_PREVIEW_TAIL_SIZE)?;
+        let mut builder = self.event_builder();
+        builder.plan_preview(None);
+        builder.track_rollback_opener(false);
+        let mut materialize = false;
+        let mut replay = DisplayReplay::default();
+        let ((selected, omitted), workspace_record, first_settings, first_title) = {
+            let (plan, history) =
+                self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
+                    rollout_file::visit_with_limits(
+                        &self.path,
+                        limits,
+                        |record, skipped, terminated| {
+                            materialize |= replay.observe(&record);
+                            visit(record, skipped, terminated)
+                        },
+                    )
+                })?;
+            (
+                plan.select_preview(rollout_file::SAMPLE_RECORDS, per_edge),
+                history.workspace.record,
+                history.settings,
+                plan.rollback_title(),
+            )
+        };
+        if materialize {
+            let preview = self.materialized_preview(limits)?;
+            anyhow::ensure!(
+                stamp()? == before,
+                "Codex rollout changed while reconstructing its preview"
+            );
+            return Ok(preview);
+        }
+        let expected = selected.len();
+        let mut builder = self.event_builder();
+        builder.plan_preview(Some(selected.clone()));
+        builder.track_rollback_opener(false);
+        let mut project = None;
+        let mut position = 0_usize;
+        let (mut events, history) =
+            self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
+                rollout_file::visit_with_limits(
+                    &self.path,
+                    limits,
+                    |record, skipped_before, terminated| {
+                        position += 1;
+                        if workspace_record == Some(position) {
+                            project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
+                        }
+                        visit(record, skipped_before, terminated)
+                    },
+                )
+            })?;
+        if stamp()? != before
+            || history.workspace.record != workspace_record
+            || history.settings != first_settings
+            || events.rollback_title() != first_title
+            || events.select_preview(rollout_file::SAMPLE_RECORDS, per_edge) != (selected, omitted)
+        {
+            return Err(anyhow!(
+                "Codex rollout changed while reconstructing its preview"
+            ));
+        }
+        events.finish_preview(expected)?;
+        let project = history.settings.directory(project);
+        let owned_settings = history.settings.has_owned();
+        if project.is_none() && (history.workspace.unknown() || owned_settings) {
+            events.mark_codex_workspace_unknown(self.updated_at);
+        }
+        if omitted > 0 {
+            events.push(
+                EventKind::ProviderEvent,
+                json!({"omitted_events": omitted}),
+                self.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.preview_limit".to_owned()),
+                None,
+            );
+        }
+        Ok((
+            events,
+            project,
+            owned_settings || !history.workspace.incomplete,
+        ))
+    }
+
+    fn preview_paginated_events(&self) -> Result<EventBuilder> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        let Some(records) = crate::support::complete_small_json_records(&self.path)? else {
+            return paginated_preview::read(self, SAMPLE_RECORDS);
         };
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut builder = self.event_builder();
@@ -1166,9 +2559,58 @@ impl CodexSession {
                 }
             };
             if index == 0 {
-                has_history_base = declares_history_base(&record);
+                has_history_base = records_history_base(&record);
             }
             history.push(&mut builder, &mut record, terminated)?;
+        }
+        if has_history_base {
+            self.report_unread_history_base(&mut builder);
+        }
+        history.finish(&mut builder);
+        Ok(builder)
+    }
+
+    fn preview_events(
+        &self,
+        directory: Option<PathBuf>,
+    ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        let preview = json_lines_preview_with_omissions(
+            &self.path,
+            SAMPLE_RECORDS,
+            MAX_PREVIEW_TAIL_SIZE,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            rollout_file::workspace_record_candidate,
+        )?;
+        if preview.omissions.workspace_gaps() > 0 {
+            return self.reconstructed_preview(rollout_file::LIMITS);
+        }
+        let mut events = self.events_from_records(preview.records)?;
+        events.push_json_line_omissions(
+            preview.omissions,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            None,
+            self.updated_at,
+        );
+        if preview.sampled {
+            events.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+                self.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.preview_limit".to_owned()),
+                None,
+            );
+        }
+        Ok((events, directory, true))
+    }
+
+    fn events_from_records(&self, records: Vec<Value>) -> Result<EventBuilder> {
+        let mut builder = self.event_builder();
+        let mut history = CodexHistory::new(self.project_path.clone());
+        let has_history_base = records.first().is_some_and(records_history_base);
+        for mut record in records {
+            history.push(&mut builder, &mut record, true)?;
         }
         if has_history_base {
             self.report_unread_history_base(&mut builder);
@@ -1199,15 +2641,12 @@ impl CodexSession {
     }
 }
 
-fn declares_history_base(record: &Value) -> bool {
-    record["type"] == "session_meta" && !record["payload"]["history_base"].is_null()
-}
-
 struct TurnCheckpoint {
     id: Option<String>,
     sequence: u64,
     admission: Option<InputPosition>,
     project_path: Option<PathBuf>,
+    workspace_record: Option<usize>,
     tool_events: usize,
 }
 
@@ -1262,6 +2701,7 @@ enum CompletedKind {
     User,
     Assistant,
     AsyncAssistant,
+    Documentary,
     Plan,
     Tool,
 }
@@ -1277,16 +2717,77 @@ impl CompletedKind {
             }
             Some("AgentMessage") => Self::Assistant,
             Some("Plan") => Self::Plan,
+            Some(_) if !completed_item::model_receipt(&payload["item"]) => Self::Documentary,
             _ => Self::Tool,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompletedPosition {
+    display_identity: Option<tool_history::DisplayCallIdentity>,
+    pending_output_call: Option<u64>,
+    deferred_output: Option<[u8; 32]>,
+    receipt: Option<tool_occurrences::Receipt>,
+    ambiguous: bool,
+    model: Option<u64>,
+    kind: CompletedKind,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum CompletionScope {
+    Published,
+    LegacyOutput,
+    Historical(CompletedKind),
+}
+
+type CompletedTurn = HashMap<(CompletionScope, String), CompletedPosition>;
+
+struct WorkspaceHistory {
+    path: Option<PathBuf>,
+    record: Option<usize>,
+    retain_path: bool,
+    gaps: usize,
+    records_before_gap: usize,
+    checkpoints_pruned: bool,
+    incomplete: bool,
+}
+
+impl WorkspaceHistory {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            record: Some(1),
+            retain_path: true,
+            gaps: 0,
+            records_before_gap: 0,
+            checkpoints_pruned: false,
+            incomplete: false,
+        }
+    }
+
+    fn unknown(&self) -> bool {
+        self.gaps > 0 && self.record.is_none()
+    }
+
+    fn observe_gaps(&mut self, skipped: usize, records_seen: usize) {
+        if skipped != self.gaps {
+            self.gaps = skipped;
+            // Only a cwd recorded after this gap can establish the workspace again.
+            self.records_before_gap = records_seen;
+            self.record = None;
+            self.path = None;
+        }
+    }
+}
+
 struct CodexHistory {
-    project_path: Option<PathBuf>,
-    first_workspace_turn: Option<u64>,
-    restored_turn: Option<u64>,
+    workspace: WorkspaceHistory,
     items: CodexItems,
+    settings: workspace_check::WorkspaceSettings,
+    records_seen: usize,
+    last_rollback_boundary: Option<u64>,
     // Logical order can differ from file order when a checkpoint supplies missing requests.
     turns: Vec<u64>,
     next_turn: u64,
@@ -1311,7 +2812,7 @@ struct CodexHistory {
     legacy_private: LegacyPrivateInputs,
     rollout_lines: RolloutLines,
     // Codex updates a completed item in place using its turn and item IDs.
-    completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
+    completed: HashMap<String, CompletedTurn>,
     // Native turn names and delayed events refer to logical turns, including their replacement copies.
     named_turns: HashMap<String, u64>,
     plan_turns: HashSet<String>,
@@ -1319,10 +2820,13 @@ struct CodexHistory {
     message_ids: MessageIds,
     aliases: TurnAliases,
     calls: NativeCalls,
+    occurrences: tool_occurrences::ToolOccurrences,
     display_revisions: DisplayRevisions,
     late_owners: HashMap<u64, u64>,
     late_tool_counts: HashMap<u64, usize>,
     display_positions: HashMap<u64, (u64, u64)>,
+    ambiguous_receipts: usize,
+    deferred_receipts: deferred_receipts::DeferredReceipts,
     omitted_tool_events: usize,
     omitted_events: usize,
 }
@@ -1331,10 +2835,11 @@ impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
             paginated_workspace: paginated_workspace::PaginatedWorkspace::new(project_path.clone()),
-            project_path,
-            first_workspace_turn: None,
-            restored_turn: None,
+            workspace: WorkspaceHistory::new(project_path),
             items: CodexItems::default(),
+            settings: workspace_check::WorkspaceSettings::from_header(None),
+            records_seen: 0,
+            last_rollback_boundary: None,
             turns: Vec::new(),
             next_turn: 0,
             checkpoints: Vec::new(),
@@ -1362,13 +2867,30 @@ impl CodexHistory {
             message_ids: MessageIds::default(),
             aliases: TurnAliases::default(),
             calls: NativeCalls::default(),
+            occurrences: tool_occurrences::ToolOccurrences::default(),
             display_revisions: DisplayRevisions::default(),
             late_owners: HashMap::new(),
             late_tool_counts: HashMap::new(),
             display_positions: HashMap::new(),
+            ambiguous_receipts: 0,
+            deferred_receipts: deferred_receipts::DeferredReceipts::default(),
             omitted_tool_events: 0,
             omitted_events: 0,
         }
+    }
+
+    /// During preview, a checkpoint holds the position of the cwd record. The second pass reads the surviving path.
+    fn preview() -> Self {
+        let mut history = Self::new(None);
+        history.workspace.retain_path = false;
+        history
+    }
+
+    fn observe_malformed(&mut self, prior: &mut usize, skipped: JsonLineSkips) {
+        for _ in *prior..skipped.malformed {
+            self.rollout_lines.malformed();
+        }
+        *prior = skipped.malformed;
     }
 
     /// Applies the retained tool event, event, and turn checkpoint caps.
@@ -1387,6 +2909,10 @@ impl CodexHistory {
             self.withdrawn.retain(|seq, _| *seq >= first);
         }
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
+        if excess > 0 || self.omitted_events > 0 || self.omitted_tool_events > 0 {
+            builder.discard_rollback_opener();
+        }
+        self.workspace.checkpoints_pruned |= excess > 0;
         if excess > 0 {
             let evicted: HashSet<_> = self.turns.drain(..excess).collect();
             self.requests.retain(|(_, id)| !evicted.contains(id));
@@ -1426,19 +2952,11 @@ impl CodexHistory {
         id
     }
 
-    fn clear_workspace_before_gap(&mut self, sequence: u64) {
-        self.project_path = None;
-        self.first_workspace_turn = Some(self.next_turn);
-        self.restored_turn = None;
-        if let Some(turn) = &mut self.pending_turn {
-            turn.project_path = None;
+    fn observe_workspace_gaps(&mut self, skipped: usize, sequence: u64) {
+        if skipped != self.workspace.gaps {
+            self.workspace.observe_gaps(skipped, self.records_seen);
+            self.paginated_workspace.new_segment(sequence);
         }
-        self.paginated_workspace.new_segment(sequence);
-    }
-
-    fn restored_workspace(&self) -> bool {
-        self.restored_turn
-            .is_some_and(|id| self.first_workspace_turn.is_none_or(|first| id >= first))
     }
 
     fn verify_legacy_rollback(&mut self, first_removed: u64, count: u64) {
@@ -1457,16 +2975,17 @@ impl CodexHistory {
     }
 
     fn rollback(&mut self, builder: &mut EventBuilder, count: u64) {
-        if count > 0 {
-            self.restored_turn = None;
+        if self.workspace.checkpoints_pruned && count > self.turns.len() as u64 {
+            self.workspace.incomplete = true;
         }
         let keep = self
             .turns
             .len()
             .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
         let Some(&first_removed) = self.turns.get(keep) else {
-            if count > 0 && self.first_workspace_turn.is_some() {
-                self.project_path = None;
+            if self.workspace.gaps > 0 {
+                self.workspace.record = None;
+                self.workspace.path = None;
             }
             return;
         };
@@ -1478,14 +2997,11 @@ impl CodexHistory {
         while let Some((id, mut point)) = points.next() {
             if discarded.contains(&id) {
                 if ranges.is_empty() {
-                    self.restored_turn =
-                        (first_removed == id && point.admission.is_some()).then_some(id);
-                    self.project_path =
-                        if self.first_workspace_turn.is_none() || self.restored_workspace() {
-                            point.project_path
-                        } else {
-                            None
-                        };
+                    self.workspace.record = point
+                        .workspace_record
+                        .filter(|position| *position > self.workspace.records_before_gap);
+                    self.workspace.path = self.workspace.record.and(point.project_path);
+                    self.last_rollback_boundary = Some(point.sequence);
                 }
                 let (end, tools) = points.peek().map_or(
                     (builder.checkpoint(), self.items.tool_events),
@@ -1502,13 +3018,17 @@ impl CodexHistory {
             let index = ranges.partition_point(|r| r.end <= sequence);
             ranges.get(index).is_none_or(|r| sequence < r.start)
         };
-        builder.retain_events(|event| {
-            self.late_owners.get(&event.sequence).map_or_else(
-                || survives(event.sequence),
-                |owner| !discarded.contains(owner),
-            )
+        builder.rollback_events(|sequence| {
+            self.late_owners
+                .get(&sequence)
+                .map_or_else(|| survives(sequence), |owner| !discarded.contains(owner))
         });
         self.named_turns.retain(|_, id| !discarded.contains(id));
+        for (owner, point) in self.checkpoints.iter().rev() {
+            if let Some(name) = &point.id {
+                self.named_turns.entry(name.clone()).or_insert(*owner);
+            }
+        }
         self.original_requests
             .retain(|id, _| !discarded.contains(id));
         self.plan_receipts
@@ -1539,6 +3059,7 @@ impl CodexHistory {
         }
         self.display_revisions
             .rollback(builder, |sequence| !survives(sequence));
+        self.deferred_receipts.retain(|_, owner| survives(owner));
         self.prune_completed(builder);
         self.requests.retain(|(sequence, _)| survives(*sequence));
     }
@@ -1548,8 +3069,9 @@ impl CodexHistory {
             id: self.active_turn_id.clone(),
             sequence: builder.checkpoint(),
             admission: None,
-            project_path: self.project_path.clone(),
+            project_path: self.workspace.path.clone(),
             tool_events: self.items.tool_events,
+            workspace_record: self.workspace.record,
         }
     }
 
@@ -1570,14 +3092,21 @@ impl CodexHistory {
     }
 
     fn prune_completed(&mut self, builder: &mut EventBuilder) {
+        self.deferred_receipts
+            .retain(|seq, _| builder.event_at_mut(seq).is_some());
         self.items
             .outcomes
             .retain(|seq| builder.event_at_mut(seq).is_some());
+        self.items
+            .unclaimed_tools
+            .retain(|seq| builder.event_at_mut(*seq).is_some());
         self.calls.retain(|seq| builder.event_at_mut(seq).is_some());
+        self.occurrences
+            .retain(|seq| builder.event_at_mut(seq).is_some());
         self.message_ids
             .retain(|seq| builder.event_at_mut(seq).is_some());
         self.completed.retain(|_, items| {
-            items.retain(|_, sequence| builder.event_at_mut(*sequence).is_some());
+            items.retain(|_, position| builder.event_at_mut(position.sequence).is_some());
             !items.is_empty()
         });
         self.late_owners
@@ -1682,15 +3211,19 @@ impl CodexHistory {
         builder: &mut EventBuilder,
         record: &mut Value,
         terminated: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
+        self.records_seen += 1;
+        self.last_rollback_boundary = None;
         if self.source_ordinal == 0 {
             self.rollout_lines.start_segment(record);
             self.paginated = self.rollout_lines.paginated();
+            self.items.tool_projection.paginated = self.paginated;
         }
         let disposition = self
             .rollout_lines
             .prepare(record, terminated, Some(self.paginated));
-        self.push_admitted(builder, record, disposition)
+        self.push_admitted(builder, record, disposition)?;
+        Ok(self.last_rollback_boundary)
     }
 
     fn push_admitted(
@@ -1702,6 +3235,10 @@ impl CodexHistory {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
         match disposition {
+            Admission::Complete if record["type"] == "realtime_item" => {
+                self.rollout_lines.project_realtime(record, index, builder);
+                Ok(())
+            }
             Admission::Complete => self.push_verified(builder, record, index),
             Admission::ModelOnly => {
                 if record["type"] == "turn_context" {
@@ -1710,7 +3247,9 @@ impl CodexHistory {
                 let event_type = (record["type"] == "event_msg")
                     .then(|| record["payload"]["type"].as_str())
                     .flatten();
-                self.consume_model_record(record, event_type, builder)?;
+                if !self.consume_model_record(record, event_type, builder)? {
+                    self.push_model_tool(builder, record);
+                }
                 Ok(())
             }
             Admission::Skip => Ok(()),
@@ -1728,19 +3267,18 @@ impl CodexHistory {
         let event_type = (record_type == Some("event_msg"))
             .then(|| payload["type"].as_str())
             .flatten();
-        if record_type == Some("session_meta") {
-            self.observe_history_mode(payload, index, builder);
+        if self.paginated && index > 0 && record_type == Some("session_meta") {
+            self.start_copied_segment(builder);
         }
         if self.consume_model_record(record, event_type, builder)? {
             return Ok(());
         }
         let turn_id = payload["turn_id"].as_str();
         if event_type == Some("thread_rolled_back") {
-            let count = payload["num_turns"]
-                .as_u64()
+            let count = rollout_lines::rollback_turns(payload)
                 .context("Codex rollback marker has no valid num_turns")?;
             if count > 0 {
-                self.rollback(builder, count);
+                self.rollback(builder, u64::from(count));
                 self.end_display_turn();
                 self.plan_turns
                     .retain(|id| self.named_turns.contains_key(id));
@@ -1788,9 +3326,9 @@ impl CodexHistory {
             self.push_identified_item(
                 builder,
                 payload,
-                turn,
-                id,
+                (turn, id),
                 parse_timestamp(record.get("timestamp")),
+                None,
             );
         } else if !self.push_model_tool(builder, record) {
             self.push_message_or_metadata(builder, record, event_type);
@@ -1812,11 +3350,12 @@ impl CodexHistory {
             self.observe_context_turn(turn, builder.checkpoint());
         }
         if self.pending_turn.is_none()
-            && self
-                .items
-                .message
-                .as_ref()
-                .is_none_or(|message| message.kind != EventKind::MessageUser)
+            && (self.workspace.unknown()
+                || self
+                    .items
+                    .message
+                    .as_ref()
+                    .is_none_or(|message| message.kind != EventKind::MessageUser))
         {
             self.pending_turn = Some(self.checkpoint(builder));
         }
@@ -1829,30 +3368,30 @@ impl CodexHistory {
                 self.paginated_workspace
                     .observe(turn_id.or(self.active_turn_id.as_deref()), Path::new(&cwd));
             }
-            self.project_path = Some(PathBuf::from(cwd));
+            self.workspace.record = Some(self.records_seen);
+            if self.workspace.retain_path {
+                self.workspace.path = Some(PathBuf::from(cwd));
+            }
         }
     }
 
-    fn observe_history_mode(&mut self, payload: &Value, index: u64, builder: &mut EventBuilder) {
-        if self.paginated && index > 0 {
-            if let Some((ordinal, end)) = self.compactions.latest() {
-                self.paginated_answers
-                    .resolve_turns(self.paginated_inputs.resolved_turns());
-                self.paginated_answers.resolve_positions(builder, ordinal);
-                self.paginated_answers.finish_answers();
-                self.paginated_answers.project_revisions(
-                    builder,
-                    self.compactions.public_history(),
-                    &self.paginated_inputs,
-                    ordinal,
-                    end,
-                );
-            }
-            self.paginated_inputs.segment();
-            self.paginated_workspace.new_segment(builder.checkpoint());
-            self.paginated_answers.segment();
+    fn start_copied_segment(&mut self, builder: &mut EventBuilder) {
+        if let Some((ordinal, end)) = self.compactions.latest() {
+            self.paginated_answers
+                .resolve_turns(self.paginated_inputs.resolved_turns());
+            self.paginated_answers.resolve_positions(builder, ordinal);
+            self.paginated_answers.finish_answers();
+            self.paginated_answers.project_revisions(
+                builder,
+                self.compactions.public_history(),
+                &self.paginated_inputs,
+                ordinal,
+                end,
+            );
         }
-        self.paginated |= payload["history_mode"] == "paginated";
+        self.paginated_inputs.segment();
+        self.paginated_workspace.new_segment(builder.checkpoint());
+        self.paginated_answers.segment();
     }
 
     fn consume_model_record(
@@ -1916,8 +3455,7 @@ impl CodexHistory {
             return Ok(true);
         }
         if event_type == Some("thread_rolled_back") {
-            let count = payload["num_turns"]
-                .as_u64()
+            let count = rollout_lines::rollback_turns(payload)
                 .context("Codex rollback marker has no valid num_turns")?;
             self.withdraw_displayed_inputs(builder, usize::try_from(count).unwrap_or(usize::MAX));
             return Ok(true);
@@ -1943,7 +3481,7 @@ impl CodexHistory {
             floor,
         );
         if effective.changed {
-            self.project_path = self.paginated_workspace.surviving(
+            self.workspace.path = self.paginated_workspace.surviving(
                 &self.aliases,
                 &aliases,
                 self.checkpoints.iter().filter_map(|(id, turn)| {
@@ -2041,6 +3579,25 @@ impl CodexHistory {
             });
         self.plan_receipts.report(builder, missing);
         self.display_revisions.finish(builder);
+        self.finish_deferred_receipts(builder);
+        if !self.paginated {
+            self.finish_legacy_outputs(builder);
+        }
+        self.report_unverified_history(builder);
+        if self.paginated {
+            self.annotate_model_window(builder, &answers);
+        } else {
+            builder.retain_events(|event| {
+                event.source.raw_record_type.as_deref()
+                    != Some("omnisession.codex_tool_display_mirror")
+            });
+        }
+        self.restore_legacy_users(builder);
+        builder.visit_events_mut(|event| completed_item::clear_source_receipt(&mut event.payload));
+        builder.order_delayed_messages(&self.display_positions);
+    }
+
+    fn report_unverified_history(&self, builder: &mut EventBuilder) {
         if self.uncertain_legacy_rollback {
             builder.push(
                 EventKind::ProviderEvent,
@@ -2052,6 +3609,11 @@ impl CodexHistory {
             );
         }
         for (count, record, reason) in [
+            (
+                self.ambiguous_receipts,
+                "omnisession.codex_ambiguous_receipt",
+                "The published command does not distinguish repeated model calls. Their outcomes remain separate.",
+            ),
             (
                 self.rollout_lines.invalid_checkpoints,
                 "omnisession.codex_invalid_checkpoint",
@@ -2080,6 +3642,8 @@ impl CodexHistory {
                 "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
             } else if gap == OrdinalGap::Possible {
                 "A documentary Codex record follows a gap in the recorded positions. OmniSession could not verify whether any published history is missing."
+            } else if !self.paginated {
+                "The Codex rollout contains unreadable records. The handoff uses the last verified history."
             } else {
                 "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
             };
@@ -2099,11 +3663,6 @@ impl CodexHistory {
                 None,
             );
         }
-        if self.paginated {
-            self.annotate_model_window(builder, &answers);
-        }
-        self.restore_legacy_users(builder);
-        builder.order_delayed_messages(&self.display_positions);
     }
 
     fn annotate_model_window(
@@ -2112,6 +3671,9 @@ impl CodexHistory {
         answers: &HashMap<u64, Option<Withdrawal>>,
     ) {
         builder.visit_events_mut(|event| {
+            if event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT) {
+                return;
+            }
             if !matches!(
                 event.kind,
                 EventKind::MessageUser
@@ -2644,6 +4206,24 @@ impl CodexHistory {
         new_turn && owner.is_none()
     }
 
+    fn owns_implicit_call(&self, named: &str, id: &str) -> bool {
+        // A generated turn can remain open after the next raw input has arrived.
+        // Use it only while its confirmed request is the most recent checkpoint.
+        let Some(owner) = self.named_turns.get(named) else {
+            return false;
+        };
+        let completed = self.completed.get(named).is_some_and(|items| {
+            items
+                .get(&(CompletionScope::Published, id.to_owned()))
+                .is_some_and(|p| p.kind == CompletedKind::Tool)
+                || items.contains_key(&(
+                    CompletionScope::Historical(CompletedKind::Tool),
+                    id.to_owned(),
+                ))
+        });
+        self.turns.last() == Some(owner) && !completed
+    }
+
     fn push_model_tool(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
         if record["type"] != "response_item" {
             return false;
@@ -2658,18 +4238,16 @@ impl CodexHistory {
         let active = current
             .filter(|turn| !is_implicit_turn(turn))
             .map(|turn| self.aliases.resolve(turn));
-        if let Some(id) = model_call_id(payload) {
-            // A generated turn can remain open after the next raw input has arrived.
-            // Use it only while its confirmed request is the most recent checkpoint.
-            let turn = stamped.or(active).or_else(|| {
-                let named = self.aliases.resolve(current?);
-                let owner = self.named_turns.get(named)?;
-                let completed = self
-                    .completed
-                    .get(named)
-                    .is_some_and(|items| items.contains_key(&(CompletedKind::Tool, id.to_owned())));
-                (self.turns.last()? == owner && !completed).then_some(named)
+        let scoped = stamped
+            .or(active)
+            .is_some_and(|turn| !is_implicit_turn(turn));
+        if let Some(id) = scoped_model_call_id(payload, scoped) {
+            let known = stamped.or(active);
+            let implicit = current.filter(|_| known.is_none()).and_then(|current| {
+                let named = self.aliases.resolve(current);
+                self.owns_implicit_call(named, id).then(|| named.to_owned())
             });
+            let turn = known.or(implicit.as_deref());
             let sequence = builder.checkpoint();
             let owner = turn.and_then(|turn| self.named_turns.get(turn).copied());
             if let Some(owner) = turn.and_then(|turn| self.noncurrent_owner(turn)) {
@@ -2681,21 +4259,28 @@ impl CodexHistory {
                 push_response_item(builder, payload, stamp, &mut self.items);
             }
             self.calls
-                .push(id, turn.map(str::to_owned), sequence, owner);
+                .push(id, turn.map(str::to_owned), sequence, owner, payload);
             let key = self.paginated_tool_id(payload, turn, id);
             self.observe_model_tool(Some(sequence), record, None, key);
             return true;
         }
-        let Some(id) = model_result_id(payload) else {
+        let Some(id) = scoped_model_result_id(payload, scoped) else {
             return false;
         };
         let call = self.calls.take(id, stamped, active);
+        if id.is_empty() && call.is_none() {
+            return false;
+        }
         let turn = stamped
             .or_else(|| call.as_ref()?.turn.as_deref())
             .or(active)
             .map(str::to_owned);
+        let rejected = call.as_ref().is_some_and(|call| {
+            self.reject_pending_display(builder, turn.as_deref(), id, call, &payload["output"])
+        });
         let sequence = if let Some(turn) = &turn {
-            self.push_identified_item(builder, payload, turn, id, stamp)
+            let owner = call.as_ref().and_then(|call| call.owner);
+            self.push_identified_item(builder, payload, (turn, id), stamp, owner)
         } else {
             self.items.projected = None;
             self.items.tool_owner = self.turns.last().copied().filter(|&id| {
@@ -2707,8 +4292,11 @@ impl CodexHistory {
                         .zip(call.as_ref())
                         .is_some_and(|(&request, call)| call.sequence >= request)
             });
+            self.items.tool_projection.wait_for_call = rejected;
             push_response_item(builder, payload, stamp, &mut self.items);
+            self.items.tool_projection.wait_for_call = false;
             self.items.tool_owner = None;
+            self.finish_unscoped_result(id);
             self.items.projected
         };
         let key = self.paginated_tool_id(payload, turn.as_deref(), id);
@@ -2721,6 +4309,7 @@ impl CodexHistory {
         if let Some(sequence) = sequence
             && let Some(call) = call
         {
+            self.calls.result_calls.insert(sequence, call.sequence);
             if let Some(owner) = call.owner.or_else(|| {
                 turn.as_ref()
                     .and_then(|turn| self.named_turns.get(turn).copied())
@@ -2769,22 +4358,18 @@ impl CodexHistory {
         &mut self,
         builder: &mut EventBuilder,
         payload: &Value,
-        turn: &str,
-        id: &str,
+        (turn, id): (&str, &str),
         timestamp: Option<DateTime<Utc>>,
+        call_owner: Option<u64>,
     ) -> Option<u64> {
         let display = payload["type"] == "item_completed";
         if display {
             push_codex_session_metadata(builder, payload, timestamp, true);
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
-        // An asynchronous assistant message and its tool receipt share the call ID.
-        let key = (CompletedKind::for_item(payload), id.to_owned());
-        let original = self
-            .completed
-            .get(&native_turn)
-            .and_then(|items| items.get(&key))
-            .copied();
+        let kind = CompletedKind::for_item(payload);
+        let projection = self.completion_position(builder, &native_turn, id, kind, payload);
+        let original = projection.original;
         let owner = self.noncurrent_owner(&native_turn);
         let input = self.legacy_revision_input(owner).filter(|_| display);
         let message_input = input.and_then(TurnCheckpoint::admitted_sequence);
@@ -2793,7 +4378,7 @@ impl CodexHistory {
             .filter(|_| owner.is_none())
             .and_then(|input| self.display_revisions.before(builder, original, input));
         // A late result cannot act as a message or tool mirror in the current turn.
-        let mut late = CodexItems::default();
+        let mut late = self.items.for_late_turn();
         let checkpoint = self.checkpoint(builder);
         // A synthesized display turn can still mirror earlier model items, even if the
         // last logical request in the file is newer. Its native turn owns the result.
@@ -2804,29 +4389,20 @@ impl CodexHistory {
         } else {
             &mut late
         };
-        let item = &payload["item"];
-        let item_type = item["type"].as_str();
-        let user = item_type == Some("UserMessage");
-        items.identity = MessageIdentity::completed(turn, id, user);
-        let scoped = MessageIdentity::completed(&native_turn, id, user);
-        items.tool_turn = Some(native_turn.clone());
-        items.tool_owner = self.named_turns.get(&native_turn).copied();
-        items.cited_display = matches!(item["memory_citation"], Value::Object(_) | Value::Array(_));
-        let message_id = match item_type {
-            Some("AgentMessage") => scoped.scoped(true),
-            Some("UserMessage") => scoped.scoped(false),
-            _ => None,
-        };
+        let message_id =
+            items.prepare_identified(payload, turn, id, &native_turn, projection, self.paginated);
+        items.tool_owner = call_owner.or_else(|| self.named_turns.get(&native_turn).copied());
         items.update =
             original.or_else(|| message_id.and_then(|key| self.message_ids.get(&key).copied()));
         items.projected = None;
         let new_turn = items.project_identified(builder, payload, turn, id, timestamp);
         let previous_message = items.previous_message.take();
-        let projected = items.finish_identified_item();
+        let peer = items.tool_projection.peer.take();
+        let projected = items.finish_identified();
         let was_displayed = self.observe_reply_revision(builder, previous_message, message_input);
         if let Some(owner) = owner {
             self.count_late_outcome(
-                owner,
+                call_owner.unwrap_or(owner),
                 projected,
                 current_mirrors,
                 checkpoint.tool_events,
@@ -2834,34 +4410,48 @@ impl CodexHistory {
             );
         }
         let sequence = projected?;
+        self.detach_tool_display(builder, projection, peer);
+        if display {
+            let key = (native_turn.as_str(), id);
+            self.record_deferred_receipt(key, sequence, owner, revision_input, projection);
+        }
         if let Some(input) = revision_input {
             self.display_revisions
                 .observe(builder, sequence, input, previous_display);
         }
         if display {
-            self.observe_display_sequence(builder, sequence, turn, id, item);
+            self.observe_display_sequence(
+                builder,
+                peer.unwrap_or(sequence),
+                turn,
+                id,
+                &payload["item"],
+            );
         }
         if let Some(key) = message_id {
             self.message_ids.insert(key, sequence);
         }
+        let item_type = payload["item"]["type"].as_str();
         if display && !matches!(item_type, Some("AgentMessage" | "UserMessage" | "Plan")) {
-            self.claim_display_outcome(&native_turn, sequence, checkpoint.sequence);
+            self.claim_display_outcome(&native_turn, peer.unwrap_or(sequence), checkpoint.sequence);
         }
-        let item_owner = (!matches!(item_type, Some("UserMessage" | "AgentMessage")))
-            .then(|| self.named_turns.get(&native_turn).copied())
-            .flatten();
-        if let Some(owner) = owner.or(item_owner).filter(|_| original.is_none()) {
-            if message_id.is_some() || item_type == Some("Plan") {
-                self.late_owners.entry(sequence).or_insert(owner);
-            } else {
-                self.claim_tool(owner, sequence);
+        let new_slot = original.is_none() || sequence >= checkpoint.sequence;
+        let owner = call_owner.or(owner.filter(|_| new_slot));
+        if !self.claim_item_owner(
+            &native_turn,
+            sequence,
+            item_type,
+            owner,
+            new_slot,
+            message_id.is_some(),
+        ) {
+            if new_turn {
+                let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+                checkpoint.id = Some(turn.to_owned());
+                self.remember_turn(checkpoint, Some(sequence));
+            } else if item_type == Some("UserMessage") && original.is_none() {
+                self.name_request_turn(turn, sequence);
             }
-        } else if new_turn {
-            let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
-            checkpoint.id = Some(turn.to_owned());
-            self.remember_turn(checkpoint, Some(sequence));
-        } else if item_type == Some("UserMessage") && original.is_none() {
-            self.name_request_turn(turn, sequence);
         }
         if display
             && original.is_none()
@@ -2871,11 +4461,51 @@ impl CodexHistory {
         {
             self.place_early_answer(builder, owner, sequence);
         }
-        self.completed
-            .entry(self.aliases.resolve(turn).to_owned())
-            .or_default()
-            .insert(key, sequence);
+        self.remember_completion(builder, (turn, id), kind, projection, sequence, peer);
         Some(sequence)
+    }
+
+    fn record_deferred_receipt(
+        &mut self,
+        key: (&str, &str),
+        sequence: u64,
+        owner: Option<u64>,
+        revision_input: Option<u64>,
+        projection: completion_positions::Projection,
+    ) {
+        self.deferred_receipts.observe(
+            key,
+            sequence,
+            revision_input
+                .or_else(|| owner.and_then(|id| self.original_requests.get(&id).copied()))
+                .unwrap_or(sequence),
+            projection.reconsider,
+            projection.ambiguous && projection.reconsider.is_some(),
+            projection.display_identity,
+        );
+    }
+
+    fn claim_item_owner(
+        &mut self,
+        native_turn: &str,
+        sequence: u64,
+        item_type: Option<&str>,
+        owner: Option<u64>,
+        new_slot: bool,
+        scoped_message: bool,
+    ) -> bool {
+        let item_owner = (new_slot && !matches!(item_type, Some("UserMessage" | "AgentMessage")))
+            .then(|| self.named_turns.get(native_turn).copied())
+            .flatten();
+        let Some(owner) = owner.or(item_owner) else {
+            return false;
+        };
+        if scoped_message || matches!(item_type, Some("Plan" | "ExitedReviewMode")) {
+            self.late_owners.entry(sequence).or_insert(owner);
+        } else {
+            self.claim_tool(owner, sequence);
+        }
+        true
     }
 
     fn count_late_outcome(
@@ -2896,6 +4526,7 @@ impl CodexHistory {
         if added > 0
             && let Some(seq) = projected
         {
+            self.items.unclaimed_tools.remove(&seq);
             self.late_owners.entry(seq).or_insert(owner);
             *self.late_tool_counts.entry(owner).or_default() += added;
         }
@@ -2941,7 +4572,10 @@ impl CodexHistory {
         if !self.paginated {
             return;
         }
-        if matches!(item["type"].as_str(), Some("Plan" | "AgentMessage")) {
+        if matches!(
+            item["type"].as_str(),
+            Some("Plan" | "AgentMessage" | "ExitedReviewMode")
+        ) {
             if let Some(text) = builder
                 .event_at_mut(sequence)
                 .and_then(|event| event.payload["text"].as_str())
@@ -3022,6 +4656,7 @@ impl CodexHistory {
             && self.aliases.bind(turn, original)
         {
             self.message_ids.bind(turn, original);
+            self.occurrences.bind(turn, original);
             if let Some(known) = self.completed.remove(turn) {
                 self.completed
                     .entry(original.clone())
@@ -3056,7 +4691,12 @@ impl CodexHistory {
     }
 
     fn claim_tool(&mut self, owner: u64, sequence: u64) {
-        if self.late_owners.contains_key(&sequence) {
+        let std::collections::hash_map::Entry::Vacant(entry) = self.late_owners.entry(sequence)
+        else {
+            return;
+        };
+        entry.insert(owner);
+        if !self.items.unclaimed_tools.remove(&sequence) {
             return;
         }
         let later = self
@@ -3064,7 +4704,6 @@ impl CodexHistory {
             .partition_point(|(_, point)| point.sequence <= sequence);
         // A display item can identify the native owner of an earlier model call and result.
         // Count the record with that owner, including after the visible tool window evicts it.
-        self.late_owners.insert(sequence, owner);
         *self.late_tool_counts.entry(owner).or_default() += 1;
         self.items.tool_events -= 1;
         for (_, point) in &mut self.checkpoints[later..] {
@@ -3559,25 +5198,40 @@ fn replacement_summary<'a>(item: &'a Value, summary: Option<&str>) -> Option<&'a
         .then_some(text)
 }
 
+fn encoded_rollback(record: &Value) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "event_msg"
+        && payload
+            .get("type")
+            .or_else(|| payload.get(0))
+            .is_some_and(|tag| {
+                tag == "thread_rolled_back"
+                    || tag.as_u64() == Some(u64::from(rollout_lines::ROLLBACK_TAG))
+            })
+}
+
 fn workspace_record_filter() -> impl Fn(&[u8]) -> bool {
     let cwd = memchr::memmem::Finder::new(b"turn_context");
     let settings = memchr::memmem::Finder::new(b"thread_settings_applied");
-    let rollback = memchr::memmem::Finder::new(b"thread_rolled_back");
-    let escape = memchr::memmem::Finder::new(b"\\u00");
+    let rollback = workspace_marker_filter(b"thread_rolled_back");
     move |line| {
         cwd.find(line).is_some()
             || settings.find(line).is_some()
-            || rollback.find(line).is_some()
-            || escape
-                .find_iter(line)
-                .any(|index| escapes_ascii_letter(line.get(index + 4..index + 6)))
+            || rollback(line)
             || workspace_damage::damaged_workspace_record(line).is_some()
     }
 }
 
-#[cfg(test)]
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
-    contains_workspace_marker(path, b"thread_rolled_back", 1024 * 1024)
+    if !contains_workspace_marker(path, b"thread_rolled_back", 1024 * 1024)? {
+        return Ok(false);
+    }
+    let mut rollback = false;
+    rollout_file::visit(path, |record, _, _| {
+        rollback |= encoded_rollback(&record);
+        Ok(())
+    })?;
+    Ok(rollback)
 }
 
 fn contains_settings_marker(path: &Path) -> Result<bool> {
@@ -3585,7 +5239,8 @@ fn contains_settings_marker(path: &Path) -> Result<bool> {
 }
 
 fn contains_workspace_marker(path: &Path, name: &[u8], chunk: usize) -> Result<bool> {
-    reader_contains_workspace_marker(fs::File::open(path)?, name, chunk)
+    let reader = rollout_file::open(path)?.take(MAX_STREAMED_TRANSCRIPT_FILE_SIZE);
+    reader_contains_workspace_marker(reader, name, chunk)
 }
 
 fn oversized_settings_marker(
@@ -3611,6 +5266,7 @@ fn reader_contains_workspace_marker(
     name: &[u8],
     chunk: usize,
 ) -> Result<bool> {
+    let matches = workspace_marker_filter(name);
     // Overlap the reads so a marker split across them is still visible.
     let mut buffer = vec![0_u8; chunk.max(name.len())];
     let mut overlap = 0;
@@ -3621,7 +5277,7 @@ fn reader_contains_workspace_marker(
         }
         let length = overlap + read;
         let window = &buffer[..length];
-        if window_contains_marker(window, name)? {
+        if matches(window) {
             return Ok(true);
         }
         overlap = (name.len() - 1).min(length);
@@ -3629,27 +5285,26 @@ fn reader_contains_workspace_marker(
     }
 }
 
-fn window_contains_marker(bytes: &[u8], name: &[u8]) -> Result<bool> {
-    // Both names start with "th". Skip to the less common second byte using the standard
-    // library's optimized byte search, then compare the complete name.
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        rest.skip_until(name[1])?;
-        let consumed = bytes.len() - rest.len();
-        if consumed >= 2 && bytes[consumed - 2..].starts_with(name) {
-            return Ok(true);
-        }
+fn workspace_marker_filter(name: &[u8]) -> impl Fn(&[u8]) -> bool + '_ {
+    let marker = memchr::memmem::Finder::new(name);
+    let tag = rollout_lines::ROLLBACK_TAG.to_string();
+    let numeric = (name == b"thread_rolled_back")
+        .then(|| memchr::memmem::Finder::new(tag.as_bytes()).into_owned());
+    let escape = memchr::memmem::Finder::new(b"\\u00");
+    move |bytes| {
+        marker.find(bytes).is_some()
+            // A possible numeric tag selects the reader that checks its enclosing event.
+            || numeric.as_ref().is_some_and(|numeric| numeric.find_iter(bytes).any(|start| {
+                start.checked_sub(1).and_then(|i| bytes.get(i)).is_some_and(|b|
+                    matches!(b, b':' | b'[') || b.is_ascii_whitespace()
+                ) && bytes.get(start + tag.len()).is_some_and(|b|
+                    matches!(b, b',' | b'}') || b.is_ascii_whitespace()
+                )
+            }))
+            || escape
+                .find_iter(bytes)
+                .any(|index| escapes_ascii_letter(bytes.get(index + 4..index + 6)))
     }
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        rest.skip_until(b'\\')?;
-        if let Some(hex) = rest.strip_prefix(b"u00")
-            && escapes_ascii_letter(hex.get(..2))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
@@ -3658,9 +5313,122 @@ fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
 }
 
+/// Published displays can update or reorder earlier events. An outline cannot apply those edits.
+#[derive(Default)]
+struct DisplayReplay {
+    model_message: bool,
+    display_message: bool,
+}
+
+impl DisplayReplay {
+    fn observe(&mut self, record: &Value) -> bool {
+        let payload = &record["payload"];
+        match record["type"].as_str() {
+            Some("session_meta") => payload["history_mode"] == "paginated",
+            Some("event_msg")
+                if matches!(
+                    payload["type"].as_str(),
+                    Some("agent_message" | "user_message")
+                ) =>
+            {
+                self.display_message = true;
+                self.model_message
+                    || payload["turn_id"].is_string()
+                    || payload["item_id"].is_string()
+            }
+            Some("event_msg") => !matches!(
+                payload["type"].as_str(),
+                Some(
+                    "thread_settings_applied"
+                        | "thread_rolled_back"
+                        | "token_count"
+                        | "task_started"
+                        | "turn_started"
+                        | "task_complete"
+                        | "turn_complete"
+                )
+            ),
+            Some("response_item") => {
+                self.model_message |= payload["type"] == "message";
+                self.display_message
+                    || payload["type"] != "message"
+                    || payload["id"].is_string()
+                    || payload["internal_chat_message_metadata_passthrough"]["turn_id"].is_string()
+                    || model_cut::input_order(&record["metadata"]).is_some()
+                    || payload["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            !matches!(
+                                part["type"].as_str(),
+                                Some("input_text" | "output_text" | "text")
+                            )
+                        })
+                    })
+            }
+            Some("compacted") => true,
+            _ => false,
+        }
+    }
+}
+
+fn ordinary_rollback_record(record: &Value, first: bool) -> bool {
+    let payload = &record["payload"];
+    match record["type"].as_str() {
+        Some("session_meta") => {
+            first
+                && payload.is_object()
+                && payload["history_base"].is_null()
+                && payload["forked_from_id"].is_null()
+                && payload
+                    .get("history_mode")
+                    .is_none_or(|mode| mode == "legacy")
+        }
+        Some("event_msg" | "response_item") => !first && payload["type"].is_string(),
+        Some("turn_context") => !first && payload.is_object(),
+        Some("dynamic_tools_updated") => !first && is_dynamic_tool_catalog(record),
+        _ => false,
+    }
+}
+
+fn is_dynamic_tool_catalog(record: &Value) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "dynamic_tools_updated"
+        && payload["thread_id"]
+            .as_str()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok())
+        && payload["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|tool| tool["name"].is_string() && tool["description"].is_string())
+        })
+}
+
+fn records_history_base(record: &Value) -> bool {
+    record["type"] == "session_meta" && !record["payload"]["history_base"].is_null()
+}
+
+fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
+    builder.push(
+        EventKind::ProviderEvent,
+        json!({"omitted_events":1,"native_history_unverified":true,"reason":"The rollout references earlier history that was not read."}),
+        timestamp,
+        ReplayPolicy::HistoricalOnly,
+        Some(UNAVAILABLE_ANCESTRY.to_owned()),
+        None,
+    );
+}
+
 fn push_record(builder: &mut EventBuilder, record: &Value, items: &mut CodexItems) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
-    match record.get("type").and_then(Value::as_str) {
+    let kind = record.get("type").and_then(Value::as_str);
+    match kind {
+        Some("compacted") => builder.push(
+            EventKind::ProviderEvent,
+            json!({"native_history_unverified":true,"reason":"The active Codex compaction checkpoint was not reconstructed."}),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.codex_compacted".to_owned()),
+            None,
+        ),
         Some("session_meta" | "turn_context") => {
             if let Some(payload) = record.get("payload") {
                 push_codex_session_metadata(builder, payload, timestamp, false);
@@ -3735,7 +5503,18 @@ fn push_codex_session_metadata(
 }
 
 #[derive(Default)]
+struct ToolProjection {
+    wait_for_call: bool,
+    ambiguous: bool,
+    paginated: bool,
+    peer: Option<u64>,
+    matched_turn: Option<String>,
+}
+
+#[derive(Default)]
 struct CodexItems {
+    shell_sources: completed_item::ShellSources,
+    tool_projection: ToolProjection,
     message: Option<VisibleMessage>,
     previous_message: Option<(u64, PreviousDisplay)>,
     mirrors: MessageMirrors,
@@ -3750,6 +5529,8 @@ struct CodexItems {
     outcomes: PendingOutcomes,
     tool_turn: Option<String>,
     tool_owner: Option<u64>,
+    // Mirrors and documentary items can acquire a turn without adding a tool event.
+    unclaimed_tools: HashSet<u64>,
     tool_events: usize,
 }
 
@@ -3764,6 +5545,13 @@ fn is_implicit_turn(id: &str) -> bool {
 }
 
 impl CodexItems {
+    fn for_late_turn(&self) -> Self {
+        Self {
+            shell_sources: self.shell_sources.clone(),
+            ..Self::default()
+        }
+    }
+
     fn can_publish_empty(&self, kind: &EventKind) -> bool {
         match kind {
             EventKind::MessageAssistant => {
@@ -3774,7 +5562,9 @@ impl CodexItems {
         }
     }
 
-    fn finish_identified_item(&mut self) -> Option<u64> {
+    fn finish_identified(&mut self) -> Option<u64> {
+        self.tool_projection.wait_for_call = false;
+        self.tool_projection.ambiguous = false;
         self.tool_turn = None;
         self.tool_owner = None;
         self.update = None;
@@ -3809,27 +5599,23 @@ impl CodexItems {
         if payload["type"] != "item_completed" {
             return push_response_item(builder, payload, timestamp, self);
         }
-        if payload["item"]["type"] == "Plan"
+        if let Some(item_type @ ("Plan" | "ExitedReviewMode")) = payload["item"]["type"].as_str()
             && let Some(text) = payload["item"]["text"].as_str()
         {
-            self.push_plan(builder, turn, id, text, timestamp);
+            let content = json!({"type":item_type,"turn_id":turn,"id":id,"text":text});
+            self.push_published_text(builder, content, timestamp);
             return false;
         }
         push_completed_item(builder, &payload["item"], timestamp, self)
     }
 
-    /// Codex displays a completed plan as a separate assistant item, even when
-    /// another assistant message in the turn has the same text.
-    fn push_plan(
+    fn push_published_text(
         &mut self,
         builder: &mut EventBuilder,
-        turn: &str,
-        id: &str,
-        text: &str,
+        payload: Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
         self.message = None;
-        let payload = json!({"type": "Plan", "turn_id": turn, "id": id, "text": text});
         if let Some(seq) = self.update
             && let Some(previous) = builder.event_at_mut(seq)
         {
@@ -3856,6 +5642,26 @@ impl CodexItems {
         }
     }
 
+    fn take_tool_outcome(&mut self, id: &str, display: bool) -> Option<u64> {
+        if self.tool_projection.wait_for_call {
+            return None;
+        }
+        let position = if self.tool_projection.paginated || !display {
+            self.tool_projection.peer
+        } else {
+            self.update
+        };
+        let entry = self.outcomes.take(
+            id,
+            display,
+            position,
+            self.tool_turn.as_deref(),
+            self.tool_owner,
+        )?;
+        self.tool_projection.matched_turn = entry.turn;
+        Some(entry.sequence)
+    }
+
     fn push_historical(
         &mut self,
         builder: &mut EventBuilder,
@@ -3866,44 +5672,57 @@ impl CodexItems {
         result_id: Option<&str>,
     ) {
         self.message = None;
-        if let Some(fields) = payload.as_object_mut() {
-            for key in [
-                "omnisession_codex_rollback",
-                "omnisession_codex_checkpoint",
-                "omnisession_codex_prior_display",
-                "omnisession_codex_before_compaction",
-                "omnisession_codex_positioned_reply",
-                "omnisession_codex_checkpoint_position",
-                "omnisession_codex_replacement",
-                "omnisession_codex_paginated",
-                "omnisession_codex_summary_withdrawn",
-            ] {
-                fields.remove(key);
-            }
-        }
+        clear_projection_metadata(&mut payload);
         let display = raw_type == "event_msg.item_completed";
-        let result_id = result_id.filter(|id| !id.is_empty());
-        let matched = result_id.and_then(|id| {
-            self.outcomes.take(
-                id,
-                display,
-                self.update,
-                self.tool_turn.as_deref(),
-                self.tool_owner,
-            )
+        if display && self.tool_projection.ambiguous {
+            completion_positions::unattribute_display(&mut payload);
+        }
+        let result_id = result_id.filter(|id| {
+            !id.is_empty()
+                || self
+                    .tool_turn
+                    .as_deref()
+                    .is_some_and(|turn| !is_implicit_turn(turn))
         });
-        let original = self.update.or(matched);
+        let matched = result_id.and_then(|id| self.take_tool_outcome(id, display));
+        let physical = self.tool_projection.paginated || !display;
+        let mirror = physical
+            .then(|| self.tool_projection.peer.take().or(matched))
+            .flatten();
+        let original = if physical {
+            self.update
+        } else {
+            self.update.or(matched).filter(|&sequence| {
+                builder.event_at_mut(sequence).is_some_and(|event| {
+                    if !completion_positions::model_output(event)
+                        || completed_item::equivalent_model_receipt(
+                            &payload,
+                            &event.payload,
+                            &self.shell_sources,
+                        )
+                    {
+                        return true;
+                    }
+                    if payload["type"] == "FunctionCallOutput"
+                        && event.payload["omnisession_codex_tool_display"]["type"]
+                            == "FunctionCallOutput"
+                    {
+                        completion_positions::restore_model_output(event);
+                    }
+                    false
+                })
+            })
+        };
         if let Some(sequence) = original
             && let Some(previous) = builder.event_at_mut(sequence)
         {
-            let has_model = previous
-                .source
-                .raw_record_type
-                .as_deref()
-                .is_some_and(|raw| raw.starts_with("response_item.") && raw.ends_with("_output"));
+            let has_model = completion_positions::model_output(previous);
             let failed_display = previous.kind == EventKind::ToolFailed
                 && (!has_model || model_result_kind(&previous.payload) != EventKind::ToolFailed);
             if display && has_model {
+                if !self.tool_projection.paginated {
+                    completed_item::annotate_model_receipt(&mut previous.payload, &payload);
+                }
                 // Codex shows a command's display output but gives the model the native result.
                 previous.kind = if kind == EventKind::ToolFailed {
                     kind
@@ -3920,11 +5739,12 @@ impl CodexItems {
                 previous.source.raw_record_type = Some(raw_type);
                 previous.replay_policy = ReplayPolicy::HistoricalOnly;
             }
-            self.projected = Some(sequence);
+            self.finish_tool_projection(builder, sequence, display, mirror);
             return;
         }
         let sequence = builder.checkpoint();
-        if let Some(id) = result_id {
+        if let Some(id) = result_id.filter(|_| mirror.is_none() && !self.tool_projection.ambiguous)
+        {
             self.outcomes.push(
                 id,
                 display,
@@ -3933,8 +5753,10 @@ impl CodexItems {
                 self.tool_owner,
             );
         }
-        self.projected = Some(sequence);
-        if kind != EventKind::PlanUpdated {
+        if (self.tool_projection.paginated || mirror.is_none())
+            && !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent)
+        {
+            self.unclaimed_tools.insert(sequence);
             self.tool_events += 1;
         }
         builder.push(
@@ -3945,6 +5767,69 @@ impl CodexItems {
             Some(raw_type),
             None,
         );
+        self.finish_tool_projection(builder, sequence, display, mirror);
+    }
+
+    fn prepare_identified(
+        &mut self,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        native_turn: &str,
+        projection: completion_positions::Projection,
+        paginated: bool,
+    ) -> Option<message_mirrors::ScopedMessageId> {
+        let user = payload["item"]["type"] == "UserMessage";
+        self.identity = MessageIdentity::completed(turn, id, user);
+        let scoped = MessageIdentity::completed(native_turn, id, user);
+        self.tool_projection = projection.tool_projection(paginated);
+        self.tool_turn = Some(native_turn.to_owned());
+        self.cited_display = matches!(
+            payload["item"]["memory_citation"],
+            Value::Object(_) | Value::Array(_)
+        );
+        match payload["item"]["type"].as_str() {
+            Some("AgentMessage") => scoped.scoped(true),
+            Some("UserMessage") => scoped.scoped(false),
+            _ => None,
+        }
+    }
+    fn finish_tool_projection(
+        &mut self,
+        builder: &mut EventBuilder,
+        sequence: u64,
+        display: bool,
+        mirror: Option<u64>,
+    ) {
+        self.projected = Some(sequence);
+        self.tool_projection.peer = mirror.filter(|&other| {
+            let (slot, model) = if display {
+                (sequence, other)
+            } else {
+                (other, sequence)
+            };
+            completion_positions::pair(builder, slot, model, &self.shell_sources)
+        });
+    }
+}
+
+fn clear_projection_metadata(payload: &mut Value) {
+    if let Some(fields) = payload.as_object_mut() {
+        for key in [
+            "omnisession_codex_rollback",
+            "omnisession_codex_checkpoint",
+            "omnisession_codex_prior_display",
+            "omnisession_codex_before_compaction",
+            "omnisession_codex_positioned_reply",
+            "omnisession_codex_active_replies",
+            "omnisession_codex_checkpoint_position",
+            "omnisession_codex_replacement",
+            "omnisession_codex_paginated",
+            "omnisession_codex_summary_withdrawn",
+            "omnisession_codex_tool_display",
+        ] {
+            fields.remove(key);
+        }
     }
 }
 
@@ -3959,9 +5844,11 @@ fn push_completed_item(
         Some("AgentMessage") => EventKind::MessageAssistant,
         _ => {
             if let Some((kind, payload)) = completed_item::historical_item(item) {
-                let id = (kind != EventKind::PlanUpdated)
+                let id = completed_item::model_receipt(item)
                     .then(|| item["id"].as_str())
                     .flatten();
+                let payload = completed_item::with_source_receipt(payload, item);
+                items.shell_sources.remember(&payload, item);
                 items.push_historical(
                     builder,
                     kind,
@@ -4079,6 +5966,11 @@ fn push_message_text<'a>(
             .mirrors
             .observe(&kind, text, matching, raw_type, builder.checkpoint())
     };
+    let matched = matched.filter(|seq| {
+        builder
+            .event_at_mut(*seq)
+            .is_some_and(|event| !completion_positions::model_output(event))
+    });
     let sequence = matched.unwrap_or_else(|| builder.checkpoint());
     items.message = Some(VisibleMessage {
         kind: kind.clone(),
@@ -4317,11 +6209,15 @@ fn push_response_item(
     let Some(kind) = model_tool_kind(item_type, payload) else {
         return false;
     };
-    let result_id = model_result_id(payload);
+    let scoped = items
+        .tool_turn
+        .as_deref()
+        .is_some_and(|turn| !is_implicit_turn(turn));
+    let result_id = scoped_model_result_id(payload, scoped);
     items.push_historical(
         builder,
         kind,
-        compact_tool_value(payload, None),
+        completed_item::with_source_receipt(compact_tool_value(payload, None), payload),
         timestamp,
         format!("response_item.{item_type}"),
         result_id,
@@ -4344,24 +6240,32 @@ fn model_tool_kind(item_type: &str, payload: &Value) -> Option<EventKind> {
 }
 
 fn model_call_id(payload: &Value) -> Option<&str> {
+    scoped_model_call_id(payload, false)
+}
+
+fn scoped_model_call_id(payload: &Value, scoped: bool) -> Option<&str> {
     match payload["type"].as_str()? {
         "function_call" | "custom_tool_call" | "web_search_call" | "computer_call"
-        | "local_shell_call" => {
-            string_at(payload, &[&["call_id"], &["id"]]).filter(|id| !id.is_empty())
-        }
+        | "local_shell_call" => tool_wire_id(payload, scoped),
         _ => None,
     }
 }
 
-fn model_result_id(payload: &Value) -> Option<&str> {
+fn scoped_model_result_id(payload: &Value, scoped: bool) -> Option<&str> {
     match payload["type"].as_str()? {
         "function_call_output"
         | "custom_tool_call_output"
         | "local_shell_call_output"
-        | "computer_call_output" => {
-            string_at(payload, &[&["call_id"], &["id"]]).filter(|id| !id.is_empty())
-        }
+        | "computer_call_output" => tool_wire_id(payload, scoped),
         _ => None,
+    }
+}
+
+fn tool_wire_id(payload: &Value, scoped: bool) -> Option<&str> {
+    if scoped && payload["call_id"].as_str() == Some("") {
+        Some("")
+    } else {
+        string_at(payload, &[&["call_id"], &["id"]])
     }
 }
 
@@ -4555,56 +6459,6 @@ fn is_media_wrapper(text: &str, before: Option<&str>, after: Option<&str>) -> bo
 }
 
 impl CodexSession {
-    fn read_unchanged<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
-        let version = || -> Result<_> {
-            let metadata = fs::symlink_metadata(&self.path)
-                .context("selected Codex rollout changed during read")?;
-            anyhow::ensure!(
-                metadata.is_file() && RolloutStamp::new(&metadata) == self.stamp,
-                "selected Codex rollout changed during read"
-            );
-            Ok((metadata.len(), metadata.modified().ok()))
-        };
-        let before = version()?;
-        let result = read(before.0);
-        anyhow::ensure!(
-            version()? == before,
-            "selected Codex rollout changed during read"
-        );
-        result
-    }
-
-    fn full_snapshot(
-        &self,
-        session: &SessionRef,
-        catalog: Option<&WorkspaceCatalog>,
-    ) -> Result<CanonicalSnapshot> {
-        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
-        let (events, project_path) = self.canonical_events()?;
-        Ok(self.snapshot(catalog, session, events, project_path, captured_at))
-    }
-
-    fn preview_snapshot(
-        &self,
-        session: &SessionRef,
-        catalog: Option<&WorkspaceCatalog>,
-    ) -> Result<CanonicalSnapshot> {
-        const PREVIEW_EVENTS: usize = 1_024;
-        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
-        // A sampled preview can miss a directory change between its prefix and tail.
-        let workspace = self.workspace_metadata(true)?;
-        let (events, directory) = if workspace.rolled_back {
-            let (mut events, directory) = self.canonical_events()?;
-            events.retain_preview_events(PREVIEW_EVENTS, captured_at);
-            (events, directory)
-        } else if let Some(records) = workspace.recent_records {
-            (self.recent_preview(records)?, workspace.directory)
-        } else {
-            (self.preview_events()?, workspace.directory)
-        };
-        Ok(self.snapshot(catalog, session, events, directory, captured_at))
-    }
-
     fn selected_workspace(&self, catalog: Option<&WorkspaceCatalog>) -> Result<NativeWorkspace> {
         #[cfg(unix)]
         if self
@@ -4655,66 +6509,205 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn discovery_notes(&self) -> Vec<String> {
-        self.listing().notes.clone()
+        self.listing(false).0.notes.clone()
     }
 
     fn discovery_is_complete(&self) -> bool {
         // A missing Codex home is not evidence that previously cached sessions were deleted.
-        self.codex_home.as_deref().is_some_and(Path::is_dir) && self.listing().notes.is_empty()
+        self.codex_home.as_deref().is_some_and(Path::is_dir)
+            && self.listing(false).0.notes.is_empty()
+    }
+
+    fn unavailable_codex_rollouts(
+        &self,
+        prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        let Some(home) = self.codex_home.as_deref().filter(|home| home.is_dir()) else {
+            return Ok(HashSet::new());
+        };
+        let cached = self
+            .listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let valid = cached.as_ref().filter(|cached| {
+            cached.database.is_some() && cached.database == self.current.stamp(home)
+        });
+        let mut unavailable = HashSet::new();
+        let prior = prior
+            .iter()
+            .filter(|(id, prior)| {
+                let known = valid.and_then(|cached| cached.listing.selected_files.get(id.as_str()));
+                if let Some((path, selected)) = known
+                    && Self::index_file_revision(path) == Some(*selected)
+                {
+                    if prior
+                        .and_then(|revision| revision.file)
+                        .is_some_and(|file| Some(file) != selected.file)
+                    {
+                        unavailable.insert(id.clone());
+                    }
+                    return false;
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+        drop(cached);
+        if prior.is_empty() {
+            return Ok(unavailable);
+        }
+        let rows = self
+            .current
+            .rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
+        let (scan, _) = self.session_scan(None);
+        for (id, revision) in prior {
+            match rows.get(id) {
+                Some(row) if row.requires_selection(home) => {
+                    match row.resolve(home, id, scan.paths(id), scan.notes.is_empty()) {
+                        Err(error) if error.is::<CurrentRolloutUnavailable>() => {
+                            unavailable.insert(id.clone());
+                        }
+                        Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
+                            if row.has_legacy_name() || row.outside_home(home) {
+                                unavailable.insert(id.clone());
+                            } else if let Some(selected) = row.generation(id)
+                                && let Some(file) = revision.and_then(|revision| revision.file)
+                                && scan.paths(id).any(|path| {
+                                    current_rollout::ids(path)
+                                        .is_some_and(|(_, generation)| generation != selected)
+                                        && Self::index_file_id(path) == Some(file)
+                                })
+                            {
+                                unavailable.insert(id.clone());
+                            }
+                        }
+                        Err(error) => return Err(error),
+                        Ok(Some(selected))
+                            if revision
+                                .and_then(|revision| revision.file)
+                                .is_some_and(|file| Some(file) != selected.revision.file) =>
+                        {
+                            unavailable.insert(id.clone());
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                None if ambiguous_generations(&scan, id) => {
+                    unavailable.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(unavailable)
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let catalog = self.workspace_catalog.as_deref();
-        let raw_sessions = self.sessions();
-        if raw_sessions.is_empty() {
-            return Ok(Vec::new());
+        Ok(self.list_project_candidates(project, false).0)
+    }
+
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let (sessions, unchecked) = self.list_project_candidates(Some(project), true);
+        let mut notes = self.discovery_notes();
+        if unchecked > 0 {
+            notes.push(format!("Codex could not check {unchecked} other-workspace rollout(s) for a directory change within this search. Run `omni index --provider codex` to refresh their workspaces."));
         }
-        let observations = catalog.map(WorkspaceCatalog::list).unwrap_or_default();
-        let mut sessions = Vec::new();
-        for raw in raw_sessions {
-            let mut session = raw.native_session();
-            if let Some((catalog, observation)) = catalog.zip(observations.get(&raw.id)) {
-                catalog.apply(raw, &mut session, observation, project);
-            }
-            if project.is_some_and(|project| {
-                session
-                    .project_path
-                    .as_deref()
-                    .is_none_or(|directory| !paths_match(directory, project))
-            }) {
-                continue;
-            }
-            sessions.push(session);
-        }
-        sort_sessions(&mut sessions);
-        Ok(sessions)
+        Ok((sessions, notes))
     }
 
     /// Reads the one matching rollout, so subagent threads that listings hide stay reachable.
     fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
-        let Some(session) = self.selected_session(id)? else {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(selected) = self.resolve_rollout(id, None, true)? else {
             return Ok(None);
         };
-        let mut native = session.native_session();
+        let mut native = selected.session.native_session();
         if let Some(catalog) = self.workspace_catalog.as_deref()
             && let Some(observation) = catalog.find(id)
         {
-            catalog.apply(&session, &mut native, &observation, None);
+            catalog.apply(&selected.session, &mut native, &observation, None);
+        }
+        if self.use_workspace_index
+            && let Some(file) = native.source_revision.and_then(|revision| revision.file)
+            && let Ok(workspaces) = omnis_store::CodexWorkspace::discovery_index(Some(file))
+        {
+            native.apply_codex_workspace_index(&workspaces, false);
         }
         Ok(Some(native))
     }
 
-    fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+    fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        native.read_unchanged(|_| native.full_snapshot(session, self.workspace_catalog.as_deref()))
+        let selected = self.require_rollout(&session.id, None)?;
+        let path = selected.session.path;
+        let archived = self
+            .codex_home
+            .as_ref()
+            .is_some_and(|home| path.starts_with(home.join("archived_sessions")));
+        let compressed = rollout_file::compressed(&path);
+        Ok(
+            if selected.shadowed
+                || archived
+                || path.extension().is_some_and(|ext| ext == "gz")
+                || (compressed && fs::symlink_metadata(path.with_extension("")).is_ok())
+                || (!selected.from_registry
+                    && !current_launch::source_filename_selects(self, &session.id, &path)?)
+            {
+                NativeResumeSupport::ImportOnly
+            } else {
+                match selected.session.history_mode {
+                    CodexHistoryMode::Paginated if current_rollout::canonical_name(&path) => {
+                        NativeResumeSupport::Since("0.167.0")
+                    }
+                    CodexHistoryMode::Legacy if compressed => NativeResumeSupport::Since("0.137.0"),
+                    CodexHistoryMode::Legacy => NativeResumeSupport::Direct,
+                    CodexHistoryMode::Paginated | CodexHistoryMode::Unknown => {
+                        NativeResumeSupport::ImportOnly
+                    }
+                }
+            },
+        )
     }
 
-    fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+    fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        native
-            .read_unchanged(|_| native.preview_snapshot(session, self.workspace_catalog.as_deref()))
+        let native = self.find_session(&session.id, None)?;
+        let (snapshot, _) = self.read_selected(native.clone(), |native, _| native.read(session))?;
+        self.remember_workspace(
+            &native,
+            &snapshot,
+            &CodexWorkspaceProjection::Unchecked,
+            true,
+        );
+        Ok(snapshot)
+    }
+
+    fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        validate_provider(session, Provider::Codex)?;
+        let native = self.find_session(&session.id, None)?;
+        let (snapshot, _, workspace) =
+            self.read_selected(native.clone(), |native, _| native.preview(session))?;
+        self.remember_workspace(&native, &snapshot, &workspace, false);
+        Ok(snapshot)
+    }
+
+    fn native_workspace(&self, session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+        validate_provider(session, Provider::Codex)?;
+        self.read_selected(self.find_session(&session.id, None)?, |native, _| {
+            native.selected_workspace(self.workspace_catalog.as_deref())
+        })
+        .map(Some)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, u64::MAX)
     }
 
     fn index_session(
@@ -4722,34 +6715,21 @@ impl ProviderAdapter for CodexAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<crate::IndexRead> {
+    ) -> Result<IndexRead> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        anyhow::ensure!(
-            source_path.is_none_or(|path| path == native.path),
-            "selected Codex rollout changed during indexing"
-        );
-        let catalog = self.workspace_catalog.as_deref();
-        native.read_unchanged(|size| {
-            let source_complete = size <= full_read_bytes;
-            let snapshot = if source_complete {
-                native.full_snapshot(session, catalog)?
-            } else {
-                native.preview_snapshot(session, catalog)?
-            };
-            Ok(crate::IndexRead {
-                snapshot,
-                source_complete,
-            })
-        })
+        let native = self.find_session(&session.id, source_path)?;
+        self.index_rollout(session, native, source_path, full_read_bytes)
     }
 
-    fn native_workspace(&self, session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        native
-            .read_unchanged(|_| native.selected_workspace(self.workspace_catalog.as_deref()))
-            .map(Some)
+        let native = self.require_rollout(&session.id, source_path)?.session;
+        self.index_rollout(session, native, source_path, full_read_bytes)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -4767,6 +6747,31 @@ impl ProviderAdapter for CodexAdapter {
             args.push(prompt.clone());
         }
         self.native_launch(target, args)
+    }
+
+    fn codex_continuation_sqlite_home(
+        &self,
+        session: Option<&SessionRef>,
+        cwd: &Path,
+        overrides: &crate::CodexLaunchOverrides,
+        expand_env_tilde: &dyn Fn() -> Result<bool>,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(session) = session {
+            return current_launch::verified_sqlite_home(
+                self,
+                session,
+                cwd,
+                overrides,
+                expand_env_tilde,
+            );
+        }
+        let home = self
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        self.current
+            .root_for_launch(home, cwd, overrides, expand_env_tilde)
+            .map(Some)
     }
 }
 
@@ -4889,7 +6894,9 @@ mod tests {
             let mut adapter = CodexAdapter::with_root(&home);
             adapter.rollout_cache = Some(cache.clone());
             adapter
-                .sessions()
+                .listing(true)
+                .0
+                .sessions
                 .iter()
                 .map(|session| session.project_path.clone())
                 .collect::<Vec<_>>()
@@ -5012,6 +7019,11 @@ mod tests {
     fn naive_rollback_marker(bytes: &[u8]) -> bool {
         const MARKER: &[u8] = b"thread_rolled_back";
         bytes.windows(MARKER.len()).any(|window| window == MARKER)
+            || bytes.windows(4).any(|token| {
+                &token[1..3] == b"14"
+                    && (matches!(token[0], b'[' | b':') || token[0].is_ascii_whitespace())
+                    && (matches!(token[3], b',' | b'}') || token[3].is_ascii_whitespace())
+            })
             || bytes.windows(6).any(|window| {
                 window.starts_with(b"\\u00")
                     && std::str::from_utf8(&window[4..])
@@ -5065,6 +7077,10 @@ mod tests {
             marker in prop_oneof![
                 Just(String::new()),
                 Just("thread_rolled_back".to_owned()),
+                Just("[14,1]".to_owned()),
+                Just(r#"{"num_turns":1,"type":14}"#.to_owned()),
+                Just("[   14  ,1]".to_owned()),
+                Just("[ 140 ,1]".to_owned()),
                 Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
                 Just(format!("{}hread_rolled_back", json_escape(b't'))),
                 Just(format!("{}[31m", json_escape(0x1b))),

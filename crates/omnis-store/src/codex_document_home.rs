@@ -209,9 +209,11 @@ mod tests {
              CREATE TABLE session_trajectories(id INTEGER PRIMARY KEY, provider, session_id, origin,
                  protected_by_bundle, codex_home TEXT, UNIQUE(provider,session_id));
              ALTER TABLE session_trajectories ADD COLUMN source_contents_id BLOB;
+             ALTER TABLE session_trajectories ADD COLUMN source_file_id BLOB;
              CREATE TABLE session_index(provider,session_id,codex_home, PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
-             CREATE TABLE trajectory_index_failures(provider,session_id,codex_home, PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
-             CREATE TABLE codex_workspace_observations(provider_home,session_id,source_stamp);
+             CREATE TABLE trajectory_index_failures(provider,session_id,codex_home,source_file_id,source_contents_id,
+                 PRIMARY KEY(provider,session_id)) WITHOUT ROWID;
+             CREATE TABLE codex_workspace_observations(provider_home,session_id,source_stamp,source_file_id,source_contents_id);
              CREATE TABLE chunks(id INTEGER PRIMARY KEY, owner REFERENCES session_trajectories(id) ON DELETE CASCADE, text);
              CREATE VIRTUAL TABLE words USING fts5(text);
              CREATE TRIGGER index_words AFTER INSERT ON chunks BEGIN
@@ -221,10 +223,10 @@ mod tests {
                  DELETE FROM trajectory_index_failures WHERE provider=new.provider AND session_id=new.session_id
                      AND codex_home IS new.codex_home; END;
              CREATE INDEX metadata_by_home ON session_index(codex_home);
-             INSERT INTO session_trajectories VALUES(41,'codex','shared','native',1,'home-a',X'0102');
-             INSERT INTO session_trajectories VALUES(42,'codex','unowned','native',0,NULL,X'0304');
+             INSERT INTO session_trajectories VALUES(41,'codex','shared','native',1,'home-a',X'0102',X'11');
+             INSERT INTO session_trajectories VALUES(42,'codex','unowned','native',0,NULL,X'0304',NULL);
              INSERT INTO chunks VALUES(87,41,'preservedmarker');
-             INSERT INTO trajectory_index_failures VALUES('codex','shared','home-a');"
+             INSERT INTO trajectory_index_failures VALUES('codex','shared','home-a',X'11',X'0102');"
         ).unwrap();
         initialize(&mut db).unwrap();
         let saved: (i64, i64, String, Option<String>) = db
@@ -241,7 +243,7 @@ mod tests {
             "INSERT INTO session_trajectories(provider,session_id,origin,protected_by_bundle,codex_home) VALUES
                  ('codex','shared','native',0,'home-b'), ('codex','shared','imported_bundle',1,NULL),
                  ('codex','unowned','native',0,'home-b');
-             INSERT INTO trajectory_index_failures VALUES('codex','shared','home-b');
+             INSERT INTO trajectory_index_failures VALUES('codex','shared','home-b',NULL,NULL);
              INSERT INTO session_index VALUES('codex','shared','home-b');"
         ).unwrap();
         let remaining: (String, bool, bool) = db.query_row(
@@ -252,15 +254,27 @@ mod tests {
         ).unwrap();
         assert_eq!(remaining, ("home-a".to_owned(), true, true));
         db.execute_batch(
-            "INSERT INTO codex_workspace_observations VALUES('home-a','shared','before');
+            "INSERT INTO codex_workspace_observations VALUES('home-a','shared','legacy',NULL,NULL);
+             UPDATE codex_workspace_observations SET source_stamp='different file',source_file_id=X'12',source_contents_id=X'0102';
+             UPDATE codex_workspace_observations SET source_stamp='different contents',source_file_id=X'11',source_contents_id=X'1234';
+             DELETE FROM codex_workspace_observations;",
+        ).unwrap();
+        let preserved: (bool, bool) = db.query_row(
+            "SELECT codex_workspace_current,EXISTS(SELECT 1 FROM trajectory_index_failures WHERE codex_home='home-a')
+             FROM session_trajectories WHERE id=41", [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(preserved, (true, true));
+        db.execute_batch(
+            "INSERT INTO codex_workspace_observations VALUES('home-a','shared','before',X'11',X'0102');
              UPDATE codex_workspace_observations SET source_stamp='after' WHERE provider_home='home-a';"
         ).unwrap();
-        let hidden: (bool, bool) = db.query_row(
+        let hidden: (bool, bool, bool) = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_trajectories WHERE id=41 AND codex_home='home-a' AND NOT codex_workspace_current),
-                 EXISTS(SELECT 1 FROM session_trajectories WHERE session_id='shared' AND codex_home='home-b' AND codex_workspace_current)",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
+                 EXISTS(SELECT 1 FROM session_trajectories WHERE session_id='shared' AND codex_home='home-b' AND codex_workspace_current),
+                 EXISTS(SELECT 1 FROM trajectory_index_failures WHERE codex_home='home-a')",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert_eq!(hidden, (true, true));
+        assert_eq!(hidden, (true, true, false));
         db.execute("DELETE FROM session_trajectories WHERE id=41", [])
             .unwrap();
         let hits: i64 = db

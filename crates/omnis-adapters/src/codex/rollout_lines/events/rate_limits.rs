@@ -7,8 +7,20 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-pub(super) fn valid(value: &Value) -> bool {
-    RateLimitSnapshot::deserialize(value).is_ok()
+pub(super) fn valid_token_count(payload: &Value) -> bool {
+    TokenCountEvent::deserialize(payload).is_ok()
+}
+
+// Codex buffers the fields of this internally tagged event before decoding the snapshot.
+// In that representation, an externally tagged unit variant also accepts an empty object.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TokenCountEvent<'a> {
+    TokenCount {
+        info: Option<serde::de::IgnoredAny>,
+        #[serde(borrow)]
+        rate_limits: Option<RateLimitSnapshot<'a>>,
+    },
 }
 
 #[derive(Deserialize)]

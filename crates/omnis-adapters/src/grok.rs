@@ -111,6 +111,7 @@ impl GrokAdapter {
                 updated_at_approximate: false,
                 event_count: 0,
                 source_path: None,
+                source_revision: None,
             });
         }
         Some(sessions)
@@ -669,6 +670,7 @@ impl ProviderAdapter for GrokAdapter {
                 updated_at_approximate: false,
                 event_count: 0,
                 source_path: Some(path),
+                source_revision: None,
             };
             if let Some(index) = index {
                 sessions[index] = session;

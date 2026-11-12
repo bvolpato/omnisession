@@ -4,7 +4,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::paginated_rollback::json_digest;
-use super::super::{model_call_id, model_result_id};
+use super::super::{scoped_model_call_id, scoped_model_result_id};
 use super::{PaginatedAnswers, TurnAliases};
 
 type Key = [u8; 32];
@@ -28,15 +28,15 @@ pub(super) fn receipt_digest(item: &Value) -> Option<Key> {
     Some(json_digest(&(id, name, namespace, output)))
 }
 
-pub(super) fn source_digest(record: &Value, repeated: bool) -> Option<Key> {
+pub(super) fn source_digest(record: &Value, repeated: bool, scoped: bool) -> Option<Key> {
     let item = &record["payload"];
     if repeated && named_output(item) {
         return None;
     }
-    payload_digest(item, &record["metadata"])
+    payload_digest(item, &record["metadata"], scoped)
 }
 
-fn payload_digest(item: &Value, metadata: &Value) -> Option<Key> {
+fn payload_digest(item: &Value, metadata: &Value, scoped: bool) -> Option<Key> {
     if named_output(item) {
         // Codex retains a standalone output only when its client marked it for retention.
         if !super::super::model_cut::harness_metadata(metadata).client_authored
@@ -57,7 +57,7 @@ fn payload_digest(item: &Value, metadata: &Value) -> Option<Key> {
         }
         return receipt_digest(item);
     }
-    let id = model_call_id(item).or_else(|| model_result_id(item))?;
+    let id = scoped_model_call_id(item, scoped).or_else(|| scoped_model_result_id(item, scoped))?;
     // Codex may assign another response item ID or omit its turn stamp when it saves a checkpoint.
     // The provider call ID and the complete tool payload still have to agree.
     let fields: BTreeMap<_, _> = item
@@ -168,8 +168,8 @@ impl PaginatedAnswers {
             if super::super::opaque_checkpoint_tool(item) {
                 continue;
             }
-            let call = model_call_id(item);
-            let Some(id) = call.or_else(|| model_result_id(item)) else {
+            let call = scoped_model_call_id(item, true);
+            let Some(id) = call.or_else(|| scoped_model_result_id(item, true)) else {
                 continue;
             };
             let meta = metadata
@@ -185,7 +185,7 @@ impl PaginatedAnswers {
                     continue;
                 };
                 let matched = (index >= start)
-                    .then(|| payload_digest(item, meta))
+                    .then(|| payload_digest(item, meta, true))
                     .flatten()
                     .and_then(|digest| self.published_receipt(seq, digest, turn, aliases))
                     .map(|seq| (index, seq, None));
@@ -198,7 +198,7 @@ impl PaginatedAnswers {
             }
             // An open call in the skipped prefix can still compete for a later result.
             let digest = (index >= start)
-                .then(|| payload_digest(item, meta))
+                .then(|| payload_digest(item, meta, true))
                 .flatten();
             if call.is_some() {
                 let matched = digest.and_then(|digest| original.find((digest, None), turn));

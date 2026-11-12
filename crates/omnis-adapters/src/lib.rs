@@ -13,18 +13,19 @@ mod omp;
 mod opencode;
 mod pi;
 mod provider_process;
+mod source_file;
 mod support;
 #[cfg(all(test, unix))]
 mod test_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -45,7 +46,7 @@ pub use opencode::{
     installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
     read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
-pub use pi::PiAdapter;
+pub use pi::{InvalidPiTree, PiAdapter};
 #[cfg(windows)]
 pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
 pub use provider_process::{
@@ -53,6 +54,8 @@ pub use provider_process::{
     bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
     inherit_provider_probes, provider_process, with_provider_probes,
 };
+pub use source_file::source_file_revision;
+pub use support::TranscriptReadLimit;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,12 +78,110 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
+    /// The file revision observed with this session's metadata.
+    pub source_revision: Option<SourceRevision>,
+}
+
+/// The opener confirmed by a full ordinary Codex read or by reconstructing an applied rollback.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RollbackTitle {
+    #[default]
+    Unknown,
+    /// An empty title means the surviving transcript has no eligible user opener.
+    Known(Option<String>),
+    /// An unread row followed one or more confirmed withdrawals. Their successor is unknown.
+    UnknownAfterWithdrawal(WithdrawnOpeners),
+}
+
+/// Bounded evidence about local opening titles removed before the first unreadable row.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WithdrawnOpeners {
+    hashes: Vec<[u8; 32]>,
+    overflowed: bool,
+}
+
+impl WithdrawnOpeners {
+    fn record(&mut self, hash: [u8; 32]) {
+        if !self.hashes.contains(&hash) {
+            if self.hashes.len() < 8 {
+                self.hashes.push(hash);
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+
+    fn reissued(&mut self, title: &str) {
+        if !self.hashes.is_empty() {
+            let hash = RollbackTitle::fingerprint(title);
+            self.hashes.retain(|previous| *previous != hash);
+        }
+    }
+
+    fn after_gap(&self) -> RollbackTitle {
+        if self.hashes.is_empty() && !self.overflowed {
+            RollbackTitle::Unknown
+        } else {
+            RollbackTitle::UnknownAfterWithdrawal(self.clone())
+        }
+    }
+}
+
+impl RollbackTitle {
+    fn fingerprint(title: &str) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(title.as_bytes()).into()
+    }
+
+    /// Whether this reconstruction witnessed the saved opener being removed before a gap.
+    #[must_use]
+    pub fn withdraws(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.hashes.contains(&Self::fingerprint(title)))
+    }
+
+    /// Whether a single-title check can resolve an overflow in the bounded withdrawal history.
+    #[must_use]
+    pub fn needs_withdrawal_check(&self, title: &str) -> bool {
+        matches!(self, Self::UnknownAfterWithdrawal(witnesses) if witnesses.overflowed && !self.withdraws(title))
+    }
+}
+
+/// The effective workspace established independently of the amount of indexed conversation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CodexWorkspaceProjection {
+    #[default]
+    Unchecked,
+    /// No directory means the selected rollout establishes that its workspace is unknown.
+    Observed(Option<PathBuf>),
+}
+
+impl CodexWorkspaceProjection {
+    fn from_reconstruction(verified: bool, directory: Option<&Path>) -> Self {
+        if verified {
+            Self::Observed(
+                directory
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            )
+        } else {
+            Self::Unchecked
+        }
+    }
 }
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Catalog metadata verified by the reader of the selected native transcript.
+    pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
+    pub rollback_title: RollbackTitle,
+    /// The workspace projection belongs to this read's source revision.
+    pub workspace_projection: CodexWorkspaceProjection,
     pub source_complete: bool,
+    /// A provider limit made a full read impossible, even without an indexer byte budget.
+    pub provider_limited: bool,
+    /// The source revision observed while reading the selected native transcript.
+    pub source_revision: SourceRevision,
 }
 
 /// Provider-specific launch input.
@@ -116,6 +217,15 @@ pub struct NativeWorkspace {
     pub git: GitState,
 }
 
+/// State database settings that a Codex launch profile supplies.
+#[derive(Debug, Default)]
+pub struct CodexLaunchOverrides {
+    pub project_root_markers: Option<Vec<String>>,
+    pub profile: Option<String>,
+    pub sqlite_home: Option<PathBuf>,
+    pub environment: Option<EnvChange>,
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
@@ -124,6 +234,62 @@ pub struct LaunchPlan {
     pub cwd: Option<PathBuf>,
     /// Changes to the inherited environment, applied in order before the child starts.
     pub env: Vec<EnvChange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeResumeSupport {
+    Direct,
+    Since(&'static str),
+    ImportOnly,
+}
+
+fn read_budgeted_transcript(
+    within_budget: bool,
+    mut read: impl FnMut(bool) -> Result<CanonicalSnapshot>,
+) -> Result<IndexRead> {
+    if within_budget {
+        match read(false) {
+            Ok(snapshot) => {
+                return Ok(IndexRead {
+                    native_session: None,
+                    rollback_title: RollbackTitle::Unknown,
+                    workspace_projection: CodexWorkspaceProjection::Unchecked,
+                    snapshot,
+                    source_complete: true,
+                    provider_limited: false,
+                    source_revision: SourceRevision::default(),
+                });
+            }
+            Err(error) if error.is::<support::TranscriptReadLimit>() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(IndexRead {
+        native_session: None,
+        rollback_title: RollbackTitle::Unknown,
+        workspace_projection: CodexWorkspaceProjection::Unchecked,
+        snapshot: read(true)?,
+        source_complete: false,
+        provider_limited: within_budget,
+        source_revision: SourceRevision::default(),
+    })
+}
+
+/// The files a native provider selects when more than one transcript can identify the same session.
+pub trait NativeSelectionInventory: Send + Sync {
+    /// Updates the inventory outside the search store's write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error when the provider directory cannot be inspected.
+    fn refresh(&mut self) -> Result<()>;
+
+    /// Returns the entry chosen by the provider's exact-ID rule.
+    fn selected(&self, id: &str) -> Option<&NativeSession>;
+
+    /// Checks known paths together and returns the result for each request in order.
+    /// If a transcript changed, the adapter can check its previously observed header.
+    fn validate(&self, requests: &[(&str, &Path, SourceRevision)]) -> Vec<bool>;
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -137,6 +303,41 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
+
+    /// Finds candidates for live indexing in one project, including recorded workspace changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        self.list_search_sessions_with_notes(Some(project))
+    }
+
+    /// Lists sessions for search in the requested project.
+    ///
+    /// Providers with duplicate IDs select the file used by an exact read before filtering by project.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_search_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        self.list_sessions(project)
+    }
+
+    /// Lists searchable sessions together with any warnings from this invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        Ok((self.list_search_sessions(project)?, self.discovery_notes()))
+    }
 
     /// Finds session metadata by exact native ID.
     ///
@@ -163,6 +364,50 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Describes whether the provider can continue the stored representation by its session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot identify the source representation.
+    fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
+        Ok(NativeResumeSupport::Direct)
+    }
+
+    /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot resolve the launch configuration.
+    fn codex_continuation_sqlite_home(
+        &self,
+        _session: Option<&SessionRef>,
+        _cwd: &Path,
+        _overrides: &CodexLaunchOverrides,
+        _expand_env_tilde: &dyn Fn() -> Result<bool>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// Revalidates the provider file selected for an exact session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider errors when the selected file cannot be inspected.
+    fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
+        Ok(self
+            .find_native_session(id)?
+            .filter(|session| session.source_path.as_deref() == Some(source_path)))
+    }
+
+    /// Captures the current file selections for repeated checks during one index operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error when a provider with an inventory cannot inspect its files.
+    fn selection_inventory(&self) -> Result<Option<Box<dyn NativeSelectionInventory>>> {
+        Ok(None)
+    }
+
     /// Non-fatal discovery observations from this adapter.
     ///
     /// Notes may be computed during the first `list_sessions` call and reused.
@@ -177,6 +422,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// session can be treated as deleted only after complete discovery. The default preserves it.
     fn discovery_is_complete(&self) -> bool {
         false
+    }
+
+    /// Returns the cached Codex sessions that their recorded rollout selections rule out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider's current selections cannot be checked.
+    fn unavailable_codex_rollouts(
+        &self,
+        _prior: &[(String, Option<SourceRevision>)],
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
     }
 
     /// Reads one provider-native session into canonical events.
@@ -200,6 +457,27 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<CanonicalSnapshot> {
         self.read_session(session)
+    }
+
+    /// Reads a full transcript together with any catalog metadata verified by the same read.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures, including limits that prevent a full read.
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        Ok(IndexRead {
+            native_session: None,
+            rollback_title: RollbackTitle::Unknown,
+            workspace_projection: CodexWorkspaceProjection::Unchecked,
+            snapshot: self.read_session_at(session, source_path)?,
+            source_complete: true,
+            provider_limited: false,
+            source_revision: SourceRevision::default(),
+        })
     }
 
     /// Reads enough provider-native history for bounded interactive previews.
@@ -226,6 +504,19 @@ pub trait ProviderAdapter: Send + Sync {
         self.preview_session(session)
     }
 
+    /// Returns the transcript file when discovery uses its modification time for search freshness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be resolved to its provider-owned file.
+    fn search_timestamp_file(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Reads history for indexing within a full-read byte budget.
     ///
     /// Shared-database adapters measure the selected session's content instead of the database.
@@ -239,18 +530,30 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        let source_complete = !source_path
+        let over_budget = source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
-        let snapshot = if source_complete {
-            self.read_session_at(session, source_path)?
-        } else {
-            self.preview_session_at(session, source_path)?
-        };
-        Ok(IndexRead {
-            snapshot,
-            source_complete,
+        read_budgeted_transcript(!over_budget, |preview| {
+            if preview {
+                self.preview_session_at(session, source_path)
+            } else {
+                self.read_session_at(session, source_path)
+            }
         })
+    }
+
+    /// Reads the conversation for its search document. Discovery supplies separately stored session names.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, full_read_bytes)
     }
 
     /// Describes a fresh interactive provider launch.
@@ -419,6 +722,32 @@ impl AdapterRegistry {
     ) -> Result<CanonicalSnapshot> {
         self.adapter(session.provider)?
             .preview_session_at(session, source_path)
+    }
+
+    /// Reads a source and its indexing time. A file change during the read leaves the time unset.
+    ///
+    /// For adapters without a file clock, the reader supplies the provider's timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be resolved or read.
+    pub fn observe_search_read<T>(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        read: impl FnOnce(&dyn ProviderAdapter, Option<&Path>) -> Result<(T, DateTime<Utc>)>,
+    ) -> Result<(T, Option<DateTime<Utc>>)> {
+        let adapter = self.adapter(session.provider)?;
+        let Some(path) = adapter.search_timestamp_file(session, source_path)? else {
+            let (value, time) = read(adapter, source_path)?;
+            return Ok((value, Some(time)));
+        };
+        let before = support::SnapshotFileStamp::read(&path).ok();
+        let (value, _) = read(adapter, Some(&path))?;
+        let modified = before
+            .filter(|stamp| support::SnapshotFileStamp::read(&path).as_ref().ok() == Some(stamp))
+            .map(|stamp| DateTime::from(stamp.modified));
+        Ok((value, modified))
     }
 
     /// Dispatches a budgeted search indexing read.

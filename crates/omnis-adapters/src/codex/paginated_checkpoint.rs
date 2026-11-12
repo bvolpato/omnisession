@@ -333,7 +333,12 @@ fn completed_positions(
     let mut completed = HashMap::new();
     for (turn, ids) in &history.completed {
         let turn = turn_key(turn);
-        for ((kind, id), &seq) in ids {
+        for ((_, id), position) in ids {
+            let super::CompletedPosition {
+                kind,
+                sequence: seq,
+                ..
+            } = *position;
             if !matches!(
                 kind,
                 super::CompletedKind::User
@@ -344,7 +349,7 @@ fn completed_positions(
             }
             let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
             completed
-                .entry((*kind, turn, id))
+                .entry((kind, turn, id))
                 .and_modify(|prior| {
                     if *prior != Some(seq) {
                         *prior = None;

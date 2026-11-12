@@ -5,6 +5,43 @@ use serde::Deserialize;
 use serde_json::Value;
 
 mod metadata;
+pub(super) use metadata::MessagePhase;
+mod response;
+
+pub(super) fn prepare(payload: &mut Value) -> bool {
+    // CompactedItemWire requires the message and defaults every trailing field.
+    if !super::rollout_lines::name_fields(
+        payload,
+        &[
+            "message",
+            "replacement_history",
+            "replacement_history_metadata",
+            "guardian_history",
+            "retained_context",
+            "mcp_resource_origins",
+            "window_number",
+            "first_window_id",
+            "previous_window_id",
+            "window_id",
+            "compaction_response_id",
+            "latest_token_usage_record",
+            "resume_metadata",
+        ],
+    ) || !payload["message"].is_string()
+    {
+        return false;
+    }
+    for key in ["replacement_history", "guardian_history"] {
+        if let Some(items) = payload.get_mut(key).and_then(Value::as_array_mut)
+            && !items.iter_mut().all(|item| {
+                (key != "guardian_history" || item.is_object()) && prepare_response_item(item)
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
 
 pub(super) fn valid(payload: &Value, paginated: bool) -> bool {
     if !payload["message"].is_string()
@@ -208,15 +245,16 @@ pub(super) fn image(part: &Value) -> bool {
     (part["image_url"].is_string() || part["file_id"].is_string()) && image_detail(&part["detail"])
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ImageDetail {
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
 pub(super) fn image_detail(detail: &Value) -> bool {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    enum ImageDetail {
-        Auto,
-        Low,
-        High,
-        Original,
-    }
     optional(detail, parses::<ImageDetail>)
 }
 
@@ -243,15 +281,15 @@ pub(super) fn message_part(part: &Value) -> bool {
 }
 
 // Serde accepts positional text, audio and encrypted fields. The flattened image reference requires a map.
-pub(super) fn normalize_output(output: &mut Value) {
+pub(super) fn prepare_output(body: &mut Value) -> bool {
     const VARIANTS: [&str; 4] = [
         "input_text",
         "input_image",
         "input_audio",
         "encrypted_content",
     ];
-    let Some(parts) = output.as_array_mut() else {
-        return;
+    let Some(parts) = body.as_array_mut() else {
+        return body.is_string();
     };
     for part in parts {
         let tag = part.get("type").or_else(|| part.get(0));
@@ -263,6 +301,9 @@ pub(super) fn normalize_output(output: &mut Value) {
         if part.is_object() {
             if let Some(name) = ordinal {
                 part["type"] = Value::from(name);
+            }
+            if part["type"] == "input_image" && !super::wire_enums::prepare_image_detail(part) {
+                return false;
             }
             continue;
         }
@@ -280,19 +321,20 @@ pub(super) fn normalize_output(output: &mut Value) {
             *part = serde_json::json!({"type": name, field: fields[1].take()});
         }
     }
+    output(body)
 }
 
-pub(super) fn prepare_response_output(item: &mut Value) -> bool {
+pub(super) fn prepare_response_item(item: &mut Value) -> bool {
+    if !response::prepare(item) {
+        return false;
+    }
     if !matches!(
         item["type"].as_str(),
         Some("function_call_output" | "custom_tool_call_output")
     ) {
         return true;
     }
-    item.get_mut("output").is_some_and(|body| {
-        normalize_output(body);
-        output(body)
-    })
+    item.get_mut("output").is_some_and(prepare_output)
 }
 
 pub(super) fn output(value: &Value) -> bool {

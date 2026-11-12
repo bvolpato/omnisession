@@ -859,6 +859,7 @@ fn native_session(value: &Value) -> Option<NativeSession> {
         updated_at_approximate: false,
         event_count,
         source_path: None,
+        source_revision: None,
     })
 }
 

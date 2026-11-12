@@ -59,7 +59,7 @@ program = "${HOME}/bin/codex-wrapper"
 args = ["--record"]
 ```
 
-The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--record`, then the arguments that `omni` builds for the agent, such as `resume <session>`. The agent itself does not have to be installed. The wrapper starts it.
+The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--record`, then the arguments that `omni` builds for the agent, such as `resume <session>`. The agent itself does not have to be installed. The wrapper starts it. For Codex, the fidelity report identifies the requested operation. OmniSession can verify a locally imported thread, but only the wrapper controls which session it opens.
 
 ## The fields of a profile
 
@@ -68,6 +68,7 @@ The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--re
 | `agent` | Yes | The built-in agent that the profile starts: `claude`, `codex`, `opencode`, `grok`, `hermes`, `antigravity`, `pi`, `omp`, or `cursor-cli`. Any name that `--in` accepts for these agents works too. |
 | `label` | No | The name that the target page shows. The default is the profile name. |
 | `program` | No | A program to run in place of the agent's own command. Give a path, or a command name that `PATH` can find. `omni` finds the file once, with its own `PATH`, and runs that file. A `PATH` that the profile sets in `env` does not change which file runs. A command that names an agent, such as `claude`, resolves as `omni` resolves that agent, including the `OMNI_CLAUDE_BIN` override. |
+| `native_codex_target` | No | Set to `true` if you have verified that `program` is the native Codex binary behind your primary `codex` command. OmniSession checks that both paths identify the same file, including through hard links, and that `program` uses its final filename. A profile whose target no longer matches is unavailable. Use this for a standalone release or a custom build that OmniSession cannot identify automatically. |
 | `args` | No | Arguments that go before the arguments that `omni` builds for the agent. |
 | `env` | No | A table of variables to set. |
 | `unset` | No | A list of variables to remove. A variable cannot be in both `env` and `unset`. |
@@ -110,7 +111,7 @@ omni resume <session> --in claude-gateway --dry-run
 
 A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.
 
-Codex resumes a session only with the model provider that created it. If plain `codex` does not supply that provider and exactly one runnable profile selects it, `omni resume <session>` uses that profile, and the target page selects it by default. If several profiles select it, `omni resume <session>` stops and lists them. `--in` always decides. OmniSession reads only provider names from the Codex configuration. A profile can name Codex directly or use another path to the same executable. If it launches a separate wrapper, the wrapper decides what its arguments mean.
+Codex resumes a session only with the model provider that created it. If plain `codex` does not supply that provider and exactly one runnable profile selects it, `omni resume <session>` uses that profile, and the target page selects it by default. If several profiles select it, `omni resume <session>` stops and lists them. `--in` always decides. OmniSession reads only provider names from the Codex configuration. A profile can name Codex directly, select its package entrypoint, or run a verified copy of the standalone package binary. On Linux and Windows, OmniSession recognizes the direct target of official Codex 0.167.1 standalone downloads by their SHA-256 digests. On macOS, OmniSession can also verify the direct target of a Codex symlink using the OpenAI code signature. A command dispatcher can use its invocation name to choose a different program, even when two commands share the same executable file. If a profile launches a separate wrapper, the wrapper decides what its arguments mean.
 
 A cross-agent import uses the installed agent to write the new session. For a profile that runs Codex directly, the importer also uses the selected provider ID and its configured name. OmniSession does not copy gateway credentials or interactive permission flags into the import command's arguments. Wrappers and their arguments still apply only to the final launch.
 
