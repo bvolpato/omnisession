@@ -1032,7 +1032,7 @@ fn read_provider_preview(
             let stored = crate::store_verified_search_document(
                 store,
                 &key.session,
-                (&snapshot, &read.search_record_groups),
+                (&snapshot, &read.search_record_groups, prefix_end),
                 complete,
                 (source_time, revision),
                 guard,

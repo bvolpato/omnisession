@@ -1006,7 +1006,7 @@ impl std::error::Error for IncompleteTranscript {}
 
 #[derive(Debug, Default)]
 pub(crate) struct JsonLineDamage {
-    oversized: Cell<bool>,
+    skipped: Cell<bool>,
     prefix_end: Cell<u64>,
     interior: Cell<usize>,
     last_offset: Cell<Option<u64>>,
@@ -1021,7 +1021,7 @@ impl JsonLineDamage {
     }
 
     pub(crate) fn verified_prefix_end(&self) -> Option<u64> {
-        (self.count() > 0 || self.oversized.get()).then(|| self.prefix_end.get())
+        (self.count() > 0 || self.skipped.get()).then(|| self.prefix_end.get())
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -1325,6 +1325,11 @@ pub(crate) fn visit_limited_search_edges(
             break;
         };
         consumed += bytes;
+        if (!matches!(kind, BoundedLine::Complete) || !line.ends_with(b"\n"))
+            && let Some(damage) = tail.damage()
+        {
+            damage.skipped.set(true);
+        }
         if matches!(kind, BoundedLine::Complete)
             && line.ends_with(b"\n")
             && let Some(record) = tail.parse(&line, consumed, false)?
@@ -1341,6 +1346,11 @@ pub(crate) fn visit_limited_search_edges(
     file.seek(SeekFrom::Start(aligned))?;
     let mut suffix = BufReader::new(file.take(length - aligned));
     let mut offset = aligned + suffix.skip_until(b'\n')? as u64;
+    if offset > consumed
+        && let Some(damage) = tail.damage()
+    {
+        damage.skipped.set(true);
+    }
     if offset == length {
         let mut file = suffix.into_inner().into_inner();
         return tail.check_final_fragment(&mut file, length, MAX_PREVIEW_TAIL_SIZE);
@@ -1349,6 +1359,11 @@ pub(crate) fn visit_limited_search_edges(
         read_bounded_line(&mut suffix, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, &mut line)?
     {
         offset += bytes;
+        if matches!(kind, BoundedLine::Oversized)
+            && let Some(damage) = tail.damage()
+        {
+            damage.skipped.set(true);
+        }
         if matches!(kind, BoundedLine::Complete)
             && let Some(record) = tail.parse(&line, offset, offset == length)?
         {
@@ -1429,7 +1444,7 @@ fn visit_json_lines_with_offsets_and_limits(
         match line_kind {
             BoundedLine::Oversized => {
                 if let Some(damage) = tail.damage() {
-                    damage.oversized.set(true);
+                    damage.skipped.set(true);
                 }
                 oversized_records += usize::from(tail.check_skipped_end(
                     reader,
@@ -1948,24 +1963,26 @@ fn read_json_lines_prefix(
     Ok(consumed)
 }
 
-pub(crate) fn json_lines_preview_with_tail(
+#[cfg(test)]
+fn json_lines_preview_with_tail(
     path: &Path,
     sample_records: usize,
     tail: JsonLineTail<'_>,
 ) -> Result<Vec<Value>> {
-    Ok(json_lines_preview_with_policy(&mut File::open(path)?, sample_records, tail)?.0)
+    Ok(json_lines_preview_with_prefix(path, sample_records, tail)?.0)
 }
 
-fn json_lines_preview_with_policy(
-    file: &mut File,
+pub(crate) fn json_lines_preview_with_prefix(
+    path: &Path,
     sample_records: usize,
     tail_policy: JsonLineTail<'_>,
 ) -> Result<(Vec<Value>, usize)> {
+    let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    json_lines_preview_at(file, sample_records, tail_policy, metadata.len())
+    json_lines_preview_at(&mut file, sample_records, tail_policy, metadata.len())
 }
 
 /// Reconstructs the sampled windows at the supplied physical end of the transcript.
@@ -1983,31 +2000,31 @@ pub(crate) fn json_lines_preview_at(
     if end <= MAX_PREVIEW_TAIL_SIZE {
         let prefix = read_verified_json_lines_prefix(file, MAX_PROVIDER_RECORDS, tail_policy, end)?;
         if prefix.at_eof {
-            return Ok((prefix.records, prefix.suffix_len));
+            return Ok((prefix.records, prefix.verified_records));
         }
     }
 
     let prefix = read_verified_json_lines_prefix(file, sample_records, tail_policy, end)?;
     if prefix.at_eof {
-        return Ok((prefix.records, prefix.suffix_len));
+        return Ok((prefix.records, prefix.verified_records));
     }
     let (tail, tail_suffix) =
         verified_json_lines_tail_with_offsets(file, sample_records, tail_policy, end)?;
     let overlap = tail.partition_point(|(offset, _)| *offset < prefix.end);
     let appended = tail.len() - overlap;
-    // Extend the prefix suffix when the next record starts at its boundary and every later line decoded.
-    let suffix = if tail
-        .get(overlap)
-        .is_some_and(|(offset, _)| *offset == prefix.end)
+    let verified_records = if prefix.verified_records == prefix.records.len()
+        && tail
+            .get(overlap)
+            .is_some_and(|(offset, _)| *offset == prefix.end)
         && tail_suffix >= appended
     {
-        prefix.suffix_len + appended
+        prefix.verified_records + appended
     } else {
-        tail_suffix
+        prefix.verified_records
     };
     let mut records = prefix.records;
     records.extend(tail.into_iter().skip(overlap).map(|(_, record)| record));
-    Ok((records, suffix))
+    Ok((records, verified_records))
 }
 
 fn verified_json_lines_tail_with_offsets(
@@ -2073,7 +2090,7 @@ fn verified_json_lines_tail_with_offsets(
 struct JsonLinesPrefix {
     records: Vec<Value>,
     end: u64,
-    suffix_len: usize,
+    verified_records: usize,
     at_eof: bool,
 }
 
@@ -2093,7 +2110,8 @@ fn read_verified_json_lines_prefix(
     let mut records = Vec::new();
     let mut line = Vec::new();
     let mut consumed = 0_u64;
-    let mut suffix = 0;
+    let mut verified_records = 0;
+    let mut contiguous = true;
     let prefix_budget = if tail.checked_end(true) {
         MAX_PREVIEW_VALIDATION_BYTES
     } else {
@@ -2131,15 +2149,17 @@ fn read_verified_json_lines_prefix(
             && let Some(record) = tail.parse(&line, consumed, consumed == end)?
         {
             records.push(record);
-            suffix += 1;
-        } else {
-            suffix = 0;
+            verified_records += usize::from(contiguous);
+        } else if matches!(line_kind, BoundedLine::Oversized)
+            || !line.iter().all(u8::is_ascii_whitespace)
+        {
+            contiguous = false;
         }
     }
     Ok(JsonLinesPrefix {
         records,
         end: consumed,
-        suffix_len: suffix,
+        verified_records,
         at_eof: consumed == end || reader.fill_buf()?.is_empty(),
     })
 }

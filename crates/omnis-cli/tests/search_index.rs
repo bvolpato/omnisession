@@ -243,6 +243,50 @@ fn state_json(environment: &TestEnvironment, state: &str, args: &[&str]) -> serd
 }
 
 #[test]
+fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
+    for (provider, directory) in [
+        ("antigravity", "antigravity-cli"),
+        ("antigravity-desktop", "antigravity-desktop"),
+    ] {
+        let root = tempdir().unwrap();
+        let env = TestEnvironment::new(root.path(), root.path().to_owned());
+        let (session, _) = antigravity_history(&env, 2);
+        let home = env.home.join(directory);
+        let histories = home.join("conversations");
+        fs::create_dir_all(&histories).unwrap();
+        let id = session.strip_prefix("antigravity:").unwrap();
+        let database = Connection::open(histories.join(format!("{id}.db"))).unwrap();
+        database.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+            INSERT INTO steps VALUES (0,x'080e9a010b0a096669727374776f7264'),(1,x'080fa2010b0a0966697273747265706c');").unwrap();
+        let index = || state_json(&env, "state", &["index", "--provider", provider]);
+        let search = |query: &str, cached| {
+            let mut args = vec!["search", "--provider", provider, "--all-projects", query];
+            if cached {
+                args.push("--cached");
+            }
+            state_json(&env, "state", &args)["results"][0]["coverage"].clone()
+        };
+        assert_eq!(index()["indexed"], 1);
+        assert_eq!(search("firstrepl", true), "complete");
+        database
+            .execute_batch(
+                "INSERT INTO steps VALUES (2,x'082a2003'),(3,x'080fa2010b0a096e6578747265706c79');",
+            )
+            .unwrap();
+        if provider == "antigravity" {
+            Connection::open(home.join("conversation_summaries.db")).unwrap().execute_batch(
+                "UPDATE conversation_summaries SET step_count=4,last_modified_time='2026-07-29T12:00:00Z';"
+            ).unwrap();
+        }
+        assert_eq!(search("nextreply", false), "preview");
+        assert_eq!(search("firstrepl", true), "preview");
+        assert_eq!(search("nextreply", true), "preview");
+        assert_eq!(index()["stale"], 0);
+        assert_eq!(index()["stale"], 0);
+    }
+}
+
+#[test]
 fn preferred_antigravity_history_does_not_inherit_cached_text_from_a_different_file() {
     use std::io::{Read, Write};
 
@@ -621,6 +665,12 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
     };
     fs::write(
         &path,
+        "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"firstreply\"}\n",
+    )
+    .unwrap();
+    assert_eq!(coverage("full", "firstreply"), "complete");
+    fs::write(
+        &path,
         concat!(
             r#"{"type":"PLANNER_RESPONSE","content":"firstreply"}"#,
             "\n",
@@ -633,7 +683,7 @@ fn partial_antigravity_search_indexes_newly_completed_turns() {
     file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
         .unwrap();
     drop(file);
-    for state in ["warm", "cold"] {
+    for state in ["warm", "cold", "full"] {
         assert_eq!(coverage(state, "nextreply"), "preview", "{state}");
         assert_eq!(coverage(state, "firstreply"), "preview", "{state}");
     }

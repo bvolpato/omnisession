@@ -1222,7 +1222,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                             || self
                                 .document
                                 .projection
-                                .is_some_and(|p| p.interior_damage.is_some())),
+                                .is_some_and(|p| p.interior_damage.is_some() || p.verified_append)),
                     self.document
                         .projection
                         .map(|p| i64::try_from(p.byte_count))
@@ -1705,7 +1705,7 @@ fn observed_file_state(
             doc.source_file_id, catalog.source_file_id,
             CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END,
             coalesce(doc.observed_text_bytes,doc.source_byte_count), coalesce(doc.source_complete OR doc.provider_limited, 0),
-            CASE WHEN doc.provider = 'antigravity' AND NOT (doc.source_complete OR doc.provider_limited)
+            CASE WHEN doc.provider = 'antigravity' AND NOT doc.provider_limited
                       AND length(doc.content_hash) = 32 THEN coalesce(doc.observed_text_hash,doc.content_hash) END, doc.sampled_file_bytes,
             doc.fully_scanned_bytes IS NOT NULL OR doc.recovered_gap_start IS NOT NULL
          FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected

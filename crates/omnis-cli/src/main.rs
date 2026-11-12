@@ -308,7 +308,11 @@ fn read_verified_session(
             && let Err(error) = store_verified_search_document(
                 &store,
                 session,
-                (snapshot, &read.search_record_groups),
+                (
+                    snapshot,
+                    &read.search_record_groups,
+                    read.verified_prefix_end,
+                ),
                 true,
                 (source_time, read.source_revision),
                 guard,
@@ -566,7 +570,7 @@ fn store_search_document<'a>(
 fn store_verified_search_document(
     store: &Store,
     session: &SessionRef,
-    (snapshot, groups): (&CanonicalSnapshot, &[std::ops::Range<u64>]),
+    (snapshot, groups, prefix_end): (&CanonicalSnapshot, &[std::ops::Range<u64>], Option<u64>),
     full_read: bool,
     source: (chrono::DateTime<Utc>, SourceRevision),
     guard: TrajectorySourceGuard,
@@ -600,7 +604,7 @@ fn store_verified_search_document(
         SessionTrajectoryOrigin::Native
     };
     let document = trajectory_search_document_in_records(snapshot, groups);
-    let derived_title = search_index::indexed_title(session, snapshot);
+    let derived_title = search_index::indexed_title(session, snapshot, prefix_end);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at,

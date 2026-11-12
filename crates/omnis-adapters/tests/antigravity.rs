@@ -247,6 +247,19 @@ fn observed_preview_reports_damage_and_keeps_the_messages_on_both_sides() {
         .index_session(&session, Some(&path.canonicalize().unwrap()), 0)
         .unwrap();
     assert!(!read.source_complete);
+    assert_eq!(
+        read.verified_prefix_end,
+        Some(read.snapshot.events[1].sequence)
+    );
+    let streamed = adapter
+        .index_search_document(
+            &session,
+            Some(&path.canonicalize().unwrap()),
+            u64::MAX,
+            None,
+        )
+        .unwrap();
+    assert_eq!(streamed.read.verified_prefix_end, read.verified_prefix_end);
     let events = read.snapshot.events;
     assert_eq!(events[0].payload["text"], "question");
     assert_eq!(events[1].payload["text"], "answer");

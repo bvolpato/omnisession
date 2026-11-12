@@ -193,6 +193,10 @@ pub struct IndexRead {
 #[derive(Clone, Copy)]
 pub enum PriorSearchDocument {
     RequireCompleteTail(usize),
+    Complete {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+    },
     Partial {
         byte_count: usize,
         indexed_hash: [u8; 32],

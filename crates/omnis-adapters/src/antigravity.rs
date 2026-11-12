@@ -22,10 +22,10 @@ use crate::{
     NativeSession, PriorSearchDocument, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, JsonLineDamage, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp,
-        paths_match, provider_executable, provider_file, provider_root, sort_sessions,
-        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines_with_tail,
-        visit_limited_search_edges, visit_streamed_json_file,
+        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_prefix,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
+        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
+        visit_json_lines_with_tail, visit_limited_search_edges, visit_streamed_json_file,
     },
 };
 
@@ -140,7 +140,7 @@ impl AntigravityAdapter {
         Ok(IndexRead {
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
-            verified_prefix_end: history.database_prefix_end.or_else(|| {
+            verified_prefix_end: history.verified_prefix_end.or_else(|| {
                 tail.damage()
                     .filter(|_| !preview)
                     .and_then(JsonLineDamage::verified_prefix_end)
@@ -148,7 +148,7 @@ impl AntigravityAdapter {
             search_record_groups: history.search_record_groups,
             snapshot: history.snapshot,
             source_complete: !preview
-                && history.database_prefix_end.is_none()
+                && history.omitted_database_rows == 0
                 && tail.damage().is_none_or(|damage| damage.count() == 0),
             provider_limited: false,
             source_revision: native.source_revision.unwrap_or_default(),
@@ -179,7 +179,8 @@ impl AntigravityAdapter {
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
         let mut groups = Vec::new();
-        let mut database_prefix_end = None;
+        let mut verified_prefix_end = None;
+        let mut omitted_database_rows = 0;
         match self.source(summary) {
             Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
                 let mut push = |record: Value| {
@@ -192,10 +193,16 @@ impl AntigravityAdapter {
                     if end - start > 1 {
                         groups.push(start..end);
                     }
+                    start
                 };
                 let oversized = if preview {
-                    for record in json_lines_preview_with_tail(&path, PREVIEW_RECORDS, tail)? {
-                        push(record);
+                    let (records, verified) =
+                        json_lines_preview_with_prefix(&path, PREVIEW_RECORDS, tail)?;
+                    for (index, record) in records.into_iter().enumerate() {
+                        let start = push(record);
+                        if index == verified {
+                            verified_prefix_end = Some(start);
+                        }
                     }
                     0
                 } else {
@@ -214,8 +221,10 @@ impl AntigravityAdapter {
                 record_jsonl_damage(&mut builder, tail, summary.updated_at);
             }
             Some(path) => {
-                (_, database_prefix_end) =
+                let (_, coverage) =
                     push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
+                verified_prefix_end = coverage.verified_prefix_end;
+                omitted_database_rows = coverage.omitted;
             }
             None if summary.step_count > 0 => {
                 return Err(anyhow!(
@@ -229,15 +238,17 @@ impl AntigravityAdapter {
         Ok(ObservedHistory {
             snapshot: summary.snapshot(session, builder),
             search_record_groups: groups,
-            database_prefix_end,
+            verified_prefix_end,
+            omitted_database_rows,
         })
     }
 }
 
 struct ObservedHistory {
+    omitted_database_rows: usize,
     snapshot: CanonicalSnapshot,
     search_record_groups: Vec<std::ops::Range<u64>>,
-    database_prefix_end: Option<u64>,
+    verified_prefix_end: Option<u64>,
 }
 
 #[derive(Default)]
@@ -283,11 +294,17 @@ struct PreviousSearchPrefix {
 impl PreviousSearchPrefix {
     fn new(prior: Option<PriorSearchDocument>) -> Self {
         let expected = match prior {
-            Some(PriorSearchDocument::Partial {
-                byte_count: n @ 1..,
-                indexed_hash,
-                ..
-            }) => Some((n, indexed_hash)),
+            Some(
+                PriorSearchDocument::Complete {
+                    byte_count: n,
+                    indexed_hash,
+                }
+                | PriorSearchDocument::Partial {
+                    byte_count: n @ 1..,
+                    indexed_hash,
+                    ..
+                },
+            ) => Some((n, indexed_hash)),
             _ => None,
         };
         Self {
@@ -360,7 +377,44 @@ impl PreviousSearchPrefix {
         }
     }
 
+    fn required_edge_bytes(
+        full_read_bytes: u64,
+        prior: Option<PriorSearchDocument>,
+    ) -> Option<usize> {
+        match (full_read_bytes, prior) {
+            (
+                u64::MAX,
+                Some(
+                    PriorSearchDocument::RequireCompleteTail(bytes)
+                    | PriorSearchDocument::Complete {
+                        byte_count: bytes, ..
+                    },
+                ),
+            ) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    fn tail_policy(
+        damage: &JsonLineDamage,
+        prior: Option<PriorSearchDocument>,
+        limited: bool,
+    ) -> JsonLineTail<'_> {
+        if matches!(prior, Some(PriorSearchDocument::RequireCompleteTail(_)))
+            || (limited && matches!(prior, Some(PriorSearchDocument::Complete { .. })))
+        {
+            JsonLineTail::RequireCompleteTail(damage)
+        } else {
+            JsonLineTail::ReportIncomplete(damage)
+        }
+    }
+
     fn needs_damage_check(damage: &JsonLineDamage, prior: Option<PriorSearchDocument>) -> bool {
+        if matches!(prior, Some(PriorSearchDocument::Complete { .. }))
+            && damage.interior_count() > 0
+        {
+            return false;
+        }
         damage.final_record()
             || (damage.interior_count() > 0
                 && matches!(
@@ -437,6 +491,7 @@ fn finish_search_document(
     provider_limited: bool,
     torn_final: bool,
     legacy_sample: Option<([u8; 32], usize)>,
+    verified_append: bool,
 ) -> omnis_core::SearchDocument {
     let mut document = document.finish();
     if length <= MAX_STREAMED_TRANSCRIPT_FILE_SIZE
@@ -444,6 +499,7 @@ fn finish_search_document(
     {
         projection.fully_scanned_bytes = Some(length);
         projection.torn_final = torn_final;
+        projection.verified_append = verified_append;
         projection.legacy_damage_sample = legacy_sample;
         if gaps.interior_seen > 0 {
             projection.dated_suffix_records = gaps.dated_records;
@@ -642,13 +698,9 @@ impl ProviderAdapter for AntigravityAdapter {
         let (file, length, native, observed) = self.open_history(&summary, path)?;
         let mut handle = file.try_clone()?;
         let torn = JsonLineDamage::default();
-        let tail = if matches!(prior, Some(PriorSearchDocument::RequireCompleteTail(_))) {
-            JsonLineTail::RequireCompleteTail(&torn)
-        } else {
-            JsonLineTail::ReportIncomplete(&torn)
-        };
-        let mut prefix = PreviousSearchPrefix::new(prior);
         let limited = length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
+        let tail = PreviousSearchPrefix::tail_policy(&torn, prior, limited);
+        let mut prefix = PreviousSearchPrefix::new(prior);
         if !limited && length > full_read_bytes {
             let preview = self.read_observed(session, Some(path), true, tail)?;
             let result =
@@ -666,14 +718,12 @@ impl ProviderAdapter for AntigravityAdapter {
         let mut push = |record| {
             let before = gaps.observe(&torn, &document);
             project_search_record(&record, &mut events, &mut document, &mut title_source);
+            torn.confirm_prefix(events.checkpoint());
             gaps.observe_suffix(&record, before, document.projected_byte_count());
             prefix.observe(&document);
             document.source_byte_count()
         };
-        let prior_prefix = match (full_read_bytes, prior) {
-            (u64::MAX, Some(PriorSearchDocument::RequireCompleteTail(bytes))) => Some(bytes),
-            _ => None,
-        };
+        let prior_prefix = PreviousSearchPrefix::required_edge_bytes(full_read_bytes, prior);
         let oversized = if limited {
             visit_limited_search_edges(file, prior_prefix, PREVIEW_RECORDS, tail, &mut push)
                 .map(|()| 0)
@@ -697,6 +747,8 @@ impl ProviderAdapter for AntigravityAdapter {
         });
         self.ensure_history_unchanged(&summary, path, observed, &handle)?;
         let (oversized, legacy_sample) = checked?;
+        let verified_append = prefix.verified
+            && matches!(prior, Some(PriorSearchDocument::Complete { byte_count, .. }) if document.source_byte_count() > byte_count);
         events.push_oversized_record_notice(oversized, summary.updated_at);
         verify_jsonl_history(&summary, &events)?;
         record_jsonl_damage(&mut events, tail, summary.updated_at);
@@ -711,13 +763,14 @@ impl ProviderAdapter for AntigravityAdapter {
             limited && prior_prefix.is_some(),
             torn.final_record(),
             legacy_sample,
+            verified_append,
         );
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {
                 workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 rollback_title: crate::RollbackTitle::Unknown,
-                verified_prefix_end: None,
+                verified_prefix_end: torn.verified_prefix_end(),
                 search_record_groups: Vec::new(),
                 snapshot: title_source,
                 source_complete: !limited && torn.count() == 0,
@@ -1079,12 +1132,48 @@ fn push_historical(
 }
 
 /// Returns the decoded step count and the exclusive event sequence at the earliest gap.
+pub(crate) struct DatabaseCoverage {
+    pub(crate) verified_prefix_end: Option<u64>,
+    pub(crate) omitted: usize,
+}
+
+impl DatabaseCoverage {
+    fn report(
+        &self,
+        builder: &mut EventBuilder,
+        unsupported: usize,
+        order_verified: bool,
+        declared_steps: usize,
+        stored: usize,
+    ) {
+        if self.omitted > 0 || unsupported > 0 || !order_verified {
+            let mut notice =
+                json!({"omitted_events": self.omitted, "unsupported_text_records": unsupported});
+            if !order_verified {
+                notice["native_history_unverified"] = json!(true);
+            }
+            if declared_steps > stored {
+                notice["declared_steps"] = json!(declared_steps);
+                notice["stored_steps"] = json!(stored);
+            }
+            builder.push(
+                EventKind::ProviderEvent,
+                notice,
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.antigravity_step_limit".to_owned()),
+                None,
+            );
+        }
+    }
+}
+
 pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
     declared_steps: usize,
-) -> Result<(usize, Option<u64>)> {
+) -> Result<(usize, DatabaseCoverage)> {
     push_database_steps_with_limits(
         root,
         database,
@@ -1119,7 +1208,7 @@ fn push_database_steps_with_limits(
     builder: &mut EventBuilder,
     declared_steps: usize,
     limits: DatabaseReadLimits,
-) -> Result<(usize, Option<u64>)> {
+) -> Result<(usize, DatabaseCoverage)> {
     let snapshot = sqlite_snapshot(root, database)
         .context("failed to snapshot Antigravity conversation database")?;
     let stored = usize::try_from(snapshot.connection.query_row(
@@ -1151,11 +1240,15 @@ fn push_database_steps_with_limits(
     let mut unsupported = 0;
     let mut damaged = 0;
     let mut previous_index = None;
-    let mut order_verified = true;
+    let mut oldest_ambiguous_row = Some(0);
     while let Some(row) = rows.next()? {
         position += 1;
         let index: Option<i64> = row.get(2)?;
-        order_verified &= index.is_some() && index != previous_index;
+        if index.is_none() {
+            oldest_ambiguous_row = None;
+        } else if index == previous_index && oldest_ambiguous_row.is_some() {
+            oldest_ambiguous_row = Some(position);
+        }
         previous_index = index;
         let Some(length) = row.get::<_, Option<i64>>(1)?.filter(|length| *length > 0) else {
             damaged += 1;
@@ -1191,39 +1284,34 @@ fn push_database_steps_with_limits(
         builder,
         retained,
         stored.max(declared_steps),
-        order_verified,
+        oldest_ambiguous_row,
     );
-    if omitted > 0 || unsupported > 0 || !order_verified {
-        let mut notice =
-            json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
-        if !order_verified {
-            notice["native_history_unverified"] = json!(true);
-        }
-        if declared_steps > stored {
-            notice["declared_steps"] = json!(declared_steps);
-            notice["stored_steps"] = json!(stored);
-        }
-        builder.push(
-            EventKind::ProviderEvent,
-            notice,
-            None,
-            ReplayPolicy::HistoricalOnly,
-            Some("omnisession.antigravity_step_limit".to_owned()),
-            None,
-        );
-    }
-    Ok((decoded, prefix_end))
+    let coverage = DatabaseCoverage {
+        verified_prefix_end: prefix_end,
+        omitted,
+    };
+    coverage.report(
+        builder,
+        unsupported,
+        oldest_ambiguous_row == Some(0),
+        declared_steps,
+        stored,
+    );
+    Ok((decoded, coverage))
 }
 
 fn push_ordered_steps(
     builder: &mut EventBuilder,
     retained: Vec<(usize, DatabaseStepEvent)>,
     mut position: usize,
-    order_verified: bool,
+    oldest_ambiguous_row: Option<usize>,
 ) -> Option<u64> {
-    let mut prefix_end = (!order_verified).then(|| builder.checkpoint());
+    let mut prefix_end = None;
     for (row, event) in retained.into_iter().rev() {
-        if row != position || event.replay_policy == ReplayPolicy::HistoricalOnly {
+        if row != position
+            || oldest_ambiguous_row.is_none_or(|oldest| row <= oldest)
+            || event.replay_policy == ReplayPolicy::HistoricalOnly
+        {
             prefix_end.get_or_insert_with(|| builder.checkpoint());
         }
         position = row - 1;
@@ -1548,6 +1636,14 @@ mod tests {
             )
             .unwrap();
         assert_messages(false);
+        connection.execute_batch("UPDATE steps SET idx = _rowid_; INSERT INTO steps SELECT * FROM steps WHERE idx = 2;").unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, "ordered-prefix");
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 3).unwrap();
+        assert_eq!(
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (3, Some(1), 0)
+        );
     }
 
     #[test]
@@ -1626,7 +1722,7 @@ mod tests {
             ),
         ] {
             let mut builder = EventBuilder::new(session.provider, &session.id);
-            let (decoded, prefix_end) = super::push_database_steps_with_limits(
+            let (decoded, coverage) = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
                 &mut builder,
@@ -1636,7 +1732,7 @@ mod tests {
             .unwrap();
             assert!(decoded >= expected.len());
             assert_eq!(
-                prefix_end,
+                coverage.verified_prefix_end,
                 Some(if expected.len() == text.len() { 2 } else { 0 })
             );
             let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
@@ -1671,9 +1767,11 @@ mod tests {
         )
         .unwrap();
         let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap();
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap(),
-            (1, Some(0))
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (1, Some(0), 5)
         );
         let snapshot = builder.snapshot(
             SessionRef::new(Provider::Antigravity, id),
@@ -1773,9 +1871,11 @@ mod tests {
             Provider::Antigravity,
             "11111111-1111-4111-8111-111111111111",
         );
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap();
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
-            (1, Some(0))
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (1, Some(0), 0)
         );
         let snapshot = builder.snapshot(
             SessionRef::new(

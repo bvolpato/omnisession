@@ -33,6 +33,7 @@ pub struct SearchProjection {
     /// Digest and length of the confirmed text in the legacy sampling windows after damage.
     pub legacy_damage_sample: Option<([u8; 32], usize)>,
     pub torn_final: bool,
+    pub verified_append: bool,
     /// Physical length scanned from start to end, including unreadable native records.
     pub fully_scanned_bytes: Option<u64>,
     state: sha2::Sha256,
@@ -50,6 +51,7 @@ impl SearchProjection {
             sampled_file_bytes: None,
             legacy_damage_sample: None,
             torn_final: false,
+            verified_append: false,
             fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
             before_last_record: before_last_record.finalize().into(),
@@ -81,6 +83,7 @@ impl PartialEq for SearchProjection {
             && self.sampled_file_bytes == other.sampled_file_bytes
             && self.legacy_damage_sample == other.legacy_damage_sample
             && self.torn_final == other.torn_final
+            && self.verified_append == other.verified_append
             && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
 }

@@ -211,12 +211,14 @@ pub(crate) fn record_strict_read_failure<'read>(
 pub(crate) fn indexed_title(
     session: &SessionRef,
     snapshot: &omnis_ir::CanonicalSnapshot,
+    prefix_end: Option<u64>,
 ) -> Option<String> {
     if matches!(
         session.provider,
         Provider::Antigravity | Provider::AntigravityDesktop
     ) {
-        omnis_core::session_history_title(snapshot)
+        let (sequence, title) = omnis_core::search_title_opener_from_messages(&snapshot.events)?;
+        title.filter(|_| prefix_end.is_none_or(|end| sequence < end))
     } else {
         session_search_title(snapshot)
     }
@@ -567,6 +569,10 @@ fn read_budget(
                         && sampled_file_bytes.is_none()
                         && !fully_scanned
                         && !candidate.can_upgrade_preview(),
+                },
+                (true, Some(indexed_hash)) if byte_count > 0 => PriorSearchDocument::Complete {
+                    byte_count,
+                    indexed_hash,
                 },
                 _ => PriorSearchDocument::RequireCompleteTail(byte_count),
             }),
@@ -1809,7 +1815,7 @@ fn prepare_session(
     let (IndexedSearchDocument { document, read }, source_updated_at) =
         read_candidate(registry, candidate, guard, budget, store)?;
     let IndexRead {
-        verified_prefix_end: _,
+        verified_prefix_end,
         search_record_groups: _,
         snapshot,
         source_complete,
@@ -1837,7 +1843,7 @@ fn prepare_session(
     let title_authoritative =
         omnis_core::session_search_title_is_authoritative(&snapshot, source_complete);
     if candidate.session.provider != Provider::Codex {
-        title.current = indexed_title(&candidate.session, &snapshot);
+        title.current = indexed_title(&candidate.session, &snapshot, verified_prefix_end);
         title.verified = title_authoritative;
     }
     Ok(PreparedIndex {
@@ -2788,7 +2794,11 @@ mod tests {
         crate::store_verified_search_document(
             &store,
             &session,
-            (&read.snapshot, &read.search_record_groups),
+            (
+                &read.snapshot,
+                &read.search_record_groups,
+                read.verified_prefix_end,
+            ),
             true,
             (source_time.unwrap(), read.source_revision),
             guard,

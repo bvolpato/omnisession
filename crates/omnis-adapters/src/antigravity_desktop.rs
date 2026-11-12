@@ -21,8 +21,8 @@ use prost::Message;
 use crate::{
     IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     antigravity::{
-        ProtoTimestamp, history_revision, nonempty, proto_timestamp, push_database_steps,
-        validate_id, workspace_uri_path,
+        DatabaseCoverage, ProtoTimestamp, history_revision, nonempty, proto_timestamp,
+        push_database_steps, validate_id, workspace_uri_path,
     },
     support::{
         EventBuilder, nested_files_matching, paths_match, provider_file, provider_root,
@@ -62,13 +62,13 @@ impl AntigravityDesktopAdapter {
         Ok(native_session(id, database, summaries.get(id)))
     }
 
-    fn snapshot(&self, native: &NativeSession) -> Result<(CanonicalSnapshot, Option<u64>)> {
+    fn snapshot(&self, native: &NativeSession) -> Result<(CanonicalSnapshot, DatabaseCoverage)> {
         let database = native
             .source_path
             .as_deref()
             .ok_or_else(|| anyhow!("Antigravity Desktop history changed during the search read"))?;
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &native.session.id);
-        let (_, prefix_end) =
+        let (_, coverage) =
             push_database_steps(self.root()?, database, &mut builder, native.event_count)?;
         Ok((
             builder.snapshot(
@@ -78,7 +78,7 @@ impl AntigravityDesktopAdapter {
                 native.git_branch.clone(),
                 native.updated_at.unwrap_or_else(Utc::now),
             ),
-            prefix_end,
+            coverage,
         ))
     }
 
@@ -108,14 +108,14 @@ impl AntigravityDesktopAdapter {
                 .as_deref()
                 .and_then(|path| path.metadata().ok())
                 .is_some_and(|metadata| metadata.len() <= budget);
-        let (snapshot, verified_prefix_end) = read?;
+        let (snapshot, coverage) = read?;
         Ok(IndexRead {
             workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
             rollback_title: crate::RollbackTitle::Unknown,
-            verified_prefix_end,
+            verified_prefix_end: coverage.verified_prefix_end,
             search_record_groups: Vec::new(),
             snapshot,
-            source_complete: complete && verified_prefix_end.is_none(),
+            source_complete: complete && coverage.omitted == 0,
             provider_limited: false,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: (!hidden).then_some(native),
