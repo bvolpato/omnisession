@@ -3074,3 +3074,104 @@ fn one_raw_reply_matches_one_saved_reply_in_the_same_implicit_turn() -> anyhow::
     }
     Ok(())
 }
+
+#[test]
+fn interruptions_keep_the_saved_implicit_request_and_replies_in_one_turn() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    for (terminal, turn, remaining) in [
+        ("turn_aborted", Value::Null, vec!["older"]),
+        ("turn_aborted", json!("implicit"), vec!["older"]),
+        ("task_complete", Value::Null, vec!["older"]),
+        (
+            "task_complete",
+            json!("implicit"),
+            vec!["older", "steer", "first"],
+        ),
+    ] {
+        let records = [
+            event("task_started", json!({"turn_id":"old"})),
+            event("user_message", json!({"message":"older"})),
+            event("task_complete", json!({"turn_id":"old"})),
+            event("user_message", json!({"message":"steer"})),
+            event("agent_message", json!({"message":"first"})),
+            event(terminal, json!({"turn_id":turn})),
+            event("agent_message", json!({"message":"last"})),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ];
+        let (full, preview) = rollback_title_reads(&header, &records, "")?;
+        for read in [full, preview] {
+            assert_eq!(visible_text(&read.snapshot), remaining);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn saved_legacy_replies_define_the_implicit_turn_across_unsubmitted_input() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    for (raw_text, id) in [
+        ("reply", json!("one")),
+        ("different", json!("two")),
+        ("reply", Value::Null),
+    ] {
+        let mut raw = message("assistant", raw_text);
+        raw["payload"]["id"] = id;
+        for saved in 0..=2 {
+            let mut records = vec![
+                event("task_started", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"older"})),
+                event("task_complete", json!({"turn_id":"old"})),
+                raw.clone(),
+                message("user", "unsubmitted"),
+            ];
+            records.extend(
+                (0..saved)
+                    .map(|_| event("agent_message", json!({"message":"reply","item_id":"one"}))),
+            );
+            for count in [0, 1] {
+                let mut data = records.clone();
+                data.push(event("thread_rolled_back", json!({"num_turns":count})));
+                let (full, preview) = rollback_title_reads(&header, &data, "")?;
+                let mut expected = vec![];
+                if count == 0 || saved > 0 {
+                    expected.push("older");
+                }
+                if count == 0 {
+                    expected.extend(std::iter::repeat_n("reply", saved));
+                }
+                for read in [full, preview] {
+                    assert_eq!(visible_text(&read.snapshot), expected);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_provenance_preserves_an_authored_import_marker_in_a_saved_legacy_turn() -> anyhow::Result<()>
+{
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    let marker = omnis_core::CODEX_IMPORT_MARKER;
+    for count in [0, 1] {
+        let rows = [
+            event("task_started", json!({"turn_id":"old"})),
+            event("user_message", json!({"message":"older"})),
+            event("task_complete", json!({"turn_id":"old"})),
+            event("agent_message", json!({"message":marker})),
+            message("assistant", marker),
+            event("agent_message", json!({"message":marker})),
+            event("thread_rolled_back", json!({"num_turns":count})),
+        ];
+        let (full, preview) = rollback_title_reads(&header, &rows, "")?;
+        for read in [full, preview] {
+            let expected: &[&str] = if count == 0 {
+                &["older", marker]
+            } else {
+                &["older"]
+            };
+            assert_eq!(visible_text(&read.snapshot), expected);
+        }
+    }
+    Ok(())
+}

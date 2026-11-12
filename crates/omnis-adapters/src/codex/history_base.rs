@@ -557,6 +557,7 @@ struct AttachmentPreamble {
     records: usize,
     previous_ordinal: Option<u64>,
     turn_hint: Option<String>,
+    foreign_turn: Option<(Uuid, String)>,
     request: Option<Value>,
     settings: bool,
     gap: bool,
@@ -574,11 +575,55 @@ impl AttachmentPreamble {
             .and_then(|id| Uuid::parse_str(id).ok());
     }
 
+    fn observe_foreign_turn(&mut self, record: &Value) {
+        let payload = &record["payload"];
+        if record["type"] != "event_msg" {
+            return;
+        }
+        let Some(turn) = payload["turn_id"].as_str().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let owner = payload
+            .get("thread_id")
+            .or_else(|| record.get("thread_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let Some(owner) = owner.filter(|id| {
+            Some(*id) != self.start.owner && super::event_scope_matches(record, &id.to_string())
+        }) else {
+            return;
+        };
+        match payload["type"].as_str() {
+            Some("task_started" | "turn_started") => {
+                self.foreign_turn = Some((owner, turn.to_owned()));
+            }
+            Some("task_complete" | "turn_complete")
+                if self
+                    .foreign_turn
+                    .as_ref()
+                    .is_some_and(|(id, active)| *id == owner && active == turn) =>
+            {
+                self.foreign_turn = None;
+            }
+            _ => {}
+        }
+    }
+
     fn matches_saved_pair(&self, raw: &Value, saved: &Value, previous: Option<u64>) -> bool {
         let Some((left, right)) = previous.zip(self.previous_ordinal) else {
             return false;
         };
-        if left < self.start.ordinal
+        let owned = [raw, saved].into_iter().any(|row| {
+            self.start.matches_scope(row)
+                && (row.get("thread_id").is_some() || row["payload"].get("thread_id").is_some())
+        });
+        let turn = raw["payload"]
+            .get("turn_id")
+            .or_else(|| saved["payload"].get("turn_id"));
+        if self.foreign_turn.as_ref().is_some_and(|(_, foreign)| {
+            !owned || turn.and_then(Value::as_str).is_none_or(|id| id == foreign)
+        }) || !(self.gap || owned)
+            || left < self.start.ordinal
             || left.checked_add(1) != Some(right)
             || !self.start.matches_scope(raw)
             || !self.start.matches_scope(saved)
@@ -604,6 +649,7 @@ impl AttachmentPreamble {
         let previous_ordinal =
             std::mem::replace(&mut self.previous_ordinal, record["ordinal"].as_u64());
         let request = self.request.take();
+        self.observe_foreign_turn(&record);
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("session_meta"), _) if self.row == 1 => {
                 self.observe_header(payload);
@@ -641,6 +687,9 @@ impl AttachmentPreamble {
                 Some(kind @ ("task_started" | "turn_started" | "item_started" | "item_completed")),
             ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
                 && self.start.matches_scope(&record)
+                && self.foreign_turn.as_ref().is_none_or(|(_, turn)| {
+                    payload["turn_id"].as_str() != Some(turn.as_str()) && self.start.owns(&record)
+                })
                 && (matches!(kind, "task_started" | "turn_started")
                     || payload["thread_id"].is_string()) =>
             {
@@ -678,16 +727,11 @@ impl AttachmentPreamble {
             }
             (Some("event_msg"), Some("user_message"))
                 if self.start.ordinal > 1
-                    && self.gap
                     && request.as_ref().is_some_and(|raw| {
                         self.matches_saved_pair(raw, &record, previous_ordinal)
                     }) =>
             {
-                if self.start.saved_pairs.len() < super::MAX_CANONICAL_EVENTS {
-                    self.start.saved_pairs.push((self.row, self.records));
-                } else {
-                    self.start.incomplete = true;
-                }
+                self.start.save_pair(self.row, self.records);
             }
             _ => {
                 self.gap = true;
@@ -702,6 +746,14 @@ impl AttachmentPreamble {
 }
 
 impl AttachmentStart {
+    fn save_pair(&mut self, row: usize, records: usize) {
+        if self.saved_pairs.len() < super::MAX_CANONICAL_EVENTS {
+            self.saved_pairs.push((row, records));
+        } else {
+            self.incomplete = true;
+        }
+    }
+
     fn matches_scope(&self, record: &Value) -> bool {
         self.owner
             .is_some_and(|owner| super::event_scope_matches(record, &owner.to_string()))

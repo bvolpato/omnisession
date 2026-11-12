@@ -2872,6 +2872,12 @@ impl CodexHistory {
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
+            if builder.codex_saved_users.is_some()
+                && matches!(self.implicit_turn, ImplicitTurn::Open)
+                && (event_type == Some("turn_aborted") || record["payload"]["turn_id"].is_null())
+            {
+                return;
+            }
             if let Some(task) = &self.native_start {
                 let id = &record["payload"]["turn_id"];
                 let named = id
@@ -2902,18 +2908,25 @@ impl CodexHistory {
             && self.native_start.is_none()
             && !matches!(self.implicit_turn, ImplicitTurn::Open);
         if outside_turn
+            && builder.codex_saved_users == Some(false)
             && record["type"] == "response_item"
             && record["payload"]["type"] == "message"
             && record["payload"]["role"] == "assistant"
         {
             self.implicit_turn = ImplicitTurn::RawReply(self.checkpoint(builder));
         }
+        let position = builder.checkpoint();
         let user = push_record(builder, record, &mut self.last_visible, confirmed);
-        let implicit_reply = outside_turn
-            && record["type"] == "event_msg"
+        let saved_reply = record["type"] == "event_msg"
             && record["payload"]["type"] == "agent_message"
             && string_at(&record["payload"], &[&["message"], &["text"]])
                 .is_some_and(|text| !text.is_empty() && text != omnis_core::CODEX_IMPORT_MARKER);
+        let authored_marker = builder.codex_saved_users == Some(true)
+            && record["type"] == "response_item"
+            && record["payload"]["type"] == "message"
+            && record["payload"]["role"] == "assistant"
+            && builder.checkpoint() > position;
+        let implicit_reply = outside_turn && (saved_reply || authored_marker);
         if !user && !implicit_reply {
             return false;
         }
@@ -3999,6 +4012,13 @@ fn push_message_text(
     record: &Value,
     last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
+    if builder.codex_saved_users == Some(true)
+        && record["type"] == "response_item"
+        && kind == EventKind::MessageAssistant
+        && text != omnis_core::CODEX_IMPORT_MARKER
+    {
+        return false;
+    }
     let message = VisibleMessage::new(record, kind.clone(), text);
     let saved = message.event;
     let request = kind == EventKind::MessageUser && !is_contextual_user_text(text);

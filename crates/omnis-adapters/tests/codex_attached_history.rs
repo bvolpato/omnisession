@@ -1717,3 +1717,67 @@ fn paired_attachment_requests_survive_metadata_until_an_inherited_abort() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn attached_saved_pairs_require_consistent_turn_ownership() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for case in [
+        "child",
+        "copied",
+        "foreign owner",
+        "turn mismatch",
+        "item mismatch",
+    ] {
+        let mut rows = interrupted_fork(&dir)?;
+        rows.truncate(2);
+        if case == "copied" {
+            rows.push(json!({"type":"event_msg","ordinal":4,"payload":{"type":"task_started","turn_id":"scope","thread_id":PARENT}}));
+        }
+        let ordinal = rows.len() + 2;
+        let mut raw = message(ordinal, "paired request");
+        raw["payload"]["id"] = json!("pair");
+        raw["payload"]["turn_id"] = json!("scope");
+        let mut saved = json!({"type":"event_msg","ordinal":ordinal+1,"payload":{"type":"user_message","message":"paired request","item_id":"pair","turn_id":"scope"}});
+        if case != "copied" {
+            raw["payload"]["thread_id"] = json!(CHILD);
+            saved["payload"]["thread_id"] = json!(CHILD);
+        }
+        match case {
+            "foreign owner" => saved["payload"]["thread_id"] = json!(PARENT),
+            "turn mismatch" => saved["payload"]["turn_id"] = json!("another"),
+            "item mismatch" => saved["payload"]["item_id"] = json!("another"),
+            _ => {}
+        }
+        rows.extend([raw, saved]);
+        if case == "copied" {
+            rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"task_complete","turn_id":"scope","thread_id":PARENT}}));
+        } else {
+            rows.push(json!({"type":"event_msg","ordinal":ordinal+2,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"scope","item":{"type":"UserMessage","id":"pair","content":[{"type":"text","text":"paired request"}]}}}));
+        }
+        let end = rows.len() + 2;
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, end, Some(bookmark(CHILD, &rows)), false),
+                message(end + 1, "detached request"),
+            ],
+        )?;
+        for id in [CHILD, REVERT] {
+            let snapshot = CodexAdapter::with_root(home.path())
+                .read_session(&SessionRef::new(Provider::Codex, id))?;
+            let messages = omnis_core::import_conversation(&snapshot).messages;
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.text == "paired request")
+                    .count(),
+                usize::from(case == "child"),
+                "{id} {case}"
+            );
+        }
+    }
+    Ok(())
+}
