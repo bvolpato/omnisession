@@ -13,9 +13,9 @@ mod private;
 mod receipts;
 
 pub(super) use receipts::{
-    annotate_model_receipt, clear_source_receipt, deferred_model_receipt, equivalent_model_receipt,
-    model_body, model_output_matcher, pending_command_output_matches, pending_shell_agrees,
-    shell_output_conflicts, with_source_receipt,
+    ShellSources, annotate_model_receipt, clear_source_receipt, deferred_model_receipt,
+    equivalent_model_receipt, model_body, model_output_matcher, pending_command_output_matches,
+    pending_shell_agrees, pending_shell_conflicts, shell_output_conflicts, with_source_receipt,
 };
 mod status;
 
@@ -158,7 +158,7 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
                 json!({"type":item_type,"id":item["id"].as_str()?}),
             ));
         }
-        "CommandExecution" => &["command", "cwd", "exit_code"],
+        "CommandExecution" => &["command", "cwd", "exit_code", "process_id"],
         "FileChange" => &["changes", "stdout", "stderr"],
         "FunctionCallOutput" => &["name", "namespace"],
         "DynamicToolCall" => &["namespace", "tool", "arguments", "error"],

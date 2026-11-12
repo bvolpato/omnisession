@@ -953,6 +953,162 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
 }
 
 #[test]
+fn codex_search_follows_a_restored_active_rollout_at_an_older_or_equal_time() {
+    for (same_project, legacy_index) in [(false, false), (true, false), (true, true)] {
+        let fixture = Fixture::new();
+        let active = fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        let archives = fixture.root.join("codex/archived_sessions");
+        fs::create_dir(&archives).unwrap();
+        let archive = archives.join(active.file_name().unwrap());
+        fs::rename(&active, &archive).unwrap();
+        let archived_time = archive.metadata().unwrap().modified().unwrap();
+        let search = |query, project: &Path, extra: &[&str]| {
+            let mut args = vec![
+                query,
+                "--provider",
+                "codex",
+                "--project",
+                project.to_str().unwrap(),
+                "--show-text",
+            ];
+            args.extend_from_slice(extra);
+            fixture.search_json(&args)
+        };
+        let original = &fixture.workspace;
+        let restored = if same_project {
+            original.clone()
+        } else {
+            fixture.root.join("other-workspace")
+        };
+        assert_eq!(
+            search("unchanged", original, &[])["results"][0]["match"],
+            "conversation"
+        );
+        if legacy_index {
+            let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+            for table in ["session_index", "session_trajectories"] {
+                db.execute(&format!("UPDATE {table} SET source_file_id = NULL, source_contents_id = NULL WHERE session_id = ?1"), [CODEX_ID]).unwrap();
+            }
+        }
+        write_codex_session(
+            &fixture.root,
+            CODEX_ID,
+            &restored,
+            "Restored request",
+            "metronome",
+        );
+        fs::File::options()
+            .write(true)
+            .open(&active)
+            .unwrap()
+            .set_modified(if same_project {
+                archived_time
+            } else {
+                archived_time - std::time::Duration::from_secs(60)
+            })
+            .unwrap();
+        assert!(result_sessions(&search("unchanged", &restored, &["--no-index"])).is_empty());
+        let current = search("metronome", &restored, &[]);
+        assert_eq!(
+            result_sessions(&current),
+            [format!("codex:{CODEX_ID}")],
+            "{current}"
+        );
+        assert_eq!(current["results"][0]["title"], "Restored request");
+        assert_eq!(current["results"][0]["match"], "conversation");
+        assert!(result_sessions(&search("unchanged", original, &[])).is_empty());
+        let warm = search("metronome", &restored, &[]);
+        assert_eq!(warm["index"]["stale"], 0);
+        assert_eq!(result_sessions(&warm), result_sessions(&current));
+    }
+}
+
+#[test]
+fn codex_gui_name_changes_without_reindexing_the_conversation() {
+    for archived in [false, true] {
+        check_codex_gui_name_changes(archived);
+    }
+}
+
+fn check_codex_gui_name_changes(archived: bool) {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(fixture.root.join("codex/state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, history_mode TEXT, name TEXT)").unwrap();
+    let rollout = fixture
+        .root
+        .join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ))
+        .canonicalize()
+        .unwrap();
+    let source = fs::read_to_string(&rollout).unwrap();
+    let (header, conversation) = source.split_once('\n').unwrap();
+    let mut header: Value = serde_json::from_str(header).unwrap();
+    header["payload"]["history_mode"] = json!("paginated");
+    write_paginated_conversation(&rollout, header, conversation, 0);
+    if archived {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let directory = fixture.root.join("codex/archived_sessions");
+        fs::create_dir(&directory).unwrap();
+        let gzip = directory
+            .join(rollout.file_name().unwrap())
+            .with_extension("jsonl.gz");
+        let mut encoder = GzEncoder::new(fs::File::create(gzip).unwrap(), Compression::fast());
+        encoder.write_all(&fs::read(&rollout).unwrap()).unwrap();
+        encoder.finish().unwrap();
+        fs::remove_file(&rollout).unwrap();
+    }
+    let original = "Xylophonist";
+    let renamed = "Vibraphonist";
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, ?3, 'paginated', ?4)",
+        rusqlite::params![
+            CODEX_ID,
+            rollout.to_str(),
+            fixture.workspace.to_str(),
+            original
+        ],
+    )
+    .unwrap();
+    let search = |q| fixture.search_json(&[q, "--provider", "codex", "--show-text"]);
+    assert_eq!(search(original)["results"][0]["title"], original);
+    let cache = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    assert_eq!(
+        cache.execute(
+            "UPDATE session_trajectories SET document_version=6, derived_title=?1, derived_title_is_verified=1, derived_title_is_local_opener=0 WHERE provider='codex' AND session_id=?2",
+            rusqlite::params![original, CODEX_ID],
+        ).unwrap(),
+        1
+    );
+    for name in [Some(renamed), None] {
+        db.execute("UPDATE threads SET name = ?1", [name]).unwrap();
+        assert!(
+            result_sessions(
+                &fixture.search_json(&[original, "--provider", "codex", "--no-index",])
+            )
+            .is_empty()
+        );
+        assert!(result_sessions(&search(original)).is_empty());
+        if let Some(name) = name {
+            assert_eq!(search(name)["results"][0]["match"], "metadata");
+        } else {
+            assert!(result_sessions(&search(renamed)).is_empty());
+        }
+        let conversation = search("unchanged");
+        assert_eq!(conversation["index"]["indexed"], 0);
+        assert_eq!(conversation["results"][0]["match"], "conversation");
+        assert_eq!(
+            conversation["results"][0]["title"],
+            name.unwrap_or("Tune the rate limiter backoff")
+        );
+    }
+}
+
+#[test]
 fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     let fixture = Fixture::new();
     let indexed = fixture
@@ -1639,24 +1795,7 @@ impl Fixture {
             "thread_id": "019f0000-0000-7000-8000-000000000099",
             "end_byte_offset": 512, "end_ordinal_exclusive": 4
         });
-        let turn = "019f0000-0000-7000-8000-000000000005";
-        let marker = |kind| json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn}});
-        let records = [header, marker("task_started")]
-            .into_iter()
-            .chain(
-                conversation
-                    .lines()
-                    .flat_map(|line| paginated_pair(serde_json::from_str(line).unwrap(), 5)),
-            )
-            .chain([marker("task_complete")])
-            .enumerate()
-            .map(|(i, mut row)| {
-                row["timestamp"] = json!(STAMP);
-                row["ordinal"] = json!(i + 4);
-                row
-            })
-            .collect::<Vec<_>>();
-        write_jsonl(&path, &records);
+        write_paginated_conversation(&path, header, conversation, 4);
     }
 
     fn index_codex(&self) -> Value {
@@ -1672,6 +1811,32 @@ impl Fixture {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+}
+
+fn write_paginated_conversation(
+    path: &Path,
+    header: Value,
+    conversation: &str,
+    first_ordinal: usize,
+) {
+    let turn = "019f0000-0000-7000-8000-000000000005";
+    let marker = |kind| json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn}});
+    let records = [header, marker("task_started")]
+        .into_iter()
+        .chain(
+            conversation
+                .lines()
+                .flat_map(|line| paginated_pair(serde_json::from_str(line).unwrap(), 5)),
+        )
+        .chain([marker("task_complete")])
+        .enumerate()
+        .map(|(i, mut row)| {
+            row["timestamp"] = json!(STAMP);
+            row["ordinal"] = json!(i + first_ordinal);
+            row
+        })
+        .collect::<Vec<_>>();
+    write_jsonl(path, &records);
 }
 
 fn paginated_pair(mut row: Value, turn_number: u64) -> [Value; 2] {

@@ -24,6 +24,7 @@ impl DeferredReceipts {
         display: u64,
         owner: u64,
         pending: Option<u64>,
+        ambiguous: bool,
         identity: Option<DisplayCallIdentity>,
     ) {
         if self.0.is_empty() && pending.is_none() {
@@ -41,7 +42,7 @@ impl DeferredReceipts {
             display,
             owner,
             awaiting: pending.or_else(|| revisions.last()?.awaiting),
-            ambiguous: pending.is_some(),
+            ambiguous,
             identity,
         };
         if let Some(last) = revisions.last_mut()
@@ -69,8 +70,9 @@ impl CodexHistory {
                 continue;
             };
             for old in revisions {
-                if old.ambiguous
+                if old.awaiting.is_some()
                     && old.display != active.display
+                    && self.resolve_receipt(builder, &turn, &id, old).is_none()
                     && let Some(event) = builder.event_at_mut(old.display)
                     && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
                 {
@@ -95,30 +97,25 @@ impl CodexHistory {
         builder: &mut EventBuilder,
         turn: &str,
         id: &str,
-    ) {
+    ) -> Option<u64> {
         if self.deferred_receipts.0.is_empty() {
-            return;
+            return None;
         }
         let key = (turn.to_owned(), id.to_owned());
-        let Some(active) = self
-            .deferred_receipts
-            .0
-            .get(&key)
-            .and_then(|entries| entries.last())
-            .copied()
-        else {
-            return;
-        };
-        if self.resolve_receipt(builder, turn, id, active).is_some()
-            && let Some(last) = self
-                .deferred_receipts
-                .0
-                .get_mut(&key)
-                .and_then(|entries| entries.last_mut())
+        let active = *self.deferred_receipts.0.get(&key)?.last()?;
+        if active.awaiting.is_some()
+            && self.resolve_receipt(builder, turn, id, active).is_none()
+            && builder.event_at_mut(active.display).is_some_and(|e| {
+                e.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+            })
         {
+            return Some(active.display);
+        }
+        if let Some(last) = self.deferred_receipts.0.get_mut(&key)?.last_mut() {
             last.ambiguous = false;
             last.awaiting = None;
         }
+        None
     }
 
     fn resolve_receipt(
@@ -158,15 +155,27 @@ impl CodexHistory {
                     .is_some_and(|e| same_function(&e.payload, &display)),
             };
             compatible
-                && builder
-                    .event_at_mut(result)
-                    .is_some_and(|e| completed_item::deferred_model_receipt(&display, &e.payload))
+                && builder.event_at_mut(result).is_some_and(|e| {
+                    completed_item::deferred_model_receipt(
+                        &display,
+                        &e.payload,
+                        &self.items.shell_sources,
+                    )
+                })
         });
         let model = candidates.next()?;
-        if candidates.next().is_some()
-            || !completion_positions::pair(builder, active.display, model)
-        {
+        if candidates.next().is_some() {
             return None;
+        }
+        let previous = self
+            .display_revisions
+            .before(builder, Some(model), active.owner);
+        if !completion_positions::pair(builder, active.display, model, &self.items.shell_sources) {
+            return None;
+        }
+        if !self.paginated {
+            self.display_revisions
+                .observe(builder, model, active.owner, previous);
         }
         if self.paginated {
             self.paginated_answers

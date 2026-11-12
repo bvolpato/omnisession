@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use super::super::paginated_rollback::json_digest;
 
 mod shell;
+mod sources;
+pub(in crate::codex) use sources::ShellSources;
 
 const WITNESS: &str = "omnisession_codex_source_receipt";
 type Key = [u8; 32];
@@ -264,7 +266,7 @@ fn body_matches(witness: &Value, body: Option<&str>, structured: Option<&str>, m
 
 pub(in super::super) fn model_output_matcher(
     source: &Value,
-) -> (Option<Key>, impl Fn(&Value) -> bool + use<>) {
+) -> (Option<Key>, impl Fn(&Value) -> bool + '_) {
     let (body_key, structured) = display_keys(source);
     let body = body_key.map(hex::encode);
     let structured = structured.map(hex::encode);
@@ -275,7 +277,7 @@ pub(in super::super) fn model_output_matcher(
         if let Some(command) = &command
             && let Some(witness) = model[WITNESS].get("shell")
         {
-            return shell::agrees(command, witness);
+            return shell::agrees(command, witness, source["aggregated_output"].as_str());
         }
         body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
             || body_matches(&model[WITNESS], sanitized.as_deref(), None, mcp)
@@ -294,22 +296,47 @@ pub(in super::super) fn shell_output_conflicts(item: &Value, model: &Value) -> b
     model[WITNESS]
         .get("shell")
         .zip(command_display(item))
-        .is_some_and(|(w, d)| !shell::agrees(&d, w))
+        .is_some_and(|(w, d)| {
+            !shell::precedes_terminal_display(&d, w)
+                && !shell::agrees(&d, w, item["aggregated_output"].as_str())
+        })
 }
 
-pub(in super::super) fn pending_shell_agrees(display: &Value, output: &Value) -> Option<bool> {
-    Some(shell::agrees(display, &shell::output(output)?))
+pub(in super::super) fn pending_shell_conflicts(
+    display: &Value,
+    output: &Value,
+    sources: &ShellSources,
+) -> bool {
+    shell::output(output).is_some_and(|w| {
+        !shell::precedes_terminal_display(display, &w) && !sources.agrees(display, &w)
+    })
 }
 
-pub(in super::super) fn deferred_model_receipt(display: &Value, model: &Value) -> bool {
+pub(in super::super) fn pending_shell_agrees(
+    display: &Value,
+    output: &Value,
+    sources: &ShellSources,
+) -> Option<bool> {
+    Some(sources.agrees(display, &shell::output(output)?))
+}
+
+pub(in super::super) fn deferred_model_receipt(
+    display: &Value,
+    model: &Value,
+    sources: &ShellSources,
+) -> bool {
     if display["type"] == "CommandExecution" && model[WITNESS].get("shell").is_none() {
         return false;
     }
-    equivalent_model_receipt(display, model)
+    equivalent_model_receipt(display, model, sources)
 }
 
-pub(in super::super) fn pending_command_output_matches(display: &Value, output: &Value) -> bool {
-    if let Some(agrees) = pending_shell_agrees(display, output) {
+pub(in super::super) fn pending_command_output_matches(
+    display: &Value,
+    output: &Value,
+    sources: &ShellSources,
+) -> bool {
+    if let Some(agrees) = pending_shell_agrees(display, output, sources) {
         return agrees;
     }
     model_body(output)
@@ -317,11 +344,15 @@ pub(in super::super) fn pending_command_output_matches(display: &Value, output: 
         .is_some_and(|key| display[WITNESS]["body"] == key)
 }
 
-pub(in super::super) fn equivalent_model_receipt(display: &Value, model: &Value) -> bool {
+pub(in super::super) fn equivalent_model_receipt(
+    display: &Value,
+    model: &Value,
+    sources: &ShellSources,
+) -> bool {
     match display["type"].as_str() {
         Some("CommandExecution") => model[WITNESS]
             .get("shell")
-            .is_none_or(|w| shell::agrees(display, w)),
+            .is_none_or(|w| sources.agrees(display, w)),
         Some("FunctionCallOutput") => body_matches(
             &model[WITNESS],
             display[WITNESS]["body"].as_str(),
@@ -361,10 +392,21 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
         || display["error"]
             .as_str()
             .is_some_and(|error| model["output"] == error);
+    let fuller_command = display["type"] == "CommandExecution"
+        && model[WITNESS]["shell"]["cut"].is_object()
+        && display[WITNESS]["body"] != model[WITNESS]["shell"]["body"]
+        && display[WITNESS]["body"] != model[WITNESS]["shell"]["timeout_body"];
     let Some(fields) = model.as_object_mut() else {
         return;
     };
     fields.remove("omnisession_codex_tool_display");
+    if fuller_command {
+        fields.insert(
+            "omnisession_codex_tool_display".into(),
+            json!({"type":"CommandExecution","output":display["output"]}),
+        );
+        return;
+    }
     if !matches!(
         display["type"].as_str(),
         Some("McpToolCall" | "DynamicToolCall" | "FunctionCallOutput")

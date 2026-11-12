@@ -94,7 +94,7 @@ impl ToolOccurrences {
         }
     }
 
-    pub(super) fn results(&self, turn: &str, id: &str) -> impl Iterator<Item = u64> {
+    pub(super) fn results(&self, turn: &str, id: &str) -> impl DoubleEndedIterator<Item = u64> {
         self.0
             .get(turn)
             .and_then(|items| items.get(id))

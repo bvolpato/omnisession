@@ -2344,3 +2344,66 @@ fn a_new_published_name_needs_an_identifiable_function_occurrence() {
         }
     }
 }
+
+#[test]
+fn rolling_back_a_deferred_rename_restores_the_owning_inputs_published_name() {
+    let user = |text| {
+        event(
+            "user_message",
+            json!({"message":text,"images":[],"local_images":[],"text_elements":[]}),
+        )
+    };
+    let called = || {
+        let mut row = call(None);
+        row["payload"]["name"] = json!("lookup");
+        row
+    };
+    let shown = |turn, name, body| {
+        turn_item(
+            turn,
+            &json!({"type":"FunctionCallOutput","id":"cmd","name":name,"output":body}),
+        )
+    };
+    for (second, display_turn) in [
+        ("first", "first"),
+        ("second", "second"),
+        ("second", "first"),
+    ] {
+        let rows = vec![
+            event("task_started", json!({"turn_id":"first"})),
+            message("user", "first request"),
+            user("first request"),
+            called(),
+            model_result("alpha cue"),
+            shown("first", "OriginalAlias", "alpha cue"),
+            event("task_complete", json!({"turn_id":"first"})),
+            event("task_started", json!({"turn_id":second})),
+            message("user", "next request"),
+            user("next request"),
+            called(),
+            shown(display_turn, "lookup", "alpha cue"),
+            model_result("beta cue"),
+            shown(display_turn, "lookup", "beta cue"),
+            event("task_complete", json!({"turn_id":second})),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ];
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snap)] {
+                assert_eq!(
+                    text.contains("OriginalAlias"),
+                    display_turn == second,
+                    "{second} {display_turn} {text}"
+                );
+                assert_eq!(
+                    text.contains("beta cue"),
+                    display_turn != second,
+                    "{second} {display_turn} {text}"
+                );
+                assert_eq!(text.matches("alpha cue").count(), 1);
+            }
+        }
+    }
+}

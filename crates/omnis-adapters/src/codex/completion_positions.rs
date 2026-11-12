@@ -29,7 +29,12 @@ pub(super) fn restore_model_output(event: &mut OmniEvent) {
     event.kind = model_result_kind(&event.payload);
 }
 
-pub(super) fn pair(builder: &mut EventBuilder, display: u64, model: u64) -> bool {
+pub(super) fn pair(
+    builder: &mut EventBuilder,
+    display: u64,
+    model: u64,
+    sources: &super::completed_item::ShellSources,
+) -> bool {
     let Some(slot) = builder.event_at_mut(display) else {
         return false;
     };
@@ -44,7 +49,11 @@ pub(super) fn pair(builder: &mut EventBuilder, display: u64, model: u64) -> bool
         .event_at_mut(model)
         .filter(|event| model_output(event))
         .is_some_and(|result| {
-            if !super::completed_item::equivalent_model_receipt(&display_payload, &result.payload) {
+            if !super::completed_item::equivalent_model_receipt(
+                &display_payload,
+                &result.payload,
+                sources,
+            ) {
                 // A distinct published item keeps its native ID without claiming the recorded call.
                 unattribute_display(&mut display_payload);
                 return false;
@@ -281,11 +290,19 @@ impl CodexHistory {
             .display_identity
             .and_then(|identity| self.calls.display_matches_call(identity, call.sequence));
         let shell_agrees = event.payload["type"] != "CommandExecution"
-            || super::completed_item::pending_shell_agrees(&event.payload, output) != Some(false);
+            || !super::completed_item::pending_shell_conflicts(
+                &event.payload,
+                output,
+                &self.items.shell_sources,
+            );
         if shell_agrees
             && compatible.unwrap_or_else(|| {
                 event.payload["type"] == "CommandExecution"
-                    && super::completed_item::pending_command_output_matches(&event.payload, output)
+                    && super::completed_item::pending_command_output_matches(
+                        &event.payload,
+                        output,
+                        &self.items.shell_sources,
+                    )
             })
         {
             return false;
@@ -319,7 +336,11 @@ impl CodexHistory {
         };
         if builder.event_at_mut(slot.sequence).is_some_and(|event| {
             event.payload["type"] == "CommandExecution"
-                && super::completed_item::pending_shell_agrees(&event.payload, output) == Some(true)
+                && super::completed_item::pending_shell_agrees(
+                    &event.payload,
+                    output,
+                    &self.items.shell_sources,
+                ) == Some(true)
         }) || super::completed_item::model_body(output) == Some(expected)
         {
             return false;
@@ -399,9 +420,9 @@ impl CodexHistory {
     ) -> Projection {
         let display = payload["type"] == "item_completed";
         let item = &payload["item"];
-        if display {
-            self.resolve_before_revision(builder, turn, id);
-        }
+        let unresolved = display
+            .then(|| self.resolve_before_revision(builder, turn, id))
+            .flatten();
         let receipt = Receipt::from_item(item);
         let historical = CompletionScope::Historical(kind);
         let positions = self.completed.get(turn);
@@ -416,7 +437,10 @@ impl CodexHistory {
         };
         let previous = get(previous_scope);
         let old_model = published.and_then(|p| p.model);
-        let last_result = history.or(old_model);
+        let last_result = history
+            .or(old_model)
+            .filter(|position| Some(*position) != unresolved)
+            .or_else(|| unresolved.and_then(|_| self.occurrences.results(turn, id).next_back()));
         let generated = super::is_implicit_turn(turn) && self.current_turn_id() == Some(turn);
         let candidate = self
             .calls
@@ -439,7 +463,7 @@ impl CodexHistory {
         };
         let mut projection = Projection {
             reconsider: pending.filter(|_| {
-                ambiguous
+                wait_for_call
                     && matches!(
                         item["type"].as_str(),
                         Some("FunctionCallOutput" | "DynamicToolCall" | "CommandExecution")
@@ -461,14 +485,8 @@ impl CodexHistory {
             ambiguous,
         };
         if !self.paginated {
-            return self.legacy_projection(
-                builder,
-                projection,
-                payload,
-                history,
-                legacy_output,
-                prior,
-            );
+            projection =
+                self.legacy_projection(builder, projection, payload, history, legacy_output, prior);
         } else if display {
             projection.scope = CompletionScope::Published;
             projection.original = published.map(|p| p.sequence);
@@ -486,6 +504,9 @@ impl CodexHistory {
                     !wait_for_call && slot.kind == CompletedKind::Tool && slot.model.is_none()
                 })
                 .map(|slot| slot.sequence);
+        }
+        if projection.original == unresolved {
+            projection.original = None;
         }
         projection
     }
@@ -623,7 +644,7 @@ impl CodexHistory {
                     None => position.model,
                 };
                 if let Some(model) = model {
-                    pair(builder, position.sequence, model);
+                    pair(builder, position.sequence, model, &self.items.shell_sources);
                 }
             }
         }

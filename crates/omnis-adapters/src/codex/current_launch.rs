@@ -189,8 +189,8 @@ fn filesystem_selects(
             5,
             &mut walked,
             SCAN_LIMIT + 1,
-            &mut unreadable,
-            &mut depth_limited,
+            (&mut unreadable, &mut depth_limited),
+            &mut Vec::new(),
             Some(&mut walked_links),
         );
         if unreadable != 0

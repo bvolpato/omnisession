@@ -45,10 +45,19 @@ pub(super) fn output(output: &Value) -> Option<Value> {
         if !super::mcp_time(time) {
             return None;
         }
-        let (code, tail) = tail
-            .strip_prefix("Process exited with code ")?
-            .split_once('\n')?;
-        let exit: i32 = decimal(code)?;
+        let (exit, tail) = if let Some(rest) = tail.strip_prefix("Process exited with code ") {
+            let (code, tail) = rest.split_once('\n')?;
+            (Some(decimal::<i32>(code)?), tail)
+        } else {
+            (None, tail)
+        };
+        let (process, tail) =
+            if let Some(rest) = tail.strip_prefix("Process running with session ID ") {
+                let (id, tail) = rest.split_once('\n')?;
+                (Some(decimal::<i32>(id)?), tail)
+            } else {
+                (None, tail)
+            };
         let tail = if let Some(rest) = tail.strip_prefix("Original token count: ") {
             let (count, rest) = rest.split_once('\n')?;
             decimal::<u64>(count)?;
@@ -56,7 +65,11 @@ pub(super) fn output(output: &Value) -> Option<Value> {
         } else {
             tail
         };
-        (exit, tail.strip_prefix("Output:\n")?, None, None)
+        let body = tail.strip_prefix("Output:\n")?;
+        if let Some(id) = process {
+            return Some(json!({"running": id}));
+        }
+        (exit?, body, None, None)
     };
     let mut result = json!({"code":exit,"body":body_key(body)});
     let mut timeout_bytes = 0;
@@ -122,20 +135,20 @@ pub(super) fn display_sizes(text: &str) -> Value {
     json!({"bytes":text.len(),"chars":text.chars().count(),"lines":text.lines().count()})
 }
 
-fn truncated_matches(display: &Value, cut: &Value) -> Option<bool> {
+fn truncated_matches(display: &Value, cut: &Value, source: Option<&str>) -> Option<bool> {
     let sizes = &display[WITNESS]["shell_sizes"];
     let bytes = usize::try_from(sizes["bytes"].as_u64()?).ok()?;
     let chars = usize::try_from(sizes["chars"].as_u64()?).ok()?;
     let left = usize::try_from(cut["left"].as_u64()?).ok()?;
     let right = usize::try_from(cut["right"].as_u64()?).ok()?;
     let count = usize::try_from(cut["count"].as_u64()?).ok()?;
-    let text = display["output"].as_str()?;
+    let text = source.or_else(|| display["output"].as_str())?;
     let prefix = text.get(..left)?;
     let suffix = text.get(text.len().checked_sub(right)?..)?;
     let lc = prefix.chars().count();
     let rc = suffix.chars().count();
     let edge = super::super::super::MAX_TOOL_STRING_CHARACTERS / 2;
-    if chars > edge * 2 && (lc > edge || rc > edge) {
+    if source.is_none() && chars > edge * 2 && (lc > edge || rc > edge) {
         return Some(false);
     }
     let omitted = bytes.checked_sub(left.checked_add(right)?)?;
@@ -171,7 +184,17 @@ fn truncated_matches(display: &Value, cut: &Value) -> Option<bool> {
     )
 }
 
-pub(super) fn agrees(display: &Value, witness: &Value) -> bool {
+pub(super) fn precedes_terminal_display(display: &Value, witness: &Value) -> bool {
+    matches!(display["status"].as_str(), Some("completed" | "failed"))
+        && witness["running"]
+            .as_i64()
+            .is_some_and(|id| display["process_id"].as_str().and_then(decimal::<i64>) == Some(id))
+}
+
+pub(super) fn agrees(display: &Value, witness: &Value, source: Option<&str>) -> bool {
+    if witness["running"].is_number() {
+        return false;
+    }
     let code = &witness["code"];
     let expected = &display[WITNESS]["body"];
     if !display["exit_code"].is_null() && display["exit_code"] != *code {
@@ -186,5 +209,5 @@ pub(super) fn agrees(display: &Value, witness: &Value) -> bool {
         && expected.is_string()
         && (*expected == witness["body"]
             || *expected == witness["timeout_body"]
-            || truncated_matches(display, &witness["cut"]) == Some(true))
+            || truncated_matches(display, &witness["cut"], source) == Some(true))
 }

@@ -2219,3 +2219,75 @@ fn revising_an_identified_deferred_failure_restores_its_own_result_status() {
         }
     }
 }
+
+#[test]
+fn delayed_command_outputs_resolve_each_identifiable_display() {
+    let records = |text: &str| {
+        let raw = format!("Exit code: 1\nWall time: 0.1 seconds\nOutput:\n{text}");
+        let [mut call, result, mut display] = command_rows("turn", "same", &raw);
+        call["payload"]["name"] = "shell_command".into();
+        call["payload"]["arguments"] = json!({"command":"pwd"}).to_string().into();
+        display["payload"]["item"]["aggregated_output"] = text.into();
+        display["payload"]["item"]["status"] = "failed".into();
+        display["payload"]["item"]["exit_code"] = 1.into();
+        (call, result, display)
+    };
+    for tied in [false, true] {
+        let (call, a, display_a) = records("ALPHA");
+        let (_, b, display_b) = records(if tied { "ALPHA" } else { "BETA" });
+        for (index, ending) in [
+            [display_a.clone(), display_b.clone(), b.clone()],
+            [display_b.clone(), display_a.clone(), b.clone()],
+            [display_a.clone(), b.clone(), display_b.clone()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                call.clone(),
+                a.clone(),
+                call.clone(),
+            ];
+            rows.extend(ending);
+            for mode in ["legacy", "paginated"] {
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                    let flags: Vec<_> =
+                        omnis_core::native_trajectory_items(&omnis_core::import_trajectory(&snap))
+                            .into_iter()
+                            .filter_map(|item| match item {
+                                omnis_core::NativeTrajectoryItem::Tool { is_error, .. } => {
+                                    Some(is_error)
+                                }
+                                omnis_core::NativeTrajectoryItem::Message { .. } => None,
+                            })
+                            .collect();
+                    let raw: Vec<_> = snap
+                        .events
+                        .iter()
+                        .filter(|event| {
+                            event.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .map(|event| event.kind == omnis_ir::EventKind::ToolFailed)
+                        .collect();
+                    assert_eq!(
+                        raw, [!tied; 2],
+                        "{mode} preview {preview}, order {index}, tied {tied}"
+                    );
+                    if tied {
+                        assert!(flags.iter().all(|failed| !failed));
+                    } else {
+                        assert_eq!(flags, [true, true]);
+                    }
+                    assert_eq!(
+                        omnis_core::trajectory_search_document(&snap).source_complete,
+                        !tied,
+                        "{mode} preview {preview}, order {index}, tied {tied}"
+                    );
+                }
+            }
+        }
+    }
+}

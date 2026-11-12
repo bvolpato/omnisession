@@ -10,6 +10,7 @@ pub(super) struct PreviousDisplay {
     kind: EventKind,
     // A model result keeps its original payload when its display status changes.
     payload: Option<Value>,
+    model_display: Option<Value>,
     message_source: Option<String>,
 }
 
@@ -47,6 +48,7 @@ impl PreviousDisplay {
         Self {
             kind: std::mem::replace(&mut event.kind, kind),
             payload: Some(std::mem::replace(&mut event.payload, payload)),
+            model_display: None,
             message_source: event.source.raw_record_type.replace(raw_type.to_owned()),
         }
     }
@@ -71,10 +73,23 @@ impl PreviousDisplay {
                 .message_source
                 .as_ref()
                 .is_none_or(|source| Some(source) == event.source.raw_record_type.as_ref())
+            && self
+                .model_display
+                .as_ref()
+                .is_none_or(|display| display == &event.payload["omnisession_codex_tool_display"])
             && self.payload.as_ref().is_none_or(|p| p == &event.payload)
     }
 
     fn restore(self, event: &mut OmniEvent) {
+        if let Some(display) = self.model_display
+            && let Some(fields) = event.payload.as_object_mut()
+        {
+            if display.is_null() {
+                fields.remove("omnisession_codex_tool_display");
+            } else {
+                fields.insert("omnisession_codex_tool_display".into(), display);
+            }
+        }
         if self.message_source.is_some() || is_display(event) {
             event.kind = self.kind;
             if let Some(payload) = self.payload {
@@ -148,6 +163,8 @@ impl DisplayRevisions {
         Some(PreviousDisplay {
             kind: event.kind.clone(),
             payload: is_display(event).then(|| event.payload.clone()),
+            model_display: super::completion_positions::model_output(event)
+                .then(|| event.payload["omnisession_codex_tool_display"].clone()),
             message_source: None,
         })
     }
@@ -223,6 +240,11 @@ impl DisplayRevisions {
         let size = size_of::<Revision>();
         let mut bytes = size
             + previous.payload.as_ref().map_or(0, estimated_event_bytes)
+            + previous
+                .model_display
+                .as_ref()
+                .filter(|display| !display.is_null())
+                .map_or(0, estimated_event_bytes)
             + previous.message_source.as_ref().map_or(0, String::len);
         let previous = if unknown || bytes > self.max_bytes {
             bytes = size;
@@ -313,7 +335,7 @@ impl DisplayRevisions {
                 }
                 omitted += 1;
                 if !is_display(event) {
-                    event.kind = model_result_kind(&event.payload);
+                    super::completion_positions::restore_model_output(event);
                 }
             }
         }

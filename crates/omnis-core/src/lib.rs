@@ -61,7 +61,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::OhMyPi => 9,
-        Provider::Pi | Provider::Codex => 7,
+        Provider::Pi => 7,
+        Provider::Codex => 8,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -846,6 +847,20 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     {
         return compact_search_title(title);
     }
+    first_user_search_title(snapshot)
+}
+
+/// Derives the title stored with the conversation. Codex keeps assigned names in separate metadata.
+#[must_use]
+pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
+    if provider == Provider::Codex {
+        first_user_search_title(snapshot)
+    } else {
+        session_search_title(snapshot)
+    }
+}
+
+fn first_user_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     let events = visible_events(snapshot);
     title_opener(
         events
@@ -1299,7 +1314,8 @@ fn search_event_text(
             // as `db_passwd`.
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
-            serde_json::to_string(&payload).ok()?
+            codex_command_search_text(event, &mut payload)
+                .or_else(|| serde_json::to_string(&payload).ok())?
         }
     };
     let safe_text = safe_terminal_text(&raw_text);
@@ -1331,6 +1347,29 @@ fn search_event_text(
         source_byte_count,
         truncated,
     })
+}
+
+fn codex_command_search_text(event: &OmniEvent, payload: &mut serde_json::Value) -> Option<String> {
+    if event.source.provider != Provider::Codex {
+        return None;
+    }
+    let display = if payload.get("omnisession_codex_tool_display").is_some() {
+        &mut payload["omnisession_codex_tool_display"]
+    } else {
+        &mut *payload
+    };
+    if display["type"] != "CommandExecution" || !display["output"].as_str()?.contains(['\n', '\r'])
+    {
+        return None;
+    }
+    // Preserve real line boundaries so the search tokenizer sees the first word on each line.
+    let serde_json::Value::String(output) = display.as_object_mut()?.remove("output")? else {
+        return None;
+    };
+    Some(format!(
+        "{}\n{output}",
+        serde_json::to_string(payload).ok()?
+    ))
 }
 
 const fn search_truncation_strategy(
@@ -3554,7 +3593,11 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
             .payload
             .get("omnisession_codex_tool_display")
             .unwrap_or(&event.payload);
-        if display["type"] == "FunctionCallOutput"
+        if display["type"] == "CommandExecution"
+            && let Some(output) = display["output"].as_str()
+        {
+            output.clone_into(&mut summary);
+        } else if display["type"] == "FunctionCallOutput"
             && let Some(name) = display["name"].as_str()
         {
             let namespace = display["namespace"]

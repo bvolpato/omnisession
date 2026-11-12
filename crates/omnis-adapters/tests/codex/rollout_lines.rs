@@ -1599,3 +1599,181 @@ fn provider_command_wrappers_preserve_timeout_truncation_and_exit_evidence() {
         }
     }
 }
+
+#[test]
+fn a_running_exec_result_keeps_its_session_id_and_the_later_process_failure() {
+    let diagnostic = "DiskQuotaExceeded";
+    let command = physical_call(
+        "exec_command",
+        &json!({"cmd":"run-check","yield_time_ms":1000}),
+    );
+    let mut display = command_display("run-check", "failed", diagnostic);
+    display["payload"]["item"]["process_id"] = "12345".into();
+    display["payload"]["item"]["exit_code"] = 1.into();
+    for (header, output, running, complete) in [
+        (
+            "Process running with session ID 12345",
+            "started",
+            true,
+            true,
+        ),
+        (
+            "Process running with session ID 12345",
+            diagnostic,
+            true,
+            true,
+        ),
+        (
+            "Process running with session ID 999",
+            diagnostic,
+            true,
+            false,
+        ),
+        ("Process exited with code 1", diagnostic, false, true),
+    ] {
+        let raw = physical_result(&format!(
+            "Chunk ID: a1b2c3\nWall time: 1.0000 seconds\n{header}\nOriginal token count: 2\nOutput:\n{output}"
+        ));
+        for suffix in [
+            [display.clone(), raw.clone()],
+            [raw.clone(), display.clone()],
+        ] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                page_user("turn", "user", "request"),
+                command.clone(),
+            ];
+            rows.extend(suffix);
+            for mode in [Some("paginated"), None] {
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                    let doc = omnis_core::trajectory_search_document(&snap);
+                    assert_eq!(doc.source_complete, complete, "{header} {mode:?} {preview}");
+                    for text in [doc.text, omnis_core::render_semantic_handoff(&snap)] {
+                        assert!(text.contains(diagnostic), "{text}");
+                        assert!(text.contains(header), "{text}");
+                    }
+                    let physical = snap
+                        .events
+                        .iter()
+                        .find(|event| {
+                            event.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .unwrap();
+                    assert_eq!(physical.kind == EventKind::ToolFailed, !running);
+                    assert_eq!(
+                        snap.events
+                            .iter()
+                            .filter(|event| event.kind == EventKind::ToolFailed)
+                            .count(),
+                        1
+                    );
+                    if running {
+                        assert!(snap.events.iter().any(|e| e.kind == EventKind::ToolFailed
+                            && e.payload["process_id"] == "12345"
+                            && e.payload["output"] == diagnostic));
+                    }
+                    let trajectory = omnis_core::import_trajectory(&snap);
+                    let native = omnis_core::native_trajectory_items(&trajectory);
+                    let failed_raw = native.iter().any(|item| {
+                        matches!(item, omnis_core::NativeTrajectoryItem::Tool { is_error: true, output, .. } if output.contains(header))
+                    });
+                    assert_eq!(failed_raw, !running);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn truncated_shell_results_keep_the_display_and_use_source_bytes_for_the_verdict() {
+    for (tool, edge, omitted) in [("shell_command", 800, 220), ("exec_command", 20_000, 5_000)] {
+        let left = "a".repeat(edge);
+        let right = "z".repeat(edge);
+        let diagnostic = "DiskQuotaExceeded";
+        let middle = format!("{diagnostic}{}", "m".repeat(omitted - diagnostic.len()));
+        let display_text = format!("{left}{middle}{right}");
+        let mut display = command_display("cat trial", "failed", &display_text);
+        display["payload"]["item"]["exit_code"] = 1.into();
+        let header = if tool == "exec_command" {
+            "Chunk ID: ab12cd\nWall time: 0.0420 seconds\nProcess exited with code 1\nOutput:\n"
+        } else {
+            "Exit code: 1\nWall time: 0 seconds\nOutput:\n"
+        };
+        for altered in [false, true] {
+            let mut retained = left.clone();
+            if altered {
+                retained.replace_range(edge - 1..edge, "X");
+            }
+            let model_text = format!(
+                "{header}{retained}…{} tokens truncated…{right}",
+                omitted / 4
+            );
+            for raw_first in [false, true] {
+                let key = if tool == "exec_command" {
+                    "cmd"
+                } else {
+                    "command"
+                };
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":"turn"})),
+                    page_user("turn", "user", "request"),
+                    physical_call(tool, &json!({(key):"cat trial"})),
+                ];
+                let raw = physical_result(&model_text);
+                rows.extend(if raw_first {
+                    [raw, display.clone()]
+                } else {
+                    [display.clone(), raw]
+                });
+                for mode in ["paginated", "legacy"] {
+                    for preview in [false, true] {
+                        let snapshot =
+                            read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                        let search = omnis_core::trajectory_search_document(&snapshot);
+                        assert_eq!(
+                            search.source_complete, !altered,
+                            "{tool} {mode} {raw_first}"
+                        );
+                        if !altered && tool == "shell_command" {
+                            assert!(search.text.contains(diagnostic));
+                            assert!(
+                                omnis_core::render_session_history_preview(&snapshot)
+                                    .contains(diagnostic)
+                            );
+                            assert!(
+                                omnis_core::render_semantic_handoff(&snapshot).contains(diagnostic)
+                            );
+                        }
+                        let model = snapshot
+                            .events
+                            .iter()
+                            .find(|e| {
+                                e.source.raw_record_type.as_deref()
+                                    == Some("response_item.function_call_output")
+                            })
+                            .unwrap();
+                        assert_eq!(model.kind == EventKind::ToolFailed, !altered);
+                        assert!(
+                            model.payload["output"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with(header)
+                        );
+                        let native = omnis_core::native_trajectory_items(
+                            &omnis_core::import_trajectory(&snapshot),
+                        );
+                        assert_eq!(
+                            native.iter().any(|entry| matches!(
+                                entry,
+                                omnis_core::NativeTrajectoryItem::Tool { is_error: true, .. }
+                            )),
+                            !altered
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
