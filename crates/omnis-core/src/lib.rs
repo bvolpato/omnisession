@@ -61,8 +61,7 @@ pub const fn search_document_version(provider: Provider) -> u32 {
         Provider::Antigravity => 11,
         Provider::OhMyPi | Provider::Codex => 10,
         Provider::AntigravityDesktop => 9,
-        Provider::Pi => 8,
-        Provider::Claude => 7,
+        Provider::Pi | Provider::Claude => 8,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -1319,7 +1318,20 @@ fn trajectory_search_document_with_limits(
     let visible = visible_history(snapshot);
     let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
     builder.source_incomplete = visible.source_incomplete();
+    let claude_summary = (snapshot.session.provider == Provider::Claude
+        && visible
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::CompactionCreated))
+    .then(|| visible_import_events(snapshot, true).current_compaction)
+    .flatten();
     for event in visible.events {
+        if event.source.provider == Provider::Claude
+            && event.kind == EventKind::CompactionCreated
+            && !claude_summary.is_some_and(|current| std::ptr::eq(current, event))
+        {
+            continue;
+        }
         let group = groups
             .get(groups.partition_point(|range| range.end <= event.sequence))
             .filter(|range| range.contains(&event.sequence));
@@ -1532,7 +1544,11 @@ fn search_event_text(
     }
 
     let raw_text = match event.kind {
-        EventKind::CompactionCreated if event.source.provider == Provider::Claude => return None,
+        EventKind::CompactionCreated
+            if event.source.provider == Provider::Claude && snapshot.is_none() =>
+        {
+            return None;
+        }
         EventKind::CompactionCreated => recorded_compaction_text(event)?.to_owned(),
         EventKind::MessageUser | EventKind::MessageAssistant => {
             if event.replay_policy != ReplayPolicy::Contextual {

@@ -126,7 +126,7 @@ fn preview_preserves_retained_links_and_explicit_roots_in_the_gap() {
         ] {
             let document = omnis_core::trajectory_search_document(&snapshot);
             assert_eq!(
-                document.text, "Task\n\nRetained answer",
+                document.text, "Task\n\nSummary\n\nRetained answer",
                 "{case}, sampled={sampled}"
             );
             assert_eq!(document.source_complete, !sampled);

@@ -400,6 +400,20 @@ fn a_failed_retention_list_marks_only_the_affected_branch() {
 }
 
 #[test]
+fn search_keeps_only_the_current_compaction_summary() {
+    let mut rows = vec![message(1, 0, "user", json!("Original request"))];
+    rows.extend(compaction(2, 1, &[]));
+    rows.push(message(4, 3, "assistant", json!("Continue")));
+    rows.extend(compaction(5, 4, &[]));
+    rows.push(message(7, 6, "user", json!("Current request")));
+    for preview in [false, true] {
+        let document = omnis_core::trajectory_search_document(&read_session(&rows, preview));
+        assert!(document.text.contains("Summary 5"));
+        assert!(!document.text.contains("Summary 2"));
+    }
+}
+
+#[test]
 fn returning_to_a_valid_summary_abandons_the_other_branches_rejected_list() {
     for invalid in [&[2, 99][..], &[2, 2][..]] {
         let mut rows = vec![
