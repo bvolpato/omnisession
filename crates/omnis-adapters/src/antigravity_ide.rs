@@ -340,6 +340,14 @@ impl ProviderAdapter for AntigravityIdeAdapter {
         Ok(self.list_catalog(project)?.sessions)
     }
 
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let listing = self.list_catalog(project)?;
+        Ok((listing.sessions, listing.notes))
+    }
+
     fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
         if let Some(desktop) = self.desktop() {
             let mut listing = desktop.list_catalog(project)?;

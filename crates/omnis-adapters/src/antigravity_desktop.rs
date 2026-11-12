@@ -138,6 +138,14 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
         self.list_catalog(project).map(|listing| listing.sessions)
     }
 
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let listing = self.list_catalog(project)?;
+        Ok((listing.sessions, listing.notes))
+    }
+
     fn list_catalog(&self, project: Option<&Path>) -> Result<NativeListing> {
         let Some(root) = self.root.as_deref() else {
             return Ok(NativeListing::default());

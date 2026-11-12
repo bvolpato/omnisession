@@ -639,8 +639,8 @@ enum WalRevision {
 impl WalRevision {
     fn read(database: &Path) -> (Self, u64) {
         if let Some(path) = wal_path(database) {
-            return crate::source_file::source_file_revision_with_size(&path)
-                .and_then(|(revision, size)| Some((Self::Present(revision.contents?), size)))
+            return crate::source_file::ObservedSourceFile::read(&path)
+                .and_then(|file| Some((Self::Present(file.revision.contents?), file.length)))
                 .unwrap_or((Self::Unavailable, 0));
         }
         if database

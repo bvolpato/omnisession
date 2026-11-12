@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use omnis_adapters::{AdapterRegistry, CodexAdapter, LaunchTarget};
+use omnis_adapters::{AdapterRegistry, CodexAdapter, LaunchTarget, ProviderAdapter};
 use omnis_core::{
     CODEX_IMPORT_MARKER, HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope,
     redact_secrets, reports_omitted_events,
@@ -38,11 +38,10 @@ pub(crate) fn check_continuation_target(target: AgentTarget, source: &SessionRef
     if let Some(profile) = target
         .profile
         .filter(|_| target.provider == Provider::Codex)
+        && target.uses_provider_program()?
     {
         let args = profile.expanded_args(&crate::launch_profile::environment)?;
-        if let Err(error) =
-            profile::require_continuation_args(&args, target.uses_provider_program()?)
-        {
+        if let Err(error) = profile::require_continuation_args(&args, true) {
             let source = crate::safe_terminal_line(&source.to_string());
             bail!(
                 "{error}. Use `--in codex` for a local continuation, or run `omni handoff {source}` and paste the handoff into the target session."
@@ -58,7 +57,7 @@ pub struct CodexImport {
     pub tool_events: usize,
     pub truncated: bool,
     home: PathBuf,
-    sqlite_home_arg: Option<String>,
+    sqlite_home: Option<PathBuf>,
     profile: ImportProfile,
 }
 
@@ -108,12 +107,26 @@ pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
         home: codex_home()?,
-        sqlite_home_arg: None,
+        sqlite_home: None,
         profile: ImportProfile::default(),
     })
 }
 
 impl CodexImport {
+    fn sqlite_home(&self) -> Result<&Path> {
+        self.sqlite_home
+            .as_deref()
+            .context("missing verified Codex import SQLite home")
+    }
+
+    pub(super) fn target_adapter(&self) -> Result<CodexAdapter> {
+        Ok(CodexAdapter::for_import(&self.home, self.sqlite_home()?))
+    }
+
+    pub(super) fn read_target(&self, target: &SessionRef) -> Result<CanonicalSnapshot> {
+        self.target_adapter()?.read_session(target)
+    }
+
     pub(crate) fn for_launch_profile(
         mut self,
         registry: &AdapterRegistry,
@@ -121,15 +134,12 @@ impl CodexImport {
         process_directory: &Path,
     ) -> Result<Self> {
         let adapter = registry.adapter(Provider::Codex)?;
-        let mut plan = target.launch(adapter.new_session_plan(&LaunchTarget {
+        let plan = target.launch(adapter.new_session_plan(&LaunchTarget {
             cwd: Some(process_directory.to_owned()),
             ..LaunchTarget::default()
         })?)?;
-        if !target.uses_provider_program()? {
-            // Native import uses the installed Codex. The replacement program runs only after the copy is verified.
-            plan.args.clear();
-            plan.program = "codex".into();
-        } else if target.profile.is_some() {
+        let mut plan = target.codex_option_plan(&plan)?.into_owned();
+        if target.profile.is_some() && target.uses_provider_program()? {
             self.profile = ImportProfile::resolve(&plan.args, &self.home)?;
         }
         let sqlite_home = if let Some(home) = profile::selected_sqlite_home(adapter, None, &plan)? {
@@ -141,7 +151,7 @@ impl CodexImport {
             profile::selected_sqlite_home(adapter, None, &plan)?
                 .context("cannot verify the local Codex SQLite home for native import")?
         };
-        self.sqlite_home_arg = Some(profile::sqlite_home_argument(&sqlite_home)?);
+        self.sqlite_home = Some(sqlite_home);
         Ok(self)
     }
 }
@@ -167,6 +177,8 @@ pub(crate) fn profiles_for_recorded_provider(
     if plain_codex_supplies(&home, &provider) {
         return Vec::new();
     }
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     let supplies = |profile: &LaunchProfile| {
         profile
             .expanded_args(&crate::launch_profile::environment)
@@ -685,11 +697,7 @@ impl AppServer {
         let mut command = crate::provider_launch::provider_process(binary)?;
         command.args(["app-server", "--stdio"]).current_dir(cwd);
         import.profile.apply(&mut command);
-        let sqlite_home = import
-            .sqlite_home_arg
-            .as_deref()
-            .context("missing verified Codex import SQLite home")?;
-        command.args(["-c", sqlite_home]);
+        command.args(["-c", &profile::sqlite_home_argument(import.sqlite_home()?)?]);
         command.env("CODEX_HOME", &import.home);
         if let Some(source_home) = source_home {
             command
@@ -894,7 +902,7 @@ mod tests {
             tool_events: 0,
             truncated: false,
             home: PathBuf::new(),
-            sqlite_home_arg: None,
+            sqlite_home: None,
             profile: ImportProfile::default(),
         };
         let user =

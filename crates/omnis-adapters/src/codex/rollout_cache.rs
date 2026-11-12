@@ -68,7 +68,7 @@ pub(super) fn default_path(codex_home: &Path) -> Option<PathBuf> {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ObservedRollout {
     pub(super) revision: SourceRevision,
-    pub(super) has_file_identity: bool,
+    pub(super) physical_identity: Option<[u64; 2]>,
     pub(super) stamp: Option<RolloutStamp>,
     pub(super) modified: Option<DateTime<Utc>>,
 }
@@ -77,55 +77,33 @@ impl ObservedRollout {
     pub(super) fn read(path: &Path) -> Option<Self> {
         super::rollout_file::jsonl_file_name(path)?;
         let canonical = fs::canonicalize(path).ok()?;
-        let path_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            canonical.as_os_str().as_encoded_bytes(),
-        );
         #[cfg(windows)]
-        let (metadata, object, has_file_identity) = {
-            use std::os::windows::fs::MetadataExt;
-            let handle = fs::File::open(&canonical).ok()?;
-            let metadata = handle.metadata().ok()?;
-            let (object, has_file_identity) = if let Ok(info) =
-                winapi_util::file::information(&handle)
-                && info.file_index() != 0
-            {
-                ([info.volume_serial_number(), info.file_index()], true)
-            } else {
-                // Some network filesystems expose a creation time but no file index.
-                ([u64::MAX, metadata.creation_time()], false)
-            };
-            (metadata, object, has_file_identity)
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .access_mode(0)
+                .open(&canonical)
+                .ok()?
         };
+        #[cfg(windows)]
+        let metadata = handle.metadata().ok()?;
         #[cfg(not(windows))]
         let metadata = fs::metadata(&canonical).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        #[cfg(unix)]
-        let (object, has_file_identity) = {
-            use std::os::unix::fs::MetadataExt;
-            ([metadata.dev(), metadata.ino()], metadata.ino() != 0)
-        };
-        #[cfg(any(unix, windows))]
-        let file = Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened());
-        #[cfg(not(any(unix, windows)))]
-        let file = path_id;
-        #[cfg(not(any(unix, windows)))]
-        let has_file_identity = false;
+        let source = crate::source_file::ObservedSourceFile::from_metadata(
+            &canonical,
+            &metadata,
+            #[cfg(windows)]
+            &handle,
+        )?;
         let mut stamp = RolloutStamp::new(&metadata);
         if let Some(stamp) = &mut stamp {
-            stamp.file_id = Some(file);
+            stamp.file_id = source.revision.file;
         }
         Some(Self {
-            has_file_identity,
-            modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+            physical_identity: source.physical_identity,
+            modified: source.modified,
+            revision: source.revision,
             stamp,
-            revision: SourceRevision {
-                file: Some(file),
-                contents: stamp.map(|stamp| stamp.contents_id(file)),
-                missing_ancestor: None,
-            },
         })
     }
 }
@@ -167,17 +145,6 @@ impl RolloutStamp {
             inode,
             file_id: None,
         })
-    }
-
-    fn contents_id(self, file: Uuid) -> Uuid {
-        let fields = [
-            self.len.to_le_bytes(),
-            self.modified.0.to_le_bytes(),
-            u64::from(self.modified.1).to_le_bytes(),
-            self.changed.0.to_le_bytes(),
-            self.changed.1.to_le_bytes(),
-        ];
-        Uuid::new_v5(&file, fields.as_flattened())
     }
 }
 

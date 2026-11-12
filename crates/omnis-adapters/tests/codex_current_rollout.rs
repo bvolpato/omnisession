@@ -169,6 +169,51 @@ fn legacy_sqlite_path_without_uuid_owns_the_thread_and_fails_closed() -> Result<
 }
 
 #[test]
+fn an_unreadable_renamed_selection_only_retires_a_proven_different_file() -> Result<()> {
+    check_unreadable_selection(&format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"))?;
+    check_unreadable_selection("rollout-original.jsonl")
+}
+
+fn check_unreadable_selection(old_name: &str) -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().canonicalize()?;
+    let logs = home.join("sessions");
+    fs::create_dir(&logs)?;
+    let old = logs.join(old_name);
+    let selected = logs.join("rollout-imported.jsonl");
+    let metadata = json!({"type":"session_meta","payload":{"id":THREAD, "history_mode":"legacy"}});
+    fs::write(&old, format!("{metadata}\n"))?;
+    let prior = CodexAdapter::index_file_revision(&old).unwrap();
+    let db = select(&home, &selected)?;
+    db.execute(
+        "UPDATE threads SET history_mode='legacy' WHERE id=?1",
+        [THREAD],
+    )?;
+    let unavailable = || -> Result<bool> {
+        let adapter = CodexAdapter::with_root(&home);
+        assert!(
+            adapter
+                .read_session(&SessionRef::new(Provider::Codex, THREAD))
+                .is_err()
+        );
+        Ok(adapter
+            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(prior))])?
+            .contains(THREAD))
+    };
+
+    // An oversized header prevents verification on every platform while metadata stays readable.
+    fs::File::create(&selected)?.set_len(3 * 1024 * 1024)?;
+    assert!(unavailable()?);
+    fs::remove_file(&selected)?;
+    fs::hard_link(&old, &selected)?;
+    fs::File::create(&selected)?.set_len(3 * 1024 * 1024)?;
+    assert!(!unavailable()?);
+    fs::remove_file(&old)?;
+    assert!(!unavailable()?);
+    Ok(())
+}
+
+#[test]
 fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<()> {
     let home = tempfile::tempdir()?;
     let path = home.path().join(format!(
@@ -235,8 +280,8 @@ fn sqlite_selected_revert_owns_the_public_thread_and_its_index_receipt() -> Resu
     let listed = adapter.list_sessions(None)?;
     assert_eq!(listed.len(), 1);
     let found = adapter.find_native_session(THREAD)?.unwrap();
-    let read = adapter.index_session(&session, Some(&original), u64::MAX)?;
-    let revision = CodexAdapter::index_file_revision(&selected).unwrap();
+    let read = adapter.read_full_index_at(&session, Some(&original))?;
+    let revision = omnis_adapters::source_file_revision(&selected).unwrap();
     let receipt = read.native_session.as_ref().unwrap();
     for entry in [&listed[0], &found, receipt] {
         assert_eq!(entry.session, session);
@@ -345,18 +390,34 @@ fn incomplete_restore_hides_only_a_cache_from_a_proven_different_generation() ->
     );
 
     fs::create_dir_all(home.join("sessions/nested/1/2/3/4/5/6"))?;
-    let limited = CodexAdapter::with_root(&home);
-    assert!(!limited.discovery_is_complete());
-    assert!(limited.read_session(&session).is_err());
-    assert_eq!(
-        limited
-            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(old_read.source_revision))])?,
-        HashSet::from([THREAD.to_owned()])
-    );
-    assert!(
-        limited
-            .unavailable_codex_rollouts(&[(THREAD.to_owned(), Some(current_read.source_revision))])?
-            .is_empty()
-    );
+    let original_home = tempfile::tempdir()?;
+    let old_home = original_home.path().canonicalize()?.join("sessions");
+    fs::create_dir_all(&old_home)?;
+    let relocated = old_home.join(&filename);
+    fs::copy(&archive, &relocated)?;
+    for selected in [&pointer, &relocated] {
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            [selected.to_str().unwrap(), THREAD],
+        )?;
+        let limited = CodexAdapter::with_root(&home);
+        assert!(!limited.discovery_is_complete());
+        assert!(limited.read_session(&session).is_err());
+        assert_eq!(
+            limited.unavailable_codex_rollouts(&[(
+                THREAD.to_owned(),
+                Some(old_read.source_revision)
+            )])?,
+            HashSet::from([THREAD.to_owned()])
+        );
+        assert!(
+            limited
+                .unavailable_codex_rollouts(&[(
+                    THREAD.to_owned(),
+                    Some(current_read.source_revision)
+                )])?
+                .is_empty()
+        );
+    }
     Ok(())
 }

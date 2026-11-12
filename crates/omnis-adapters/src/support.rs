@@ -578,12 +578,23 @@ impl SnapshotFileStamp {
     }
 
     fn copy_unchanged(&self, path: &Path, target: &Path) -> Result<bool> {
-        let mut source = match File::open(path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            result => result?,
+        let Some(mut source) = open_observed_source(path)? else {
+            return Ok(false);
         };
         if *self != Self::from_metadata(&source.metadata()?)? {
             return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        if rustix::fs::fclonefileat(
+            &source,
+            rustix::fs::CWD,
+            target,
+            rustix::fs::CloneFlags::empty(),
+        )
+        .is_ok()
+        {
+            return Ok(*self == Self::from_metadata(&source.metadata()?)?
+                && fs::metadata(target)?.len() == self.len);
         }
         let mut copy = File::create(target)?;
         let bytes = io::copy(&mut (&mut source).take(self.len), &mut copy)?;
@@ -668,6 +679,179 @@ impl SnapshotStamp {
     }
 }
 
+fn open_snapshot_source(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "provider SQLite source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// A file observed in a snapshot stamp can disappear before the copy opens it.
+fn open_observed_source(path: &Path) -> io::Result<Option<File>> {
+    match open_snapshot_source(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// A WAL reset replaces the header salts. Appending transactions preserves the header.
+struct WalPrefix {
+    header: [u8; 32],
+    len: u64,
+}
+
+impl WalPrefix {
+    fn capture(path: &Path, len: u64) -> Result<Option<Self>> {
+        if len < 32 {
+            return Ok(None);
+        }
+        let Some(file) = open_observed_source(path)? else {
+            return Ok(None);
+        };
+        let mut reader = BufReader::with_capacity(128 * 1024, file);
+        let mut header = [0; 32];
+        if !read_snapshot_bytes(&mut reader, &mut header)? {
+            return Ok(None);
+        }
+        let magic = u32::from_be_bytes(header[0..4].try_into()?);
+        let page_size = u32::from_be_bytes(header[8..12].try_into()?);
+        if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+            || !(512..=65_536).contains(&page_size)
+            || !page_size.is_power_of_two()
+        {
+            return Ok(None);
+        }
+        // SQLite can reuse a WAL without truncating it. Frames from the prior generation
+        // and an unfinished write after the last commit do not belong to this snapshot.
+        let frame_size = 24 + u64::from(page_size);
+        let mut offset = 32;
+        let mut committed = offset;
+        let mut frame = [0; 24];
+        while len - offset >= frame_size {
+            if !read_snapshot_bytes(&mut reader, &mut frame)?
+                || frame[8..16] != header[16..24]
+                || frame[..4] == [0; 4]
+            {
+                break;
+            }
+            offset += frame_size;
+            if frame[4..8] != [0; 4] {
+                committed = offset;
+            }
+            reader.seek_relative(i64::from(page_size))?;
+        }
+        Ok(Some(Self {
+            header,
+            len: committed,
+        }))
+    }
+
+    fn still_matches(&self, path: &Path) -> Result<bool> {
+        let mut header = [0; 32];
+        let Some(mut file) = open_observed_source(path)? else {
+            return Ok(false);
+        };
+        Ok(read_snapshot_bytes(&mut file, &mut header)? && header == self.header)
+    }
+}
+
+fn read_snapshot_bytes(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn prefix_matches(source: &Path, copy: &Path, len: u64) -> Result<bool> {
+    let Some(mut source) = open_observed_source(source)? else {
+        return Ok(false);
+    };
+    let mut copy = File::open(copy)?;
+    let mut left = vec![0_u8; 64 * 1024];
+    let mut right = vec![0_u8; left.len()];
+    let mut remaining = len;
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(left.len() as u64))?;
+        if let Err(err) = source.read_exact(&mut left[..count]) {
+            if err.kind() == ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(err.into());
+        }
+        copy.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
+impl SnapshotStamp {
+    fn copy_live_wal(
+        &self,
+        root: &Path,
+        database: &Path,
+        limits: SnapshotLimits,
+        prefix: &WalPrefix,
+    ) -> Result<Option<SqliteSnapshot>> {
+        let directory = private_snapshot_directory()?;
+        ensure_snapshot_space(directory.path(), self.bytes(), limits.free_space_reserve)?;
+        let copy = directory.path().join("snapshot.sqlite");
+        let wal = sidecar(database, "-wal");
+        let copy_wal = sidecar(&copy, "-wal");
+        if !self.database.copy_unchanged(database, &copy)? || !prefix.still_matches(&wal)? {
+            return Ok(None);
+        }
+        let Some(file) = open_observed_source(&wal)? else {
+            return Ok(None);
+        };
+        let copied = io::copy(&mut file.take(prefix.len), &mut File::create(&copy_wal)?)?;
+        if copied != prefix.len
+            || !prefix_matches(&wal, &copy_wal, prefix.len)?
+            || !prefix.still_matches(&wal)?
+        {
+            return Ok(None);
+        }
+        let latest = Self::read(root, database, limits.max_bytes, true)?;
+        if latest.database != self.database || latest.wal.is_none_or(|wal| wal.len < prefix.len) {
+            return Ok(None);
+        }
+        if !self.database.has_precise_change_time()
+            && !prefix_matches(database, &copy, self.database.len)?
+        {
+            return Ok(None);
+        }
+        // SQLite recovers complete committed frames in the private WAL. An unfinished tail is ignored.
+        open_snapshot(directory)
+    }
+}
+
 fn optional_regular_file(path: &Path) -> Result<Option<SnapshotFileStamp>> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => Ok(Some(SnapshotFileStamp::from_metadata(&meta)?)),
@@ -733,7 +917,7 @@ impl SqliteSnapshotCache {
         self.read_using(root, database, false, read)
     }
 
-    /// Copies an unchanged database and WAL once when both files have precise Unix change times.
+    /// Reads a stable database and committed WAL prefix. Unchanged precise Unix stamps permit reuse.
     pub(crate) fn read_stamped<T>(
         &self,
         root: &Path,
@@ -771,7 +955,22 @@ impl SqliteSnapshotCache {
                 return read(&snapshot.snapshot);
             }
             *cached = None;
-            let snapshot = if cacheable && stamped {
+            let live_prefix = if stamped && let Some(wal) = &stamp.wal {
+                let path = sidecar(&database, "-wal");
+                let prefix = WalPrefix::capture(&path, wal.len)?;
+                if prefix.is_none() && optional_regular_file(&path)?.as_ref() != Some(wal) {
+                    continue;
+                }
+                prefix
+            } else {
+                None
+            };
+            let snapshot = if let Some(prefix) = &live_prefix {
+                let Some(snapshot) = stamp.copy_live_wal(root, &database, limits, prefix)? else {
+                    continue;
+                };
+                snapshot
+            } else if cacheable && stamped {
                 let Some(snapshot) = stamp.copy_snapshot(root, &database, limits)? else {
                     continue;
                 };
@@ -780,6 +979,10 @@ impl SqliteSnapshotCache {
                 sqlite_snapshot_with_limits(root, &database, limits)?
             };
             if stamp != SnapshotStamp::read(root, &database, limits.max_bytes, stamped)? {
+                if live_prefix.is_some() {
+                    // A later lookup must observe commits appended after this private snapshot.
+                    return read(&snapshot);
+                }
                 continue;
             }
             if !cacheable {
@@ -1006,8 +1209,9 @@ fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<Option<u
     Ok(Some(copied))
 }
 
+/// A transcript read could not establish its result within the provider reader's limits.
 #[derive(Debug)]
-pub(crate) struct TranscriptReadLimit(&'static str);
+pub struct TranscriptReadLimit(pub(crate) &'static str);
 
 impl std::fmt::Display for TranscriptReadLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1392,20 +1596,11 @@ fn visit_index_json_lines_with_limits(
     mut visit: impl FnMut(Option<Value>),
 ) -> Result<IndexScan> {
     let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(anyhow!("provider path is not a file"));
-    }
-    let length = metadata.len();
-    let start = length.saturating_sub(file_limit);
-    // Start one byte early so a suffix that begins on a record boundary keeps that record.
-    let aligned = start.saturating_sub(1);
-    file.seek(SeekFrom::Start(aligned))?;
-    let mut reader = BufReader::new(file.take(length - aligned));
-    let mut scan = IndexScan::default();
-    if start > 0 {
-        scan.skipped_bytes = aligned + u64::try_from(reader.skip_until(b'\n')?)?;
-    }
+    let (mut reader, skipped_bytes) = jsonl_tail_reader(&mut file, file_limit)?;
+    let mut scan = IndexScan {
+        skipped_bytes,
+        ..IndexScan::default()
+    };
     let mut line = Vec::new();
     while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
         match line_kind {
@@ -1509,7 +1704,17 @@ fn skip_line_tail(reader: &mut impl BufRead) -> io::Result<(u64, bool)> {
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    read_json_lines(path, limit)
+    let mut preview = JsonLinesPreview::default();
+    read_json_lines_prefix(
+        &mut File::open(path)?,
+        limit,
+        u64::MAX,
+        MAX_TRANSCRIPT_LINE_SIZE,
+        JsonLineTail::SkipMalformed,
+        &mut preview,
+        &|_, _| WorkspaceGap::Other,
+    )?;
+    Ok(preview.records)
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
@@ -1521,15 +1726,48 @@ pub(crate) fn json_lines_preview_with_tail(
     sample_records: usize,
     tail: JsonLineTail,
 ) -> Result<Vec<Value>> {
-    Ok(preview_json_lines(
-        path,
+    Ok(read_preview(
+        &mut File::open(path)?,
         sample_records,
         u64::MAX,
         MAX_TRANSCRIPT_LINE_SIZE,
         tail,
-        |_, _| WorkspaceGap::Other,
+        &|_, _| WorkspaceGap::Other,
     )?
     .records)
+}
+
+/// Samples an open file and counts consecutive decoded records at EOF.
+pub(crate) fn json_lines_preview_file_with_suffix(
+    file: &mut File,
+    sample_records: usize,
+) -> Result<(Vec<Value>, usize)> {
+    let preview = read_preview(
+        file,
+        sample_records,
+        u64::MAX,
+        MAX_TRANSCRIPT_LINE_SIZE,
+        JsonLineTail::SkipMalformed,
+        &|_, _| WorkspaceGap::Other,
+    )?;
+    Ok((preview.records, preview.suffix_len))
+}
+
+fn jsonl_tail_reader(file: &mut File, byte_limit: u64) -> Result<(impl BufRead + '_, u64)> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    let length = metadata.len();
+    let start = length.saturating_sub(byte_limit);
+    // Include the preceding byte so a newline immediately before the window keeps the first record.
+    let mut offset = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file.take(length - offset));
+    if start > 0 {
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
+    }
+    Ok((reader, offset))
 }
 
 #[derive(Default)]
@@ -1539,6 +1777,7 @@ pub(crate) struct JsonLinesPreview {
     pub(crate) sampled: bool,
     /// Number of leading records retained without any unreadable or unsampled row.
     pub(crate) prefix_records: usize,
+    suffix_len: usize,
 }
 
 pub(crate) fn json_lines_preview_with_omissions(
@@ -1548,65 +1787,73 @@ pub(crate) fn json_lines_preview_with_omissions(
     line_bytes: u64,
     match_malformed: impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<JsonLinesPreview> {
-    preview_json_lines(
-        path,
+    read_preview(
+        &mut File::open(path)?,
         sample_records,
         prefix_bytes,
         line_bytes,
         JsonLineTail::SkipMalformed,
-        match_malformed,
+        &match_malformed,
     )
 }
 
-fn preview_json_lines(
-    path: &Path,
+fn read_preview(
+    file: &mut File,
     sample_records: usize,
     prefix_bytes: u64,
     line_bytes: u64,
     tail: JsonLineTail,
-    match_malformed: impl Fn(&[u8], bool) -> WorkspaceGap,
+    match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<JsonLinesPreview> {
-    let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
     let mut preview = JsonLinesPreview::default();
-    if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        let end = read_json_lines_prefix(
-            &file,
-            MAX_PROVIDER_RECORDS,
-            prefix_bytes,
-            line_bytes,
-            tail,
-            &mut preview,
-            &match_malformed,
-        )?;
-        if end >= metadata.len() || prefix_bytes < metadata.len() {
-            preview.sampled = end < metadata.len();
-            return Ok(preview);
-        }
-        // The file fits the byte budget but has too many records. Sample both ends.
-        file.rewind()?;
-        preview = JsonLinesPreview::default();
-    }
-    let prefix_end = read_json_lines_prefix(
-        &file,
-        sample_records,
+    let small = metadata.len() <= MAX_PREVIEW_TAIL_SIZE;
+    let limit = if small {
+        MAX_PROVIDER_RECORDS
+    } else {
+        sample_records
+    };
+    let mut prefix_end = read_json_lines_prefix(
+        file,
+        limit,
         prefix_bytes,
         line_bytes,
         tail,
         &mut preview,
-        &match_malformed,
+        match_malformed,
     )?;
+    if prefix_end == metadata.len() {
+        return Ok(preview);
+    }
+    if small && prefix_bytes < metadata.len() {
+        preview.sampled = true;
+        return Ok(preview);
+    }
+    if small {
+        // A short file can contain more records than the full-preview limit.
+        // Use the requested head and tail when the prefix did not reach EOF.
+        preview = JsonLinesPreview::default();
+        prefix_end = read_json_lines_prefix(
+            file,
+            sample_records,
+            prefix_bytes,
+            line_bytes,
+            tail,
+            &mut preview,
+            match_malformed,
+        )?;
+    }
     let tail = read_json_lines_tail(
-        &file,
+        file,
         sample_records,
         prefix_end,
         line_bytes,
         tail,
         &mut preview,
-        &match_malformed,
+        match_malformed,
     )?;
     preview
         .records
@@ -1615,9 +1862,9 @@ fn preview_json_lines(
 }
 
 #[cfg(test)]
-fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
+fn json_lines_tail_with_offsets(file: &mut File, limit: usize) -> Result<Vec<(u64, Value)>> {
     read_json_lines_tail(
-        &File::open(path)?,
+        file,
         limit,
         0,
         MAX_TRANSCRIPT_LINE_SIZE,
@@ -1628,7 +1875,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
 }
 
 fn read_json_lines_tail(
-    mut file: &File,
+    file: &mut File,
     limit: usize,
     prefix_end: u64,
     line_bytes: u64,
@@ -1646,6 +1893,7 @@ fn read_json_lines_tail(
         .max(prefix_end);
     let partial_first_line = if start > prefix_end {
         preview.sampled = true;
+        preview.suffix_len = 0;
         file.seek(SeekFrom::Start(start - 1))?;
         let mut preceding = [0];
         file.read_exact(&mut preceding)?;
@@ -1674,6 +1922,7 @@ fn read_json_lines_tail(
         offset += u64::try_from(read)?;
         if read as u64 > line_bytes {
             tail.check_skipped_end(line.ends_with(b"\n"))?;
+            preview.suffix_len = 0;
             preview
                 .omissions
                 .observe(match_malformed(&line, true), true);
@@ -1684,18 +1933,23 @@ fn read_json_lines_tail(
                 .omissions
                 .parse(&line, tail, offset == metadata.len(), match_malformed)?
         {
+            preview.suffix_len += 1;
             if limit == 0 {
+                preview.suffix_len = 0;
                 preview.sampled = true;
                 continue;
             }
             if records.len() == limit {
                 records.pop_front();
+                preview.suffix_len = preview.suffix_len.min(limit);
                 preview.sampled = true;
             }
             if !preview.sampled && preview.omissions.total() == 0 {
                 verified_tail_records += 1;
             }
             records.push_back((line_offset, record));
+        } else {
+            preview.suffix_len = 0;
         }
     }
     if !preview.sampled {
@@ -1704,24 +1958,9 @@ fn read_json_lines_tail(
     Ok(records.into_iter().collect())
 }
 
-fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    let file = File::open(path)?;
-    let mut preview = JsonLinesPreview::default();
-    read_json_lines_prefix(
-        &file,
-        limit,
-        u64::MAX,
-        MAX_TRANSCRIPT_LINE_SIZE,
-        JsonLineTail::SkipMalformed,
-        &mut preview,
-        &|_, _| WorkspaceGap::Other,
-    )?;
-    Ok(preview.records)
-}
-
 /// Reads up to `limit` leading lines and returns the end of the observed prefix.
 fn read_json_lines_prefix(
-    file: &File,
+    file: &mut File,
     limit: usize,
     byte_limit: u64,
     line_bytes: u64,
@@ -1729,6 +1968,7 @@ fn read_json_lines_prefix(
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<u64> {
+    file.rewind()?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1753,6 +1993,7 @@ fn read_json_lines_prefix(
         match line_kind {
             BoundedLine::Oversized { terminated } => {
                 tail.check_skipped_end(terminated)?;
+                preview.suffix_len = 0;
                 preview
                     .omissions
                     .observe(match_malformed(&line, true), true);
@@ -1768,6 +2009,9 @@ fn read_json_lines_prefix(
                         preview.prefix_records += 1;
                     }
                     preview.records.push(record);
+                    preview.suffix_len += 1;
+                } else {
+                    preview.suffix_len = 0;
                 }
             }
         }
@@ -2699,6 +2943,109 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn live_wal_snapshot_accepts_appends_and_rejects_a_restarted_generation() -> anyhow::Result<()>
+    {
+        let (root, database, writer) = wal_store();
+        let db = database.canonicalize()?;
+        let wal = super::sidecar(&db, "-wal");
+        let limits = SnapshotLimits {
+            max_bytes: 1024 * 1024,
+            free_space_reserve: 0,
+        };
+        let observe = || -> anyhow::Result<_> {
+            let stamp = super::SnapshotStamp::read(root.path(), &db, limits.max_bytes, true)?;
+            let len = stamp.wal.as_ref().expect("fixture WAL").len;
+            let prefix = super::WalPrefix::capture(&wal, len)?.expect("fixture WAL prefix");
+            Ok((stamp, prefix))
+        };
+        let (initial, prefix) = observe()?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(512))", [])?;
+        let snapshot = initial
+            .copy_live_wal(root.path(), &db, limits, &prefix)?
+            .expect("unchanged WAL prefix");
+        let rows: i64 = snapshot
+            .connection
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+        assert_eq!(rows, 2);
+
+        let restart = || -> anyhow::Result<()> {
+            let (busy, frames, copied): (i64, i64, i64) =
+                writer.query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            assert_eq!(busy, 0);
+            assert_eq!(frames, copied);
+            Ok(())
+        };
+        restart()?;
+        let (checkpointed, prefix) = observe()?;
+        let previous = std::fs::read(&wal)?;
+        writer.execute("INSERT INTO blobs (data) VALUES (zeroblob(65536))", [])?;
+        let restarted = std::fs::read(&wal)?;
+        assert!(restarted.len() >= previous.len());
+        assert_ne!(previous[16..24], restarted[16..24]);
+        assert!(
+            checkpointed
+                .copy_live_wal(root.path(), &db, limits, &prefix)?
+                .is_none()
+        );
+
+        restart()?;
+        let physical_len = std::fs::metadata(&wal)?.len();
+        let insert = "INSERT INTO blobs (data) VALUES (zeroblob(128))";
+        writer.execute(insert, [])?;
+        let (small, prefix) = observe()?;
+        assert!(prefix.len < physical_len);
+        let count = "SELECT COUNT(*) FROM blobs";
+        let at_capture: i64 = writer.query_row(count, [], |row| row.get(0))?;
+        for _ in 0..3 {
+            writer.execute(insert, [])?;
+        }
+        assert_eq!(std::fs::metadata(&wal)?.len(), physical_len);
+        assert_eq!(
+            writer.query_row(count, [], |row| row.get::<_, i64>(0))?,
+            at_capture + 3
+        );
+        let copy = small
+            .copy_live_wal(root.path(), &db, limits, &prefix)?
+            .expect("valid commits within the preallocated WAL");
+        assert_eq!(
+            copy.connection
+                .query_row(count, [], |row| row.get::<_, i64>(0))?,
+            at_capture
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_registry_recovers_when_the_last_writer_closes_its_wal() -> anyhow::Result<()> {
+        let (root, database, writer) = wal_store();
+        let db = database.canonicalize()?;
+        writer.execute_batch(
+            "CREATE TABLE threads(title TEXT); INSERT INTO threads VALUES ('updated title')",
+        )?;
+        let stamp = super::SnapshotStamp::read(root.path(), &db, u64::MAX, true)?;
+        let wal = super::sidecar(&db, "-wal");
+        let len = stamp.wal.as_ref().unwrap().len;
+        let prefix = super::WalPrefix::capture(&wal, len)?.unwrap();
+        drop(writer);
+        assert!(!wal.exists());
+        assert!(super::WalPrefix::capture(&wal, len)?.is_none());
+        let limits = SnapshotLimits::from_environment()?;
+        assert!(
+            stamp
+                .copy_live_wal(root.path(), &db, limits, &prefix)?
+                .is_none()
+        );
+        let title: String =
+            super::SqliteSnapshotCache::default().read_stamped(root.path(), &db, |conn| {
+                Ok(conn.query_row("SELECT title FROM threads", [], |row| row.get(0))?)
+            })?;
+        assert_eq!(title, "updated title");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn stamped_snapshot_rejects_a_changed_database_or_wal() -> anyhow::Result<()> {
@@ -3232,6 +3579,27 @@ mod tests {
     }
 
     #[test]
+    fn tail_keeps_complete_records_at_the_byte_limit() {
+        let mut content = b"0\n123\n".to_vec();
+        let tail_size = usize::try_from(super::MAX_PREVIEW_TAIL_SIZE).unwrap();
+        // The final records fill the rest of the window without exceeding the line limit.
+        for value in *b"45" {
+            content.push(value);
+            content.resize(content.len() + tail_size / 2 - 4, b' ');
+            content.push(b'\n');
+        }
+        let (_temporary, path) = write_fixture(&content);
+        let read =
+            || json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 3).unwrap();
+        assert_eq!(read()[0], (2, json!(123)));
+
+        // Moving the cutoff into the number must discard the entire partial record.
+        content.push(b'\n');
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(read()[0], (6, json!(4)));
+    }
+
+    #[test]
     fn tail_reader_returns_latest_records() {
         let temporary = tempdir().expect("temporary directory");
         let path = temporary.path().join("records.jsonl");
@@ -3241,7 +3609,7 @@ mod tests {
         }
         std::fs::write(&path, content).expect("JSONL fixture");
 
-        let records = json_lines_tail_with_offsets(&path, 2)
+        let records = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 2)
             .expect("tail records")
             .into_iter()
             .map(|(_, record)| record)
@@ -3262,7 +3630,8 @@ mod tests {
         let padding = " ".repeat(tail_bytes - first.len() - last.len() - 2);
         let mut contents = format!("{header}{first}{padding}\r\n{last}");
         std::fs::write(&path, &contents).unwrap();
-        let records = json_lines_tail_with_offsets(&path, 2).unwrap();
+        let records =
+            json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 2).unwrap();
         assert_eq!(
             records,
             [
@@ -3277,11 +3646,50 @@ mod tests {
 
         contents.push(' ');
         std::fs::write(&path, &contents).unwrap();
-        let records = json_lines_tail_with_offsets(&path, 2).unwrap();
+        let records =
+            json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 2).unwrap();
         assert_eq!(
             records,
             [((contents.len() - last.len() - 1) as u64, json!({"index":2}))]
         );
+    }
+
+    #[test]
+    fn jsonl_preview_tracks_the_consecutive_suffix_across_read_windows() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("window.jsonl");
+        let padding = "x".repeat(768 * 1024);
+        let encode = |id| json!({"id":id,"padding":&padding}).to_string() + "\n";
+        let prefix = (0..3).map(encode).collect::<String>();
+        let suffix = (3..7).map(encode).collect::<String>();
+        let oversized =
+            json!({"padding":"x".repeat(usize::try_from(MAX_TRANSCRIPT_LINE_SIZE).unwrap())})
+                .to_string()
+                + "\n";
+        for (gap, limit, ids, expected) in [
+            ("", 7, vec![0, 1, 2, 3, 4, 5, 6], 7),
+            ("", 4, vec![0, 1, 2, 3, 4, 5, 6], 7),
+            ("", 2, vec![0, 1, 5, 6], 2),
+            ("invalid\n", 8, vec![0, 1, 2, 3, 4, 5, 6], 4),
+            ("invalid\n", 5, vec![0, 1, 2, 3, 4, 5, 6], 4),
+            ("invalid\n", 3, vec![0, 1, 2, 4, 5, 6], 3),
+            (oversized.as_str(), 8, vec![0, 1, 2, 3, 4, 5, 6], 4),
+        ] {
+            std::fs::write(&path, format!("{prefix}{gap}{suffix}")).unwrap();
+            let (records, count) = super::json_lines_preview_file_with_suffix(
+                &mut std::fs::File::open(&path).unwrap(),
+                limit,
+            )
+            .unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(count, expected);
+        }
     }
 
     #[test]
@@ -3412,7 +3820,7 @@ mod tests {
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = json_lines_tail_with_offsets(&path, records);
+            let _ = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records);
         }
 
         #[test]

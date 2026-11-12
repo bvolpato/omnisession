@@ -26,7 +26,7 @@ const ALIAS_SOURCES: &str = "
         SELECT provider,session_id,source_home,source_file,source_contents,content_hash,length(step_proof)/16
         FROM antigravity_ide_search_receipts
     ), primary_docs AS (
-        SELECT r.*,d.id AS document_id,d.indexed_at,d.derived_title,d.complete AS projection_complete,d.source_complete AND NOT d.provider_limited AS complete
+        SELECT r.*,d.id AS document_id,d.indexed_at,d.derived_title,d.complete AS projection_complete,d.document_version,d.source_complete AND NOT d.provider_limited AS complete
         FROM receipts r JOIN session_trajectories d USING(provider,session_id)
         JOIN native_search_document_homes o ON o.trajectory_id=d.id AND o.verification=1
             AND o.source_home=r.source_home AND o.source_file=r.source_file
@@ -38,7 +38,7 @@ const ALIAS_SOURCES: &str = "
     ), documents AS (
         SELECT * FROM primary_docs
         UNION ALL
-        SELECT r.*,-s.id,NULL,s.derived_title,s.complete,s.source_complete AND NOT s.provider_limited
+        SELECT r.*,-s.id,NULL,s.derived_title,s.complete,coalesce(s.document_version,0),s.source_complete AND NOT s.provider_limited
         FROM receipts r JOIN scoped_native_documents s USING(provider,session_id,source_home,source_file,source_contents)
         WHERE NOT EXISTS(SELECT 1 FROM primary_docs p WHERE p.provider=r.provider AND p.session_id=r.session_id
             AND p.source_home=r.source_home AND p.source_file=r.source_file)
@@ -60,8 +60,8 @@ const ALIAS_SOURCES: &str = "
              WHEN cur.document_id>0 THEN c.updated_at ELSE s.summary->>'updated_at' END AS donor_updated_at,
         CASE WHEN shared.summary IS NOT NULL THEN coalesce(shared.summary->>'approximate',0)
              WHEN cur.document_id>0 THEN c.updated_at_approximate ELSE coalesce(s.summary->>'approximate',0) END AS donor_approximate,
-        cur.steps,cur.source_file,cur.source_contents,cur.derived_title,
-        cur.document_id,cur.content_hash,older.document_id,older.content_hash
+        cur.steps,NULL,cur.source_file,cur.source_contents,cur.derived_title,
+        cur.document_id,cur.content_hash,older.document_id,older.content_hash,cur.document_version
     FROM documents older
     LEFT JOIN physical_database_body_reads witness USING(session_id,source_home,source_file)
     LEFT JOIN physical_step_declarations declaration USING(session_id,source_home,source_file)
@@ -133,17 +133,21 @@ impl TrajectorySearchSnapshot<'_> {
                     ide_home.map(|p| p.as_os_str().as_encoded_bytes())
                 ],
                 |row| {
-                    if !archived_body_matches(self.connection, row, 12)?
-                        || !archived_body_matches(self.connection, row, 14)?
+                    if !archived_body_matches(self.connection, row, 13)?
+                        || !archived_body_matches(self.connection, row, 15)?
                     {
                         return Ok(None);
                     }
                     let catalog = indexed_session_from_row(row)?;
                     let session = catalog.session.clone();
+                    let document_version = row.get(17)?;
                     let title =
-                        row.get::<_, Option<String>>(11)?
+                        row.get::<_, Option<String>>(12)?
                             .map(|title| IndexedTrajectoryTitle {
                                 session: session.clone(),
+                                document_version,
+                                verified_at: None,
+                                cached_at: None,
                                 title: Some(title),
                                 source_revision: catalog.source_revision.unwrap_or_default(),
                             });
@@ -156,7 +160,7 @@ impl TrajectorySearchSnapshot<'_> {
                         SessionRef::new(provider, session.id.clone()),
                         CachedDatabaseAliasSource {
                             provider,
-                            document_id: row.get(12)?,
+                            document_id: row.get(13)?,
                             catalog,
                             title,
                         },

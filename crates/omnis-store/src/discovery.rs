@@ -627,7 +627,7 @@ impl Store {
         let connection = self.connection.borrow();
         let mut statement = connection.prepare(
             "SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
-                    created_at, updated_at, updated_at_approximate, event_count,
+                    created_at, updated_at, updated_at_approximate, event_count, catalog.source_updated_submillis,
                     catalog.source_file_id, catalog.source_contents_id
              FROM desktop_discovery_snapshots AS snapshot
              LEFT JOIN json_each(snapshot.session_ids) AS listed ON true

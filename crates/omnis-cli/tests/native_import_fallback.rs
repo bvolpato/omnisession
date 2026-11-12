@@ -683,6 +683,126 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn close_progress_at_import(child: &mut Child, provider: &str) {
+    use std::io::{BufRead, BufReader};
+
+    let suffix = format!("into {provider}...");
+    let progress = BufReader::new(child.stderr.take().unwrap());
+    assert!(
+        progress
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| { line.starts_with("Importing ") && line.ends_with(&suffix) })
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
+    use prost::Message;
+    use rusqlite::{Connection, params};
+    use sha2::{Digest, Sha256};
+
+    #[derive(Message)]
+    struct PromptHistory {
+        #[prost(bytes, repeated, tag = "1")]
+        prompt_ids: Vec<Vec<u8>>,
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.root.join("cursor/workspace").join(SOURCE_ID);
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("meta.json"),
+        json!({"cwd": fixture.workspace}).to_string(),
+    )
+    .unwrap();
+    let db = Connection::open(source.join("store.db")).unwrap();
+    db.execute_batch("PRAGMA user_version=1; CREATE TABLE blobs(id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+    let missing = "Retain the synthetic migration decision.";
+    let prompt = serde_json::to_vec(
+        &json!({"role": "user", "content": format!("{}{missing}", "word ".repeat(26_000))}),
+    )
+    .unwrap();
+    let prompt_id = Sha256::digest(&prompt);
+    let graph = PromptHistory {
+        prompt_ids: vec![prompt_id.to_vec()],
+    }
+    .encode_to_vec();
+    let root_id = hex::encode(Sha256::digest(&graph));
+    db.execute(
+        "INSERT INTO blobs VALUES (?1,?2),(?3,?4)",
+        params![hex::encode(prompt_id), prompt, root_id, graph],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO meta VALUES ('0',?1)",
+        [hex::encode(
+            json!({"latestRootBlobId": root_id}).to_string(),
+        )],
+    )
+    .unwrap();
+    drop(db);
+
+    let executable = install_synthetic("cursor-agent", "#!/bin/sh\necho 2026.07.23-e383d2b\n");
+    let mut child = fixture
+        .command()
+        .env("OMNI_CURSOR_AGENT_BIN", executable)
+        .args([
+            "fork",
+            &format!("cursor-cli:{SOURCE_ID}"),
+            "--in",
+            "cursor-cli",
+            "--materialize-only",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    close_progress_at_import(&mut child, "Cursor CLI");
+    let fork = child.wait_with_output().unwrap();
+    assert!(
+        fork.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let stdout = String::from_utf8(fork.stdout).unwrap();
+    let target = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Created and verified ")?
+                .strip_suffix('.')
+        })
+        .unwrap();
+    let shown = fixture
+        .command()
+        .args(["--json", "show", target])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let snapshot: omnis_ir::CanonicalSnapshot = serde_json::from_slice(&shown.stdout).unwrap();
+    let history = omnis_core::readback_trajectory(&snapshot).unwrap();
+    assert!(
+        history
+            .items
+            .iter()
+            .any(|item| item.text.starts_with("word word "))
+    );
+    assert!(!history.items.iter().any(|item| item.text.contains(missing)));
+    let notice = history
+        .items
+        .iter()
+        .find(|item| item.text.starts_with("[OmniSession recovery file]\n"))
+        .unwrap();
+    let document = fs::read_to_string(notice.text.lines().last().unwrap()).unwrap();
+    assert!(document.contains(missing));
+}
+
 #[test]
 fn archived_codex_keeps_the_submitted_recovery_file_after_a_lost_completion() {
     use flate2::{Compression, write::GzEncoder};
@@ -825,6 +945,92 @@ fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_la
 
 #[cfg(unix)]
 #[test]
+fn codex_wrapper_reports_the_verified_local_import_and_the_unverified_launch() -> anyhow::Result<()>
+{
+    let fixture = Fixture::new();
+    let wrapper = fixture.root.join("wrapper");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CODEX_CAPTURE/wrapper-args\"\n",
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        format!(
+            "[profiles.routed]\nagent='codex'\nprogram={}\n",
+            serde_json::to_string(&wrapper)?
+        ),
+    )?;
+    fs::set_permissions(profile, fs::Permissions::from_mode(0o600))?;
+    let run = |args: &[&str]| -> anyhow::Result<String> {
+        let output = fixture
+            .command()
+            .env("FAKE_CODEX_ROLLOUT", "faithful")
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    let source = format!("claude:{SOURCE_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &source, "--target", "routed"])?)?;
+    assert_eq!(inspected["mode"], "native_materialization");
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["feature"] == "Wrapper destination verification"
+                    && entry["status"] == "unsupported"
+            )
+    );
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["feature"] == "Visible conversation"
+                && entry["status"] == "preserved")
+    );
+    let materialized = run(&["fork", &source, "--in", "routed", "--materialize-only"])?;
+    assert!(materialized.contains("Created and verified"));
+    assert!(!materialized.contains("Wrapper destination verification"));
+    let target = format!("codex:{THREAD_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &target, "--target", "routed"])?)?;
+    let entries = inspected["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["feature"] == "Wrapper destination verification")
+    );
+    assert!(entries.iter().all(|entry| entry["status"] != "preserved"));
+    let launched = run(&[
+        "resume",
+        &target,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--allow-workspace-mismatch",
+    ])?;
+    assert!(launched.contains("Wrapper destination verification"));
+    assert!(!launched.contains("Preserved"));
+    assert!(
+        fs::read_to_string(fixture.capture.join("wrapper-args"))?
+            .ends_with(&format!("resume\n{THREAD_ID}\n"))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Result<()> {
     let fixture = Fixture::new();
     let profile = fixture.root.join("state/profiles.toml");
@@ -835,6 +1041,13 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
     let selected = fixture.workspace.join("selected state");
     let foreign = fixture.root.join("home/foreign state");
     fs::create_dir_all(&foreign)?;
+    fs::create_dir_all(&selected)?;
+    write_import_thread_database(
+        &selected.join("state_5.sqlite"),
+        &fixture.generated_rollout(),
+    )?;
+    let foreign_db = foreign.join("state_5.sqlite");
+    fs::write(&foreign_db, b"damaged caller database")?;
     let canary = foreign.join(THREAD_ID);
     fs::write(&canary, "Existing thread with the same ID")?;
 
@@ -845,19 +1058,23 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
         "routed",
         "--materialize-only",
     ]);
-    let run = |read| {
+    let run = |read, rollout, materialize_only| {
         fixture.run(
-            &args,
+            if materialize_only {
+                &args
+            } else {
+                &args[..args.len() - 1]
+            },
             &[
                 ("FAKE_CODEX_VERSION", "0.167.1"),
                 ("FAKE_CODEX_TRACK_DATABASE", "1"),
-                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_ROLLOUT", rollout),
                 ("FAKE_CODEX_READ", read),
                 ("CODEX_SQLITE_HOME", "~/foreign state"),
             ],
         )
     };
-    let failed = run("empty");
+    let failed = run("empty", "faithful", true);
     assert!(!failed.status.success(), "{}", failed.stderr);
     assert!(
         fixture
@@ -871,8 +1088,25 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
     );
 
     fs::write(&profile, config)?;
-    let succeeded = run("");
+    let assert_readback_rollback = |failed: Run| {
+        assert!(!failed.status.success(), "{}", failed.stderr);
+        assert!(
+            failed
+                .stderr
+                .contains("Codex import failed read-back verification"),
+            "{}",
+            failed.stderr
+        );
+        assert!(!selected.join(THREAD_ID).exists());
+        assert!(!fixture.generated_rollout().exists());
+    };
+    assert_readback_rollback(run("", "divergent", true));
+    let succeeded = run("", "faithful", true);
     assert!(succeeded.status.success(), "{}", succeeded.stderr);
+    assert!(fixture.launch_arguments().is_none());
+    let launched = run("", "faithful", false);
+    assert!(launched.status.success(), "{}", launched.stderr);
+    assert_import_resume(&fixture, &selected)?;
     let generated = fs::read_to_string(fixture.generated_rollout())?;
     assert!(generated.contains(SOURCE_QUESTION));
     assert_eq!(fs::read_to_string(selected.join(THREAD_ID))?, generated);
@@ -880,13 +1114,47 @@ fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Resul
         fs::read_to_string(&canary)?,
         "Existing thread with the same ID"
     );
+    assert_eq!(fs::read(&foreign_db)?, b"damaged caller database");
+    fs::copy(selected.join("state_5.sqlite"), &foreign_db)?;
+    let caller_before = fs::read(&foreign_db)?;
+    fs::write(selected.join("state_5.sqlite"), b"damaged profile database")?;
+    assert_readback_rollback(run("", "faithful", true));
+    assert_eq!(fs::read(&foreign_db)?, caller_before);
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
     let pins = fs::read_to_string(fixture.capture.join("sqlite-pins"))?;
     let pins: Vec<_> = pins.lines().collect();
-    assert_eq!(pins.len(), 3, "import, rollback, then a successful import");
+    assert_eq!(pins.len(), 8, "three rollbacks and two successful imports");
     for pin in pins {
         let config: toml::Table = toml::from_str(pin)?;
         assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), selected);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_import_resume(fixture: &Fixture, selected: &Path) -> anyhow::Result<()> {
+    let launched = fixture.launch_arguments().expect("native Codex launch");
+    let pin = format!("sqlite_home={}", serde_json::to_string(selected)?);
+    assert!(
+        launched.ends_with(&strings(&["-c", &pin, "resume", THREAD_ID])),
+        "{launched:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_import_thread_database(path: &Path, rollout: &Path) -> anyhow::Result<()> {
+    let db = rusqlite::Connection::open(path)?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        [THREAD_ID, rollout.to_str().unwrap()],
+    )?;
     Ok(())
 }
 
@@ -2411,6 +2679,29 @@ fn assert_interrupted_pi_family_import(provider: &str, binary_override: &str, ve
                 .contains(&format!("Imported and verified `{target}`.")),
             "{label}: {}",
             run.stderr
+        );
+        let cached = fixture
+            .command()
+            .args([
+                "--json",
+                "search",
+                "--cached",
+                "--provider",
+                provider,
+                SOURCE_QUESTION,
+            ])
+            .output()
+            .expect("search the cached target provider");
+        assert!(
+            cached.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&cached.stderr)
+        );
+        let cached: Value = serde_json::from_slice(&cached.stdout).expect("cached search JSON");
+        assert_eq!(
+            cached["results"],
+            json!([]),
+            "{label} left a searchable target"
         );
         // On Windows, omni locks the Pi session root through its own lock file there.
         let remaining = walkdir::WalkDir::new(pi_root.join("sessions"))

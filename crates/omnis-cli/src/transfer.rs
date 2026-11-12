@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use omnis_adapters::OpenCodeGeneration;
+use omnis_adapters::{OpenCodeGeneration, ProviderAdapter};
 use omnis_core::{ImportTrajectory, TrajectoryItem, TrajectoryItemKind, needs_recovery_handoff};
 use omnis_ir::SourceRevision;
 use omnis_store::{BindingRecord, BranchHeadAdvance, BranchHeadRestore};
@@ -42,6 +42,11 @@ pub(super) fn resume(
     json_output: bool,
     task_binding: Option<&BindingRecord>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let _identity = args
+        .source
+        .as_ref()
+        .map(|_| crate::provider_launch::codex_identity_scope());
     if let Some(target) = args.target {
         reject_unsupported_target(target.provider)?;
         check_launch_profile(target)?;
@@ -75,6 +80,8 @@ fn resume_request(
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
@@ -132,7 +139,7 @@ fn resume_from_snapshot(
         ))?;
         progress_line("Reading source trajectory...")?;
     }
-    let read = registry
+    let mut read = registry
         .read_selected_session_indexed(
             source,
             request
@@ -141,6 +148,9 @@ fn resume_from_snapshot(
                 .and_then(|selection| selection.source_revision),
         )
         .with_context(|| format!("reading `{source}`"))?;
+    if read.snapshot.session.provider == Provider::OhMyPi {
+        read.snapshot.title = omnis_core::continuation_title(&read.snapshot).map(str::to_owned);
+    }
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }
@@ -626,6 +636,7 @@ fn resume_native_without_snapshot(
     } else {
         build_native_fork_report(request.source.provider, repository_matches)
     };
+    let report = launch_fidelity(request.agent_target(), report)?;
     if preview {
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
@@ -639,6 +650,7 @@ fn resume_native_without_snapshot(
     if let Some(started_at) = fork_started_at {
         link_native_fork(
             registry,
+            request.agent_target(),
             &request.source,
             &plan,
             started_at,
@@ -647,8 +659,8 @@ fn resume_native_without_snapshot(
         )?;
     }
     if !request.resume_in_place && !tracks_native_fork && task_binding.is_some() {
-        eprintln!(
-            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
+        let _ = progress_line(
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
         );
     }
     Ok(())
@@ -771,6 +783,7 @@ fn resume_opencode_v2_fork(
 
 fn link_native_fork(
     registry: &AdapterRegistry,
+    target: AgentTarget,
     source: &SessionRef,
     plan: &LaunchPlan,
     started_at: chrono::DateTime<Utc>,
@@ -779,14 +792,16 @@ fn link_native_fork(
 ) -> Result<()> {
     let provider = provider_name(source.provider);
     let project = if source.provider == Provider::Codex {
-        Some(codex_import::launch_directory(plan)?)
+        Some(codex_import::launch_directory(
+            target.codex_option_plan(plan)?.as_ref(),
+        )?)
     } else {
         plan.cwd.clone()
     };
     let Some(project) = project.as_deref() else {
-        progress_line(&format!(
+        let _ = progress_line(&format!(
             "warning: {provider} fork workspace was unavailable; lineage was not linked."
-        ))?;
+        ));
         return Ok(());
     };
     let candidates = match registry
@@ -795,10 +810,10 @@ fn link_native_fork(
     {
         Ok(candidates) => candidates,
         Err(error) => {
-            progress_line(&format!(
+            let _ = progress_line(&format!(
                 "warning: Could not discover {provider} fork: {}",
                 safe_terminal_line(&error.to_string())
-            ))?;
+            ));
             return Ok(());
         }
     };
@@ -811,25 +826,15 @@ fn link_native_fork(
                 candidates.len()
             )
         };
-        progress_line(&format!("warning: {warning}"))?;
+        let _ = progress_line(&format!("warning: {warning}"));
         return Ok(());
     };
 
-    record_native_fork_lineage(source, target, report, task_binding)
-}
-
-fn record_native_fork_lineage(
-    source: &SessionRef,
-    target: &SessionRef,
-    report: &FidelityReport,
-    task_binding: Option<&BindingRecord>,
-) -> Result<()> {
-    let provider = provider_name(source.provider);
     if let Err(error) = record_transfer_lineage(source, target, report, task_binding) {
-        progress_line(&format!(
+        let _ = progress_line(&format!(
             "warning: Could not record {provider} fork lineage: {}",
             safe_terminal_line(&error.to_string())
-        ))?;
+        ));
         return Ok(());
     }
     notify_stdout(format_args!(
@@ -1090,7 +1095,8 @@ fn codex_native_launch(
     let native_args = std::mem::take(&mut plan.args);
     let mut plan = target.launch_with_mode(plan, &mode_args)?;
     if (override_dir || !startup_matches)
-        && !plan
+        && !target
+            .codex_option_plan(&plan)?
             .args
             .iter()
             .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
@@ -1102,7 +1108,13 @@ fn codex_native_launch(
         !requires_import_for_native_resume(registry, source, target)?,
         "selected Codex rollout no longer supports a native launch"
     );
-    verify_codex_launch(registry, source, source, &mut plan)?;
+    verify_codex_launch(
+        registry.adapter(Provider::Codex)?,
+        target,
+        source,
+        source,
+        &mut plan,
+    )?;
     let selected = registry.find_native_session(Provider::Codex, &source.id)?;
     anyhow::ensure!(
         selected
@@ -1113,14 +1125,44 @@ fn codex_native_launch(
     Ok((plan, matches))
 }
 
+pub(super) fn launch_fidelity(
+    target: AgentTarget,
+    mut report: FidelityReport,
+) -> Result<FidelityReport> {
+    if target.provider != Provider::Codex || target.uses_provider_program()? {
+        return Ok(report);
+    }
+    let detail = match report.mode {
+        super::TransferMode::NativeResume | super::TransferMode::NativeFork => {
+            report
+                .entries
+                .retain(|entry| entry.status != super::FidelityStatus::Preserved);
+            "The wrapper receives the requested native command. OmniSession cannot verify which session it opens."
+        }
+        super::TransferMode::NativeMaterialization => {
+            "The import report describes the local Codex thread. OmniSession cannot verify that the wrapper opens that thread."
+        }
+        super::TransferMode::SemanticHandoff => {
+            "The handoff report describes the prepared file. OmniSession cannot verify that the wrapper opens the file in Codex."
+        }
+        _ => return Ok(report),
+    };
+    report.entries.push(super::FidelityEntry {
+        feature: "Wrapper destination verification".into(),
+        status: super::FidelityStatus::Unsupported,
+        detail: Some(detail.into()),
+    });
+    Ok(report)
+}
+
 pub(super) fn verify_codex_launch(
-    registry: &AdapterRegistry,
+    adapter: &dyn ProviderAdapter,
+    target: AgentTarget,
     session: &SessionRef,
     source: &SessionRef,
     plan: &mut LaunchPlan,
 ) -> Result<()> {
-    let route =
-        codex_import::pin_local_server(registry.adapter(Provider::Codex)?, Some(session), plan);
+    let route = codex_import::pin_local_server(adapter, target, Some(session), plan);
     if matches!(route, Ok(true)) {
         return Ok(());
     }
@@ -1273,8 +1315,7 @@ struct ResumeContext<'a> {
 impl ImportSource for ResumeContext<'_> {
     fn history(&self) -> Result<(&CanonicalSnapshot, ImportTrajectory)> {
         let (snapshot, mut trajectory) = self.snapshot.history()?;
-        if self.can_use_handoff()
-            && !self.args.dry_run
+        if !self.args.dry_run
             && !self.json_output
             && !trajectory.items.is_empty()
             && needs_recovery_handoff(snapshot, trajectory.truncated)
@@ -1333,10 +1374,25 @@ impl ResumeContext<'_> {
     }
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
+        self.launch_plan_from(session, target, self.registry.adapter(session.provider)?)
+    }
+
+    fn launch_plan_from(
+        &self,
+        session: &SessionRef,
+        target: &LaunchTarget,
+        source_adapter: &dyn ProviderAdapter,
+    ) -> Result<LaunchPlan> {
         let plan = self.registry.launch_plan(session, target)?;
         let mut plan = self.agent_target().launch_with_mode(plan, self.mode_args)?;
         if session.provider == Provider::Codex && !self.args.materialize_only {
-            verify_codex_launch(self.registry, session, self.source, &mut plan)?;
+            verify_codex_launch(
+                source_adapter,
+                self.agent_target(),
+                session,
+                self.source,
+                &mut plan,
+            )?;
         }
         Ok(plan)
     }
@@ -1346,7 +1402,12 @@ impl ResumeContext<'_> {
         let mut plan = self.agent_target().launch_with_mode(plan, self.mode_args)?;
         if provider == Provider::Codex && target.prompt.is_some() {
             anyhow::ensure!(
-                codex_import::pin_local_server(self.registry.adapter(provider)?, None, &mut plan)?,
+                codex_import::pin_local_server(
+                    self.registry.adapter(provider)?,
+                    self.agent_target(),
+                    None,
+                    &mut plan
+                )?,
                 "cannot verify the local Codex configuration for the handoff file"
             );
         }
@@ -1672,6 +1733,8 @@ fn ask_after_failed_import(
     let source = context.source.provider;
     let fork_in = (source != context.target && runnable_target_providers().contains(&source))
         .then(|| provider_name(source));
+    #[cfg(windows)]
+    crate::provider_launch::release_codex_identity();
     import_choice::ask(
         provider,
         &safe_terminal_line(&format!("{error:#}")),
@@ -1722,6 +1785,35 @@ fn semantic_handoff_prompt(file: &NamedTempFile) -> String {
     }
 }
 
+fn handoff_workspace_warning(context: &ResumeContext<'_>) -> Result<Option<&'static str>> {
+    Ok(
+        if !context.can_use_handoff()
+            || context.repository_matches
+            || (context.source.provider != Provider::Codex
+                && source_workspace_matches_for_session(
+                    context.source,
+                    context.snapshot,
+                    context.project,
+                )?)
+        {
+            None
+        } else if context.source.provider != Provider::Codex
+            && (context.args.allow_workspace_mismatch
+                || context
+                    .picker_selection
+                    .is_some_and(|selection| selection.workspace_override.is_some()))
+        {
+            Some(
+                "# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n",
+            )
+        } else {
+            Some(
+                "# Workspace verification\n\nOmniSession could not verify that the target workspace matches the source. Check the referenced paths before acting.\n\n",
+            )
+        },
+    )
+}
+
 fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<()> {
     if context.args.materialize_only {
         bail!("`--materialize-only` requires a supported native import");
@@ -1736,16 +1828,8 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
-    let workspace_warning = if !handoff {
-        None
-    } else if context.source.provider == Provider::Codex {
-        (!context.repository_matches).then_some(
-            "# Workspace verification\n\nOmniSession could not verify that the target workspace matches the source. Check the referenced paths before acting.\n\n",
-        )
-    } else {
-        (!source_workspace_matches_for_session(context.source, context.snapshot, context.project)?)
-            .then_some("# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n")
-    };
+    let report = launch_fidelity(context.agent_target(), report)?;
+    let workspace_warning = handoff_workspace_warning(context)?;
     let mut handoff_file = None;
     let launch_prompt = if handoff {
         if context.args.dry_run {
@@ -1812,8 +1896,8 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     }
     wait_for_launch(child, &plan)?;
     if context.mode != ResumeMode::InPlace && context.task_binding.is_some() {
-        eprintln!(
-            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
+        let _ = progress_line(
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
         );
     }
     Ok(())
@@ -2033,11 +2117,11 @@ impl ImportInterrupt {
                 &self.operation,
             )),
             None => {
-                eprintln!(
+                let _ = progress_line(&format!(
                     "Interrupted; {} did not complete ({}). Source session was not changed.",
                     self.operation,
                     safe_terminal_line(&error.to_string())
-                );
+                ));
                 Err(Interrupted.into())
             }
         }
@@ -2146,6 +2230,11 @@ fn resume_via_codex_import(
         import.tool_events,
         0,
     );
+    let report = if context.args.materialize_only {
+        report
+    } else {
+        launch_fidelity(context.agent_target(), report)?
+    };
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,
@@ -2168,7 +2257,7 @@ fn resume_via_codex_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Codex");
-    let target = match materialize_codex_import(context.registry, import, context.project, binary) {
+    let target = match materialize_codex_import(import, context.project, binary) {
         Ok(target) => target,
         Err(error) => {
             // Codex assigns the thread ID, so a thread it never reported has no exact rollback.
@@ -2181,14 +2270,17 @@ fn resume_via_codex_import(
     };
     let rollback = || codex_import::rollback(binary, context.project, &target, import);
     interrupt.check(ImportCheckpoint::Materialized, &target, rollback)?;
-    let launch = match context.launch_plan(
-        &target,
-        &LaunchTarget {
-            cwd: Some(context.process_directory.to_path_buf()),
-            fork: false,
-            prompt: None,
-        },
-    ) {
+    let launch = match import.target_adapter().and_then(|adapter| {
+        context.launch_plan_from(
+            &target,
+            &LaunchTarget {
+                cwd: Some(context.process_directory.to_path_buf()),
+                fork: false,
+                prompt: None,
+            },
+            &adapter,
+        )
+    }) {
         Ok(launch) => launch,
         Err(error) => {
             return Err(error_after_rollback(
@@ -2890,6 +2982,15 @@ fn readback_failure_details(
     }
 }
 
+// The provider has created the target. Verification and cleanup must continue if stderr closes.
+fn notify_verifying_import(target: &SessionRef) {
+    let _ = progress_line(&format!("Verifying imported session `{target}`..."));
+}
+
+fn notify_verified_import(target: &SessionRef) {
+    let _ = progress_line(&format!("Imported and verified `{target}`."));
+}
+
 pub(super) fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
@@ -2900,16 +3001,13 @@ pub(super) fn materialize_claude_import(
         import.history_items
     ))?;
     let write_guard = claude_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    notify_verifying_import(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| claude_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -2922,7 +3020,6 @@ pub(super) fn materialize_claude_import(
 }
 
 pub(super) fn materialize_codex_import(
-    registry: &AdapterRegistry,
     import: &codex_import::CodexImport,
     project: &Path,
     binary: &Path,
@@ -2932,14 +3029,14 @@ pub(super) fn materialize_codex_import(
         "Importing {history_items} trajectory items into Codex..."
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
-    progress_line(&format!("Verifying imported session `{target}`..."))?;
-    let readback = registry.read_session_indexed(&target);
+    notify_verifying_import(&target);
+    let readback = import.read_target(&target);
     let report = readback
         .as_ref()
         .ok()
         .map(|snapshot| codex_import::readback_report(snapshot, &import.expected_messages));
     if report.as_ref().is_some_and(|report| report.verified) {
-        progress_line(&format!("Imported and verified `{target}`."))?;
+        notify_verified_import(&target);
         Ok(target)
     } else {
         let details = report.map_or_else(
@@ -3007,12 +3104,9 @@ fn materialize_opencode_import(
         // A queued worker can consume the input before a retry reports the path or session missing.
         return Err(unverified(anyhow!("OpenCode import exited with {status}")));
     }
-    let _ = progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ));
+    notify_verifying_import(&import.target);
     opencode_import::wait_for_readback(&mut export, import, deadline).map_err(unverified)?;
-    let _ = progress_line(&format!("Imported and verified `{}`.", import.target));
+    notify_verified_import(&import.target);
     Ok(())
 }
 
@@ -3037,16 +3131,13 @@ pub(super) fn materialize_grok_import(
         "Importing {history_items} trajectory items into Grok..."
     ))?;
     grok_import::materialize(import, binary, project)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    notify_verifying_import(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| grok_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -3068,16 +3159,13 @@ pub(super) fn materialize_hermes_import(
         import.history_items
     ))?;
     hermes_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    notify_verifying_import(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| hermes_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -3099,17 +3187,12 @@ pub(super) fn materialize_cursor_import(
         import.history_items
     ))?;
     cursor_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            cursor_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    notify_verifying_import(&import.target);
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        cursor_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         Err(error_after_rollback(
@@ -3131,16 +3214,13 @@ pub(super) fn materialize_pi_import(
         import.history_items
     ))?;
     pi_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    notify_verifying_import(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| pi_import::readback_matches(snapshot, &import.expected_items));
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(())
     } else {
         let details = readback_failure_details(&readback, &import.expected_items);
@@ -3162,17 +3242,12 @@ pub(super) fn materialize_cursor_ide_import(
         import.history_items
     ))?;
     let write_guard = cursor_ide_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    notify_verifying_import(&import.target);
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         Err(error_after_rollback(
@@ -3193,17 +3268,12 @@ pub(super) fn materialize_antigravity_import(
         import.history_items
     ))?;
     let write_guard = antigravity_import::materialize(import, binary)?;
-    progress_line(&format!(
-        "Verifying imported session `{}`...",
-        import.target
-    ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            antigravity_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    notify_verifying_import(&import.target);
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        antigravity_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
         Err(error_after_rollback(

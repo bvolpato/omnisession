@@ -6,7 +6,7 @@ mod text;
 use std::borrow::Cow;
 
 use super::{
-    CatalogObservation, OptionalExtension, PreparedTrajectoryWrite, Result,
+    CatalogHomeObservation, OptionalExtension, PreparedTrajectoryWrite, Result,
     SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, TrajectoryWriteContext,
     Transaction, database_error, params,
 };
@@ -348,14 +348,14 @@ fn selected_home<'a>(
     context: TrajectoryWriteContext<'a>,
     provider: &str,
     id: &str,
-    catalog: CatalogObservation,
+    catalog: CatalogHomeObservation,
 ) -> Result<Option<Cow<'a, [u8]>>> {
     let home = match context {
         TrajectoryWriteContext::Locator {
             home: Some(home), ..
         } => Cow::Borrowed(home.as_os_str().as_encoded_bytes()),
         TrajectoryWriteContext::Discovered(_)
-            if matches!(catalog, CatalogObservation::Verified { .. }) =>
+            if matches!(catalog, CatalogHomeObservation::Verified { .. }) =>
         {
             let home = tx
                 .query_row(

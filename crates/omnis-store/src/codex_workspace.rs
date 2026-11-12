@@ -153,7 +153,10 @@ impl CodexWorkspace {
                AND c.source_file_id=t.source_file_id AND c.source_contents_id=t.source_contents_id";
         let mut statement = connection.prepare(sql).map_err(database_error)?;
         statement
-            .query_map([omnis_core::SEARCH_DOCUMENT_VERSION], workspace_row)
+            .query_map(
+                [omnis_core::search_document_version(Provider::Codex)],
+                workspace_row,
+            )
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
             .map_err(database_error)
