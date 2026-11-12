@@ -34,7 +34,7 @@ const ALIAS_SOURCES: &str = "
         JOIN session_index c USING(provider,session_id)
         WHERE d.origin='native' AND d.source_file_id=r.source_file AND d.source_contents_id=r.source_contents
             AND d.content_hash=r.content_hash AND h.verified AND h.home=r.source_home
-            AND c.source_file_id=r.source_file AND c.source_contents_id=r.source_contents
+            AND c.source_file_id=r.source_file
     ), documents AS (
         SELECT * FROM primary_docs
         UNION ALL
@@ -69,29 +69,29 @@ const ALIAS_SOURCES: &str = "
     JOIN native_catalog_homes selected ON selected.provider=older.provider AND selected.session_id=older.session_id
         AND selected.verified AND selected.home=older.source_home
     JOIN session_index selected_catalog ON selected_catalog.provider=older.provider AND selected_catalog.session_id=older.session_id
-        AND selected_catalog.source_file_id=older.source_file AND selected_catalog.source_contents_id=older.source_contents
+        AND selected_catalog.source_file_id=older.source_file
+        AND (selected_catalog.source_contents_id=older.source_contents OR witness.provider=cur.provider)
     LEFT JOIN session_index c ON cur.document_id>0 AND c.provider=cur.provider AND c.session_id=cur.session_id
     LEFT JOIN physical_database_summaries shared ON shared.session_id=cur.session_id
         AND shared.source_home=cur.source_home AND shared.source_file=cur.source_file
     LEFT JOIN summaries s ON cur.document_id<0 AND s.provider=cur.provider AND s.session_id=cur.session_id
         AND s.source_file=cur.source_file AND s.source_home=cur.source_home AND s.steps=cur.steps
-    WHERE (?1 IS NULL OR older.provider=?1) AND (older.provider<>'antigravity-ide' OR selected.home=?2)
+    WHERE (cur.document_id<0 OR c.source_contents_id=cur.source_contents)
+        AND (?1 IS NULL OR older.provider=?1) AND (older.provider<>'antigravity-ide' OR selected.home=?2)
         AND (older.content_hash,older.steps,older.complete,older.projection_complete,older.derived_title,
              selected_catalog.title,selected_catalog.project_path,selected_catalog.git_branch,
              selected_catalog.created_at,selected_catalog.updated_at,selected_catalog.updated_at_approximate,
              selected_catalog.event_count)
           IS NOT (cur.content_hash,cur.steps,cur.complete,cur.projection_complete,cur.derived_title,
              donor_title,donor_project_path,donor_git_branch,donor_created_at,donor_updated_at,donor_approximate,cur.steps)
-        AND older.provider<>cur.provider AND cur.complete AND (
+        AND older.provider<>cur.provider AND (
             ((witness.declaration_generation IS declaration.generation
-                  OR (declaration.source_contents=witness.source_contents AND declaration.steps=cur.steps))
+                  OR declaration.source_contents=witness.source_contents)
                 AND cur.provider=witness.provider
                 AND cur.source_contents=witness.source_contents AND cur.content_hash=witness.content_hash)
             OR (witness.session_id IS NULL
                 AND cur.source_contents=declaration.source_contents AND cur.steps=declaration.steps
-                AND ((older.steps>cur.steps AND (cur.indexed_at>older.indexed_at
-                        OR (cur.projection_complete AND (NOT older.complete OR cur.indexed_at IS NULL OR older.indexed_at IS NULL))))
-                    OR (older.steps=cur.steps AND older.complete AND cur.indexed_at>older.indexed_at)))
+                AND cur.complete AND cur.indexed_at>older.indexed_at)
         )";
 
 fn archived_body_matches(

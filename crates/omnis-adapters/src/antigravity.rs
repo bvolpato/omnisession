@@ -534,7 +534,7 @@ impl Summary {
             let wal = source
                 .extension()
                 .is_some_and(|ext| ext == "db")
-                .then(|| WalRevision::read(source));
+                .then(|| WalRevision::read(source).0);
             (file, Some(history), wal)
         };
         let empty_sources_verified = if self.step_count == Some(0)
@@ -580,30 +580,56 @@ fn history_contents(
     ))
 }
 
-pub(super) fn database_history_revision(
-    database: &Path,
-    declared_steps: Option<usize>,
-) -> Option<SourceRevision> {
-    let revision = source_file_revision(database)?;
-    let wal = WalRevision::read(database);
-    if matches!(wal, WalRevision::Unavailable) {
-        return None;
-    }
-    let contents = history_contents(
-        revision.file?,
-        Some(revision.contents?),
-        Some(wal),
-        declared_steps,
-        None,
-    )
-    .ok()?;
-    Some(SourceRevision {
-        contents: Some(contents),
-        ..revision
-    })
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DatabaseGeneration {
+    file: Uuid,
+    base: Uuid,
+    wal: WalRevision,
+    wal_bytes: u64,
 }
 
-#[derive(serde::Serialize)]
+impl DatabaseGeneration {
+    pub(super) fn read(database: &Path) -> Option<Self> {
+        let revision = source_file_revision(database)?;
+        let (wal, wal_bytes) = WalRevision::read(database);
+        if matches!(wal, WalRevision::Unavailable) {
+            return None;
+        }
+        Some(Self {
+            file: revision.file?,
+            base: revision.contents?,
+            wal,
+            wal_bytes,
+        })
+    }
+
+    pub(super) fn revision(self, declared_steps: Option<usize>) -> Option<SourceRevision> {
+        Some(SourceRevision {
+            file: Some(self.file),
+            contents: Some(
+                history_contents(
+                    self.file,
+                    Some(self.base),
+                    Some(self.wal),
+                    declared_steps,
+                    None,
+                )
+                .ok()?,
+            ),
+            missing_ancestor: None,
+        })
+    }
+
+    pub(super) fn checkpoint(self) -> (Uuid, Option<Uuid>) {
+        let wal = match self.wal {
+            WalRevision::Present(id) if self.wal_bytes > 0 => Some(id),
+            _ => None,
+        };
+        (self.base, wal)
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 enum WalRevision {
     Missing,
     Unavailable,
@@ -611,19 +637,19 @@ enum WalRevision {
 }
 
 impl WalRevision {
-    fn read(database: &Path) -> Self {
+    fn read(database: &Path) -> (Self, u64) {
         if let Some(path) = wal_path(database) {
-            return source_file_revision(&path)
-                .and_then(|revision| revision.contents)
-                .map_or(Self::Unavailable, Self::Present);
+            return crate::source_file::source_file_revision_with_size(&path)
+                .and_then(|(revision, size)| Some((Self::Present(revision.contents?), size)))
+                .unwrap_or((Self::Unavailable, 0));
         }
         if database
             .parent()
             .is_some_and(|parent| verify_missing(&sidecar(database, "-wal"), parent).is_ok())
         {
-            Self::Missing
+            (Self::Missing, 0)
         } else {
-            Self::Unavailable
+            (Self::Unavailable, 0)
         }
     }
 }
@@ -1075,11 +1101,18 @@ fn push_database_steps_with_limits(
 }
 
 fn mark_unverified_wal(builder: &mut EventBuilder) {
+    mark_unverified_database(
+        builder,
+        "The SQLite WAL could not confirm the end of this history.",
+    );
+}
+
+pub(super) fn mark_unverified_database(builder: &mut EventBuilder, reason: &str) {
     builder.push(
         EventKind::ProviderEvent,
         json!({
             "native_history_unverified": true,
-            "reason": "The SQLite WAL could not confirm the end of this history."
+            "reason": reason
         }),
         None,
         ReplayPolicy::HistoricalOnly,

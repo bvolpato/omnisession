@@ -18,6 +18,7 @@ pub(super) fn record(
     tx: &Transaction<'_>,
     write: &PreparedTrajectoryWrite<'_, '_>,
     home: &[u8],
+    accepted: bool,
 ) -> Result<()> {
     let TrajectorySourceGuard::ObservedDocument(observed) = write.guard else {
         return Ok(());
@@ -29,9 +30,23 @@ pub(super) fn record(
     ) else {
         return Ok(());
     };
-    let certified = write.source_complete
-        && !write.document.provider_limited
-        && write.document.database_step_proof.is_some();
+    if accepted {
+        crate::desktop_declarations::wal_rows::record(tx, write, home)?;
+    }
+    let owner = write.session.provider.to_string();
+    let typed = accepted && write.document.database_step_proof.is_some();
+    let complete = write.source_complete && !write.document.provider_limited;
+    // A preview can extend the document already selected for both references.
+    let certified = typed
+        && (complete
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM physical_database_body_reads
+         WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND provider=?4)",
+                    params![write.session.id, home, file.as_bytes(), owner],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(database_error)?);
     tx.prepare_cached(
         "INSERT INTO physical_database_body_reads(session_id,source_home,source_file,database_contents,
              provider,source_contents,content_hash,declaration_generation)
@@ -45,6 +60,6 @@ pub(super) fn record(
            AND (database_contents,provider,source_contents,content_hash,declaration_generation) IS NOT
                (excluded.database_contents,excluded.provider,excluded.source_contents,excluded.content_hash,excluded.declaration_generation)",
     ).and_then(|mut statement| statement.execute(params![write.session.id,home,file.as_bytes(),database.as_bytes(),
-        certified.then(|| write.session.provider.to_string()),certified.then_some(contents.as_bytes()),certified.then_some(&write.content_hash)]))
+        certified.then_some(owner),certified.then_some(contents.as_bytes()),certified.then_some(&write.content_hash)]))
         .map(|_| ()).map_err(database_error)
 }

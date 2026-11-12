@@ -46,7 +46,7 @@ pub(super) fn observe(
         paths.push(root.to_path_buf());
     }
     let mut summaries_unavailable = false;
-    let mut database_contents = None;
+    let mut database_generation = None;
     let mut observation = SearchSourceObservation::capture(root, paths, || {
         ensure!(
             visible()?,
@@ -61,23 +61,11 @@ pub(super) fn observe(
         let summaries = read_summaries(root).ok().flatten();
         let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
         summaries_unavailable = summary.is_none();
-        let listed = native_session(&session.id, database.clone(), summary);
-        let physical = if summary.is_none() {
-            listed.source_revision
-        } else {
-            crate::antigravity::database_history_revision(&database, None)
-        }
-        .context("Antigravity Desktop database revision is unavailable")?;
-        ensure!(
-            listed
-                .source_revision
-                .is_some_and(|revision| revision.file == physical.file),
-            "Antigravity Desktop database changed during search read"
-        );
-        database_contents = physical.contents;
+        let (listed, generation) = native_session(&session.id, database, summary);
+        database_generation = generation;
         Ok(listed)
     })?;
     observation.desktop_summaries_unavailable = summaries_unavailable;
-    observation.database_contents = database_contents;
+    observation.database_generation = database_generation;
     Ok(Some(observation))
 }

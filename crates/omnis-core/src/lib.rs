@@ -61,8 +61,9 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 8;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity | Provider::AntigravityDesktop => 13,
-        Provider::AntigravityIde => 10,
+        Provider::Antigravity => 13,
+        Provider::AntigravityDesktop => 14,
+        Provider::AntigravityIde => 11,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }

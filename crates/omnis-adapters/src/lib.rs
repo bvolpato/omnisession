@@ -131,7 +131,7 @@ pub struct SearchSourceObservation {
     /// Canonical native home verified together with this session.
     pub home: PathBuf,
     selected_home: PathBuf,
-    database_contents: Option<uuid::Uuid>,
+    database_generation: Option<antigravity::DatabaseGeneration>,
     paths: Vec<(PathBuf, FileObservation)>,
 }
 
@@ -174,7 +174,7 @@ impl SearchSourceObservation {
             desktop_summaries_unavailable: false,
             home,
             selected_home: root.to_path_buf(),
-            database_contents: None,
+            database_generation: None,
             paths,
         };
         anyhow::ensure!(
@@ -198,22 +198,22 @@ impl SearchSourceObservation {
     /// Returns the observed Desktop database and WAL revision, independent of summary metadata.
     #[must_use]
     pub fn database_contents(&self) -> Option<uuid::Uuid> {
-        self.database_contents
+        self.database_generation?.revision(None)?.contents
+    }
+
+    /// Returns the checkpointed database revision and the generation of its nonempty WAL, if present.
+    #[must_use]
+    pub fn database_checkpoint(&self) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
+        self.database_generation
+            .map(antigravity::DatabaseGeneration::checkpoint)
     }
 
     /// Checks a historical declaration against the selected database and WAL.
     #[must_use]
     pub fn matches_database_declaration(&self, count: usize, contents: uuid::Uuid) -> bool {
-        (self.is_ide_desktop_database()
-            || self.session.session.provider == Provider::AntigravityDesktop)
-            && self
-                .session
-                .source_path
-                .as_deref()
-                .and_then(|path| antigravity::database_history_revision(path, Some(count)))
-                .is_some_and(|revision| {
-                    revision.file == self.revision.file && revision.contents == Some(contents)
-                })
+        self.database_generation
+            .and_then(|generation| generation.revision(Some(count)))
+            .is_some_and(|revision| revision.contents == Some(contents))
     }
 
     fn watch_absent(&mut self, path: PathBuf) -> Result<()> {

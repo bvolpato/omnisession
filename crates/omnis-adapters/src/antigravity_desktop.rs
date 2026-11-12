@@ -40,7 +40,14 @@ const MAX_SUMMARIES_SIZE: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct AntigravityDesktopAdapter {
     root: Option<PathBuf>,
-    cached_step_count: Option<(Uuid, usize)>,
+    cached_step_count: Option<CachedCount>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedCount {
+    file: Uuid,
+    minimum: usize,
+    uncertain: bool,
 }
 
 impl AntigravityDesktopAdapter {
@@ -60,7 +67,24 @@ impl AntigravityDesktopAdapter {
     pub fn with_cached_step_count(root: &Path, file: Uuid, count: usize) -> Self {
         Self {
             root: Some(root.to_owned()),
-            cached_step_count: Some((file, count)),
+            cached_step_count: Some(CachedCount {
+                file,
+                minimum: count,
+                uncertain: false,
+            }),
+        }
+    }
+
+    /// Preserves uncertain coverage when previous step counts for the same database conflict.
+    #[must_use]
+    pub fn with_uncertain_step_count(root: &Path, file: Uuid, minimum: usize) -> Self {
+        Self {
+            root: Some(root.to_owned()),
+            cached_step_count: Some(CachedCount {
+                file,
+                minimum,
+                uncertain: true,
+            }),
         }
     }
 
@@ -191,7 +215,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
                 }
             }
             let summary = summaries.as_ref().and_then(|rows| rows.get(id));
-            let session = native_session(id, database, summary);
+            let (session, _) = native_session(id, database, summary);
             if project.is_some_and(|requested| {
                 session
                     .project_path
@@ -242,17 +266,20 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             .ok_or_else(|| anyhow!("Antigravity Desktop session `{}` was not found", session.id))?;
         let summaries = read_summaries(root).ok().flatten();
         let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
-        let listed = native_session(&session.id, database.clone(), summary);
+        let (listed, _) = native_session(&session.id, database.clone(), summary);
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let declared_steps = if summary.is_none()
-            && let Some((file, count)) = self.cached_step_count
-            && listed.source_revision.and_then(|revision| revision.file) == Some(file)
-        {
-            count
-        } else {
-            listed.event_count
-        };
+        let cached = self.cached_step_count.filter(|known| {
+            summary.is_none()
+                && listed.source_revision.and_then(|revision| revision.file) == Some(known.file)
+        });
+        let declared_steps = cached.map_or(listed.event_count, |known| known.minimum);
         push_database_steps(root, &database, &mut builder, declared_steps)?;
+        if cached.is_some_and(|known| known.uncertain) {
+            crate::antigravity::mark_unverified_database(
+                &mut builder,
+                "Previous step counts for this database disagree and the current summary is unavailable.",
+            );
+        }
         Ok(builder.snapshot(
             session.clone(),
             listed.title,
@@ -423,7 +450,10 @@ fn native_session(
     id: &str,
     database: PathBuf,
     summary: Option<&ProtoTrajectorySummary>,
-) -> NativeSession {
+) -> (
+    NativeSession,
+    Option<crate::antigravity::DatabaseGeneration>,
+) {
     let recorded_update = summary
         .and_then(|summary| summary.last_modified_time.as_ref())
         .and_then(proto_timestamp);
@@ -434,20 +464,24 @@ fn native_session(
         .as_ref()
         .and_then(|_| summary.and_then(ProtoTrajectorySummary::git_branch));
     let declared_steps = summary.map(|row| usize::try_from(row.step_count).unwrap_or(usize::MAX));
-    NativeSession {
-        source_revision: crate::antigravity::database_history_revision(&database, declared_steps),
-        session: SessionRef::new(Provider::AntigravityDesktop, id),
-        title: summary.and_then(|summary| nonempty(summary.summary.clone())),
-        project_path,
-        git_branch,
-        created_at: summary
-            .and_then(|summary| summary.created_time.as_ref())
-            .and_then(proto_timestamp),
-        updated_at,
-        updated_at_approximate: recorded_update.is_none(),
-        event_count: declared_steps.unwrap_or_default(),
-        source_path: Some(database),
-    }
+    let generation = crate::antigravity::DatabaseGeneration::read(&database);
+    (
+        NativeSession {
+            source_revision: generation.and_then(|generation| generation.revision(declared_steps)),
+            session: SessionRef::new(Provider::AntigravityDesktop, id),
+            title: summary.and_then(|summary| nonempty(summary.summary.clone())),
+            project_path,
+            git_branch,
+            created_at: summary
+                .and_then(|summary| summary.created_time.as_ref())
+                .and_then(proto_timestamp),
+            updated_at,
+            updated_at_approximate: recorded_update.is_none(),
+            event_count: declared_steps.unwrap_or_default(),
+            source_path: Some(database),
+        },
+        generation,
+    )
 }
 
 fn read_summaries(root: &Path) -> Result<Option<HashMap<String, ProtoTrajectorySummary>>> {
@@ -850,6 +884,24 @@ mod tests {
             let snapshot = reader.read_session(&session.session).unwrap();
             crate::AntigravityAdapter::has_missing_database_steps(&snapshot)
         };
+        let uncertain = |minimum| {
+            let snapshot =
+                AntigravityDesktopAdapter::with_uncertain_step_count(root, file, minimum)
+                    .read_session(&session.session)
+                    .unwrap();
+            let omitted: u64 = snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload["omitted_events"].as_u64())
+                .sum();
+            let unknown = snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["native_history_unverified"] == true);
+            (omitted, unknown)
+        };
+        assert_eq!(uncertain(3), (0, true));
+        assert_eq!(uncertain(4), (1, true));
         assert!(has_gap());
 
         write_summaries(root, vec![(ORPHAN_ID, ProtoTrajectorySummary::default())]);
@@ -877,6 +929,7 @@ mod tests {
                     .missing_desktop_summary_ids
                     .is_empty()
             );
+            assert_eq!(uncertain(4), (0, false));
             assert!(!has_gap());
         }
 
@@ -947,6 +1000,57 @@ mod tests {
             assert!(listing.is_err());
         }
         assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_committed_wal_preserves_the_checkpoint_generation() {
+        let original = tempfile::tempdir().unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        write_conversation(original.path(), SESSION_ID);
+        let relative = format!("conversations/{SESSION_ID}.db");
+        let source = original.path().join(&relative);
+        let copy = restored.path().join(relative);
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            INSERT INTO steps SELECT idx + 10, step_type, step_payload FROM steps;",
+            )
+            .unwrap();
+        fs::create_dir(copy.parent().unwrap()).unwrap();
+        fs::copy(&source, &copy).unwrap();
+        let wal = crate::support::sidecar(&copy, "-wal");
+        fs::copy(crate::support::sidecar(&source, "-wal"), &wal).unwrap();
+        let adapter = AntigravityDesktopAdapter::with_root(restored.path());
+        let session = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
+        let observe = || {
+            adapter
+                .observe_search_source(&session, None)
+                .unwrap()
+                .unwrap()
+                .database_checkpoint()
+                .unwrap()
+        };
+        let rows = || {
+            AntigravityDesktopAdapter::step_proof(&adapter.read_session(&session).unwrap())
+                .unwrap()
+                .len()
+        };
+        let (base, generation) = observe();
+        assert!(generation.is_some());
+        assert_eq!(rows(), 6);
+        fs::remove_file(&wal).unwrap();
+        assert_eq!(rows(), 3);
+        assert_eq!(observe(), (base, None));
+        fs::write(&wal, []).unwrap();
+        assert_eq!(observe(), (base, None));
+        fs::remove_file(wal).unwrap();
+        let local = rusqlite::Connection::open(&copy).unwrap();
+        local
+            .execute_batch("DELETE FROM steps WHERE idx = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        assert_ne!(observe().0, base);
+        assert_eq!(rows(), 2);
     }
 
     #[test]

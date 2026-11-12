@@ -74,6 +74,18 @@ impl AntigravityIdeAdapter {
         }
     }
 
+    /// Opens a Desktop database with conflicting older counts through its IDE reference.
+    #[must_use]
+    pub fn with_uncertain_step_count(root: &Path, file: uuid::Uuid, minimum: usize) -> Self {
+        Self {
+            legacy_desktop: true,
+            cached_desktop: Some(AntigravityDesktopAdapter::with_uncertain_step_count(
+                root, file, minimum,
+            )),
+            ..Self::with_root(root)
+        }
+    }
+
     /// Returns whether a standalone IDE transcript read omitted records.
     #[must_use]
     pub fn has_unreadable_log_records(snapshot: &CanonicalSnapshot) -> bool {

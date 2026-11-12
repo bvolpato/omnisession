@@ -9,6 +9,10 @@ use uuid::Uuid;
 /// Observes a selected native file without reading transcript content.
 #[must_use]
 pub fn source_file_revision(path: &Path) -> Option<SourceRevision> {
+    source_file_revision_with_size(path).map(|(revision, _)| revision)
+}
+
+pub(crate) fn source_file_revision_with_size(path: &Path) -> Option<(SourceRevision, u64)> {
     let canonical = fs::canonicalize(path).ok()?;
     #[cfg(windows)]
     let file = fs::File::open(&canonical).ok()?;
@@ -45,11 +49,14 @@ pub fn source_file_revision(path: &Path) -> Option<SourceRevision> {
     #[cfg(not(any(unix, windows)))]
     let file = path_id;
     let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
-    Some(SourceRevision {
-        file: Some(file),
-        contents: contents_id(file, &metadata, modified),
-        missing_ancestor: None,
-    })
+    Some((
+        SourceRevision {
+            file: Some(file),
+            contents: contents_id(file, &metadata, modified),
+            missing_ancestor: None,
+        },
+        metadata.len(),
+    ))
 }
 
 // Keep the content identity stable across the shared readers of this native file.

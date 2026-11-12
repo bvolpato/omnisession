@@ -163,7 +163,7 @@ pub(super) fn write(
         };
         match decision {
             coverage::PartialWrite::Keep => {
-                publish_read(tx, write, context, &home)?;
+                publish_read(tx, write, context, &home, false)?;
                 return Ok(WriteResult::Handled(0));
             }
             coverage::PartialWrite::KeepBoth if on_primary => {
@@ -198,7 +198,7 @@ pub(super) fn write(
         return Ok(WriteResult::primary());
     }
     let changed = save_scoped(tx, write, &home, file, contents, retain_archived_text)?;
-    publish_read(tx, write, context, &home)?;
+    publish_read(tx, write, context, &home, true)?;
     Ok(WriteResult::Handled(changed))
 }
 
@@ -260,6 +260,7 @@ fn publish_read(
     write: &PreparedTrajectoryWrite<'_, '_>,
     context: TrajectoryWriteContext<'_>,
     home: &[u8],
+    accepted: bool,
 ) -> Result<()> {
     let TrajectorySourceGuard::ObservedDocument(observed) = write.guard else {
         return Err(StoreError::TrajectorySourceChanged);
@@ -296,7 +297,7 @@ fn publish_read(
         )?;
     }
     context.publish_locator(tx, write, true)?;
-    super::physical_database_bodies::record(tx, write, home)
+    super::physical_database_bodies::record(tx, write, home, accepted)
 }
 
 fn archive_primary(tx: &Transaction<'_>, trajectory_id: i64, text: &str) -> Result<()> {

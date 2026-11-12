@@ -278,7 +278,8 @@ pub(super) fn guard_observed_steps(
     guard: TrajectorySourceGuard,
     source: &SearchSourceObservation,
 ) -> TrajectorySourceGuard {
-    let guard = guard.with_database_contents(source.database_contents());
+    let guard =
+        guard.with_database_contents(source.database_contents(), source.database_checkpoint());
     if source.is_ide_desktop_database() && !source.desktop_summaries_unavailable {
         guard.with_database_alias_step_count(source.session.event_count)
     } else {
@@ -1639,22 +1640,40 @@ pub(crate) fn observe_native_read<T>(
             && let Some(file) = source.revision.file
         {
             store
-                .reconcile_desktop_step_count(session, &source.home, file, |count, contents| {
-                    source.matches_database_declaration(count, contents)
-                })?
+                .reconcile_desktop_step_count(
+                    session,
+                    &source.home,
+                    file,
+                    source.database_checkpoint(),
+                    |count, contents| source.matches_database_declaration(count, contents),
+                )?
                 .map(|count| -> Box<dyn ProviderAdapter> {
-                    if source.is_ide_desktop_database() {
-                        Box::new(AntigravityIdeAdapter::with_cached_step_count(
-                            &source.home,
-                            file,
-                            count,
-                        ))
-                    } else {
-                        Box::new(AntigravityDesktopAdapter::with_cached_step_count(
-                            &source.home,
-                            file,
-                            count,
-                        ))
+                    use omnis_store::DesktopHistoryCount::{Disputed, Known};
+                    match (source.is_ide_desktop_database(), count) {
+                        (true, Known(n)) => Box::new(
+                            AntigravityIdeAdapter::with_cached_step_count(&source.home, file, n),
+                        ),
+                        (false, Known(n)) => {
+                            Box::new(AntigravityDesktopAdapter::with_cached_step_count(
+                                &source.home,
+                                file,
+                                n,
+                            ))
+                        }
+                        (true, Disputed { minimum }) => {
+                            Box::new(AntigravityIdeAdapter::with_uncertain_step_count(
+                                &source.home,
+                                file,
+                                minimum,
+                            ))
+                        }
+                        (false, Disputed { minimum }) => {
+                            Box::new(AntigravityDesktopAdapter::with_uncertain_step_count(
+                                &source.home,
+                                file,
+                                minimum,
+                            ))
+                        }
                     }
                 })
         } else {

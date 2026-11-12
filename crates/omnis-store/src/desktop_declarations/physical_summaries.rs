@@ -5,30 +5,26 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='physical_database_summaries')",
         [], |row| row.get::<_, bool>(0),
     ).map_err(database_error)?;
-    if exists {
-        return Ok(());
+    if !exists {
+        create(tx)?;
     }
+    if tx.execute(
+        "INSERT OR IGNORE INTO session_trajectory_migrations(name) VALUES('recover_physical_summary_fields')",
+        [],
+    ).map_err(database_error)? != 0 {
+        tx.execute_batch(include_str!("summary_fields.sql")).map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn create(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE physical_database_summaries(
             session_id TEXT NOT NULL, source_home BLOB NOT NULL, source_file BLOB NOT NULL,
             summary TEXT NOT NULL, PRIMARY KEY(session_id,source_home,source_file)
-         ) WITHOUT ROWID;
-         WITH summaries AS (
-             SELECT 'antigravity-ide' AS provider,session_id,source_home,source_file,steps,summary FROM ide_step_declarations
-             UNION ALL SELECT 'antigravity-desktop',session_id,source_home,source_file,steps,summary FROM desktop_step_declarations
-         ), candidates AS (
-             SELECT s.*,coalesce(c.source_file_id=p.source_file AND c.source_contents_id=p.source_contents AND h.verified AND h.home=p.source_home,0) AS matches_revision
-             FROM summaries s JOIN physical_step_declarations p USING(session_id,source_home,source_file,steps)
-             LEFT JOIN session_index c USING(provider,session_id)
-             LEFT JOIN native_catalog_homes h USING(provider,session_id)
-             WHERE s.summary IS NOT NULL
-         ), ranked AS (
-             SELECT *, max(matches_revision) OVER (PARTITION BY session_id,source_home,source_file) AS best FROM candidates
-         )
-         INSERT INTO physical_database_summaries
-             SELECT session_id,source_home,source_file,min(summary) FROM ranked WHERE matches_revision=best
-             GROUP BY session_id,source_home,source_file HAVING min(summary)=max(summary);",
-    ).map_err(database_error)?;
+         ) WITHOUT ROWID;",
+    )
+    .map_err(database_error)?;
     for (table, peer) in [
         ("desktop_step_declarations", "ide_step_declarations"),
         ("ide_step_declarations", "desktop_step_declarations"),

@@ -6,11 +6,13 @@ use crate::{IndexedSession, MissingDesktopSummaries, Result, StoreError, databas
 use std::path::Path;
 
 mod physical_summaries;
+pub(super) mod wal_rows;
 
 pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     initialize_provider_counts(tx)?;
     initialize_physical_counts(tx)?;
     recover_historical_counts(tx)?;
+    wal_rows::initialize(tx)?;
     physical_summaries::initialize(tx)
 }
 
@@ -177,12 +179,15 @@ pub(super) fn reconcile(
     session: &SessionRef,
     home: &[u8],
     file: Uuid,
+    checkpoint: Option<(Uuid, Option<Uuid>)>,
     matches: impl Fn(usize, Uuid) -> bool,
-) -> Result<Option<usize>> {
+) -> Result<Option<crate::DesktopHistoryCount>> {
+    use crate::DesktopHistoryCount::{Disputed, Known};
     let id = &session.id;
     let tx = connection.unchecked_transaction().map_err(database_error)?;
+    let wal_floor = wal_rows::missing(&tx, id, home, file, checkpoint)?;
     if let Some(count) = verified(&tx, id, home, file)? {
-        return Ok(Some(count));
+        return Ok(Some(Known(count.max(wal_floor.unwrap_or(0)))));
     }
     let mut query = tx.prepare_cached(
         "WITH candidates(provider,steps) AS (
@@ -231,7 +236,13 @@ pub(super) fn reconcile(
     drop(rows);
     drop(query);
     if ambiguous || (archived && local.is_some() && foreign.is_some() && local != foreign) {
-        return Ok(local);
+        return Ok(local
+            .into_iter()
+            .chain(foreign)
+            .min()
+            .map(|minimum| Disputed {
+                minimum: minimum.max(wal_floor.unwrap_or(0)),
+            }));
     }
     if let Some(count) = proven {
         tx.execute(
@@ -247,7 +258,7 @@ pub(super) fn reconcile(
         .map_err(database_error)?;
     }
     tx.commit().map_err(database_error)?;
-    Ok(proven.or(local))
+    Ok(proven.or(local).max(wal_floor).map(Known))
 }
 
 pub(super) fn table(provider: Provider) -> Option<&'static str> {

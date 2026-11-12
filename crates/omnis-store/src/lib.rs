@@ -1015,6 +1015,7 @@ pub struct TrajectoryDocumentObservation {
     failure: Option<[u8; 32]>,
     desktop_steps: Option<usize>,
     database_contents: Option<Uuid>,
+    database_checkpoint: Option<(Uuid, Option<Uuid>)>,
     desktop_generation: Option<i64>,
     incomplete_native_history: bool,
 }
@@ -1063,9 +1064,14 @@ impl TrajectorySourceGuard {
 
     /// Binds the read to the observed database and WAL independently of the optional summary.
     #[must_use]
-    pub fn with_database_contents(mut self, contents: Option<Uuid>) -> Self {
+    pub fn with_database_contents(
+        mut self,
+        contents: Option<Uuid>,
+        checkpoint: Option<(Uuid, Option<Uuid>)>,
+    ) -> Self {
         if let Self::ObservedDocument(observed) = &mut self {
             observed.database_contents = contents;
+            observed.database_checkpoint = checkpoint;
         }
         self
     }
@@ -1582,6 +1588,13 @@ impl PreparedTrajectoryWrite<'_, '_> {
 /// `SQLite`-backed state for one local `OmniSession` installation.
 pub struct Store {
     connection: RefCell<Connection>,
+}
+
+/// Native database history evidence for a read without its optional summary.
+#[derive(Clone, Copy, Debug)]
+pub enum DesktopHistoryCount {
+    Known(usize),
+    Disputed { minimum: usize },
 }
 
 impl Store {
@@ -2850,7 +2863,7 @@ impl Store {
         .map(|_| ())
     }
 
-    /// Fills unavailable Desktop summaries from the same verified native home and session ID.
+    /// Fills unavailable Desktop summaries from the verified database file in the same home.
     ///
     /// # Errors
     ///
@@ -2899,8 +2912,9 @@ impl Store {
         session: &SessionRef,
         home: &Path,
         file: Uuid,
+        checkpoint: Option<(Uuid, Option<Uuid>)>,
         matches: impl Fn(usize, Uuid) -> bool,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<DesktopHistoryCount>> {
         validate_session_ref(session)?;
         desktop_declarations::table(session.provider).ok_or(StoreError::InvalidSessionReference)?;
         desktop_declarations::reconcile(
@@ -2908,6 +2922,7 @@ impl Store {
             session,
             home.as_os_str().as_encoded_bytes(),
             file,
+            checkpoint,
             matches,
         )
     }
@@ -3936,6 +3951,7 @@ impl Store {
                 failure: native_failure_receipt(&transaction, session)?,
                 desktop_steps: None,
                 database_contents: None,
+                database_checkpoint: None,
                 desktop_generation: desktop_declarations::generation(
                     &transaction,
                     session.provider,
@@ -3951,6 +3967,7 @@ impl Store {
                 failure: None,
                 desktop_steps: None,
                 database_contents: None,
+                database_checkpoint: None,
                 desktop_generation: None,
                 incomplete_native_history: false,
             }
@@ -5853,7 +5870,7 @@ fn record_primary_database_receipt(
             &write.content_hash,
             write.document.database_step_proof,
         )?;
-        physical_database_bodies::record(tx, write, &home)?;
+        physical_database_bodies::record(tx, write, &home, true)?;
     }
     Ok(())
 }
@@ -5873,13 +5890,13 @@ fn retain_desktop_summaries(
     let mut statement = connection
         .prepare_cached(
             "SELECT ?4,session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
-                summary->>'created_at',summary->>'updated_at',summary->>'approximate',p.steps,source_file,NULL
-         FROM physical_database_summaries d JOIN physical_step_declarations p USING(session_id,source_home,source_file) WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
+                summary->>'created_at',summary->>'updated_at',summary->>'approximate',coalesce(p.steps,?5),source_file,NULL
+         FROM physical_database_summaries d LEFT JOIN physical_step_declarations p USING(session_id,source_home,source_file) WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
          UNION ALL SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
                created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
          FROM session_index AS catalog JOIN native_catalog_homes USING(provider,session_id)
          WHERE ?4='antigravity-desktop' AND catalog.provider = ?4 AND catalog.session_id = ?1
-             AND verified AND home = ?2 LIMIT 1",
+             AND verified AND home = ?2 AND source_file_id = ?3 LIMIT 1",
         )
         .map_err(database_error)?;
     sessions
@@ -5895,7 +5912,9 @@ fn retain_desktop_summaries(
                         session.session.id,
                         home.as_os_str().as_encoded_bytes(),
                         file.map(Uuid::into_bytes),
-                        provider.to_string()
+                        provider.to_string(),
+                        i64::try_from(session.event_count)
+                            .map_err(|_| StoreError::InvalidSessionReference)?
                     ],
                     indexed_session_from_row,
                 )
@@ -5904,10 +5923,6 @@ fn retain_desktop_summaries(
             let Some(mut previous) = previous else {
                 return Ok(session.clone());
             };
-            if file.is_none() || file != previous.source_revision.and_then(|revision| revision.file)
-            {
-                previous.event_count = session.event_count;
-            }
             previous.source_revision = session.source_revision;
             if previous.updated_at_approximate || previous.updated_at.is_none() {
                 previous.updated_at = session.updated_at.or(previous.updated_at);
@@ -14834,11 +14849,12 @@ mod tests {
         record(&named, super::DiscoveryScope::PartialProvider);
         assert_eq!(verified_count(&home.join("other"), 1), None);
         assert_eq!(verified_count(home, 3), None);
-        for (current, count) in [
-            (revision(1, 2), 3),
-            (revision(2, 2), 0),
-            (revision(2, 3), 0),
-            (None, 0),
+        for (current, same_file) in [
+            (revision(1, 2), true),
+            (revision(2, 2), false),
+            (revision(2, 3), false),
+            (None, false),
+            (revision(1, 4), true),
         ] {
             let observed = IndexedSession {
                 source_revision: current,
@@ -14855,14 +14871,15 @@ mod tests {
             let (rows, _) = store
                 .cached_picker_sessions_with_titles_in_homes(None, Some(home))
                 .unwrap();
-            assert_eq!(
-                rows,
-                [IndexedSession {
+            let expected = if same_file {
+                IndexedSession {
                     source_revision: current,
-                    event_count: count,
                     ..named.clone()
-                }]
-            );
+                }
+            } else {
+                observed
+            };
+            assert_eq!(rows, [expected]);
             assert_eq!(verified_count(home, 1), Some(3));
             assert_eq!(verified_count(home, 2), None);
         }
