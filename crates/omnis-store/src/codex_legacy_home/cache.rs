@@ -449,6 +449,7 @@ mod tests {
             fs::write(name, data.to_string()).unwrap();
             omnis_ir::SourceRevision {
                 file: Some(file),
+                legacy_file: None,
                 contents: Some(contents),
                 missing_ancestor: None,
             }

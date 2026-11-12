@@ -257,6 +257,7 @@ impl CodexSession {
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
                         if let Ok(record) = serde_json::from_slice::<Value>(&line)
+                            .map(super::saved_message::project)
                             && let Some(visible) = lineage.leaf_row_visibility(&record, row)
                         {
                             if !visible {

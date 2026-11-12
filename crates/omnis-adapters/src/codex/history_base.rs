@@ -537,6 +537,7 @@ fn attached_history_start(
         else {
             preamble.gap = true;
             preamble.request = None;
+            preamble.pending_pair = None;
             preamble.previous_ordinal = None;
             // The leaf reader already reports malformed JSON and oversized rows.
             preamble.start.incomplete |=
@@ -566,6 +567,7 @@ struct AttachmentPreamble {
     turn_hint: Option<String>,
     foreign_turn: Option<ForeignTurn>,
     request: Option<Value>,
+    pending_pair: Option<Value>,
     settings: bool,
     gap: bool,
     responses: usize,
@@ -574,7 +576,6 @@ struct AttachmentPreamble {
 struct ForeignTurn {
     owner: Uuid,
     turn: String,
-    item: Option<super::MediaDigest>,
 }
 
 impl AttachmentPreamble {
@@ -596,44 +597,27 @@ impl AttachmentPreamble {
         let Some(turn) = payload["turn_id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
-        let item_id = payload["item"]["id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(super::media_digest);
         let owner = payload
             .get("thread_id")
             .or_else(|| record.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok());
-        match payload["type"].as_str() {
+        match super::history_event_type(payload) {
             Some("task_started" | "turn_started" | "item_started") => {
                 if let Some(owner) = owner.filter(|id| {
                     Some(*id) != self.start.owner
                         && super::event_scope_matches(record, &id.to_string())
                 }) {
-                    let item = payload["type"] == "item_started";
-                    if !item
-                        || self
-                            .foreign_turn
-                            .as_ref()
-                            .is_none_or(|active| active.turn != turn || active.owner != owner)
-                    {
-                        self.foreign_turn = Some(ForeignTurn {
-                            owner,
-                            turn: turn.to_owned(),
-                            item: item.then_some(item_id).flatten(),
-                        });
-                    }
+                    self.foreign_turn = Some(ForeignTurn {
+                        owner,
+                        turn: turn.to_owned(),
+                    });
                 }
             }
-            Some("task_complete" | "turn_complete" | "item_completed")
+            Some("task_complete" | "turn_complete")
                 if self.foreign_turn.as_ref().is_some_and(|active| {
                     active.turn == turn
                         && super::event_scope_matches(record, &active.owner.to_string())
-                        && (payload["type"] != "item_completed"
-                            || active.item.is_some()
-                                && active.item == item_id
-                                && owner == Some(active.owner))
                 }) =>
             {
                 self.foreign_turn = None;
@@ -664,7 +648,7 @@ impl AttachmentPreamble {
             .saved_pairs
             .retain(|pair| confirmed && pair.child_turn.is_some());
         self.start.incomplete |=
-            child_turn.is_some() && self.responses > self.start.saved_pairs.len();
+            self.start.owns(record) && self.responses > self.start.saved_pairs.len();
     }
 
     fn save_pair(&mut self, raw: &Value, saved: &Value) {
@@ -686,39 +670,101 @@ impl AttachmentPreamble {
         if [raw, saved].into_iter().any(|row| {
             row["payload"]
                 .get("turn_id")
-                .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+                .is_some_and(|id| !id.is_null() && id.as_str().is_none_or(str::is_empty))
         }) {
             return false;
         }
         let owned = self.start.owns(raw) || self.start.owns(saved);
-        let turn = raw["payload"]
-            .get("turn_id")
-            .or_else(|| saved["payload"].get("turn_id"));
-        if self.foreign_turn.as_ref().is_some_and(|foreign| {
-            !owned
-                || turn
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id == foreign.turn)
-        }) || !(self.gap || owned)
+        if !(self.gap || owned)
             || left < self.start.ordinal
             || left.checked_add(1) != Some(right)
             || !self.start.matches_scope(raw)
             || !self.start.matches_scope(saved)
             || raw["payload"]
                 .get("turn_id")
-                .zip(saved["payload"].get("turn_id"))
+                .and_then(Value::as_str)
+                .zip(saved["payload"]["turn_id"].as_str())
                 .is_some_and(|(raw, saved)| raw != saved)
         {
             return false;
         }
         let identity = |row: &Value| {
-            request_text(row).map(|text| {
-                super::VisibleMessage::new(row, omnis_ir::EventKind::MessageUser, &text)
-            })
+            let (kind, text) = match message_role(row)? {
+                "user" => (omnis_ir::EventKind::MessageUser, request_text(row)?),
+                "assistant" if row["type"] == "event_msg" => (
+                    omnis_ir::EventKind::MessageAssistant,
+                    row["payload"]["message"].as_str()?.to_owned(),
+                ),
+                "assistant" => (
+                    omnis_ir::EventKind::MessageAssistant,
+                    super::message_parts(&row["payload"]).0.join("\n"),
+                ),
+                _ => return None,
+            };
+            Some(super::VisibleMessage::new(row, kind, &text))
         };
         identity(raw)
             .zip(identity(saved))
-            .is_some_and(|(raw, saved)| raw.mirrors(&saved))
+            .is_some_and(|(raw, saved)| {
+                raw.item_id.zip(saved.item_id).is_none_or(|(a, b)| a == b) && raw.mirrors(&saved)
+            })
+    }
+
+    fn observe_pair(&mut self, raw: Value, saved: &Value) {
+        let owned = self.start.owns(&raw) || self.start.owns(saved);
+        let turn = raw["payload"]["turn_id"]
+            .as_str()
+            .or_else(|| saved["payload"]["turn_id"].as_str());
+        if self
+            .foreign_turn
+            .as_ref()
+            .is_none_or(|foreign| owned && turn.is_some_and(|id| id != foreign.turn))
+        {
+            if message_role(saved) == Some("user") || owned && turn.is_some() {
+                self.save_pair(&raw, saved);
+            }
+        } else if owned && turn.is_none() && message_role(saved) == Some("user") {
+            self.pending_pair = Some(raw);
+        }
+    }
+
+    fn confirm_opening(
+        &mut self,
+        receipt: &Value,
+        pair: Option<&Value>,
+        request: Option<&Value>,
+    ) -> bool {
+        if !self.start.owner.is_some_and(|id| {
+            super::receipt_in_turn(receipt, &id.to_string(), self.turn_hint.as_deref())
+        }) {
+            return false;
+        }
+        let Some(raw) = pair.or(request) else {
+            return false;
+        };
+        let Some(ordinal) = raw["ordinal"].as_u64() else {
+            return false;
+        };
+        let Some(indices) =
+            receipt_literal_parts_at(raw, receipt, if pair.is_some() { 2 } else { 1 })
+        else {
+            return false;
+        };
+        self.start.literal_tags = Some(LiteralTags {
+            ordinal,
+            request_digest: super::media_digest(&raw.to_string()),
+            indices,
+        });
+        if pair.is_some() {
+            self.start.save_pair(
+                self.row - 1,
+                self.records - 1,
+                receipt["payload"]["turn_id"]
+                    .as_str()
+                    .map(super::media_digest),
+            );
+        }
+        pair.is_none()
     }
 
     fn observe(&mut self, record: Value) -> bool {
@@ -726,8 +772,9 @@ impl AttachmentPreamble {
         let previous_ordinal =
             std::mem::replace(&mut self.previous_ordinal, record["ordinal"].as_u64());
         let request = self.request.take();
+        let pending = self.pending_pair.take();
         self.observe_foreign_turn(&record);
-        match (record["type"].as_str(), payload["type"].as_str()) {
+        match (record["type"].as_str(), super::history_event_type(payload)) {
             (Some("session_meta"), _) if self.row == 1 => {
                 self.observe_header(payload);
             }
@@ -740,7 +787,7 @@ impl AttachmentPreamble {
                 if super::is_dynamic_tool_catalog(&record) && self.start.owns(&record) => {}
             (Some("response_item"), Some(kind)) => {
                 self.responses += 1;
-                if kind == "message" && payload["role"] == "user" {
+                if kind == "message" && message_role(&record).is_some() {
                     self.request = Some(record);
                 }
             }
@@ -771,29 +818,7 @@ impl AttachmentPreamble {
                 && (matches!(kind, "task_started" | "turn_started")
                     || payload["thread_id"].is_string()) =>
             {
-                let verified = request.as_ref().and_then(|request| {
-                    (kind == "item_completed"
-                        && previous_ordinal.is_some()
-                        && self.start.owner.is_some_and(|owner| {
-                            super::receipt_in_turn(
-                                &record,
-                                &owner.to_string(),
-                                self.turn_hint.as_deref(),
-                            )
-                        }))
-                    .then(|| receipt_literal_parts(request, &record))
-                    .flatten()
-                });
-                let recovered = verified.is_some();
-                if let Some(literal_tags) = verified
-                    && let Some((ordinal, request)) = previous_ordinal.zip(request)
-                {
-                    self.start.literal_tags = Some(LiteralTags {
-                        ordinal,
-                        request_digest: super::media_digest(&request.to_string()),
-                        indices: literal_tags,
-                    });
-                }
+                let recovered = self.confirm_opening(&record, pending.as_ref(), request.as_ref());
                 let omitted =
                     self.responses > self.start.saved_pairs.len() + usize::from(recovered);
                 if self.gap || omitted {
@@ -804,13 +829,15 @@ impl AttachmentPreamble {
                 }
                 return true;
             }
-            (Some("event_msg"), Some("user_message"))
+            (Some("event_msg"), Some("user_message" | "agent_message"))
                 if self.start.ordinal > 1
                     && request.as_ref().is_some_and(|raw| {
                         self.matches_saved_pair(raw, &record, previous_ordinal)
                     }) =>
             {
-                self.save_pair(request.as_ref().unwrap(), &record);
+                if let Some(raw) = request {
+                    self.observe_pair(raw, &record);
+                }
             }
             _ => {
                 self.gap = true;
@@ -858,13 +885,21 @@ pub(super) fn project_literal_parts(record: &mut Value, indices: &[usize]) {
 }
 
 pub(super) fn receipt_literal_parts(request: &Value, completed: &Value) -> Option<Vec<usize>> {
+    receipt_literal_parts_at(request, completed, 1)
+}
+
+fn receipt_literal_parts_at(
+    request: &Value,
+    completed: &Value,
+    distance: u64,
+) -> Option<Vec<usize>> {
     let response = &request["payload"];
     let receipt = &completed["payload"];
     let item = &receipt["item"];
     let id = response["id"].as_str().filter(|id| !id.is_empty())?;
     let adjacent = match (request.get("ordinal"), completed.get("ordinal")) {
         (None, None) => true,
-        (Some(left), Some(right)) => left.as_u64()?.checked_add(1)? == right.as_u64()?,
+        (Some(left), Some(right)) => left.as_u64()?.checked_add(distance)? == right.as_u64()?,
         _ => false,
     };
     if request["type"] != "response_item"
@@ -876,9 +911,10 @@ pub(super) fn receipt_literal_parts(request: &Value, completed: &Value) -> Optio
         || item["id"] != id
         || !adjacent
         || ["thread_id", "turn_id"].iter().any(|&key| {
-            [request, response]
-                .iter()
-                .any(|obj| obj.get(key).is_some_and(|v| v != &receipt[key]))
+            [request, response].iter().any(|obj| {
+                obj.get(key)
+                    .is_some_and(|v| !(key == "turn_id" && v.is_null()) && v != &receipt[key])
+            })
         })
     {
         return None;

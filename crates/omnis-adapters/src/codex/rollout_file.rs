@@ -508,6 +508,7 @@ pub(super) fn sample(
         LIMITS,
         |line, oversized| workspace_gap(line, oversized, Some(session)),
         |loc, record, skipped| {
+            let record = super::saved_message::project(record);
             let ordinal = count + skipped.total();
             count += 1;
             workspace.settings.observe_gaps(skipped);

@@ -1881,3 +1881,86 @@ fn scoped_pair_rows(dir: &Path, case: &str) -> Result<Vec<Value>> {
     }
     Ok(rows)
 }
+
+#[test]
+fn damaged_attachment_boundaries_use_the_surviving_item_and_turn_evidence() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for case in [
+        "next parent item",
+        "null turns",
+        "pending receipt",
+        "wrong receipt",
+        "child reply",
+        "missing abort turn",
+    ] {
+        let base = match case {
+            "next parent item" => "copied item",
+            "child reply" | "missing abort turn" => "child abort",
+            _ => "child",
+        };
+        let mut rows = scoped_pair_rows(&dir, base)?;
+        match case {
+            "next parent item" => {
+                rows[2]["payload"]["item"] = json!({"id":"previous"});
+                let mut complete = rows[2].clone();
+                complete["payload"]["type"] = json!("item_completed");
+                rows.insert(3, complete);
+            }
+            "pending receipt" | "wrong receipt" | "null turns" => {
+                for row in &mut rows[2..4] {
+                    row["payload"]["turn_id"] = Value::Null;
+                }
+                if case != "null turns" {
+                    rows.insert(2,json!({"type":"event_msg","payload":{"type":"item_started","thread_id":PARENT,"turn_id":"parent","item":{"id":"parent item"}}}));
+                    if case == "wrong receipt" {
+                        rows[5]["payload"]["item"]["id"] = json!("different");
+                    }
+                }
+            }
+            "child reply" => {
+                rows.insert(4,json!({"type":"response_item","payload":{"type":"message","role":"assistant","thread_id":CHILD,"turn_id":"scope","id":"reply","content":[{"type":"output_text","text":"paired answer"}]}}));
+                rows.insert(5,json!({"type":"event_msg","payload":{"type":"agent_message","thread_id":CHILD,"turn_id":"scope","item_id":"reply","message":"paired answer"}}));
+            }
+            _ => {
+                rows[4]["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("turn_id");
+            }
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["ordinal"] = json!(index + 2);
+        }
+        let end = rows.len() + 2;
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, end, Some(bookmark(CHILD, &rows)), false),
+                message(end + 1, "detached request"),
+            ],
+        )?;
+        for id in [CHILD, REVERT] {
+            let snapshot = CodexAdapter::with_root(home.path())
+                .read_session(&SessionRef::new(Provider::Codex, id))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let contains = |text| conversation.messages.iter().any(|m| m.text == text);
+            assert_eq!(
+                contains("paired request"),
+                matches!(case, "null turns" | "pending receipt" | "child reply"),
+                "{id} {case}"
+            );
+            assert_eq!(
+                contains("paired answer"),
+                case == "child reply",
+                "{id} {case}"
+            );
+            if case == "missing abort turn" {
+                assert!(conversation.truncated, "{id} {case}");
+            }
+        }
+    }
+    Ok(())
+}

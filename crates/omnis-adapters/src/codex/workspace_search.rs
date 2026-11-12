@@ -41,14 +41,25 @@ impl CodexAdapter {
                 })
             })
         };
+        let catalog = self.codex_home.as_deref().map(RolloutCatalog::new);
+        let mut revisions = HashMap::new();
         for raw in &listing.sessions {
-            let (session, verified) = raw.indexed_workspace(&workspaces, cached_header);
-            if in_project(session.project_path.as_deref()) {
+            let (session, verified) =
+                raw.indexed_workspace(&workspaces, cached_header, |id, revision| {
+                    !revision.is_nil()
+                        && catalog.as_ref().is_some_and(|catalog| {
+                            *revisions
+                                .entry(id)
+                                .or_insert_with(|| catalog.inventory_revision(id))
+                                == revision
+                        })
+                });
+            if project.is_some() && !verified && raw.needs_visible_projection() {
+                projected.insert(raw.id.as_str(), raw);
+                unknown.push(session);
+            } else if in_project(session.project_path.as_deref()) {
                 sessions.push(session);
             } else if check_moves && !verified {
-                if raw.needs_visible_projection() {
-                    projected.insert(raw.id.as_str(), raw);
-                }
                 unknown.push(session);
             }
         }
@@ -79,20 +90,8 @@ impl CodexAdapter {
             bytes_left: 4 * MAX_PREVIEW_TAIL_SIZE,
         };
         let mut unchecked = 0;
-        for session in unknown {
+        for mut session in unknown {
             let raw = projected.get(session.session.id.as_str()).copied();
-            if raw.is_some()
-                && let Some(revision) = session.source_revision
-                && let Some(workspace) = revision
-                    .file
-                    .and_then(|file| workspaces.verified.get(&file))
-                && revision.matches_file_contents(workspace.source_revision)
-                && in_project(workspace.project_path.as_deref())
-            {
-                // Indexing checks the ancestor revisions before the workspace enters the results.
-                sessions.push(session);
-                continue;
-            }
             if raw.is_none()
                 && let Some(revision) = session.source_revision
                 && !workspaces.needs_recheck(revision)
@@ -106,6 +105,10 @@ impl CodexAdapter {
             }
             match probe.read(&session, raw) {
                 Ok(Some(workspace)) if in_project(Some(&workspace)) => {
+                    if let Some(raw) = raw {
+                        session.git_branch = raw.branch_at(Some(&workspace));
+                        session.project_path = Some(workspace);
+                    }
                     sessions.push(session);
                 }
                 Ok(_) => {}

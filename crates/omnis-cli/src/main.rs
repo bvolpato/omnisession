@@ -24,7 +24,7 @@ use omnis_core::{
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
     redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
-    trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
+    trajectory_search_document_in_records, workspace_paths_match, workspace_remote_fingerprint,
     workspace_root, workspace_state_matches,
 };
 use omnis_ir::{
@@ -143,10 +143,17 @@ fn full_index_read(
             );
         }
         Ok(read)
+    } else if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
+        registry
+            .adapter(session.provider)?
+            .read_full_index_at(session, None)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
             ancestor_revisions: Vec::new(),
             native_session: None,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -342,7 +349,7 @@ fn read_verified_session(
     };
     let mut retry = true;
     loop {
-        let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+        let observed = if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
             store
                 .observe_verified_session(session)
                 .map(|guard| (None, guard))
@@ -352,6 +359,13 @@ fn read_verified_session(
                 .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
         };
         let (read, source_time) = match read_search_snapshot(registry, session, true) {
+            Ok((read, _))
+                if session.provider == Provider::Antigravity
+                    && !read.source_complete
+                    && !read.provider_limited =>
+            {
+                return Ok(read);
+            }
             Ok(read) => read,
             Err(error) => {
                 if retry
@@ -393,7 +407,7 @@ fn read_verified_session(
                 return Ok(read);
             }
         };
-        let version = omnis_core::search_document_version(snapshot.session.provider);
+        let version = search_version(session, snapshot);
         let current = prior.is_some_and(|state| {
             state.document_version > version
                 || (state.source_complete
@@ -405,9 +419,9 @@ fn read_verified_session(
             && let Err(error) = store_verified_search_document(
                 &store,
                 session,
-                snapshot,
+                &read,
                 true,
-                (source_time, read.source_revision),
+                source_time,
                 guard,
                 read.native_session
                     .as_ref()
@@ -421,6 +435,14 @@ fn read_verified_session(
             eprintln!("warning: local trajectory index write: {error}");
         }
         return Ok(read);
+    }
+}
+
+fn search_version(session: &SessionRef, snapshot: &CanonicalSnapshot) -> u32 {
+    if session.provider == Provider::Imported {
+        omnis_core::imported_search_document_version(snapshot.session.provider)
+    } else {
+        omnis_core::search_document_version(session.provider)
     }
 }
 
@@ -583,7 +605,10 @@ fn store_search_document<'a>(
     let rollback_title = read.map_or(&omnis_adapters::RollbackTitle::Unknown, |read| {
         &read.rollback_title
     });
-    let document = trajectory_search_document(snapshot);
+    let document = read.map_or_else(
+        || trajectory_search_document_in_records(snapshot, &[]),
+        omnis_adapters::IndexRead::search_document,
+    );
     let mut title = search_index::IndexedTitle::from_read(
         provider,
         snapshot,
@@ -602,13 +627,18 @@ fn store_search_document<'a>(
         ancestor_revisions: read.map_or(&[], |r| r.ancestor_revisions.as_slice()),
         redacted_text: &document.text,
         source_updated_at: snapshot.captured_at,
+        projection: document.projection.as_ref(),
         source_byte_count: document.source_byte_count,
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
         source_complete,
         source_revision,
         origin,
-        document_version: omnis_core::search_document_version(snapshot.session.provider),
+        document_version: if native_registry.is_some() {
+            omnis_core::search_document_version(snapshot.session.provider)
+        } else {
+            omnis_core::imported_search_document_version(snapshot.session.provider)
+        },
         derived_title: title.current.as_deref(),
         provider_limited: read.is_some_and(|read| read.provider_limited),
         withdrawn_title: title.withdrawn.as_deref(),
@@ -660,54 +690,84 @@ fn store_search_document<'a>(
 fn store_verified_search_document(
     store: &Store,
     session: &SessionRef,
-    snapshot: &CanonicalSnapshot,
+    read: &omnis_adapters::IndexRead,
     full_read: bool,
-    source: (chrono::DateTime<Utc>, SourceRevision),
+    source_updated_at: chrono::DateTime<Utc>,
     guard: TrajectorySourceGuard,
     native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
-    let (source_updated_at, source_revision) = source;
+    let snapshot = &read.snapshot;
+    let source_complete = full_read && read.source_complete;
+    let provider_limited = full_read && read.provider_limited;
+    // Let the indexer verify a damaged picker sample or update a previous full read.
+    if (!source_complete
+        && !provider_limited
+        && session.provider == Provider::Antigravity
+        && (snapshot
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+            || matches!(
+                guard,
+                TrajectorySourceGuard::Verified {
+                    full_or_provider_limited: true,
+                    ..
+                } | TrajectorySourceGuard::Verified {
+                    fully_scanned: true,
+                    ..
+                }
+            )))
+        || native_session.is_some_and(|(_, native)| has_empty_cli_history(native))
+    {
+        return Ok(false);
+    }
+    let source_revision = read.source_revision;
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let document = trajectory_search_document(snapshot);
-    let derived_title = omnis_core::indexed_search_title(session.provider, snapshot);
+    let document = read.search_document();
+    let derived_title = search_index::indexed_title(session, snapshot, read.verified_prefix_end);
     let document = omnis_store::TrajectoryDocument {
-        ancestor_revisions: &[],
+        ancestor_revisions: read.ancestor_revisions.as_slice(),
         redacted_text: &document.text,
         source_updated_at,
         source_revision,
         source_byte_count: document.source_byte_count,
+        projection: document.projection.as_ref(),
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
-        source_complete: full_read,
-        provider_limited: false,
+        source_complete,
+        provider_limited,
         origin,
-        document_version: omnis_core::search_document_version(snapshot.session.provider),
+        document_version: search_version(session, snapshot),
         derived_title: derived_title.as_deref(),
         withdrawn_title: None,
         local_opener: omnis_store::LocalOpenerEvidence::Unknown,
         title_is_verified: false,
-        title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
+        title_authoritative: omnis_core::session_search_title_is_authoritative(
+            snapshot,
+            source_complete,
+        ),
     };
-    let rewritten = if TrajectorySourceGuard::verifies_search_file(session.provider) {
+    let rewritten = if source_revision.file.is_some()
+        || TrajectorySourceGuard::verifies_search_file(session.provider)
+    {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
+        let metadata = indexed_session_metadata(native);
         let check = search_index::FileCheck {
             session,
             path: native.source_path.as_deref(),
             revision: source_revision,
+            catalog: Some(&metadata),
             guard,
         };
-        search_index::FileSelections::new(registry).write(&[check], |verify| {
-            store.upsert_verified_session_document_checked(
-                &indexed_session_metadata(native),
-                document,
-                guard,
-                verify,
-            )
-        })?
+        search_index::FileSelections::new(registry).write_documents(
+            store,
+            &[check],
+            std::iter::once((session, document, guard, Some(&metadata))),
+        )?
     } else {
         store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
     };
@@ -794,6 +854,69 @@ fn index_with_interrupt(
         &|| interrupt.requested(),
         &mut |update| progress.update(&update),
     )
+}
+
+struct DiscoveryCheck {
+    provider: Provider,
+    home: PathBuf,
+    started_at: chrono::DateTime<Utc>,
+}
+
+impl DiscoveryCheck {
+    fn capture(registry: &AdapterRegistry, provider: Provider) -> Result<Option<Self>> {
+        let started_at = Utc::now();
+        Ok(registry.discovery_cache_home(provider)?.map(|home| Self {
+            provider,
+            home,
+            started_at,
+        }))
+    }
+
+    fn before_listing(
+        store: &Store,
+        registry: &AdapterRegistry,
+        provider: Provider,
+        project: Option<&Path>,
+    ) -> (
+        omnis_store::Result<Option<omnis_store::CatalogObservation>>,
+        Result<Option<Self>>,
+    ) {
+        let check = if project.is_none() {
+            Self::capture(registry, provider)
+        } else {
+            Ok(None)
+        };
+        (store.observe_session_catalog(provider), check)
+    }
+
+    fn verify(&self, registry: &AdapterRegistry) -> Result<()> {
+        anyhow::ensure!(
+            registry.discovery_cache_home(self.provider)?.as_ref() == Some(&self.home),
+            "native home changed during discovery"
+        );
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        registry: &AdapterRegistry,
+        store: &Store,
+        found: &[NativeSession],
+    ) -> Result<()> {
+        self.verify(registry)?;
+        Ok(store.record_completed_discovery(
+            self.provider,
+            omnis_core::search_document_version(self.provider),
+            &self.home,
+            self.started_at,
+            found.iter().map(|native| {
+                (
+                    indexed_session_metadata(native),
+                    native.source_path.as_deref(),
+                )
+            }),
+        )?)
+    }
 }
 
 struct DiscoveredCatalog {
@@ -946,6 +1069,24 @@ fn discover_search_sessions(
         .list_search_sessions_with_notes(project)
 }
 
+fn discover_provider_sessions(
+    registry: &AdapterRegistry,
+    provider: Provider,
+    project: Option<&Path>,
+    candidate_project: Option<&Path>,
+    raw_listing: bool,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    if let Some(project) = candidate_project {
+        registry
+            .adapter(provider)?
+            .project_search_candidates(project)
+    } else if raw_listing {
+        registry.list_sessions_with_notes(provider, project)
+    } else {
+        discover_search_sessions(registry, provider, project)
+    }
+}
+
 fn codex_discovery_inventory(
     store: &Store,
     project: Option<&Path>,
@@ -964,8 +1105,8 @@ fn discover_sessions(
     project: Option<&Path>,
     purpose: DiscoveryUse<'_>,
 ) -> (Vec<NativeSession>, Vec<String>) {
-    let raw_listing = matches!(purpose, DiscoveryUse::List);
     let candidate_project = purpose.candidate_project(project);
+    let raw_listing = matches!(purpose, DiscoveryUse::List);
     let cache = purpose.store();
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = match provider {
@@ -990,20 +1131,20 @@ fn discover_sessions(
                     .filter(|_| {
                         provider != Provider::Codex && matches!(purpose, DiscoveryUse::Index(_))
                     })
-                    .map(|store| store.observe_session_catalog(provider));
+                    .map(|store| {
+                        DiscoveryCheck::before_listing(store, registry, provider, project)
+                    });
                 (
                     provider,
                     observation,
                     scope.spawn(omnis_adapters::inherit_provider_probes(move || {
-                        if let Some(project) = candidate_project {
-                            registry
-                                .adapter(provider)?
-                                .project_search_candidates(project)
-                        } else if raw_listing {
-                            registry.list_sessions_with_notes(provider, project)
-                        } else {
-                            discover_search_sessions(registry, provider, project)
-                        }
+                        discover_provider_sessions(
+                            registry,
+                            provider,
+                            project,
+                            candidate_project,
+                            raw_listing,
+                        )
                     })),
                 )
             })
@@ -1041,8 +1182,10 @@ fn discover_sessions(
                 notes.push(format!("{provider} session cache: {error}"));
             }
         }
-        if let (Some(store), Some(observed)) = (cache, observation) {
-            result = cache_provider_discovery(registry, store, provider, project, observed, result);
+        if let (Some(store), Some((observed, check))) = (cache, observation) {
+            result = cache_provider_discovery(
+                registry, store, provider, project, observed, result, check,
+            );
         }
         match result {
             Ok((found, notes)) => {
@@ -1222,7 +1365,12 @@ fn cache_provider_discovery(
     project: Option<&Path>,
     initial: omnis_store::Result<Option<omnis_store::CatalogObservation>>,
     listing: Result<(Vec<NativeSession>, Vec<String>)>,
+    check: Result<Option<DiscoveryCheck>>,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let check = check?;
+    if let Some(check) = &check {
+        check.verify(registry)?;
+    }
     let (mut found, mut notes) = listing?;
     let mut observation = match initial {
         Ok(observation) => observation,
@@ -1275,6 +1423,11 @@ fn cache_provider_discovery(
             }
         }
     }
+    if notes.is_empty()
+        && let Some(check) = check
+    {
+        check.publish(registry, store, &found)?;
+    }
     Ok((found, notes))
 }
 
@@ -1307,13 +1460,63 @@ fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     }
 }
 
+fn scope_cached_native_catalog(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Option<Provider>,
+    include_uncatalogued_documents: bool,
+    mut rows: Vec<IndexedSession>,
+    mut titles: Vec<IndexedTrajectoryTitle>,
+) -> Result<(
+    Vec<IndexedSession>,
+    Vec<IndexedTrajectoryTitle>,
+    Vec<String>,
+)> {
+    let mut warnings = Vec::new();
+    for selected in [Provider::Antigravity, Provider::AntigravityDesktop] {
+        if provider.is_some_and(|provider| provider != selected) {
+            continue;
+        }
+        match registry.discovery_cache_home(selected) {
+            Ok(Some(home)) => {
+                let excluded = store.excluded_catalog_ids(selected, &home)?;
+                titles.retain(|row| {
+                    row.session.provider != selected || !excluded.contains(&row.session.id)
+                });
+                rows.retain(|row| {
+                    row.session.provider != selected || !excluded.contains(&row.session.id)
+                });
+                if include_uncatalogued_documents && !excluded.is_empty() {
+                    rows.extend(store.uncatalogued_search_documents(selected, &home)?);
+                }
+            }
+            Ok(None) => {}
+            Err(error) if provider.is_none() => {
+                rows.retain(|row| row.session.provider != selected);
+                titles.retain(|row| row.session.provider != selected);
+                warnings.push(format!("{selected} cached sessions skipped: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((rows, titles, warnings))
+}
+
 fn cached_search_sessions(
+    registry: &AdapterRegistry,
     store: &Store,
     args: &SearchArgs,
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>, Vec<IndexedTrajectoryTitle>)> {
-    let mut warnings = Vec::new();
-    let (indexed, titles) = store.cached_sessions_with_titles(args.provider)?;
+    let (rows, titles) = store.cached_sessions_with_titles(args.provider)?;
+    let (indexed, titles, mut warnings) = scope_cached_native_catalog(
+        registry,
+        store,
+        args.provider,
+        args.all_projects,
+        rows,
+        titles,
+    )?;
     let sources = titles
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
@@ -1428,7 +1631,7 @@ struct SearchHit<'a> {
     conversation: Option<SessionTrajectoryMatch>,
 }
 
-fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: bool) -> Result<()> {
+fn validated_search_query(args: &SearchArgs) -> Result<String> {
     let query = args.query.join(" ");
     if query.trim().is_empty() {
         bail!("search query cannot be empty");
@@ -1439,11 +1642,17 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
     }
+    Ok(query)
+}
+
+fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: bool) -> Result<()> {
+    let query = validated_search_query(args)?;
     let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let store = Store::open_default().context("opening OmniSession state")?;
     let (mut sessions, mut warnings, cached_titles, live_names) = if args.cached {
-        let (sessions, warnings, titles) = cached_search_sessions(&store, args, &project)?;
+        let (sessions, warnings, titles) =
+            cached_search_sessions(registry, &store, args, &project)?;
         (sessions, warnings, Some(titles), HashMap::new())
     } else {
         let (sessions, warnings) = live_search_sessions(registry, &store, args, &project);
@@ -1481,6 +1690,15 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if !args.cached {
         refresh_search_workspaces(&mut sessions, (!args.all_projects).then_some(&project))?;
     }
+    let titles = match cached_titles {
+        Some(titles) => titles,
+        None => store.trajectory_titles_with_sources()?,
+    };
+    let mut eligible = sessions
+        .iter()
+        .filter_map(|session| selected_search_trajectory(session, args.cached))
+        .collect();
+    scope_search_trajectories(registry, &store, &mut eligible)?;
     let changed_ancestors = if !args.cached
         && (args.no_index || index.failed > 0 || index.failed_skipped > 0 || index.stopped)
     {
@@ -1489,26 +1707,18 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     } else {
         HashSet::new()
     };
-    let titles = match cached_titles {
-        Some(titles) => titles,
-        None => store.trajectory_titles_with_sources()?,
-    };
-    let mut titles = resolve_search_titles(&mut sessions, titles, args.cached);
+    eligible.retain(|row| {
+        row.session.provider != Provider::Codex || !changed_ancestors.contains(&row.session.id)
+    });
+    let mut titles = resolve_search_titles(&mut sessions, titles, args.cached, &eligible);
     if !live_names.is_empty() {
         apply_live_search_titles(&store, &mut sessions, live_names, &mut titles)?;
     }
     titles.retain(|session, _| {
         session.provider != Provider::Codex || !changed_ancestors.contains(&session.id)
     });
-    let (hits, has_more) = rank_search_hits(
-        &store,
-        &query,
-        &sessions,
-        &titles,
-        args.limit,
-        args.cached,
-        &changed_ancestors,
-    )?;
+    let (hits, has_more) =
+        rank_search_hits(&store, &query, &sessions, &titles, args.limit, &eligible)?;
     print_search_results(
         &query,
         args,
@@ -1600,7 +1810,30 @@ fn refresh_search_workspaces(
     Ok(())
 }
 
+fn has_empty_cli_history(session: &NativeSession) -> bool {
+    session.session.provider == Provider::Antigravity
+        && session.source_path.is_none()
+        && session.source_revision.is_none()
+        && session.event_count == 0
+}
+
+fn selected_search_trajectory(
+    session: &NativeSession,
+    cached: bool,
+) -> Option<TrajectorySelection> {
+    (!has_empty_cli_history(session)).then(|| TrajectorySelection {
+        session: session.session.clone(),
+        source: selected_search_source(session, cached),
+    })
+}
+
 fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
+    if matches!(
+        session.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) {
+        return session.source_revision;
+    }
     if !TrajectorySourceGuard::verifies_search_file(session.session.provider) {
         None
     } else if cached {
@@ -1610,14 +1843,78 @@ fn selected_search_source(session: &NativeSession, cached: bool) -> Option<Sourc
     }
 }
 
+fn scope_search_trajectories(
+    registry: &AdapterRegistry,
+    store: &Store,
+    eligible: &mut Vec<TrajectorySelection>,
+) -> Result<()> {
+    for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+        let sessions: Vec<_> = eligible
+            .iter()
+            .filter(|row| row.session.provider == provider)
+            .map(|row| (row.session.id.as_str(), row.source.unwrap_or_default()))
+            .collect();
+        if sessions.is_empty() {
+            continue;
+        }
+        let revisions = registry
+            .discovery_cache_home(provider)
+            .ok()
+            .flatten()
+            .map(|home| store.selected_document_revisions(provider, &home, &sessions))
+            .transpose()?
+            .unwrap_or_default();
+        eligible.retain_mut(|row| {
+            if row.session.provider != provider {
+                return true;
+            }
+            let Some(revision) = revisions.get(&row.session.id) else {
+                return false;
+            };
+            row.source = Some(*revision);
+            true
+        });
+    }
+    Ok(())
+}
+
+fn retain_scoped_titles(
+    titles: &mut HashMap<SessionRef, omnis_store::IndexedTitle>,
+    eligible: &[TrajectorySelection],
+) {
+    let revisions: HashMap<_, _> = eligible
+        .iter()
+        .filter_map(|row| Some((&row.session, row.source?)))
+        .collect();
+    titles.retain(|session, title| {
+        !matches!(
+            session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) || revisions
+            .get(session)
+            .is_some_and(|revision| revision.matches_file_contents(title.source_revision))
+    });
+}
+
 fn title_matches_search_source(
     session: &NativeSession,
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
+    if has_empty_cli_history(session) {
+        return false;
+    }
+    if matches!(
+        session.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) && let (Some(expected), Some(file)) =
+        (session.source_revision, record.source_revision.file)
+    {
+        return expected.file == Some(file);
+    }
     if session.session.provider == Provider::Codex {
-        if !cached && record.document_version < omnis_core::search_document_version(Provider::Codex)
-        {
+        // Version 7 bound cached titles to the selected rollout revision.
+        if !cached && record.document_version < 7 {
             return false;
         }
         if let Some(revision) = session.source_revision {
@@ -1638,6 +1935,7 @@ fn resolve_search_titles(
     sessions: &mut [NativeSession],
     titles: Vec<IndexedTrajectoryTitle>,
     cached: bool,
+    eligible: &[TrajectorySelection],
 ) -> HashMap<SessionRef, String> {
     let mut records: HashMap<_, _> = titles
         .into_iter()
@@ -1654,6 +1952,7 @@ fn resolve_search_titles(
             )
         })
         .collect();
+    retain_scoped_titles(&mut records, eligible);
     for session in sessions {
         let Some(record) = records.get(&session.session) else {
             continue;
@@ -1698,20 +1997,23 @@ fn apply_live_search_titles(
         let Some(revision) = session.source_revision else {
             continue;
         };
-        if let NativeSessionName::Gui(name) = name {
-            session.title = name;
-        } else {
-            let Some(indexed) = titles.get(&session.session) else {
-                continue;
-            };
-            if !name.confirms(session.title.as_deref())
-                || session.title.as_ref() == Some(indexed)
-                || !store
+        match name {
+            NativeSessionName::Named(name) | NativeSessionName::Gui(Some(name)) => {
+                session.title = Some(name);
+            }
+            NativeSessionName::Gui(None) => session.title = None,
+            NativeSessionName::Absent => {
+                let Some(indexed) = titles.get(&session.session) else {
+                    continue;
+                };
+                if !store
                     .retained_codex_name(&session.session, revision)?
                     .is_some_and(|prior| matches_previous_name(indexed, &prior))
-            {
-                continue;
+                {
+                    continue;
+                }
             }
+            NativeSessionName::Unknown => continue,
         }
         titles.remove(&session.session);
         selected.push((session.session.id.clone(), revision));
@@ -1755,8 +2057,7 @@ fn rank_search_hits<'a>(
     sessions: &'a [NativeSession],
     titles: &HashMap<SessionRef, String>,
     limit: usize,
-    cached: bool,
-    changed_ancestors: &HashSet<String>,
+    eligible: &[TrajectorySelection],
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let terms = fuzzy::query_terms(query);
     let display_title = |session: &NativeSession| {
@@ -1807,19 +2108,9 @@ fn rank_search_hits<'a>(
         .iter()
         .map(|session| &session.session)
         .collect::<HashSet<_>>();
-    let eligible = sessions
-        .iter()
-        .filter(|row| {
-            row.session.provider != Provider::Codex || !changed_ancestors.contains(&row.session.id)
-        })
-        .map(|session| TrajectorySelection {
-            session: session.session.clone(),
-            source: selected_search_source(session, cached),
-        })
-        .collect::<Vec<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
     let page = store
-        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), &eligible)
+        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), eligible)
         .context("searching indexed conversations")?;
     let by_reference = sessions
         .iter()
@@ -1963,7 +2254,9 @@ fn search_text(
 }
 
 fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
-    if conversation.complete {
+    if conversation.truncation_strategy == "provider_read_limit" {
+        "source-limit"
+    } else if conversation.complete {
         "complete"
     } else if head_tail_coverage(conversation) {
         "head-tail"
@@ -2140,6 +2433,9 @@ fn read_search_snapshot(
         return Ok((
             omnis_adapters::IndexRead {
                 ancestor_revisions: Vec::new(),
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
                 rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -2170,6 +2466,9 @@ fn read_search_snapshot(
         } else {
             omnis_adapters::IndexRead {
                 ancestor_revisions: Vec::new(),
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
                 rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -4897,8 +5196,10 @@ mod tests {
                 &sessions,
                 &super::HashMap::new(),
                 limit,
-                true,
-                &super::HashSet::new(),
+                &sessions
+                    .iter()
+                    .filter_map(|session| super::selected_search_trajectory(session, true))
+                    .collect::<Vec<_>>(),
             )
             .expect("rank matches");
             assert_eq!(
@@ -4963,8 +5264,13 @@ mod tests {
                 .replace_indexed_sessions(Provider::Codex, &entries)
                 .expect("cache both path spellings");
 
-            let (sessions, _, _) = super::cached_search_sessions(&store, &args, &project)
-                .expect("search local workspace");
+            let (sessions, _, _) = super::cached_search_sessions(
+                &super::AdapterRegistry::new(),
+                &store,
+                &args,
+                &project,
+            )
+            .expect("search local workspace");
             assert_eq!(sessions.len(), 1, "local first: {local_first}");
             assert_eq!(sessions[0].session, entries[0].session);
         }

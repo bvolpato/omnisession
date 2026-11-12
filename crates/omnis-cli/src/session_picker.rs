@@ -1211,6 +1211,22 @@ impl PickerState {
         self.trajectory_index_changed();
     }
 
+    fn resume_index_sources(&mut self, sessions: Vec<NativeSession>) {
+        for native in sessions {
+            let Some(entry) = self
+                .entry_positions
+                .get(&native.session.to_string())
+                .and_then(|index| self.entries.get_mut(*index))
+            else {
+                continue;
+            };
+            if entry.cached && entry.session.source_revision == native.source_revision {
+                entry.session.source_path = native.source_path;
+                self.index_deadline = Some(Instant::now());
+            }
+        }
+    }
+
     fn due_index_request(&mut self) -> Option<Vec<IndexCandidate>> {
         let deadline = self.index_deadline?;
         if Instant::now() < deadline {
@@ -1274,13 +1290,15 @@ impl PickerState {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| TrajectorySelection {
-                    session: entry.session.session.clone(),
-                    source: if entry.session.session.provider == Provider::Codex {
-                        Some(entry.source_revision().unwrap_or_default())
+                .filter_map(|(_, entry)| {
+                    if entry.session.session.provider == Provider::Codex {
+                        Some(TrajectorySelection {
+                            session: entry.session.session.clone(),
+                            source: Some(entry.source_revision().unwrap_or_default()),
+                        })
                     } else {
-                        crate::selected_search_source(&entry.session, entry.cached)
-                    },
+                        crate::selected_search_trajectory(&entry.session, entry.cached)
+                    }
                 })
                 .collect(),
         })
@@ -1775,8 +1793,49 @@ struct CachedPickerEntries {
     warnings: Vec<String>,
 }
 
+fn retain_current_antigravity_titles(
+    registry: &AdapterRegistry,
+    store: &Store,
+    titles: &mut Vec<omnis_store::IndexedTrajectoryTitle>,
+    warnings: &mut Vec<String>,
+) {
+    let mut eligible: Vec<_> = titles
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.session.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            )
+        })
+        .map(|row| TrajectorySelection {
+            session: row.session.clone(),
+            source: None,
+        })
+        .collect();
+    if let Err(error) = crate::scope_search_trajectories(registry, store, &mut eligible) {
+        eligible.clear();
+        workers::record_picker_warning(warnings, format!("Antigravity cached titles: {error:#}"));
+    }
+    let revisions: HashMap<_, _> = eligible
+        .into_iter()
+        .filter_map(|row| Some((row.session, row.source?)))
+        .collect();
+    titles.retain(|row| {
+        !matches!(
+            row.session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) || revisions
+            .get(&row.session)
+            .is_some_and(|revision| revision.matches_file_contents(row.source_revision))
+    });
+}
+
 fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let (sessions, mut titles) = store.cached_picker_sessions_with_titles()?;
+    let registry = AdapterRegistry::with_local_adapters();
+    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
+    let (sessions, mut titles, mut warnings) =
+        crate::scope_cached_native_catalog(&registry, store, None, false, sessions, titles)?;
+    retain_current_antigravity_titles(&registry, store, &mut titles, &mut warnings);
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -1811,7 +1870,6 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
     }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
-    let mut warnings = Vec::new();
     let mut paths = SessionWorkspaceMatcher::new(current_project);
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
@@ -3437,6 +3495,7 @@ mod tests {
     ) -> omnis_store::TrajectoryDocument<'_> {
         omnis_store::TrajectoryDocument {
             ancestor_revisions: &[],
+            projection: None,
             redacted_text: text,
             source_updated_at: updated_at,
             source_revision: SourceRevision::default(),

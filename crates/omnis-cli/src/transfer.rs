@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use omnis_adapters::{OpenCodeGeneration, ProviderAdapter};
+use omnis_adapters::{NativeSession, OpenCodeGeneration, ProviderAdapter};
 use omnis_core::{ImportTrajectory, TrajectoryItem, TrajectoryItemKind, needs_recovery_handoff};
 use omnis_ir::SourceRevision;
 use omnis_store::{BindingRecord, BranchHeadAdvance, BranchHeadRestore};
@@ -649,11 +649,7 @@ fn resume_native_without_snapshot(
             plan,
             mode_args,
             args.allow_workspace_mismatch,
-            |file| {
-                omnis_store::CodexWorkspace::read_index(Some(file))
-                    .ok()?
-                    .remove(&file)
-            },
+            |file| omnis_store::CodexWorkspace::discovery_index(Some(file)).ok(),
         )?
     } else {
         (
@@ -1072,7 +1068,7 @@ fn codex_native_launch(
     mut plan: LaunchPlan,
     mode_args: impl FnOnce(&Path) -> Result<Vec<String>>,
     allow_workspace_mismatch: bool,
-    cached_workspace: impl FnOnce(uuid::Uuid) -> Option<omnis_store::CodexWorkspace>,
+    cached_workspace: impl FnOnce(uuid::Uuid) -> Option<omnis_store::CodexWorkspaceIndex>,
 ) -> Result<(LaunchPlan, bool)> {
     let source = &request.source;
     let selection = request.picker_selection.as_ref();
@@ -1095,14 +1091,14 @@ fn codex_native_launch(
                 .is_none_or(|shown| shown.matches_file_contents(revision)),
         "selected Codex rollout changed during discovery"
     );
-    let cached = revision.file.and_then(cached_workspace);
-    let (workspace, startup) = picked_codex_directories(revision, cached, || {
-        let path = selected
-            .source_path
-            .as_deref()
-            .context("selected Codex rollout has no source path")?;
-        read_codex_directories(registry, source, path, revision)
-    })?;
+    let directories = codex_launch_directories(
+        registry,
+        selected,
+        revision,
+        revision.file.and_then(cached_workspace),
+    )?;
+    let workspace = directories.workspace;
+    let startup = directories.startup;
     let (directory, matches) = codex_continuation_directory(
         workspace.as_deref(),
         project,
@@ -1157,6 +1153,7 @@ fn codex_native_launch(
             .is_some_and(|live| live.matches_file_contents(revision)),
         "selected Codex rollout changed before launch"
     );
+    crate::search_index::confirm_index_ancestors(registry, &directories.ancestors)?;
     Ok((plan, matches))
 }
 
@@ -1299,16 +1296,42 @@ fn codex_continuation_directory(
     Ok((directory, matches))
 }
 
-fn read_codex_directories(
+struct CodexLaunchDirectories {
+    workspace: Option<PathBuf>,
+    startup: Option<PathBuf>,
+    ancestors: Vec<(uuid::Uuid, uuid::Uuid)>,
+}
+
+fn codex_launch_directories(
     registry: &AdapterRegistry,
-    source: &SessionRef,
-    path: &Path,
+    mut selected: NativeSession,
     revision: SourceRevision,
-) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    index: Option<omnis_store::CodexWorkspaceIndex>,
+) -> Result<CodexLaunchDirectories> {
+    if let (Some(file), Some(mut index)) = (revision.file, index)
+        && registry
+            .adapter(Provider::Codex)?
+            .apply_verified_workspace(&mut selected, &index)
+    {
+        return Ok(CodexLaunchDirectories {
+            workspace: selected.project_path,
+            startup: None,
+            ancestors: index.ancestor_revisions.remove(&file).unwrap_or_default(),
+        });
+    }
+    let source = &selected.session;
+    let path = selected
+        .source_path
+        .as_deref()
+        .context("selected Codex rollout has no source path")?;
     let (workspace, startup) =
         omnis_adapters::CodexAdapter::rollout_workspaces(source, path, revision)?;
     if workspace.is_some() {
-        return Ok((workspace, startup));
+        return Ok(CodexLaunchDirectories {
+            workspace,
+            startup,
+            ancestors: Vec::new(),
+        });
     }
     let read = registry.index_session(
         source,
@@ -1323,20 +1346,11 @@ fn read_codex_directories(
         omnis_adapters::CodexWorkspaceProjection::Observed(directory) => directory,
         omnis_adapters::CodexWorkspaceProjection::Unchecked => None,
     };
-    Ok((workspace, startup))
-}
-
-fn picked_codex_directories(
-    revision: omnis_ir::SourceRevision,
-    cached: Option<omnis_store::CodexWorkspace>,
-    read: impl FnOnce() -> Result<(Option<PathBuf>, Option<PathBuf>)>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-    if let Some(workspace) =
-        cached.filter(|workspace| workspace.source_revision.matches_file_contents(revision))
-    {
-        return Ok((workspace.project_path, None));
-    }
-    read()
+    Ok(CodexLaunchDirectories {
+        workspace,
+        startup,
+        ancestors: read.ancestor_revisions,
+    })
 }
 
 fn selected_workspace(
@@ -3647,45 +3661,43 @@ mod tests {
     use omnis_adapters::EnvChange;
 
     #[test]
-    fn picker_reads_the_rollout_only_when_its_workspace_receipt_is_missing_or_stale() {
-        let revision = omnis_ir::SourceRevision {
-            file: Some(uuid::Uuid::from_u128(11)),
-            contents: Some(uuid::Uuid::from_u128(12)),
-            missing_ancestor: None,
-        };
-        let effective = PathBuf::from("verified-workspace");
-        let receipt = omnis_store::CodexWorkspace {
-            source_revision: revision,
-            project_path: Some(effective.clone()),
-            git_branch: None,
-        };
-        let reads = std::cell::Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            anyhow::bail!("full rollout read")
-        };
-        assert_eq!(
-            super::picked_codex_directories(revision, Some(receipt.clone()), read).unwrap(),
-            (Some(effective), None)
-        );
-        assert_eq!(reads.get(), 0);
-        let changed = omnis_ir::SourceRevision {
-            contents: Some(uuid::Uuid::from_u128(13)),
+    fn launch_reuses_a_matching_leaf_workspace_and_rereads_a_stale_one() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir(&sessions)?;
+        let id = "019f0000-0000-7000-8000-000000000001";
+        let path = sessions.join(format!("rollout-{id}.jsonl"));
+        let header =
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":home.path()}});
+        std::fs::write(&path, format!("{header}\n"))?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+        let selected = registry.find_native_session(Provider::Codex, id)?.unwrap();
+        let revision = selected.source_revision.unwrap();
+        let cached = home.path().join("cached");
+        let stale = omnis_ir::SourceRevision {
+            contents: Some(uuid::Uuid::new_v4()),
             ..revision
         };
-        let replaced = omnis_ir::SourceRevision {
-            file: Some(uuid::Uuid::from_u128(14)),
-            ..revision
-        };
-        for (live, cached) in [
-            (revision, None),
-            (changed, Some(receipt.clone())),
-            (replaced, Some(receipt)),
-        ] {
-            let error = super::picked_codex_directories(live, cached, read).unwrap_err();
-            assert_eq!(error.to_string(), "full rollout read");
+        for (observed, expected) in [(revision, cached.as_path()), (stale, home.path())] {
+            let mut index = omnis_store::CodexWorkspaceIndex::default();
+            index.verified.insert(
+                revision.file.unwrap(),
+                omnis_store::CodexWorkspace {
+                    source_revision: observed,
+                    project_path: Some(cached.clone()),
+                    git_branch: None,
+                },
+            );
+            let dirs = super::codex_launch_directories(
+                &registry,
+                selected.clone(),
+                revision,
+                Some(index),
+            )?;
+            assert_eq!(dirs.workspace.as_deref(), Some(expected));
         }
-        assert_eq!(reads.get(), 3);
+        Ok(())
     }
 
     fn verify_test_native_launch(

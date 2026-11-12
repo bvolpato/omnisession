@@ -6,7 +6,7 @@ use std::{
 
 use omnis_adapters::{AdapterRegistry, NativeSelectionInventory};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
-use omnis_store::{StoreError, TrajectorySourceGuard};
+use omnis_store::{IndexedSession, StoreError, TrajectorySourceGuard};
 
 #[derive(Clone, Copy)]
 pub(crate) struct FileCheck<'a> {
@@ -14,6 +14,16 @@ pub(crate) struct FileCheck<'a> {
     pub(crate) path: Option<&'a Path>,
     pub(crate) revision: SourceRevision,
     pub(crate) guard: TrajectorySourceGuard,
+    pub(crate) catalog: Option<&'a IndexedSession>,
+}
+
+impl FileCheck<'_> {
+    fn requires_catalog(self) -> bool {
+        matches!(
+            self.session.provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        )
+    }
 }
 
 /// One native file inventory per provider for the duration of an indexing operation.
@@ -51,7 +61,7 @@ impl<'a> FileSelections<'a> {
         Ok(())
     }
 
-    pub(super) fn selected(&mut self, check: FileCheck<'_>) -> omnis_store::Result<bool> {
+    pub(super) fn selected(&mut self, check: &FileCheck<'_>) -> omnis_store::Result<bool> {
         self.observe(check.session.provider)?;
         let inventory = self.inventories[&check.session.provider]
             .as_ref()
@@ -82,14 +92,64 @@ impl<'a> FileSelections<'a> {
             .selected_session_at(&session.id, path)
     }
 
-    fn provider_selects(&self, check: FileCheck<'_>) -> bool {
+    fn provider_selects(&self, check: &FileCheck<'_>) -> bool {
         check.path.is_some_and(|path| {
             self.registry
                 .adapter(check.session.provider)
                 .and_then(|adapter| adapter.selected_session_at(&check.session.id, path))
                 .is_ok_and(|native| {
-                    native.and_then(|native| native.source_revision) == Some(check.revision)
+                    native.is_some_and(|native| {
+                        if check.requires_catalog() {
+                            native.source_revision.is_some_and(|revision| {
+                                revision.matches_file_contents(check.revision)
+                            }) && check.catalog.is_some_and(|catalog| {
+                                crate::indexed_session_metadata(&native) == *catalog
+                            })
+                        } else {
+                            native.source_revision == Some(check.revision)
+                        }
+                    })
                 })
+        })
+    }
+
+    pub(crate) fn write_documents<'s, 'd>(
+        &mut self,
+        store: &omnis_store::Store,
+        checks: &[FileCheck<'_>],
+        documents: impl ExactSizeIterator<Item = omnis_store::SelectedTrajectoryDocument<'s, 'd>>,
+    ) -> omnis_store::Result<usize> {
+        let registry = self.registry;
+        let mut homes = HashMap::new();
+        for check in checks.iter().filter(|check| check.requires_catalog()) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                homes.entry(check.session.provider)
+            {
+                entry.insert(
+                    registry
+                        .discovery_cache_home(check.session.provider)
+                        .ok()
+                        .flatten()
+                        .ok_or(StoreError::TrajectorySourceChanged)?,
+                );
+            }
+        }
+        self.write(checks, |verify| {
+            store.upsert_selected_trajectory_documents_in_homes(
+                documents,
+                &homes,
+                |session, revision| {
+                    verify(session, revision)
+                        && homes.get(&session.provider).is_none_or(|home| {
+                            registry
+                                .discovery_cache_home(session.provider)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                == Some(home)
+                        })
+                },
+            )
         })
     }
 
@@ -121,6 +181,9 @@ impl<'a> FileSelections<'a> {
             if !check.revision.matches_file_contents(revision) {
                 return false;
             }
+            if check.requires_catalog() {
+                return self.provider_selects(check);
+            }
             if !check.guard.has_competing_file(revision.file) {
                 return check
                     .path
@@ -128,7 +191,7 @@ impl<'a> FileSelections<'a> {
                     .is_some_and(|current| current.matches_file_contents(revision));
             }
             if matches!(self.inventories.get(&session.provider), Some(Ok(None))) {
-                return self.provider_selects(**check);
+                return self.provider_selects(check);
             }
             let selected = validated.get_or_init(|| {
                 let mut selected = HashSet::new();
@@ -197,9 +260,15 @@ mod tests {
             session,
             path: Some(Path::new(&session.id)),
             revision,
+            catalog: None,
             guard: TrajectorySourceGuard::Verified {
                 state: [0; 32],
                 known_files: [Some(Uuid::nil()), None, None],
+                source_byte_count: None,
+                full_or_provider_limited: false,
+                document_hash: None,
+                sampled_file_bytes: None,
+                fully_scanned: false,
             },
         });
         for batch in [&checks[..2], &checks[2..]] {

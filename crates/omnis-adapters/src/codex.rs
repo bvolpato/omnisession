@@ -587,6 +587,9 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                verified_prefix_end: None,
+                database_aliases: Arc::default(),
+                search_record_groups: Vec::new(),
                 ancestor_revisions: read.ancestor_revisions.clone(),
                 rollback_title,
                 workspace_projection,
@@ -2186,10 +2189,21 @@ impl CodexSession {
         &self,
         index: &omnis_store::CodexWorkspaceIndex,
         cached_header: bool,
+        mut ancestor_is_current: impl FnMut(Uuid, Uuid) -> bool,
     ) -> (NativeSession, bool) {
         let mut session = self.native_session();
-        let verified = !self.needs_visible_projection()
-            && session.apply_codex_workspace_index(index, cached_header);
+        let proven = !self.needs_visible_projection()
+            || session
+                .source_revision
+                .and_then(|r| r.file)
+                .and_then(|file| index.ancestor_revisions.get(&file))
+                .is_some_and(|parents| {
+                    (!matches!(self.history_base, HistoryBase::Prefix(_)) || !parents.is_empty())
+                        && parents
+                            .iter()
+                            .all(|&(id, revision)| ancestor_is_current(id, revision))
+                });
+        let verified = proven && session.apply_codex_workspace_index(index, cached_header);
         (session, verified)
     }
 
@@ -2609,6 +2623,9 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            verified_prefix_end: None,
+            database_aliases: Arc::default(),
+            search_record_groups: Vec::new(),
             ancestor_revisions: Vec::new(),
             native_session,
             snapshot,
@@ -2652,6 +2669,9 @@ impl CodexSession {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let branch = self.branch_at(project.as_deref());
         Ok(IndexRead {
+            verified_prefix_end: None,
+            database_aliases: Arc::default(),
+            search_record_groups: Vec::new(),
             ancestor_revisions: lineage.ancestor_revisions,
             native_session: (!self.is_subagent).then(|| self.native_session()),
             rollback_title: events.rollback_title(),
@@ -2737,7 +2757,7 @@ impl CodexSession {
                         omitted > 0,
                         prefix_records,
                     );
-                    if requires_assistant_reconstruction(&preview, saved_messages) {
+                    if requires_message_reconstruction(&preview, saved_messages) {
                         let (events, project, verified) =
                             self.reconstructed_preview(rollout_file::LIMITS)?;
                         (events, project, false, verified)
@@ -2755,6 +2775,9 @@ impl CodexSession {
         );
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
+            verified_prefix_end: None,
+            database_aliases: Arc::default(),
+            search_record_groups: Vec::new(),
             ancestor_revisions: Vec::new(),
             native_session: None,
             workspace_projection,
@@ -2871,15 +2894,19 @@ impl CodexSession {
         saved_messages: usize,
     ) -> Result<(EventBuilder, Option<PathBuf>, bool)> {
         const SAMPLE_RECORDS: usize = 1_024;
-        let preview = json_lines_preview_with_omissions(
+        let mut preview = json_lines_preview_with_omissions(
             &self.path,
             SAMPLE_RECORDS,
             MAX_PREVIEW_TAIL_SIZE,
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             rollout_file::workspace_record_candidate,
         )?;
+        preview
+            .records
+            .iter_mut()
+            .for_each(saved_message::normalize);
         if preview.omissions.workspace_gaps() > 0
-            || requires_assistant_reconstruction(&preview, saved_messages)
+            || requires_message_reconstruction(&preview, saved_messages)
         {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
@@ -2889,14 +2916,10 @@ impl CodexSession {
 
     fn events_from_preview(
         &self,
-        mut preview: JsonLinesPreview,
+        preview: JsonLinesPreview,
         omitted: Option<usize>,
     ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
-        preview
-            .records
-            .iter_mut()
-            .for_each(saved_message::normalize);
         let unread_ancestor = preview.records.iter().any(|record| {
             record["type"] == "session_meta"
                 && HistoryBase::from_header(&self.path, record).is_some()
@@ -2912,39 +2935,20 @@ impl CodexSession {
             builder.track_rollback_opener(false);
             builder.note_rollback_history_gap();
         }
-        let complete = !preview.sampled && preview.omissions.total() == 0;
         let total = preview.records.len();
         let mut records = preview.records.into_iter();
         let mut start = 0;
         let mut prefix_end = builder.checkpoint();
-        let mut assistant_mode = None;
         for end in preview.run_starts.into_iter().chain(std::iter::once(total)) {
             let mut last_visible = None;
             let mut receipts = RequestReceipts::new(&self.id, true);
             let mut push = |record: Value, (), confirmed| {
-                let raw_assistant = !complete
-                    && record["type"] == "response_item"
-                    && record["payload"]["role"] == "assistant";
-                if raw_assistant {
-                    builder.codex_saved_users = assistant_mode;
-                }
                 push_record(
                     &mut builder,
                     &record,
                     &mut last_visible,
                     confirmed && matches!(self.history_base, HistoryBase::Attachment(_)),
                 );
-                if !complete {
-                    if record["type"] == "session_meta" {
-                        assistant_mode = builder.codex_saved_users;
-                    } else if client_submission(&record)
-                        && string_at(&record["payload"], &[&["message"], &["text"]]).is_some()
-                        && assistant_mode.is_some()
-                    {
-                        assistant_mode = Some(true);
-                    }
-                    builder.codex_saved_users = None;
-                }
                 Ok(())
             };
             for record in records.by_ref().take(end - start) {
@@ -3313,6 +3317,7 @@ impl CodexHistory {
             && !matches!(self.implicit_turn, ImplicitTurn::Open);
         if outside_turn
             && builder.codex_saved_users == Some(false)
+            && !builder.codex_saved_assistant
             && record["type"] == "response_item"
             && record["payload"]["type"] == "message"
             && record["payload"]["role"] == "assistant"
@@ -3450,7 +3455,7 @@ fn native_legacy_header(payload: &Value) -> bool {
                 .all(|key| payload[key].as_str().is_some_and(|value| !value.is_empty())))
 }
 
-fn requires_assistant_reconstruction(preview: &JsonLinesPreview, saved_messages: usize) -> bool {
+fn requires_message_reconstruction(preview: &JsonLinesPreview, saved_messages: usize) -> bool {
     (preview.sampled || preview.omissions.total() > 0)
         && saved_messages > preview.records.iter().filter(|r| saved_message(r)).count()
         && preview.records.first().is_some_and(|header| {
@@ -3459,7 +3464,10 @@ fn requires_assistant_reconstruction(preview: &JsonLinesPreview, saved_messages:
         && preview.records.iter().any(|record| {
             record["type"] == "response_item"
                 && record["payload"]["type"] == "message"
-                && record["payload"]["role"] == "assistant"
+                && matches!(
+                    record["payload"]["role"].as_str(),
+                    Some("assistant" | "user")
+                )
         })
 }
 
@@ -3477,7 +3485,12 @@ fn saved_message(record: &Value) -> bool {
 fn history_event_type(payload: &Value) -> Option<&str> {
     let kind = payload["type"].as_str()?;
     let id = &payload["turn_id"];
-    if matches!(kind, "turn_complete" | "task_complete") && !id.is_null() && !id.is_string() {
+    if matches!(
+        kind,
+        "turn_complete" | "task_complete" | "task_started" | "turn_started"
+    ) && !id.is_null()
+        && !id.is_string()
+    {
         return None;
     }
     Some(kind)
@@ -3554,6 +3567,7 @@ fn push_record(
     let payload = &record["payload"];
     if record["type"] == "session_meta" {
         builder.codex_saved_users = native_legacy_header(payload).then_some(false);
+        builder.codex_saved_assistant = false;
     } else if client_submission(record)
         && string_at(payload, &[&["message"], &["text"]]).is_some()
         && let Some(saved) = &mut builder.codex_saved_users
@@ -4450,7 +4464,14 @@ fn push_message_text(
     record: &Value,
     last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
-    if builder.codex_saved_users == Some(true)
+    if builder.codex_saved_users.is_some()
+        && record["type"] == "event_msg"
+        && kind == EventKind::MessageAssistant
+        && !text.is_empty()
+    {
+        builder.codex_saved_assistant = true;
+    }
+    if (builder.codex_saved_users == Some(true) || builder.codex_saved_assistant)
         && record["type"] == "response_item"
         && kind == EventKind::MessageAssistant
         && text != omnis_core::CODEX_IMPORT_MARKER
@@ -5351,6 +5372,38 @@ impl ProviderAdapter for CodexAdapter {
         }))
     }
 
+    fn apply_verified_workspace(
+        &self,
+        session: &mut NativeSession,
+        index: &omnis_store::CodexWorkspaceIndex,
+    ) -> bool {
+        let Some(home) = self.codex_home.as_deref() else {
+            return false;
+        };
+        let Ok(selected) =
+            self.require_rollout(&session.session.id, session.source_path.as_deref())
+        else {
+            return false;
+        };
+        let raw = selected.session;
+        if !session
+            .source_revision
+            .zip(raw.observed_revision)
+            .is_some_and(|(prior, current)| prior.matches_file_contents(current))
+        {
+            return false;
+        }
+        let catalog = RolloutCatalog::new(home);
+        let (observed, verified) = raw.indexed_workspace(index, true, |id, revision| {
+            !revision.is_nil() && catalog.inventory_revision(id) == revision
+        });
+        if verified {
+            session.project_path = observed.project_path;
+            session.git_branch = observed.git_branch;
+        }
+        verified
+    }
+
     fn index_ancestor_revisions(&self, ids: &HashSet<Uuid>) -> HashMap<Uuid, Uuid> {
         let Some(home) = self.codex_home.as_deref() else {
             return HashMap::new();
@@ -5392,10 +5445,12 @@ impl ProviderAdapter for CodexAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<IndexRead> {
+        _prior: Option<crate::PriorSearchDocument>,
+    ) -> Result<crate::IndexedSearchDocument> {
         validate_provider(session, Provider::Codex)?;
         let native = self.require_rollout(&session.id, source_path)?.session;
         self.index_rollout(session, source_path, full_read_bytes, native, None)
+            .map(Into::into)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -5504,7 +5559,7 @@ mod tests {
             cache.verified.insert(revision.file.unwrap(), cached);
             assert_eq!(
                 session
-                    .indexed_workspace(&cache, true)
+                    .indexed_workspace(&cache, true, |_, _| false)
                     .0
                     .project_path
                     .as_deref(),

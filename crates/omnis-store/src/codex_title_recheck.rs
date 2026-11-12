@@ -118,6 +118,7 @@ pub(super) fn name_retries(connection: &Connection) -> Result<HashMap<SessionRef
                 SessionRef::new(Provider::Codex, row.get::<_, String>(0)?),
                 SourceRevision {
                     file: Some(Uuid::from_bytes(row.get(1)?)),
+                    legacy_file: None,
                     contents: Some(Uuid::from_bytes(row.get(2)?)),
                     missing_ancestor: None,
                 },

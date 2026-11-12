@@ -103,7 +103,7 @@ fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
 
 #[cfg(unix)]
 #[test]
-fn a_cold_native_fork_uses_the_directory_inherited_at_its_bookmark() {
+fn native_fork_and_cached_resume_follow_the_directory_at_the_bookmark() {
     const CHILD: &str = "22222222-2222-4222-8222-222222222222";
     let fixture = Fixture::new();
     let inherited = fixture.workspace.join("inherited");
@@ -155,6 +155,47 @@ fn a_cold_native_fork_uses_the_directory_inherited_at_its_bookmark() {
     assert_eq!(plan["launch"]["cwd"], json!(inherited));
     let args = plan["launch"]["args"].as_array().unwrap();
     assert!(args.ends_with(&[json!("fork"), json!(CHILD)]));
+
+    let index = fixture
+        .command()
+        .args(["index", "--provider", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let changed = fixture.workspace.join("different");
+    fs::create_dir(&changed).unwrap();
+    let context = json!({"type":"turn_context","ordinal":1,"payload":{"cwd":changed}});
+    let replacement = format!("{}\n{context}\n", header(SOURCE_ID, 0));
+    assert_eq!(
+        replacement.len() as u64,
+        fs::metadata(rollout(SOURCE_ID)).unwrap().len()
+    );
+    fs::write(rollout(SOURCE_ID), replacement).unwrap();
+    let resumed = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", &codex)
+        .args([
+            "--json",
+            "resume",
+            &format!("codex:{CHILD}"),
+            "--in",
+            "codex",
+            "--no-fork",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(plan["launch"]["cwd"], json!(changed));
 }
 
 #[cfg(unix)]

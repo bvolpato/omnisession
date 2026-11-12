@@ -694,8 +694,7 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     let name = json!({"id": CODEX_ID, "thread_name": "Violet Quokka"});
     fs::write(&sidecar, name.to_string()).unwrap();
     fixture.index_codex();
-    let store = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    let check = |official: Option<&str>, searchable: &str| {
+    let check = |official: Option<&str>| {
         let output = fixture
             .command()
             .args(["--json", "show", &session.to_string()])
@@ -708,29 +707,26 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
         );
         let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(shown["title"].as_str(), official);
-        let saved: (Option<String>, Option<String>) = store
-            .query_row(
-                "SELECT c.title, t.derived_title FROM session_index c
-                 JOIN session_trajectories t USING (provider, session_id)
-                 WHERE c.provider='codex' AND c.session_id=?1",
-                [&session.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(saved.0.as_deref(), official);
-        assert_eq!(saved.1.as_deref(), Some(searchable));
     };
+    let opener_search = |expected: &str| {
+        let hit =
+            fixture.search_json(&["limter", "--provider", "codex", "--no-index", "--show-text"]);
+        assert_eq!(hit["results"][0]["match"], "metadata", "{hit}");
+        assert_eq!(hit["results"][0]["title"], expected, "{hit}");
+    };
+    opener_search("Violet Quokka");
     let ambiguous = format!(
         "{}\n{{",
         json!({"id": CODEX_ID, "thread_name": "Amber Heron"})
     );
     fs::write(&sidecar, &ambiguous).unwrap();
-    check(Some("Violet Quokka"), "Violet Quokka");
+    check(Some("Violet Quokka"));
     fs::write(&sidecar, "\n").unwrap();
-    check(None, "Tune the rate limiter backoff");
+    opener_search("Tune the rate limiter backoff");
+    check(None);
 
     fs::write(&sidecar, name.to_string()).unwrap();
-    check(Some("Violet Quokka"), "Violet Quokka");
+    check(Some("Violet Quokka"));
     fs::write(&sidecar, ambiguous).unwrap();
     let file = codex.join(format!(
         "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
@@ -744,7 +740,7 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
         .set_modified(fs::metadata(&file).unwrap().modified().unwrap())
         .unwrap();
     fs::rename(replacement, file).unwrap();
-    check(None, "Tune the rate limiter backoff");
+    check(None);
 }
 
 #[test]
@@ -817,6 +813,7 @@ fn check_fork_search_upgrade(document_version: u32, padding_rows: u32) -> anyhow
                 omnis_adapters::CodexAdapter::index_file_revision(&child).unwrap()
             },
             source_byte_count: local_text.len(),
+            projection: None,
             indexed_byte_count: local_text.len(),
             truncation_strategy: "none",
             source_complete: true,
@@ -869,6 +866,7 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
             &TrajectoryDocument {
                 ancestor_revisions: &[],
                 redacted_text: obsolete,
+                projection: None,
                 source_updated_at: state.source_updated_at,
                 source_revision: state.source_revision,
                 source_byte_count: obsolete.len(),
@@ -907,6 +905,38 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         result_sessions(&fixture.search_json(&["unchanged", "--cached", "--all-projects"])),
         [session.to_string()]
     );
+}
+
+fn listed_fork_workspace(fixture: &Fixture, project: &Path) -> Option<String> {
+    let output = fixture
+        .command()
+        .args(["--json", "list", "--provider", "codex", "--project"])
+        .arg(project)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session"]["id"] == CODEX_ID)
+        .map(|row| row["project_path"].as_str().unwrap().to_owned())
+}
+
+fn check_indexed_fork_workspace(fixture: &Fixture, project: &Path, child_ref: &str) {
+    assert_eq!(
+        listed_fork_workspace(fixture, project).as_deref(),
+        project.to_str()
+    );
+    assert!(listed_fork_workspace(fixture, &fixture.workspace).is_none());
+    let no_index = fixture.search_json(&[
+        "--no-index",
+        "--project",
+        project.to_str().unwrap(),
+        "inheritedworkspaceprobe",
+    ]);
+    assert_eq!(result_sessions(&no_index), [child_ref]);
 }
 
 #[test]
@@ -964,11 +994,17 @@ fn project_search_follows_the_surviving_workspace_in_a_fork_prefix() {
     assert_eq!(result_sessions(&search(&folders[0])), [child_ref.as_str()]);
     set_workspace(&folders[1]);
     fixture.index_codex();
+    check_indexed_fork_workspace(&fixture, &folders[1], &child_ref);
     let warm = search(&folders[1]);
     assert_eq!(result_sessions(&warm), [child_ref.as_str()]);
     assert_eq!(warm["index"]["indexed"], 0);
     assert!(result_sessions(&search(&folders[0])).is_empty());
     set_workspace(&folders[2]);
+    assert!(listed_fork_workspace(&fixture, &folders[1]).is_none());
+    assert_eq!(
+        listed_fork_workspace(&fixture, &folders[2]).as_deref(),
+        folders[2].to_str()
+    );
     assert_eq!(result_sessions(&search(&folders[2])), [child_ref.as_str()]);
     assert!(result_sessions(&search(&folders[1])).is_empty());
 
@@ -1499,6 +1535,33 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
 }
 
 #[test]
+fn failed_discovery_cannot_assign_a_name_with_two_possible_rollouts() {
+    let fixture = Fixture::new();
+    let home = fixture.root.join("codex");
+    let filename = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let selected = home.join("sessions/2026/01/02").join(&filename);
+    let archive = home.join("archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let content = fs::read_to_string(selected).unwrap();
+    fs::write(
+        archive.join(filename),
+        content.replace("Pagination", "Archive"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("session_index.jsonl"),
+        json!({"id": CODEX_ID, "thread_name": "Violet Quokka"}).to_string(),
+    )
+    .unwrap();
+    let query = ["Violet Quokka", "--provider", "codex", "--cached"];
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
+    fs::write(home.join("state_5.sqlite"), "unreadable database").unwrap();
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
+}
+
+#[test]
 fn live_search_reconciles_a_name_saved_before_the_first_trajectory() {
     use omnis_adapters::{CodexAdapter, ProviderAdapter};
     use omnis_store::{IndexedSession, Store};
@@ -1979,6 +2042,48 @@ fn switching_the_selected_codex_rollout_refreshes_equal_time_search_results() {
     );
     assert_eq!(matches("Activebluejay", true), [session]);
     assert!(matches("Archivejunco", true).is_empty());
+}
+
+#[test]
+fn cached_search_keeps_other_providers_when_a_home_cannot_be_resolved() {
+    let fixture = Fixture::new();
+    let indexed = fixture
+        .command()
+        .args(["index", "--provider", "claude"])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let inaccessible = fixture.root.join("not-a-directory");
+    fs::write(&inaccessible, "").unwrap();
+    for (home, should_warn) in [
+        (inaccessible.clone(), true),
+        (inaccessible.join("provider"), true),
+        (fixture.root.join("absent/provider"), false),
+    ] {
+        let search = fixture
+            .command()
+            .env("ANTIGRAVITY_CLI_HOME", home)
+            .args([
+                "--json",
+                "search",
+                "zebracorn",
+                "--cached",
+                "--all-projects",
+            ])
+            .output()
+            .unwrap();
+        assert!(search.status.success(), "{search:?}");
+        let cached: Value = serde_json::from_slice(&search.stdout).unwrap();
+        assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+        assert_eq!(
+            cached["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("antigravity")),
+            should_warn
+        );
+    }
 }
 
 #[test]

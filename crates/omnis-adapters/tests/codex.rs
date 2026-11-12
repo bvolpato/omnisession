@@ -3116,6 +3116,7 @@ fn interruptions_keep_the_saved_implicit_request_and_replies_in_one_turn() -> an
         ("turn_aborted", json!("implicit"), vec!["older"]),
         ("task_complete", Value::Null, vec!["older"]),
         ("task_complete", json!(17), vec!["older"]),
+        ("task_started", json!(17), vec!["older"]),
         (
             "task_complete",
             json!("implicit"),
@@ -3246,6 +3247,8 @@ fn positional_saved_messages_use_the_same_turns_as_named_messages() -> anyhow::R
     assert_eq!(compact.rollback_title, ordinary.rollback_title);
     for (payload, reply) in [
         (json!(["agent_message", "reply"]), true),
+        (json!([19, "reply"]), true),
+        (json!([2, "not an assistant reply"]), false),
         (
             json!(["agent_message", "reply", "final_answer", null, "async", []]),
             true,
@@ -3266,7 +3269,7 @@ fn positional_saved_messages_use_the_same_turns_as_named_messages() -> anyhow::R
                 json!({"type":"event_msg","payload":["user_message","missing fields"]}),
             ]);
             if let Some(count) = count {
-                rows.push(event("thread_rolled_back", json!({"num_turns":count})));
+                rows.push(json!({"type":"event_msg","payload":[if reply {json!(14)} else {json!("thread_rolled_back")},count]}));
             }
             let (full, preview) = rollback_title_reads(&header, &rows, "")?;
             for read in [full, preview] {
@@ -3968,5 +3971,55 @@ fn check_legacy_owners(file: &str) -> anyhow::Result<()> {
     check([Some(threads[0].2), Some(threads[1].2)])?;
     fs::write(&shadow, "{")?;
     check([None, None])?;
+    Ok(())
+}
+
+#[test]
+fn sampled_native_messages_follow_saved_membership_and_multiplicity() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir()?;
+    let sessions = temporary.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let source = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let padding = " ".repeat(512 * 1024);
+    for saved_first in [true, false] {
+        let raw = message("assistant", "Reply");
+        let saved = event("agent_message", json!({"message":"Reply"}));
+        let batch = if saved_first {
+            [&saved, &raw, &raw]
+        } else {
+            [&raw, &saved, &saved]
+        };
+        let mut file = std::io::BufWriter::new(fs::File::create(&source)?);
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy","cwd":"/synthetic"}})
+        )?;
+        for row in batch {
+            writeln!(file, "{row}")?;
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","payload":["user_message",null,"Saved request",null,[],null,[],[],[],[],null]})
+        )?;
+        for _ in 0..20 {
+            writeln!(file, "{}{padding}", event("token_count", json!({})))?;
+        }
+        writeln!(file, "{}", message("user", "Unsubmitted"))?;
+        file.flush()?;
+        let preview = adapter.preview_session(&session)?;
+        let expected = if saved_first {
+            vec!["Reply", "Saved request"]
+        } else {
+            vec!["Reply", "Reply", "Saved request"]
+        };
+        assert_eq!(visible_text(&preview), expected);
+        assert_eq!(visible_text(&adapter.read_session(&session)?), expected);
+    }
     Ok(())
 }

@@ -7,12 +7,40 @@ pub(super) fn project(mut record: Value) -> Value {
 }
 
 pub(super) fn normalize(record: &mut Value) {
-    if record["type"] == "event_msg"
-        && record["payload"].is_array()
-        && let Ok(message) = SavedMessage::deserialize(&record["payload"])
-        && let Ok(payload) = serde_json::to_value(message)
-    {
-        record["payload"] = payload;
+    if record["type"] != "event_msg" {
+        return;
+    }
+    let payload = &mut record["payload"];
+    let positional = payload.is_array();
+    let tag = if positional {
+        payload.get_mut(0)
+    } else {
+        payload.get_mut("type")
+    };
+    let Some(tag) = tag else { return };
+    let original = if let Some(index) = tag.as_u64() {
+        let name = match index {
+            14 => "thread_rolled_back",
+            19 => "agent_message",
+            20 => "user_message",
+            _ => return,
+        };
+        Some(std::mem::replace(tag, name.into()))
+    } else if positional && tag.is_string() {
+        None
+    } else {
+        return;
+    };
+    if let Ok(message) = SavedMessage::deserialize(&*payload) {
+        if positional && let Ok(named) = serde_json::to_value(message) {
+            *payload = named;
+        }
+    } else if let Some(original) = original {
+        if positional {
+            payload[0] = original;
+        } else {
+            payload["type"] = original;
+        }
     }
 }
 
@@ -31,6 +59,9 @@ enum SavedMessage {
         questions: Option<Vec<Question>>,
     },
     UserMessage(Box<UserMessage>),
+    ThreadRolledBack {
+        num_turns: u32,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
