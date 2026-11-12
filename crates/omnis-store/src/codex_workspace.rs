@@ -247,6 +247,7 @@ fn workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Uuid, CodexWorksp
         file,
         CodexWorkspace {
             source_revision: SourceRevision {
+                legacy_file: None,
                 file: Some(file),
                 contents: Some(Uuid::from_bytes(row.get(1)?)),
                 missing_ancestor: None,

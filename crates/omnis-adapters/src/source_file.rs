@@ -12,6 +12,8 @@ use uuid::Uuid;
 pub(crate) struct ObservedSourceFile {
     pub(crate) physical_identity: Option<[u64; 2]>,
     pub(crate) revision: SourceRevision,
+    #[cfg(any(unix, windows))]
+    object: [u64; 2],
     pub(crate) modified: Option<DateTime<Utc>>,
 }
 
@@ -71,6 +73,27 @@ impl ObservedSourceFile {
         Ok(())
     }
 
+    pub(crate) fn revision_in_namespace(self, path: &Path) -> SourceRevision {
+        #[cfg(any(unix, windows))]
+        {
+            #[cfg(windows)]
+            if self.object[0] == u64::MAX {
+                return self.revision;
+            }
+            let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_os_str().as_encoded_bytes());
+            let file = Uuid::new_v5(&namespace, self.object.map(u64::to_le_bytes).as_flattened());
+            SourceRevision {
+                file: Some(file),
+                ..self.revision
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            self.revision
+        }
+    }
+
     pub(crate) fn from_metadata(
         canonical: &Path,
         metadata: &fs::Metadata,
@@ -110,8 +133,11 @@ impl ObservedSourceFile {
         let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
             physical_identity,
+            #[cfg(any(unix, windows))]
+            object,
             modified,
             revision: SourceRevision {
+                legacy_file: None,
                 file: Some(file),
                 contents: contents_id(file, metadata, modified),
                 missing_ancestor: None,
