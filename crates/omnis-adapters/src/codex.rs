@@ -1891,8 +1891,7 @@ impl CodexSession {
         let lineage = self.visible_leaf()?;
         let mut builder = self.event_builder();
         let mut history = CodexHistory::preview();
-        let mut opener: Option<(u64, bool)> = None;
-        let mut withdrew = false;
+        builder.track_saved_opener(prior_title);
         let mut row = 0;
         let complete = rollout_file::visit_all_records(&self.path, |record| {
             row += 1;
@@ -1920,18 +1919,8 @@ impl CodexSession {
                 return Ok(false);
             }
             let record = lineage.project_leaf_request(record);
-            let rollback = history.push(&mut builder, &record)?;
-            if let Some(boundary) = rollback
-                && let Some((_, matched)) = opener.take_if(|(sequence, _)| *sequence >= boundary)
-            {
-                withdrew |= matched;
-            }
-            let events = builder.drain_events();
-            if opener.is_none() {
-                opener = omnis_core::search_title_opener_from_messages(events.as_slice())
-                    .map(|(sequence, title)| (sequence, title.as_deref() == Some(prior_title)));
-            }
-            drop(events);
+            history.push(&mut builder, &record)?;
+            drop(builder.drain_events());
             if history
                 .records_seen
                 .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
@@ -1940,7 +1929,7 @@ impl CodexSession {
             }
             Ok(true)
         })?;
-        Ok(complete && withdrew && !opener.is_some_and(|(_, matches)| matches))
+        Ok(complete && builder.witnessed_saved_opener_withdrawal(prior_title))
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
@@ -2362,7 +2351,7 @@ impl CodexSession {
                         },
                         Some(omitted),
                         MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-                    );
+                    )?;
                     (events, directory, false, true)
                 }
             };
@@ -2498,7 +2487,7 @@ impl CodexSession {
         if preview.omissions.workspace_gaps() > 0 {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
-        let events = self.events_from_preview(preview, None, MAX_STREAMED_TRANSCRIPT_LINE_SIZE);
+        let events = self.events_from_preview(preview, None, MAX_STREAMED_TRANSCRIPT_LINE_SIZE)?;
         Ok((events, directory, true))
     }
 
@@ -2507,7 +2496,7 @@ impl CodexSession {
         preview: JsonLinesPreview,
         omitted: Option<usize>,
         line_limit: u64,
-    ) -> EventBuilder {
+    ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
         let mut last_visible = None;
         let unread_ancestor = preview.records.iter().any(|record| {
@@ -2526,13 +2515,25 @@ impl CodexSession {
             builder.note_rollback_history_gap();
         }
         let mut records = preview.records.into_iter();
-        for record in records.by_ref().take(preview.prefix_records) {
-            push_record(&mut builder, &record, &mut last_visible);
-        }
+        let mut push_edge =
+            |builder: &mut EventBuilder, edge: &mut dyn Iterator<Item = Value>, contiguous| {
+                let mut receipts = RequestReceipts::new(&self.id, contiguous);
+                let mut push = |record, ()| {
+                    push_record(builder, &record, &mut last_visible);
+                    Ok(())
+                };
+                for record in edge {
+                    receipts.observe(record, (), &mut push)?;
+                }
+                receipts.flush(push)
+            };
+        push_edge(
+            &mut builder,
+            &mut records.by_ref().take(preview.prefix_records),
+            true,
+        )?;
         let prefix_end = builder.checkpoint();
-        for record in records {
-            push_record(&mut builder, &record, &mut last_visible);
-        }
+        push_edge(&mut builder, &mut records, preview.omissions.total() == 0)?;
         if unread_ancestor {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
@@ -2548,7 +2549,7 @@ impl CodexSession {
             prefix_end,
             preview.omissions.total() == 0 && !unread_ancestor,
         );
-        builder
+        Ok(builder)
     }
 
     fn finish_preview_prefix(
@@ -2875,7 +2876,15 @@ impl CodexHistory {
         let checkpoint = self.checkpoint(builder);
         let client_submission = client_submission(record);
         if push_record(builder, record, &mut self.last_visible) {
-            if self.separate_request(client_submission) {
+            if let Some(start) = self
+                .last_visible
+                .as_mut()
+                .and_then(|group| group.batch_checkpoint.take())
+            {
+                let first = self.turns.partition_point(|turn| turn.request_at < start);
+                self.turns.truncate(first.saturating_add(1));
+                self.pending_turn = None;
+            } else if self.separate_request(client_submission) {
                 let at = checkpoint.request_at;
                 let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
                 checkpoint.request_at = at;
@@ -3080,6 +3089,9 @@ struct MirrorGroup {
     scoped: bool,
     next: usize,
     order: BTreeMap<usize, bool>,
+    provisional_requests: VecDeque<u64>,
+    saved_batch: bool,
+    batch_checkpoint: Option<u64>,
     last_text: Option<(MediaDigest, Option<MediaDigest>)>,
     kind: EventKind,
     pending: HashMap<bool, PendingMessages>,
@@ -3101,6 +3113,9 @@ impl MirrorGroup {
             next: 0,
             order: BTreeMap::new(),
             kind: EventKind::ProviderEvent,
+            provisional_requests: VecDeque::new(),
+            saved_batch: false,
+            batch_checkpoint: None,
             last_text: None,
             pending: HashMap::new(),
             image_pairs: ImagePairs::default(),
@@ -3116,6 +3131,39 @@ impl MirrorGroup {
         }
     }
 
+    fn publish_implicit_request(
+        &mut self,
+        builder: &mut EventBuilder,
+        saved: bool,
+        paired: bool,
+    ) -> bool {
+        if self.scoped || self.kind != EventKind::MessageUser {
+            return false;
+        }
+        if !saved {
+            if !paired {
+                if self.saved_batch {
+                    self.provisional_requests.clear();
+                    self.saved_batch = false;
+                }
+                if self.provisional_requests.len() == MAX_CANONICAL_EVENTS {
+                    self.provisional_requests.pop_front();
+                }
+                self.provisional_requests.push_back(builder.checkpoint());
+            }
+            return false;
+        }
+        if paired && self.provisional_requests.len() > 1 {
+            self.batch_checkpoint = self.provisional_requests.front().copied();
+            for position in self.provisional_requests.drain(..) {
+                builder.remove_codex_mirror(position);
+            }
+            self.saved_batch = true;
+        }
+        self.provisional_requests.clear();
+        self.saved_batch
+    }
+
     fn observe(
         slot: &mut Option<Self>,
         message: VisibleMessage,
@@ -3124,6 +3172,8 @@ impl MirrorGroup {
         let group = slot.get_or_insert_with(|| Self::new(false));
         if group.kind != message.kind
             || (!group.scoped
+                && group.provisional_requests.is_empty()
+                && !group.saved_batch
                 && !group
                     .last_text
                     .is_some_and(|(text, alternative)| message.matches_text(text, alternative)))
@@ -3131,7 +3181,10 @@ impl MirrorGroup {
             group.pending.clear();
             group.order.clear();
             group.image_pairs = ImagePairs::default();
+            group.provisional_requests.clear();
+            group.saved_batch = false;
         }
+        group.batch_checkpoint = None;
         group.kind.clone_from(&message.kind);
         group.last_text = Some((message.text, message.alternative));
         group.paired_position = None;
@@ -3206,10 +3259,22 @@ impl ImagePairs {
             first.media.as_ref().map_or(0, Vec::len) + other.media.as_ref().map_or(0, Vec::len);
         if self.retained_parts + parts > MAX_CANONICAL_EVENTS
             || ![first, other].iter().any(|row| {
-                row.media
-                    .iter()
-                    .flatten()
-                    .any(|part| matches!(part, MessageMedia::Image { detail: None, .. }))
+                row.media.iter().flatten().any(|part| {
+                    matches!(
+                        part,
+                        MessageMedia::Image { detail: None, .. }
+                            | MessageMedia::Image {
+                                path: Some(_),
+                                url: Some(_),
+                                ..
+                            }
+                            | MessageMedia::Image {
+                                path: Some(_),
+                                file: Some(_),
+                                ..
+                            }
+                    )
+                })
             })
         {
             return;
@@ -3713,7 +3778,7 @@ fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageMedia>> {
                     let wrapper = index
                         .checked_sub(1)
                         .and_then(|i| parts.get(i))
-                        .filter(|p| matches!(p["type"].as_str(), Some("input_text" | "text")))
+                        .filter(|p| p["type"] == "input_text")
                         .and_then(|p| p["text"].as_str())
                         .filter(|t| is_image_wrapper(t, false, true));
                     let path = wrapper
@@ -3763,8 +3828,20 @@ fn push_message_text(
     last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let message = VisibleMessage::new(record, kind.clone(), text);
-    if message.alternative.is_some() && !last_visible.as_ref().is_some_and(|group| group.scoped) {
+    let saved = message.event;
+    let request = kind == EventKind::MessageUser && !is_contextual_user_text(text);
+    if !saved
+        && request
+        && !text.is_empty()
+        && !last_visible.as_ref().is_some_and(|group| group.scoped)
+    {
         builder.track_codex_provisional_opener();
+    }
+    if (!request || text.is_empty())
+        && let Some(group) = last_visible
+    {
+        group.provisional_requests.clear();
+        group.saved_batch = false;
     }
     let observation = MirrorGroup::observe(
         last_visible,
@@ -3772,7 +3849,12 @@ fn push_message_text(
         usize::try_from(builder.checkpoint()).ok(),
     );
     let paired = matches!(observation, MirrorObservation::Paired(_));
-    if let MirrorObservation::Paired(position) = observation {
+    let publish_saved = request
+        && !text.is_empty()
+        && last_visible
+            .as_mut()
+            .is_some_and(|group| group.publish_implicit_request(builder, saved, paired));
+    if !publish_saved && let MirrorObservation::Paired(position) = observation {
         if !last_visible.as_ref().is_some_and(|group| group.reorder) || text.is_empty() {
             return false;
         }
@@ -3784,7 +3866,9 @@ fn push_message_text(
             builder.remove_codex_mirror(position);
         }
     }
-    let user_turn = !paired && kind == EventKind::MessageUser && !is_contextual_user_text(text);
+    let user_turn = (!paired || publish_saved)
+        && kind == EventKind::MessageUser
+        && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
     }
@@ -3851,6 +3935,91 @@ fn omitted_media_text(payload: &Value, images: usize) -> Option<String> {
     has_audio.then(|| "[audio omitted]".to_owned())
 }
 
+struct RequestReceipts<'a, M> {
+    owner: &'a str,
+    contiguous: bool,
+    turn: Option<String>,
+    pending: Option<(Value, M)>,
+}
+
+impl<'a, M: Copy + Eq> RequestReceipts<'a, M> {
+    fn new(owner: &'a str, contiguous: bool) -> Self {
+        Self {
+            owner,
+            contiguous,
+            turn: None,
+            pending: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        record: Value,
+        mark: M,
+        mut visit: impl FnMut(Value, M) -> Result<()>,
+    ) -> Result<()> {
+        let payload = &record["payload"];
+        if let Some((mut request, before)) = self.pending.take() {
+            if before == mark
+                && (self.contiguous || request["ordinal"].is_u64())
+                && record["type"] == "event_msg"
+                && payload["type"] == "item_completed"
+                && payload["thread_id"].as_str().is_some_and(|id| {
+                    !id.is_empty() && workspace_check::same_thread(self.owner, id)
+                })
+                && record.get("thread_id").is_none_or(|id| {
+                    id.as_str()
+                        .is_some_and(|id| workspace_check::same_thread(self.owner, id))
+                })
+                && payload["turn_id"].as_str().is_some_and(|id| {
+                    !id.is_empty() && self.turn.as_deref().is_none_or(|active| active == id)
+                })
+                && let Some(parts) = history_base::receipt_literal_parts(&request, &record)
+            {
+                history_base::project_literal_parts(&mut request, &parts);
+            }
+            visit(request, before)?;
+        }
+        if record["type"] == "event_msg" {
+            match payload["type"].as_str() {
+                Some("task_started" | "turn_started") => {
+                    self.turn = payload["turn_id"].as_str().map(str::to_owned);
+                }
+                Some("task_complete" | "turn_complete" | "turn_aborted" | "thread_rolled_back") => {
+                    self.turn = None;
+                }
+                _ => {}
+            }
+        }
+        if record["type"] == "response_item"
+            && payload["role"] == "user"
+            && payload["id"].is_string()
+            && payload["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p["type"] == "input_text"
+                        && p["text"].as_str().is_some_and(|text| {
+                            text.starts_with("<audio")
+                                || text.starts_with("<image")
+                                || matches!(text, "</audio>" | "</image>")
+                        })
+                })
+            })
+        {
+            self.pending = Some((record, mark));
+            Ok(())
+        } else {
+            visit(record, mark)
+        }
+    }
+
+    fn flush(&mut self, mut visit: impl FnMut(Value, M) -> Result<()>) -> Result<()> {
+        if let Some((record, mark)) = self.pending.take() {
+            visit(record, mark)?;
+        }
+        Ok(())
+    }
+}
+
 /// Visible text parts of a message payload and how many images it carries.
 ///
 /// Codex adds framing around local images and audio. Only the adjacent user text is visible.
@@ -3886,11 +4055,12 @@ fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
                         .checked_sub(1)
                         .is_some_and(|i| local_audio_path(content, i).is_some()));
             !audio_wrapper
-                && !is_image_wrapper(
-                    text,
-                    part_type(index.checked_sub(1)) == Some("input_image"),
-                    part_type(Some(index + 1)) == Some("input_image"),
-                )
+                && (part_type(Some(*index)) == Some("text")
+                    || !is_image_wrapper(
+                        text,
+                        part_type(index.checked_sub(1)) == Some("input_image"),
+                        part_type(Some(index + 1)) == Some("input_image"),
+                    ))
         })
         .map(|(_, text)| text)
         .collect();

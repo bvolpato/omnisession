@@ -905,10 +905,26 @@ fn add_receipt_media(rows: &mut [Value], diff: &str) {
             .unwrap()
             .push(json!({"type":"image","image_url":"data:image/png;base64,Yw=="}));
     }
-    if diff == "matching wrapped image" {
+    if matches!(
+        diff,
+        "matching wrapped image" | "matching literal image" | "wrong literal image"
+    ) {
+        let open = "<image name=[Iris]>";
         let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
-        parts.insert(1, json!({"type":"input_text","text":"<image>"}));
+        parts.insert(1, json!({"type":"input_text","text":open}));
         parts.push(json!({"type":"input_text","text":"</image>"}));
+        if diff.ends_with("literal image") {
+            let saved = rows[5]["payload"]["item"]["content"]
+                .as_array_mut()
+                .unwrap();
+            let saved_open = if diff == "wrong literal image" {
+                "<image>"
+            } else {
+                open
+            };
+            saved.insert(1, json!({"type":"text","text":saved_open}));
+            saved.push(json!({"type":"text","text":"</image>"}));
+        }
     } else if diff == "matching uploaded audio" {
         rows[4]["payload"]["content"]
             .as_array_mut()
@@ -974,6 +990,8 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
         "matching",
         "matching image",
         "matching wrapped image",
+        "matching literal image",
+        "wrong literal image",
         "matching uploaded audio",
         "matching local audio",
         "matching literal audio",
@@ -1029,6 +1047,11 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
                     .iter()
                     .any(|m| m.starts_with("confirmed child opening")),
                 diff.starts_with("matching"),
+                "{id} {diff}"
+            );
+            assert_eq!(
+                messages.contains(&"confirmed child opening\n<image name=[Iris]>\n</image>"),
+                diff == "matching literal image",
                 "{id} {diff}"
             );
             let literal = "confirmed child opening\n<audio name=[Audio #1] path=\"/synthetic/voice memo.wav\">\n</audio>";
@@ -1370,6 +1393,52 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
     Ok(())
 }
 
+fn subagent_rows_with_gap(missing: usize, gap: &str) -> Vec<Value> {
+    let mut meta = header(PARENT, 0, None, false);
+    meta["payload"]["subagent_history_start_ordinal"] = json!(3);
+    let mut rows = vec![meta];
+    for _ in 0..missing {
+        let mut request = message(0, "unplaced");
+        request.as_object_mut().unwrap().remove("ordinal");
+        rows.push(request);
+    }
+    match gap {
+        "abort" => {
+            rows[1] = json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted","turn_id":"local"}});
+        }
+        "foreign abort" => {
+            rows[1] = json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted","thread_id":REVERT}});
+        }
+        "zero rollback" => {
+            rows[1] =
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":0}});
+        }
+        "invalid rollback" => {
+            rows[1] =
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":"0"}});
+        }
+        "assistant" => rows[1]["payload"]["role"] = json!("assistant"),
+        "token" => rows[1] = json!({"type":"event_msg","payload":{"type":"token_count"}}),
+        "context" => rows[1] = json!({"type":"turn_context","payload":{"turn_id":"local"}}),
+        "completion" => {
+            rows[1] = json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"local","thread_id":PARENT}});
+        }
+        "foreign token" => {
+            rows[1] =
+                json!({"type":"event_msg","payload":{"type":"token_count","thread_id":REVERT}});
+        }
+        "opaque" => rows[1] = json!({"type":"event_msg","payload":{"type":"unknown_control"}}),
+        "foreign" => rows[1]["payload"]["thread_id"] = json!(REVERT),
+        "rollback" => {
+            rows[1] =
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+        }
+        "malformed" => rows[1] = json!({"type":"damaged_marker"}),
+        _ => (),
+    }
+    rows
+}
+
 #[test]
 fn a_fork_keeps_numbered_subagent_messages_after_recognized_unplaced_records() -> Result<()> {
     let home = tempfile::tempdir()?;
@@ -1379,6 +1448,10 @@ fn a_fork_keeps_numbered_subagent_messages_after_recognized_unplaced_records() -
         (4, "requests"),
         (1, "assistant"),
         (1, "token"),
+        (1, "abort"),
+        (1, "zero rollback"),
+        (1, "invalid rollback"),
+        (1, "foreign abort"),
         (2, "context"),
         (2, "completion"),
         (2, "foreign token"),
@@ -1387,36 +1460,16 @@ fn a_fork_keeps_numbered_subagent_messages_after_recognized_unplaced_records() -
         (2, "rollback"),
         (2, "malformed"),
     ] {
-        let mut meta = header(PARENT, 0, None, false);
-        meta["payload"]["subagent_history_start_ordinal"] = json!(3);
-        let mut rows = vec![meta];
-        for _ in 0..missing {
-            let mut request = message(0, "unplaced");
-            request.as_object_mut().unwrap().remove("ordinal");
-            rows.push(request);
-        }
-        match gap {
-            "assistant" => rows[1]["payload"]["role"] = json!("assistant"),
-            "token" => rows[1] = json!({"type":"event_msg","payload":{"type":"token_count"}}),
-            "context" => rows[1] = json!({"type":"turn_context","payload":{"turn_id":"local"}}),
-            "completion" => {
-                rows[1] = json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"local","thread_id":PARENT}});
-            }
-            "foreign token" => {
-                rows[1] =
-                    json!({"type":"event_msg","payload":{"type":"token_count","thread_id":REVERT}});
-            }
-            "opaque" => rows[1] = json!({"type":"event_msg","payload":{"type":"unknown_control"}}),
-            "foreign" => rows[1]["payload"]["thread_id"] = json!(REVERT),
-            "rollback" => {
-                rows[1] = json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
-            }
-            "malformed" => rows[1] = json!({"type":"damaged_marker"}),
-            _ => (),
-        }
+        let mut rows = subagent_rows_with_gap(missing, gap);
         let preserves_suffix = matches!(
             gap,
-            "requests" | "assistant" | "token" | "context" | "completion"
+            "requests"
+                | "assistant"
+                | "token"
+                | "context"
+                | "completion"
+                | "abort"
+                | "zero rollback"
         );
         let first = 3 + missing;
         for (ordinal, text, role) in [

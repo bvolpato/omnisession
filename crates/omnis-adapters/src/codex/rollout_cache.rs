@@ -32,6 +32,8 @@ const PARSER_SOURCES: [&[u8]; 9] = [
     include_bytes!("rollout_identity.rs"),
     include_bytes!("rollout_file.rs"),
 ];
+// Evaluation visits each byte of the finite parser source list once.
+#[allow(long_running_const_eval)]
 const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);
 /// Largest cache file read. The 10,000-rollout scan limit keeps real caches far smaller.
 const MAX_CACHE_FILE_SIZE: u64 = 64 * 1024 * 1024;

@@ -393,7 +393,35 @@ fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> any
     let rolled_back = |turns: u64| event("thread_rolled_back", json!({"num_turns":turns}));
     let saved = || message("user", "Saved   title");
     let header = json!({"type":"session_meta","payload":{"id":SESSION_ID, "history_base":{"session_id":"11111111-1111-4111-8111-111111111111"}}});
+    let mut reissued = message("user", "Sa");
+    reissued["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":"ved title"}));
+    let mut provisional = message("user", "Saved");
+    provisional["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":"title"}));
     let cases = [
+        (
+            vec![
+                saved(),
+                rolled_back(1),
+                provisional,
+                event("user_message", json!({"message":"Savedtitle"})),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                rolled_back(1),
+                reissued,
+                event("user_message", json!({"message":"Saved title"})),
+            ],
+            false,
+        ),
         (
             vec![saved(), message("user", "later"), rolled_back(1)],
             false,
@@ -2577,6 +2605,172 @@ fn rollback_keeps_the_first_implicit_multipart_request_at_its_checkpoint() -> an
                 visible_text(&read_records_with_preview(records.clone(), preview)?),
                 expected
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_multipart_replacement_cannot_restore_a_withdrawn_title_candidate() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let mut raw = message("user", "Fresh");
+    raw["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":"title"}));
+    let rows = [
+        event("task_started", json!({"turn_id":"old"})),
+        event("user_message", json!({"message":"Retiredtitle"})),
+        event("thread_rolled_back", json!({"num_turns":1})),
+        raw,
+        event("user_message", json!({"message":"Freshtitle"})),
+    ];
+    let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
+    for read in [full, sampled] {
+        assert_eq!(visible_text(&read.snapshot), ["Freshtitle"]);
+        assert_eq!(
+            read.rollback_title,
+            omnis_adapters::RollbackTitle::Known(Some("Freshtitle".into()))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn native_image_matching_keeps_both_local_and_inline_submissions() -> anyhow::Result<()> {
+    let wrapper = "<image name=[Image #1] path=\"picture.png\">";
+    let image = json!({"type":"input_image","image_url":"fixture-url","detail":"high"});
+    let mut inline = message("user", "Iris");
+    inline["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(image.clone());
+    let mut local = message("user", "Iris");
+    local["payload"]["content"].as_array_mut().unwrap().extend([
+        json!({"type":"input_text","text":wrapper}),
+        image,
+        json!({"type":"input_text","text":"</image>"}),
+    ]);
+    let in_event = event(
+        "user_message",
+        json!({"message":"Iris","images":["fixture-url"],"image_details":["high"]}),
+    );
+    let local_event = event(
+        "user_message",
+        json!({"message":"Iris","local_images":["picture.png"],"local_image_details":["high"]}),
+    );
+    for requests in [[local.clone(), inline.clone()], [inline, local]] {
+        for events in [
+            [in_event.clone(), local_event.clone()],
+            [local_event.clone(), in_event.clone()],
+        ] {
+            let mut rows = vec![event("task_started", json!({"turn_id":"test"}))];
+            rows.extend(requests.clone());
+            rows.extend(events);
+            rows.push(event("task_complete", json!({"turn_id":"test"})));
+            assert_eq!(visible_text(&read_records(rows)?), ["Iris", "Iris"]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_receipt_disambiguates_literal_tags_from_local_media() -> anyhow::Result<()> {
+    for kind in ["audio", "image"] {
+        let tag = format!(
+            "<{kind} name=[{} #1] path=\"picture\">",
+            if kind == "audio" { "Audio" } else { "Image" }
+        );
+        let close = format!("</{kind}>");
+        let url = format!("data:{kind}/fixture;base64,AAAA");
+        let wire = format!("{kind}_url");
+        let mut raw = message("user", "Question");
+        raw["payload"]["id"] = json!("request");
+        raw["payload"]["content"].as_array_mut().unwrap().extend([
+            json!({"type":"input_text","text":tag}),
+            json!({"type":format!("input_{kind}"), &wire:&url}),
+            json!({"type":"input_text","text":close}),
+        ]);
+        let text = format!("Question\n{tag}\n{close}");
+        let receipt = event(
+            "item_completed",
+            json!({"thread_id":SESSION_ID,"turn_id":"task","item":{"id":"request","type":"UserMessage",
+            "content":[{"type":"text","text":"Question"},{"type":"text","text":tag},{"type":kind,&wire:&url},{"type":"text","text":close}]}}),
+        );
+        let media = if kind == "audio" { "audio" } else { "images" };
+        let saved = event("user_message", json!({"message":text,media:[url]}));
+        for foreign in [false, true] {
+            let mut completion = receipt.clone();
+            if foreign {
+                completion["payload"]["thread_id"] = json!("elsewhere");
+            }
+            let rows = vec![
+                event("task_started", json!({"turn_id":"task"})),
+                raw.clone(),
+                completion,
+                saved.clone(),
+                event("task_complete", json!({"turn_id":"task"})),
+            ];
+            for preview in [false, true] {
+                let snapshot = read_records_with_preview(rows.clone(), preview)?;
+                let expected = if foreign {
+                    vec!["Question", text.as_str()]
+                } else {
+                    vec![text.as_str()]
+                };
+                assert_eq!(
+                    visible_text(&snapshot),
+                    expected,
+                    "{kind} foreign={foreign} preview={preview}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn implicit_rollback_counts_the_saved_submissions_in_wire_order() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let parts = [("first", "First"), ("second", "Second")];
+    for saved in [vec![0], vec![1], vec![0, 1], vec![1, 0]] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"A"})),
+            event("user_message", json!({"message":"older"})),
+            event("task_complete", json!({"turn_id":"A"})),
+        ];
+        for (id, prefix) in parts {
+            let mut raw = message("user", prefix);
+            raw["payload"]["client_id"] = json!(id);
+            raw["payload"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"input_text","text":"word"}));
+            rows.push(raw);
+        }
+        for &i in &saved {
+            rows.push(event(
+                "user_message",
+                json!({"client_id":parts[i].0,"message":format!("{}word",parts[i].1)}),
+            ));
+        }
+        for count in [0usize, 1, 2] {
+            let mut data = rows.clone();
+            data.push(event("thread_rolled_back", json!({"num_turns":count})));
+            let mut expected = Vec::new();
+            if count <= saved.len() {
+                expected.push("older".to_owned());
+            }
+            expected.extend(
+                saved
+                    .iter()
+                    .take(saved.len().saturating_sub(count))
+                    .map(|&i| format!("{}word", parts[i].1)),
+            );
+            let (full, sampled) = rollback_title_reads(&header, &data, "")?;
+            for read in [full, sampled] {
+                assert_eq!(visible_text(&read.snapshot), expected);
+            }
         }
     }
     Ok(())

@@ -1614,6 +1614,16 @@ struct RollbackOpener {
     target: Option<[u8; 32]>,
 }
 
+impl RollbackOpener {
+    fn active_withdrawals(&self) -> crate::WithdrawnOpeners {
+        let mut withdrawn = self.withdrawn.clone();
+        if let Some((_, Some(title))) = &self.first_message {
+            withdrawn.reissued(title);
+        }
+        withdrawn
+    }
+}
+
 #[derive(Default)]
 struct EventPreview {
     outline: Vec<PreviewEvent>,
@@ -1854,6 +1864,15 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn witnessed_saved_opener_withdrawal(&self, title: &str) -> bool {
+        self.rollback_opener.as_ref().is_some_and(|opener| {
+            opener
+                .active_withdrawals()
+                .hashes
+                .contains(&crate::RollbackTitle::fingerprint(title))
+        })
+    }
+
     pub(crate) fn confirms_saved_local_opener(&self, title: &str) -> bool {
         self.rollback_opener.as_ref().is_some_and(|opener| {
             (!opener.gap
@@ -1862,16 +1881,13 @@ impl EventBuilder {
                     .as_ref()
                     .and_then(|(_, title)| title.as_deref())
                     == Some(title))
-                || opener
-                    .withdrawn
-                    .hashes
-                    .contains(&crate::RollbackTitle::fingerprint(title))
+                || self.witnessed_saved_opener_withdrawal(title)
         })
     }
 
     pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
         match &self.rollback_opener {
-            Some(opener) if opener.gap => opener.withdrawn.after_gap(),
+            Some(opener) if opener.gap => opener.active_withdrawals().after_gap(),
             Some(opener) if opener.full_read || opener.applied_rollback => {
                 crate::RollbackTitle::Known(
                     opener
@@ -1943,9 +1959,6 @@ impl EventBuilder {
             } else {
                 opener.first_message = replacement;
             }
-            if let Some((_, Some(title))) = &opener.first_message {
-                opener.withdrawn.reissued(title);
-            }
         }
         if let Some(index) = retained {
             self.events[index] = event;
@@ -1989,6 +2002,9 @@ impl EventBuilder {
             && !opener.gap
         {
             opener.applied_rollback = true;
+            if let Some(candidates) = &mut opener.mirror_openers {
+                candidates.split_off(&checkpoint);
+            }
             if let Some((_, Some(title))) = opener
                 .first_message
                 .take_if(|(sequence, _)| *sequence >= checkpoint)
@@ -2183,9 +2199,6 @@ impl EventBuilder {
                 }
             }
             if opener.first_message.is_none() {
-                if let Some(title) = &title {
-                    opener.withdrawn.reissued(title);
-                }
                 opener.first_message = Some((pos, title));
             }
         }

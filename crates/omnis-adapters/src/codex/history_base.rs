@@ -126,34 +126,24 @@ struct AttachmentStart {
     owner: Option<Uuid>,
     hidden_rows: usize,
     hidden_records: usize,
-    literal_audio: Option<LiteralAudio>,
+    literal_tags: Option<LiteralTags>,
     incomplete: bool,
 }
 
 #[derive(Clone)]
-struct LiteralAudio {
+struct LiteralTags {
     ordinal: u64,
     request_digest: super::MediaDigest,
-    openings: Vec<usize>,
+    indices: Vec<usize>,
 }
 
 impl VisibleStart {
     fn project_request(&self, mut record: Value) -> Value {
-        if let Some(literal) = self
-            .attached
-            .as_ref()
-            .and_then(|a| a.literal_audio.as_ref())
+        if let Some(literal) = self.attached.as_ref().and_then(|a| a.literal_tags.as_ref())
             && record["ordinal"].as_u64() == Some(literal.ordinal)
             && super::media_digest(&record.to_string()) == literal.request_digest
-            && let Some(parts) = record["payload"]["content"].as_array_mut()
         {
-            for &index in &literal.openings {
-                if super::local_audio_path(parts, index + 1).is_some() {
-                    // The receipt identifies both tags as ordinary text around inline audio.
-                    parts[index]["type"] = Value::from("text");
-                    parts[index + 2]["type"] = Value::from("text");
-                }
-            }
+            project_literal_parts(&mut record, &literal.indices);
         }
         record
     }
@@ -590,23 +580,24 @@ impl AttachmentPreamble {
                     || matches!(kind, "task_started" | "turn_started")
                         && payload.get("thread_id").is_none()) =>
             {
-                let mut literal_audio = Vec::new();
-                let recovered = kind == "item_completed"
-                    && self
-                        .turn_hint
-                        .as_deref()
-                        .is_none_or(|id| payload["turn_id"] == id)
-                    && request.as_ref().is_some_and(|request| {
-                        matches_request_receipt(request, &record, &mut literal_audio)
-                    });
-                if recovered
-                    && !literal_audio.is_empty()
+                let verified = request.as_ref().and_then(|request| {
+                    (kind == "item_completed"
+                        && previous_ordinal.is_some()
+                        && self
+                            .turn_hint
+                            .as_deref()
+                            .is_none_or(|id| payload["turn_id"] == id))
+                    .then(|| receipt_literal_parts(request, &record))
+                    .flatten()
+                });
+                let recovered = verified.is_some();
+                if let Some(literal_tags) = verified.filter(|tags| !tags.is_empty())
                     && let Some((ordinal, request)) = previous_ordinal.zip(request)
                 {
-                    self.start.literal_audio = Some(LiteralAudio {
+                    self.start.literal_tags = Some(LiteralTags {
                         ordinal,
                         request_digest: super::media_digest(&request.to_string()),
-                        openings: literal_audio,
+                        indices: literal_tags,
                     });
                 }
                 let omitted = self.responses > usize::from(recovered);
@@ -639,45 +630,66 @@ impl AttachmentStart {
     }
 }
 
-fn matches_request_receipt(
-    request: &Value,
-    completed: &Value,
-    literal_audio: &mut Vec<usize>,
-) -> bool {
+pub(super) fn project_literal_parts(record: &mut Value, indices: &[usize]) {
+    if let Some(parts) = record["payload"]["content"].as_array_mut() {
+        for &index in indices {
+            // Generic text retains the receipt's literal spelling and carries no native framing.
+            parts[index]["type"] = Value::from("text");
+        }
+    }
+}
+
+pub(super) fn receipt_literal_parts(request: &Value, completed: &Value) -> Option<Vec<usize>> {
     let response = &request["payload"];
     let receipt = &completed["payload"];
     let item = &receipt["item"];
-    let Some(id) = response["id"].as_str().filter(|id| !id.is_empty()) else {
-        return false;
+    let id = response["id"].as_str().filter(|id| !id.is_empty())?;
+    let adjacent = match (request.get("ordinal"), completed.get("ordinal")) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.as_u64()?.checked_add(1)? == right.as_u64()?,
+        _ => false,
     };
-    if item["type"] != "UserMessage"
+    if request["type"] != "response_item"
+        || response["type"] != "message"
+        || response["role"] != "user"
+        || completed["type"] != "event_msg"
+        || receipt["type"] != "item_completed"
+        || item["type"] != "UserMessage"
         || item["id"] != id
-        || request["ordinal"]
-            .as_u64()
-            .and_then(|n| n.checked_add(1))
-            .is_none_or(|n| completed["ordinal"].as_u64() != Some(n))
+        || !adjacent
         || ["thread_id", "turn_id"].iter().any(|&key| {
             [request, response]
                 .iter()
                 .any(|obj| obj.get(key).is_some_and(|v| v != &receipt[key]))
         })
     {
-        return false;
+        return None;
     }
     let (Some(raw), Some(saved)) = (response["content"].as_array(), item["content"].as_array())
     else {
-        return false;
+        return None;
     };
+    let mut literal_tags = Vec::new();
     let mut saved = saved.iter().peekable();
     let is_image = |part: Option<&Value>| part.is_some_and(|p| p["type"] == "input_image");
     let mut parts = raw.iter().enumerate();
     while let Some((index, part)) = parts.next() {
+        let before = index.checked_sub(1).and_then(|previous| raw.get(previous));
+        let image_tag = part["type"] == "input_text"
+            && part["text"].as_str().is_some_and(|text| {
+                super::is_image_wrapper(text, is_image(before), is_image(raw.get(index + 1)))
+            });
         if saved
             .next_if(|candidate| same_input_part(part, candidate))
             .is_some()
         {
-            if super::local_audio_path(raw, index + 1).is_some() {
-                literal_audio.push(index);
+            if image_tag
+                || super::local_audio_path(raw, index + 1).is_some()
+                || index
+                    .checked_sub(1)
+                    .is_some_and(|audio| super::local_audio_path(raw, audio).is_some())
+            {
+                literal_tags.push(index);
             }
             continue;
         }
@@ -692,16 +704,11 @@ fn matches_request_receipt(
             continue;
         }
         // Local image framing can be absent from the user's saved input.
-        let before = index.checked_sub(1).and_then(|previous| raw.get(previous));
-        if part["type"] != "input_text"
-            || !part["text"].as_str().is_some_and(|text| {
-                super::is_image_wrapper(text, is_image(before), is_image(raw.get(index + 1)))
-            })
-        {
-            return false;
+        if !image_tag {
+            return None;
         }
     }
-    !raw.is_empty() && saved.next().is_none()
+    (!raw.is_empty() && saved.next().is_none()).then_some(literal_tags)
 }
 
 // Compare native input references without resolving URLs or local attachment paths.
@@ -1064,6 +1071,12 @@ impl Lineage {
         read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
         mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
     ) -> Result<JsonLineSkips> {
+        let read = |visit: &mut dyn FnMut(Value, JsonLineSkips) -> Result<()>| {
+            let mut receipts = super::RequestReceipts::new(session, true);
+            let skipped = read(&mut |record, mark| receipts.observe(record, mark, &mut *visit))?;
+            receipts.flush(visit)?;
+            Ok(skipped)
+        };
         if self.visible_leaf_start.ordinal().is_none() {
             return read(&mut visit);
         }
@@ -1263,7 +1276,18 @@ fn read_prefix(
         Err(error) if access_denied(&error) => return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE)),
         result => result?,
     };
-    let mut projection = read_prefix_from(segment, &mut source, visit)?;
+    let owner = rollout_identity::thread_id(&segment.path).unwrap_or_default();
+    let mut receipts = super::RequestReceipts::new(owner, false);
+    let mut projection = read_prefix_from(segment, &mut source, &mut |record, skipped| {
+        let mut native = |row, mark| visit(InheritedRecord::Native(row), mark);
+        if let InheritedRecord::Native(row) = record {
+            receipts.observe(row, skipped, native)
+        } else {
+            receipts.flush(&mut native)?;
+            visit(record, skipped)
+        }
+    })?;
+    receipts.flush(|row, mark| visit(InheritedRecord::Native(row), mark))?;
     if let PrefixRead::Partial(_, plan) = &mut projection {
         let Some(revision) = revision else {
             return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE));
@@ -1680,10 +1704,19 @@ fn is_owned_completion(record: &Value, path: &Path) -> bool {
 }
 
 fn preserves_subagent_suffix(record: &Value, path: &Path) -> bool {
-    owned_event(record, path)
-        && (message_role(record).is_some()
-            || is_non_turn_body(record)
-            || (recoverable_control(record, path) && !is_owned_rollback(record, path)))
+    if !owned_event(record, path) {
+        return false;
+    }
+    let payload = &record["payload"];
+    match (record["type"].as_str(), payload["type"].as_str()) {
+        (Some("event_msg"), Some("turn_aborted")) => true,
+        (Some("event_msg"), Some("thread_rolled_back")) => payload["num_turns"].as_u64() == Some(0),
+        _ => {
+            message_role(record).is_some()
+                || is_non_turn_body(record)
+                || recoverable_control(record, path)
+        }
+    }
 }
 
 struct PrefixCursor {
