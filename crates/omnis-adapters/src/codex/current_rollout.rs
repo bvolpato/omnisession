@@ -242,6 +242,24 @@ pub(super) struct CurrentFile {
     pub(super) native: bool,
 }
 
+impl CurrentFile {
+    fn source(&self) -> (&Path, SourceRevision) {
+        (&self.path, self.revision)
+    }
+}
+
+fn same_index_filename(a: &Path, b: &Path) -> bool {
+    let a_name = rollout_file::jsonl_file_name(a);
+    let b_name = rollout_file::jsonl_file_name(b);
+    a_name == b_name
+        || (canonical_name(a)
+            && canonical_name(b)
+            && a_name
+                .and_then(Path::to_str)
+                .zip(b_name.and_then(Path::to_str))
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
 impl CurrentRollout {
     pub(super) fn title(&self, indexed: impl FnOnce() -> Option<String>) -> Option<String> {
         self.name.title(indexed)
@@ -274,15 +292,18 @@ impl CurrentRollout {
                 saw_selected = true;
                 continue;
             }
-            if rollout_file::jsonl_file_name(path) != rollout_file::jsonl_file_name(selected)
-                || !live_rollout_path(home, &root, path)
-            {
+            if !same_index_filename(path, selected) || !live_rollout_path(home, &root, path) {
                 return Ok(false);
             }
-            let Some(copy) = self.check(path, id)? else {
+            let Some(revision) = CodexAdapter::index_file_revision(path) else {
                 return Ok(false);
             };
-            if !copies_match(&original, &copy, &mut digest, &mut remaining)? {
+            if !copies_match(
+                original.source(),
+                (path, revision),
+                &mut digest,
+                &mut remaining,
+            )? {
                 return Ok(false);
             }
             saw_copy = true;
@@ -501,7 +522,7 @@ impl CurrentRollout {
                 continue;
             };
             if let Some(prior) = original.or(selected.as_ref())
-                && !copies_match(prior, &copy, &mut digest, &mut bytes)?
+                && !copies_match(prior.source(), copy.source(), &mut digest, &mut bytes)?
             {
                 ensure!(original.is_some(), CurrentRolloutUnavailable);
                 continue;
@@ -689,23 +710,22 @@ pub(super) fn canonical_name(path: &Path) -> bool {
 }
 
 fn copies_match(
-    reference: &CurrentFile,
-    copy: &CurrentFile,
+    reference @ (reference_path, _): (&Path, SourceRevision),
+    copy @ (copy_path, _): (&Path, SourceRevision),
     reference_digest: &mut Option<[u8; 32]>,
     remaining: &mut u64,
 ) -> Result<bool> {
-    if reference.path.extension() == copy.path.extension()
-        && same_file::is_same_file(&reference.path, &copy.path)
-            .context(CurrentRolloutUnconfirmed)?
+    if reference_path.extension() == copy_path.extension()
+        && same_file::is_same_file(reference_path, copy_path).context(CurrentRolloutUnconfirmed)?
     {
         return Ok(true);
     }
-    if !rollout_file::compressed(&reference.path)
-        && !rollout_file::compressed(&copy.path)
-        && fs::metadata(&reference.path)
+    if !rollout_file::compressed(reference_path)
+        && !rollout_file::compressed(copy_path)
+        && fs::metadata(reference_path)
             .context(CurrentRolloutUnconfirmed)?
             .len()
-            != fs::metadata(&copy.path)
+            != fs::metadata(copy_path)
                 .context(CurrentRolloutUnconfirmed)?
                 .len()
     {
@@ -722,13 +742,11 @@ fn copies_match(
     }
 }
 
-fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
-    let encoded = fs::metadata(&copy.path)
-        .context(CurrentRolloutUnconfirmed)?
-        .len();
+fn hash_copy((path, revision): (&Path, SourceRevision), remaining: &mut u64) -> Result<[u8; 32]> {
+    let encoded = fs::metadata(path).context(CurrentRolloutUnconfirmed)?.len();
     ensure!(encoded <= *remaining, CurrentRolloutUnconfirmed);
     let mut hash = Sha256::new();
-    let mut reader = rollout_file::open(&copy.path)
+    let mut reader = rollout_file::open(path)
         .context(CurrentRolloutUnconfirmed)?
         .take(*remaining + 1);
     let mut buffer = [0; 16 * 1024];
@@ -740,14 +758,14 @@ fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
                 decoded += size as u64;
                 hash.update(&buffer[..size]);
             }
-            Err(error) => break Err(copy_read_error(&copy.path, error)),
+            Err(error) => break Err(copy_read_error(path, error)),
         }
     };
     *remaining = remaining
         .checked_sub(encoded.max(decoded))
         .ok_or(CurrentRolloutUnconfirmed)?;
     ensure!(
-        Some(copy.revision) == CodexAdapter::index_file_revision(&copy.path),
+        Some(revision) == CodexAdapter::index_file_revision(path),
         CurrentRolloutUnconfirmed
     );
     result?;
@@ -1023,7 +1041,7 @@ mod tests {
         let copy = row.check(&damaged, THREAD)?.unwrap();
         let mut budget = 64 * 1024;
         assert!(
-            hash_copy(&copy, &mut budget)
+            hash_copy(copy.source(), &mut budget)
                 .unwrap_err()
                 .is::<CurrentRolloutUnavailable>()
         );
@@ -1056,7 +1074,7 @@ mod tests {
         assert_eq!(selected.path, packed);
         assert!(!selected.native);
         assert!(
-            hash_copy(&selected, &mut 1)
+            hash_copy(selected.source(), &mut 1)
                 .unwrap_err()
                 .is::<CurrentRolloutUnconfirmed>()
         );

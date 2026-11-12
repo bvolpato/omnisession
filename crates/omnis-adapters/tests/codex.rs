@@ -1804,7 +1804,16 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
 }
 
 fn check_gui_title(home: &Path, path: &Path, expected: Option<&str>) -> anyhow::Result<()> {
-    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    check_gui_title_for(home, path, expected, SESSION_ID)
+}
+
+fn check_gui_title_for(
+    home: &Path,
+    path: &Path,
+    expected: Option<&str>,
+    id: &str,
+) -> anyhow::Result<()> {
+    let session = SessionRef::new(Provider::Codex, id);
     let adapter = CodexAdapter::with_root(home);
     let mut rows = adapter.list_sessions(None)?;
     assert_eq!(rows[0].title.as_deref(), expected);
@@ -1824,11 +1833,7 @@ fn check_gui_title(home: &Path, path: &Path, expected: Option<&str>) -> anyhow::
     assert_eq!(rows[0].title.as_deref(), expected);
     assert_eq!(rows[0].source_path.as_ref().unwrap().canonicalize()?, path);
     assert_eq!(
-        adapter
-            .find_native_session(SESSION_ID)?
-            .unwrap()
-            .title
-            .as_deref(),
+        adapter.find_native_session(id)?.unwrap().title.as_deref(),
         expected
     );
     assert_eq!(adapter.read_session(&session)?.title.as_deref(), expected);
@@ -2154,16 +2159,17 @@ fn compressed_archive_uses_the_name_and_reply_of_the_registered_generation() -> 
 
 #[test]
 fn assigned_legacy_opener_survives_only_agreeing_archive_copies() -> anyhow::Result<()> {
-    let canonical = format!("rollout-2026-10-02T00-00-00-{SESSION_ID}.jsonl");
+    let id = "abcdefab-1234-4234-8234-123456789abc";
+    let canonical = format!("rollout-2026-10-02T00-00-00-{id}.jsonl");
     for file in [&canonical[..], "orchard-history.jsonl"] {
         for compressed in [false, true] {
-            check_assigned_legacy_opener(file, compressed)?;
+            check_assigned_legacy_opener(id, file, compressed)?;
         }
     }
     Ok(())
 }
 
-fn check_assigned_legacy_opener(file: &str, compressed: bool) -> anyhow::Result<()> {
+fn check_assigned_legacy_opener(id: &str, file: &str, compressed: bool) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let home = tmp.path().canonicalize()?;
     let active_dir = home.join("sessions");
@@ -2176,9 +2182,10 @@ fn check_assigned_legacy_opener(file: &str, compressed: bool) -> anyhow::Result<
     } else {
         recorded.clone()
     };
-    let archived = archived_dir.join(file);
+    let archived = archived_dir.join(file.replace(id, &id.to_ascii_uppercase()));
     let opener = "Synthetic first question";
-    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example","history_mode":"legacy"}});
+    let header =
+        json!({"type":"session_meta","payload":{"id":id,"cwd":"/example","history_mode":"legacy"}});
     let text = format!(
         "{header}\n{}\n{}\n",
         message("user", opener),
@@ -2193,30 +2200,27 @@ fn check_assigned_legacy_opener(file: &str, compressed: bool) -> anyhow::Result<
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
     db.execute(
         "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,?3,?3)",
-        rusqlite::params![SESSION_ID, recorded.to_str(), opener],
+        rusqlite::params![id, recorded.to_str(), opener],
     )?;
     let index = home.join("session_index.jsonl");
-    fs::write(
-        &index,
-        json!({"id":SESSION_ID,"thread_name":opener}).to_string(),
-    )?;
-    check_gui_title(&home, &active, Some(opener))?;
+    fs::write(&index, json!({"id":id,"thread_name":opener}).to_string())?;
+    check_gui_title_for(&home, &active, Some(opener), id)?;
     fs::write(&archived, &text)?;
-    check_gui_title(&home, &active, Some(opener))?;
+    check_gui_title_for(&home, &active, Some(opener), id)?;
     fs::write(&archived, text.replace("Reply A", "Reply B"))?;
-    check_gui_title(&home, &active, None)?;
+    check_gui_title_for(&home, &active, None, id)?;
     let renamed = archived_dir.join("independent-history.jsonl");
     fs::rename(&archived, &renamed)?;
-    check_gui_title(&home, &active, None)?;
+    check_gui_title_for(&home, &active, None, id)?;
     fs::remove_file(renamed)?;
     fs::write(&archived, &text)?;
     fs::write(
         &index,
-        json!({"id":SESSION_ID,"thread_name":"Unrelated stale name"}).to_string(),
+        json!({"id":id,"thread_name":"Unrelated stale name"}).to_string(),
     )?;
-    check_gui_title(&home, &active, None)?;
+    check_gui_title_for(&home, &active, None, id)?;
     fs::remove_file(&index)?;
-    check_gui_title(&home, &active, None)?;
+    check_gui_title_for(&home, &active, None, id)?;
     Ok(())
 }
 
