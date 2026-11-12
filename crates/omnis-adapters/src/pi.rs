@@ -875,6 +875,10 @@ impl SelectedPiFile {
             })
         } else {
             self.full_snapshot(session).map(|snapshot| IndexRead {
+                ownership_revision: None,
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
                 native_session: None,
                 rollback_title: crate::RollbackTitle::Unknown,
                 workspace_projection: crate::CodexWorkspaceProjection::Unchecked,

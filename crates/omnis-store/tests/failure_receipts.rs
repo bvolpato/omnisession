@@ -10,7 +10,7 @@ fn revision(file: u128, contents: u128) -> SourceRevision {
     SourceRevision {
         file: Some(Uuid::from_u128(file)),
         contents: Some(Uuid::from_u128(contents)),
-        missing_ancestor: None,
+        ..SourceRevision::default()
     }
 }
 
@@ -20,8 +20,11 @@ fn full(text: &str, rev: SourceRevision) -> TrajectoryDocument<'_> {
         title_is_verified: false,
         local_opener: LocalOpenerEvidence::Unknown,
         database_step_proof: None,
+        database_wal_commits: None,
+        database_summary_revision: None,
         desktop_projection: None,
         legacy_utf8_text: None,
+        projection: None,
         withdrawn_title: None,
         source_revision: rev,
         redacted_text: text,
@@ -103,11 +106,12 @@ impl Fixture {
             .observe_trajectory_document(&self.session)
             .unwrap()
     }
-    fn write(&self, doc: TrajectoryDocument<'_>, guard: TrajectorySourceGuard) -> usize {
+    fn write(&self, doc: TrajectoryDocument<'_>, guard: &TrajectorySourceGuard) -> usize {
         self.index
-            .upsert_observed_trajectory_documents_checked(&[(&self.session, doc, guard)], |_, _| {
-                true
-            })
+            .upsert_observed_trajectory_documents_checked(
+                &[(&self.session, doc, *guard)],
+                |_, _| true,
+            )
             .unwrap()
     }
     fn record(&self, failed: &TrajectoryIndexFailure) {
@@ -132,7 +136,7 @@ fn a_late_failure_or_clear_cannot_replace_the_current_receipt() {
     let first = summary(revision(1, 1));
     let second = summary(revision(1, 2));
     let current = failure(second);
-    f.write(first, f.observe());
+    f.write(first, &f.observe());
     let prior = index.observe_trajectory_document(session).unwrap();
     index
         .record_observed_trajectory_index_failure_checked(
@@ -166,16 +170,16 @@ fn a_late_failure_or_clear_cannot_replace_the_current_receipt() {
             .clear_observed_trajectory_index_failure(session, &obsolete)
             .unwrap();
     }
-    f.write(first, prior);
+    f.write(first, &prior);
     assert_eq!(f.saved(), Some(current));
     let reading = f.observe();
     let concurrent = failure(summary(revision(1, 3)));
     f.record(&concurrent);
     let rejected = index.record_observed_trajectory_index_failure(session, &current, reading);
     assert!(matches!(rejected, Err(StoreError::TrajectorySourceChanged)));
-    f.write(first, reading);
+    f.write(first, &reading);
     assert_eq!(f.saved(), Some(concurrent));
-    f.write(second, f.observe());
+    f.write(second, &f.observe());
     assert_eq!(f.saved(), None);
     let rejected = index.record_observed_trajectory_index_failure(session, &old, prior);
     assert!(matches!(rejected, Err(StoreError::TrajectorySourceChanged)));
@@ -192,9 +196,9 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
         derived_title: Some("Original"),
         ..full("original indexed words", revision(1, 1))
     };
-    assert_eq!(f.write(first, f.observe()), 1);
+    assert_eq!(f.write(first, &f.observe()), 1);
     let old = reader.observe_trajectory_document(session).unwrap();
-    assert_eq!(f.write(preview(first.source_revision), f.observe()), 0);
+    assert_eq!(f.write(preview(first.source_revision), &f.observe()), 0);
     raw.execute_batch(
         "CREATE TRIGGER no_chunk_delete BEFORE DELETE ON session_trajectory_chunk_rows
         BEGIN SELECT RAISE(ABORT, 'unchanged search chunks were rewritten'); END;",
@@ -204,7 +208,7 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
         source_revision: revision(1, 2),
         ..first
     };
-    assert_eq!(f.write(revised, f.observe()), 0);
+    assert_eq!(f.write(revised, &f.observe()), 0);
     let state = f.index.trajectory_index_states().unwrap()[session];
     assert_eq!(state.source_revision, revised.source_revision);
     assert!(state.source_complete);
@@ -221,14 +225,14 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
     assert_eq!(reader.trajectory_index_state(&other).unwrap(), None);
     raw.execute_batch("DROP TRIGGER no_chunk_delete").unwrap();
     let replaced = preview(revision(2, 1));
-    assert_eq!(f.write(replaced, fresh), 1);
+    assert_eq!(f.write(replaced, &fresh), 1);
     assert_eq!(f.index.trajectory_title(session).unwrap(), None);
     let weak = TrajectoryDocument {
         source_revision: SourceRevision::default(),
         document_version: 7,
         ..first
     };
-    assert_eq!(f.write(weak, f.observe()), 0);
+    assert_eq!(f.write(weak, &f.observe()), 0);
     let state = reader.trajectory_index_state(session).unwrap().unwrap();
     assert_eq!(state.source_revision, replaced.source_revision);
     assert!(!state.source_complete);
@@ -236,46 +240,56 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
 
 #[test]
 fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
-    let f = Fixture::new();
-    let path = f.root.path().join("synthetic.sqlite3");
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("synthetic.sqlite3");
+    let session = SessionRef::new(Provider::Antigravity, "sample");
     let legacy = TrajectoryDocument {
         document_version: 4,
+        source_updated_at: DateTime::from_timestamp_millis(1_000_000).unwrap(),
         ..full("historical result", SourceRevision::default())
     };
-    f.index
-        .upsert_trajectory_document(&f.session, &legacy)
-        .unwrap();
     let raw = rusqlite::Connection::open(&path).unwrap();
-    // This historical schema predates physical source IDs and native document ownership.
     raw.execute_batch(
-        "DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
-         DROP TRIGGER clear_replaced_primary_legacy_text;
-         DROP TABLE detached_native_documents; DROP TABLE native_search_document_homes;",
+        "CREATE TABLE session_trajectories (
+            id INTEGER PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT NOT NULL,
+            redacted_text TEXT NOT NULL, source_updated_at INTEGER NOT NULL,
+            source_complete INTEGER NOT NULL, complete INTEGER NOT NULL, indexed_at INTEGER NOT NULL,
+            source_byte_count INTEGER NOT NULL, indexed_byte_count INTEGER NOT NULL,
+            truncation_strategy TEXT NOT NULL, document_version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(provider, session_id)
+        );",
     )
     .unwrap();
-    for column in [
-        "source_file_id",
-        "missing_ancestor_id",
-        "source_contents_id",
-    ] {
-        raw.execute_batch(&format!(
-            "ALTER TABLE session_trajectories DROP COLUMN {column}"
-        ))
-        .unwrap();
-    }
-    let restored = Store::open(path).unwrap();
-    let read = || {
-        restored
-            .trajectory_index_state(&f.session)
-            .unwrap()
-            .unwrap()
+    raw.execute(
+        "INSERT INTO session_trajectories (
+            provider, session_id, redacted_text, source_updated_at, source_complete, complete,
+            indexed_at, source_byte_count, indexed_byte_count, truncation_strategy, document_version
+         ) VALUES (?1, ?2, ?3, ?4, 1, 1, ?4, ?5, ?5, 'none', ?6)",
+        rusqlite::params![
+            session.provider.to_string(),
+            session.id,
+            legacy.redacted_text,
+            legacy.source_updated_at.timestamp_millis(),
+            i64::try_from(legacy.source_byte_count).unwrap(),
+            legacy.document_version,
+        ],
+    )
+    .unwrap();
+    drop(raw);
+    let f = Fixture {
+        index: Store::open(path).unwrap(),
+        root,
+        session,
     };
+    let read = || f.index.trajectory_index_state(&f.session).unwrap().unwrap();
+    assert_eq!(read().source_updated_at, legacy.source_updated_at);
+    assert!(!read().source_time_precise);
     let rev = revision(1, 1);
     let partial = TrajectoryDocument {
         document_version: 7,
         ..preview(rev)
     };
-    assert_eq!(f.write(partial, f.observe()), 0);
+    assert_eq!(f.write(partial, &f.observe()), 0);
     let state = read();
     assert!(state.source_complete);
     assert_eq!(state.source_revision, legacy.source_revision);
@@ -285,7 +299,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 7,
         ..legacy
     };
-    assert_eq!(f.write(upgraded, f.observe()), 0);
+    assert_eq!(f.write(upgraded, &f.observe()), 0);
     assert_eq!(read().document_version, upgraded.document_version);
     assert_eq!(read().source_revision, rev);
     let limited = TrajectoryDocument {
@@ -293,7 +307,7 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 8,
         ..partial
     };
-    assert_eq!(f.write(limited, f.observe()), 1);
+    assert_eq!(f.write(limited, &f.observe()), 1);
     let state = read();
     assert_eq!(state.source_revision, rev);
     assert!(state.provider_limited);
@@ -306,7 +320,7 @@ fn a_verified_preview_retires_an_obsolete_failure_and_keeps_full_text() {
     let current = full("preface middlequartz epilogue", revision(1, 1));
     let observed = preview(current.source_revision);
     let other = failure(full("", revision(1, 2)));
-    assert_eq!(f.write(current, f.observe()), 1);
+    assert_eq!(f.write(current, &f.observe()), 1);
     let same = failure(current);
     let future = TrajectoryIndexFailure {
         document_version: 7,
@@ -314,7 +328,7 @@ fn a_verified_preview_retires_an_obsolete_failure_and_keeps_full_text() {
     };
     for (failed, retain) in [(other, false), (same, true), (future, true)] {
         f.record(&failed);
-        assert_eq!(f.write(observed, f.observe()), 0);
+        assert_eq!(f.write(observed, &f.observe()), 0);
         assert_eq!(f.saved(), retain.then_some(failed));
         f.index
             .clear_observed_trajectory_index_failure(&f.session, &failed)
@@ -461,7 +475,7 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
             ..preview(revision(1, 7))
         };
         assert_eq!(publish(&locator, &other, partial), 0);
-        assert_eq!(f.write(partial, f.observe()), 0);
+        assert_eq!(f.write(partial, &f.observe()), 0);
         assert!(
             f.index
                 .indexed_sessions_in_homes(Some(&other), None)
@@ -575,7 +589,7 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
     locator.title = Some("B renamed".into());
     list(&locator, &b);
     rejected(before_rename);
-    assert_eq!(f.write(full("beta", revision(2, 2)), observe(&b)), 1);
+    assert_eq!(f.write(full("beta", revision(2, 2)), &observe(&b)), 1);
 
     // Direct reads can publish a verified locator and document together when the native home changes.
     assert_eq!(

@@ -33,7 +33,13 @@ pub(super) fn scoped_selection_sql(parameter: usize) -> String {
          WHERE CASE WHEN (picked.value ->> 2) IS NULL THEN
                  native.verified AND scoped.source_home = native.home AND scoped.source_file = catalog.source_file_id
              ELSE scoped.source_home = unhex(picked.value ->> 2)
-                 AND scoped.source_file = unhex(picked.value ->> 3) END"
+                 AND (scoped.source_file = unhex(picked.value ->> 3)
+                     OR ((picked.value ->> 3) IS NULL AND scoped.provider = 'antigravity'
+                         AND native.verified AND scoped.source_home = native.home
+                         AND catalog.source_file_id IS NULL AND catalog.event_count > 0
+                         AND NOT EXISTS (SELECT 1 FROM scoped_native_documents other
+                             WHERE other.provider = scoped.provider AND other.session_id = scoped.session_id
+                               AND other.source_home = scoped.source_home AND other.id <> scoped.id))) END"
     )
 }
 

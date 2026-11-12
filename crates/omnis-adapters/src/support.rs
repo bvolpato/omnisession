@@ -1,5 +1,7 @@
+mod json_tail;
+
 use std::{
-    cell::OnceCell,
+    cell::{Cell, OnceCell},
     collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
@@ -26,17 +28,20 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const MAX_PROVIDER_RECORDS: usize = 100_000;
-pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
-pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_RECORDS: usize = 100_000;
+pub(crate) const MAX_PREVIEW_EDGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = MAX_PREVIEW_EDGE_BYTES as u64;
+/// Maximum bytes in a full transcript read.
+pub const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_PREVIEW_VALIDATION_BYTES: u64 = 2 * MAX_STREAMED_TRANSCRIPT_LINE_SIZE;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
-pub(super) const MAX_DISCOVERED_FILES: usize = 10_000;
-pub(super) const MAX_DISCOVERY_ENTRIES: usize = 200_000;
+pub(crate) const MAX_DISCOVERED_FILES: usize = 10_000;
+pub(crate) const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 // Snapshots copy the database and WAL to private temporary storage, so this bounds disk use, not
 // memory. It matches the streamed transcript budget. `OMNI_SNAPSHOT_MAX_BYTES` overrides it.
@@ -60,10 +65,18 @@ pub(crate) fn discovery_home(root: Option<&Path>) -> io::Result<Option<PathBuf>>
         .transpose()
 }
 
+fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+    if !resolved.metadata()?.is_dir() {
+        return Err(ErrorKind::NotADirectory.into());
+    }
+    Ok(resolved)
+}
+
 fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<PathBuf> {
     let mut ancestor = path;
     let mut resolved = loop {
-        match ancestor.canonicalize() {
+        match canonical_directory(ancestor) {
             Ok(physical) => break physical,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 ancestor = ancestor.parent().ok_or(error)?;
@@ -74,7 +87,7 @@ fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<P
     // A missing target can leave a readable symlink anywhere below the last existing ancestor.
     for component in path.strip_prefix(ancestor).unwrap().components() {
         let child = resolved.join(component);
-        match child.canonicalize() {
+        match canonical_directory(&child) {
             Ok(physical) => resolved = physical,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if component == std::path::Component::ParentDir {
@@ -522,7 +535,7 @@ struct SnapshotLimits {
 impl SnapshotLimits {
     fn from_environment() -> Result<Self> {
         Ok(Self {
-            max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
+            max_bytes: sqlite_snapshot_byte_limit()?,
             free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
         })
     }
@@ -547,7 +560,26 @@ impl SnapshotFileStamp {
         self.modified.into()
     }
 
-    pub(super) fn read(path: &Path) -> io::Result<Self> {
+    pub(crate) fn revision(&self, namespace: Uuid) -> Uuid {
+        let modified = DateTime::<Utc>::from(self.modified);
+        let mut hash = Sha256::new();
+        hash.update(self.len.to_le_bytes());
+        hash.update(modified.timestamp().to_le_bytes());
+        hash.update(modified.timestamp_subsec_nanos().to_le_bytes());
+        if let Some(created) = self.created.map(DateTime::<Utc>::from) {
+            hash.update(created.timestamp().to_le_bytes());
+            hash.update(created.timestamp_subsec_nanos().to_le_bytes());
+        }
+        if let Some((device, inode, seconds, nanos)) = self.unix_identity {
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+            hash.update(nanos.to_le_bytes());
+        }
+        Uuid::new_v5(&namespace, &hash.finalize())
+    }
+
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
         Self::from_metadata(&path.metadata()?)
     }
 
@@ -1002,6 +1034,10 @@ impl SqliteSnapshotCache {
 }
 
 /// Parses the snapshot bound setting. An invalid value fails closed instead of falling back.
+pub(super) fn sqlite_snapshot_byte_limit() -> Result<u64> {
+    snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())
+}
+
 fn snapshot_max_bytes(value: Option<&OsStr>) -> Result<u64> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES);
@@ -1233,41 +1269,184 @@ impl std::fmt::Display for IncompleteTranscript {
 
 impl std::error::Error for IncompleteTranscript {}
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum JsonLineTail {
-    SkipMalformed,
-    RequireComplete,
+#[derive(Debug, Default)]
+pub(crate) struct JsonLineDamage {
+    skipped: Cell<bool>,
+    prefix_end: Cell<u64>,
+    interior: Cell<usize>,
+    last_offset: Cell<Option<u64>>,
+    final_record: Cell<bool>,
 }
 
-impl JsonLineTail {
-    fn parse(self, line: &[u8], at_end: bool) -> Result<Option<Value>> {
-        let json = if self.checked_end(at_end) {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            line.strip_suffix(b"\r").unwrap_or(line)
-        } else {
-            line
-        };
-        match serde_json::from_slice(json) {
-            Ok(value) => Ok(Some(value)),
-            Err(error)
-                if self.checked_end(at_end)
-                    && (error.is_eof() || !line.ends_with(b"\n"))
-                    && !line.iter().all(u8::is_ascii_whitespace) =>
-            {
-                Err(IncompleteTranscript.into())
+impl JsonLineDamage {
+    pub(crate) fn confirm_prefix(&self, end: u64) {
+        if self.verified_prefix_end().is_none() {
+            self.prefix_end.set(end);
+        }
+    }
+
+    pub(crate) fn verified_prefix_end(&self) -> Option<u64> {
+        (self.count() > 0 || self.skipped.get()).then(|| self.prefix_end.get())
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.interior.get() + usize::from(self.final_record.get())
+    }
+
+    pub(crate) fn interior_count(&self) -> usize {
+        self.interior.get()
+    }
+
+    pub(crate) fn final_record(&self) -> bool {
+        self.final_record.get()
+    }
+
+    fn record_interior(&self, offset: u64) {
+        // The prefix and suffix can visit the same malformed line twice.
+        if self
+            .last_offset
+            .get()
+            .is_none_or(|previous| offset > previous)
+        {
+            self.last_offset.set(Some(offset));
+            self.interior.set(self.interior.get() + 1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum JsonLineTail<'a> {
+    SkipMalformed,
+    RequireComplete,
+    ReportIncomplete(&'a JsonLineDamage),
+    RequireCompleteTail(&'a JsonLineDamage),
+}
+
+impl<'a> JsonLineTail<'a> {
+    fn record_end(self, reader: &mut (impl Read + Seek), length: u64, budget: u64) -> Result<u64> {
+        if matches!(self, Self::SkipMalformed) {
+            return Ok(length);
+        }
+        let mut position = length;
+        let mut line_end = length;
+        let lower_bound = length.saturating_sub(budget);
+        let mut buffer = [0; 8192];
+        while position > lower_bound {
+            let start = position
+                .saturating_sub(buffer.len() as u64)
+                .max(lower_bound);
+            let chunk = &mut buffer[..usize::try_from(position - start)?];
+            reader.seek(SeekFrom::Start(start))?;
+            reader.read_exact(chunk)?;
+            for (index, &byte) in chunk.iter().enumerate().rev() {
+                if !byte.is_ascii_whitespace() {
+                    return Ok(line_end);
+                }
+                if byte == b'\n' {
+                    line_end = start + index as u64 + 1;
+                }
             }
+            position = start;
+        }
+        if lower_bound > 0 {
+            self.incomplete()?;
+            return Ok(length);
+        }
+        Ok(0)
+    }
+
+    fn incomplete(self) -> Result<()> {
+        match self {
+            Self::ReportIncomplete(damage) => damage.final_record.set(true),
+            Self::RequireCompleteTail(damage) if damage.interior_count() > 0 => {
+                damage.final_record.set(true);
+            }
+            _ => return Err(IncompleteTranscript.into()),
+        }
+        Ok(())
+    }
+
+    fn parse(self, line: &[u8], offset: u64, at_end: bool) -> Result<Option<Value>> {
+        match serde_json::from_slice(line) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if self.checked_end(at_end) && !line.iter().all(u8::is_ascii_whitespace) => {
+                self.incomplete().map(|()| None)
+            }
+            Err(_) if !line.iter().all(u8::is_ascii_whitespace) => match self {
+                Self::RequireComplete => Err(IncompleteTranscript.into()),
+                Self::RequireCompleteTail(damage) | Self::ReportIncomplete(damage) => {
+                    damage.record_interior(offset);
+                    Ok(None)
+                }
+                Self::SkipMalformed => Ok(None),
+            },
             Err(_) => Ok(None),
         }
     }
 
-    fn checked_end(self, at_end: bool) -> bool {
-        at_end && matches!(self, Self::RequireComplete)
+    pub(crate) fn damage(self) -> Option<&'a JsonLineDamage> {
+        match self {
+            Self::RequireCompleteTail(damage) | Self::ReportIncomplete(damage) => Some(damage),
+            _ => None,
+        }
     }
 
-    fn check_skipped_end(self, terminated: bool) -> Result<()> {
-        if !terminated && matches!(self, Self::RequireComplete) {
-            return Err(IncompleteTranscript.into());
+    fn checked_end(self, at_end: bool) -> bool {
+        at_end && !matches!(self, Self::SkipMalformed)
+    }
+
+    fn check_skipped_end(
+        self,
+        reader: &mut (impl Read + Seek),
+        at_end: bool,
+        bytes: u64,
+        budget: u64,
+    ) -> Result<bool> {
+        if self.checked_end(at_end) {
+            if bytes > budget {
+                self.incomplete()?;
+                return Ok(false);
+            }
+            let end = reader.stream_position()?;
+            reader.seek(SeekFrom::Start(end - bytes))?;
+            let valid = json_tail::valid_record(reader.take(bytes))?;
+            reader.seek(SeekFrom::Start(end))?;
+            if !valid {
+                self.incomplete()?;
+                return Ok(false);
+            }
         }
+        Ok(true)
+    }
+
+    fn check_final_fragment(self, file: &mut File, end: u64, budget: u64) -> Result<()> {
+        let mut position = end.saturating_sub(1);
+        let lower = end.saturating_sub(budget);
+        let mut buffer = [0; 8192];
+        loop {
+            let start = position.saturating_sub(buffer.len() as u64).max(lower);
+            file.seek(SeekFrom::Start(start))?;
+            let chunk = &mut buffer[..usize::try_from(position - start)?];
+            file.read_exact(chunk)?;
+            if let Some(index) = memchr::memrchr(b'\n', chunk) {
+                position = start + index as u64 + 1;
+                break;
+            }
+            position = start;
+            if start == lower {
+                if lower != 0 {
+                    file.seek(SeekFrom::Start(lower - 1))?;
+                    let mut previous = [0];
+                    file.read_exact(&mut previous)?;
+                    if previous[0] != b'\n' {
+                        return self.incomplete();
+                    }
+                }
+                break;
+            }
+        }
+        file.seek(SeekFrom::Start(end))?;
+        self.check_skipped_end(file, true, end - position, budget)?;
         Ok(())
     }
 }
@@ -1281,7 +1460,6 @@ pub(crate) struct JsonLinesLimits {
     pub(crate) file_bytes: u64,
     pub(crate) records: usize,
     pub(crate) line_bytes: u64,
-    pub(crate) tail: JsonLineTail,
 }
 
 impl JsonLinesLimits {
@@ -1290,18 +1468,8 @@ impl JsonLinesLimits {
             file_bytes,
             records: MAX_PROVIDER_RECORDS,
             line_bytes: MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-            tail: JsonLineTail::SkipMalformed,
         }
     }
-}
-
-/// Streams transcript records and returns how many oversized records were skipped.
-pub(crate) fn visit_json_lines(
-    path: &Path,
-    file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
-) -> Result<usize> {
-    visit_json_lines_with_tail(path, file_limit, JsonLineTail::SkipMalformed, visit)
 }
 
 pub(crate) fn visit_json_lines_with_omissions(
@@ -1309,45 +1477,93 @@ pub(crate) fn visit_json_lines_with_omissions(
     file_limit: u64,
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<JsonLineSkips> {
-    visit_json_lines_with_offsets_and_limits(
-        &mut BufReader::new(File::open(path)?),
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "provider path is not a file");
+    if metadata.len() > file_limit {
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
+    }
+    visit_json_reader(
+        &mut BufReader::new(file),
         JsonLinesLimits::streamed(file_limit),
-        |_, record| visit(record),
+        |_, _| WorkspaceGap::Other,
+        |_, record, _| visit(record),
     )
+    .map(|(omissions, _)| omissions)
 }
 
 pub(crate) fn visit_json_lines_with_tail(
     path: &Path,
     file_limit: u64,
-    tail: JsonLineTail,
+    tail: JsonLineTail<'_>,
     visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
-    let limits = JsonLinesLimits {
-        tail,
-        ..JsonLinesLimits::streamed(file_limit)
-    };
-    visit_json_lines_with_limits(path, limits, visit)
+    visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), tail, visit)
 }
 
-/// Byte location of one complete JSON value in a bounded JSONL transcript.
+/// Byte location of one physical line in a bounded JSONL transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JsonLineLocation {
     pub(crate) offset: u64,
     pub(crate) length: u64,
+    /// Whether the buffered bytes include the terminator. An oversized line can expose only its prefix.
+    pub(crate) terminated: bool,
 }
 
 /// Visits records from an already-open transcript and reports their source locations.
 ///
 /// The caller can seek within the same file handle to reread only selected records after it has
 /// collected compact index metadata. The regular file, file-size, record-count, and line-size
-/// limits match `visit_json_lines`.
+/// limits match `visit_json_lines_with_tail`.
 pub(crate) fn visit_json_lines_with_offsets(
     reader: &mut BufReader<File>,
     file_limit: u64,
-    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
-        .map(|skips| skips.oversized)
+    visit_json_lines_with_offsets_and_limits(
+        reader,
+        JsonLinesLimits::streamed(file_limit),
+        JsonLineTail::SkipMalformed,
+        |loc, record, _| visit(loc, record),
+    )
+    .map(|skips| skips.oversized)
+}
+
+/// Reports nonblank lines and their source positions. The caller bounds the state it retains.
+pub(crate) fn visit_streamed_json_records_with_offsets(
+    reader: &mut BufReader<File>,
+    file_limit: u64,
+    mut visit: impl FnMut(JsonLineLocation, JsonlRecord) -> Result<()>,
+) -> Result<usize> {
+    let limits = JsonLinesLimits {
+        records: usize::MAX,
+        ..JsonLinesLimits::streamed(file_limit)
+    };
+    let metadata = reader.get_ref().metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    if metadata.len() > file_limit {
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
+    }
+    reader.rewind()?;
+    let mut oversized = 0;
+    let consumed = visit_bounded_lines(reader, limits, |location, line| {
+        if let Some(record) = line.into_record() {
+            visit(location, record)?;
+        } else {
+            oversized += 1;
+        }
+        Ok(())
+    })?;
+    if consumed < metadata.len() {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "provider transcript changed during the read",
+        )
+        .into());
+    }
+    Ok(oversized)
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -1375,6 +1591,139 @@ pub(crate) fn read_json_line_at(
     serde_json::from_slice(line).context("provider record changed while rereading transcript")
 }
 
+pub(crate) enum JsonLine<'a> {
+    Record(Value),
+    Unterminated(Value),
+    Malformed(&'a [u8]),
+    Oversized(&'a [u8], JsonLineLocation),
+}
+
+/// A decoded nonblank line. Malformed lines carry no source bytes.
+pub(crate) enum JsonlRecord {
+    Complete(Value),
+    Unterminated(Value),
+    Malformed,
+}
+
+impl<'a> JsonLine<'a> {
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        match serde_json::from_slice(bytes) {
+            Ok(value) if bytes.ends_with(b"\n") => Some(Self::Record(value)),
+            Ok(value) => Some(Self::Unterminated(value)),
+            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => None,
+            Err(_) => Some(Self::Malformed(bytes)),
+        }
+    }
+
+    pub(crate) fn into_record(self) -> Option<JsonlRecord> {
+        match self {
+            Self::Record(value) => Some(JsonlRecord::Complete(value)),
+            Self::Unterminated(value) => Some(JsonlRecord::Unterminated(value)),
+            Self::Malformed(_) => Some(JsonlRecord::Malformed),
+            Self::Oversized(..) => None,
+        }
+    }
+}
+
+/// Folds records from an open file so callers can verify the identity of the source they read.
+pub(crate) fn visit_streamed_json_file(
+    file: File,
+    file_limit: u64,
+    tail: JsonLineTail<'_>,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        JsonLinesLimits {
+            records: usize::MAX,
+            ..JsonLinesLimits::streamed(file_limit)
+        },
+        tail,
+        |_, record, _| visit(record),
+    )
+    .map(|skips| skips.oversized)
+}
+
+/// Reads up to the previous searchable prefix and the newest complete records inside the file budget.
+pub(crate) fn visit_limited_search_edges(
+    mut file: File,
+    previous_text_bytes: Option<usize>,
+    sample_records: usize,
+    tail: JsonLineTail<'_>,
+    mut visit: impl FnMut(Value) -> usize,
+) -> Result<()> {
+    let physical_length = file.metadata()?.len();
+    let length = tail.record_end(&mut file, physical_length, MAX_PREVIEW_TAIL_SIZE)?;
+    if length == 0 {
+        return Ok(());
+    }
+    file.rewind()?;
+    let (prefix_limit, record_limit) = if previous_text_bytes.is_some() {
+        (
+            MAX_STREAMED_TRANSCRIPT_FILE_SIZE - MAX_PREVIEW_TAIL_SIZE - 1,
+            MAX_PROVIDER_RECORDS,
+        )
+    } else {
+        (MAX_PREVIEW_TAIL_SIZE, sample_records)
+    };
+    let mut prefix = BufReader::new((&mut file).take(prefix_limit.min(length)));
+    let mut consumed = 0u64;
+    let mut line = Vec::new();
+    for _ in 0..record_limit {
+        let Some((kind, bytes)) =
+            read_bounded_line(&mut prefix, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, &mut line)?
+        else {
+            break;
+        };
+        consumed += bytes;
+        if (!matches!(kind, BoundedLine::Complete) || !line.ends_with(b"\n"))
+            && let Some(damage) = tail.damage()
+        {
+            damage.skipped.set(true);
+        }
+        if matches!(kind, BoundedLine::Complete)
+            && line.ends_with(b"\n")
+            && let Some(record) = tail.parse(&line, consumed, false)?
+        {
+            let observed = visit(record);
+            if previous_text_bytes.is_some_and(|bytes| observed >= bytes) {
+                break;
+            }
+        }
+    }
+
+    let start = length.saturating_sub(MAX_PREVIEW_TAIL_SIZE).max(consumed);
+    let aligned = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(aligned))?;
+    let mut suffix = BufReader::new(file.take(length - aligned));
+    let mut offset = aligned + suffix.skip_until(b'\n')? as u64;
+    if offset > consumed
+        && let Some(damage) = tail.damage()
+    {
+        damage.skipped.set(true);
+    }
+    if offset == length {
+        let mut file = suffix.into_inner().into_inner();
+        return tail.check_final_fragment(&mut file, length, MAX_PREVIEW_TAIL_SIZE);
+    }
+    while let Some((kind, bytes)) =
+        read_bounded_line(&mut suffix, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, &mut line)?
+    {
+        offset += bytes;
+        if matches!(kind, BoundedLine::Oversized)
+            && let Some(damage) = tail.damage()
+        {
+            damage.skipped.set(true);
+        }
+        if matches!(kind, BoundedLine::Complete)
+            && let Some(record) = tail.parse(&line, offset, offset == length)?
+        {
+            visit(record);
+        }
+    }
+    Ok(())
+}
+
 /// Visible text for a user turn made only of images, so the turn stays in history.
 pub(crate) fn omitted_images_text(count: usize) -> String {
     if count == 1 {
@@ -1384,22 +1733,46 @@ pub(crate) fn omitted_images_text(count: usize) -> String {
     }
 }
 
+pub(crate) fn visit_json_lines_with_gaps(
+    path: &Path,
+    file_limit: u64,
+    mut visit: impl FnMut(Value, bool) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    let mut previous = 0;
+    let file = File::open(path)?;
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        JsonLinesLimits::streamed(file_limit),
+        JsonLineTail::SkipMalformed,
+        |_, record, skips| {
+            let gap = skips.total() > previous;
+            previous = skips.total();
+            visit(record, gap)
+        },
+    )
+}
+
 fn visit_json_lines_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
+    tail: JsonLineTail<'_>,
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
-        visit(record)
-    })
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        limits,
+        tail,
+        |_, record, _| visit(record),
+    )
     .map(|skips| skips.oversized)
 }
 
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    tail: JsonLineTail<'_>,
+    mut visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() {
@@ -1408,14 +1781,71 @@ fn visit_json_lines_with_offsets_and_limits(
     if metadata.len() > limits.file_bytes {
         return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
     }
+    let end = tail.record_end(reader, metadata.len(), limits.file_bytes)?;
     reader.seek(SeekFrom::Start(0))?;
-    visit_json_reader(
-        reader,
-        limits,
-        |_, _| WorkspaceGap::Other,
-        |location, record, _| visit(location, record),
-    )
-    .map(|(omissions, _)| omissions)
+    let mut line = Vec::new();
+    let mut records = 0_usize;
+    let mut omissions = JsonLineSkips::default();
+    let mut offset = 0_u64;
+    loop {
+        if end < metadata.len() && offset == end {
+            break;
+        }
+        if records >= limits.records {
+            if !reader.fill_buf()?.is_empty() {
+                return Err(TranscriptReadLimit("provider file exceeds safe record limit").into());
+            }
+            break;
+        }
+        let line_offset = offset;
+        let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
+        let Some((line_kind, read)) = read_bounded_line_with_budget(
+            reader,
+            limits.line_bytes,
+            remaining_file_bytes,
+            &mut line,
+        )?
+        else {
+            break;
+        };
+        records += 1;
+        offset = offset
+            .checked_add(read)
+            .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+        match line_kind {
+            BoundedLine::Oversized => {
+                if let Some(damage) = tail.damage() {
+                    damage.skipped.set(true);
+                }
+                if tail.check_skipped_end(reader, offset == end, read, limits.file_bytes)? {
+                    omissions.observe(WorkspaceGap::Other, true);
+                }
+            }
+            BoundedLine::Complete => {
+                if let Some(record) = tail.parse(&line, offset, offset == end)? {
+                    visit(
+                        JsonLineLocation {
+                            offset: line_offset,
+                            length: read,
+                            terminated: line.ends_with(b"\n"),
+                        },
+                        record,
+                        omissions,
+                    )?;
+                } else if !line.iter().all(u8::is_ascii_whitespace) {
+                    omissions.observe(WorkspaceGap::Other, false);
+                }
+            }
+        }
+    }
+    if offset < end {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "provider transcript changed during the read",
+        )
+        .into());
+    }
+    Ok(omissions)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1463,15 +1893,13 @@ impl JsonLineSkips {
     fn parse(
         &mut self,
         line: &[u8],
-        tail: JsonLineTail,
-        at_end: bool,
         classify: &impl Fn(&[u8], bool) -> WorkspaceGap,
-    ) -> Result<Option<Value>> {
-        let record = tail.parse(line, at_end)?;
+    ) -> Option<Value> {
+        let record = serde_json::from_slice(line).ok();
         if record.is_none() && !line.iter().all(u8::is_ascii_whitespace) {
             self.observe(classify(line, false), false);
         }
-        Ok(record)
+        record
     }
 }
 
@@ -1480,18 +1908,55 @@ pub(crate) fn visit_json_reader(
     reader: &mut impl BufRead,
     limits: JsonLinesLimits,
     match_malformed: impl Fn(&[u8], bool) -> WorkspaceGap,
+    visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
+) -> Result<(JsonLineSkips, u64)> {
+    visit_json_reader_with_locations(
+        reader,
+        limits,
+        |_, line, oversized| Ok(match_malformed(line, oversized)),
+        visit,
+    )
+}
+
+/// Supplies the physical source range when an unreadable record needs further inspection.
+pub(crate) fn visit_json_reader_with_locations(
+    reader: &mut impl BufRead,
+    limits: JsonLinesLimits,
+    match_malformed: impl Fn(JsonLineLocation, &[u8], bool) -> Result<WorkspaceGap>,
     mut visit: impl FnMut(JsonLineLocation, Value, JsonLineSkips) -> Result<()>,
 ) -> Result<(JsonLineSkips, u64)> {
+    let mut omissions = JsonLineSkips::default();
+    let consumed = visit_bounded_lines(reader, limits, |location, line| {
+        match line {
+            JsonLine::Record(value) | JsonLine::Unterminated(value) => {
+                visit(location, value, omissions)?;
+            }
+            JsonLine::Malformed(bytes) => {
+                omissions.observe(match_malformed(location, bytes, false)?, false);
+            }
+            JsonLine::Oversized(bytes, _) => {
+                omissions.observe(match_malformed(location, bytes, true)?, true);
+            }
+        }
+        Ok(())
+    })?;
+    Ok((omissions, consumed))
+}
+
+fn visit_bounded_lines(
+    reader: &mut impl BufRead,
+    limits: JsonLinesLimits,
+    mut visit: impl FnMut(JsonLineLocation, JsonLine<'_>) -> Result<()>,
+) -> Result<u64> {
     let mut line = Vec::new();
     let mut records = 0_usize;
-    let mut omissions = JsonLineSkips::default();
     let mut offset = 0_u64;
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
                 return Err(TranscriptReadLimit("provider file exceeds safe record limit").into());
             }
-            return Ok((omissions, offset));
+            return Ok(offset);
         }
         let line_offset = offset;
         let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
@@ -1502,31 +1967,22 @@ pub(crate) fn visit_json_reader(
             &mut line,
         )?
         else {
-            return Ok((omissions, offset));
+            return Ok(offset);
         };
         records += 1;
         offset = offset
             .checked_add(read)
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+        let location = JsonLineLocation {
+            offset: line_offset,
+            length: read,
+            terminated: line.ends_with(b"\n"),
+        };
         match line_kind {
-            BoundedLine::Oversized { terminated } => {
-                limits.tail.check_skipped_end(terminated)?;
-                omissions.observe(match_malformed(&line, true), true);
-            }
+            BoundedLine::Oversized => visit(location, JsonLine::Oversized(&line, location))?,
             BoundedLine::Complete => {
-                let at_end = matches!(limits.tail, JsonLineTail::RequireComplete)
-                    && reader.fill_buf()?.is_empty();
-                if let Some(record) =
-                    omissions.parse(&line, limits.tail, at_end, &match_malformed)?
-                {
-                    visit(
-                        JsonLineLocation {
-                            offset: line_offset,
-                            length: read,
-                        },
-                        record,
-                        omissions,
-                    )?;
+                if let Some(record) = JsonLine::parse(&line) {
+                    visit(location, record)?;
                 }
             }
         }
@@ -1604,7 +2060,7 @@ fn visit_index_json_lines_with_limits(
     let mut line = Vec::new();
     while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
         match line_kind {
-            BoundedLine::Oversized { .. } => {
+            BoundedLine::Oversized => {
                 scan.oversized_records += 1;
                 visit(None);
             }
@@ -1623,7 +2079,7 @@ fn visit_index_json_lines_with_limits(
 
 pub(crate) enum BoundedLine {
     Complete,
-    Oversized { terminated: bool },
+    Oversized,
 }
 
 /// Reads one line into `line` and returns its kind and consumed bytes, or `None` at the end.
@@ -1665,42 +2121,23 @@ pub(crate) fn read_bounded_line_with_budget(
     if read <= line_limit {
         return Ok(Some((BoundedLine::Complete, read)));
     }
-    let (rest, terminated) = if line.ends_with(b"\n") {
-        (0, true)
+    let rest = if line.last() == Some(&b'\n') {
+        0
     } else {
-        let remaining = file_budget - read;
-        let (rest, terminated) =
-            skip_line_tail(&mut reader.by_ref().take(remaining.saturating_add(1)))?;
+        let remaining = file_budget.saturating_sub(read);
+        let rest = reader
+            .by_ref()
+            .take(remaining.saturating_add(1))
+            .skip_until(b'\n')? as u64;
         if rest > remaining {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "provider file exceeds safe streaming limit",
             ));
         }
-        (rest, terminated)
+        rest
     };
-    Ok(Some((BoundedLine::Oversized { terminated }, read + rest)))
-}
-
-/// Discards the rest of a line and reports whether it ended with a newline.
-fn skip_line_tail(reader: &mut impl BufRead) -> io::Result<(u64, bool)> {
-    let mut consumed = 0;
-    loop {
-        let chunk = match reader.fill_buf() {
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if chunk.is_empty() {
-            return Ok((consumed, false));
-        }
-        let newline = memchr::memchr(b'\n', chunk);
-        let bytes = newline.map_or(chunk.len(), |offset| offset + 1);
-        reader.consume(bytes);
-        consumed += bytes as u64;
-        if newline.is_some() {
-            return Ok((consumed, true));
-        }
-    }
+    Ok(Some((BoundedLine::Oversized, read.saturating_add(rest))))
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
@@ -1710,7 +2147,6 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
         limit,
         u64::MAX,
         MAX_TRANSCRIPT_LINE_SIZE,
-        JsonLineTail::SkipMalformed,
         &mut preview,
         &|_, _| WorkspaceGap::Other,
     )?;
@@ -1718,23 +2154,42 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
-    json_lines_preview_with_tail(path, sample_records, JsonLineTail::SkipMalformed)
+    Ok(json_lines_preview_file_with_suffix(&mut File::open(path)?, sample_records)?.0)
 }
 
-pub(crate) fn json_lines_preview_with_tail(
+/// Visits lines in the bounded suffix and returns its first physical line offset.
+pub(crate) fn visit_json_lines_tail(
     path: &Path,
-    sample_records: usize,
-    tail: JsonLineTail,
-) -> Result<Vec<Value>> {
-    Ok(read_preview(
-        &mut File::open(path)?,
-        sample_records,
-        u64::MAX,
-        MAX_TRANSCRIPT_LINE_SIZE,
-        tail,
-        &|_, _| WorkspaceGap::Other,
-    )?
-    .records)
+    line_limit: u64,
+    mut include: impl FnMut(&[u8]) -> bool,
+    mut visit: impl FnMut(u64, JsonLine<'_>),
+) -> Result<u64> {
+    let mut file = File::open(path)?;
+    let (mut reader, mut offset) = jsonl_tail_reader(&mut file, MAX_PREVIEW_TAIL_SIZE)?;
+    let first_offset = offset;
+    let mut line = Vec::new();
+    loop {
+        let line_offset = offset;
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        offset += u64::try_from(read)?;
+        if read as u64 > line_limit {
+            let location = JsonLineLocation {
+                offset: line_offset,
+                length: read as u64,
+                terminated: line.ends_with(b"\n"),
+            };
+            visit(line_offset, JsonLine::Oversized(&line, location));
+        } else if include(&line)
+            && let Some(record) = JsonLine::parse(&line)
+        {
+            visit(line_offset, record);
+        }
+    }
+    Ok(first_offset)
 }
 
 /// Samples an open file and counts consecutive decoded records at EOF.
@@ -1747,7 +2202,6 @@ pub(crate) fn json_lines_preview_file_with_suffix(
         sample_records,
         u64::MAX,
         MAX_TRANSCRIPT_LINE_SIZE,
-        JsonLineTail::SkipMalformed,
         &|_, _| WorkspaceGap::Other,
     )?;
     Ok((preview.records, preview.suffix_len))
@@ -1772,6 +2226,7 @@ fn jsonl_tail_reader(file: &mut File, byte_limit: u64) -> Result<(impl BufRead +
 
 #[derive(Default)]
 pub(crate) struct JsonLinesPreview {
+    pub(crate) gap_before: std::collections::BTreeSet<usize>,
     pub(crate) records: Vec<Value>,
     pub(crate) omissions: JsonLineSkips,
     pub(crate) sampled: bool,
@@ -1792,7 +2247,6 @@ pub(crate) fn json_lines_preview_with_omissions(
         sample_records,
         prefix_bytes,
         line_bytes,
-        JsonLineTail::SkipMalformed,
         &match_malformed,
     )
 }
@@ -1802,7 +2256,6 @@ fn read_preview(
     sample_records: usize,
     prefix_bytes: u64,
     line_bytes: u64,
-    tail: JsonLineTail,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<JsonLinesPreview> {
     let metadata = file.metadata()?;
@@ -1821,15 +2274,15 @@ fn read_preview(
         limit,
         prefix_bytes,
         line_bytes,
-        tail,
         &mut preview,
         match_malformed,
     )?;
     if prefix_end == metadata.len() {
         return Ok(preview);
     }
-    if small && prefix_bytes < metadata.len() {
+    if small && metadata.len() > prefix_bytes {
         preview.sampled = true;
+        preview.suffix_len = 0;
         return Ok(preview);
     }
     if small {
@@ -1841,7 +2294,6 @@ fn read_preview(
             sample_records,
             prefix_bytes,
             line_bytes,
-            tail,
             &mut preview,
             match_malformed,
         )?;
@@ -1851,7 +2303,6 @@ fn read_preview(
         sample_records,
         prefix_end,
         line_bytes,
-        tail,
         &mut preview,
         match_malformed,
     )?;
@@ -1868,7 +2319,6 @@ fn json_lines_tail_with_offsets(file: &mut File, limit: usize) -> Result<Vec<(u6
         limit,
         0,
         MAX_TRANSCRIPT_LINE_SIZE,
-        JsonLineTail::SkipMalformed,
         &mut JsonLinesPreview::default(),
         &|_, _| WorkspaceGap::Other,
     )
@@ -1879,7 +2329,6 @@ fn read_json_lines_tail(
     limit: usize,
     prefix_end: u64,
     line_bytes: u64,
-    tail: JsonLineTail,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<Vec<(u64, Value)>> {
@@ -1905,12 +2354,11 @@ fn read_json_lines_tail(
     let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
     let mut offset = start;
     if partial_first_line {
-        let (bytes, terminated) = skip_line_tail(&mut reader)?;
-        offset += bytes;
-        tail.check_skipped_end(terminated)?;
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
     let mut verified_tail_records = 0;
+    let mut previous = preview.omissions.total();
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1921,18 +2369,13 @@ fn read_json_lines_tail(
         }
         offset += u64::try_from(read)?;
         if read as u64 > line_bytes {
-            tail.check_skipped_end(line.ends_with(b"\n"))?;
             preview.suffix_len = 0;
             preview
                 .omissions
                 .observe(match_malformed(&line, true), true);
             continue;
         }
-        if let Some(record) =
-            preview
-                .omissions
-                .parse(&line, tail, offset == metadata.len(), match_malformed)?
-        {
+        if let Some(record) = preview.omissions.parse(&line, match_malformed) {
             preview.suffix_len += 1;
             if limit == 0 {
                 preview.suffix_len = 0;
@@ -1947,7 +2390,8 @@ fn read_json_lines_tail(
             if !preview.sampled && preview.omissions.total() == 0 {
                 verified_tail_records += 1;
             }
-            records.push_back((line_offset, record));
+            records.push_back((line_offset, record, preview.omissions.total() > previous));
+            previous = preview.omissions.total();
         } else {
             preview.suffix_len = 0;
         }
@@ -1955,7 +2399,17 @@ fn read_json_lines_tail(
     if !preview.sampled {
         preview.prefix_records += verified_tail_records;
     }
-    Ok(records.into_iter().collect())
+    let records = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, record, gap))| {
+            if gap || (index == 0 && preview.sampled) {
+                preview.gap_before.insert(preview.records.len() + index);
+            }
+            (offset, record)
+        })
+        .collect();
+    Ok(records)
 }
 
 /// Reads up to `limit` leading lines and returns the end of the observed prefix.
@@ -1964,7 +2418,6 @@ fn read_json_lines_prefix(
     limit: usize,
     byte_limit: u64,
     line_bytes: u64,
-    tail: JsonLineTail,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8], bool) -> WorkspaceGap,
 ) -> Result<u64> {
@@ -1981,30 +2434,21 @@ fn read_json_lines_prefix(
             break;
         };
         let end = consumed + read;
-        let terminated = match line_kind {
-            BoundedLine::Complete => line.ends_with(b"\n"),
-            BoundedLine::Oversized { terminated } => terminated,
-        };
-        if end == byte_limit && end < metadata.len() && !terminated {
+        if end == byte_limit && end < metadata.len() && !line.ends_with(b"\n") {
             // The edge stops inside a record. The tail can still read that record in full.
             break;
         }
         consumed = end;
+        let previous = preview.omissions.total();
         match line_kind {
-            BoundedLine::Oversized { terminated } => {
-                tail.check_skipped_end(terminated)?;
+            BoundedLine::Oversized => {
                 preview.suffix_len = 0;
                 preview
                     .omissions
                     .observe(match_malformed(&line, true), true);
             }
             BoundedLine::Complete => {
-                if let Some(record) = preview.omissions.parse(
-                    &line,
-                    tail,
-                    consumed == metadata.len(),
-                    match_malformed,
-                )? {
+                if let Some(record) = preview.omissions.parse(&line, match_malformed) {
                     if preview.omissions.total() == 0 {
                         preview.prefix_records += 1;
                     }
@@ -2015,8 +2459,249 @@ fn read_json_lines_prefix(
                 }
             }
         }
+        if preview.omissions.total() > previous {
+            preview.gap_before.insert(preview.records.len());
+        }
     }
     Ok(consumed)
+}
+
+/// Collects the physical records when the whole file fits the small-preview budgets.
+pub(crate) fn complete_small_json_records(path: &Path) -> Result<Option<Vec<JsonlRecord>>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    let len = metadata.len();
+    if len > MAX_PREVIEW_TAIL_SIZE {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new((&file).take(len));
+    let mut records = Vec::new();
+    let mut consumed = 0;
+    let mut line = Vec::new();
+    for _ in 0..MAX_PROVIDER_RECORDS {
+        let Some((kind, read)) =
+            read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
+        else {
+            break;
+        };
+        if matches!(kind, BoundedLine::Oversized) {
+            return Ok(None);
+        }
+        consumed += read;
+        if let Some(record) = JsonLine::parse(&line).and_then(JsonLine::into_record) {
+            records.push(record);
+        }
+    }
+    Ok((consumed == len && file.metadata()?.len() == len).then_some(records))
+}
+
+#[cfg(test)]
+fn json_lines_preview_with_tail(
+    path: &Path,
+    sample_records: usize,
+    tail: JsonLineTail<'_>,
+) -> Result<Vec<Value>> {
+    Ok(json_lines_preview_with_prefix(path, sample_records, tail)?.0)
+}
+
+pub(crate) fn json_lines_preview_with_prefix(
+    path: &Path,
+    sample_records: usize,
+    tail_policy: JsonLineTail<'_>,
+) -> Result<(Vec<Value>, usize)> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    json_lines_preview_at(&mut file, sample_records, tail_policy, metadata.len())
+}
+
+/// Reconstructs the sampled windows at the supplied physical end of the transcript.
+pub(crate) fn json_lines_preview_at(
+    file: &mut File,
+    sample_records: usize,
+    tail_policy: JsonLineTail<'_>,
+    length: u64,
+) -> Result<(Vec<Value>, usize)> {
+    anyhow::ensure!(
+        file.metadata()?.len() >= length,
+        "transcript shortened during preview"
+    );
+    let end = tail_policy.record_end(file, length, MAX_PREVIEW_TAIL_SIZE)?;
+    if end <= MAX_PREVIEW_TAIL_SIZE {
+        let prefix = read_verified_json_lines_prefix(file, MAX_PROVIDER_RECORDS, tail_policy, end)?;
+        if prefix.at_eof {
+            return Ok((prefix.records, prefix.verified_records));
+        }
+    }
+
+    let prefix = read_verified_json_lines_prefix(file, sample_records, tail_policy, end)?;
+    if prefix.at_eof {
+        return Ok((prefix.records, prefix.verified_records));
+    }
+    let (tail, verified_end) =
+        verified_json_lines_tail_with_offsets(file, sample_records, tail_policy, end, prefix.end)?;
+    let overlap = tail.partition_point(|(offset, _)| *offset < prefix.end);
+    let appended = tail.into_iter().skip(overlap);
+    let mut verified_records = prefix.verified_records;
+    let mut records = prefix.records;
+    for (offset, record) in appended {
+        verified_records += usize::from(prefix.fully_verified && offset < verified_end);
+        records.push(record);
+    }
+    Ok((records, verified_records))
+}
+
+fn verified_json_lines_tail_with_offsets(
+    file: &mut File,
+    limit: usize,
+    tail_policy: JsonLineTail<'_>,
+    end: u64,
+    prefix_end: u64,
+) -> Result<(Vec<(u64, Value)>, u64)> {
+    let start = end.saturating_sub(MAX_PREVIEW_TAIL_SIZE);
+    let mut leading_fragment = start > 0;
+    if leading_fragment {
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0];
+        file.read_exact(&mut previous)?;
+        leading_fragment = previous[0] != b'\n';
+    } else {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut reader = BufReader::new(file.take(end - start));
+    let mut offset = start;
+    if leading_fragment {
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
+        if tail_policy.checked_end(offset == end) {
+            let file = reader.into_inner().into_inner();
+            tail_policy.check_final_fragment(file, end, MAX_PREVIEW_VALIDATION_BYTES)?;
+            return Ok((Vec::new(), 0));
+        }
+    }
+    let mut records = VecDeque::with_capacity(limit);
+    let mut verified_end = if offset <= prefix_end {
+        end
+    } else {
+        prefix_end
+    };
+    let mut line = Vec::new();
+    loop {
+        let line_offset = offset;
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        offset += u64::try_from(read)?;
+        // Previews skip oversized records the way streamed reads do.
+        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            if tail_policy.checked_end(offset == end) {
+                tail_policy.parse(&line, offset, true)?;
+            }
+            if line_offset >= prefix_end {
+                verified_end = verified_end.min(line_offset);
+            }
+            continue;
+        }
+        if let Some(record) = tail_policy.parse(&line, offset, offset == end)?
+            && limit > 0
+        {
+            if records.len() == limit
+                && let Some((evicted, _)) = records.pop_front()
+                && evicted >= prefix_end
+            {
+                verified_end = verified_end.min(evicted);
+            }
+            records.push_back((line_offset, record));
+        } else if line_offset >= prefix_end && !line.iter().all(u8::is_ascii_whitespace) {
+            verified_end = verified_end.min(line_offset);
+        }
+    }
+    Ok((records.into_iter().collect(), verified_end))
+}
+
+struct JsonLinesPrefix {
+    fully_verified: bool,
+    records: Vec<Value>,
+    end: u64,
+    verified_records: usize,
+    at_eof: bool,
+}
+
+/// Reads leading lines and tracks the decoded suffix after the last skipped line.
+fn read_verified_json_lines_prefix(
+    file: &mut File,
+    limit: usize,
+    tail: JsonLineTail<'_>,
+    end: u64,
+) -> Result<JsonLinesPrefix> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    file.rewind()?;
+    let mut reader = BufReader::new(file);
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    let mut consumed = 0_u64;
+    let mut verified_records = 0;
+    let mut contiguous = true;
+    let prefix_budget = if tail.checked_end(true) {
+        MAX_PREVIEW_VALIDATION_BYTES
+    } else {
+        u64::MAX
+    };
+    for _ in 0..limit {
+        if consumed == end || consumed >= prefix_budget {
+            break;
+        }
+        let Some((line_kind, read)) = read_bounded_line(
+            &mut reader
+                .by_ref()
+                .take((prefix_budget - consumed).min(end - consumed)),
+            MAX_TRANSCRIPT_LINE_SIZE,
+            &mut line,
+        )?
+        else {
+            break;
+        };
+        consumed += read;
+        if consumed == prefix_budget && consumed < end && !line.ends_with(b"\n") {
+            consumed -= read;
+            break;
+        }
+        // Previews skip oversized records the way streamed reads do.
+        if matches!(line_kind, BoundedLine::Oversized) {
+            tail.check_skipped_end(
+                &mut reader,
+                consumed == end,
+                read,
+                MAX_PREVIEW_VALIDATION_BYTES,
+            )?;
+        }
+        if matches!(line_kind, BoundedLine::Complete)
+            && let Some(record) = tail.parse(&line, consumed, consumed == end)?
+        {
+            records.push(record);
+            verified_records += usize::from(contiguous);
+        } else if matches!(line_kind, BoundedLine::Oversized)
+            || !line.iter().all(u8::is_ascii_whitespace)
+        {
+            contiguous = false;
+        }
+    }
+    Ok(JsonLinesPrefix {
+        fully_verified: contiguous,
+        records,
+        end: consumed,
+        verified_records,
+        at_eof: consumed == end || reader.fill_buf()?.is_empty(),
+    })
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -2041,6 +2726,46 @@ pub(crate) fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
                 DateTime::from_timestamp(raw, 0)
             }
         }
+        _ => None,
+    }
+}
+
+pub(crate) fn encode_uri_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
 }
@@ -2115,6 +2840,63 @@ pub(crate) struct PreviewEvent {
     tool: bool,
 }
 
+impl PreviewEvent {
+    fn new(sequence: u64, kind: &EventKind, payload: &Value, source_bytes: usize) -> Self {
+        Self {
+            sequence,
+            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
+            tool: is_tool_event(kind),
+        }
+    }
+}
+
+fn select_preview_edges(
+    outline: impl DoubleEndedIterator<Item = PreviewEvent> + ExactSizeIterator + Clone,
+    limit: usize,
+    bytes_per_edge: usize,
+) -> (VecDeque<PreviewEvent>, usize) {
+    let mut selected = VecDeque::new();
+    let add_edge = |events: &mut dyn Iterator<Item = PreviewEvent>| {
+        let mut added = Vec::new();
+        let mut remaining = bytes_per_edge;
+        for event in events {
+            if event.bytes > bytes_per_edge {
+                continue;
+            }
+            if added.len() == limit / 2 || event.bytes > remaining {
+                break;
+            }
+            remaining -= event.bytes;
+            added.push(event);
+        }
+        added
+    };
+    let total = outline.len();
+    selected.extend(add_edge(&mut outline.clone()));
+    let end = selected.back().map(|event| event.sequence);
+    selected.extend(
+        add_edge(&mut outline.rev())
+            .into_iter()
+            .rev()
+            .filter(|event| end.is_none_or(|last| event.sequence > last)),
+    );
+    let omitted = total - selected.len();
+    (selected, omitted)
+}
+
+fn preview_prefix_end(
+    sequences: impl Iterator<Item = u64>,
+    selected: &VecDeque<PreviewEvent>,
+    end: u64,
+) -> u64 {
+    sequences
+        .enumerate()
+        .find_map(|(index, sequence)| {
+            (selected.get(index).map(|event| event.sequence) != Some(sequence)).then_some(sequence)
+        })
+        .unwrap_or(end)
+}
+
 impl EventPreview {
     fn record(
         &mut self,
@@ -2123,11 +2905,7 @@ impl EventPreview {
         payload: &Value,
         source_bytes: usize,
     ) -> bool {
-        let item = PreviewEvent {
-            sequence,
-            bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
-            tool: is_tool_event(kind),
-        };
+        let item = PreviewEvent::new(sequence, kind, payload, source_bytes);
         self.outline.push(item);
         let Some(selected) = self.selection.as_mut() else {
             return false;
@@ -2248,38 +3026,48 @@ impl EventBuilder {
             .as_ref()
             .expect("preview planning enabled")
             .outline;
-        let mut selected = VecDeque::new();
-        let add_edge = |events: &mut dyn Iterator<Item = &PreviewEvent>| {
-            let mut added = Vec::new();
-            let mut remaining = bytes_per_edge;
-            for event in events {
-                if event.bytes > bytes_per_edge {
-                    continue;
-                }
-                if added.len() == limit / 2 || event.bytes > remaining {
-                    break;
-                }
-                remaining -= event.bytes;
-                added.push(*event);
-            }
-            added
-        };
-        selected.extend(add_edge(&mut outline.iter()));
-        let end = selected.back().map(|event| event.sequence);
-        selected.extend(
-            add_edge(&mut outline.iter().rev())
-                .into_iter()
-                .rev()
-                .filter(|event| end.is_none_or(|last| event.sequence > last)),
+        let (selected, omitted) =
+            select_preview_edges(outline.iter().copied(), limit, bytes_per_edge);
+        let prefix_end = preview_prefix_end(
+            outline.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
         );
-        let omitted = outline.len() - selected.len();
-        // An event above the byte limit can be missing even from the first edge.
-        let prefix_end = outline
-            .iter()
-            .enumerate()
-            .find(|(index, event)| selected.get(*index) != Some(*event))
-            .map_or(self.next_sequence, |(_, event)| event.sequence);
         (selected, omitted, prefix_end)
+    }
+
+    /// Selects the preview after published revisions and rollbacks have updated canonical events.
+    pub(crate) fn retain_bounded_preview(
+        &mut self,
+        limit: usize,
+        bytes_per_edge: usize,
+    ) -> (usize, u64) {
+        let outline = self.events.iter().map(|event| {
+            let source_bytes = event.source.native_session_id.len()
+                + event
+                    .source
+                    .provider_version
+                    .as_ref()
+                    .map_or(0, String::len)
+                + event.source.raw_record_type.as_ref().map_or(0, String::len);
+            PreviewEvent::new(event.sequence, &event.kind, &event.payload, source_bytes)
+        });
+        let (selected, omitted) = select_preview_edges(outline, limit, bytes_per_edge);
+        if omitted == 0 {
+            return (0, self.next_sequence);
+        }
+        let prefix_end = preview_prefix_end(
+            self.events.iter().map(|event| event.sequence),
+            &selected,
+            self.next_sequence,
+        );
+        let mut selected = selected.into_iter().peekable();
+        self.events.retain(|event| {
+            selected
+                .next_if(|next| next.sequence == event.sequence)
+                .is_some()
+        });
+        (omitted, prefix_end)
     }
 
     pub(crate) fn finish_preview(&mut self, expected: usize) -> Result<()> {
@@ -2298,6 +3086,85 @@ impl EventBuilder {
 
     pub(crate) fn checkpoint(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// Keep a native position for a message whose public spelling may arrive later.
+    pub(crate) fn reserve_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
+    }
+
+    pub(crate) fn fill_reserved_sequences(&mut self, events: Vec<OmniEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.events.extend(events.into_iter().map(|mut event| {
+            event.event_id = Uuid::new_v5(&self.thread_id, event.sequence.to_string().as_bytes());
+            event
+        }));
+        self.events.sort_unstable_by_key(|event| event.sequence);
+    }
+
+    pub(crate) fn events(&self) -> &[OmniEvent] {
+        &self.events
+    }
+
+    /// Inserts projected events after a surviving source record and keeps source IDs stable.
+    pub(crate) fn insert_after(&mut self, index: usize, add: impl FnOnce(&mut Self)) {
+        let mut tail = self.events.split_off(index + 1);
+        let first_sequence = self.events[index].sequence + 1;
+        add(self);
+        let inserted = &mut self.events[index + 1..];
+        for event in &mut tail {
+            event.sequence += inserted.len() as u64;
+        }
+        for (sequence, event) in (first_sequence..).zip(inserted) {
+            event.sequence = sequence;
+        }
+        self.events.extend(tail);
+    }
+
+    pub(crate) fn first_sequence(&self) -> u64 {
+        if let Some(preview) = &self.preview {
+            return preview
+                .outline
+                .first()
+                .map_or(self.next_sequence, |event| event.sequence);
+        }
+        self.events
+            .first()
+            .map_or(self.next_sequence, |event| event.sequence)
+    }
+
+    /// Finds a retained event after truncation or pruning has left gaps in the sequence.
+    pub(crate) fn event_at_mut(&mut self, sequence: u64) -> Option<&mut OmniEvent> {
+        let index = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok()?;
+        self.events.get_mut(index)
+    }
+
+    /// Move confirmed early model messages to their first display position after all ID lookups.
+    pub(crate) fn order_delayed_messages(&mut self, positions: &HashMap<u64, (u64, u64)>) {
+        if positions.is_empty() {
+            return;
+        }
+        let sequences: Vec<_> = self.events.iter().map(|event| event.sequence).collect();
+        // An answer from an older window must stay on its side of the compaction boundary.
+        for window in self
+            .events
+            .split_mut(|event| event.kind == EventKind::CompactionCreated)
+        {
+            window.sort_unstable_by_key(|event| match positions.get(&event.sequence) {
+                Some(&(before, ordinal)) => (before, false, ordinal),
+                None => (event.sequence, true, 0),
+            });
+        }
+        for (event, sequence) in self.events.iter_mut().zip(sequences) {
+            event.sequence = sequence;
+        }
     }
 
     pub(crate) fn drain_events(&mut self) -> std::vec::Drain<'_, OmniEvent> {
@@ -2347,6 +3214,30 @@ impl EventBuilder {
         })
     }
 
+    pub(crate) fn record_paginated_opener_withdrawal(&mut self, inherited: bool) {
+        if let Some((prior, successor)) = omnis_core::codex_withdrawn_search_opener(&self.events) {
+            let mut opener = RollbackOpener {
+                gap: inherited,
+                full_read: true,
+                first_message: successor.map(|title| (0, Some(title))),
+                ..Default::default()
+            };
+            opener
+                .withdrawn
+                .record(crate::RollbackTitle::fingerprint(&prior));
+            self.rollback_opener = Some(opener);
+        }
+    }
+
+    pub(crate) fn withdrew_saved_opener(&self, title: &str) -> bool {
+        self.rollback_opener.as_ref().is_some_and(|opener| {
+            opener
+                .withdrawn
+                .hashes
+                .contains(&crate::RollbackTitle::fingerprint(title))
+        })
+    }
+
     pub(crate) fn rollback_title(&self) -> crate::RollbackTitle {
         match &self.rollback_opener {
             Some(opener) if opener.gap => opener.withdrawn.after_gap(),
@@ -2364,13 +3255,17 @@ impl EventBuilder {
     }
 
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        self.rollback_events(|sequence| sequence < checkpoint);
+    }
+
+    pub(crate) fn rollback_events(&mut self, keep: impl Fn(u64) -> bool) {
         if let Some(opener) = &mut self.rollback_opener
             && !opener.gap
         {
             opener.applied_rollback = true;
             if let Some((_, Some(title))) = opener
                 .first_message
-                .take_if(|(sequence, _)| *sequence >= checkpoint)
+                .take_if(|(sequence, _)| !keep(*sequence))
             {
                 let hash = crate::RollbackTitle::fingerprint(&title);
                 if opener.target.is_none_or(|target| target == hash) {
@@ -2379,13 +3274,21 @@ impl EventBuilder {
             }
         }
         if let Some(preview) = &mut self.preview {
-            preview.outline.truncate(
-                preview
-                    .outline
-                    .partition_point(|event| event.sequence < checkpoint),
-            );
+            preview.outline.retain(|event| keep(event.sequence));
         }
-        self.events.retain(|event| event.sequence < checkpoint);
+        self.events.retain(|event| keep(event.sequence));
+    }
+
+    pub(crate) fn visit_events(&self, visit: impl FnMut(&OmniEvent)) {
+        self.events.iter().for_each(visit);
+    }
+
+    pub(crate) fn visit_events_mut(&mut self, visit: impl FnMut(&mut OmniEvent)) {
+        self.events.iter_mut().for_each(visit);
+    }
+
+    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
+        self.events.retain(keep);
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
@@ -2458,7 +3361,14 @@ impl EventBuilder {
                 payload,
                 timestamp,
                 ReplayPolicy::HistoricalOnly,
-                Some("omnisession.codex_malformed_records".to_owned()),
+                Some(
+                    if self.provider == Provider::Codex {
+                        "omnisession.codex_malformed_records"
+                    } else {
+                        "omnisession.malformed_records"
+                    }
+                    .to_owned(),
+                ),
                 None,
             );
         }
@@ -2565,18 +3475,33 @@ impl EventBuilder {
         }
     }
 
-    pub(crate) fn record_database_step_hash(&mut self, index: Option<i64>, wire: &[u8]) {
-        if self.events.len() > crate::antigravity::MAX_DATABASE_STEPS {
-            return;
-        }
-        if let (Some(index), Some(event)) = (index, self.events.last_mut())
+    pub(crate) fn contains_database_steps(&self, expected: &[Uuid]) -> bool {
+        let mut records = self.events.iter().filter(|event| {
+            event.source.raw_record_type.as_deref() != Some(crate::antigravity::STEP_LIMIT_RECORD)
+        });
+        expected.iter().all(|id| {
+            records.any(|event| {
+                event
+                    .raw_blob_hash
+                    .as_deref()
+                    .and_then(|hash| Uuid::parse_str(hash).ok())
+                    == Some(*id)
+            })
+        })
+    }
+
+    pub(crate) fn database_step_namespace(&self, index: i64, opaque: bool) -> Uuid {
+        let mut key = [0; 9];
+        key[..8].copy_from_slice(&index.to_be_bytes());
+        key[8] = u8::from(opaque);
+        Uuid::new_v5(&self.thread_id, &key)
+    }
+
+    pub(crate) fn set_last_database_step_hash(&mut self, hash: Option<Uuid>) {
+        if let Some(event) = self.events.last_mut()
             && event.sequence + 1 == self.next_sequence
         {
-            let mut key = [0; 9];
-            key[..8].copy_from_slice(&index.to_be_bytes());
-            key[8] = u8::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
-            let row = Uuid::new_v5(&self.thread_id, &key);
-            event.raw_blob_hash = Some(Uuid::new_v5(&row, wire).to_string());
+            event.raw_blob_hash = hash.map(|hash| hash.to_string());
         }
     }
 
@@ -2691,6 +3616,193 @@ mod tests {
         snapshot_max_bytes, sqlite_snapshot, sqlite_snapshot_with_limits,
         visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
+
+    #[test]
+    fn over_limit_search_rereads_previous_text_and_keeps_the_latest_turn() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"\"first\"\n\"middle\"\n\"unsampled\"\n")
+            .unwrap();
+        file.seek(SeekFrom::Start(2 * super::MAX_PREVIEW_TAIL_SIZE))
+            .unwrap();
+        file.write_all(b"\n\"latest\"").unwrap();
+        file.rewind().unwrap();
+        let mut words = Vec::new();
+        let mut bytes = 0;
+        super::visit_limited_search_edges(
+            file,
+            Some(11),
+            1,
+            JsonLineTail::RequireComplete,
+            |value| {
+                let word = value.as_str().unwrap().to_owned();
+                bytes += word.len();
+                words.push(word);
+                bytes
+            },
+        )
+        .unwrap();
+        assert_eq!(words, ["first", "middle", "latest"]);
+    }
+
+    #[test]
+    fn limited_search_counts_malformed_lines_inside_its_windows() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"{}\n{broken}\n\"").unwrap();
+        // Put the malformed records in disjoint sample windows.
+        file.seek(SeekFrom::Start(2 * super::MAX_PREVIEW_TAIL_SIZE + 1))
+            .unwrap();
+        file.write_all(b"\n{also broken}\n\n\"latest\"").unwrap();
+        let damage = super::JsonLineDamage::default();
+        let mut records = Vec::new();
+        super::visit_limited_search_edges(
+            file,
+            None,
+            8,
+            JsonLineTail::ReportIncomplete(&damage),
+            |v| {
+                records.push(v);
+                0
+            },
+        )
+        .unwrap();
+        assert_eq!(records, [json!({}), json!("latest")]);
+        assert_eq!(damage.count(), 2);
+        assert!(!damage.final_record());
+    }
+
+    #[test]
+    fn incomplete_jsonl_tail_preserves_earlier_records_until_repair() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        let preview =
+            || super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete);
+        let padding = format!("\n{}", " \t\n".repeat(4_096));
+        for ending in ["", "\r\n", "\n\n", padding.as_str()] {
+            std::fs::write(&path, format!("{{}}\n{{\"text\":\"half{ending}")).unwrap();
+            assert!(preview().unwrap_err().is::<super::IncompleteTranscript>());
+            let stream = super::visit_json_lines_with_tail(
+                &path,
+                super::MAX_PREVIEW_TAIL_SIZE,
+                JsonLineTail::RequireComplete,
+                |_| Ok(()),
+            );
+            assert!(stream.unwrap_err().is::<super::IncompleteTranscript>());
+            let edges = super::visit_limited_search_edges(
+                std::fs::File::open(&path).unwrap(),
+                None,
+                1,
+                JsonLineTail::RequireComplete,
+                |_| 0,
+            );
+            assert!(edges.unwrap_err().is::<super::IncompleteTranscript>());
+            assert_eq!(json_lines_preview(&path, 2).unwrap(), [json!({})]);
+        }
+
+        for ending in ["\n", "\r\n", "\n\n"] {
+            std::fs::write(&path, format!("{{}}\n{{broken}}{ending}")).unwrap();
+            assert!(preview().unwrap_err().is::<super::IncompleteTranscript>());
+            let omitted = super::JsonLineDamage::default();
+            let values = super::json_lines_preview_with_tail(
+                &path,
+                2,
+                JsonLineTail::ReportIncomplete(&omitted),
+            )
+            .unwrap();
+            assert_eq!(values, [json!({})]);
+            assert_eq!(omitted.count(), 1);
+        }
+
+        std::fs::write(&path, b"{}\n{discarded\n{\"text\":\"whole\"}").unwrap();
+        assert!(preview().unwrap_err().is::<super::IncompleteTranscript>());
+        let damage = super::JsonLineDamage::default();
+        assert_eq!(
+            super::json_lines_preview_with_tail(
+                &path,
+                2,
+                JsonLineTail::RequireCompleteTail(&damage)
+            )
+            .unwrap(),
+            [json!({}), json!({"text":"whole"})]
+        );
+        assert_eq!(damage.count(), 1);
+    }
+
+    #[test]
+    fn a_short_read_of_an_observed_transcript_returns_unexpected_eof() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        std::fs::write(&path, b"1\n2\n3\n").unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut reader = std::io::BufReader::with_capacity(2, std::fs::File::open(path).unwrap());
+        let error = super::visit_json_lines_with_offsets_and_limits(
+            &mut reader,
+            JsonLinesLimits::streamed(64),
+            JsonLineTail::RequireComplete,
+            |_, _, _| Ok(writer.set_len(2)?),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn a_final_fragment_needs_a_known_record_start_within_the_validation_budget() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        let valid = br#"{"content":"a complete response"}"#;
+        let mut bytes = b"{}\n".to_vec();
+        bytes.extend_from_slice(valid);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
+        let budget = valid.len() as u64;
+        let end = bytes.len() as u64;
+        JsonLineTail::RequireComplete
+            .check_final_fragment(&mut file, end, budget)
+            .unwrap();
+        assert!(
+            JsonLineTail::RequireComplete
+                .check_final_fragment(&mut file, end, budget - 1)
+                .unwrap_err()
+                .is::<super::IncompleteTranscript>()
+        );
+    }
+
+    #[test]
+    fn valid_unterminated_final_records_do_not_hide_the_search_preview() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("transcript.jsonl");
+        let limit = usize::try_from(MAX_TRANSCRIPT_LINE_SIZE).unwrap();
+        for size in [limit - 32, limit + 32] {
+            let final_record = serde_json::to_string(&"x".repeat(size)).unwrap();
+            std::fs::write(&path, format!("42\n{final_record}")).unwrap();
+            let records =
+                super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete)
+                    .unwrap();
+            assert_eq!(records.first(), Some(&json!(42)));
+            assert_eq!(records.len(), if size < limit { 2 } else { 1 });
+            std::fs::write(
+                &path,
+                format!("42\n{}", &final_record[..final_record.len() - 1]),
+            )
+            .unwrap();
+            assert!(
+                super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete)
+                    .unwrap_err()
+                    .is::<super::IncompleteTranscript>()
+            );
+        }
+        let window = usize::try_from(super::MAX_PREVIEW_TAIL_SIZE).unwrap();
+        let final_record = serde_json::to_string(&"x".repeat(window - 2)).unwrap();
+        std::fs::write(&path, format!("42\n43\n44\n{final_record}")).unwrap();
+        let records =
+            super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete).unwrap();
+        assert_eq!(records, [json!(42), json!(43)]);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3220,7 +4332,6 @@ mod tests {
         file_bytes: 1024,
         records: 16,
         line_bytes: 64,
-        tail: JsonLineTail::SkipMalformed,
     };
 
     /// A JSON record of exactly `bytes` bytes, without a terminator.
@@ -3238,11 +4349,133 @@ mod tests {
 
     fn visit_all(path: &Path, limits: JsonLinesLimits) -> anyhow::Result<(usize, usize)> {
         let mut visited = 0;
-        let oversized = visit_json_lines_with_limits(path, limits, |_| {
-            visited += 1;
-            Ok(())
-        })?;
+        let oversized =
+            visit_json_lines_with_limits(path, limits, JsonLineTail::SkipMalformed, |_| {
+                visited += 1;
+                Ok(())
+            })?;
         Ok((visited, oversized))
+    }
+
+    #[test]
+    fn materialized_preview_uses_the_size_of_revised_events() {
+        let mut builder = EventBuilder::new(Provider::Codex, "revised-size");
+        for text in ["original", "surviving head", "surviving tail"] {
+            builder.push(
+                EventKind::MessageAssistant,
+                json!({"text": text}),
+                None,
+                ReplayPolicy::Contextual,
+                None,
+                None,
+            );
+        }
+        builder.event_at_mut(0).unwrap().payload["text"] = "x".repeat(8192).into();
+        assert_eq!(builder.retain_bounded_preview(2, 4096), (1, 0));
+
+        let events = &builder.events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["text"], "surviving head");
+        assert_eq!(events[1].payload["text"], "surviving tail");
+    }
+
+    #[test]
+    fn physical_records_report_damage_and_keep_offsets_across_blank_lines() {
+        use super::{
+            JsonlRecord, WorkspaceGap, visit_json_reader, visit_streamed_json_records_with_offsets,
+        };
+
+        let (_root, path) = write_fixture(b"1\r\n{x}\n\xff\n \t\r\n2\n3");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut records = Vec::new();
+        let (omissions, bytes) = visit_json_reader(
+            &mut reader,
+            JsonLinesLimits::streamed(64),
+            |_, _| WorkspaceGap::Other,
+            |location, value, omitted| {
+                records.push((
+                    location.offset,
+                    location.length,
+                    location.terminated,
+                    value.as_u64(),
+                    omitted.malformed,
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                (0, 3, true, Some(1), 0),
+                (13, 2, true, Some(2), 2),
+                (15, 1, false, Some(3), 2),
+            ]
+        );
+        assert_eq!((omissions.malformed, bytes), (2, 16));
+
+        let mut records = Vec::new();
+        visit_streamed_json_records_with_offsets(&mut reader, 64, |location, record| {
+            let (kind, value) = match record {
+                JsonlRecord::Complete(v) => ("complete", v.as_u64()),
+                JsonlRecord::Unterminated(v) => ("unfinished", v.as_u64()),
+                JsonlRecord::Malformed => ("malformed", None),
+            };
+            records.push((location.offset, location.length, kind, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                (0, 3, "complete", Some(1)),
+                (3, 4, "malformed", None),
+                (7, 2, "malformed", None),
+                (13, 2, "complete", Some(2)),
+                (15, 1, "unfinished", Some(3)),
+            ]
+        );
+        assert_eq!(visit_all(&path, LIMITS).unwrap(), (3, 0));
+        let small = super::complete_small_json_records(&path).unwrap().unwrap();
+        assert!(matches!(small.as_slice(), [
+            JsonlRecord::Complete(first), JsonlRecord::Malformed, JsonlRecord::Malformed,
+            JsonlRecord::Complete(second), JsonlRecord::Unterminated(last)
+        ] if [first.as_u64(), second.as_u64(), last.as_u64()] == [Some(1), Some(2), Some(3)]));
+    }
+
+    #[test]
+    fn tail_exposes_a_skipped_prefix_even_when_the_first_retained_line_is_blank() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        use super::{JsonLine, MAX_PREVIEW_TAIL_SIZE, visit_json_lines_tail};
+
+        let (_root, path) = write_fixture([]);
+        let prefix = MAX_PREVIEW_TAIL_SIZE + 5;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.seek(SeekFrom::Start(prefix)).unwrap();
+        file.write_all(b"\n \n1\n2").unwrap();
+
+        let mut rows = Vec::new();
+        let first = visit_json_lines_tail(
+            &path,
+            32,
+            |_| true,
+            |offset, line| {
+                let (terminated, value) = match line {
+                    JsonLine::Record(value) => (true, value),
+                    JsonLine::Unterminated(value) => (false, value),
+                    _ => panic!("expected a valid value"),
+                };
+                rows.push((offset, terminated, value.as_u64()));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first, prefix + 1);
+        assert_eq!(
+            rows,
+            [(prefix + 3, true, Some(1)), (prefix + 5, false, Some(2))]
+        );
     }
 
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {
@@ -3542,43 +4775,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_jsonl_tail_preserves_earlier_records_until_repair() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("transcript.jsonl");
-        let preview =
-            || super::json_lines_preview_with_tail(&path, 2, JsonLineTail::RequireComplete);
-        for ending in ["", "\r\n"] {
-            std::fs::write(&path, format!("{{}}\n{{\"text\":\"half{ending}")).unwrap();
-            assert!(preview().unwrap_err().is::<super::IncompleteTranscript>());
-            let stream = super::visit_json_lines_with_tail(
-                &path,
-                256,
-                JsonLineTail::RequireComplete,
-                |_| Ok(()),
-            );
-            assert!(stream.unwrap_err().is::<super::IncompleteTranscript>());
-            assert_eq!(json_lines_preview(&path, 2).unwrap(), [json!({})]);
-        }
-
-        std::fs::write(&path, b"{}\n{discarded\n{\"text\":\"whole\"}").unwrap();
-        assert_eq!(preview().unwrap(), [json!({}), json!({"text":"whole"})]);
-
-        let limits = JsonLinesLimits {
-            line_bytes: 5,
-            tail: JsonLineTail::RequireComplete,
-            ..LIMITS
-        };
-        std::fs::write(&path, b"{}\n{\"text\":\"partial").unwrap();
-        assert!(
-            visit_all(&path, limits)
-                .unwrap_err()
-                .is::<super::IncompleteTranscript>()
-        );
-        std::fs::write(&path, b"{}\n{\"text\":\"whole\"}\n").unwrap();
-        assert_eq!(visit_all(&path, limits).unwrap(), (1, 1));
-    }
-
-    #[test]
     fn tail_keeps_complete_records_at_the_byte_limit() {
         let mut content = b"0\n123\n".to_vec();
         let tail_size = usize::try_from(super::MAX_PREVIEW_TAIL_SIZE).unwrap();
@@ -3591,12 +4787,27 @@ mod tests {
         let (_temporary, path) = write_fixture(&content);
         let read =
             || json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 3).unwrap();
+        let read_verified = || {
+            let mut file = std::fs::File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            super::verified_json_lines_tail_with_offsets(
+                &mut file,
+                3,
+                JsonLineTail::SkipMalformed,
+                len,
+                0,
+            )
+            .unwrap()
+            .0
+        };
         assert_eq!(read()[0], (2, json!(123)));
+        assert_eq!(read_verified(), read());
 
         // Moving the cutoff into the number must discard the entire partial record.
         content.push(b'\n');
         std::fs::write(&path, content).unwrap();
         assert_eq!(read()[0], (6, json!(4)));
+        assert_eq!(read_verified(), read());
     }
 
     #[test]
@@ -3609,11 +4820,18 @@ mod tests {
         }
         std::fs::write(&path, content).expect("JSONL fixture");
 
-        let records = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 2)
-            .expect("tail records")
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect::<Vec<_>>();
+        let records = super::verified_json_lines_tail_with_offsets(
+            &mut std::fs::File::open(&path).unwrap(),
+            2,
+            JsonLineTail::SkipMalformed,
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+        )
+        .expect("tail records")
+        .0
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
 
         assert_eq!(records[0]["value"], 8);
         assert_eq!(records[1]["value"], 9);
@@ -3652,6 +4870,33 @@ mod tests {
             records,
             [((contents.len() - last.len() - 1) as u64, json!({"index":2}))]
         );
+    }
+
+    #[test]
+    fn sampled_opener_uses_the_contiguous_prefix_across_overlapping_windows() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sample.jsonl");
+        let padding = json!({"padding": "x".repeat(768 * 1024)}).to_string() + "\n";
+        let prefix = padding.repeat(6);
+        for (tail, confirmed) in [
+            ("\n1\n2\n", 8),
+            ("1\n \t\r\n2\n", 8),
+            ("1\n2\n\n", 8),
+            ("broken\n1\n2\n", 6),
+            ("1\nbroken\n2\n", 7),
+            ("1\n2\nbroken\n", 8),
+        ] {
+            std::fs::write(&path, format!("{prefix}{tail}")).unwrap();
+            let damage = super::JsonLineDamage::default();
+            let (records, verified) = super::json_lines_preview_with_prefix(
+                &path,
+                6,
+                JsonLineTail::ReportIncomplete(&damage),
+            )
+            .unwrap();
+            assert_eq!(&records[6..], &[json!(1), json!(2)]);
+            assert_eq!(verified, confirmed, "{tail:?}");
+        }
     }
 
     #[test]
@@ -3730,10 +4975,23 @@ mod tests {
         content.push_str("2\n");
         std::fs::write(&path, content).expect("short JSONL records");
 
-        assert_eq!(
-            json_lines_preview(&path, 1).expect("sampled end records"),
-            [json!(1), json!(2)]
-        );
+        for (prefix_bytes, expected, suffix_len) in [
+            (u64::MAX, vec![json!(1), json!(2)], 1),
+            (super::MAX_PREVIEW_TAIL_SIZE, vec![json!(1), json!(2)], 1),
+            (2, vec![json!(1)], 0),
+        ] {
+            let preview = super::json_lines_preview_with_omissions(
+                &path,
+                1,
+                prefix_bytes,
+                MAX_TRANSCRIPT_LINE_SIZE,
+                |_, _| super::WorkspaceGap::Other,
+            )
+            .expect("sampled end records");
+            assert!(preview.sampled);
+            assert_eq!(preview.records, expected);
+            assert_eq!(preview.suffix_len, suffix_len);
+        }
     }
 
     #[test]
@@ -3748,6 +5006,7 @@ mod tests {
         writeln!(content, "{}", serde_json::json!({"value": "tail"})).expect("JSON line");
         std::fs::write(&path, content).expect("small oversized JSONL fixture");
 
+        assert!(super::complete_small_json_records(&path).unwrap().is_none());
         let records = json_lines_preview(&path, 32).expect("small preview skips oversized records");
 
         assert_eq!(
@@ -3813,14 +5072,14 @@ mod tests {
             line_bytes in 0_u64..48,
         ) {
             let (_temporary, path) = write_fixture(&bytes);
-            let limits = JsonLinesLimits { file_bytes, records, line_bytes, tail: JsonLineTail::SkipMalformed };
-            let _ = visit_json_lines_with_limits(&path, limits, |_| Ok(()));
+            let limits = JsonLinesLimits { file_bytes, records, line_bytes };
+            let _ = visit_json_lines_with_limits(&path, limits, JsonLineTail::SkipMalformed, |_| Ok(()));
             let scan = visit_index_json_lines_with_limits(&path, file_bytes, line_bytes, |_| {})
                 .expect("index scan");
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records);
+            let _ = super::verified_json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records, JsonLineTail::SkipMalformed, bytes.len() as u64, 0);
         }
 
         #[test]

@@ -12,23 +12,100 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use omnis_ir::SourceRevision;
+use omnis_ir::{GitState, SourceRevision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::support::provider_root;
 
-/// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
-/// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 5] = [
-    include_bytes!("../codex.rs"),
-    include_bytes!("../support.rs"),
-    include_bytes!("current_rollout.rs"),
-    include_bytes!("rollout_cache.rs"),
-    include_bytes!("rollout_file.rs"),
-];
-const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);
+// Evaluate large parser sources separately to stay within the compiler's const-evaluation limit.
+const ADAPTER_HASH: u64 = fnv1a(0xcbf2_9ce4_8422_2325, &[include_bytes!("../codex.rs")]);
+const EVENT_BUILDER_HASH: u64 = fnv1a(ADAPTER_HASH, &[include_bytes!("../support.rs")]);
+const ITEMS_HASH: u64 = fnv1a(
+    EVENT_BUILDER_HASH,
+    &[
+        include_bytes!("attachments.rs"),
+        include_bytes!("checkpoint_wire/metadata.rs"),
+        include_bytes!("checkpoint_wire/response.rs"),
+        include_bytes!("checkpoint_wire.rs"),
+        include_bytes!("completed_item/assistant.rs"),
+        include_bytes!("completed_item/command.rs"),
+        include_bytes!("completed_item/documentary/extension.rs"),
+        include_bytes!("completed_item/documentary.rs"),
+        include_bytes!("completed_item/positional.rs"),
+        include_bytes!("completed_item/private/review.rs"),
+        include_bytes!("completed_item/private.rs"),
+        include_bytes!("completed_item/receipts/shell.rs"),
+        include_bytes!("completed_item/receipts/sources.rs"),
+        include_bytes!("completed_item/receipts.rs"),
+        include_bytes!("completed_item/status/collab.rs"),
+        include_bytes!("completed_item/status/mcp.rs"),
+        include_bytes!("completed_item/status.rs"),
+        include_bytes!("completed_item.rs"),
+        include_bytes!("completion_positions.rs"),
+    ],
+);
+const DISCOVERY_HASH: u64 = fnv1a(
+    ITEMS_HASH,
+    &[
+        include_bytes!("current_launch.rs"),
+        include_bytes!("current_rollout/sqlite_home/policy/macos.rs"),
+        include_bytes!("current_rollout/sqlite_home/policy.rs"),
+        include_bytes!("current_rollout/sqlite_home/project.rs"),
+        include_bytes!("current_rollout/sqlite_home.rs"),
+        include_bytes!("current_rollout.rs"),
+        include_bytes!("deferred_receipts.rs"),
+        include_bytes!("display_text.rs"),
+        include_bytes!("gui_names.rs"),
+        include_bytes!("message_mirrors.rs"),
+        include_bytes!("model_cut.rs"),
+    ],
+);
+const HISTORY_HASH: u64 = fnv1a(
+    DISCOVERY_HASH,
+    &[
+        include_bytes!("paginated_answers/checkpoint_tools.rs"),
+        include_bytes!("paginated_answers/occurrences.rs"),
+        include_bytes!("paginated_answers.rs"),
+        include_bytes!("paginated_checkpoint/history.rs"),
+        include_bytes!("paginated_checkpoint/legacy.rs"),
+        include_bytes!("paginated_checkpoint/turns.rs"),
+        include_bytes!("paginated_checkpoint.rs"),
+        include_bytes!("paginated_compaction.rs"),
+        include_bytes!("paginated_preview.rs"),
+        include_bytes!("paginated_rollback/legacy_inputs.rs"),
+        include_bytes!("paginated_rollback/media.rs"),
+        include_bytes!("paginated_rollback/migration_scopes.rs"),
+        include_bytes!("paginated_rollback.rs"),
+        include_bytes!("paginated_workspace.rs"),
+    ],
+);
+const PARSER_FINGERPRINT: u64 = fnv1a(
+    HISTORY_HASH,
+    &[
+        include_bytes!("rollout_cache.rs"),
+        include_bytes!("rollout_file.rs"),
+        include_bytes!("rollout_lines/events/messages.rs"),
+        include_bytes!("rollout_lines/events/metadata.rs"),
+        include_bytes!("rollout_lines/events/rate_limits.rs"),
+        include_bytes!("rollout_lines/events.rs"),
+        include_bytes!("rollout_lines/realtime.rs"),
+        include_bytes!("rollout_lines.rs"),
+        include_bytes!("tool_history/directory.rs"),
+        include_bytes!("tool_history.rs"),
+        include_bytes!("tool_occurrences.rs"),
+        include_bytes!("tool_revisions.rs"),
+        include_bytes!("turn_aliases.rs"),
+        include_bytes!("wire_enums.rs"),
+        include_bytes!("workspace_catalog.rs"),
+        include_bytes!("workspace_check.rs"),
+        include_bytes!("workspace_damage.rs"),
+        include_bytes!("workspace_records.rs"),
+        include_bytes!("workspace_search.rs"),
+        include_bytes!("workspace_settings.rs"),
+    ],
+);
 /// Largest cache file read. The 10,000-rollout scan limit keeps real caches far smaller.
 const MAX_CACHE_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -37,8 +114,7 @@ fn cache_format() -> String {
     format!("1-{}-{PARSER_FINGERPRINT:016x}", env!("CARGO_PKG_VERSION"))
 }
 
-const fn fnv1a(sources: &[&[u8]]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+const fn fnv1a(mut hash: u64, sources: &[&[u8]]) -> u64 {
     let mut source = 0;
     while source < sources.len() {
         let bytes = sources[source];
@@ -111,7 +187,7 @@ impl ObservedRollout {
 /// Stat fields that change when a rollout is written or replaced.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct RolloutStamp {
-    len: u64,
+    pub(super) len: u64,
     modified: (i64, u32),
     /// Inode change time on Unix, creation time elsewhere.
     changed: (i64, i64),
@@ -120,6 +196,24 @@ pub(super) struct RolloutStamp {
 }
 
 impl RolloutStamp {
+    pub(super) fn read(path: &Path) -> Option<Self> {
+        ObservedRollout::read(path)?.stamp
+    }
+
+    pub(super) fn catalog_key(self, path: &Path) -> String {
+        let path_hash = Sha256::digest(path.as_os_str().as_encoded_bytes());
+        format!(
+            "{PARSER_FINGERPRINT:016x}/{}/{}/{}/{}/{}/{}/{}",
+            hex::encode(path_hash),
+            self.len,
+            self.modified.0,
+            self.modified.1,
+            self.changed.0,
+            self.changed.1,
+            self.inode
+        )
+    }
+
     pub(super) fn new(metadata: &fs::Metadata) -> Option<Self> {
         let modified = DateTime::<Utc>::from(metadata.modified().ok()?);
         #[cfg(unix)]
@@ -154,7 +248,7 @@ pub(super) struct RolloutHeader {
     pub(super) id: String,
     pub(super) forked_from_id: Option<Uuid>,
     pub(super) project_path: Option<PathBuf>,
-    pub(super) git_branch: Option<String>,
+    pub(super) git: GitState,
     pub(super) cli_version: Option<String>,
     pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,

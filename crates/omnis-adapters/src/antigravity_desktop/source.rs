@@ -47,6 +47,7 @@ pub(super) fn observe(
     }
     let mut summaries_unavailable = false;
     let mut database_generation = None;
+    let mut summary_revision = None;
     let mut observation = SearchSourceObservation::capture(root, paths, || {
         ensure!(
             visible()?,
@@ -61,11 +62,16 @@ pub(super) fn observe(
         let summaries = read_summaries(root).ok().flatten();
         let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
         summaries_unavailable = summary.is_none();
+        if summary.is_some() {
+            summary_revision = provider_file(root, &root.join(SUMMARIES))
+                .and_then(|path| crate::source_file_revision(&path)?.contents);
+        }
         let (listed, generation) = native_session(&session.id, database, summary);
         database_generation = generation;
         Ok(listed)
     })?;
     observation.desktop_summaries_unavailable = summaries_unavailable;
     observation.database_generation = database_generation;
+    observation.database_summary_revision = summary_revision;
     Ok(Some(observation))
 }

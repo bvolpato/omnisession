@@ -1,5 +1,7 @@
 //! Stable canonical types used between `OmniSession` core, adapters, and bundles.
 
+pub mod antigravity_receipts;
+
 use std::{fmt, path::PathBuf, str::FromStr};
 
 use chrono::{DateTime, Utc};
@@ -9,6 +11,149 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: &str = "1.0";
+
+/// Tool payloads can contain entire files or logs. Search retains both edges.
+pub const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
+pub const ANTIGRAVITY_DATABASE_STEP_LIMIT: usize = 100_000;
+pub const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
+pub const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
+pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
+
+/// Measurements of eligible, redacted text after event limits and before document limits.
+#[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "JSONL and SQLite record independent observations"
+)]
+pub struct SearchProjection {
+    pub byte_count: usize,
+    /// SHA-256 of the eligible text with its event separators.
+    pub digest: [u8; 32],
+    /// SHA-256 before the last native record that contributed eligible text.
+    pub before_last_record: [u8; 32],
+    /// Searchable byte boundaries at damaged records in a full scan with interior damage.
+    pub interior_damage: Option<Vec<usize>>,
+    pub last_record_time: Option<i64>,
+    pub dated_suffix_records: Vec<(usize, usize, i64)>,
+    /// Physical length at which the JSONL head and tail windows were sampled.
+    pub sampled_file_bytes: Option<u64>,
+    /// Digest and length of the confirmed text in the legacy sampling windows after damage.
+    pub legacy_damage_sample: Option<([u8; 32], usize)>,
+    pub torn_final: bool,
+    pub verified_append: bool,
+    pub database_gap: bool,
+    pub database_history_unverified: bool,
+    pub database_steps: Option<Vec<Uuid>>,
+    pub database_aliases: std::sync::Arc<antigravity_receipts::DatabaseAliases>,
+    /// Physical length scanned from start to end, including unreadable native records.
+    pub fully_scanned_bytes: Option<u64>,
+    state: sha2::Sha256,
+}
+
+impl SearchProjection {
+    #[must_use]
+    pub fn new(byte_count: usize, state: sha2::Sha256, before_last_record: sha2::Sha256) -> Self {
+        use sha2::Digest;
+        Self {
+            byte_count,
+            interior_damage: None,
+            last_record_time: None,
+            dated_suffix_records: Vec::new(),
+            sampled_file_bytes: None,
+            legacy_damage_sample: None,
+            torn_final: false,
+            verified_append: false,
+            database_gap: false,
+            database_history_unverified: false,
+            database_steps: None,
+            database_aliases: std::sync::Arc::default(),
+            fully_scanned_bytes: None,
+            digest: state.clone().finalize().into(),
+            before_last_record: before_last_record.finalize().into(),
+            state,
+        }
+    }
+
+    /// Checks an older index digest that included the leading events of the missing record.
+    #[must_use]
+    pub fn matches_with_suffix(&self, suffix: &[u8], expected: &[u8]) -> bool {
+        use sha2::Digest;
+        self.state
+            .clone()
+            .chain_update(suffix)
+            .finalize()
+            .as_slice()
+            == expected
+    }
+}
+
+impl PartialEq for SearchProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.byte_count == other.byte_count
+            && self.digest == other.digest
+            && self.before_last_record == other.before_last_record
+            && self.last_record_time == other.last_record_time
+            && self.dated_suffix_records == other.dated_suffix_records
+            && self.interior_damage == other.interior_damage
+            && self.sampled_file_bytes == other.sampled_file_bytes
+            && self.legacy_damage_sample == other.legacy_damage_sample
+            && self.torn_final == other.torn_final
+            && self.verified_append == other.verified_append
+            && self.database_gap == other.database_gap
+            && self.database_history_unverified == other.database_history_unverified
+            && self.database_steps == other.database_steps
+            && self.database_aliases == other.database_aliases
+            && self.fully_scanned_bytes == other.fully_scanned_bytes
+    }
+}
+
+impl Eq for SearchProjection {}
+
+/// Splits a capped search document at the marker between its two retained windows.
+#[must_use]
+pub fn search_document_windows(text: &str) -> Option<(&str, &str)> {
+    search_windows(text, SEARCH_DOCUMENT_EDGE_BYTE_LIMIT)
+}
+
+/// Returns the bounded event length, including its separator, when its complete head and tail
+/// survive at the outside edge of an older document window.
+#[must_use]
+pub fn capped_search_event_at_edge(window: &str, tail: bool) -> Option<usize> {
+    for edge in [
+        SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
+        SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
+    ] {
+        // Each UTF-8 boundary can move inward by at most three bytes.
+        for len in (2 * edge - 6..=2 * edge).rev() {
+            let event = if tail {
+                let Some(start) = window.len().checked_sub(len) else {
+                    continue;
+                };
+                window
+                    .split_at_checked(start)
+                    .filter(|(prefix, _)| prefix.ends_with("\n\n"))
+                    .map(|(_, event)| event)
+            } else {
+                window
+                    .split_at_checked(len)
+                    .filter(|(_, suffix)| suffix.starts_with("\n\n"))
+                    .map(|(event, _)| event)
+            };
+            if event.is_some_and(|text| search_windows(text, edge).is_some()) {
+                return Some(len + 2);
+            }
+        }
+    }
+    None
+}
+
+fn search_windows(text: &str, edge_limit: usize) -> Option<(&str, &str)> {
+    let head_budget = (2 * edge_limit - SEARCH_TRUNCATION_NOTICE.len()).div_ceil(2);
+    (head_budget.saturating_sub(3)..=head_budget).find_map(|i| {
+        let (head, rest) = text.split_at_checked(i)?;
+        Some((head, rest.strip_prefix(SEARCH_TRUNCATION_NOTICE)?))
+    })
+}
 
 macro_rules! define_providers {
     ($( $(#[$variant_attribute:meta])* $variant:ident ),+ $(,)?) => {
@@ -281,14 +426,33 @@ pub struct WorkspaceSnapshot {
 }
 
 /// The selected provider file, its contents revision, and any missing source needed for indexing.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq)]
 pub struct SourceRevision {
+    /// A historical file ID derived from the same open file for cache migration.
+    pub legacy_file: Option<Uuid>,
     pub file: Option<Uuid>,
     pub contents: Option<Uuid>,
     pub missing_ancestor: Option<Uuid>,
 }
 
+impl PartialEq for SourceRevision {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl std::hash::Hash for SourceRevision {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
 impl SourceRevision {
+    // Stored revisions keep their identity when a live reader supplies a historical file ID.
+    fn identity(self) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
+        (self.file, self.contents, self.missing_ancestor)
+    }
+
     /// Checks whether both reads observed the same provider file and contents revision.
     #[must_use]
     pub fn matches_file_contents(self, other: Self) -> bool {

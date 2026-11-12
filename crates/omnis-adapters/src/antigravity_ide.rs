@@ -86,6 +86,15 @@ impl AntigravityIdeAdapter {
         }
     }
 
+    /// Compares historical WAL rows for an IDE reference to a verified Desktop database.
+    #[must_use]
+    pub fn with_previous_wal_rows(mut self, expected: Vec<uuid::Uuid>) -> Self {
+        self.cached_desktop = self
+            .cached_desktop
+            .map(|reader| reader.with_previous_wal_rows(expected));
+        self
+    }
+
     /// Returns whether a standalone IDE transcript read omitted records.
     #[must_use]
     pub fn has_unreadable_log_records(snapshot: &CanonicalSnapshot) -> bool {
@@ -218,10 +227,8 @@ impl AntigravityIdeAdapter {
         let path = match self.history(session)? {
             IdeHistory::Log(path) => path,
             IdeHistory::Desktop(root) => {
-                let desktop = self
-                    .cached_desktop
-                    .clone()
-                    .unwrap_or_else(|| AntigravityDesktopAdapter::with_root(root));
+                let fallback = AntigravityDesktopAdapter::with_root(root);
+                let desktop = self.cached_desktop.as_ref().unwrap_or(&fallback);
                 let mut snapshot = desktop
                     .read_session(&SessionRef::new(Provider::AntigravityDesktop, &session.id))?;
                 // Preserve old references while recording the actual product in event provenance.

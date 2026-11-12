@@ -31,7 +31,9 @@ known-folders = "1.4.2"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 md-5 = "0.11"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFPreferences", "CFString"] }
+percent-encoding = "2"
 prost = "0.14"
+quick-xml = { version = "0.41.0", features = ["serialize"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 rustix = { version = "1.1", features = ["event", "process"] }
@@ -47,11 +49,14 @@ toml = { version = "1.1", default-features = false, features = ["parse", "serde"
 thiserror = "2.0"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
+url = "2"
 uuid = { version = "1.17", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
 wait-timeout = "0.2"
 winapi-util = "0.1.11"
 winreg = "0.56"
+# Later versions removed the safe file change-time query.
+winx = "0.22"
 zstd = { version = "0.13", default-features = false }
 
 [workspace.lints.rust]

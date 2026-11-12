@@ -21,10 +21,11 @@ use prost::Message;
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeListing, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeListing, NativeSession, ProviderAdapter,
+    ProviderInstallation,
     antigravity::{
-        ProtoTimestamp, history_file_time, nonempty, proto_timestamp, push_database_steps,
-        validate_id, workspace_uri_path,
+        DatabaseCoverage, ProtoTimestamp, history_file_time, nonempty, proto_timestamp,
+        push_database_steps, validate_id, workspace_uri_path,
     },
     support::{
         EventBuilder, MAX_DISCOVERED_FILES, MAX_DISCOVERY_ENTRIES, paths_match, provider_file,
@@ -41,6 +42,7 @@ const MAX_SUMMARIES_SIZE: u64 = 64 * 1024 * 1024;
 pub struct AntigravityDesktopAdapter {
     root: Option<PathBuf>,
     cached_step_count: Option<CachedCount>,
+    previous_wal_rows: Vec<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +60,7 @@ impl AntigravityDesktopAdapter {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
+            previous_wal_rows: Vec::new(),
             cached_step_count: None,
         }
     }
@@ -67,6 +70,7 @@ impl AntigravityDesktopAdapter {
     pub fn with_cached_step_count(root: &Path, file: Uuid, count: usize) -> Self {
         Self {
             root: Some(root.to_owned()),
+            previous_wal_rows: Vec::new(),
             cached_step_count: Some(CachedCount {
                 file,
                 minimum: count,
@@ -80,12 +84,20 @@ impl AntigravityDesktopAdapter {
     pub fn with_uncertain_step_count(root: &Path, file: Uuid, minimum: usize) -> Self {
         Self {
             root: Some(root.to_owned()),
+            previous_wal_rows: Vec::new(),
             cached_step_count: Some(CachedCount {
                 file,
                 minimum,
                 uncertain: true,
             }),
         }
+    }
+
+    /// Compares rows from an earlier committed WAL of the configured database.
+    #[must_use]
+    pub fn with_previous_wal_rows(mut self, expected: Vec<Uuid>) -> Self {
+        self.previous_wal_rows = expected;
+        self
     }
 
     /// Returns the native row fingerprints for a Desktop database read.
@@ -101,12 +113,136 @@ impl AntigravityDesktopAdapter {
             .as_deref()
             .ok_or_else(|| anyhow!("Antigravity Desktop data root was not found"))
     }
+
+    fn selected(&self, id: &str) -> Result<(NativeSession, bool)> {
+        let root = self.root()?;
+        let database = conversation_database(root, id)
+            .ok_or_else(|| anyhow!("Antigravity Desktop session `{id}` was not found"))?;
+        let summaries = read_summaries(root).ok().flatten();
+        let summary = summaries.as_ref().and_then(|rows| rows.get(id));
+        Ok((native_session(id, database, summary).0, summary.is_some()))
+    }
+
+    fn hidden(&self, id: &str) -> Result<bool> {
+        let root = self.root()?.canonicalize()?;
+        native_directory(&root, ANNOTATIONS)?
+            .map_or(Ok(false), |directory| archived(&directory, id))
+    }
+
+    fn snapshot(
+        &self,
+        native: &NativeSession,
+        has_summary: bool,
+    ) -> Result<(CanonicalSnapshot, DatabaseCoverage)> {
+        let database = native
+            .source_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("Antigravity Desktop history changed during the search read"))?;
+        let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &native.session.id);
+        let physical = self.cached_step_count.filter(|known| {
+            native.source_revision.and_then(|revision| revision.file) == Some(known.file)
+        });
+        let cached = physical.filter(|_| !has_summary);
+        let expected = if physical.is_some() {
+            self.previous_wal_rows.as_slice()
+        } else {
+            &[]
+        };
+        let declared = cached
+            .map_or(native.event_count, |known| known.minimum)
+            .max(expected.len());
+        let (_, mut coverage) =
+            push_database_steps(self.root()?, database, &mut builder, declared)?;
+        if !expected.is_empty() && !builder.contains_database_steps(expected) {
+            crate::antigravity::mark_unverified_database(
+                &mut builder,
+                "The restored database does not contain all rows previously read from its committed WAL.",
+            );
+            coverage.verified_prefix_end = Some(0);
+        }
+        if cached.is_some_and(|known| known.uncertain) {
+            crate::antigravity::mark_unverified_database(
+                &mut builder,
+                "Previous step counts for this database disagree and the current summary is unavailable.",
+            );
+            coverage.verified_prefix_end = Some(0);
+        }
+        Ok((
+            builder.snapshot(
+                native.session.clone(),
+                native.title.clone(),
+                native.project_path.clone(),
+                native.git_branch.clone(),
+                native.updated_at.unwrap_or_else(Utc::now),
+            ),
+            coverage,
+        ))
+    }
+
+    fn matches_database_path(&self, id: &str, hint: &Path, selected: &Path) -> Result<bool> {
+        let root = self.root()?;
+        Ok(hint == selected
+            || (hint == root.join(CONVERSATIONS).join(format!("{id}.db"))
+                && provider_file(root, hint).as_deref() == Some(selected)))
+    }
+
+    fn observed_index(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        budget: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::AntigravityDesktop)?;
+        validate_id(&session.id)?;
+        let (native, has_summary) = self.selected(&session.id)?;
+        let hidden = self.hidden(&session.id)?;
+        let path_matches = match (path, native.source_path.as_deref()) {
+            (Some(hint), Some(selected)) => {
+                !hidden && self.matches_database_path(&session.id, hint, selected)?
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        anyhow::ensure!(
+            path_matches && native.source_revision.is_some(),
+            "Antigravity Desktop history changed during the search read"
+        );
+        let read = self.snapshot(&native, has_summary);
+        anyhow::ensure!(
+            self.selected(&session.id)? == (native.clone(), has_summary)
+                && self.hidden(&session.id)? == hidden,
+            "Antigravity Desktop history changed during the search read"
+        );
+        let complete = budget > 0
+            && native
+                .source_path
+                .as_deref()
+                .and_then(|path| path.metadata().ok())
+                .is_some_and(|metadata| metadata.len() <= budget);
+        let (snapshot, coverage) = read?;
+        let incomplete = coverage.omitted > 0
+            || crate::antigravity::AntigravityAdapter::has_missing_database_steps(&snapshot);
+        Ok(IndexRead {
+            ownership_revision: None,
+            workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+            rollback_title: crate::RollbackTitle::Unknown,
+            verified_prefix_end: coverage.verified_prefix_end,
+            database_aliases: coverage.aliases.into(),
+            search_record_groups: Vec::new(),
+            snapshot,
+            source_complete: complete && !incomplete,
+            provider_limited: complete && incomplete,
+            source_revision: native.source_revision.unwrap_or_default(),
+            native_session: (!hidden).then_some(native),
+        })
+    }
 }
 
 impl Default for AntigravityDesktopAdapter {
     fn default() -> Self {
         Self {
             root: provider_root("ANTIGRAVITY_DESKTOP_HOME", &[".gemini", "antigravity"]),
+            previous_wal_rows: Vec::new(),
             cached_step_count: None,
         }
     }
@@ -245,6 +381,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             missing_desktop_summary_ids,
             archived_desktop_ids,
             unverified_desktop_ids,
+            ..NativeListing::default()
         })
     }
 
@@ -269,32 +406,33 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::AntigravityDesktop)?;
         validate_id(&session.id)?;
+        let (native, has_summary) = self.selected(&session.id)?;
+        self.snapshot(&native, has_summary)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn read_full_index_at(&self, session: &SessionRef, path: Option<&Path>) -> Result<IndexRead> {
+        self.observed_index(session, path, u64::MAX)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        budget: u64,
+    ) -> Result<IndexRead> {
+        self.observed_index(session, path, budget)
+    }
+
+    fn selected_session_at(&self, id: &str, path: &Path) -> Result<Option<NativeSession>> {
         let root = self.root()?;
-        let database = conversation_database(root, &session.id)
-            .ok_or_else(|| anyhow!("Antigravity Desktop session `{}` was not found", session.id))?;
-        let summaries = read_summaries(root).ok().flatten();
-        let summary = summaries.as_ref().and_then(|rows| rows.get(&session.id));
-        let (listed, _) = native_session(&session.id, database.clone(), summary);
-        let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let cached = self.cached_step_count.filter(|known| {
-            summary.is_none()
-                && listed.source_revision.and_then(|revision| revision.file) == Some(known.file)
-        });
-        let declared_steps = cached.map_or(listed.event_count, |known| known.minimum);
-        push_database_steps(root, &database, &mut builder, declared_steps)?;
-        if cached.is_some_and(|known| known.uncertain) {
-            crate::antigravity::mark_unverified_database(
-                &mut builder,
-                "Previous step counts for this database disagree and the current summary is unavailable.",
-            );
+        let Some(selected) = conversation_database(root, id) else {
+            return Ok(None);
+        };
+        if !self.matches_database_path(id, path, &selected)? || self.hidden(id)? {
+            return Ok(None);
         }
-        Ok(builder.snapshot(
-            session.clone(),
-            listed.title,
-            listed.project_path,
-            listed.git_branch,
-            listed.updated_at.unwrap_or_else(Utc::now),
-        ))
+        Ok(Some(self.selected(id)?.0))
     }
 
     fn new_session_plan(&self, _target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1062,6 +1200,89 @@ mod tests {
     }
 
     #[test]
+    fn wal_witness_matches_sqlite_recovery_across_edits_torn_frames_and_restarts() {
+        let original = tempfile::tempdir().unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        write_conversation(original.path(), SESSION_ID);
+        let relative = format!("conversations/{SESSION_ID}.db");
+        let source = original.path().join(&relative);
+        let copy = restored.path().join(relative);
+        fs::create_dir(copy.parent().unwrap()).unwrap();
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            UPDATE steps SET step_payload=(SELECT step_payload FROM steps WHERE idx=0) WHERE idx=1;").unwrap();
+        fs::copy(&source, &copy).unwrap();
+        let source_wal = crate::support::sidecar(&source, "-wal");
+        let restored_wal = crate::support::sidecar(&copy, "-wal");
+        let first = fs::read(&source_wal).unwrap();
+        writer
+            .execute_batch(
+                "INSERT INTO steps SELECT 4,step_type,step_payload FROM steps WHERE idx=0;",
+            )
+            .unwrap();
+        let both = fs::read(&source_wal).unwrap();
+        let adapter = AntigravityDesktopAdapter::with_root(restored.path());
+        let session = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
+        let observe = || {
+            adapter
+                .observe_search_source(&session, None)
+                .unwrap()
+                .unwrap()
+        };
+        let read = || adapter.read_session(&session).unwrap();
+        fs::write(&restored_wal, &both).unwrap();
+        let full = observe();
+        let file = full.revision.file.unwrap();
+        let commits = full.database_wal_commits().unwrap().to_vec();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            AntigravityDesktopAdapter::step_proof(&read())
+                .unwrap()
+                .len(),
+            4
+        );
+        fs::write(&restored_wal, &both[..both.len() - 1]).unwrap();
+        assert_eq!(observe().database_wal_commits().unwrap(), &commits[..1]);
+        let recovered = read();
+        assert!(crate::AntigravityAdapter::has_missing_database_steps(
+            &recovered
+        ));
+        let edited = AntigravityDesktopAdapter::step_proof(&recovered).unwrap();
+        assert_eq!(edited.len(), 3);
+        fs::write(&restored_wal, &first).unwrap();
+        assert_eq!(observe().database_wal_commits().unwrap(), &commits[..1]);
+        assert_eq!(
+            AntigravityDesktopAdapter::step_proof(&read()).unwrap(),
+            edited
+        );
+        fs::remove_file(&restored_wal).unwrap();
+        let fallback = AntigravityDesktopAdapter::with_cached_step_count(restored.path(), file, 3)
+            .with_previous_wal_rows(edited);
+        let checkpoint = fallback.read_session(&session).unwrap();
+        assert!(crate::AntigravityAdapter::has_missing_database_steps(
+            &checkpoint
+        ));
+        assert_ne!(
+            checkpoint.events[1].payload["text"],
+            recovered.events[1].payload["text"]
+        );
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(RESTART); DELETE FROM steps WHERE idx=4;")
+            .unwrap();
+        fs::copy(&source, &copy).unwrap();
+        fs::copy(source_wal, restored_wal).unwrap();
+        let reset = observe();
+        assert_eq!(reset.database_wal_commits().unwrap().len(), 1);
+        assert!(!commits.contains(&reset.database_wal_commits().unwrap()[0]));
+        assert_eq!(
+            AntigravityDesktopAdapter::step_proof(&read())
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn search_observes_the_selected_database_wal_count_and_archive() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
@@ -1091,6 +1312,8 @@ mod tests {
         write_summaries(root, vec![(SESSION_ID, ProtoTrajectorySummary::default())]);
         let healthy = observe();
         assert!(!healthy.desktop_summaries_unavailable);
+        assert!(missing.database_summary_revision().is_none());
+        assert!(healthy.database_summary_revision().is_some());
         assert_ne!(healthy.revision, missing.revision);
         assert!(missing.database_contents().is_some());
         assert_eq!(healthy.database_contents(), missing.database_contents());
@@ -1121,6 +1344,10 @@ mod tests {
         );
         assert_ne!(with_count.revision.contents, with_wal.revision.contents);
         assert_eq!(with_count.database_contents(), with_wal.database_contents());
+        assert_ne!(
+            with_count.database_summary_revision(),
+            with_wal.database_summary_revision()
+        );
         let annotations = root.join("annotations");
         fs::create_dir(&annotations).unwrap();
         fs::write(

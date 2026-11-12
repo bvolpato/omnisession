@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+use omnis_adapters::NativeSession;
 
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -30,23 +35,66 @@ impl CachedDatabaseAliases {
         Ok(Self { sources })
     }
 
+    pub(crate) fn live(
+        snapshot: &TrajectorySearchSnapshot<'_>,
+        provider: Option<Provider>,
+        homes: &HashMap<Provider, PathBuf>,
+        sessions: &[NativeSession],
+    ) -> Result<Self> {
+        if !sessions.iter().any(|row| {
+            matches!(
+                row.session.provider,
+                Provider::AntigravityIde | Provider::AntigravityDesktop
+            )
+        }) {
+            return Ok(Self::default());
+        }
+        let mut aliases = Self::read(
+            snapshot,
+            provider,
+            homes.get(&Provider::AntigravityIde).map(PathBuf::as_path),
+        )?;
+        if aliases.sources.is_empty() {
+            return Ok(aliases);
+        }
+        let mut selected = HashMap::new();
+        for row in sessions {
+            if let Some(source) = aliases.sources.remove(&row.session)
+                && let Some(home) = homes.get(&row.session.provider)
+                && row
+                    .source_revision
+                    .is_some_and(|revision| source.matches_observation(home, revision))
+            {
+                selected.insert(row.session.clone(), source);
+            }
+        }
+        Ok(Self { sources: selected })
+    }
+
+    pub(crate) fn project_titles(&self, titles: &mut Vec<IndexedTrajectoryTitle>) {
+        if self.sources.is_empty() {
+            return;
+        }
+        titles.retain(|row| !self.sources.contains_key(&row.session));
+        titles.extend(self.sources.iter().filter_map(|(session, source)| {
+            Some(IndexedTrajectoryTitle {
+                session: session.clone(),
+                ..source.title.as_ref()?.clone()
+            })
+        }));
+    }
+
     pub(crate) fn project_catalog(
         &self,
         sessions: &mut [IndexedSession],
         titles: &mut Vec<IndexedTrajectoryTitle>,
     ) {
-        titles.retain(|row| !self.sources.contains_key(&row.session));
+        self.project_titles(titles);
         for row in sessions {
             if let Some(source) = self.sources.get(&row.session) {
                 let session = row.session.clone();
                 row.clone_from(&source.catalog);
-                row.session.clone_from(&session);
-                if let Some(title) = &source.title {
-                    titles.push(IndexedTrajectoryTitle {
-                        session,
-                        ..title.clone()
-                    });
-                }
+                row.session = session;
             }
         }
     }

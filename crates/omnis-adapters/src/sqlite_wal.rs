@@ -40,21 +40,8 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
     }
     let mut header = [0; 32];
     wal.read_exact(&mut header)?;
+    let (page_size, read, seed) = header_fields(&header)?;
     let words = header.as_chunks::<4>().0;
-    let read = match u32::from_be_bytes(words[0]) {
-        0x377f_0682 => u32::from_le_bytes,
-        0x377f_0683 => u32::from_be_bytes,
-        _ => anyhow::bail!("invalid SQLite WAL magic"),
-    };
-    let page_size = u32::from_be_bytes(words[2]);
-    let seed = [u32::from_be_bytes(words[6]), u32::from_be_bytes(words[7])];
-    ensure!(
-        u32::from_be_bytes(words[1]) == 3_007_000
-            && (512..=65_536).contains(&page_size)
-            && page_size.is_power_of_two()
-            && checksum(&header[..24], read, [0, 0]) == seed,
-        "invalid SQLite WAL header"
-    );
     let stride = FRAME_HEADER_BYTES + u64::from(page_size);
     ensure!(
         (len - HEADER_BYTES).is_multiple_of(stride),
@@ -117,6 +104,70 @@ pub(super) fn verify(connection: &Connection, path: &Path) -> Result<()> {
         ensure!(matches, "unverified SQLite WAL frame checksum");
     }
     Ok(())
+}
+
+type WordReader = fn([u8; 4]) -> u32;
+
+fn header_fields(header: &[u8; 32]) -> Result<(u32, WordReader, [u32; 2])> {
+    let words = header.as_chunks::<4>().0;
+    let read = match u32::from_be_bytes(words[0]) {
+        0x377f_0682 => u32::from_le_bytes,
+        0x377f_0683 => u32::from_be_bytes,
+        _ => anyhow::bail!("invalid SQLite WAL magic"),
+    };
+    let page_size = u32::from_be_bytes(words[2]);
+    let seed = [u32::from_be_bytes(words[6]), u32::from_be_bytes(words[7])];
+    ensure!(
+        u32::from_be_bytes(words[1]) == 3_007_000
+            && (512..=65_536).contains(&page_size)
+            && page_size.is_power_of_two()
+            && checksum(&header[..24], read, [0, 0]) == seed,
+        "invalid SQLite WAL header"
+    );
+    Ok((page_size, read, seed))
+}
+
+/// Identifies each committed prefix by its header, frames, and page bytes, stopping
+/// at the first frame SQLite recovery cannot use.
+pub(super) fn commit_history(path: &Path, max_bytes: u64) -> Result<Vec<uuid::Uuid>> {
+    use sha2::{Digest, Sha256};
+
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    ensure!(len <= max_bytes, "WAL exceeds the snapshot byte limit");
+    let mut wal = BufReader::new(file);
+    let mut header = [0; 32];
+    wal.read_exact(&mut header)?;
+    let (page_size, read, mut running) = header_fields(&header)?;
+    let stride = u64::from(page_size) + FRAME_HEADER_BYTES;
+    let mut hash = Sha256::new();
+    hash.update(header);
+    let mut page = vec![0; usize::try_from(page_size)?];
+    let mut commits = Vec::new();
+    for _ in 0..(len - HEADER_BYTES) / stride {
+        let mut frame = [0; 24];
+        wal.read_exact(&mut frame)?;
+        if frame[..4] == [0; 4] || frame[8..16] != header[16..24] {
+            break;
+        }
+        wal.read_exact(&mut page)?;
+        running = checksum(&frame[..8], read, running);
+        running = checksum(&page, read, running);
+        if frame[16..20] != running[0].to_be_bytes() || frame[20..24] != running[1].to_be_bytes() {
+            break;
+        }
+        hash.update(frame);
+        hash.update(&page);
+        if frame[4..8] != [0; 4] {
+            ensure!(
+                commits.len() < crate::antigravity::MAX_DATABASE_STEPS,
+                "WAL commit history exceeds the receipt limit"
+            );
+            let digest = hash.clone().finalize();
+            commits.push(uuid::Uuid::from_slice(&digest[..16])?);
+        }
+    }
+    Ok(commits)
 }
 
 fn verify_older_headers(

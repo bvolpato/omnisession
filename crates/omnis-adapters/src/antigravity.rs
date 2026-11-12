@@ -8,20 +8,26 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
+use omnis_core::{SearchDocumentBuilder, SearchTruncationStrategy, session_preview};
+use omnis_ir::{
+    CanonicalSnapshot, EventKind, OmniEvent, Provider, ReplayPolicy, SessionRef, SourceRevision,
+};
 use prost::Message;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use sha2::Digest;
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IncompleteTranscript, IndexRead, IndexedSearchDocument, LaunchPlan, LaunchTarget,
+    NativeSession, PriorSearchDocument, ProviderAdapter, ProviderInstallation,
     SearchSourceObservation, source_file_revision,
     support::{
-        EventBuilder, IncompleteTranscript, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_tail, parse_timestamp,
-        paths_match, provider_executable, provider_file, provider_root, sidecar, sort_sessions,
-        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines_with_tail,
+        EventBuilder, JsonLineDamage, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+        SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_prefix,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root, sidecar,
+        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
+        visit_json_lines_with_tail, visit_limited_search_edges, visit_streamed_json_file,
     },
 };
 
@@ -138,11 +144,128 @@ impl AntigravityAdapter {
         Ok(catalog)
     }
 
+    fn observed_native(&self, id: &str) -> Result<(Summary, Option<anyhow::Error>, NativeSession)> {
+        validate_id(id)?;
+        let root = self.root()?;
+        self.summaries
+            .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
+                let summary = summary_by_id(&catalog.connection, id)?;
+                let source = self.source(&summary)?;
+                let catalog_wal = catalog.verify_wal();
+                let revision = summary.search_revision(root, &source, catalog_wal.is_ok())?;
+                let wal_error = if Self::is_summary_catalog(&source) {
+                    catalog_wal?;
+                    None
+                } else {
+                    catalog_wal.err()
+                };
+                let native = summary.native_session(Some(source), Some(revision));
+                Ok((summary, wal_error, native))
+            })
+    }
+    fn open_history(
+        &self,
+        summary: &Summary,
+        path: &Path,
+    ) -> Result<(
+        std::fs::File,
+        u64,
+        NativeSession,
+        crate::source_file::ObservedSourceFile,
+    )> {
+        anyhow::ensure!(
+            self.source(summary)? == path,
+            "Antigravity history changed during the search read"
+        );
+        let file = std::fs::File::open(path)
+            .context("Antigravity history changed during the search read")?;
+        let before = file.metadata()?;
+        let (current, wal_error, native) = self.observed_native(&summary.id)?;
+        ensure!(
+            current == *summary,
+            "Antigravity summary changed during the search read"
+        );
+        let observed = crate::source_file::ObservedSourceFile::from_open_file(path, &file, &before)
+            .context("Antigravity history changed during the search read")?;
+        anyhow::ensure!(
+            native.source_revision
+                == Some(summary.search_revision_from(
+                    self.root()?,
+                    path,
+                    wal_error.is_none(),
+                    Some(observed)
+                )?),
+            "Antigravity history changed during the search read"
+        );
+        Ok((file, before.len(), native, observed))
+    }
+
+    fn ensure_history_unchanged(
+        &self,
+        summary: &Summary,
+        path: &Path,
+        observed: crate::source_file::ObservedSourceFile,
+        handle: &std::fs::File,
+    ) -> Result<()> {
+        observed.ensure_unchanged(path, path, handle)?;
+        anyhow::ensure!(
+            self.source(summary)? == path,
+            "Antigravity history changed during the search read"
+        );
+        Ok(())
+    }
+
+    fn read_observed(
+        &self,
+        session: &SessionRef,
+        path: Option<&Path>,
+        preview: bool,
+        tail: JsonLineTail<'_>,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::Antigravity)?;
+
+        let (summary, wal_error, native) = self.observed_native(&session.id)?;
+        ensure!(
+            path.is_none_or(|p| native.source_path.as_deref() == Some(p)),
+            "Antigravity history changed during the search read"
+        );
+        let read = self.read_summary(session, &summary, wal_error, preview, tail);
+        let (current, _, after) = self.observed_native(&session.id)?;
+        ensure!(
+            current == summary
+                && after.source_path == native.source_path
+                && after.source_revision == native.source_revision,
+            "Antigravity history changed during the search read"
+        );
+        let history = read?;
+        Ok(IndexRead {
+            ownership_revision: None,
+            workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+            rollback_title: crate::RollbackTitle::Unknown,
+            verified_prefix_end: history.verified_prefix_end.or_else(|| {
+                tail.damage()
+                    .filter(|_| !preview)
+                    .and_then(JsonLineDamage::verified_prefix_end)
+            }),
+            database_aliases: history.database_aliases.into(),
+            search_record_groups: history.search_record_groups,
+            snapshot: history.snapshot,
+            source_complete: !preview
+                && !history.unverified_database
+                && history.omitted_database_rows == 0
+                && tail.damage().is_none_or(|damage| damage.count() == 0),
+            provider_limited: !preview
+                && (history.unverified_database || history.omitted_database_rows > 0),
+            source_revision: native.source_revision.unwrap_or_default(),
+            native_session: Some(native),
+        })
+    }
+
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Antigravity)?;
         validate_id(&session.id)?;
         let root = self.root()?;
-        let (summary, mut catalog_wal_error) =
+        let (summary, wal_error) =
             self.summaries
                 .read_snapshot(root, &root.join(SUMMARY_DATABASE), |catalog| {
                     Ok((
@@ -150,72 +273,438 @@ impl AntigravityAdapter {
                         catalog.verify_wal().err(),
                     ))
                 })?;
-        let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
+        self.read_summary(
+            session,
+            &summary,
+            wal_error,
+            preview,
+            JsonLineTail::ReportIncomplete(&JsonLineDamage::default()),
+        )
+        .map(|read| read.snapshot)
+    }
+    fn read_summary(
+        &self,
+        session: &SessionRef,
+        summary: &Summary,
+        mut catalog_wal_error: Option<anyhow::Error>,
+        preview: bool,
+        tail: JsonLineTail<'_>,
+    ) -> Result<ObservedHistory> {
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
-        let path = self.source(&summary)?;
+        let mut groups = Vec::new();
+        let mut verified_prefix_end = None;
+        let mut omitted_database_rows = 0;
+        let mut database_aliases = omnis_ir::antigravity_receipts::DatabaseAliases::new();
+        let path = self.source(summary)?;
         let transcript = path.extension().is_some_and(|ext| ext == "jsonl");
         if transcript {
-            if preview {
-                for record in json_lines_preview_with_tail(
-                    &path,
-                    PREVIEW_RECORDS,
-                    JsonLineTail::RequireComplete,
-                )? {
-                    push_transcript_record(&mut builder, &record);
+            let mut push = |record: Value| {
+                let start = builder.checkpoint();
+                push_transcript_record(&mut builder, &record);
+                let end = builder.checkpoint();
+                if !preview && let Some(damage) = tail.damage() {
+                    damage.confirm_prefix(end);
                 }
+                if end - start > 1 {
+                    groups.push(start..end);
+                }
+                start
+            };
+            let oversized = if preview {
+                let (records, verified) =
+                    json_lines_preview_with_prefix(&path, PREVIEW_RECORDS, tail)?;
+                for (index, record) in records.into_iter().enumerate() {
+                    let start = push(record);
+                    if index == verified {
+                        verified_prefix_end = Some(start);
+                    }
+                }
+                0
             } else {
-                let oversized_records = visit_json_lines_with_tail(
+                visit_json_lines_with_tail(
                     &path,
                     MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-                    JsonLineTail::RequireComplete,
+                    tail,
                     |record| {
-                        push_transcript_record(&mut builder, &record);
+                        push(record);
                         Ok(())
                     },
-                )?;
-                builder.push_oversized_record_notice(oversized_records, summary.updated_at);
-            }
+                )?
+            };
+            builder.push_oversized_record_notice(oversized, summary.updated_at);
+            verify_jsonl_history(self.root()?, &path, summary, &builder)?;
+            record_jsonl_damage(&mut builder, tail, summary.updated_at);
         } else if !Self::is_summary_catalog(&path) {
             let declared = if catalog_wal_error.is_none() {
                 summary.step_count.unwrap_or(0)
             } else {
                 0
             };
-            let decoded = push_database_steps(root, &path, &mut builder, declared)?;
+            let (decoded, coverage) =
+                push_database_steps(self.root()?, &path, &mut builder, declared)?;
+            verified_prefix_end = coverage.verified_prefix_end;
+            omitted_database_rows = coverage.omitted;
+            database_aliases = coverage.aliases;
             if let Some(error) = catalog_wal_error.take() {
                 if decoded == 0 {
                     return Err(error);
                 }
                 mark_unverified_wal(&mut builder);
+                verified_prefix_end = Some(0);
             }
         }
-
-        let snapshot = builder.snapshot(
-            session.clone(),
-            nonempty(summary.title),
-            summary.project_path,
-            None,
-            captured_at,
-        );
-        if snapshot.events.is_empty()
+        if builder.checkpoint() == 0
             && let Some(error) = catalog_wal_error
         {
             return Err(error);
         }
-        if snapshot.events.is_empty() && !Self::is_summary_catalog(&path) {
+        if builder.checkpoint() == 0 && !Self::is_summary_catalog(&path) {
             if transcript && (summary.step_count != Some(0) || fs::metadata(&path)?.len() != 0) {
                 return Err(IncompleteTranscript.into());
             }
             ensure!(
                 summary.step_count == Some(0),
-                "Antigravity session `{}` has no readable steps in its history",
+                "Antigravity session {} has no readable steps in its history",
                 session.id
             );
             verify_empty_history_sources(self.root()?, &session.id, &path)?;
         }
-        Ok(snapshot)
+        let snapshot = summary.snapshot(session, builder);
+        let unverified_database =
+            database_notices(&snapshot).any(|notice| notice["native_history_unverified"] == true);
+        Ok(ObservedHistory {
+            snapshot,
+            unverified_database,
+            database_aliases,
+            search_record_groups: groups,
+            verified_prefix_end,
+            omitted_database_rows,
+        })
     }
+}
+
+struct ObservedHistory {
+    unverified_database: bool,
+    database_aliases: omnis_ir::antigravity_receipts::DatabaseAliases,
+    omitted_database_rows: usize,
+    snapshot: CanonicalSnapshot,
+    search_record_groups: Vec<std::ops::Range<u64>>,
+    verified_prefix_end: Option<u64>,
+}
+
+#[derive(Default)]
+struct DamagedRecordPositions {
+    dated_records: Vec<(usize, usize, i64)>,
+    interior_seen: usize,
+    starts: Vec<usize>,
+}
+
+impl DamagedRecordPositions {
+    fn observe_suffix(&mut self, record: &serde_json::Value, before: usize, after: usize) {
+        if self.interior_seen > 0
+            && after > before
+            && after <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+            && let Some(time) =
+                parse_timestamp(record.get("created_at")).and_then(|t| t.timestamp_nanos_opt())
+        {
+            let start = if before == 0 { 0 } else { before + 2 };
+            self.dated_records.push((start, after, time));
+        }
+    }
+
+    fn observe(&mut self, damage: &JsonLineDamage, document: &SearchDocumentBuilder) -> usize {
+        let bytes = document.projected_byte_count();
+        if damage.interior_count() > self.interior_seen || damage.final_record() {
+            self.interior_seen = damage.interior_count();
+            if bytes <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+                && self.starts.last() != Some(&bytes)
+            {
+                self.starts.push(bytes);
+            }
+        }
+        bytes
+    }
+}
+
+// A growing partial transcript can publish more confirmed turns if its earlier search text still matches.
+struct PreviousSearchPrefix {
+    expected: Option<(usize, [u8; 32])>,
+    verified: bool,
+}
+
+impl PreviousSearchPrefix {
+    fn new(prior: Option<PriorSearchDocument>) -> Self {
+        let expected = match prior {
+            Some(
+                PriorSearchDocument::Complete {
+                    byte_count: n,
+                    indexed_hash,
+                }
+                | PriorSearchDocument::Partial {
+                    byte_count: n @ 1..,
+                    indexed_hash,
+                    ..
+                },
+            ) => Some((n, indexed_hash)),
+            _ => None,
+        };
+        if let Some((0, hash)) = expected {
+            return Self {
+                expected: None,
+                verified: sha2::Sha256::digest(b"").as_slice() == hash,
+            };
+        }
+        Self {
+            expected,
+            verified: expected.is_none(),
+        }
+    }
+
+    fn observe(&mut self, document: &SearchDocumentBuilder) {
+        if let Some((length, hash)) = self.expected
+            && document.source_byte_count() >= length
+        {
+            self.verified =
+                document.source_byte_count() == length && document.indexed_text_hash() == hash;
+            self.expected = None;
+        }
+    }
+
+    fn sample_at(
+        file: &mut std::fs::File,
+        session: &SessionRef,
+        end: u64,
+    ) -> Result<SearchDocumentBuilder> {
+        let damage = JsonLineDamage::default();
+        let (records, _) = crate::support::json_lines_preview_at(
+            file,
+            PREVIEW_RECORDS,
+            JsonLineTail::ReportIncomplete(&damage),
+            end,
+        )?;
+        let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut document = SearchDocumentBuilder::default();
+        for record in records {
+            push_transcript_record(&mut builder, &record);
+            for event in builder.drain_events() {
+                document.push(&event);
+            }
+        }
+        Ok(document)
+    }
+
+    fn verified_preview(
+        &mut self,
+        preview: IndexRead,
+        session: &SessionRef,
+        mut file: std::fs::File,
+        length: u64,
+        prior: Option<PriorSearchDocument>,
+        torn: bool,
+    ) -> Result<IndexedSearchDocument> {
+        self.observe_preview(&preview.snapshot, torn);
+        self.verify(torn, &mut file, session, length, prior, false)?;
+        let mut indexed: IndexedSearchDocument = preview.into();
+        if let Some(projection) = &mut indexed.document.projection {
+            projection.sampled_file_bytes = Some(length);
+        }
+        Ok(indexed)
+    }
+
+    fn observe_preview(&mut self, snapshot: &CanonicalSnapshot, torn: bool) {
+        if torn && self.expected.is_some() {
+            let mut document = SearchDocumentBuilder::default();
+            for event in &snapshot.events {
+                document.push(event);
+                self.observe(&document);
+                if self.expected.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn required_edge_bytes(
+        full_read_bytes: u64,
+        prior: Option<PriorSearchDocument>,
+    ) -> Option<usize> {
+        match (full_read_bytes, prior) {
+            (
+                u64::MAX,
+                Some(
+                    PriorSearchDocument::RequireCompleteTail(bytes)
+                    | PriorSearchDocument::Complete {
+                        byte_count: bytes, ..
+                    },
+                ),
+            ) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    fn tail_policy(
+        damage: &JsonLineDamage,
+        prior: Option<PriorSearchDocument>,
+        limited: bool,
+    ) -> JsonLineTail<'_> {
+        if matches!(prior, Some(PriorSearchDocument::RequireCompleteTail(_)))
+            || (limited && matches!(prior, Some(PriorSearchDocument::Complete { .. })))
+        {
+            JsonLineTail::RequireCompleteTail(damage)
+        } else {
+            JsonLineTail::ReportIncomplete(damage)
+        }
+    }
+
+    fn needs_damage_check(damage: &JsonLineDamage, prior: Option<PriorSearchDocument>) -> bool {
+        if matches!(prior, Some(PriorSearchDocument::Complete { .. }))
+            && damage.interior_count() > 0
+        {
+            return false;
+        }
+        damage.final_record()
+            || (damage.interior_count() > 0
+                && matches!(
+                    prior,
+                    Some(PriorSearchDocument::Partial {
+                        recover_from_full_scan: true,
+                        sampled_file_bytes: None,
+                        ..
+                    })
+                ))
+    }
+
+    fn verify(
+        &self,
+        torn: bool,
+        file: &mut std::fs::File,
+        session: &SessionRef,
+        length: u64,
+        prior: Option<PriorSearchDocument>,
+        full_scan: bool,
+    ) -> Result<Option<([u8; 32], usize)>> {
+        if !torn || self.verified {
+            return Ok(None);
+        }
+        if let Some(PriorSearchDocument::Partial {
+            byte_count,
+            indexed_hash,
+            sampled_file_bytes,
+            recover_from_full_scan,
+        }) = prior
+        {
+            if let Some(old) = sampled_file_bytes
+                && old <= length
+            {
+                let sample = Self::sample_at(file, session, old)?;
+                if sample.source_byte_count() == byte_count
+                    && sample.indexed_text_hash() == indexed_hash
+                {
+                    return Ok(None);
+                }
+            } else if full_scan && recover_from_full_scan {
+                let sample = Self::sample_at(file, session, length)?.finish();
+                return Ok(Some(sample.projection.map_or_else(
+                    || (sha2::Sha256::digest(b"").into(), 0),
+                    |p| (p.digest, p.byte_count),
+                )));
+            }
+        }
+        Err(IncompleteTranscript.into())
+    }
+}
+
+fn record_jsonl_damage(
+    builder: &mut EventBuilder,
+    tail: JsonLineTail<'_>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if let Some(damage) = tail.damage().filter(|damage| damage.count() > 0) {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({"omitted_events": damage.count(), "native_history_unverified": true, "incomplete_final_record": damage.final_record()}),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some(if damage.final_record() { "omnisession.antigravity_incomplete_tail" } else { "omnisession.antigravity_malformed_record" }.to_owned()),
+            None,
+        );
+    }
+}
+
+fn finish_search_document(
+    document: SearchDocumentBuilder,
+    gaps: DamagedRecordPositions,
+    length: u64,
+    provider_limited: bool,
+    torn_final: bool,
+    legacy_sample: Option<([u8; 32], usize)>,
+    verified_append: bool,
+) -> omnis_core::SearchDocument {
+    let mut document = document.finish();
+    if length <= MAX_STREAMED_TRANSCRIPT_FILE_SIZE
+        && let Some(projection) = document.projection.as_mut()
+    {
+        projection.fully_scanned_bytes = Some(length);
+        projection.torn_final = torn_final;
+        projection.verified_append = verified_append;
+        projection.legacy_damage_sample = legacy_sample;
+        if gaps.interior_seen > 0 {
+            projection.dated_suffix_records = gaps.dated_records;
+            projection.interior_damage = Some(gaps.starts);
+        }
+    }
+    if provider_limited {
+        document.source_complete = false;
+        document.truncated = true;
+        document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
+    }
+    document
+}
+
+fn project_search_record(
+    record: &Value,
+    events: &mut EventBuilder,
+    document: &mut SearchDocumentBuilder,
+    title_source: &mut CanonicalSnapshot,
+) {
+    let start = events.checkpoint();
+    push_transcript_record(events, record);
+    for event in events.drain_events() {
+        document.push_record_event(&event, start);
+        capture_first_message(title_source, event);
+    }
+}
+
+fn capture_first_message(snapshot: &mut CanonicalSnapshot, event: OmniEvent) {
+    if snapshot.events.is_empty()
+        && matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        )
+    {
+        snapshot.events.push(event);
+        if session_preview(snapshot).first.is_none() {
+            snapshot.events.clear();
+        }
+    }
+}
+
+fn verify_jsonl_history(
+    root: &Path,
+    path: &Path,
+    summary: &Summary,
+    events: &EventBuilder,
+) -> Result<()> {
+    if events.checkpoint() != 0 {
+        return Ok(());
+    }
+    if summary.step_count != Some(0) || fs::metadata(path)?.len() != 0 {
+        return Err(IncompleteTranscript).with_context(|| format!(
+            "Antigravity session `{}` declares history but its transcript contains no readable steps", summary.id
+        ));
+    }
+    verify_empty_history_sources(root, &summary.id, path)
 }
 
 fn database_notices(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &Value> {
@@ -307,6 +796,10 @@ impl ProviderAdapter for AntigravityAdapter {
         Ok(sessions)
     }
 
+    fn selected_session_at(&self, id: &str, path: &Path) -> Result<Option<NativeSession>> {
+        let (_, _, native) = self.observed_native(id)?;
+        Ok((native.source_path.as_deref() == Some(path)).then_some(native))
+    }
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read(session, false)
     }
@@ -441,6 +934,148 @@ impl ProviderAdapter for AntigravityAdapter {
         self.read(session, true)
     }
 
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.read_observed(
+            session,
+            source_path,
+            false,
+            JsonLineTail::ReportIncomplete(&JsonLineDamage::default()),
+        )
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        let preview = !self.search_source_is_summary(session, source_path)?
+            && (full_read_bytes == 0
+                || source_path
+                    .and_then(|path| path.metadata().ok())
+                    .is_some_and(|metadata| metadata.len() > full_read_bytes));
+        if preview {
+            self.read_observed(
+                session,
+                source_path,
+                true,
+                JsonLineTail::ReportIncomplete(&JsonLineDamage::default()),
+            )
+        } else {
+            self.read_observed(session, source_path, false, JsonLineTail::RequireComplete)
+        }
+    }
+
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+        prior: Option<PriorSearchDocument>,
+    ) -> Result<IndexedSearchDocument> {
+        let Some(path) =
+            source_path.filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        else {
+            return self
+                .index_session(session, source_path, full_read_bytes)
+                .map(Into::into);
+        };
+        validate_provider(session, Provider::Antigravity)?;
+        let summary = self.summary(&session.id)?;
+        let (file, length, native, observed) = self.open_history(&summary, path)?;
+        let mut handle = file.try_clone()?;
+        let torn = JsonLineDamage::default();
+        let limited = length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
+        let tail = PreviousSearchPrefix::tail_policy(&torn, prior, limited);
+        let mut prefix = PreviousSearchPrefix::new(prior);
+        if !limited && length > full_read_bytes {
+            let preview = self.read_observed(session, Some(path), true, tail)?;
+            let result =
+                prefix.verified_preview(preview, session, file, length, prior, torn.final_record());
+            self.ensure_history_unchanged(&summary, path, observed, &handle)?;
+            return result;
+        }
+        let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
+        let mut title_source = summary.snapshot(
+            session,
+            EventBuilder::new(Provider::Antigravity, &session.id),
+        );
+        let mut document = SearchDocumentBuilder::default();
+        let mut gaps = DamagedRecordPositions::default();
+        let mut push = |record| {
+            let before = gaps.observe(&torn, &document);
+            project_search_record(&record, &mut events, &mut document, &mut title_source);
+            torn.confirm_prefix(events.checkpoint());
+            gaps.observe_suffix(&record, before, document.projected_byte_count());
+            prefix.observe(&document);
+            document.source_byte_count()
+        };
+        let prior_prefix = PreviousSearchPrefix::required_edge_bytes(full_read_bytes, prior);
+        let oversized = if limited {
+            visit_limited_search_edges(file, prior_prefix, PREVIEW_RECORDS, tail, &mut push)
+                .map(|()| 0)
+        } else {
+            visit_streamed_json_file(file, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, tail, |record| {
+                push(record);
+                Ok(())
+            })
+        };
+        let checked = oversized.and_then(|count| {
+            prefix
+                .verify(
+                    PreviousSearchPrefix::needs_damage_check(&torn, prior),
+                    &mut handle,
+                    session,
+                    length,
+                    prior,
+                    !limited,
+                )
+                .map(|sample| (count, sample))
+        });
+        self.ensure_history_unchanged(&summary, path, observed, &handle)?;
+        let (oversized, legacy_sample) = checked?;
+        let verified_append = prefix.verified
+            && matches!(prior, Some(PriorSearchDocument::Complete { byte_count, .. }) if document.source_byte_count() > byte_count);
+        events.push_oversized_record_notice(oversized, summary.updated_at);
+        verify_jsonl_history(self.root()?, path, &summary, &events)?;
+        record_jsonl_damage(&mut events, tail, summary.updated_at);
+        for event in events.drain_events() {
+            document.push(&event);
+        }
+        gaps.observe(&torn, &document);
+        let document = finish_search_document(
+            document,
+            gaps,
+            length,
+            limited && prior_prefix.is_some(),
+            torn.final_record(),
+            legacy_sample,
+            verified_append,
+        );
+        Ok(IndexedSearchDocument {
+            document,
+            read: IndexRead {
+                ownership_revision: None,
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
+                verified_prefix_end: torn.verified_prefix_end(),
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
+                snapshot: title_source,
+                source_complete: !limited && torn.count() == 0,
+                provider_limited: limited && prior_prefix.is_some(),
+                source_revision: native
+                    .source_revision
+                    .context("Antigravity history changed during the search read")?,
+                native_session: Some(native),
+            },
+        })
+    }
+
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
         let mut args = Vec::new();
         if let Some(prompt) = &target.prompt {
@@ -477,7 +1112,7 @@ impl ProviderAdapter for AntigravityAdapter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Summary {
     id: String,
     title: String,
@@ -487,8 +1122,18 @@ struct Summary {
 }
 
 impl Summary {
+    fn snapshot(&self, session: &SessionRef, events: EventBuilder) -> CanonicalSnapshot {
+        events.snapshot(
+            session.clone(),
+            nonempty(self.title.clone()),
+            self.project_path.clone(),
+            None,
+            self.updated_at.unwrap_or_else(Utc::now),
+        )
+    }
+
     fn native_session(
-        self,
+        &self,
         source_path: Option<PathBuf>,
         source_revision: Option<SourceRevision>,
     ) -> NativeSession {
@@ -500,8 +1145,8 @@ impl Summary {
         });
         NativeSession {
             session: SessionRef::new(Provider::Antigravity, self.id.clone()),
-            title: nonempty(self.title),
-            project_path: self.project_path,
+            title: nonempty(self.title.clone()),
+            project_path: self.project_path.clone(),
             git_branch: None,
             created_at: None,
             updated_at,
@@ -518,13 +1163,31 @@ impl Summary {
         source: &Path,
         catalog_wal_verified: bool,
     ) -> Result<SourceRevision> {
-        let (file, history, wal) = if AntigravityAdapter::is_summary_catalog(source) {
+        let observed = if AntigravityAdapter::is_summary_catalog(source) {
+            None
+        } else {
+            Some(
+                crate::source_file::ObservedSourceFile::read(source)
+                    .context("Antigravity history is unavailable")?,
+            )
+        };
+        self.search_revision_from(root, source, catalog_wal_verified, observed)
+    }
+
+    fn search_revision_from(
+        &self,
+        root: &Path,
+        source: &Path,
+        catalog_wal_verified: bool,
+        observed: Option<crate::source_file::ObservedSourceFile>,
+    ) -> Result<SourceRevision> {
+        let (file, history, wal, legacy_file) = if AntigravityAdapter::is_summary_catalog(source) {
             // All zero-step rows share a path. Each row keeps its own identity across catalog writes.
             let catalog = Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_os_str().as_encoded_bytes());
-            (Uuid::new_v5(&catalog, self.id.as_bytes()), None, None)
+            (Uuid::new_v5(&catalog, self.id.as_bytes()), None, None, None)
         } else {
-            let revision =
-                source_file_revision(source).context("Antigravity history is unavailable")?;
+            let observed = observed.context("Antigravity history is unavailable")?;
+            let revision = cli_file_revision(source, observed);
             let file = revision
                 .file
                 .context("Antigravity history has no file identity")?;
@@ -535,7 +1198,7 @@ impl Summary {
                 .extension()
                 .is_some_and(|ext| ext == "db")
                 .then(|| WalRevision::read(source).0);
-            (file, Some(history), wal)
+            (file, Some(history), wal, revision.legacy_file)
         };
         let empty_sources_verified = if self.step_count == Some(0)
             && history.is_some()
@@ -562,9 +1225,29 @@ impl Summary {
         Ok(SourceRevision {
             file: Some(file),
             contents: Some(contents),
-            missing_ancestor: None,
+            legacy_file,
+            ..SourceRevision::default()
         })
     }
+}
+
+fn cli_file_revision(
+    path: &Path,
+    observed: crate::source_file::ObservedSourceFile,
+) -> SourceRevision {
+    let mut revision = observed.revision;
+    if matches!(
+        path.file_name().and_then(|s| s.to_str()),
+        Some("transcript.jsonl" | "transcript_full.jsonl")
+    ) {
+        // Both filenames can name the same file after a rename. Older readers used the selected name.
+        revision = observed.revision_in_namespace(&path.with_file_name("transcript_full.jsonl"));
+        let fallback = observed
+            .revision_in_namespace(&path.with_file_name("transcript.jsonl"))
+            .file;
+        revision.legacy_file = fallback.filter(|file| Some(*file) != revision.file);
+    }
+    revision
 }
 
 fn history_contents(
@@ -616,7 +1299,7 @@ impl DatabaseGeneration {
                 )
                 .ok()?,
             ),
-            missing_ancestor: None,
+            ..SourceRevision::default()
         })
     }
 
@@ -972,13 +1655,50 @@ fn push_historical(
     );
 }
 
-/// Pushes decoded conversation steps and returns how many stored steps were decoded.
+/// Returns the decoded step count and the exclusive event sequence at the earliest gap.
+pub(crate) struct DatabaseCoverage {
+    pub(crate) aliases: omnis_ir::antigravity_receipts::DatabaseAliases,
+    pub(crate) verified_prefix_end: Option<u64>,
+    pub(crate) omitted: usize,
+}
+
+impl DatabaseCoverage {
+    fn report(
+        &self,
+        builder: &mut EventBuilder,
+        unsupported: usize,
+        order_verified: bool,
+        declared_steps: usize,
+        stored: usize,
+    ) {
+        if self.omitted > 0 || unsupported > 0 || !order_verified {
+            let mut notice =
+                json!({"omitted_events": self.omitted, "unsupported_text_records": unsupported});
+            if !order_verified {
+                notice["native_history_unverified"] = json!(true);
+            }
+            if declared_steps > stored {
+                notice["declared_steps"] = json!(declared_steps);
+                notice["stored_steps"] = json!(stored);
+            }
+            builder.push(
+                EventKind::ProviderEvent,
+                notice,
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some(STEP_LIMIT_RECORD.to_owned()),
+                None,
+            );
+        }
+    }
+}
+
 pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
     declared_steps: usize,
-) -> Result<usize> {
+) -> Result<(usize, DatabaseCoverage)> {
     push_database_steps_with_limits(
         root,
         database,
@@ -1002,7 +1722,7 @@ impl Default for DatabaseReadLimits {
             row_bytes: 16 * 1024 * 1024,
             wire_bytes: 64 * 1024 * 1024,
             history_bytes: 64 * 1024 * 1024,
-            records: MAX_DATABASE_STEPS,
+            records: omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT,
         }
     }
 }
@@ -1013,7 +1733,7 @@ fn push_database_steps_with_limits(
     builder: &mut EventBuilder,
     declared_steps: usize,
     limits: DatabaseReadLimits,
-) -> Result<usize> {
+) -> Result<(usize, DatabaseCoverage)> {
     let snapshot = sqlite_snapshot(root, database)
         .context("failed to snapshot Antigravity conversation database")?;
     let stored = usize::try_from(snapshot.connection.query_row(
@@ -1021,83 +1741,185 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
+    let wal = snapshot.verify_wal();
     if stored == 0 && declared_steps > 0 {
-        snapshot.verify_wal()?;
+        wal?;
         return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
             "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
         )));
     }
-    let wal = snapshot.verify_wal();
-    let mut statement = snapshot
+    let (key, newest_first) = database_step_order(&snapshot.connection)?;
+    // Look at sizes first so a skipped step does not read its blob or displace a smaller one.
+    let mut statement = snapshot.connection.prepare(&format!(
+        "SELECT {key}, CASE WHEN typeof(step_payload) = 'blob' THEN length(step_payload) END, \
+         CASE WHEN typeof(idx) = 'integer' THEN idx END \
+         FROM steps ORDER BY {newest_first} LIMIT ?1"
+    ))?;
+    let mut payload_by_key = snapshot
         .connection
-        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END, idx FROM steps ORDER BY idx LIMIT ?2")?;
-    let mut rows = statement.query(rusqlite::params![
-        i64::try_from(limits.row_bytes)?,
-        i64::try_from(limits.records)?,
-    ])?;
+        .prepare(&format!("SELECT step_payload FROM steps WHERE {key} = ?1"))?;
+    let mut rows = statement.query([i64::try_from(limits.records)?])?;
+    let mut aliases = omnis_ir::antigravity_receipts::DatabaseAliases::new();
+    let mut retained = Vec::new();
+    let mut position = 0;
     let mut decoded = 0;
-    let mut visited = 0;
     let mut remaining_wire = limits.wire_bytes;
     let mut remaining_history = limits.history_bytes;
-    let missing = declared_steps.saturating_sub(stored);
-    let mut omitted = missing + stored.saturating_sub(limits.records);
     let mut unsupported = 0;
+    let mut damaged = 0;
+    let mut previous_index = None;
+    let mut oldest_ambiguous_row = Some(0);
     while let Some(row) = rows.next()? {
-        let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
-        visited += 1;
-        if bytes > limits.row_bytes {
-            omitted += 1;
+        position += 1;
+        let index: Option<i64> = row.get(2)?;
+        if index.is_none() {
+            oldest_ambiguous_row = None;
+        } else if index == previous_index && oldest_ambiguous_row.is_some() {
+            oldest_ambiguous_row = Some(position);
+        }
+        previous_index = index;
+        let Some(length) = row.get::<_, Option<i64>>(1)?.filter(|length| *length > 0) else {
+            damaged += 1;
+            continue;
+        };
+        let bytes = usize::try_from(length)?;
+        if bytes > limits.row_bytes || bytes > remaining_wire {
             continue;
         }
-        if bytes > remaining_wire {
-            omitted = omitted.saturating_add(stored.min(limits.records) - visited + 1);
-            break;
-        }
         remaining_wire -= bytes;
-        let payload = row.get::<_, Vec<u8>>(1)?;
-        let step = ProtoStep::decode(payload.as_slice())?;
+        let row_key = rusqlite::types::ToSqlOutput::Borrowed(row.get_ref(0)?);
+        let payload: Vec<u8> = payload_by_key.query_row([row_key], |record| record.get(0))?;
+        let Ok(step) = ProtoStep::decode(payload.as_slice()) else {
+            damaged += 1;
+            continue;
+        };
         decoded += 1;
-        let event = database_step_event(step, &payload);
+        let mut event = database_step_event(step, &payload);
         unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
         let bytes = estimated_event_bytes(&event.payload);
-        if bytes > remaining_history {
-            omitted += 1;
-        } else {
+        if bytes <= remaining_history {
             remaining_history -= bytes;
-            builder.push(
-                event.kind,
-                event.payload,
-                event.timestamp,
-                event.replay_policy,
-                Some(event.record_type),
-                None,
-            );
-            builder.record_database_step_hash(row.get_ref(2)?.as_i64().ok(), &payload);
+            if let Some(index) = index {
+                record_database_proof(&mut aliases, builder, &mut event, index, &payload);
+            }
+            retained.push((position, index, event));
         }
     }
-    if omitted > 0 || unsupported > 0 {
-        let mut notice =
-            json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
-        if missing > 0 {
-            notice["declared_steps"] = json!(declared_steps);
-            notice["stored_steps"] = json!(stored);
-        }
-        builder.push(
-            EventKind::ProviderEvent,
-            notice,
-            None,
-            ReplayPolicy::HistoricalOnly,
-            Some(STEP_LIMIT_RECORD.to_owned()),
-            None,
-        );
-    }
-    if let Err(error) = wal {
-        if decoded == 0 {
-            return Err(error);
-        }
+    let wal_unverified = validate_decoded_steps(wal, decoded, damaged)?;
+    let omitted = stored.max(declared_steps) - retained.len();
+    let prefix_end = push_ordered_steps(
+        builder,
+        retained,
+        stored,
+        declared_steps != stored && omitted > 0,
+        oldest_ambiguous_row,
+    );
+    let coverage = DatabaseCoverage {
+        aliases,
+        verified_prefix_end: if wal_unverified { Some(0) } else { prefix_end },
+        omitted,
+    };
+    coverage.report(
+        builder,
+        unsupported,
+        oldest_ambiguous_row == Some(0),
+        declared_steps,
+        stored,
+    );
+    if wal_unverified {
         mark_unverified_wal(builder);
     }
-    Ok(decoded)
+    Ok((decoded, coverage))
+}
+
+fn validate_decoded_steps(wal: Result<()>, decoded: usize, damaged: usize) -> Result<bool> {
+    let wal_unverified = match wal {
+        Err(error) if decoded == 0 => return Err(error),
+        result => result.is_err(),
+    };
+    if decoded == 0 && damaged > 0 {
+        return Err(anyhow!(
+            "no Antigravity steps could be decoded ({damaged} selected step payloads were missing or invalid)"
+        ));
+    }
+    Ok(wal_unverified)
+}
+
+fn push_ordered_steps(
+    builder: &mut EventBuilder,
+    retained: Vec<(usize, Option<i64>, DatabaseStepEvent)>,
+    stored: usize,
+    require_contiguous_prefix: bool,
+    oldest_ambiguous_row: Option<usize>,
+) -> Option<u64> {
+    let mut prefix_end = None;
+    let mut position = stored;
+    for (row, index, event) in retained.into_iter().rev() {
+        let missing_before = require_contiguous_prefix
+            && index.and_then(|idx| usize::try_from(idx).ok()) != Some(stored - row);
+        if missing_before
+            || row != position
+            || oldest_ambiguous_row.is_none_or(|oldest| row <= oldest)
+            || event.replay_policy == ReplayPolicy::HistoricalOnly
+        {
+            prefix_end.get_or_insert_with(|| builder.checkpoint());
+        }
+        position = row - 1;
+        builder.push(
+            event.kind,
+            event.payload,
+            event.timestamp,
+            event.replay_policy,
+            Some(event.record_type),
+            None,
+        );
+        builder.set_last_database_step_hash(event.hash);
+    }
+    if position > 0 || require_contiguous_prefix {
+        prefix_end.get_or_insert_with(|| builder.checkpoint());
+    }
+    prefix_end
+}
+
+fn database_step_order(connection: &rusqlite::Connection) -> Result<(&'static str, &'static str)> {
+    let without_rowid: bool = connection.query_row(
+        "SELECT wr FROM pragma_table_list('steps') WHERE schema = 'main' AND type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !without_rowid {
+        return Ok(("_rowid_", "idx DESC, _rowid_ DESC"));
+    }
+    let indexed_by_step: bool = connection.query_row(
+        "SELECT count(*) = 1 AND min(lower(name)) = 'idx' FROM pragma_table_info('steps') WHERE pk > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        indexed_by_step,
+        "Antigravity steps have neither a rowid nor an idx primary key"
+    );
+    Ok(("idx", "idx DESC"))
+}
+
+fn record_database_proof(
+    aliases: &mut omnis_ir::antigravity_receipts::DatabaseAliases,
+    builder: &EventBuilder,
+    event: &mut DatabaseStepEvent,
+    index: i64,
+    wire: &[u8],
+) {
+    let opaque = event.replay_policy == ReplayPolicy::HistoricalOnly;
+    let namespace = builder.database_step_namespace(index, opaque);
+    let raw = uuid::Uuid::new_v5(&namespace, wire);
+    event.hash = Some(raw);
+    if !opaque
+        && let Some(alias) =
+            omnis_ir::antigravity_receipts::DatabaseStepAlias::from_wire(namespace, raw, wire)
+        && alias.canonical != raw
+    {
+        aliases.insert(raw, alias);
+    }
 }
 
 fn mark_unverified_wal(builder: &mut EventBuilder) {
@@ -1122,6 +1944,7 @@ pub(super) fn mark_unverified_database(builder: &mut EventBuilder, reason: &str)
 }
 
 struct DatabaseStepEvent {
+    hash: Option<uuid::Uuid>,
     kind: EventKind,
     payload: Value,
     timestamp: Option<DateTime<Utc>>,
@@ -1178,6 +2001,7 @@ fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
         _ => opaque(),
     };
     DatabaseStepEvent {
+        hash: None,
         kind,
         payload,
         timestamp,
@@ -1430,28 +2254,50 @@ mod tests {
             ],
         );
 
-        let mut builder = EventBuilder::new(
-            Provider::Antigravity,
-            "11111111-1111-4111-8111-111111111111",
-        );
-        let decoded = push_database_steps(temporary.path(), &database, &mut builder, 2)
-            .expect("native steps");
-        assert_eq!(decoded, 2);
-        let snapshot = builder.snapshot(
-            SessionRef::new(
+        let assert_messages = |order_verified| {
+            let session = SessionRef::new(
                 Provider::Antigravity,
                 "11111111-1111-4111-8111-111111111111",
-            ),
-            None,
-            None,
-            None,
-            Utc::now(),
+            );
+            let mut builder = EventBuilder::new(session.provider, &session.id);
+            assert_eq!(
+                push_database_steps(temporary.path(), &database, &mut builder, 2)
+                    .unwrap()
+                    .0,
+                2
+            );
+            let snapshot = builder.snapshot(session, None, None, None, Utc::now());
+            assert_eq!(snapshot.events.len(), if order_verified { 2 } else { 3 });
+            if !order_verified {
+                assert_eq!(
+                    snapshot.events[2].payload["native_history_unverified"],
+                    true
+                );
+            }
+            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+            assert_eq!(snapshot.events[0].payload["text"], "question");
+            assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
+            assert_eq!(snapshot.events[1].payload["text"], "answer");
+        };
+        assert_messages(true);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE restored AS SELECT * FROM steps ORDER BY idx;
+             DROP TABLE steps;
+             ALTER TABLE restored RENAME TO steps;
+             UPDATE steps SET idx = 0;",
+            )
+            .unwrap();
+        assert_messages(false);
+        connection.execute_batch("UPDATE steps SET idx = _rowid_; INSERT INTO steps SELECT * FROM steps WHERE idx = 2;").unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, "ordered-prefix");
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 3).unwrap();
+        assert_eq!(
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (3, Some(1), 0)
         );
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
-        assert_eq!(snapshot.events[0].payload["text"], "question");
-        assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
-        assert_eq!(snapshot.events[1].payload["text"], "answer");
     }
 
     #[test]
@@ -1506,7 +2352,7 @@ mod tests {
         write_steps_database(&database, &[]);
         let read = || {
             let mut events = EventBuilder::new(Provider::AntigravityDesktop, "synthetic");
-            push_database_steps(root.path(), &database, &mut events, 0)
+            push_database_steps(root.path(), &database, &mut events, 0).map(|(decoded, _)| decoded)
         };
         assert_eq!(read().unwrap(), 0);
         let writer = rusqlite::Connection::open(&database).unwrap();
@@ -1542,7 +2388,7 @@ mod tests {
             std::fs::write(restored.path().join("steps.db-wal"), bytes).unwrap();
             let session = SessionRef::new(Provider::AntigravityDesktop, "synthetic");
             let mut events = EventBuilder::new(session.provider, &session.id);
-            let decoded = push_database_steps(restored.path(), &copy, &mut events, 0).unwrap();
+            let (decoded, _) = push_database_steps(restored.path(), &copy, &mut events, 0).unwrap();
             assert_eq!(decoded, expected);
             let snapshot = events.snapshot(session, None, None, None, Utc::now());
             assert_eq!(
@@ -1570,7 +2416,9 @@ mod tests {
         let session = SessionRef::new(Provider::AntigravityDesktop, "synthetic");
         let mut events = EventBuilder::new(session.provider, &session.id);
         assert_eq!(
-            push_database_steps(root.path(), &database, &mut events, 0).unwrap(),
+            push_database_steps(root.path(), &database, &mut events, 0)
+                .unwrap()
+                .0,
             2
         );
         let snapshot = events.snapshot(session, None, None, None, Utc::now());
@@ -1597,7 +2445,7 @@ mod tests {
         );
         for declared in [0, 1, 2, 3] {
             let mut builder = EventBuilder::new(session.provider, &session.id);
-            let decoded =
+            let (decoded, _) =
                 push_database_steps(root.path(), &database, &mut builder, declared).unwrap();
             let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
             assert_eq!(decoded, 2);
@@ -1625,15 +2473,18 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let database = temporary.path().join("conversation.db");
-        let step = synthetic_step(
-            14,
-            Some(proto_step::Step::UserInput(ProtoUserInput {
-                query: "Synthetic visible history".to_owned(),
-                ..ProtoUserInput::default()
-            })),
-        );
-        let wire_bytes = step.encoded_len();
-        write_steps_database(&database, &[step.clone(), step]);
+        let text = ["First visible request", "Final visible request"];
+        let steps = text.map(|query| {
+            synthetic_step(
+                14,
+                Some(proto_step::Step::UserInput(ProtoUserInput {
+                    query: query.to_owned(),
+                    ..ProtoUserInput::default()
+                })),
+            )
+        });
+        let wire_bytes = steps[1].encoded_len();
+        write_steps_database(&database, &steps);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
@@ -1643,76 +2494,123 @@ mod tests {
             .unwrap();
         drop(connection);
         let before = std::fs::read(&database).unwrap();
-        let visible_bytes = crate::support::estimated_event_bytes(
-            &serde_json::json!({"text":"Synthetic visible history"}),
+        let visible_bytes =
+            crate::support::estimated_event_bytes(&serde_json::json!({"text": text[1]}));
+        let row_limit = super::DatabaseReadLimits {
+            row_bytes: wire_bytes,
+            ..super::DatabaseReadLimits::default()
+        };
+        let session = SessionRef::new(
+            Provider::Antigravity,
+            "11111111-1111-4111-8111-111111111111",
         );
-        let session = SessionRef::new(Provider::Antigravity, "synthetic");
-        let mut observed = Vec::new();
-        for (limits, omitted) in [
+        for (limits, expected) in [
+            (row_limit, &text[..]),
             (
                 super::DatabaseReadLimits {
-                    row_bytes: wire_bytes,
-                    ..super::DatabaseReadLimits::default()
-                },
-                1,
-            ),
-            (
-                super::DatabaseReadLimits {
-                    row_bytes: 1024,
                     history_bytes: visible_bytes,
-                    ..super::DatabaseReadLimits::default()
+                    ..row_limit
                 },
-                2,
+                &text[1..],
             ),
             (
                 super::DatabaseReadLimits {
-                    records: 1,
+                    records: 2,
+                    ..row_limit
+                },
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    wire_bytes: steps.iter().map(Message::encoded_len).sum(),
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[..],
             ),
             (
                 super::DatabaseReadLimits {
                     wire_bytes,
                     ..super::DatabaseReadLimits::default()
                 },
-                2,
+                &text[1..],
+            ),
+            (
+                super::DatabaseReadLimits {
+                    records: 1,
+                    ..row_limit
+                },
+                &text[..0],
             ),
         ] {
             let mut builder = EventBuilder::new(session.provider, &session.id);
-            let decoded = super::push_database_steps_with_limits(
+            let (decoded, coverage) = super::push_database_steps_with_limits(
                 temporary.path(),
                 &database,
                 &mut builder,
-                0,
+                3,
                 limits,
             )
             .unwrap();
-            assert!(decoded > 0);
-            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
-            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+            assert!(decoded >= expected.len());
             assert_eq!(
-                snapshot.events[0].payload["text"],
-                "Synthetic visible history"
+                coverage.verified_prefix_end,
+                Some(if expected.len() == text.len() { 2 } else { 0 })
             );
-            let proof = super::AntigravityAdapter::database_step_proof(&snapshot).unwrap();
-            if observed.is_empty() {
-                observed = proof.clone();
-                assert_eq!(observed.len(), 2);
-                assert_ne!(observed[0], observed[1]);
-            }
-            assert_eq!(proof, observed[..3 - omitted]);
-            assert!(super::AntigravityAdapter::has_omitted_stored_steps(
-                &snapshot
-            ));
-            let notice = snapshot.events.last().unwrap();
-            assert_eq!(notice.payload["omitted_events"], omitted);
-            assert!(super::AntigravityAdapter::has_missing_database_steps(
-                &snapshot
-            ));
+            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
+            let (notice, messages) = snapshot.events.split_last().unwrap();
+            let actual = messages
+                .iter()
+                .map(|message| message.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            assert_eq!(notice.payload["omitted_events"], 3 - expected.len());
             assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
         }
         assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn damaged_database_steps_do_not_hide_a_readable_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        let id = "11111111-1111-4111-8111-111111111111";
+        let request = synthetic_step(
+            14,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "Latest readable request".into(),
+                ..ProtoUserInput::default()
+            })),
+        );
+        write_steps_database(&database, &[request]);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 15, NULL), (2, 14, x'80'), (3, 14, 'invalid'), (4, 14, x'')",
+        )
+        .unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 6).unwrap();
+        assert_eq!(
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (1, Some(1), 5)
+        );
+        let snapshot = builder.snapshot(
+            SessionRef::new(Provider::Antigravity, id),
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(
+            snapshot.events[0].payload["text"],
+            "Latest readable request"
+        );
+        assert_eq!(snapshot.events[1].payload["omitted_events"], 5);
+        assert_eq!(snapshot.events[1].payload["declared_steps"], 6);
+        assert_eq!(snapshot.events[1].payload["stored_steps"], 5);
+        conn.execute("DELETE FROM steps WHERE idx = 0", []).unwrap();
+        let mut builder = EventBuilder::new(Provider::Antigravity, id);
+        assert!(push_database_steps(temporary.path(), &database, &mut builder, 6).is_err());
     }
 
     #[test]
@@ -1794,9 +2692,11 @@ mod tests {
             Provider::Antigravity,
             "11111111-1111-4111-8111-111111111111",
         );
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap();
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
-            1
+            (decoded, coverage.verified_prefix_end, coverage.omitted),
+            (1, Some(0), 0)
         );
         let snapshot = builder.snapshot(
             SessionRef::new(
@@ -1823,15 +2723,6 @@ mod tests {
                 )
                 .unwrap(),
             wire
-        );
-        assert!(!super::AntigravityAdapter::has_missing_database_steps(
-            &snapshot
-        ));
-        assert_eq!(
-            super::AntigravityAdapter::database_step_proof(&snapshot)
-                .unwrap()
-                .len(),
-            1
         );
         assert_eq!(snapshot.events[1].payload["unsupported_text_records"], 1);
         assert!(omnis_core::import_conversation(&snapshot).truncated);

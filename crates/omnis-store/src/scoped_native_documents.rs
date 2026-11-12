@@ -1,6 +1,6 @@
 pub(super) mod chunks;
 mod coverage;
-pub(super) mod database_receipts;
+pub(super) use crate::database_receipts;
 mod text;
 
 use std::borrow::Cow;
@@ -12,6 +12,7 @@ use super::{
 };
 
 pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
+    crate::migrate_trajectory_provider_key(tx, "scoped_native_documents")?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS scoped_native_documents (
              id INTEGER PRIMARY KEY,
@@ -32,7 +33,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
              complete INTEGER NOT NULL DEFAULT 0,
              provider_limited INTEGER NOT NULL DEFAULT 0,
              UNIQUE(provider, session_id, source_home, source_file),
-             FOREIGN KEY(provider, session_id) REFERENCES session_trajectories(provider, session_id) ON DELETE CASCADE
+             FOREIGN KEY(provider, session_id) REFERENCES session_trajectories(provider, non_codex_session_id) ON DELETE CASCADE
          );",
     )
     .map_err(database_error)?;
@@ -95,7 +96,15 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
          END;",
     )
     .map_err(database_error)?;
-    database_receipts::initialize(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scoped_database_catalogs (
+            document_id INTEGER PRIMARY KEY REFERENCES scoped_native_documents(id) ON DELETE CASCADE,
+            catalog_hash TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS invalidate_scoped_database_catalog AFTER UPDATE ON scoped_native_documents
+        BEGIN DELETE FROM scoped_database_catalogs WHERE document_id=old.id; END;",
+    )
+    .map_err(database_error)?;
     super::physical_database_bodies::initialize(tx)?;
     chunks::initialize(tx)
 }
@@ -152,6 +161,11 @@ pub(super) fn write(
     let same_source = same_owner && primary.file == Some(file);
     let legacy_file = primary.verified_home.is_none() && primary.file == Some(file);
     let has_gap = observed.incomplete_native_history;
+    if same_source
+        && let Some(result) = database_gap_write(tx, write, &primary, &home, file, rewritten)?
+    {
+        return Ok(result);
+    }
     let mut retain_archived_text = false;
     let mut retain_text = None;
     if !write.source_complete {
@@ -163,6 +177,20 @@ pub(super) fn write(
         };
         match decision {
             coverage::PartialWrite::Keep => {
+                if same_source && has_gap && document.projection.is_some_and(|p| p.database_gap) {
+                    tx.execute(
+                        "INSERT INTO antigravity_search_gaps
+                         SELECT id,?2,source_file_id,source_contents_id,content_hash,?3
+                         FROM session_trajectories WHERE id=?1 AND source_contents_id IS NOT NULL
+                         ON CONFLICT(trajectory_id) DO UPDATE SET observed_contents=excluded.observed_contents,
+                             indexed_contents=excluded.indexed_contents,indexed_hash=excluded.indexed_hash,
+                             source_file=excluded.source_file,source_home=excluded.source_home
+                         WHERE (source_home,source_file,indexed_contents,indexed_hash,observed_contents)
+                            IS NOT (excluded.source_home,excluded.source_file,excluded.indexed_contents,excluded.indexed_hash,excluded.observed_contents)",
+                        params![primary.id, home.as_ref(), contents.as_bytes()],
+                    )
+                    .map_err(database_error)?;
+                }
                 publish_read(tx, write, context, &home, false)?;
                 return Ok(WriteResult::Handled(0));
             }
@@ -200,6 +228,59 @@ pub(super) fn write(
     let changed = save_scoped(tx, write, &home, file, contents, retain_archived_text)?;
     publish_read(tx, write, context, &home, true)?;
     Ok(WriteResult::Handled(changed))
+}
+
+fn database_gap_write(
+    tx: &Transaction<'_>,
+    write: &PreparedTrajectoryWrite<'_, '_>,
+    primary: &coverage::Primary,
+    home: &[u8],
+    file: uuid::Uuid,
+    rewritten: &[(i64, &str)],
+) -> Result<Option<WriteResult>> {
+    let document = &write.document;
+    let TrajectorySourceGuard::ObservedDocument(observed) = write.guard else {
+        return Ok(None);
+    };
+    if write.verified_metadata.is_some()
+        && matches!(
+            write.session.provider,
+            crate::Provider::Antigravity | crate::Provider::AntigravityDesktop
+        )
+        && let Some(projection) = document
+            .projection
+            .filter(|projection| projection.database_gap)
+        && let Some(rows) = document.database_step_proof.filter(|rows| !rows.is_empty())
+        && !primary.needs_window_comparison(tx, write, home, file, rows)?
+        && !super::physical_database_bodies::contains_rows(tx, write, home, file, rows)?
+    {
+        if !projection.database_history_unverified {
+            return Ok(Some(WriteResult::Primary {
+                verified_partial: true,
+                retain_text: None,
+            }));
+        }
+        // A restored checkpoint can show different replies after its committed WAL disappears.
+        // Keep the previous replies separately so a query cannot combine the two revisions.
+        if super::desktop_declarations::wal_rows::restored_rows(
+            tx,
+            &write.session.id,
+            home,
+            file,
+            observed.database_checkpoint,
+            document.database_wal_commits,
+            document.database_summary_revision,
+        )?
+        .is_some()
+            && let Some(previous) = primary.text(tx, rewritten)?
+        {
+            return Ok(Some(WriteResult::Primary {
+                verified_partial: true,
+                retain_text: Some(previous.into_owned()),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn save_scoped(
@@ -252,7 +333,32 @@ fn save_scoped(
             document.database_step_proof,
         )?;
     }
-    confirm_document_version(tx, changed)
+    let count = confirm_document_version(tx, changed)?;
+    if let Some(metadata) = write.verified_metadata
+        && matches!(
+            write.session.provider,
+            crate::Provider::Antigravity | crate::Provider::AntigravityDesktop
+        )
+    {
+        tx.execute(
+            "INSERT INTO scoped_database_catalogs(document_id,catalog_hash)
+             SELECT id,?1 FROM scoped_native_documents WHERE provider=?2 AND session_id=?3
+               AND source_home=?4 AND source_file=?5 AND source_contents=?6 AND document_version=?7
+             ON CONFLICT(document_id) DO UPDATE SET catalog_hash=excluded.catalog_hash
+             WHERE catalog_hash<>excluded.catalog_hash",
+            params![
+                super::database_receipts::catalog_hash(metadata)?,
+                provider,
+                id,
+                home,
+                file.as_bytes(),
+                contents.as_bytes(),
+                document.document_version
+            ],
+        )
+        .map_err(database_error)?;
+    }
+    Ok(count)
 }
 
 fn publish_read(

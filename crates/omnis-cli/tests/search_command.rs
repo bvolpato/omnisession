@@ -1,4 +1,4 @@
-//! Drives `omni search` end to end against synthetic Claude and Codex stores.
+//! Drives `omni search` end to end against synthetic provider stores.
 
 use std::{
     fs,
@@ -8,6 +8,12 @@ use std::{
 
 use serde_json::{Value, json};
 
+#[path = "search_command/codex_home.rs"]
+mod codex_home;
+#[path = "search_command/duplicate_rollouts.rs"]
+mod duplicate_rollouts;
+
+const STAMP: &str = "2026-01-02T00:00:00Z";
 const CLAUDE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CODEX_ID: &str = "019f0000-0000-7000-8000-000000000001";
 const OTHER_CODEX_ID: &str = "019f0000-0000-7000-8000-000000000002";
@@ -94,12 +100,12 @@ fn check_missing_current_rollout(command: &[&str]) {
     write_jsonl(
         &current,
         &[
-            json!({"type":"session_meta","ordinal":0,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
+            json!({"type":"session_meta","ordinal":0,"timestamp":STAMP,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
               "history_mode":"paginated","cwd":fixture.workspace}}),
-            json!({"type":"event_msg","ordinal":1,"payload":{"type":"item_completed","thread_id":CODEX_ID,
+            json!({"type":"event_msg","ordinal":1,"timestamp":STAMP,"payload":{"type":"item_completed","thread_id":CODEX_ID,
               "turn_id":"restored","item":{"type":"AgentMessage","id":"answer","content":[
                   {"type":"Text","text":"Restored cinnabar response"}]}}}),
-            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant",
+            json!({"type":"response_item","ordinal":2,"timestamp":STAMP,"payload":{"type":"message","role":"assistant",
               "content":[{"type":"output_text","text":"Restored cinnabar response"}]}}),
         ],
     );
@@ -394,7 +400,7 @@ fn scoped_search_can_recheck_a_stamped_full_document_beyond_the_cold_probe_limit
     );
     let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
     for valid_stamp in [true, false] {
-        // Recreate the version-5 catalog that preceded the verified-workspace table.
+        // Version 5 stored the workspace in the catalog without a separate observation.
         assert_eq!(
             db.execute(
                 "UPDATE session_trajectories SET document_version=5 WHERE provider='codex' AND session_id=?1 AND source_complete=1",
@@ -402,8 +408,11 @@ fn scoped_search_can_recheck_a_stamped_full_document_beyond_the_cold_probe_limit
             ).unwrap(),
             1
         );
-        db.execute("DROP TABLE codex_indexed_workspaces", [])
-            .unwrap();
+        db.execute_batch(
+            "DROP TABLE codex_indexed_workspaces;
+             DROP TABLE codex_workspace_observations;",
+        )
+        .unwrap();
         if !valid_stamp {
             db.execute("UPDATE session_index SET source_contents_id=randomblob(16) WHERE provider='codex' AND session_id=?1",[CODEX_ID]).unwrap();
         }
@@ -537,6 +546,469 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
     }
 }
 
+fn write_grok_log_with_mixed_owners(
+    directory: &Path,
+    id: &str,
+    other: &str,
+    update: &impl Fn(&str, &str) -> Value,
+) {
+    use std::io::Write;
+    let mut log =
+        std::io::BufWriter::new(fs::File::create(directory.join("updates.jsonl")).unwrap());
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}}).to_string();
+    // Leave the different owner outside both search samples.
+    for owner in [other, id] {
+        for _ in 0..140 {
+            writeln!(log, "{padding}").unwrap();
+        }
+        writeln!(log, "{}", update(owner, "tangerinecobalt")).unwrap();
+    }
+    log.flush().unwrap();
+    drop(log);
+}
+
+fn check_bare_id_rejects_replacement(fixture: &Fixture, id: &str, other: &str, replacement: &Path) {
+    fs::create_dir(replacement).unwrap();
+    fs::write(
+        replacement.join("summary.json"),
+        json!({"info":{"id":other,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let rejected = fixture.command().args(["show", id]).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        result_sessions(&fixture.search_json(&[
+            "marjoramquartz",
+            "--cached",
+            "--provider",
+            "grok"
+        ]))
+        .is_empty()
+    );
+    fs::remove_dir_all(replacement).unwrap();
+}
+
+#[test]
+fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let group = fixture.root.join("grok/sessions/restore");
+    let backup = group.join(format!("{id}.backup"));
+    let replacement = group.join(id);
+    let update = |owner: &str, text: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
+        }}})
+    };
+    let show = || {
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+    };
+    let cached =
+        |term| result_sessions(&fixture.search_json(&[term, "--cached", "--provider", "grok"]));
+    let index = |retry| {
+        let mut command = fixture.command();
+        command.args(["index", "--provider", "grok"]);
+        if retry {
+            command.arg("--retry-failed");
+        }
+        assert!(command.output().unwrap().status.success());
+    };
+    fs::create_dir_all(&backup).unwrap();
+    let summary = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(backup.join("summary.json"), summary.to_string()).unwrap();
+    write_jsonl(
+        &backup.join("updates.jsonl"),
+        &[update(id, "marjoramquartz")],
+    );
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
+
+    let other = "22222222-2222-4222-8222-222222222222";
+    check_bare_id_rejects_replacement(&fixture, id, other, &replacement);
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
+
+    fs::create_dir(&replacement).unwrap();
+    fs::copy(
+        backup.join("summary.json"),
+        replacement.join("summary.json"),
+    )
+    .unwrap();
+    write_grok_log_with_mixed_owners(&replacement, id, other, &update);
+    index(false);
+    assert!(!show().status.success());
+    for retry in [false, true] {
+        assert!(cached("marjoramquartz").is_empty());
+        assert!(cached("tangerinecobalt").is_empty());
+        index(retry);
+    }
+    assert!(cached("tangerinecobalt").is_empty());
+
+    let mut renamed = summary.clone();
+    renamed["generated_title"] = json!("Renamed while the update log was unchanged");
+    fs::write(replacement.join("summary.json"), renamed.to_string()).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::write(replacement.join("summary.json"), "{").unwrap();
+    index(false);
+    fs::write(replacement.join("summary.json"), summary.to_string()).unwrap();
+    index(true);
+    assert!(cached("tangerinecobalt").is_empty());
+
+    let original = fixture.root.join("saved-original");
+    fs::rename(&backup, &original).unwrap();
+    fs::rename(&replacement, &backup).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::rename(&backup, &replacement).unwrap();
+    fs::rename(original, &backup).unwrap();
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(replacement.join("updates.jsonl"))
+        .unwrap();
+    writeln!(log, "{}", update(id, " recentapricot")).unwrap();
+    drop(log);
+    index(false);
+    assert!(cached("recentapricot").is_empty());
+
+    let displaced = json!({"info":{"id":other,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(replacement.join("summary.json"), displaced.to_string()).unwrap();
+    write_jsonl(
+        &replacement.join("updates.jsonl"),
+        &[update(other, "tangerinecobalt")],
+    );
+    index(false);
+    assert!(cached("marjoramquartz").is_empty());
+    assert_eq!(cached("tangerinecobalt"), [format!("grok:{other}")]);
+
+    fs::remove_dir_all(replacement).unwrap();
+    assert!(show().status.success());
+    assert_eq!(cached("marjoramquartz"), [reference]);
+}
+
+#[test]
+fn grok_partial_export_recovers_explicitly_owned_turns_after_a_foreign_log() {
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let replacement = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&replacement).unwrap();
+    let update = |owner: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"user_message_chunk","content":{"type":"text","text":"violetcedar"}
+        }}})
+    };
+    let partial = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2});
+    fs::write(replacement.join("summary.json"), partial.to_string()).unwrap();
+    for (last, detail) in [
+        (
+            json!({"params":{"sessionId":id}}).to_string(),
+            "found_updates",
+        ),
+        ("{".to_owned(), "malformed_records"),
+    ] {
+        write_jsonl(
+            &replacement.join("updates.jsonl"),
+            &[update("22222222-2222-4222-8222-222222222222")],
+        );
+        let rejected = fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8(rejected.stderr)
+                .unwrap()
+                .contains("different session ID")
+        );
+        fs::write(
+            replacement.join("updates.jsonl"),
+            format!("{}\n{last}", update(id)),
+        )
+        .unwrap();
+        let shown = fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap();
+        assert!(shown.status.success());
+        let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert!(
+            snapshot["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["omitted_events"] == 1
+                    && event["payload"][detail] == 1)
+        );
+        let markdown = fixture
+            .command()
+            .args(["markdown", &reference])
+            .output()
+            .unwrap();
+        assert!(markdown.status.success());
+        assert!(
+            String::from_utf8(markdown.stdout)
+                .unwrap()
+                .contains("violetcedar")
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "violetcedar",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+    fs::write(
+        replacement.join("updates.jsonl"),
+        format!(
+            "{}\n{{\n{}",
+            update(id),
+            update("22222222-2222-4222-8222-222222222222")
+        ),
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn grok_search_refreshes_when_only_its_plan_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    fs::write(dir.join("updates.jsonl"), "").unwrap();
+    let plan = dir.join("plan.json");
+    let search = |text| result_sessions(&fixture.search_json(&[text, "--provider", "grok"]));
+    let mut previous = "absentterm";
+    for text in ["orangeclover", "silverthistle"] {
+        fs::write(
+            &plan,
+            json!([{"content":text,"status":"pending"}]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(search(text), [format!("grok:{id}")]);
+        assert!(search(previous).is_empty());
+        previous = text;
+    }
+    fs::remove_file(plan).unwrap();
+    assert!(search(previous).is_empty());
+}
+
+#[test]
+fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"amberquince"}}}});
+    let half = format!("{padding}\n").repeat(132);
+    fs::write(dir.join("updates.jsonl"), format!("{half}{marker}\n{half}")).unwrap();
+    let reference = format!("grok:{id}");
+    assert!(
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let search = |term| result_sessions(&fixture.search_json(&[term, "--provider", "grok"]));
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET source_file_id = NULL, source_contents_id = NULL WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::write(dir.join("usage.json"), r#"{"total_tokens":17}"#).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    for timestamp in ["2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"] {
+        fs::write(
+            dir.join("summary.json"),
+            json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(search("amberquince"), [reference.as_str()]);
+        let (complete, source_time): (bool, i64) = db.query_row(
+            "SELECT source_complete,source_updated_at FROM session_trajectories WHERE provider = 'grok' AND session_id = ?1",
+            [id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert!(complete);
+        assert_eq!(
+            source_time,
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .timestamp_millis()
+        );
+    }
+    let plan = dir.join("plan.json");
+    fs::write(
+        &plan,
+        json!([{"content":"juniperviolet","status":"pending"}]).to_string(),
+    )
+    .unwrap();
+    assert_eq!(search("juniperviolet"), [reference.as_str()]);
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+    fs::remove_file(plan).unwrap();
+    assert!(search("juniperviolet").is_empty());
+    assert_eq!(search("amberquince"), [reference.as_str()]);
+}
+
+#[test]
+fn grok_timestamp_refresh_keeps_a_valid_turn_larger_than_the_preview_line_limit() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"amberquince"},"padding":"x".repeat(2*1024*1024)}}});
+    fs::write(dir.join("updates.jsonl"), marker.to_string()).unwrap();
+    let reference = format!("grok:{id}");
+    for timestamp in [
+        "2026-01-01T00:00:00Z",
+        "2025-01-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+    ] {
+        fs::write(dir.join("summary.json"),json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp,"num_messages":1}).to_string()).unwrap();
+        assert_eq!(
+            result_sessions(&fixture.search_json(&["amberquince", "--provider", "grok"])),
+            [reference.as_str()]
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "amberquince",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+}
+
+#[test]
+fn grok_ownership_scan_continues_after_an_oversized_record() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":3}).to_string(),
+    )
+    .unwrap();
+    let update = |owner: &str, kind: &str, text: &str| json!({"params":{"sessionId":owner,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}});
+    let foreign = update(
+        "22222222-2222-4222-8222-222222222222",
+        "agent_message_chunk",
+        "foreignlemon",
+    );
+    let path = dir.join("updates.jsonl");
+    let reference = format!("grok:{id}");
+    let show = || {
+        fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap()
+    };
+    fs::write(&path, foreign.to_string()).unwrap();
+    assert!(!show().status.success());
+    let question = update(id, "user_message_chunk", "ownedmint");
+    let reply = update(id, "agent_message_chunk", "ownedpear");
+    let oversized = "x".repeat(16 * 1024 * 1024 + 1);
+    fs::write(&path, format!("{question}\n{oversized}\n{reply}")).unwrap();
+    let result = show();
+    assert!(result.status.success());
+    let snapshot: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    for turn in ["ownedmint", "ownedpear"] {
+        assert!(events.iter().any(|row| row["payload"]["text"] == turn));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|row| row["payload"]["omitted_events"] == 1)
+    );
+    fs::write(&path, format!("{question}\n{oversized}\n{foreign}")).unwrap();
+    let result = show();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("different session ID"));
+}
+
+#[test]
+fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2}).to_string(),
+    )
+    .unwrap();
+    let event = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update"}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"coralplum"}}}});
+    let updates = dir.join("updates.jsonl");
+    fs::write(
+        &updates,
+        format!("{event}\n").repeat(100_001) + &marker.to_string(),
+    )
+    .unwrap();
+    assert!(fs::metadata(&updates).unwrap().len() < 16 * 1024 * 1024);
+    let index = || {
+        let out = fixture
+            .command()
+            .args(["--json", "index", "--provider", "grok"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    assert_eq!(
+        result_sessions(&fixture.search_json(&["coralplum", "--provider", "grok"])),
+        [format!("grok:{id}")]
+    );
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET document_version = document_version - 1 WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    fs::write(&updates, marker.to_string()).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    let (complete, limited): (bool, bool) = db.query_row("SELECT source_complete, provider_limited FROM session_trajectories WHERE provider = 'grok'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert!(complete && !limited);
+}
+
 #[test]
 fn missing_rollout_names_follow_the_last_readable_assignment_in_their_home() {
     let name = json!({"id":CODEX_ID,"thread_name":"Violet Quokka"}).to_string();
@@ -621,8 +1093,7 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     let name = json!({"id": CODEX_ID, "thread_name": "Violet Quokka"});
     fs::write(&sidecar, name.to_string()).unwrap();
     fixture.index_codex();
-    let store = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    let check = |official: Option<&str>, searchable: &str| {
+    let check = |official: Option<&str>| {
         let output = fixture
             .command()
             .args(["--json", "show", &session.to_string()])
@@ -635,29 +1106,26 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
         );
         let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(shown["title"].as_str(), official);
-        let saved: (Option<String>, Option<String>) = store
-            .query_row(
-                "SELECT c.title, t.derived_title FROM session_index c
-                 JOIN session_trajectories t USING (provider, session_id)
-                 WHERE c.provider='codex' AND c.session_id=?1",
-                [&session.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(saved.0.as_deref(), official);
-        assert_eq!(saved.1.as_deref(), Some(searchable));
     };
+    let opener_search = |expected: &str| {
+        let hit =
+            fixture.search_json(&["limter", "--provider", "codex", "--no-index", "--show-text"]);
+        assert_eq!(hit["results"][0]["match"], "metadata", "{hit}");
+        assert_eq!(hit["results"][0]["title"], expected, "{hit}");
+    };
+    opener_search("Violet Quokka");
     let ambiguous = format!(
         "{}\n{{",
         json!({"id": CODEX_ID, "thread_name": "Amber Heron"})
     );
     fs::write(&sidecar, &ambiguous).unwrap();
-    check(Some("Violet Quokka"), "Violet Quokka");
+    check(Some("Violet Quokka"));
     fs::write(&sidecar, "\n").unwrap();
-    check(None, "Tune the rate limiter backoff");
+    opener_search("Tune the rate limiter backoff");
+    check(None);
 
     fs::write(&sidecar, name.to_string()).unwrap();
-    check(Some("Violet Quokka"), "Violet Quokka");
+    check(Some("Violet Quokka"));
     fs::write(&sidecar, ambiguous).unwrap();
     let file = codex.join(format!(
         "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
@@ -671,50 +1139,46 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
         .set_modified(fs::metadata(&file).unwrap().modified().unwrap())
         .unwrap();
     fs::rename(replacement, file).unwrap();
-    check(None, "Tune the rate limiter backoff");
+    check(None);
 }
 
 #[test]
 fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
     use omnis_ir::{Provider, SessionRef};
-    use omnis_store::{SessionTrajectoryOrigin, Store, TrajectoryDocument};
 
     let fixture = Fixture::new();
     fixture.add_missing_ancestor();
+    write_codex_session(
+        &fixture.root,
+        OTHER_CODEX_ID,
+        &fixture.workspace,
+        "Previously indexed request",
+        "Superseded fixture content",
+    );
     fixture.index_codex();
     let session = SessionRef::new(Provider::Codex, CODEX_ID);
-    let store = Store::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    let state = store.trajectory_index_state(&session).unwrap().unwrap();
-    let obsolete = "Superseded fixture content";
-    store
-        .upsert_trajectory_document(
-            &session,
-            &TrajectoryDocument {
-                redacted_text: obsolete,
-                database_step_proof: None,
-                desktop_projection: None,
-                legacy_utf8_text: None,
-                source_updated_at: state.source_updated_at,
-                source_revision: state.source_revision,
-                source_byte_count: obsolete.len(),
-                indexed_byte_count: obsolete.len(),
-                truncation_strategy: "none",
-                source_complete: true,
-                provider_limited: false,
-                origin: SessionTrajectoryOrigin::Native,
-                document_version: state.document_version,
-                derived_title: None,
-                withdrawn_title: None,
-                title_is_verified: false,
-                title_authoritative: true,
-                local_opener: omnis_store::LocalOpenerEvidence::Unknown,
-            },
+    // Give the obsolete document the selected rollout's genuine source receipt.
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE session_trajectories SET codex_home=NULL WHERE provider='codex' AND session_id=?1",
+        [CODEX_ID],
+    )
+    .unwrap();
+    let changed = db
+        .execute(
+            "UPDATE session_trajectories SET (session_id, source_updated_at, source_updated_submillis,
+                 source_file_id, source_contents_id, missing_ancestor_id) = (
+                 SELECT session_id, source_updated_at, source_updated_submillis, source_file_id,
+                        source_contents_id, missing_ancestor_id FROM session_trajectories
+                 WHERE provider='codex' AND session_id=?1 AND codex_home IS NULL)
+             WHERE provider='codex' AND session_id=?2",
+            [CODEX_ID, OTHER_CODEX_ID],
         )
         .unwrap();
-    assert_eq!(
-        result_sessions(&fixture.search_json(&["Superseded", "--cached", "--all-projects"])),
-        [session.to_string()]
-    );
+    assert_eq!(changed, 1);
+    let stale = fixture.search_json(&["Superseded", "--cached", "--all-projects"]);
+    assert_eq!(result_sessions(&stale), [session.to_string()]);
+    assert_eq!(stale["results"][0]["match"], "conversation");
     assert!(
         fixture
             .command()
@@ -759,14 +1223,14 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
         writeln!(
             fs::OpenOptions::new().append(true).open(&path).unwrap(),
             "{}",
-            json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})
+            json!({"ordinal":11,"timestamp":STAMP,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})
         )
         .unwrap();
         let original = fs::read(&path).unwrap();
         if show_first {
             let shown = fixture
                 .command()
-                .args(["show", &reference])
+                .args(["--json", "show", &reference])
                 .output()
                 .unwrap();
             assert!(
@@ -774,11 +1238,27 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
                 "{}",
                 String::from_utf8_lossy(&shown.stderr)
             );
-            assert!(!String::from_utf8_lossy(&shown.stdout).contains("backoff"));
+            let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+            let opener = snapshot["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event["kind"] == "message_user"
+                        && event["payload"]["text"] == "Tune the rate limiter backoff"
+                })
+                .expect("published opener");
+            assert_eq!(opener["payload"]["omnisession_codex_rollback"], "withdrawn");
         } else {
-            assert!(result_sessions(&search("backoff", false)).is_empty());
+            assert_eq!(
+                search("backoff", false)["results"][0]["match"],
+                "conversation"
+            );
         }
-        assert!(result_sessions(&search("backoff", true)).is_empty());
+        assert_eq!(
+            search("backoff", true)["results"][0]["match"],
+            "conversation"
+        );
         assert!(search(CODEX_ID, true)["results"][0]["title"].is_null());
         assert_eq!(fs::read(path).unwrap(), original);
     }
@@ -797,12 +1277,10 @@ fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
             "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
         ));
         let mut source = fs::read(&plain).unwrap();
-        let pad = format!(
-            "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}\n",
-            " ".repeat(1024 * 1024)
-        );
-        for _ in 0..16 {
-            source.extend_from_slice(pad.as_bytes());
+        let padding = " ".repeat(1024 * 1024);
+        for ordinal in 11..27 {
+            let row = json!({"ordinal":ordinal,"timestamp":STAMP,"type":"event_msg","payload":{"type":"warning","message":"padding"}});
+            source.extend_from_slice(format!("{row}{padding}\n").as_bytes());
         }
         fs::remove_file(&plain).unwrap();
         let path = if gzip {
@@ -852,13 +1330,20 @@ fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
         drop(db);
         assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
 
-        append(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n");
+        let rollback = json!({"ordinal":27,"timestamp":STAMP,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+        append(format!("{rollback}\n").as_bytes());
         if repeated_later {
             let new_opener = format!("New opener {}", "x".repeat(5 * 1024 * 1024));
-            for text in [new_opener.as_str(), initial_title] {
-                let row = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            for (ordinal, text) in [(28, new_opener.as_str()), (32, initial_title)] {
+                let row = json!({"timestamp":STAMP,"ordinal":ordinal,"type":"response_item","payload":{"type":"message","role":"user",
                     "content":[{"type":"input_text","text":text}]}});
-                append(format!("{row}\n").as_bytes());
+                let [mut display, mut model] = paginated_pair(row, ordinal);
+                let turn = &display["payload"]["turn_id"];
+                let start = json!({"ordinal":ordinal,"timestamp":STAMP,"type":"event_msg","payload":{"type":"task_started","turn_id":turn}});
+                let end = json!({"ordinal":ordinal+3,"timestamp":STAMP,"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}});
+                display["ordinal"] = json!(ordinal + 1);
+                model["ordinal"] = json!(ordinal + 2);
+                append(format!("{start}\n{display}\n{model}\n{end}\n").as_bytes());
             }
         }
         let original = fs::read(&path).unwrap();
@@ -870,12 +1355,8 @@ fn sampled_fork_index_withdraws_a_legacy_title_after_rollback() {
             "backoff",
         ]);
         for results in [live, search("backoff")] {
-            if repeated_later {
-                assert_eq!(results["results"][0]["match"], "conversation");
-                assert_eq!(results["results"][0]["coverage"], "preview");
-            } else {
-                assert!(result_sessions(&results).is_empty());
-            }
+            assert_eq!(results["results"][0]["match"], "conversation");
+            assert_eq!(results["results"][0]["coverage"], "preview");
         }
         assert!(search(CODEX_ID)["results"][0]["title"].is_null());
         assert_eq!(fixture.index_codex()["indexed"], 0);
@@ -907,6 +1388,14 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         rows[0]["payload"]["history_mode"] = json!("legacy");
+        let header = rows.remove(0);
+        let rows = std::iter::once(header)
+            .chain(rows.into_iter().flat_map(|mut row| {
+                row["timestamp"] = json!(STAMP);
+                let display = display_event(&row);
+                [row, display]
+            }))
+            .collect::<Vec<_>>();
         write_jsonl(&path, &rows);
     }
     let cached = |query: &str| {
@@ -919,7 +1408,8 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     );
     let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
     let pad = format!(
-        "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}",
+        "{}{}",
+        json!({"timestamp":STAMP,"type":"event_msg","payload":{"type":"warning","message":"padding"}}),
         " ".repeat(1024 * 1024)
     );
     for _ in 0..16 {
@@ -933,33 +1423,18 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
         json!({"type":"response_item","payload":{"type":"message","role":"assistant",
             "content":[{"type":"output_text","text":"Queue delay explains the slowdown"}]}}),
     ] {
+        let mut row = row;
+        row["timestamp"] = json!(STAMP);
         writeln!(file, "{row}").unwrap();
+        if old_legacy_cache && row["type"] == "response_item" {
+            writeln!(file, "{}", display_event(&row)).unwrap();
+        }
     }
     drop(file.into_inner().unwrap());
     let original = fs::read(&path).unwrap();
     if old_legacy_cache {
         fixture.index_codex();
-        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-        db.execute_batch(
-            "DROP TABLE codex_workspace_rechecks;
-             CREATE TABLE codex_workspace_rechecks(
-                 trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
-                 source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
-        ).unwrap();
-        assert_eq!(
-            db.execute(
-                "UPDATE session_trajectories SET document_version=6,source_updated_submillis=NULL,
-                 derived_title='Tune the rate limiter backoff',derived_title_is_verified=1,derived_title_is_local_opener=0
-                 WHERE provider='codex' AND session_id=?1 AND source_complete=0
-                   AND document_version=?2 AND derived_title='Investigate latency instead'",
-                rusqlite::params![CODEX_ID, omnis_core::search_document_version(omnis_ir::Provider::Codex)],
-            )
-            .unwrap(),
-            1,
-        );
-    }
-
-    if old_legacy_cache {
+        restore_legacy_title_cache(&fixture);
         let pending = fixture.search_json(&["slowdown", "--provider", "codex"]);
         assert!(result_sessions(&pending).is_empty());
         assert!(
@@ -982,7 +1457,10 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     assert!(result_sessions(&cached("backoff")).is_empty());
     let retained = cached("slowdown");
     let scoped = fixture.search_json(&["slowdown", "--provider", "codex", "--show-text"]);
-    assert_eq!(scoped["results"][0]["title"], "Investigate latency instead");
+    assert_eq!(
+        scoped["results"][0]["title"], "Investigate latency instead",
+        "{scoped} {retained}"
+    );
     assert_eq!(
         retained["results"][0]["title"],
         "Investigate latency instead"
@@ -990,6 +1468,28 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     assert_eq!(retained["results"][0]["coverage"], "preview");
     assert_eq!(fixture.index_codex()["stale"], 0);
     assert_eq!(fs::read(path).unwrap(), original);
+}
+
+fn restore_legacy_title_cache(fixture: &Fixture) {
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute_batch(
+        "DROP TABLE codex_workspace_rechecks;
+         CREATE TABLE codex_workspace_rechecks(
+             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+             source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE session_trajectories SET document_version=6,source_updated_submillis=NULL,
+             derived_title='Tune the rate limiter backoff',derived_title_is_verified=1,derived_title_is_local_opener=0
+             WHERE provider='codex' AND session_id=?1 AND source_complete=0
+               AND document_version=?2 AND derived_title='Investigate latency instead'",
+            rusqlite::params![CODEX_ID, omnis_core::search_document_version(omnis_ir::Provider::Codex)],
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1144,13 +1644,15 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
     }
 
     // An interrupted pass can persist the new catalog row before it records a read failure.
-    let store = omnis_store::Store::open(fixture.root.join("state/store.sqlite3")).unwrap();
-    store
-        .clear_trajectory_index_failure(&omnis_ir::SessionRef::new(
-            omnis_ir::Provider::Codex,
-            CODEX_ID,
-        ))
-        .unwrap();
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    let home = fs::canonicalize(fixture.root.join("codex")).unwrap();
+    assert_eq!(
+        db.execute(
+            "DELETE FROM trajectory_index_failures WHERE provider='codex' AND session_id=?1 AND codex_home=?2",
+            rusqlite::params![CODEX_ID, home.to_str().unwrap()],
+        ).unwrap(),
+        1
+    );
     assert!(result_sessions(&search("Pagination", &["--cached"])).is_empty());
     assert!(result_sessions(&search("backoff", &["--cached"])).is_empty());
 
@@ -1163,6 +1665,33 @@ fn unreadable_preferred_rollout_hides_archived_text_and_title_until_recovery() {
         result_sessions(&fixture.search_json(&["Pagination", "--provider", "codex", "--cached"])),
         [format!("codex:{CODEX_ID}")]
     );
+}
+
+#[test]
+fn failed_discovery_cannot_assign_a_name_with_two_possible_rollouts() {
+    let fixture = Fixture::new();
+    let home = fixture.root.join("codex");
+    let filename = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let selected = home.join("sessions/2026/01/02").join(&filename);
+    let archive = home.join("archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let content = fs::read_to_string(selected).unwrap();
+    fs::write(
+        archive.join(filename),
+        content.replace("Pagination", "Archive"),
+    )
+    .unwrap();
+    fs::write(
+        home.join("session_index.jsonl"),
+        json!({"id": CODEX_ID, "thread_name": "Violet Quokka"}).to_string(),
+    )
+    .unwrap();
+    let query = ["Violet Quokka", "--provider", "codex", "--cached"];
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
+    fs::write(home.join("state_5.sqlite"), "unreadable database").unwrap();
+    fixture.index_codex();
+    assert!(result_sessions(&fixture.search_json(&query)).is_empty());
 }
 
 #[test]
@@ -1403,7 +1932,7 @@ fn check_codex_gui_name_changes(archived: bool, legacy: bool) {
     let (header, conversation) = source.split_once('\n').unwrap();
     let mut header: Value = serde_json::from_str(header).unwrap();
     header["payload"]["history_mode"] = json!("paginated");
-    fs::write(&rollout, format!("{header}\n{conversation}")).unwrap();
+    write_paginated_conversation(&rollout, header, conversation, 0);
     if archived {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
@@ -1803,7 +2332,10 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
             &omnis_store::TrajectoryDocument {
                 source_revision: omnis_ir::SourceRevision::default(),
                 redacted_text: preview,
+                projection: None,
                 database_step_proof: None,
+                database_wal_commits: None,
+                database_summary_revision: None,
                 desktop_projection: None,
                 legacy_utf8_text: None,
                 indexed_byte_count: preview.len(),
@@ -1856,6 +2388,48 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn cached_search_keeps_other_providers_when_a_home_cannot_be_resolved() {
+    let fixture = Fixture::new();
+    let indexed = fixture
+        .command()
+        .args(["index", "--provider", "claude"])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let inaccessible = fixture.root.join("not-a-directory");
+    fs::write(&inaccessible, "").unwrap();
+    for (home, should_warn) in [
+        (inaccessible.clone(), true),
+        (inaccessible.join("provider"), true),
+        (fixture.root.join("absent/provider"), false),
+    ] {
+        let search = fixture
+            .command()
+            .env("ANTIGRAVITY_CLI_HOME", home)
+            .args([
+                "--json",
+                "search",
+                "zebracorn",
+                "--cached",
+                "--all-projects",
+            ])
+            .output()
+            .unwrap();
+        assert!(search.status.success(), "{search:?}");
+        let cached: Value = serde_json::from_slice(&search.stdout).unwrap();
+        assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+        assert_eq!(
+            cached["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("antigravity")),
+            should_warn
+        );
+    }
 }
 
 #[test]
@@ -2238,6 +2812,12 @@ fn no_index_searches_only_what_is_already_indexed() {
 
 #[test]
 fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
+    for version in [4, 5] {
+        check_unstamped_middle_messages(version);
+    }
+}
+
+fn check_unstamped_middle_messages(version: u32) {
     use std::io::{BufWriter, Write};
 
     let fixture = Fixture::new();
@@ -2277,8 +2857,8 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
     };
     for substituted in [false, true] {
         db.execute(
-            "UPDATE session_trajectories SET document_version=4, source_file_id=NULL, source_contents_id=NULL WHERE session_id=?1",
-            [CODEX_ID],
+            "UPDATE session_trajectories SET document_version=?2, source_file_id=NULL, source_contents_id=NULL WHERE session_id=?1 AND codex_home IS NOT NULL",
+            rusqlite::params![CODEX_ID, version],
         ).unwrap();
         if substituted {
             write("Topazjackdaw");
@@ -2298,9 +2878,17 @@ fn an_unstamped_legacy_document_keeps_only_verified_middle_messages() {
             // Older readers marked a verified projection partial when the rollout had malformed records.
             for version in 6..=omnis_core::search_document_version(omnis_ir::Provider::Codex) {
                 assert_eq!(db.execute(
-                    "UPDATE session_trajectories SET document_version=?2, source_complete=0, tail_reader_version=0 WHERE session_id=?1",
+                    "UPDATE session_trajectories SET document_version=?2, source_complete=0, tail_reader_version=0 WHERE session_id=?1 AND codex_home IS NOT NULL",
                     rusqlite::params![CODEX_ID, version],
                 ).unwrap(), 1);
+                if version == 8 {
+                    // This reader saved the document before Codex homes had separate rows.
+                    db.execute(
+                        "UPDATE session_trajectories SET codex_home=NULL WHERE session_id=?1 AND codex_home IS NOT NULL",
+                        [CODEX_ID],
+                    )
+                    .unwrap();
+                }
                 assert_eq!(fixture.index_codex()["indexed"], 1);
                 assert!(hit("Bronzekestrel"));
                 assert!(hit("Visible"));
@@ -2414,12 +3002,12 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
             .env("CODEX_SQLITE_HOME", self.root.join("codex"))
+            .env("GROK_HOME", self.root.join("grok"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
         #[cfg(unix)]
         command.env("PATH", "/usr/bin:/bin");
         for variable in [
-            "GROK_HOME",
             "HERMES_HOME",
             "ANTIGRAVITY_CLI_HOME",
             "ANTIGRAVITY_IDE_HOME",
@@ -2487,7 +3075,7 @@ impl Fixture {
             "thread_id": "019f0000-0000-7000-8000-000000000099",
             "end_byte_offset": 512, "end_ordinal_exclusive": 4
         });
-        fs::write(path, format!("{header}\n{conversation}")).unwrap();
+        write_paginated_conversation(&path, header, conversation, 4);
     }
 
     fn index_codex(&self) -> Value {
@@ -2503,6 +3091,58 @@ impl Fixture {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+}
+
+fn write_paginated_conversation(
+    path: &Path,
+    header: Value,
+    conversation: &str,
+    first_ordinal: usize,
+) {
+    let turn = "019f0000-0000-7000-8000-000000000005";
+    let marker = |kind| json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn}});
+    let records = [header, marker("task_started")]
+        .into_iter()
+        .chain(
+            conversation
+                .lines()
+                .flat_map(|line| paginated_pair(serde_json::from_str(line).unwrap(), 5)),
+        )
+        .chain([marker("task_complete")])
+        .enumerate()
+        .map(|(i, mut row)| {
+            row["timestamp"] = json!(STAMP);
+            row["ordinal"] = json!(i + first_ordinal);
+            row
+        })
+        .collect::<Vec<_>>();
+    write_jsonl(path, &records);
+}
+
+fn paginated_pair(mut row: Value, turn_number: u64) -> [Value; 2] {
+    let user = row["payload"]["role"] == "user";
+    let (kind, part) = if user {
+        ("UserMessage", "text")
+    } else {
+        ("AgentMessage", "Text")
+    };
+    let turn = format!("019f0000-0000-7000-8000-{turn_number:012}");
+    let id = format!("{kind}-{turn_number}");
+    let text = &row["payload"]["content"][0]["text"];
+    let display = json!({"timestamp":STAMP,"type":"event_msg","payload":{"type":"item_completed","thread_id":CODEX_ID,"turn_id":turn,"item":{"type":kind,"id":id,"content":[{"type":part,"text":text}]}}});
+    row["payload"]["id"] = json!(id);
+    row["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+    [display, row]
+}
+
+fn display_event(row: &Value) -> Value {
+    let message = &row["payload"];
+    let kind = if message["role"] == "user" {
+        "user_message"
+    } else {
+        "agent_message"
+    };
+    json!({"timestamp": STAMP, "type": "event_msg", "payload": {"type": kind, "message": message["content"][0]["text"]}})
 }
 
 fn write_codex_session(root: &Path, id: &str, workspace: &Path, question: &str, answer: &str) {

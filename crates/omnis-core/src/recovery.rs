@@ -5,18 +5,30 @@ use std::{
 
 use super::{
     CODEX_IMPORT_MARKER, CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
-    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, UNCERTAIN_COMPACTION,
-    bounded_text, codex_history_warnings, is_documentary_tool_message, is_secret,
+    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, MESSAGE_CHARACTER_LIMIT, OmniEvent,
+    RECENT_MESSAGE_LIMIT, ReplayPolicy, UNCERTAIN_COMPACTION, bounded_text,
+    codex_exclusion_receipt, codex_history_warnings, codex_replacement_length, codex_rollback,
+    has_recoverable_codex_rollback, is_documentary_tool_message, is_secret,
     is_source_compaction_boundary, is_user_harness_envelope, latest_plan_action,
-    markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
-    render_recorded_workspace, sorted_context_events, source_compaction_text,
-    text_from_payload_ref,
+    markdown_tool_label, quote_untrusted, recorded_compaction_text, redact_secrets,
+    redacted_tool_payload, render_recorded_workspace, sorted_context_events, text_from_payload_ref,
+    visible_events,
 };
 
-/// A bounded import can omit records, or the source summary can replace earlier messages.
+/// Returns whether a bounded import or a compaction boundary leaves out recoverable history.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
-    if import_truncated {
+    if import_truncated || has_recoverable_codex_rollback(snapshot) {
+        return snapshot
+            .events
+            .iter()
+            .any(|event| recovery_entry(event).is_some());
+    }
+    if snapshot
+        .events
+        .iter()
+        .any(|event| super::codex_answer_before_compaction(event) && has_recovery_content(event))
+    {
         return true;
     }
     if !snapshot.events.iter().any(is_source_compaction_boundary) {
@@ -24,6 +36,9 @@ pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bo
     }
     let context = sorted_context_events(snapshot);
     context.uncertain
+        || context.events.get(context.start).is_some_and(|event| {
+            codex_replacement_length(event).is_some() && recorded_compaction_text(event).is_some()
+        })
         || context.events[..context.start]
             .iter()
             .any(|event| has_recovery_content(event))
@@ -39,8 +54,18 @@ enum RecoveryEntry<'a> {
     ToolPayload(&'static str, &'a serde_json::Value),
 }
 
+impl RecoveryEntry<'_> {
+    fn redacted(&self) -> (&'static str, String) {
+        match self {
+            Self::Message(heading, text) => (heading, redact_secrets(text)),
+            Self::ToolText(text) => ("Historical tool record", redact_secrets(text)),
+            Self::ToolPayload(label, payload) => (label, redacted_tool_payload(payload)),
+        }
+    }
+}
+
 fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
-    if is_secret(event) {
+    if is_secret(event) || super::is_codex_checkpoint_tool(event) {
         return None;
     }
     if let Some(label) = markdown_tool_label(&event.kind) {
@@ -48,10 +73,33 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
     }
     let heading = match event.kind {
         EventKind::CompactionCreated => {
-            return source_compaction_text(event)
-                .map(|text| RecoveryEntry::Message("Source compaction summary", text));
+            if event.replay_policy == ReplayPolicy::HistoricalOnly
+                && event.source.provider == super::Provider::Claude
+                && event.source.raw_record_type.as_deref()
+                    == Some(super::CLAUDE_MISSING_COMPACTION_SUMMARY)
+            {
+                return event.payload["text"].as_str().map(|text| {
+                    RecoveryEntry::Message("Unverified Claude compaction anchor", text)
+                });
+            }
+            let heading = if codex_replacement_length(event).is_some() {
+                "Codex compaction note outside the replacement history"
+            } else {
+                "Source compaction summary"
+            };
+            return recorded_compaction_text(event)
+                .map(|text| RecoveryEntry::Message(heading, text));
+        }
+        EventKind::MessageUser if super::is_codex_replacement_message(event) => {
+            "Codex model-window replacement (user)"
+        }
+        EventKind::MessageAssistant if super::is_codex_replacement_message(event) => {
+            "Codex model-window replacement (assistant)"
         }
         EventKind::MessageUser => "User",
+        EventKind::MessageAssistant if super::codex_answer_before_compaction(event) => {
+            "Codex reply displayed after compaction"
+        }
         EventKind::MessageAssistant => "Assistant",
         _ => return None,
     };
@@ -66,6 +114,38 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return Some(RecoveryEntry::ToolText(text));
     }
     Some(RecoveryEntry::Message(heading, text))
+}
+
+pub(super) fn append_previous_display(snapshot: &CanonicalSnapshot, markdown: &mut String) {
+    use std::fmt::Write;
+
+    if !has_recoverable_codex_rollback(snapshot) {
+        return;
+    }
+    let mut entries = visible_events(snapshot)
+        .into_iter()
+        .rev()
+        .filter(|event| {
+            !super::is_codex_replacement_message(event)
+                && !super::is_paginated_codex_checkpoint(event)
+        })
+        .filter_map(|event| Some((codex_rollback(snapshot, event)?, recovery_entry(event)?)))
+        .take(RECENT_MESSAGE_LIMIT + 1)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return;
+    }
+    markdown.push_str("\n## Previous Codex display\n\nThese historical excerpts are excluded from active context.\n");
+    if entries.len() > RECENT_MESSAGE_LIMIT {
+        entries.pop();
+        markdown.push_str("Earlier excerpts exceed the preview limit.\n");
+    }
+    for (rollback, entry) in entries.into_iter().rev() {
+        let (heading, text) = entry.redacted();
+        writeln!(markdown, "\n### {heading} ({})\n", rollback.label())
+            .expect("writing to String cannot fail");
+        quote_untrusted(markdown, &bounded_text(&text, MESSAGE_CHARACTER_LIMIT));
+    }
 }
 
 /// Writes the available redacted conversation, including turns before the latest compaction.
@@ -94,7 +174,7 @@ pub fn write_recovery_handoff(
         redact_secrets(&block)
     )?;
     let context = sorted_context_events(snapshot);
-    if let Some(action) = latest_plan_action(&context.events[context.start..]) {
+    if let Some(action) = latest_plan_action(context.events[context.start..].iter().copied()) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
@@ -111,16 +191,10 @@ pub fn write_recovery_handoff(
             writeln!(output, "{reason}\n")?;
         }
     }
-    if !context.unattributed_codex_displays.is_empty() {
-        writeln!(
-            output,
-            "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
-        )?;
-        for sequence in &context.unattributed_codex_displays {
-            writeln!(output, "- Record {sequence}")?;
-        }
-        writeln!(output)?;
+    if let Some((notice, _)) = codex_exclusion_receipt(snapshot) {
+        writeln!(output, "{notice}\n")?;
     }
+    write_unattributed_displays(&mut output, &context.unattributed_codex_displays)?;
     if context
         .events
         .iter()
@@ -138,9 +212,29 @@ pub fn write_recovery_handoff(
         } else {
             continue;
         };
+        for active in super::codex_replies::previous_spellings(snapshot, event) {
+            block.clear();
+            quote_untrusted(&mut block, &redact_secrets(active));
+            writeln!(output, "### Restored Codex reply (Assistant)\n\n{block}")?;
+        }
         block.clear();
         quote_untrusted(&mut block, &text);
-        writeln!(output, "### {heading}\n\n{block}")?;
+        if let Some(rollback) = codex_rollback(snapshot, event) {
+            let section = if super::is_codex_replacement_message(event)
+                || super::is_paginated_codex_checkpoint(event)
+            {
+                "Previous Codex model context"
+            } else {
+                "Previous Codex display"
+            };
+            writeln!(
+                output,
+                "### {section} ({heading}, {})\n\n{block}",
+                rollback.label()
+            )?;
+        } else {
+            writeln!(output, "### {heading}\n\n{block}")?;
+        }
     }
     if tools_limited {
         writeln!(
@@ -149,6 +243,20 @@ pub fn write_recovery_handoff(
         )?;
     }
     output.flush()
+}
+
+fn write_unattributed_displays(output: &mut impl Write, sequences: &[u64]) -> io::Result<()> {
+    if sequences.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
+    )?;
+    for sequence in sequences {
+        writeln!(output, "- Record {sequence}")?;
+    }
+    writeln!(output)
 }
 
 fn recovery_tools(context: &ContextEvents<'_>) -> (HashMap<usize, (&'static str, String)>, bool) {

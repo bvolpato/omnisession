@@ -11,19 +11,20 @@ fn text_update(kind: &str, text: &str) -> String {
         .to_string()
 }
 
-fn read_updates(updates: &str) -> anyhow::Result<CanonicalSnapshot> {
+fn read_updates(updates: &str, declared_count: usize) -> anyhow::Result<CanonicalSnapshot> {
     let temporary = tempfile::tempdir()?;
-    write_session(temporary.path(), updates)?;
+    write_session(temporary.path(), updates, declared_count)?;
     GrokAdapter::with_root(temporary.path())
         .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
 }
 
-fn write_session(root: &Path, updates: &str) -> anyhow::Result<()> {
+fn write_session(root: &Path, updates: &str, declared_count: usize) -> anyhow::Result<()> {
     let session = root.join("workspace-hash").join(SESSION_ID);
     fs::create_dir_all(&session)?;
     fs::write(
         session.join("summary.json"),
-        json!({"id": SESSION_ID, "cwd": "/workspace/demo", "num_messages": 2}).to_string(),
+        json!({"id": SESSION_ID, "cwd": "/workspace/demo", "num_messages": declared_count})
+            .to_string(),
     )?;
     fs::write(session.join("updates.jsonl"), updates)?;
     Ok(())
@@ -50,7 +51,7 @@ fn grok_updates_over_the_strict_file_limit_still_read() {
     updates.push_str(&text_update("agent_message_chunk", "synthetic answer"));
     updates.push('\n');
 
-    let snapshot = read_updates(&updates).expect("Grok updates over 32 MiB read");
+    let snapshot = read_updates(&updates, 5).expect("Grok updates over 32 MiB read");
 
     assert_eq!(
         kinds(&snapshot),
@@ -68,7 +69,7 @@ fn grok_skips_oversized_updates_and_reports_omission() {
         text_update("agent_message_chunk", "synthetic answer")
     );
 
-    let snapshot = read_updates(&updates).expect("oversized Grok update must not abort read");
+    let snapshot = read_updates(&updates, 3).expect("oversized Grok update must not abort read");
 
     assert_eq!(
         kinds(&snapshot),
@@ -149,7 +150,8 @@ fn grok_streaming_coalesces_chunks_and_flushes_at_record_boundaries() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let snapshot = read_updates(&updates).expect("Grok updates stream into snapshot");
+    let snapshot =
+        read_updates(&updates, records.len()).expect("Grok updates stream into snapshot");
 
     assert_eq!(
         kinds(&snapshot),
@@ -183,7 +185,7 @@ fn grok_streaming_coalesces_chunks_and_flushes_at_record_boundaries() {
 #[test]
 fn grok_rejects_declared_history_without_any_readable_json_records() {
     for updates in ["", "not-json\n"] {
-        let error = read_updates(updates).expect_err("declared history has no JSON records");
+        let error = read_updates(updates, 1).expect_err("declared history has no JSON records");
         assert!(
             error
                 .to_string()
@@ -199,7 +201,7 @@ fn grok_accepts_valid_records_that_do_not_emit_events() {
     })
     .to_string();
 
-    let snapshot = read_updates(&updates).expect("unknown update is still readable history");
+    let snapshot = read_updates(&updates, 1).expect("unknown update is still readable history");
 
     assert!(snapshot.events.is_empty());
 }

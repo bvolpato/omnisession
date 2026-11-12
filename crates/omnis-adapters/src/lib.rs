@@ -26,7 +26,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -37,7 +37,7 @@ pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use cursor_identity::{
     cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
 };
-pub use grok::GrokAdapter;
+pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
@@ -57,8 +57,7 @@ pub use provider_process::{
 };
 pub use source_file::source_file_revision;
 pub use sqlite_wal::UnverifiedSqliteWal;
-pub use support::IncompleteTranscript;
-pub use support::TranscriptReadLimit;
+pub use support::{IncompleteTranscript, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, TranscriptReadLimit};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +97,7 @@ pub struct NativeSession {
 /// Native catalog rows and the metadata quality observed during the same read.
 #[derive(Default)]
 pub struct NativeListing {
+    pub conflicting_grok_ids: Vec<String>,
     pub sessions: Vec<NativeSession>,
     pub notes: Vec<String>,
     pub desktop_summaries_unavailable: bool,
@@ -120,6 +120,8 @@ pub struct SearchSourceObservation {
     pub home: PathBuf,
     selected_home: PathBuf,
     database_generation: Option<antigravity::DatabaseGeneration>,
+    database_wal_commits: std::sync::OnceLock<Option<Vec<uuid::Uuid>>>,
+    database_summary_revision: Option<uuid::Uuid>,
     paths: Vec<(PathBuf, FileObservation)>,
 }
 
@@ -163,6 +165,8 @@ impl SearchSourceObservation {
             home,
             selected_home: root.to_path_buf(),
             database_generation: None,
+            database_wal_commits: std::sync::OnceLock::new(),
+            database_summary_revision: None,
             paths,
         };
         anyhow::ensure!(
@@ -194,6 +198,34 @@ impl SearchSourceObservation {
     pub fn database_checkpoint(&self) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
         self.database_generation
             .map(antigravity::DatabaseGeneration::checkpoint)
+    }
+
+    /// Identifies the committed prefixes of the WAL selected for this observation.
+    #[must_use]
+    pub fn database_wal_commits(&self) -> Option<&[uuid::Uuid]> {
+        let (_, wal) = self.database_checkpoint()?;
+        if !self.is_current() {
+            return None;
+        }
+        if wal.is_none() {
+            return Some(&[]);
+        }
+        self.database_wal_commits
+            .get_or_init(|| {
+                let database = self.session.source_path.as_deref()?;
+                let path = support::provider_file(&self.home, &support::sidecar(database, "-wal"))?;
+                let commits =
+                    sqlite_wal::commit_history(&path, support::sqlite_snapshot_byte_limit().ok()?)
+                        .ok()?;
+                self.is_current().then_some(commits)
+            })
+            .as_deref()
+    }
+
+    /// Identifies the physical summary file that supplied this database's declared count.
+    #[must_use]
+    pub fn database_summary_revision(&self) -> Option<uuid::Uuid> {
+        self.database_summary_revision
     }
 
     /// Checks a historical declaration against the selected database and WAL.
@@ -332,6 +364,13 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Physical file whose ownership was checked independently of display metadata.
+    pub ownership_revision: Option<SourceRevision>,
+    pub database_aliases: std::sync::Arc<omnis_ir::antigravity_receipts::DatabaseAliases>,
+    /// Exclusive event sequence at the first gap in an otherwise sequential read.
+    pub verified_prefix_end: Option<u64>,
+    /// Sequence ranges for native records that produced multiple canonical events.
+    pub search_record_groups: Vec<std::ops::Range<u64>>,
     /// Catalog metadata verified by the reader of the selected native transcript.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
@@ -343,6 +382,53 @@ pub struct IndexRead {
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+}
+
+/// Search text previously indexed from the same physical transcript.
+#[derive(Clone, Copy)]
+pub enum PriorSearchDocument {
+    RequireCompleteTail(usize),
+    Complete {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+    },
+    Partial {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+        sampled_file_bytes: Option<u64>,
+        /// An older partial index lacks the location of its sampled windows.
+        recover_from_full_scan: bool,
+    },
+}
+
+/// The searchable result of a provider read, including its source time and coverage.
+pub struct IndexedSearchDocument {
+    pub document: omnis_core::SearchDocument,
+    /// Native metadata and the visible message used to derive a search title.
+    pub read: IndexRead,
+}
+
+impl IndexRead {
+    #[must_use]
+    pub fn search_document(&self) -> omnis_core::SearchDocument {
+        let mut document = omnis_core::trajectory_search_document_in_records(
+            &self.snapshot,
+            &self.search_record_groups,
+        );
+        if let Some(projection) = document.projection.as_mut() {
+            projection.database_aliases = std::sync::Arc::clone(&self.database_aliases);
+        }
+        document
+    }
+}
+
+impl From<IndexRead> for IndexedSearchDocument {
+    fn from(read: IndexRead) -> Self {
+        Self {
+            document: read.search_document(),
+            read,
+        }
+    }
 }
 
 /// Provider-specific launch input.
@@ -368,6 +454,14 @@ impl Default for LaunchTarget {
 pub enum EnvChange {
     Set { name: String, value: String },
     Remove(String),
+}
+
+/// Workspace evidence for a session whose active directory can change between turns.
+pub struct NativeWorkspace {
+    pub directory: Option<PathBuf>,
+    /// Directory the native client can safely infer when it opens the session.
+    pub startup_directory: Option<PathBuf>,
+    pub git: GitState,
 }
 
 /// State database settings that a Codex launch profile supplies.
@@ -404,6 +498,10 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    ownership_revision: None,
+                    verified_prefix_end: None,
+                    database_aliases: std::sync::Arc::default(),
+                    search_record_groups: Vec::new(),
                     native_session: None,
                     rollback_title: RollbackTitle::Unknown,
                     workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -418,6 +516,10 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        ownership_revision: None,
+        verified_prefix_end: None,
+        database_aliases: std::sync::Arc::default(),
+        search_record_groups: Vec::new(),
         native_session: None,
         rollback_title: RollbackTitle::Unknown,
         workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -530,6 +632,15 @@ pub trait ProviderAdapter: Send + Sync {
             .find(|session| session.session.id == id))
     }
 
+    /// Reads the effective workspace when it can differ from the discovery metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot determine the effective directory.
+    fn native_workspace(&self, _session: &SessionRef) -> Result<Option<NativeWorkspace>> {
+        Ok(None)
+    }
+
     /// Describes whether the provider can continue the stored representation by its session ID.
     ///
     /// # Errors
@@ -537,6 +648,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error if the adapter cannot identify the source representation.
     fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
         Ok(NativeResumeSupport::Direct)
+    }
+
+    /// IDs with a conflicting or unreadable native source in the last discovery pass.
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Resolves the local SQLite home for a Codex continuation. An existing ID must select the displayed session there.
@@ -755,9 +871,10 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<(IndexRead, DateTime<Utc>)> {
-        let read = self.index_search_document(session, source_path, full_read_bytes)?;
-        let time = self.search_source_time(&read.snapshot, source_path)?;
+        prior: Option<PriorSearchDocument>,
+    ) -> Result<(IndexedSearchDocument, DateTime<Utc>)> {
+        let read = self.index_search_document(session, source_path, full_read_bytes, prior)?;
+        let time = self.search_source_time(&read.read.snapshot, source_path)?;
         Ok((read, time))
     }
 
@@ -772,6 +889,10 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            ownership_revision: None,
+            verified_prefix_end: None,
+            database_aliases: std::sync::Arc::default(),
+            search_record_groups: Vec::new(),
             native_session: None,
             rollback_title: RollbackTitle::Unknown,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
@@ -885,7 +1006,7 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
-    /// Reads the conversation for its search document. Discovery supplies separately stored session names.
+    /// Builds the local search document with the provider's full-read or preview budget.
     ///
     /// # Errors
     ///
@@ -895,8 +1016,10 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-    ) -> Result<IndexRead> {
+        _prior: Option<PriorSearchDocument>,
+    ) -> Result<IndexedSearchDocument> {
         self.index_session(session, source_path, full_read_bytes)
+            .map(Into::into)
     }
 
     /// Describes a fresh interactive provider launch.
@@ -970,6 +1093,15 @@ impl AdapterRegistry {
         self.adapters.get(&provider).map(Box::as_ref)
     }
 
+    /// Returns the selected native home for providers with home-specific catalog caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolution error for an inaccessible or invalid native home.
+    pub fn discovery_cache_home(&self, provider: Provider) -> Result<Option<PathBuf>> {
+        Ok(self.adapter(provider)?.discovery_cache_home()?)
+    }
+
     /// Returns registered provider adapter.
     ///
     /// # Errors
@@ -1005,15 +1137,6 @@ impl AdapterRegistry {
     ) -> Result<(Vec<NativeSession>, Vec<String>)> {
         let listing = self.adapter(provider)?.list_catalog(project)?;
         Ok((listing.sessions, listing.notes))
-    }
-
-    /// Returns the selected native home for providers with home-specific catalog caches.
-    ///
-    /// # Errors
-    ///
-    /// Returns the resolution error for an inaccessible or invalid native home.
-    pub fn discovery_cache_home(&self, provider: Provider) -> Result<Option<PathBuf>> {
-        Ok(self.adapter(provider)?.discovery_cache_home()?)
     }
 
     /// Reads catalog metadata from the selected native home.

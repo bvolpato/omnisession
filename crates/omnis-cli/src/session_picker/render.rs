@@ -1242,6 +1242,7 @@ pub(super) fn selected_detail_lines(
     };
     let title = display_title(entry, preview);
     let location = session_location(state, entry, ready_preview);
+    let sampled_grok = entry.session.session.provider == Provider::Grok && !preview_complete;
     let mut lines = vec![
         detail_line("SELECTED SESSION", DetailStyle::Accent),
         detail_line(title, DetailStyle::Strong),
@@ -1262,7 +1263,7 @@ pub(super) fn selected_detail_lines(
                 &mut lines,
                 preview,
                 *can_use_first_title,
-                message_count_is_complete,
+                (message_count_is_complete, sampled_grok),
                 width,
                 height,
             );
@@ -1280,7 +1281,7 @@ pub(super) fn selected_detail_lines(
             &mut lines,
             preview,
             preview_complete,
-            message_count_is_complete,
+            (message_count_is_complete, sampled_grok),
             entry.session.event_count,
             width,
             usize::MAX,
@@ -1326,11 +1327,16 @@ fn preview_message_count(count: usize, complete: bool) -> String {
     format!("{} {unit}{scope}", grouped_number(count))
 }
 
+fn counted(value: usize, noun: &str) -> String {
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{} {noun}{suffix}", grouped_number(value))
+}
+
 pub(super) fn append_session_metadata(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     preview_complete: bool,
-    message_count_is_complete: bool,
+    (message_count_is_complete, sampled_grok): (bool, bool),
     discovered_event_count: usize,
     width: usize,
     height: usize,
@@ -1339,11 +1345,21 @@ pub(super) fn append_session_metadata(
         return;
     }
     let event_count = discovered_event_count.max(preview.event_count);
-    let trajectory = format!(
-        "{} · {} tools · {event_count} events",
-        preview_message_count(preview.message_count, message_count_is_complete),
-        grouped_number(preview.tool_event_count),
-    );
+    let trajectory = if sampled_grok {
+        if preview.message_count == 0 {
+            "Message count unknown".to_owned()
+        } else {
+            format!("{} in preview", counted(preview.message_count, "message"))
+        }
+    } else if !preview_complete && preview.message_count == 0 {
+        "Message count unknown".to_owned()
+    } else {
+        format!(
+            "{} · {} tools · {event_count} events",
+            preview_message_count(preview.message_count, message_count_is_complete),
+            grouped_number(preview.tool_event_count),
+        )
+    };
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_field(
         "Trajectory",
@@ -1351,6 +1367,19 @@ pub(super) fn append_session_metadata(
         width,
         DetailStyle::Normal,
     ));
+    if sampled_grok || (!preview_complete && preview.message_count == 0) {
+        let activity = format!(
+            "{} · {}",
+            counted(preview.tool_event_count, "tool"),
+            counted(preview.event_count, "event")
+        );
+        lines.push(detail_field(
+            "In preview",
+            &activity,
+            width,
+            DetailStyle::Normal,
+        ));
+    }
     if let Some(tokens) = preview.total_tokens {
         let coverage = if preview.token_usage_is_cumulative || preview_complete {
             "total"
@@ -1634,7 +1663,7 @@ pub(super) fn append_preview_lines(
     lines: &mut Vec<DetailLine>,
     preview: &SessionPreview,
     can_use_first_title: bool,
-    message_count_is_complete: bool,
+    (message_count_is_complete, sampled_grok): (bool, bool),
     width: usize,
     height: usize,
 ) {
@@ -1645,7 +1674,9 @@ pub(super) fn append_preview_lines(
     } else {
         2
     };
-    let first_label = if can_use_first_title {
+    let first_label = if sampled_grok {
+        "FIRST IN PREVIEW"
+    } else if can_use_first_title {
         "FIRST MESSAGE"
     } else {
         "FIRST AVAILABLE MESSAGE"
@@ -1655,12 +1686,14 @@ pub(super) fn append_preview_lines(
             if message_count_is_complete {
                 "No visible messages"
             } else {
-                "No visible messages in preview"
+                "Preview incomplete. No messages were visible in the sample."
             },
             DetailStyle::Muted,
         )),
         (Some(first), Some(_)) if preview.message_count == 1 => {
-            let label = if message_count_is_complete {
+            let label = if sampled_grok {
+                "SAMPLED MESSAGE"
+            } else if message_count_is_complete {
                 "ONLY MESSAGE"
             } else if can_use_first_title {
                 "FIRST MESSAGE"
@@ -1674,7 +1707,9 @@ pub(super) fn append_preview_lines(
             if height >= 15 {
                 lines.push(detail_line(String::new(), DetailStyle::Normal));
             }
-            let latest_label = if message_count_is_complete {
+            let latest_label = if sampled_grok {
+                "LATEST IN PREVIEW"
+            } else if message_count_is_complete {
                 "LATEST MESSAGE"
             } else {
                 "LATEST AVAILABLE MESSAGE"

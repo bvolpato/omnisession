@@ -60,6 +60,30 @@ impl Primary {
         }
     }
 
+    pub(super) fn needs_window_comparison(
+        &self,
+        tx: &Transaction<'_>,
+        write: &PreparedTrajectoryWrite<'_, '_>,
+        home: &[u8],
+        file: Uuid,
+        rows: &[Uuid],
+    ) -> Result<bool> {
+        if !self.coverage.document_truncated
+            && !write
+                .document
+                .truncation_strategy
+                .contains("document_head_tail")
+        {
+            return Ok(false);
+        }
+        let Some(contents) = self.coverage.contents else {
+            return Ok(false);
+        };
+        let prior =
+            super::database_receipts::read(tx, write.session, home, file, contents, &self.hash)?;
+        Ok(prior.is_some_and(|prior| retains_steps(&prior, rows, false)))
+    }
+
     pub(super) fn partial_write(
         &self,
         tx: &Transaction<'_>,

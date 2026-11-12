@@ -18,8 +18,8 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     bounded_provider_json_output, bounded_provider_output, provider_process,
     support::{
-        EventBuilder, omitted_images_text, parse_timestamp, paths_match, provider_executable,
-        sort_sessions, string_at, validate_provider, value_at,
+        EventBuilder, encode_uri_component, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, sort_sessions, string_at, validate_provider, value_at,
     },
 };
 
@@ -380,19 +380,6 @@ fn session_endpoint(id: &str) -> Result<String> {
         bail!("invalid OpenCode session ID path segment");
     }
     Ok(format!("/api/session/{}", encode_uri_component(id)))
-}
-
-fn encode_uri_component(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                char::from(byte).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
 }
 
 /// Captures JSON from a prepared `OpenCode` command without interactive input.
