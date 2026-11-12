@@ -268,7 +268,8 @@ fn legacy_projection_source(
     {
         return Some(prior.source_revision);
     }
-    (prior.legacy_tail_receipt.is_some()
+    // Retries and picker previews can revisit a wider partial projection after its tail repair.
+    (!prior.source_complete
         && prior.document_version == SEARCH_DOCUMENT_VERSION
         && revision.file.is_some()
         && revision.contents.is_some()

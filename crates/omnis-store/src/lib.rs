@@ -3907,7 +3907,7 @@ impl Store {
                  WHERE t.provider = 'codex' AND t.session_id = ?1 AND t.source_updated_at = ?2
                    AND t.origin = 'native' AND typeof(t.content_hash) = 'blob' AND length(t.content_hash) = 32
                    AND t.source_file_id IS ?3 AND t.source_contents_id IS ?4 AND t.missing_ancestor_id IS NULL
-                   AND ((?3 IS NOT NULL AND ?4 IS NOT NULL AND t.source_complete = 0 AND t.tail_reader_version = 0)
+                   AND ((?3 IS NOT NULL AND ?4 IS NOT NULL AND t.source_complete = 0)
                      OR (?3 IS NULL AND ?4 IS NULL AND t.source_complete = 1
                        AND (t.document_version = 4 OR (t.document_version = 5 AND EXISTS (
                            SELECT 1 FROM legacy_codex_v5_projections AS old
