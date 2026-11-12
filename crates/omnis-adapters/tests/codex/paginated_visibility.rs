@@ -1837,3 +1837,59 @@ fn a_checkpoint_can_retain_a_physical_tool_result_with_a_duplicate_display_ordin
         }
     }
 }
+
+#[test]
+fn legacy_output_corrections_supersede_only_the_published_text() {
+    let [call, raw, _] = command_rows("turn", "cmd", "alpha cue");
+    let display = |body| {
+        turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"cmd","name":"lookup","output":body}),
+        )
+    };
+    for display_first in [false, true] {
+        let mut prefix = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "u", "request"),
+            call.clone(),
+        ];
+        prefix.extend(if display_first {
+            [display("beta cue"), raw.clone()]
+        } else {
+            [raw.clone(), display("beta cue")]
+        });
+        prefix.push(page_user("turn", "steer", "followup"));
+        for (correction, rollback, expected) in [
+            ("alpha cue", false, "alpha cue"),
+            ("other cue", false, "other cue"),
+            ("alpha cue", true, "beta cue"),
+        ] {
+            let mut rows = prefix.clone();
+            rows.push(display(correction));
+            if rollback {
+                rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+            }
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                for text in [&search.text, &handoff] {
+                    assert_eq!(
+                        text.matches("alpha cue").count(),
+                        1,
+                        "{correction}, rollback {rollback}: {text}"
+                    );
+                    assert_eq!(
+                        text.matches("beta cue").count(),
+                        usize::from(expected == "beta cue")
+                    );
+                    assert_eq!(
+                        text.matches("other cue").count(),
+                        usize::from(expected == "other cue")
+                    );
+                }
+            }
+        }
+    }
+}

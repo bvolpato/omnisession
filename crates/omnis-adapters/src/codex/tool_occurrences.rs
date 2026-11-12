@@ -38,6 +38,7 @@ impl Receipt {
 }
 
 pub(super) enum Match {
+    DifferentCommand,
     AwaitOutput([u8; 32]),
     Missing,
     One(u64),
@@ -53,6 +54,7 @@ impl ToolOccurrences {
         turn: &str,
         id: &str,
         wanted: Option<Receipt>,
+        input_agrees: impl Fn(u64) -> Option<bool>,
         mut output_matches: impl FnMut(u64) -> bool,
     ) -> Match {
         let Some((receipt, records)) = wanted.zip(self.0.get(turn).and_then(|items| items.get(id)))
@@ -61,10 +63,13 @@ impl ToolOccurrences {
         };
         // A first display can arrive after several results. Compare its full output against
         // every physical candidate, including results that have no prior display.
+        if !records.is_empty() && records.keys().all(|seq| input_agrees(*seq) == Some(false)) {
+            return Match::DifferentCommand;
+        }
         let compatible = || {
-            records
-                .iter()
-                .filter(|(_, prior)| prior.is_none_or(|p| p.input == receipt.input))
+            records.iter().filter(|(seq, prior)| {
+                prior.is_none_or(|p| p.input == receipt.input) && input_agrees(**seq) != Some(false)
+            })
         };
         let mut exact = compatible().filter(|(seq, _)| output_matches(**seq));
         match (exact.next(), exact.next()) {

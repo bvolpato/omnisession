@@ -111,9 +111,68 @@ impl PendingCall {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct CommandIdentity {
+    command: [u8; 32],
+    directory: Option<[u8; 32]>,
+}
+
+impl CommandIdentity {
+    pub(super) fn display(item: &serde_json::Value) -> Option<Self> {
+        if item["type"] != "CommandExecution" {
+            return None;
+        }
+        let argv = item["command"].as_array()?.as_slice();
+        let command = match argv {
+            [single] => single.as_str()?,
+            [shell, flag, text] | [shell, _, flag, text] => {
+                let shell = shell.as_str()?.rsplit(['/', '\\']).next()?;
+                let flag = flag.as_str()?;
+                let recognized = match (shell, flag) {
+                    ("sh" | "bash" | "zsh", "-c" | "-lc") | ("cmd" | "cmd.exe", "/c") => {
+                        argv.len() == 3
+                    }
+                    ("pwsh" | "powershell" | "pwsh.exe" | "powershell.exe", "-Command") => {
+                        argv.len() == 3 || argv[1] == "-NoProfile"
+                    }
+                    _ => false,
+                };
+                if !recognized {
+                    return None;
+                }
+                text.as_str()?
+            }
+            _ => return None,
+        };
+        let directory = item["cwd"]
+            .as_str()
+            .and_then(|cwd| url::Url::parse(cwd).ok()?.to_file_path().ok());
+        Some(Self::new(command, directory.as_deref()))
+    }
+
+    fn new(command: &str, directory: Option<&std::path::Path>) -> Self {
+        Self {
+            command: super::paginated_rollback::json_digest(&command),
+            directory: directory.filter(|path| path.is_absolute()).map(|path| {
+                let path: std::path::PathBuf = path.components().collect();
+                super::paginated_rollback::json_digest(&path.as_os_str().as_encoded_bytes())
+            }),
+        }
+    }
+
+    pub(super) fn agrees(self, other: Self) -> bool {
+        self.command == other.command
+            && self
+                .directory
+                .zip(other.directory)
+                .is_none_or(|(a, b)| a == b)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct NativeCalls {
     pub(super) result_calls: HashMap<u64, u64>,
+    pub(super) commands: HashMap<u64, CommandIdentity>,
     pub(super) source_keys: HashMap<u64, [u8; 32]>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
     // A later display result can identify the turn of both unstamped model records.
@@ -132,12 +191,18 @@ impl NativeCalls {
         #[derive(serde::Deserialize)]
         struct ExecCommand {
             cmd: String,
+            workdir: Option<String>,
         }
         let command = (payload["name"] == "exec_command")
             .then(|| payload["arguments"].as_str())
             .flatten()
             .and_then(|text| serde_json::from_str::<ExecCommand>(text).ok())
-            .map(|args| serde_json::Value::String(args.cmd));
+            .map(|args| {
+                let cwd = args.workdir.as_deref().map(std::path::Path::new);
+                self.commands
+                    .insert(sequence, CommandIdentity::new(&args.cmd, cwd));
+                serde_json::Value::String(args.cmd)
+            });
         self.source_keys.insert(
             sequence,
             super::paginated_rollback::json_digest(&[
@@ -234,6 +299,7 @@ impl NativeCalls {
     }
 
     pub(super) fn retain(&mut self, mut exists: impl FnMut(u64) -> bool) {
+        self.commands.retain(|&seq, _| exists(seq));
         self.source_keys.retain(|&seq, _| exists(seq));
         self.result_calls
             .retain(|&result, call| exists(result) && exists(*call));

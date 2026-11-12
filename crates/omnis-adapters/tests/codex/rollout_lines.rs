@@ -1098,3 +1098,136 @@ fn a_deferred_failure_requires_the_eventual_result_to_match_its_output() {
         }
     }
 }
+
+#[test]
+fn identical_outputs_follow_the_published_command_and_working_directory() {
+    for different_dirs in [false, true] {
+        let (first_name, second_name) = if different_dirs {
+            ("pwd", "pwd")
+        } else {
+            ("first", "second")
+        };
+        for fail_first in [true, false] {
+            for raw_first in [false, true] {
+                let args = |cmd: &str, dir: &str| {
+                    if different_dirs {
+                        json!({"cmd":cmd,"workdir":dir})
+                    } else {
+                        json!({"cmd":cmd})
+                    }
+                };
+                let display = |name: &str, dir: &str, status: &str| {
+                    let mut display = command_display(name, status, "same output");
+                    display["payload"]["item"]["command"] = json!(["/bin/sh", "-c", name]);
+                    display["payload"]["item"]["cwd"] = json!(format!("file://{dir}"));
+                    display
+                };
+                let mut rows = vec![
+                    event("task_started", json!({"turn_id":"turn"})),
+                    page_user("turn", "request", "objective"),
+                    physical_call("exec_command", &args(first_name, "/workspace/alpha")),
+                    physical_result("same output"),
+                ];
+                if different_dirs {
+                    rows.push(display(first_name, "/workspace/alpha", "completed"));
+                }
+                rows.push(physical_call(
+                    "exec_command",
+                    &args(second_name, "/workspace/beta"),
+                ));
+                let correction = if fail_first {
+                    display(first_name, "/workspace/alpha", "failed")
+                } else {
+                    display(second_name, "/workspace/beta", "failed")
+                };
+                let last = physical_result("same output");
+                rows.extend(if raw_first {
+                    [last, correction]
+                } else {
+                    [correction, last]
+                });
+                for mode in ["legacy", "paginated"] {
+                    for preview in [false, true] {
+                        let snapshot =
+                            read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                        let plan = omnis_core::plan_semantic_handoff(&snapshot);
+                        let statuses: Vec<_> = plan
+                            .tool_outcomes
+                            .iter()
+                            .filter(|outcome| outcome.summary.contains("same output"))
+                            .map(|outcome| outcome.status == omnis_core::ToolOutcomeStatus::Failed)
+                            .collect();
+                        assert_eq!(
+                            statuses,
+                            [fail_first, !fail_first],
+                            "{different_dirs} {fail_first} {raw_first} {mode}"
+                        );
+                        let trajectory = omnis_core::import_trajectory(&snapshot);
+                        let native = omnis_core::native_trajectory_items(&trajectory);
+                        let flags: Vec<_> = native
+                            .iter()
+                            .filter_map(|item| match item {
+                                omnis_core::NativeTrajectoryItem::Tool {
+                                    is_error, output, ..
+                                } if output == "same output" => Some(*is_error),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(flags, [fail_first, !fail_first], "{mode}");
+                        assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unrecognized_command_wrapper_does_not_disambiguate_identical_results() {
+    let mut correction = command_display("other", "failed", "common result");
+    correction["payload"]["item"]["command"] = json!(["fixture-wrapper", "-c", "second"]);
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "objective"),
+        physical_call("exec_command", &json!({"cmd":"first"})),
+        physical_result("common result"),
+        physical_call("exec_command", &json!({"cmd":"second"})),
+    ];
+    for raw_first in [false, true] {
+        let result = physical_result("common result");
+        rows.extend(if raw_first {
+            [result, correction.clone()]
+        } else {
+            [correction.clone(), result]
+        });
+        for mode in ["legacy", "paginated"] {
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+                let plan = omnis_core::plan_semantic_handoff(&snapshot);
+                assert_eq!(
+                    plan.tool_outcomes
+                        .iter()
+                        .filter(|outcome| outcome.status
+                            == omnis_core::ToolOutcomeStatus::Completed
+                            && outcome.summary.contains("common result"))
+                        .count(),
+                    2,
+                    "{mode}"
+                );
+                assert_eq!(
+                    plan.tool_outcomes
+                        .iter()
+                        .filter(
+                            |outcome| outcome.status == omnis_core::ToolOutcomeStatus::Failed
+                                && outcome.summary.contains("common result")
+                        )
+                        .count(),
+                    1,
+                    "{mode}"
+                );
+            }
+        }
+        rows.truncate(5);
+    }
+}

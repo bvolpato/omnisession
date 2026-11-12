@@ -2159,6 +2159,7 @@ struct CompletedPosition {
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum CompletionScope {
     Published,
+    LegacyOutput,
     Historical(CompletedKind),
 }
 
@@ -2861,6 +2862,9 @@ impl CodexHistory {
             });
         self.plan_receipts.report(builder, missing);
         self.display_revisions.finish(builder);
+        if !self.paginated {
+            self.finish_legacy_outputs(builder);
+        }
         if self.uncertain_legacy_rollback {
             builder.push(
                 EventKind::ProviderEvent,

@@ -1711,3 +1711,44 @@ fn a_revised_published_function_output_keeps_its_correction_and_the_raw_receipt(
         }
     }
 }
+
+#[test]
+fn published_function_identity_survives_result_pairing_and_revision() {
+    let shown = |name, namespace| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"FunctionCallOutput","id":"cmd","name":name,"namespace":namespace,"output":"fixed receipt"
+            }),
+        )
+    };
+    for mode in [None, Some("paginated")] {
+        for model_first in [false, true] {
+            let mut records = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                call(Some("turn")),
+            ];
+            let raw = model_result("fixed receipt");
+            let initial = shown("lookup", "initialspace");
+            records.extend(if model_first {
+                [raw, initial]
+            } else {
+                [initial, raw]
+            });
+            records.push(shown("correctedfixture", "revisedspace"));
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(records.clone(), preview, mode).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                let handoff = omnis_core::render_semantic_handoff(&snapshot);
+                for text in [&search.text, &handoff] {
+                    assert!(
+                        text.contains("correctedfixture") && text.contains("revisedspace"),
+                        "{mode:?} {model_first} {text}"
+                    );
+                    assert_eq!(text.matches("fixed receipt").count(), 1, "{text}");
+                    assert!(!text.contains("initialspace"), "{text}");
+                }
+            }
+        }
+    }
+}

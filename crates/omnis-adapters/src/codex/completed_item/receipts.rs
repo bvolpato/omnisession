@@ -313,7 +313,7 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
     fields.remove("omnisession_codex_tool_display");
     if !matches!(
         display["type"].as_str(),
-        Some("McpToolCall" | "DynamicToolCall")
+        Some("McpToolCall" | "DynamicToolCall" | "FunctionCallOutput")
     ) {
         return;
     }
@@ -333,7 +333,9 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
     } else {
         "structuredContent"
     };
-    if let Some(value) = display["output"].get(retained) {
+    if display["type"] == "McpToolCall"
+        && let Some(value) = display["output"].get(retained)
+    {
         metadata.insert(retained.into(), value.clone());
     }
     fields.insert(

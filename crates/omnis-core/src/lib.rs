@@ -3545,11 +3545,28 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
         EventKind::CommandExecuted => ToolOutcomeStatus::CommandResult,
         _ => return None,
     };
-    text_from_payload(
+    let mut summary = text_from_payload(
         &event.payload,
         &["summary", "result", "output", "message", "status"],
-    )
-    .map(|summary| ToolOutcome {
+    )?;
+    if event.source.provider == Provider::Codex {
+        let display = event
+            .payload
+            .get("omnisession_codex_tool_display")
+            .unwrap_or(&event.payload);
+        if display["type"] == "FunctionCallOutput"
+            && let Some(name) = display["name"].as_str()
+        {
+            let namespace = display["namespace"]
+                .as_str()
+                .filter(|value| !value.is_empty());
+            summary = match namespace {
+                Some(namespace) => format!("{namespace}.{name}: {summary}"),
+                None => format!("{name}: {summary}"),
+            };
+        }
+    }
+    Some(ToolOutcome {
         status,
         summary: bounded_redacted(&summary, TOOL_OUTCOME_CHARACTER_LIMIT),
     })
