@@ -247,13 +247,8 @@ impl CurrentRollout {
         self.name.title(indexed)
     }
 
-    pub(super) fn corroborates_index_at(&self, selected: &Path) -> bool {
+    pub(super) fn corroborates_index(&self) -> bool {
         matches!(self.name, gui_names::StateName::CorroboratedIndex)
-            && (self.path == selected
-                || self
-                    .path
-                    .canonicalize()
-                    .is_ok_and(|path| selected.canonicalize().is_ok_and(|current| current == path)))
     }
 
     pub(super) fn index_copies_match<'a>(

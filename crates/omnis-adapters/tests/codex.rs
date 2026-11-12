@@ -2154,14 +2154,28 @@ fn compressed_archive_uses_the_name_and_reply_of_the_registered_generation() -> 
 
 #[test]
 fn assigned_legacy_opener_survives_only_agreeing_archive_copies() -> anyhow::Result<()> {
+    let canonical = format!("rollout-2026-10-02T00-00-00-{SESSION_ID}.jsonl");
+    for file in [&canonical[..], "orchard-history.jsonl"] {
+        for compressed in [false, true] {
+            check_assigned_legacy_opener(file, compressed)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_assigned_legacy_opener(file: &str, compressed: bool) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let home = tmp.path().canonicalize()?;
     let active_dir = home.join("sessions");
     let archived_dir = home.join("archived_sessions");
     fs::create_dir(&active_dir)?;
     fs::create_dir(&archived_dir)?;
-    let file = format!("rollout-2026-10-02T00-00-00-{SESSION_ID}.jsonl");
-    let active = active_dir.join(&file);
+    let recorded = active_dir.join(file);
+    let active = if compressed {
+        recorded.with_extension("jsonl.zst")
+    } else {
+        recorded.clone()
+    };
     let archived = archived_dir.join(file);
     let opener = "Synthetic first question";
     let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example","history_mode":"legacy"}});
@@ -2170,23 +2184,32 @@ fn assigned_legacy_opener_survives_only_agreeing_archive_copies() -> anyhow::Res
         message("user", opener),
         message("assistant", "Reply A")
     );
-    fs::write(&active, &text)?;
+    if compressed {
+        fs::write(&active, encode_rollout(text.as_bytes(), "zst"))?;
+    } else {
+        fs::write(&active, &text)?;
+    }
     let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
     db.execute(
         "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,?3,?3)",
-        rusqlite::params![SESSION_ID, active.to_str(), opener],
+        rusqlite::params![SESSION_ID, recorded.to_str(), opener],
     )?;
     let index = home.join("session_index.jsonl");
     fs::write(
         &index,
         json!({"id":SESSION_ID,"thread_name":opener}).to_string(),
     )?;
-    fs::copy(&active, &archived)?;
+    check_gui_title(&home, &active, Some(opener))?;
+    fs::write(&archived, &text)?;
     check_gui_title(&home, &active, Some(opener))?;
     fs::write(&archived, text.replace("Reply A", "Reply B"))?;
     check_gui_title(&home, &active, None)?;
-    fs::copy(&active, &archived)?;
+    let renamed = archived_dir.join("independent-history.jsonl");
+    fs::rename(&archived, &renamed)?;
+    check_gui_title(&home, &active, None)?;
+    fs::remove_file(renamed)?;
+    fs::write(&archived, &text)?;
     fs::write(
         &index,
         json!({"id":SESSION_ID,"thread_name":"Unrelated stale name"}).to_string(),

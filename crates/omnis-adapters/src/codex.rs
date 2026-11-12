@@ -124,6 +124,39 @@ impl CodexFileScan {
         self.notes.is_empty().then(|| self.files[*index].as_path())
     }
 
+    fn index_paths(
+        &self,
+        selected: &SelectedRollout,
+        legacy: &HashMap<String, Vec<&Path>>,
+    ) -> Option<Vec<PathBuf>> {
+        if !self.notes.is_empty() {
+            return None;
+        }
+        let session = &selected.session;
+        let mut paths: Vec<_> = self
+            .paths(&session.id)
+            .chain(legacy.get(&session.id).into_iter().flatten().copied())
+            .map(Path::to_owned)
+            .collect();
+        if selected.from_registry {
+            // SQLite can select a physical representation whose filename has no thread ID.
+            paths.push(session.path.clone());
+        }
+        if current_rollout::ids(&session.path).is_none() {
+            // Keep same-named copies in the comparison even when their headers are unreadable.
+            let name = rollout_file::jsonl_file_name(&session.path);
+            paths.extend(
+                self.files
+                    .iter()
+                    .filter(|path| rollout_file::jsonl_file_name(path) == name)
+                    .cloned(),
+            );
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths)
+    }
+
     fn paths(&self, id: &str) -> impl Iterator<Item = &Path> {
         self.candidates
             .get(id)
@@ -617,21 +650,25 @@ impl CodexAdapter {
         &self,
         selected: &SelectedRollout,
         row: Option<&current_rollout::CurrentRollout>,
-        scan: impl FnOnce() -> Arc<CodexFileScan>,
+        candidates: impl FnOnce() -> Option<Vec<PathBuf>>,
     ) -> Option<String> {
         let session = &selected.session;
         let indexed = || {
             let title = self.title_index().titles.get(&session.id)?;
-            let scan = scan();
-            if scan.unique_path(&session.id) == Some(session.path.as_path()) {
+            let paths = candidates()?;
+            if paths.as_slice() == [session.path.as_path()] {
                 return Some(title.clone());
             }
-            if scan.notes.is_empty()
-                && let Some(row) = row
-                && row.corroborates_index_at(&session.path)
+            if let Some(row) = row
+                && row.corroborates_index()
                 && let Some(home) = self.codex_home.as_deref()
                 && row
-                    .index_copies_match(home, &session.id, &session.path, scan.paths(&session.id))
+                    .index_copies_match(
+                        home,
+                        &session.id,
+                        &session.path,
+                        paths.iter().map(PathBuf::as_path),
+                    )
                     .unwrap_or(false)
             {
                 return Some(title.clone());
@@ -665,6 +702,7 @@ impl CodexAdapter {
             .map(|s| s.session.id.as_str());
         let rows = self.named_rows(home, ids);
         let mut cache = self.header_cache(home);
+        let legacy = scan.legacy_paths(home, cache.as_mut());
         for cached in sessions
             .iter_mut()
             .filter(|s| s.session.provider == Provider::Codex)
@@ -676,6 +714,9 @@ impl CodexAdapter {
             };
             let row = rows.get(id);
             if let Some(path) = scan.unique_path(id)
+                && legacy
+                    .get(id)
+                    .is_none_or(|files| files.iter().all(|&file| file == path))
                 && row.is_none_or(|row| row.ordinary_path_is(path))
                 && cached
                     .source_revision
@@ -700,7 +741,8 @@ impl CodexAdapter {
                 cached.title = None;
                 continue;
             };
-            let title = self.selected_title(&selected, row, || Arc::clone(&scan));
+            let title =
+                self.selected_title(&selected, row, || scan.index_paths(&selected, &legacy));
             let current = selected.session;
             if cached
                 .source_revision
@@ -783,7 +825,6 @@ impl CodexAdapter {
                 };
             }
         };
-        let title_index = self.title_index();
         let mut sessions = Vec::new();
         let mut selected_files = HashMap::new();
         let mut requires_scan = false;
@@ -805,12 +846,13 @@ impl CodexAdapter {
                     continue;
                 }
             };
-            if row.is_some_and(|row| row.corroborates_index_at(&selected.session.path))
-                && scan.unique_path(id).is_none()
+            if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
+                && (scan.unique_path(id).is_none() || legacy.contains_key(id))
             {
                 requires_scan = true;
             }
-            let title = self.selected_title(&selected, row, || Arc::clone(&scan));
+            let title =
+                self.selected_title(&selected, row, || scan.index_paths(&selected, &legacy));
             let mut session = selected.session;
             if current_rollout::ids(&session.path).is_none()
                 && legacy
@@ -849,7 +891,7 @@ impl CodexAdapter {
                 .map(compact_discovery_error)
                 .as_deref(),
         );
-        notes.extend(title_index.notes.iter().cloned());
+        notes.extend(self.title_index().notes.iter().cloned());
         CodexListing {
             scan,
             sessions,
@@ -946,8 +988,11 @@ impl CodexAdapter {
         let row = rows.get(id);
         let finish = |mut selected: SelectedRollout| {
             if with_title {
-                selected.session.title =
-                    self.selected_title(&selected, row, || self.current_session_scan().0);
+                selected.session.title = self.selected_title(&selected, row, || {
+                    let (scan, _) = self.current_session_scan();
+                    let legacy = scan.legacy_paths(home, None);
+                    scan.index_paths(&selected, &legacy)
+                });
             }
             Ok(Some(selected))
         };
