@@ -65,6 +65,8 @@ struct CodexFileScan {
 #[derive(Default)]
 struct LegacyPaths<'a> {
     by_id: HashMap<String, Vec<&'a Path>>,
+    identified: HashSet<&'a Path>,
+    revisions: Vec<(PathBuf, Option<SourceRevision>)>,
     unidentified: HashMap<&'a Path, Vec<&'a Path>>,
 }
 
@@ -94,8 +96,13 @@ impl CodexFileScan {
             {
                 // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
                 legacy.by_id.entry(session.id).or_default().push(path);
+                legacy.identified.insert(path);
+                legacy
+                    .revisions
+                    .push((path.clone(), session.observed_revision));
             } else if let Some(name) = rollout_file::jsonl_file_name(path) {
                 legacy.unidentified.entry(name).or_default().push(path);
+                legacy.revisions.push((path.clone(), None));
             }
         }
         legacy
@@ -150,6 +157,7 @@ impl CodexFileScan {
         let session = &selected.session;
         let mut paths: Vec<_> = self
             .paths(&session.id)
+            .filter(|path| !legacy.identified.contains(path))
             .chain(legacy.by_id.get(&session.id).into_iter().flatten().copied())
             .map(Path::to_owned)
             .collect();
@@ -157,8 +165,7 @@ impl CodexFileScan {
             // SQLite can select a physical representation whose filename has no thread ID.
             paths.push(session.path.clone());
         }
-        if current_rollout::ids(&session.path).is_none()
-            && let Some(name) = rollout_file::jsonl_file_name(&session.path)
+        if let Some(name) = rollout_file::jsonl_file_name(&session.path)
             && let Some(unknown) = legacy.unidentified.get(name)
         {
             paths.extend(unknown.iter().map(|path| path.to_path_buf()));
@@ -222,11 +229,11 @@ fn select_rollout<'a>(
                 let Some((thread, file)) = current_rollout::ids(path) else {
                     continue;
                 };
-                if session.id != thread {
+                if !session.id.eq_ignore_ascii_case(thread) {
                     // A suffix on a manual filename can name an unrelated thread.
                     continue;
                 }
-                let dual = thread != file;
+                let dual = !thread.eq_ignore_ascii_case(file);
                 return Some(SelectedRollout {
                     session,
                     shadowed: shadowed || dual,
@@ -251,6 +258,7 @@ struct CodexListing {
     sessions: Vec<CodexSession>,
     notes: Vec<String>,
     selected_files: HashMap<String, (PathBuf, SourceRevision)>,
+    legacy_revisions: Vec<(PathBuf, Option<SourceRevision>)>,
     requires_scan: bool,
 }
 
@@ -725,6 +733,7 @@ impl CodexAdapter {
             };
             let row = rows.get(id);
             if let Some(path) = scan.unique_path(id)
+                && current_rollout::canonical_name(path)
                 && legacy
                     .by_id
                     .get(id)
@@ -786,6 +795,13 @@ impl CodexAdapter {
                     && cached.database == database
                     && !cached.listing.requires_scan
                     && cached.listing.scan.current()
+                    && cached
+                        .listing
+                        .legacy_revisions
+                        .iter()
+                        .all(|(path, previous)| {
+                            previous.is_some() && Self::index_file_revision(path) == *previous
+                        })
                     && cached.listing.sessions.iter().all(|session| {
                         cached.listing.selected_files.contains_key(&session.id)
                             || Self::index_file_revision(&session.path) == session.observed_revision
@@ -899,6 +915,7 @@ impl CodexAdapter {
         );
         notes.extend(self.title_index().notes.iter().cloned());
         CodexListing {
+            legacy_revisions: legacy.revisions,
             scan,
             sessions,
             notes,
@@ -1227,7 +1244,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
         return Ok(cached
             .header
             .clone()
-            .map(|header| CodexSession::from_header(path, header, observed)));
+            .and_then(|header| CodexSession::from_header(path, header, observed)));
     }
     let session = CodexSession::parse_with_observation(path, observed)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
@@ -1561,7 +1578,7 @@ fn collect_jsonl(
 }
 
 fn path_uuid(path: &Path) -> Option<String> {
-    current_rollout::ids(path).map(|(thread, _)| thread.to_owned())
+    current_rollout::ids(path).map(|(thread, _)| thread.to_ascii_lowercase())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1671,14 +1688,15 @@ impl CodexSession {
         }
         let payload = record.get("payload")?;
         let id = string_at(payload, &[&["id"], &["session_id"]])?;
-        Uuid::parse_str(id).ok()?;
-        if current_rollout::ids(&path).is_some_and(|(thread, _)| thread != id)
+        let id = Uuid::parse_str(id).ok()?;
+        if current_rollout::ids(&path)
+            .is_some_and(|(thread, _)| Uuid::parse_str(thread).ok() != Some(id))
             && current_rollout::canonical_name(&path)
         {
             return None;
         }
         Some(Self {
-            id: id.to_owned(),
+            id: id.to_string(),
             forked_from_id: string_at(payload, &[&["forked_from_id"]])
                 .and_then(|parent| Uuid::parse_str(parent).ok()),
             title: None,
@@ -1704,9 +1722,9 @@ impl CodexSession {
         })
     }
 
-    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Self {
-        Self {
-            id: header.id,
+    fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Option<Self> {
+        Some(Self {
+            id: Uuid::parse_str(&header.id).ok()?.to_string(),
             forked_from_id: header.forked_from_id,
             title: None,
             path: path.to_path_buf(),
@@ -1718,7 +1736,7 @@ impl CodexSession {
             is_subagent: header.is_subagent,
             created_at: header.created_at,
             updated_at: observed.modified,
-        }
+        })
     }
 
     fn header(&self) -> RolloutHeader {

@@ -2222,13 +2222,28 @@ fn check_assigned_legacy_opener(file: &str, compressed: bool) -> anyhow::Result<
 
 #[test]
 fn legacy_rollouts_with_a_shared_basename_keep_their_own_titles() -> anyhow::Result<()> {
+    for file in [
+        "rollout-imported.jsonl",
+        "rollout-imported-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+        "rollout-imported-12345678-1234-4234-8234-123456789abc.jsonl",
+    ] {
+        check_legacy_owners(file)?;
+    }
+    Ok(())
+}
+
+fn check_legacy_owners(file: &str) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let home = tmp.path().canonicalize()?;
     let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, title TEXT, first_user_message TEXT)")?;
     let mut index = fs::File::create(home.join("session_index.jsonl"))?;
     let threads = [
-        (SESSION_ID, "01", "First assigned opener"),
+        (
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "01",
+            "First assigned opener",
+        ),
         (
             "55555555-5555-4555-8555-555555555555",
             "02",
@@ -2238,27 +2253,29 @@ fn legacy_rollouts_with_a_shared_basename_keep_their_own_titles() -> anyhow::Res
     for (id, day, title) in threads {
         let dir = home.join("sessions/2026/10").join(day);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("rollout-imported.jsonl");
+        let path = dir.join(file);
         let header =
             json!({"type":"session_meta","payload":{"id":id,"cwd":dir,"history_mode":"legacy"}});
         fs::write(&path, format!("{header}\n{}\n", message("user", title)))?;
         db.execute(
-            "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,?3,?3)",
+            "INSERT INTO threads VALUES(?1,?2,'legacy',NULL,NULL,?3)",
             rusqlite::params![id, path.to_str(), title],
         )?;
         writeln!(index, "{}", json!({"id":id, "thread_name":title}))?;
     }
-    let warm = CodexAdapter::with_root(&home).list_sessions(None)?;
+    let persistent = CodexAdapter::with_root(&home);
+    let warm = persistent.list_sessions(None)?;
     let check = |expected: [Option<&str>; 2]| -> anyhow::Result<()> {
         let adapter = CodexAdapter::with_root(&home);
         let listed = adapter.list_sessions(None)?;
+        let reused = persistent.list_sessions(None)?;
         let mut cached = warm.clone();
         for row in &mut cached {
             row.source_path = None;
         }
         adapter.refresh_session_titles(&mut cached);
         for ((id, _, _), name) in threads.into_iter().zip(expected) {
-            for rows in [&listed, &cached] {
+            for rows in [&listed, &cached, &reused] {
                 assert_eq!(
                     rows.iter()
                         .find(|row| row.session.id == id)
@@ -2276,11 +2293,21 @@ fn legacy_rollouts_with_a_shared_basename_keep_their_own_titles() -> anyhow::Res
     check([Some(threads[0].2), Some(threads[1].2)])?;
     let archive = home.join("archived_sessions");
     fs::create_dir(&archive)?;
-    let shadow = archive.join("rollout-imported.jsonl");
+    let shadow = archive.join(file);
     fs::write(&shadow, "{")?;
     check([None, None])?;
-    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/another","history_mode":"legacy"}});
-    fs::write(shadow, format!("{header}\n"))?;
+    let header = json!({"type":"session_meta","payload":{"id":threads[0].0.to_uppercase(),"cwd":"/another","history_mode":"legacy"}});
+    fs::write(&shadow, format!("{header}\n"))?;
     check([None, Some(threads[1].2)])?;
+    fs::write(
+        &shadow,
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":"c1234567-1234-4234-8234-123456789abc","cwd":"/other"}})
+        ),
+    )?;
+    check([Some(threads[0].2), Some(threads[1].2)])?;
+    fs::write(&shadow, "{")?;
+    check([None, None])?;
     Ok(())
 }
