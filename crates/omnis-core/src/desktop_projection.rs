@@ -1,4 +1,4 @@
-//! Indexed byte coverage for search results from a native Antigravity database.
+//! Indexed byte coverage for native Antigravity database and IDE log searches.
 
 use std::ops::Range;
 
@@ -7,22 +7,82 @@ use uuid::Uuid;
 
 use super::truncation_notice;
 
-/// The range each verified Antigravity database row occupies after per-event truncation and before document truncation.
+/// Event boundaries after redaction and per-event truncation, before document truncation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopProjection {
-    rows: Vec<(Uuid, Range<usize>)>,
+    rows: Rows,
     edge_limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Rows {
+    Database(Vec<(Uuid, Range<usize>)>),
+    IdeLog(Vec<(usize, usize)>),
 }
 
 impl DesktopProjection {
     pub(super) fn new(edge_limit: usize) -> Self {
         Self {
-            rows: Vec::new(),
+            rows: Rows::Database(Vec::new()),
             edge_limit,
         }
     }
 
-    pub(super) fn record(&mut self, event: &OmniEvent, bytes: Range<usize>) -> bool {
+    pub(super) fn ide_log(edge_limit: usize) -> Self {
+        Self {
+            rows: Rows::IdeLog(Vec::new()),
+            edge_limit,
+        }
+    }
+
+    /// Checks whether the prior indexed document ends at an observed IDE message boundary.
+    #[must_use]
+    pub fn retains_ide_log_prefix(
+        &self,
+        previous_bytes: usize,
+        previous_text: &str,
+        incoming_text: &str,
+    ) -> bool {
+        let Rows::IdeLog(ends) = &self.rows else {
+            return false;
+        };
+        let Some(&(total_source, total_projected)) = ends.last() else {
+            return false;
+        };
+        if previous_bytes >= total_source {
+            return false;
+        }
+        let old_end = if previous_bytes == 0 {
+            0
+        } else {
+            let Ok(row) = ends.binary_search_by_key(&previous_bytes, |&(source, _)| source) else {
+                return false;
+            };
+            ends[row].1
+        };
+        // A shifted document tail may displace old hits. Only a fully retained prefix
+        // can prove an append without replaying those previously indexed tail bytes.
+        let Some(edges) = Edges::of(incoming_text, total_projected, self.edge_limit) else {
+            return false;
+        };
+        old_end <= edges.0[0].source.end && incoming_text.get(..old_end) == Some(previous_text)
+    }
+
+    pub(super) fn record(
+        &mut self,
+        event: &OmniEvent,
+        bytes: Range<usize>,
+        source_end: usize,
+    ) -> bool {
+        let rows = match &mut self.rows {
+            Rows::Database(rows) => rows,
+            Rows::IdeLog(ends) => {
+                if !bytes.is_empty() {
+                    ends.push((source_end, bytes.end));
+                }
+                return true;
+            }
+        };
         if event.source.raw_record_type.as_deref() == Some("omnisession.antigravity_step_limit") {
             return true;
         }
@@ -33,16 +93,18 @@ impl DesktopProjection {
         else {
             return false;
         };
-        self.rows.push((id, bytes));
+        rows.push((id, bytes));
         true
     }
 
     /// Checks that the previous rows survive in order and every additional row contributes no text.
     #[must_use]
     pub fn same_visible_rows(&self, previous: &[Uuid]) -> bool {
+        let Rows::Database(rows) = &self.rows else {
+            return false;
+        };
         let mut pending = previous.iter().peekable();
-        self.rows
-            .iter()
+        rows.iter()
             .all(|(id, range)| pending.next_if_eq(&id).is_some() || range.is_empty())
             && pending.next().is_none()
     }
@@ -51,10 +113,13 @@ impl DesktopProjection {
     /// Both texts must come from the same per-event projection and native row identities.
     #[must_use]
     pub fn retains(&self, previous: &[Uuid], previous_text: &str, incoming_text: &str) -> bool {
+        let Rows::Database(rows) = &self.rows else {
+            return false;
+        };
         let mut pending = previous.iter().peekable();
         let mut old_size: usize = 0;
         let mut selected = Vec::new();
-        for (id, current) in &self.rows {
+        for (id, current) in rows {
             if pending.next_if_eq(&id).is_none() || current.is_empty() {
                 continue;
             }
@@ -65,7 +130,7 @@ impl DesktopProjection {
         if pending.next().is_some() {
             return false;
         }
-        let new_size = self.rows.last().map_or(0, |(_, range)| range.end);
+        let new_size = rows.last().map_or(0, |(_, range)| range.end);
         let (Some(old_edges), Some(new_edges)) = (
             Edges::of(previous_text, old_size, self.edge_limit),
             Edges::of(incoming_text, new_size, self.edge_limit),
@@ -162,5 +227,35 @@ impl Edges {
                 indexed_start: tail_index,
             },
         ]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DesktopProjection, Rows};
+
+    #[test]
+    fn ide_log_append_requires_the_complete_old_projection_at_a_message_boundary() {
+        let old = "first\n\nsecond";
+        let new = format!("{old}\n\n{}", "later ".repeat(30));
+        let layout = DesktopProjection {
+            rows: Rows::IdeLog(vec![(old.len(), old.len()), (new.len(), new.len())]),
+            edge_limit: 64,
+        };
+        let indexed = crate::head_tail_text(&new, 64).0;
+        assert!(layout.retains_ide_log_prefix(old.len(), old, &indexed));
+        assert!(!layout.retains_ide_log_prefix(5, "first", &indexed));
+        assert!(!layout.retains_ide_log_prefix(old.len(), "first\n\nabsent", &indexed));
+        let longer = "before ".repeat(15);
+        let new = format!("{longer}\n\n{}", "later ".repeat(30));
+        let layout = DesktopProjection {
+            rows: Rows::IdeLog(vec![(longer.len(), longer.len()), (new.len(), new.len())]),
+            edge_limit: 64,
+        };
+        assert!(!layout.retains_ide_log_prefix(
+            longer.len(),
+            &longer,
+            &crate::head_tail_text(&new, 64).0
+        ));
     }
 }

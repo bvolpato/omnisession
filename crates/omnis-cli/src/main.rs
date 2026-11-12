@@ -47,6 +47,8 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 mod antigravity_import;
+mod cached_database_aliases;
+use cached_database_aliases::CachedDatabaseAliases;
 mod claude_delete;
 mod claude_import;
 mod clipboard;
@@ -1447,9 +1449,11 @@ fn cached_native_sessions(
     args: &SearchArgs,
     project: &Path,
     ide_home: Option<&Path>,
+    aliases: &CachedDatabaseAliases,
 ) -> Result<(Vec<NativeSession>, Vec<IndexedTrajectoryTitle>)> {
-    let (indexed, titles) =
+    let (mut indexed, mut titles) =
         snapshot.cached_sessions_with_titles_for_ide_home(args.provider, ide_home)?;
+    aliases.project_catalog(&mut indexed, &mut titles);
     let sources = titles
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
@@ -1605,10 +1609,12 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         refresh_search_workspaces(&mut sessions, (!args.all_projects).then_some(&project))?;
     }
     let (hits, has_more) = store.read_trajectory_search(|snapshot| {
+        let mut aliases = CachedDatabaseAliases::default();
         let titles = if args.cached {
             let ide_home = cached_ide_home(registry, args.provider, &mut warnings);
+            aliases = CachedDatabaseAliases::read(snapshot, args.provider, ide_home.as_deref())?;
             let (native, titles) =
-                cached_native_sessions(snapshot, args, &project, ide_home.as_deref())?;
+                cached_native_sessions(snapshot, args, &project, ide_home.as_deref(), &aliases)?;
             sessions.extend(native);
             order_search_sessions(&mut sessions);
             index.candidates = sessions.len();
@@ -1616,11 +1622,12 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         } else {
             snapshot.trajectory_titles_with_sources()?
         };
-        let selections = ScopedSearchSelections::new(
+        let mut selections = ScopedSearchSelections::new(
             snapshot,
             (!args.cached).then_some(&homes),
             search_selections(&sessions, args.cached),
         )?;
+        selections.aliases = aliases;
         rank_search_hits(snapshot, &query, &sessions, &selections, titles, args.limit)
     })?;
     if json_output {
@@ -1665,6 +1672,7 @@ fn order_search_sessions(sessions: &mut Vec<NativeSession>) {
 }
 
 struct ScopedSearchSelections {
+    aliases: CachedDatabaseAliases,
     primary: Vec<TrajectorySelection>,
     scoped_documents: Vec<(SessionRef, Option<PathBuf>, Option<Uuid>)>,
 }
@@ -1700,6 +1708,7 @@ impl ScopedSearchSelections {
             }
         }
         Ok(Self {
+            aliases: CachedDatabaseAliases::default(),
             primary,
             scoped_documents,
         })
@@ -1711,12 +1720,7 @@ impl ScopedSearchSelections {
         query: &str,
         limit: usize,
     ) -> omnis_store::Result<omnis_store::SessionTrajectorySearchPage> {
-        snapshot.search_selected_source_documents(
-            query,
-            limit,
-            &self.primary,
-            &self.scoped_documents,
-        )
+        self.aliases.search(snapshot, query, limit, self)
     }
 }
 
@@ -1825,8 +1829,11 @@ fn rank_search_hits<'a>(
     let mut titles: HashMap<_, _> = indexed_titles
         .into_iter()
         .filter_map(|entry| {
-            let selected = sources.get(&entry.session)?;
             let title = entry.title?;
+            if selections.aliases.contains(&entry.session) {
+                return Some((entry.session, title));
+            }
+            let selected = sources.get(&entry.session)?;
             selected
                 .is_none_or(|revision| revision.matches_file_contents(entry.source_revision))
                 .then_some((entry.session, title))
@@ -1836,6 +1843,7 @@ fn rank_search_hits<'a>(
         snapshot
             .scoped_native_titles(&selections.scoped_documents)?
             .into_iter()
+            .filter(|entry| !selections.aliases.contains(&entry.session))
             .filter_map(|entry| Some((entry.session, entry.title?))),
     );
     let terms = fuzzy::query_terms(query);
@@ -5075,7 +5083,13 @@ mod tests {
 
             let (sessions, _) = store
                 .read_trajectory_search(|snapshot| {
-                    super::cached_native_sessions(snapshot, &args, &project, None)
+                    super::cached_native_sessions(
+                        snapshot,
+                        &args,
+                        &project,
+                        None,
+                        &super::CachedDatabaseAliases::default(),
+                    )
                 })
                 .expect("search local workspace");
             assert_eq!(sessions.len(), 1, "local first: {local_first}");

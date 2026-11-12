@@ -159,6 +159,28 @@ impl PriorCoverage {
         })
     }
 
+    fn preserves_ide_log_prefix<'a>(
+        &self,
+        write: &PreparedTrajectoryWrite<'_, '_>,
+        prior_text: impl FnOnce() -> Result<Option<Cow<'a, str>>>,
+    ) -> Result<bool> {
+        if write.session.provider != crate::Provider::AntigravityIde
+            || write.document.database_step_proof.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(projection) = write.document.desktop_projection else {
+            return Ok(false);
+        };
+        Ok(prior_text()?.is_some_and(|previous| {
+            projection.retains_ide_log_prefix(
+                self.source_bytes,
+                &previous,
+                write.document.redacted_text,
+            )
+        }))
+    }
+
     fn partial_write<'a>(
         &self,
         tx: &Transaction<'_>,
@@ -221,6 +243,9 @@ impl PriorCoverage {
                 return Ok(PartialWrite::KeepBoth);
             }
         }
+        if has_gap && home.is_some() && self.preserves_ide_log_prefix(write, &prior_text)? {
+            return Ok(PartialWrite::Replace);
+        }
         if let Some(previous) = prior_steps {
             let Some(incoming) = incoming else {
                 return Ok(PartialWrite::Keep);
@@ -233,15 +258,11 @@ impl PriorCoverage {
                 return Ok(PartialWrite::Keep);
             }
             // A whole-document limit can displace indexed text even when every old step survives.
-            if !self.document_truncated
-                && !write
-                    .document
-                    .truncation_strategy
-                    .contains("document_head_tail")
-            {
-                return Ok(PartialWrite::Replace);
-            }
-            if hash == write.content_hash {
+            let capped = write
+                .document
+                .truncation_strategy
+                .contains("document_head_tail");
+            if (!self.document_truncated && !capped) || hash == write.content_hash {
                 return Ok(PartialWrite::Replace);
             }
             if let Some(projection) = write.document.desktop_projection {

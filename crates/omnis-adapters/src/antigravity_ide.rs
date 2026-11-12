@@ -77,17 +77,7 @@ impl AntigravityIdeAdapter {
     /// Returns whether a standalone IDE transcript read omitted records.
     #[must_use]
     pub fn has_unreadable_log_records(snapshot: &CanonicalSnapshot) -> bool {
-        snapshot.session.provider == Provider::AntigravityIde
-            && snapshot.events.iter().rev().take(2).any(|event| {
-                event.source.provider == Provider::AntigravityIde
-                    && matches!(
-                        event.source.raw_record_type.as_deref(),
-                        Some(UNVERIFIED_LOG | "omnisession.record_size_limit")
-                    )
-                    && event.payload["omitted_events"]
-                        .as_u64()
-                        .is_some_and(|count| count > 0)
-            })
+        omnis_core::has_unreadable_ide_log_records(snapshot)
     }
 
     /// Uses a specific IDE user-data directory without consulting other profiles.

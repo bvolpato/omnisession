@@ -1234,8 +1234,13 @@ fn trajectory_search_document_with_limits(
             .is_some_and(|event| event.source.provider == Provider::AntigravityDesktop));
     let mut legacy =
         legacy_utf8_projection::LegacyRenderer::new(source_incomplete && database_provider);
-    let mut desktop_projection =
-        database_provider.then(|| DesktopProjection::new(document_edge_limit));
+    let mut desktop_projection = if database_provider {
+        Some(DesktopProjection::new(document_edge_limit))
+    } else if has_unreadable_ide_log_records(snapshot) {
+        Some(DesktopProjection::ide_log(document_edge_limit))
+    } else {
+        None
+    };
     for event in events {
         let mut start = retained.total_byte_count;
         if let Some(event_text) = search_event_text(event, event_edge_limit)
@@ -1258,7 +1263,7 @@ fn trajectory_search_document_with_limits(
             retained.push(&event_text.text);
         }
         if let Some(projection) = &mut desktop_projection
-            && !projection.record(event, start..retained.total_byte_count)
+            && !projection.record(event, start..retained.total_byte_count, source_byte_count)
         {
             desktop_projection = None;
         }
@@ -2922,6 +2927,27 @@ fn visible_import_events(
 
 fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
+}
+
+/// Returns whether a standalone Antigravity IDE transcript read omitted records.
+#[must_use]
+pub fn has_unreadable_ide_log_records(snapshot: &CanonicalSnapshot) -> bool {
+    snapshot.session.provider == Provider::AntigravityIde
+        && snapshot.events.iter().rev().take(2).any(|event| {
+            event.source.provider == Provider::AntigravityIde
+                && event.kind == EventKind::ProviderEvent
+                && event.replay_policy == ReplayPolicy::HistoricalOnly
+                && matches!(
+                    event.source.raw_record_type.as_deref(),
+                    Some(
+                        "omnisession.antigravity_ide_unverified_history"
+                            | "omnisession.record_size_limit"
+                    )
+                )
+                && event.payload["omitted_events"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        })
 }
 
 /// Returns whether the provider adapter reported incomplete history.

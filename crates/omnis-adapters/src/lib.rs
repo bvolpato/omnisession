@@ -193,6 +193,21 @@ impl SearchSourceObservation {
                 .is_some_and(|path| path.extension().is_some_and(|ext| ext == "db"))
     }
 
+    /// Checks a historical declaration against the selected database and WAL.
+    #[must_use]
+    pub fn matches_database_declaration(&self, count: usize, contents: uuid::Uuid) -> bool {
+        (self.is_ide_desktop_database()
+            || self.session.session.provider == Provider::AntigravityDesktop)
+            && self
+                .session
+                .source_path
+                .as_deref()
+                .and_then(|path| antigravity::database_history_revision(path, Some(count)))
+                .is_some_and(|revision| {
+                    revision.file == self.revision.file && revision.contents == Some(contents)
+                })
+    }
+
     fn watch_absent(&mut self, path: PathBuf) -> Result<()> {
         anyhow::ensure!(
             optional_stamp(&path)?.is_none(),

@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod cached_database_aliases;
+pub use cached_database_aliases::CachedDatabaseAliasSource;
 mod codex_legacy_home;
 mod codex_title_recheck;
 use codex_title_recheck::schedule_legacy_codex_title_proofs;
@@ -2867,30 +2869,36 @@ impl Store {
         file: Uuid,
     ) -> Result<Option<usize>> {
         validate_session_ref(session)?;
-        let table = desktop_declarations::table(session.provider)
-            .ok_or(StoreError::InvalidSessionReference)?;
-        self.connection
-            .borrow()
-            .prepare_cached(&format!(
-                "SELECT steps FROM {table}
-                 WHERE session_id=?1 AND source_home=?2 AND source_file=?3"
-            ))
-            .and_then(|mut statement| {
-                statement
-                    .query_row(
-                        params![
-                            session.id,
-                            home.as_os_str().as_encoded_bytes(),
-                            file.as_bytes()
-                        ],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-            })
-            .map_err(database_error)?
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| StoreError::CorruptStore)
+        desktop_declarations::table(session.provider).ok_or(StoreError::InvalidSessionReference)?;
+        desktop_declarations::verified(
+            &self.connection.borrow(),
+            &session.id,
+            home.as_os_str().as_encoded_bytes(),
+            file,
+        )
+    }
+
+    /// Recovers a count when pre-upgrade readers recorded different declarations for one database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cached declarations cannot be read or saved.
+    pub fn reconcile_desktop_step_count(
+        &self,
+        session: &SessionRef,
+        home: &Path,
+        file: Uuid,
+        matches: impl Fn(usize, Uuid) -> bool,
+    ) -> Result<Option<usize>> {
+        validate_session_ref(session)?;
+        desktop_declarations::table(session.provider).ok_or(StoreError::InvalidSessionReference)?;
+        desktop_declarations::reconcile(
+            &self.connection.borrow(),
+            &session.id,
+            home.as_os_str().as_encoded_bytes(),
+            file,
+            matches,
+        )
     }
 
     fn write_discovered_sessions(
@@ -4417,7 +4425,7 @@ impl Store {
         limit: usize,
     ) -> Result<SessionTrajectorySearchPage> {
         self.read_trajectory_search(|snapshot| {
-            snapshot.search_session_trajectory_page_with_eligibility(query, limit, None, None)
+            snapshot.search_session_trajectory_page_with_eligibility(query, limit, None, None, None)
         })
     }
 
@@ -4505,13 +4513,13 @@ impl TrajectoryWriteContext<'_> {
         if let Some(home) = home
             && let TrajectorySourceGuard::ObservedDocument(prior) = write.guard
             && let Some(steps) = prior.desktop_steps
-            && let Some(file) = write.document.source_revision.file
+            && write.document.source_revision.file.is_some()
         {
             desktop_declarations::record(
                 transaction,
                 &row.session,
                 home.as_os_str().as_encoded_bytes(),
-                file,
+                write.document.source_revision,
                 steps,
                 prior.desktop_generation,
                 Some(row),
@@ -4974,10 +4982,26 @@ impl TrajectorySearchSnapshot<'_> {
         eligible_sessions: &[TrajectorySelection],
         scoped: &[(SessionRef, Option<PathBuf>, Option<Uuid>)],
     ) -> Result<SessionTrajectorySearchPage> {
+        self.search_projected_source_documents(query, limit, eligible_sessions, scoped, &[])
+    }
+
+    /// Ranks verified alias documents with ordinary documents under their selected session references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid references or an unreadable index.
+    pub fn search_projected_source_documents(
+        &self,
+        query: &str,
+        limit: usize,
+        eligible_sessions: &[TrajectorySelection],
+        scoped: &[(SessionRef, Option<PathBuf>, Option<Uuid>)],
+        aliases: &[&CachedDatabaseAliasSource],
+    ) -> Result<SessionTrajectorySearchPage> {
         for selection in eligible_sessions {
             validate_session_ref(&selection.session)?;
         }
-        if eligible_sessions.is_empty() && scoped.is_empty() {
+        if eligible_sessions.is_empty() && scoped.is_empty() && aliases.is_empty() {
             return Ok(empty_trajectory_search_page());
         }
         let mut eligibility = eligible_sessions
@@ -5006,7 +5030,7 @@ impl TrajectorySearchSnapshot<'_> {
         eligibility.dedup();
         let eligibility_json = serde_json::to_string(&eligibility)
             .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
-        let scoped_json = (!scoped.is_empty())
+        let scoped_json = (!scoped.is_empty() || !aliases.is_empty())
             .then(|| scoped_native_search::scoped_selection_json(scoped))
             .transpose()?;
         self.search_session_trajectory_page_with_eligibility(
@@ -5014,6 +5038,7 @@ impl TrajectorySearchSnapshot<'_> {
             limit,
             Some(&eligibility_json),
             scoped_json.as_deref(),
+            (!aliases.is_empty()).then_some(aliases),
         )
     }
     fn search_session_trajectory_page_with_eligibility(
@@ -5022,6 +5047,7 @@ impl TrajectorySearchSnapshot<'_> {
         limit: usize,
         eligibility_json: Option<&str>,
         scoped_json: Option<&str>,
+        aliases: Option<&[&CachedDatabaseAliasSource]>,
     ) -> Result<SessionTrajectorySearchPage> {
         let clauses = trajectory_clauses(query);
         if clauses.is_empty() || limit == 0 {
@@ -5029,7 +5055,8 @@ impl TrajectorySearchSnapshot<'_> {
         }
         let limit = limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT);
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let statement_sql = trajectory_search_page_sql(&clauses, scoped_json.is_some());
+        let statement_sql =
+            trajectory_search_page_sql(&clauses, scoped_json.is_some(), aliases.is_some());
         let mut parameters = clauses
             .iter()
             .map(|clause| SqlValue::Text(clause.match_expression.clone()))
@@ -5044,6 +5071,15 @@ impl TrajectorySearchSnapshot<'_> {
         );
         if let Some(json) = scoped_json {
             parameters.push(SqlValue::Text(json.to_owned()));
+        }
+        if let Some(aliases) = aliases {
+            let aliases: Vec<_> = aliases
+                .iter()
+                .map(|source| (source.document_id, source.provider))
+                .collect();
+            parameters.push(SqlValue::Text(
+                serde_json::to_string(&aliases).map_err(|_| StoreError::CorruptStore)?,
+            ));
         }
         let connection = self.connection;
         let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
@@ -5197,8 +5233,8 @@ impl Store {
         initialize_trajectory_schema(&transaction)?;
         initialize_discovery_schema(&transaction)?;
         primary_legacy::initialize(&transaction)?;
-        desktop_declarations::initialize(&transaction)?;
         scoped_native_documents::initialize(&transaction)?;
+        desktop_declarations::initialize(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -5354,7 +5390,11 @@ fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTr
 /// phrase per exact clause, in clause order. Rows end with the snippet's chunk ID and clause index.
 /// Exact clauses filter candidate chunks with [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet
 /// empty for the caller to cut around the phrase.
-fn trajectory_search_page_sql(clauses: &[TrajectoryClause], scoped: bool) -> String {
+fn trajectory_search_page_sql(
+    clauses: &[TrajectoryClause],
+    scoped: bool,
+    projected: bool,
+) -> String {
     let eligibility_parameter = clauses.len() + 1;
     let limit_parameter = clauses.len() + 2;
     let mut exact_parameter = limit_parameter;
@@ -5368,8 +5408,13 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause], scoped: bool) -> Str
             format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
         })
         .collect::<Vec<_>>();
+    let primary = if projected {
+        "direct_primary"
+    } else {
+        "eligible"
+    };
     let mut eligible = format!(
-        "WITH eligible(provider, session_id, file, contents) AS (
+        "WITH {primary}(provider, session_id, file, contents) AS (
              SELECT provider, session_id, NULL, NULL FROM session_trajectories
              WHERE ?{eligibility_parameter} IS NULL
              UNION ALL
@@ -5379,7 +5424,33 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause], scoped: bool) -> Str
              WHERE ?{eligibility_parameter} IS NOT NULL
          ),"
     );
-    let documents = if scoped {
+    let documents = if projected {
+        let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
+        let parameter = exact_parameter + 2;
+        write!(eligible, "
+            projection AS (SELECT value ->> 0 AS id, value ->> 1 AS provider FROM json_each(?{parameter})),
+            direct_scoped AS MATERIALIZED ({selected}),
+            eligible(provider,session_id,file,contents) AS (
+                SELECT * FROM direct_primary UNION
+                SELECT t.provider,t.session_id,NULL,NULL FROM projection p JOIN session_trajectories t ON t.id=p.id
+            ),
+            selected_scoped AS (SELECT id FROM direct_scoped UNION SELECT -id FROM projection WHERE id<0),
+            selected_documents(id,provider) AS (
+                SELECT t.id,t.provider FROM direct_primary e JOIN session_trajectories t USING(provider,session_id)
+                UNION ALL SELECT -s.id,s.provider FROM direct_scoped e JOIN scoped_native_documents s USING(id)
+                UNION ALL SELECT id,provider FROM projection
+            ),
+            documents AS (
+                SELECT t.id,e.provider,t.session_id,t.source_complete,t.complete,t.indexed_byte_count,
+                       t.source_byte_count,t.truncation_strategy,t.source_updated_at
+                FROM selected_documents e JOIN session_trajectories t ON t.id=e.id
+                UNION ALL
+                SELECT -s.id,e.provider,s.session_id,s.source_complete,s.complete,s.indexed_byte_count,
+                       s.source_byte_count,s.truncation_strategy,s.source_updated_at
+                FROM selected_documents e JOIN scoped_native_documents s ON -e.id=s.id
+            ),").expect("writing SQL into a string cannot fail");
+        "documents"
+    } else if scoped {
         let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
         write!(
             eligible,
@@ -5602,7 +5673,7 @@ fn multi_clause_page_sql(
              HAVING count(*) = {clause_count}
          ),
          ranked_trajectories AS (
-             SELECT qualified_trajectories.trajectory_id,
+             SELECT qualified_trajectories.trajectory_id, trajectories.provider,
                     qualified_trajectories.trajectory_rank
              FROM qualified_trajectories
              INNER JOIN {documents} AS trajectories
@@ -5619,10 +5690,7 @@ fn multi_clause_page_sql(
                         ORDER BY exact_clause DESC, clause_rank, clause_index, chunk_id
                     ) AS snippet_rank
              FROM best_clause_matches
-             INNER JOIN ranked_trajectories
-                 ON ranked_trajectories.trajectory_id =
-                    best_clause_matches.trajectory_id
-             WHERE clause_rank_order = 1
+             WHERE clause_rank_order = 1 AND trajectory_id IN (SELECT trajectory_id FROM ranked_trajectories)
          )
          SELECT trajectories.provider, trajectories.session_id,
                 trajectories.source_complete, trajectories.complete,
@@ -5634,7 +5702,7 @@ fn multi_clause_page_sql(
              ON best_snippets.trajectory_id = ranked_trajectories.trajectory_id
             AND best_snippets.snippet_rank = 1
          INNER JOIN {documents} AS trajectories
-             ON trajectories.id = ranked_trajectories.trajectory_id
+             ON trajectories.id = ranked_trajectories.trajectory_id AND trajectories.provider=ranked_trajectories.provider
          ORDER BY ranked_trajectories.trajectory_rank,
                   trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id"
@@ -5697,7 +5765,7 @@ fn record_verified_document_home(
             transaction,
             write.session,
             &home,
-            file,
+            write.document.source_revision,
             steps,
             observation.desktop_generation,
             None,
@@ -5791,8 +5859,8 @@ fn retain_desktop_summaries(
     let mut statement = connection
         .prepare_cached(
             &format!("SELECT ?4,session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
-                summary->>'created_at',summary->>'updated_at',summary->>'approximate',steps,source_file,NULL
-         FROM {table} WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
+                summary->>'created_at',summary->>'updated_at',summary->>'approximate',p.steps,source_file,NULL
+         FROM {table} d JOIN physical_step_declarations p USING(session_id,source_home,source_file) WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
          UNION ALL SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
                created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
          FROM session_index AS catalog JOIN native_catalog_homes USING(provider,session_id)
@@ -14711,7 +14779,7 @@ mod tests {
         publish(Some(2));
         publish(None);
         assert_eq!(read(row.session.provider, home, file), Some(2));
-        assert_eq!(read(Provider::AntigravityDesktop, home, file), None);
+        assert_eq!(read(Provider::AntigravityDesktop, home, file), Some(2));
         assert_eq!(read(row.session.provider, &home.join("other"), file), None);
         assert_eq!(read(row.session.provider, home, Uuid::from_u128(2)), None);
         publish(Some(0));

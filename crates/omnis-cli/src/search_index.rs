@@ -1638,7 +1638,9 @@ pub(crate) fn observe_native_read<T>(
             && let Some(file) = source.revision.file
         {
             store
-                .verified_desktop_step_count(session, &source.home, file)?
+                .reconcile_desktop_step_count(session, &source.home, file, |count, contents| {
+                    source.matches_database_declaration(count, contents)
+                })?
                 .map(|count| -> Box<dyn ProviderAdapter> {
                     if source.is_ide_desktop_database() {
                         Box::new(AntigravityIdeAdapter::with_cached_step_count(

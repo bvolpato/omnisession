@@ -288,7 +288,7 @@ fn publish_read(
             tx,
             write.session,
             home,
-            file,
+            document.source_revision,
             steps,
             observed.desktop_generation,
             None,
