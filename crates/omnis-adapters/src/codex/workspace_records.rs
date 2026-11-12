@@ -15,9 +15,7 @@ pub(super) struct WorkspaceRecords {
     workspace: RolloutWorkspace,
     paginated: bool,
     gap: Option<WorkspaceGap>,
-    pub(super) malformed: usize,
     settings_gap: Option<SettingsGap>,
-    invalid_rollback: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,23 +42,23 @@ impl WorkspaceRecords {
         }
     }
 
-    pub(super) fn had_gap(&self) -> bool {
-        self.gap.is_some()
-    }
-
     fn restore_context(&mut self) {
         if let Some(gap) = &mut self.gap {
             *gap = WorkspaceGap::ContextRestored;
         }
     }
 
-    fn accepts(&self, record: &Value) -> bool {
+    pub(super) fn accepts(paginated: bool, record: &Value) -> bool {
         let payload = &record["payload"];
+        if super::encoded_rollback(record) {
+            return !paginated
+                || (valid_envelope(record)
+                    && super::rollout_lines::rollback_turns(payload).is_some());
+        }
         match (record["type"].as_str(), payload["type"].as_str()) {
-            (Some("turn_context"), _) => !self.paginated || valid_envelope(record),
-            (Some("event_msg"), Some("thread_rolled_back" | "thread_settings_applied")) => {
-                !self.paginated
-                    || (valid_envelope(record) && classify_event(payload) != Wire::Invalid)
+            (Some("turn_context"), _) => !paginated || valid_envelope(record),
+            (Some("event_msg"), Some("thread_settings_applied")) => {
+                !paginated || (valid_envelope(record) && classify_event(payload) != Wire::Invalid)
             }
             _ => false,
         }
@@ -70,15 +68,12 @@ impl WorkspaceRecords {
     pub(super) fn observe(&mut self, session: &str, line: &JsonLine<'_>) -> bool {
         let kind = match line {
             JsonLine::Record(record) | JsonLine::Unterminated(record) => {
-                if self.accepts(record) {
+                if Self::accepts(self.paginated, record) {
                     self.record(session, record);
                 }
                 return false;
             }
-            JsonLine::Malformed(bytes) => {
-                self.malformed += 1;
-                damaged_workspace_record(bytes)
-            }
+            JsonLine::Malformed(bytes) => damaged_workspace_record(bytes),
             JsonLine::Oversized(prefix, _) => oversized_workspace_record(prefix),
         };
         match kind {
@@ -103,7 +98,6 @@ impl WorkspaceRecords {
         }
         self.gap = Some(WorkspaceGap::AwaitingContext);
         self.workspace.directory = None;
-        self.workspace.rolled_back = false;
         true
     }
 
@@ -123,27 +117,16 @@ impl WorkspaceRecords {
                 self.settings_gap = None;
                 self.restore_context();
             }
-            (Some("event_msg"), Some("thread_rolled_back"))
-                if payload["num_turns"].as_u64() != Some(0) =>
+            _ if super::encoded_rollback(record)
+                && super::rollout_lines::rollback_turns(payload) != Some(0) =>
             {
                 self.workspace.directory = None;
-                self.workspace.rolled_back = true;
-                self.invalid_rollback |= payload["num_turns"].as_u64().is_none();
             }
             _ => {}
         }
     }
 
-    pub(super) fn use_history(&mut self, directory: Option<PathBuf>, restored: bool) {
-        if !self.had_gap() || (restored && self.workspace.rolled_back && !self.invalid_rollback) {
-            self.workspace.directory = directory;
-        }
-    }
-
     pub(super) fn finish(mut self, path: &Path) -> Result<RolloutWorkspace> {
-        if self.had_gap() && self.invalid_rollback {
-            self.workspace.rolled_back = false;
-        }
         let directory = self
             .workspace
             .settings

@@ -22,6 +22,1292 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[test]
+fn search_rebuilds_an_old_antigravity_document_and_retries_its_recorded_failure() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_path_buf());
+    let session = SessionRef::new(Provider::AntigravityDesktop, Uuid::new_v4().to_string());
+    let histories = environment.home.join("antigravity-desktop/conversations");
+    fs::create_dir_all(&histories).unwrap();
+    Connection::open(histories.join(format!("{}.db", session.id)))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES (0, x'080e9a010b0a096672657368776f7264');",
+        )
+        .unwrap();
+
+    fs::create_dir_all(&environment.state_root).unwrap();
+    let index = environment.state_root.join("store.sqlite3");
+    let store = Store::open(&index).unwrap();
+    let old_time = Utc::now() + chrono::Duration::hours(1);
+    store
+        .upsert_session_trajectory(&session, "obsolete wording", old_time, true)
+        .unwrap();
+    Connection::open(index)
+        .unwrap()
+        .execute("UPDATE session_trajectories SET document_version = 5", [])
+        .unwrap();
+    store
+        .record_trajectory_index_failure(
+            &session,
+            &omnis_store::TrajectoryIndexFailure {
+                source_updated_at: Some(old_time),
+                source_file: None,
+                source_contents: None,
+                source_time_precise: true,
+                document_version: 5,
+            },
+        )
+        .unwrap();
+
+    let search = environment
+        .command()
+        .args([
+            "--json",
+            "search",
+            "--provider",
+            "antigravity-desktop",
+            "--all-projects",
+            "freshword",
+        ])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{search:?}");
+    assert!(
+        String::from_utf8(search.stdout)
+            .unwrap()
+            .contains(&session.id)
+    );
+    assert_eq!(
+        store
+            .search_session_trajectories("freshword", 1)
+            .unwrap()
+            .first(),
+        Some(&session)
+    );
+    assert!(
+        !store
+            .trajectory_index_failures()
+            .unwrap()
+            .contains_key(&session)
+    );
+    let warm = environment
+        .command()
+        .args(["--json", "index", "--provider", "antigravity-desktop"])
+        .output()
+        .unwrap();
+    assert!(warm.status.success(), "{warm:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(summary["stale"], 0);
+}
+
+#[test]
+fn antigravity_search_keeps_a_verified_conversation_in_its_original_home() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let id = Uuid::new_v4().to_string();
+    let a = root.path().join("home-a");
+    let b = root.path().join("home-b");
+    for (home, title, count) in [(&a, "First workspace", 2), (&b, "Empty workspace", 0)] {
+        fs::create_dir(home).unwrap();
+        let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+        catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+        catalog.execute("INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, '2026-07-28T12:00:00Z', '[]')", params![id, title, count]).unwrap();
+    }
+    let logs = a.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        logs.join("transcript_full.jsonl"),
+        concat!(
+            r#"{"type":"USER_INPUT","content":"originalprompt"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"homeaword"}"#,
+        ),
+    )
+    .unwrap();
+    let run = |home: &Path, args: &[&str]| {
+        let output = environment
+            .command()
+            .env("ANTIGRAVITY_CLI_HOME", home)
+            .arg("--json")
+            .args(args)
+            .args(["--provider", "antigravity"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let query = ["search", "--all-projects", "homeaword"];
+    assert_eq!(run(&a, &query)["results"].as_array().unwrap().len(), 1);
+    for (steps, torn) in [(0, false), (1, false), (1, true)] {
+        Connection::open(b.join("conversation_summaries.db"))
+            .unwrap()
+            .execute("UPDATE conversation_summaries SET step_count=?1", [steps])
+            .unwrap();
+        if torn {
+            let logs = b.join("brain").join(&id).join(".system_generated/logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(
+                logs.join("transcript_full.jsonl"),
+                r#"{"type":"USER_INPUT","content":"torn"#,
+            )
+            .unwrap();
+        }
+        for flag in [Some("--no-index"), None] {
+            for term in ["originalprompt", "homeaword"] {
+                let mut args = vec!["search", "--all-projects", term];
+                args.extend(flag);
+                assert!(
+                    run(&b, &args)["results"].as_array().unwrap().is_empty(),
+                    "{steps} {torn} {term}"
+                );
+            }
+        }
+        if steps == 0 {
+            let shown = environment
+                .command()
+                .env("ANTIGRAVITY_CLI_HOME", &b)
+                .args(["--json", "show", &format!("antigravity:{id}")])
+                .output()
+                .unwrap();
+            assert!(shown.status.success(), "{shown:?}");
+            let snapshot: CanonicalSnapshot = serde_json::from_slice(&shown.stdout).unwrap();
+            assert!(snapshot.events.is_empty());
+        }
+        run(&b, &["index"]);
+        assert!(
+            run(&b, &["search", "--cached", "--all-projects", "homeaword"])["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            run(&b, &["search", "--cached", "--all-projects", "Empty"])["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    fs::remove_file(logs.join("transcript_full.jsonl")).unwrap();
+    assert_eq!(run(&a, &query)["results"].as_array().unwrap().len(), 1);
+}
+
+fn assert_recovered_antigravity_prefix(environment: &TestEnvironment, id: &str, confirmed: &str) {
+    let shown = environment
+        .command()
+        .args(["--json", "show", &format!("antigravity:{id}")])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let recovered = serde_json::from_slice::<omnis_ir::CanonicalSnapshot>(&shown.stdout).unwrap();
+    assert!(
+        recovered
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+    );
+    assert!(
+        recovered
+            .events
+            .iter()
+            .any(|event| event.payload["text"] == confirmed)
+    );
+}
+
+fn antigravity_history(environment: &TestEnvironment, steps: u32) -> (String, PathBuf) {
+    let home = environment.home.join("antigravity-cli");
+    let id = Uuid::new_v4().to_string();
+    let logs = home.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'Catalog', ?2, '2026-07-28T12:00:00Z', '[]')", params![id, steps]).unwrap();
+    (
+        format!("antigravity:{id}"),
+        logs.join("transcript_full.jsonl"),
+    )
+}
+
+fn state_json(environment: &TestEnvironment, state: &str, args: &[&str]) -> serde_json::Value {
+    let output = environment
+        .command()
+        .env("OMNISESSION_HOME", environment.home.join(state))
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+}
+
+fn check_moved_antigravity_catalog(env: &TestEnvironment, home: &Path, workspace: &Path) {
+    fs::create_dir(workspace).unwrap();
+    let path = workspace.to_string_lossy().replace('\\', "/");
+    let uri = format!("file:///{}", path.trim_start_matches('/'));
+    Connection::open(home.join("conversation_summaries.db"))
+        .unwrap()
+        .execute(
+            "UPDATE conversation_summaries SET title='Moved session',workspace_uris=?1",
+            [serde_json::json!([uri]).to_string()],
+        )
+        .unwrap();
+    let args = [
+        "search",
+        "nextreply",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+    ];
+    let live = state_json(env, "state", &args);
+    assert_eq!(live["results"][0]["coverage"], "preview");
+    let mut args = args.to_vec();
+    args.extend(["--cached", "--show-text"]);
+    let cached = state_json(env, "state", &args);
+    assert_eq!(cached["results"][0]["title"], "Moved session");
+    assert_eq!(
+        Path::new(cached["results"][0]["project_path"].as_str().unwrap()),
+        workspace
+    );
+}
+
+fn check_legacy_catalog_recovery(env: &TestEnvironment, provider: &str) {
+    let store = Connection::open(env.home.join("state/store.sqlite3")).unwrap();
+    store.execute("UPDATE session_index SET source_file_id=NULL,source_contents_id=NULL WHERE provider=?1", [provider]).unwrap();
+    let args = [
+        "search",
+        "--provider",
+        provider,
+        "--all-projects",
+        "firstrepl",
+    ];
+    let mut cached = args.to_vec();
+    cached.push("--cached");
+    let offline = state_json(env, "state", &cached);
+    assert_eq!(offline["results"][0]["coverage"], "complete", "{offline}");
+    assert!(offline["results"][0]["project_path"].is_null());
+    let live = state_json(env, "state", &args);
+    assert_eq!(live["index"]["stale"], 1, "{live}");
+    assert_eq!(
+        state_json(env, "state", &cached)["results"][0]["coverage"],
+        "complete"
+    );
+    assert_eq!(state_json(env, "state", &args)["index"]["stale"], 0);
+}
+
+#[test]
+fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
+    for (provider, directory) in [
+        ("antigravity", "antigravity-cli"),
+        ("antigravity-desktop", "antigravity-desktop"),
+    ] {
+        let root = tempdir().unwrap();
+        let env = TestEnvironment::new(root.path(), root.path().to_owned());
+        let (session, _) = antigravity_history(&env, 2);
+        let home = env.home.join(directory);
+        let histories = home.join("conversations");
+        fs::create_dir_all(&histories).unwrap();
+        let id = session.strip_prefix("antigravity:").unwrap();
+        let database = Connection::open(histories.join(format!("{id}.db"))).unwrap();
+        database.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+            INSERT INTO steps VALUES (0,x'080e9a010b0a096669727374776f7264'),(1,x'080fa2010b0a0966697273747265706c');").unwrap();
+        let index = || state_json(&env, "state", &["index", "--provider", provider]);
+        let search = |query: &str, cached| {
+            let mut args = vec!["search", "--provider", provider, "--all-projects", query];
+            if cached {
+                args.push("--cached");
+            }
+            state_json(&env, "state", &args)["results"][0]["coverage"].clone()
+        };
+        assert_eq!(index()["indexed"], 1);
+        assert_eq!(search("firstrepl", true), "complete");
+        check_legacy_catalog_recovery(&env, provider);
+        database
+            .execute("UPDATE steps SET step_payload=x'082a2003' WHERE idx=1", [])
+            .unwrap();
+        assert!(search("firstrepl", false).is_null());
+        assert!(search("firstrepl", true).is_null());
+        database
+            .execute_batch(
+                "UPDATE steps SET step_payload=x'080fa2010b0a096368616e6765647878' WHERE idx=1;
+             INSERT INTO steps VALUES (2,x'80'),(3,x'080fa2010b0a096e6578747265706c79');",
+            )
+            .unwrap();
+        if provider == "antigravity" {
+            check_moved_antigravity_catalog(&env, &home, &root.path().join("moved"));
+        } else {
+            assert_eq!(search("nextreply", false), "preview");
+        }
+        assert_eq!(search("nextreply", true), "preview");
+        assert!(search("firstrepl", true).is_null());
+        assert_eq!(search("changedxx", true), "preview");
+        database
+            .execute_batch(
+                "DELETE FROM steps WHERE idx>=2;
+             UPDATE steps SET step_payload=x'080fa2010b0a0966697273747265706c' WHERE idx=1;",
+            )
+            .unwrap();
+        assert_eq!(search("firstrepl", false), "complete");
+        assert_eq!(search("firstrepl", true), "complete");
+        database
+            .execute_batch(
+                "INSERT INTO steps VALUES (2,x'082a2003'),(3,x'080fa2010b0a096e6578747265706c79');",
+            )
+            .unwrap();
+        if provider == "antigravity" {
+            Connection::open(home.join("conversation_summaries.db")).unwrap().execute_batch(
+                "UPDATE conversation_summaries SET step_count=4,last_modified_time='2026-07-29T12:00:00Z';"
+            ).unwrap();
+        }
+        assert_eq!(search("nextreply", false), "preview");
+        assert_eq!(search("firstrepl", true), "preview");
+        assert_eq!(search("nextreply", true), "preview");
+        assert_eq!(index()["stale"], 0);
+        assert_eq!(index()["stale"], 0);
+        database
+            .execute_batch(
+                "UPDATE steps SET step_payload=x'a2010b0a096e6578747265706c79080f' WHERE idx=3;
+                 INSERT INTO steps VALUES (4,x'80'),(5,x'080fa2010b0a096d6f726576616c7565');",
+            )
+            .unwrap();
+        let reference = format!("{provider}:{id}");
+        let shown = |word: &str| {
+            state_json(&env, "state", &["show", &reference])["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["text"] == word)
+        };
+        assert!(shown("morevalue"));
+        assert_eq!(search("morevalue", true), "preview");
+        assert_eq!(search("morevalue", false), "preview");
+        assert_eq!(search("nextreply", true), "preview");
+        database
+            .execute_batch(
+                "UPDATE steps SET step_payload=x'080fa2010b0a096e6578747265706c792008' WHERE idx=3;
+             INSERT INTO steps VALUES (6,x'080fa2010b0a096c61746572776f7264');",
+            )
+            .unwrap();
+        assert!(shown("laterword"));
+        assert_eq!(search("laterword", true), "preview");
+        assert_eq!(search("laterword", false), "preview");
+        assert_eq!(search("morevalue", true), "preview");
+    }
+}
+
+#[test]
+fn preferred_antigravity_history_does_not_inherit_cached_text_from_a_different_file() {
+    use std::io::{Read, Write};
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, preferred) = antigravity_history(&env, 2);
+    let fallback = preferred.with_file_name("transcript.jsonl");
+    fs::write(
+        &fallback,
+        r#"{"type":"PLANNER_RESPONSE","content":"fallbackonly"}"#,
+    )
+    .unwrap();
+    let search = [
+        "search",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+        "fallbackonly",
+    ];
+    for state in ["show", "search"] {
+        assert_eq!(
+            state_json(&env, state, &search)["results"][0]["coverage"],
+            "complete"
+        );
+    }
+
+    let mut replacement = fs::File::create(&preferred).unwrap();
+    writeln!(replacement, r#"{{"type":"CHECKPOINT","status":"DONE"}}"#).unwrap();
+    replacement
+        .write_all(br#"{"type":"PLANNER_RESPONSE","content":"newreply","thinking":""#)
+        .unwrap();
+    std::io::copy(
+        &mut std::io::repeat(b'x').take(16 * 1024 * 1024),
+        &mut replacement,
+    )
+    .unwrap();
+    replacement.write_all(b"\"}").unwrap();
+    drop(replacement);
+
+    let mut no_index = search.to_vec();
+    no_index.push("--no-index");
+    assert_eq!(state_json(&env, "search", &no_index)["results"], json!([]));
+    let shown = state_json(&env, "show", &["show", &session]);
+    let snapshot: CanonicalSnapshot = serde_json::from_value(shown).unwrap();
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::CheckpointCreated)
+    );
+    assert_eq!(state_json(&env, "search", &search)["results"], json!([]));
+    let mut cached = search.to_vec();
+    cached.push("--cached");
+    for state in ["show", "search", "cold"] {
+        assert_eq!(
+            state_json(&env, state, &cached)["results"],
+            json!([]),
+            "{state}"
+        );
+    }
+    assert_eq!(state_json(&env, "cold", &search)["results"], json!([]));
+}
+
+#[test]
+fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, preferred) = antigravity_history(&env, 2);
+    let lookup = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            "--provider",
+            "antigravity",
+            "--all-projects",
+            term,
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&env, state, &args)["results"].clone()
+    };
+    fs::write(
+        preferred.with_file_name("transcript.jsonl"),
+        r#"{"type":"PLANNER_RESPONSE","content":"fallbackonly"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        lookup("warm", "fallbackonly", false)[0]["coverage"],
+        "complete"
+    );
+    fs::create_dir(env.home.join("legacy")).unwrap();
+    let legacy = Store::open(env.home.join("legacy").join("store.sqlite3")).unwrap();
+    legacy
+        .upsert_session_trajectory(
+            &SessionRef::new(
+                Provider::Antigravity,
+                session.strip_prefix("antigravity:").unwrap(),
+            ),
+            "fallbackonly",
+            Utc::now(),
+            true,
+        )
+        .unwrap();
+    drop(legacy);
+    fs::write(
+        preferred,
+        concat!(
+            r#"{"type":"PLANNER_RESPONSE","content":"preferredreply"}"#,
+            "\n",
+            r#"{"type":"USER_INPUT","content":"torn"#,
+        ),
+    )
+    .unwrap();
+    for state in ["cold", "warm", "legacy"] {
+        assert_eq!(
+            lookup(state, "preferredreply", false)[0]["coverage"],
+            "preview",
+            "{state}"
+        );
+        assert_eq!(
+            lookup(state, "preferredreply", true)[0]["coverage"],
+            "preview",
+            "{state}"
+        );
+        assert_eq!(lookup(state, "fallbackonly", true), json!([]), "{state}");
+    }
+}
+
+#[test]
+fn interior_damage_keeps_observed_and_previously_verified_search_text_separate() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 4);
+    let message = |text: &str| json!({"type":"PLANNER_RESPONSE","content":text}).to_string();
+    let write = |records: &[String]| fs::write(&path, records.join("\n")).unwrap();
+    let coverage = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            term,
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&env, state, &args)["results"][0]["coverage"].clone()
+    };
+    let broken = "{bad}".to_owned();
+    write(&[message("firstreply"), message("oldreply")]);
+    assert_eq!(coverage("warm", "oldreply", false), "complete");
+    write(&[message("firstreply"), broken.clone(), message("thirdreply")]);
+    assert_eq!(
+        state_json(&env, "warm", &["verify", &session])["omitted_events"],
+        1
+    );
+    let bundle = root.path().join("bundle.json");
+    state_json(
+        &env,
+        "warm",
+        &["export", &session, "--output", bundle.to_str().unwrap()],
+    );
+    let exported: PortableBundle = serde_json::from_slice(&fs::read(bundle).unwrap()).unwrap();
+    assert!(
+        exported
+            .snapshot
+            .events
+            .iter()
+            .any(omnis_core::reports_omitted_events)
+    );
+    assert!(
+        exported
+            .snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["text"] == "thirdreply")
+    );
+    assert!(
+        !exported
+            .snapshot
+            .events
+            .iter()
+            .any(|e| e.payload["text"] == "oldreply")
+    );
+    assert_eq!(coverage("cold", "thirdreply", false), "preview");
+    assert_eq!(coverage("cold", "oldreply", true), serde_json::Value::Null);
+    assert_eq!(coverage("warm", "thirdreply", false), "preview");
+    assert_eq!(coverage("warm", "oldreply", true), "preview");
+    write(&[
+        message("firstreply"),
+        broken.clone(),
+        message("thirdreply"),
+        message("fourthreply"),
+        "{unfinished".to_owned(),
+    ]);
+    assert_eq!(coverage("warm", "fourthreply", false), "preview");
+    assert_eq!(coverage("warm", "oldreply", true), "preview");
+    write(&[
+        message("firstreply"),
+        message("repairedreply"),
+        message("thirdreply"),
+        message("fourthreply"),
+    ]);
+    assert_eq!(coverage("warm", "repairedreply", false), "complete");
+    assert_eq!(coverage("warm", "oldreply", true), serde_json::Value::Null);
+    write(&[
+        message("firstreply"),
+        broken.clone(),
+        message("thirdreply"),
+        broken,
+    ]);
+    assert_eq!(
+        state_json(&env, "warm", &["verify", &session])["omitted_events"],
+        2
+    );
+}
+
+#[test]
+fn warm_search_recovers_only_verified_replies_absent_from_the_readable_suffix() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 3);
+    let reply = |text: &str| json!({"type":"PLANNER_RESPONSE","content":text}).to_string();
+    let search = |state: &str, term: &str| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                term,
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                "--show-text",
+            ],
+        )["results"]
+            .clone()
+    };
+    let first = reply("firstreply");
+    let second = reply("onlyonce");
+    let last = reply("verifiedthird");
+    fs::write(&path, format!("{first}\n{second}")).unwrap();
+    assert_eq!(search("insert", "onlyonce")[0]["coverage"], "complete");
+    fs::write(&path, format!("{first}\n{{broken}}\n{second}")).unwrap();
+    let warm = search("insert", "onlyonce");
+    let cold = search("cold", "onlyonce");
+    assert_eq!(warm[0]["snippet"], cold[0]["snippet"]);
+    assert_eq!(
+        warm[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .matches("onlyonce")
+            .count(),
+        1
+    );
+    fs::write(&path, format!("{first}\n{second}\n{last}")).unwrap();
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "complete");
+    fs::write(
+        &path,
+        format!("{first}\n{{broken}}\n{second}\n{{unfinished"),
+    )
+    .unwrap();
+    assert_eq!(
+        state_json(&env, "both", &["verify", &session])["omitted_events"],
+        2
+    );
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "preview");
+    let fourth = reply("confirmedfourth");
+    fs::write(
+        &path,
+        format!("{first}\n{{broken}}\n{second}\n{{unfinished\n{fourth}"),
+    )
+    .unwrap();
+    assert_eq!(search("both", "confirmedfourth")[0]["coverage"], "preview");
+    assert_eq!(search("both", "verifiedthird")[0]["coverage"], "preview");
+    fs::write(&path, format!("{first}\n{second}\n{fourth}")).unwrap();
+    assert!(
+        search("both", "verifiedthird")
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 4);
+    for dated in [true, false] {
+        let step = |i: u32, text: &str| {
+            let mut record = json!({"type":"PLANNER_RESPONSE","content":text});
+            if dated {
+                record["created_at"] = json!(format!("2026-06-01T00:00:0{i}Z"));
+            }
+            if i == 3 {
+                record["tool_calls"] = json!([{"name":"lookup"}]);
+            }
+            record.to_string()
+        };
+        let snippet = |state: &str, cached: bool| {
+            let mut args = vec![
+                "search",
+                "acknowledged",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                "--show-text",
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            state_json(&env, state, &args)["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let sequential = format!("staged-{dated}");
+        let direct = format!("direct-{dated}");
+        let opening = step(0, "opening");
+        let old_reply = step(1, "acknowledged");
+        fs::write(&path, format!("{opening}\n{old_reply}\n")).unwrap();
+        assert_eq!(snippet(&sequential, false), "opening acknowledged");
+        assert_eq!(snippet(&direct, false), "opening acknowledged");
+        let ambiguous = format!("unchanged-time-{dated}");
+        assert_eq!(snippet(&ambiguous, false), "opening acknowledged");
+        let partial = format!("{opening}\n{{broken}}\n{}\n", step(1, "nextquestion"));
+        fs::write(&path, &partial).unwrap();
+        assert_eq!(
+            snippet(&sequential, false),
+            "opening acknowledged nextquestion"
+        );
+        fs::write(&path, format!("{partial}{}\n", step(3, "acknowledged"))).unwrap();
+        for cached in [false, true, false] {
+            assert_eq!(
+                snippet(&sequential, cached),
+                r#"opening acknowledged nextquestion acknowledged {"arguments":null,"name":"lookup"}"#
+            );
+            if dated {
+                assert_eq!(
+                    snippet(&direct, cached),
+                    r#"opening acknowledged nextquestion acknowledged {"arguments":null,"name":"lookup"}"#
+                );
+            }
+        }
+        fs::write(&path, format!("{partial}{old_reply}\n")).unwrap();
+        for cached in [false, true] {
+            assert_eq!(
+                snippet(&ambiguous, cached),
+                "opening nextquestion acknowledged"
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_antigravity_search_indexes_newly_completed_turns() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 3);
+    let coverage = |state: &str, term: &str| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ],
+        )["results"][0]["coverage"]
+            .clone()
+    };
+    fs::write(&path, "{\"type\":\"CHECKPOINT\"}\n").unwrap();
+    assert_eq!(coverage("empty", "firstreply"), serde_json::Value::Null);
+    fs::write(
+        &path,
+        "{\"type\":\"CHECKPOINT\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"firstreply\"}\n",
+    )
+    .unwrap();
+    assert_eq!(coverage("full", "firstreply"), "complete");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"CHECKPOINT\"}\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"firstreply"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"nextreply"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(coverage("warm", "firstreply"), "preview");
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
+        .unwrap();
+    drop(file);
+    for state in ["warm", "cold", "full", "empty"] {
+        assert_eq!(coverage(state, "nextreply"), "preview", "{state}");
+        assert_eq!(coverage(state, "firstreply"), "preview", "{state}");
+    }
+}
+
+fn large_antigravity_transcript(path: &std::path::Path) -> std::io::BufWriter<fs::File> {
+    use std::io::Write;
+    let mut file = std::io::BufWriter::new(fs::File::create(path).unwrap());
+    let private = "x".repeat(8192);
+    for index in 0..3250 {
+        writeln!(
+            file,
+            r#"{{"type":"PLANNER_RESPONSE","content":"message{index}","thinking":"{private}"}}"#
+        )
+        .unwrap();
+    }
+    file.flush().unwrap();
+    file
+}
+
+#[test]
+fn damaged_full_scan_keeps_middle_turns_after_append() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&env, 3251);
+    let mut file = large_antigravity_transcript(&path);
+    state_json(&env, "warm", &["show", &session]);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"!")
+        .unwrap();
+    let search = [
+        "search",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+        "message1800",
+    ];
+    assert_eq!(
+        state_json(&env, "warm", &search)["results"][0]["coverage"],
+        "preview"
+    );
+    writeln!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"appended"}}"#
+    )
+    .unwrap();
+    drop(file);
+    assert_eq!(
+        state_json(&env, "warm", &search)["results"][0]["coverage"],
+        "preview"
+    );
+    let mut cached = search.to_vec();
+    cached.push("--cached");
+    assert_eq!(
+        state_json(&env, "warm", &cached)["results"][0]["coverage"],
+        "preview"
+    );
+}
+
+#[test]
+fn growing_antigravity_history_moves_the_sampled_tail() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 3251);
+    let mut file = large_antigravity_transcript(&path);
+    write!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"newreply","thinking":""#
+    )
+    .unwrap();
+    file.flush().unwrap();
+    let coverage = |state, term| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ],
+        )["results"][0]["coverage"]
+            .clone()
+    };
+    assert_eq!(coverage("warm", "message3249"), "preview");
+    file.write_all(&vec![b'z'; 512 * 1024]).unwrap();
+    file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
+        .unwrap();
+    drop(file);
+    for state in ["warm", "cold"] {
+        assert_eq!(coverage(state, "newreply"), "preview", "{state}");
+    }
+}
+
+#[test]
+fn an_oversized_reply_preserves_verified_search_after_show_or_indexing() {
+    use std::io::{Read, Write};
+
+    for request in [
+        "",
+        "{\"type\":\"USER_INPUT\",\"content\":\"unchanged request\"}\n",
+    ] {
+        let root = tempdir().unwrap();
+        let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+        let (session, path) =
+            antigravity_history(&environment, if request.is_empty() { 1 } else { 2 });
+        let run = |state: &str, args: &[&str]| state_json(&environment, state, args);
+        let search = [
+            "search",
+            "verifiedreply",
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        let prefix = r#"{"type":"PLANNER_RESPONSE","content":"verifiedreply","thinking":""#;
+        fs::write(&path, format!("{request}{prefix}private\"}}")).unwrap();
+        for state in ["shown", "searched"] {
+            assert_eq!(run(state, &search)["results"][0]["coverage"], "complete");
+        }
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(request.as_bytes()).unwrap();
+        file.write_all(prefix.as_bytes()).unwrap();
+        std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+        file.write_all(b"\"}").unwrap();
+        drop(file);
+
+        let shown = run("shown", &["show", &session]);
+        let snapshot: CanonicalSnapshot = serde_json::from_value(shown).unwrap();
+        let omissions = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["omitted_events"].as_u64())
+            .sum::<u64>();
+        assert_eq!(omissions, 1);
+        assert_eq!(
+            snapshot.events.len(),
+            if request.is_empty() { 1 } else { 2 }
+        );
+        let live = run("searched", &search);
+        assert_eq!(live["results"][0]["coverage"], "complete");
+        let mut cached_search = search.to_vec();
+        cached_search.push("--cached");
+        for state in ["shown", "searched"] {
+            let cached = run(state, &cached_search);
+            assert_eq!(cached["results"][0]["coverage"], "complete", "{state}");
+        }
+    }
+}
+
+#[test]
+fn oversized_antigravity_tail_preserves_verified_and_cold_search_results() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&environment, 3);
+    let prefix = concat!(
+        r#"{"type":"USER_INPUT","content":"question"}"#,
+        "\n",
+        r#"{"type":"PLANNER_RESPONSE","content":"prefixmarker"}"#,
+        "\n"
+    );
+    let tail = r#"{"type":"PLANNER_RESPONSE","content":"warmmarker"#;
+    fs::write(&path, format!("{prefix}{tail}\"}}")).unwrap();
+    let search = |state: &str, term: &str, cached: bool| {
+        let mut command = environment.command();
+        command
+            .env("OMNISESSION_HOME", root.path().join(state))
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ]);
+        if cached {
+            command.arg("--cached");
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        response["results"][0]["coverage"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        search("warm", "warmmarker", false).as_deref(),
+        Some("complete")
+    );
+    let mut file = fs::File::create(&path).unwrap();
+    write!(file, "{prefix}{tail}").unwrap();
+    std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+    file.write_all(b"\n\n").unwrap();
+    for cached in [false, true] {
+        assert_eq!(
+            search("warm", "warmmarker", cached).as_deref(),
+            Some("complete")
+        );
+    }
+    for cached in [false, true] {
+        assert_eq!(
+            search("recover", "prefixmarker", cached).as_deref(),
+            Some("preview")
+        );
+    }
+    assert!(search("recover", "warmmarker", true).is_none());
+    file.rewind().unwrap();
+    let changed_prefix = prefix.replace("prefixmarker", "hiddenmarker");
+    file.write_all(changed_prefix.as_bytes()).unwrap();
+    assert_eq!(
+        search("recover", "prefixmarker", false).as_deref(),
+        Some("preview")
+    );
+    file.rewind().unwrap();
+    file.write_all(prefix.as_bytes()).unwrap();
+    for (state, record_size) in [
+        ("cold-above", 16 * 1024 * 1024 + 8),
+        ("cold-below", 16 * 1024 * 1024 - 8),
+    ] {
+        let length = prefix.len() as u64 + record_size;
+        file.set_len(length).unwrap();
+        file.seek(SeekFrom::End(-2)).unwrap();
+        file.write_all(b"\"}").unwrap();
+        for cached in [false, true] {
+            assert_eq!(
+                search(state, "prefixmarker", cached).as_deref(),
+                Some("preview")
+            );
+        }
+    }
+    drop(file);
+    fs::write(&path, format!("{prefix}{tail} repairedfinal\"}}")).unwrap();
+    assert_eq!(
+        search("recover", "repairedfinal", false).as_deref(),
+        Some("complete")
+    );
+}
+
+#[test]
+fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = environment.home.join("antigravity-cli");
+    let id = Uuid::new_v4().to_string();
+    let logs = home.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'History', 2, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
+    let search = |term: &str| {
+        let output = environment
+            .command()
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let preferred = logs.join("transcript_full.jsonl");
+    let fallback = logs.join("transcript.jsonl");
+    let first = r#"{"type":"USER_INPUT","content":"firstword"}"#;
+    let last = r#"{"type":"USER_INPUT","content":"restoredword"}"#;
+    fs::write(&preferred, first).unwrap();
+    assert_eq!(search("firstword")["results"].as_array().unwrap().len(), 1);
+    fs::rename(&preferred, &fallback).unwrap();
+    let torn = r#"{"type":"USER_INPUT","content":"torn"#;
+    fs::write(&fallback, format!("{last}\n{torn}\n\n")).unwrap();
+    assert_recovered_antigravity_prefix(&environment, &id, "restoredword");
+    let failed = search("firstword");
+    assert_eq!(failed["index"]["failed"], 1);
+    assert_eq!(failed["results"].as_array().unwrap().len(), 1);
+    fs::write(&fallback, first).unwrap();
+    assert_eq!(search("firstword")["index"]["indexed"], 1);
+    fs::write(&preferred, format!("{first}\n{last}")).unwrap();
+    assert_eq!(
+        search("restoredword")["results"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
+
+    // A restored database with the same messages changes the source of the existing search text.
+    let histories = home.join("conversations");
+    fs::create_dir_all(&histories).unwrap();
+    Connection::open(histories.join(format!("{id}.db")))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES (0, x'080e9a010b0a096669727374776f7264'),
+                                      (1, x'080e9a010e0a0c726573746f726564776f7264');",
+        )
+        .unwrap();
+    Connection::open(environment.state_root.join("store.sqlite3"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER preserve_chunks BEFORE DELETE ON session_trajectory_chunk_rows
+             BEGIN SELECT RAISE(ABORT, 'unexpected change to reusable search text'); END;",
+        )
+        .unwrap();
+    fs::remove_file(preferred).unwrap();
+    fs::remove_file(fallback).unwrap();
+    assert_eq!(search("restoredword")["index"]["indexed"], 1);
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
+
+    let index = Connection::open(environment.state_root.join("store.sqlite3")).unwrap();
+    index
+        .execute_batch(
+            "DROP TRIGGER preserve_chunks;
+        UPDATE session_trajectories SET document_version=4, source_complete=0, source_file_id=NULL,
+            source_contents_id=NULL, derived_title='retiredlabel';",
+        )
+        .unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET title='currentlabel'", [])
+        .unwrap();
+    Connection::open(histories.join(format!("{id}.db")))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE native_padding (data BLOB);
+            INSERT INTO native_padding VALUES (zeroblob(17825792));
+            DELETE FROM steps WHERE idx=0;
+            UPDATE steps SET step_payload=x'080fa2010e0a0c726573746f726564776f7264' WHERE idx=1;",
+        )
+        .unwrap();
+    assert!(
+        search("retiredlabel")["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        search("currentlabel")["results"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
+}
+
+#[test]
+fn search_reads_committed_antigravity_steps_from_the_wal() {
+    for (provider, directory) in [
+        ("antigravity", "antigravity-cli"),
+        ("antigravity-desktop", "antigravity-desktop"),
+    ] {
+        let root = tempdir().unwrap();
+        let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+        let home = environment.home.join(directory);
+        let id = Uuid::new_v4().to_string();
+        let histories = home.join("conversations");
+        fs::create_dir_all(&histories).unwrap();
+        if provider == "antigravity" {
+            let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+            catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT)").unwrap();
+            catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'History', 2, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
+        }
+        let database = histories.join(format!("{id}.db"));
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+            INSERT INTO steps VALUES (0, x'080e9a01070a056669727374');
+            PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let search = |term: &str| {
+            let output = environment
+                .command()
+                .args([
+                    "--json",
+                    "search",
+                    "--all-projects",
+                    "--provider",
+                    provider,
+                    term,
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        assert_eq!(search("first")["results"].as_array().unwrap().len(), 1);
+        let before = database.metadata().unwrap();
+        writer
+            .execute(
+                "INSERT INTO steps VALUES (1, x'080e9a010a0a08726573746f726564')",
+                [],
+            )
+            .unwrap();
+        let after = database.metadata().unwrap();
+        assert_eq!(
+            (before.len(), before.modified().unwrap()),
+            (after.len(), after.modified().unwrap())
+        );
+        assert_eq!(
+            search("restored")["results"].as_array().unwrap().len(),
+            1,
+            "{provider}"
+        );
+        assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+        drop(writer);
+        assert_eq!(search("restored")["results"][0]["coverage"], "complete");
+
+        let backup = root.path().join("backup.db");
+        fs::copy(&database, &backup).unwrap();
+        let backup_writer = Connection::open(&backup).unwrap();
+        backup_writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+             UPDATE steps SET step_payload=x'080e9a01070a056f74686572' WHERE idx=1;
+             INSERT INTO steps VALUES (2,x'80');",
+            )
+            .unwrap();
+        let wal = database.with_extension("db-wal");
+        for _ in 0..2 {
+            fs::copy(backup.with_extension("db-wal"), &wal).unwrap();
+            let observed = search("other");
+            assert_eq!(
+                observed["results"][0]["coverage"], "preview",
+                "{provider} {observed}"
+            );
+            let repeated = search("other");
+            assert_eq!(repeated["index"]["stale"], 0, "{provider} {repeated}");
+            assert_eq!(repeated["index"]["indexed"], 0, "{provider} {repeated}");
+            fs::remove_file(&wal).unwrap();
+            assert_eq!(
+                search("restored")["results"][0]["coverage"],
+                "complete",
+                "{provider}"
+            );
+            assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+        }
+    }
+}
+
+#[test]
+fn list_leads_with_the_assigned_codex_name_and_keeps_unnamed_sessions_metadata_only() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = root.path().join("codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let named = Uuid::from_u128(1);
+    let unnamed = Uuid::from_u128(2);
+    for id in [named, unnamed] {
+        let meta = json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta",
+            "payload":{"id":id,"cwd":root.path()}});
+        let request = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"private first prompt"}]}});
+        fs::write(
+            home.join(format!("sessions/rollout-{id}.jsonl")),
+            format!("{meta}\n{request}\n"),
+        )
+        .unwrap();
+    }
+    let index = json!({"id":named,"thread_name":format!("🛰️ Orbit\n{SECRET_VALUE}")});
+    fs::write(home.join("session_index.jsonl"), index.to_string()).unwrap();
+    let list = |json_output| {
+        let mut cmd = environment.command();
+        cmd.env("CODEX_HOME", &home).env_remove("CODEX_SQLITE_HOME");
+        if json_output {
+            cmd.arg("--json");
+        }
+        let output = cmd
+            .args(["list", "--provider", "codex", "--all-projects"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains(SECRET_VALUE));
+        assert!(!text.contains("private first prompt"));
+        text
+    };
+    let text = list(false);
+    let named_row = text
+        .lines()
+        .find(|line| line.contains(&named.to_string()))
+        .unwrap();
+    assert!(named_row.starts_with("🛰️ Orbit "));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&format!("codex:{unnamed}")))
+    );
+    let rows: serde_json::Value = serde_json::from_str(&list(true)).unwrap();
+    let rows = rows["sessions"].as_array().unwrap();
+    let named_row = rows
+        .iter()
+        .find(|row| row["session"]["id"] == named.to_string())
+        .unwrap();
+    let title = named_row["title"].as_str().unwrap();
+    assert!(title.starts_with("🛰️ Orbit "));
+    assert!(!title.contains('\n'));
+    assert!(
+        rows.iter()
+            .any(|row| row["session"]["id"] == unnamed.to_string() && row.get("title").is_none())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
@@ -41,9 +1327,10 @@ fn check_opencode_search_upgrade(previous_version: u32) {
         &binary,
         r##"#!/bin/sh
 case "$*" in
-  --version) echo 1.18.18 ;;
-  *export*) echo '{"id":"ses_guide","updated_at":"2026-01-01T00:00:00Z","messages":[{"role":"assistant","text":"# AGENTS.md instructions for receiptguide"}]}' ;;
-  *) echo '[]' ;;
+  --version) echo 2.0.0 ;;
+  "session export ses_guide --standalone")
+    echo '{"info":{"id":"ses_guide","time":{"updated":1767225600000}},"messages":[{"type":"assistant","content":[{"type":"text","text":"# AGENTS.md instructions for receiptguide"}]}]}' ;;
+  *) exit 1 ;;
 esac
 "##,
     )
@@ -141,8 +1428,87 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
         temporary_directory.path(),
     );
     assert_task_and_resume(&environment, &imported);
+    #[cfg(unix)]
+    assert_first_run_codex_probes(&environment, &imported);
     assert_missing_uuid(&environment);
     assert_uuid_collision_fails(&environment, bundle, temporary_directory.path());
+}
+
+#[test]
+fn imported_documents_refresh_at_their_source_providers_version() {
+    let temporary = tempdir().unwrap();
+    let environment = TestEnvironment::new(temporary.path(), temporary.path().to_owned());
+    let path = temporary.path().join("bundle.json");
+    let providers = [Provider::OhMyPi, Provider::Pi, Provider::Claude];
+    let mut locators = Vec::new();
+    for provider in providers {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.session.provider = provider;
+        for event in &mut snapshot.events {
+            event.source.provider = provider;
+        }
+        let bundle_id = Uuid::new_v4();
+        let bundle = PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.into(),
+                bundle_id,
+                created_at: snapshot.captured_at,
+                source: snapshot.session.clone(),
+                event_count: snapshot.events.len(),
+                redactions: Vec::new(),
+            },
+            snapshot,
+            fidelity: None,
+        };
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert_import_succeeds(&environment, &path, "seed imported locator");
+        locators.push(SessionRef::new(Provider::Imported, bundle_id.to_string()));
+    }
+    let database = environment.state_root.join("store.sqlite3");
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET document_version = 4, derived_title = 'Old title'
+         WHERE provider = 'imported'",
+            [],
+        )
+        .unwrap();
+    let shown = environment
+        .command()
+        .args(["show", &locators[0].to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let indexed = environment
+        .command()
+        .args(["--json", "index", "--provider", "imported"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let expected = providers[1..]
+        .iter()
+        .filter(|&&provider| omnis_core::search_document_version(provider) > 4)
+        .count();
+    assert_eq!(summary["stale"], expected);
+    assert_eq!(summary["indexed"], expected);
+    let store = Store::open(&database).unwrap();
+    for (provider, locator) in providers.into_iter().zip(&locators) {
+        let version = omnis_core::search_document_version(provider);
+        let state = store.trajectory_index_state(locator).unwrap().unwrap();
+        assert_eq!(state.document_version, version);
+        assert!(state.source_complete);
+        let title = store.trajectory_title(locator).unwrap().unwrap();
+        assert_eq!(title == "Old title", version == 4);
+    }
 }
 
 #[test]
@@ -179,6 +1545,7 @@ fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
     store
         .upsert_indexed_session(&IndexedSession {
             source_path: None,
+            source_revision: None,
             session: SessionRef::new(Provider::Imported, missing_id.to_string()),
             title: Some("missing bundle".to_owned()),
             project_path: Some(temporary_directory.path().join("elsewhere")),
@@ -279,7 +1646,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     );
 
     let switched = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&workspace)
         .args(["--json", "switch", "codex", "--dry-run"])
         .output()
@@ -290,6 +1657,7 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         String::from_utf8_lossy(&switched.stderr)
     );
     assert!(!String::from_utf8_lossy(&switched.stdout).contains("Cross-Workspace Override"));
+    environment.assert_first_run_handoff(&serde_json::from_slice(&switched.stdout).unwrap());
     let listed = environment
         .command()
         .current_dir(&workspace)
@@ -754,7 +2122,7 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
 
     assert!(!environment.home.join(".codex").exists());
     let resume = environment
-        .command()
+        .first_run_codex_command()
         .current_dir(&environment.workspace)
         .args(["--json", "resume", &source, "--dry-run"])
         .output()
@@ -768,10 +2136,68 @@ fn assert_task_and_resume(environment: &TestEnvironment, imported: &SessionRef) 
     assert_eq!(resumed["source"], json!(imported));
     assert_eq!(resumed["target"], "codex");
     assert_eq!(resumed["dry_run"], true);
+    environment.assert_first_run_handoff(&resumed);
     let resumed_text = String::from_utf8_lossy(&resume.stdout);
     assert!(!resumed_text.contains(SECRET_VALUE));
     assert!(!resumed_text.contains(HIDDEN_REASONING_MARKER));
     assert!(!resumed_text.contains(HIDDEN_APPROVAL_MARKER));
+}
+
+#[cfg(unix)]
+fn assert_first_run_codex_probes(environment: &TestEnvironment, imported: &SessionRef) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = environment.home.join("codex-cli");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+store=${CODEX_HOME:-$HOME/.codex}
+case "$1" in
+    --version|--help)
+        mkdir -p "$store" || exit 1
+        echo "$1" >> "$HOME/probes"
+        if [ "$1" = --version ]; then echo 'codex-cli 0.137.0';
+        else echo '  --dangerously-bypass-approvals-and-sandbox  Skip approvals'; fi ;;
+    *) printf '%s\n' "$store" "$@" > "$HOME/launch" ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = imported.to_string();
+    let run = |dry_run| {
+        let mut command = environment.first_run_codex_command();
+        command
+            .current_dir(&environment.workspace)
+            .env("OMNI_CODEX_BIN", &executable)
+            .env("TMPDIR", &environment.home)
+            .args(["resume", &source, "--in", "codex", "--mode", "yolo"]);
+        if dry_run {
+            command.args(["--json", "--dry-run"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    environment.assert_first_run_handoff(&serde_json::from_slice(&run(true).stdout).unwrap());
+    let probes = fs::read_to_string(environment.home.join("probes")).unwrap();
+    for flag in ["--version", "--help"] {
+        assert!(probes.lines().any(|probe| probe == flag), "{probes}");
+    }
+    assert!(!environment.home.join("launch").exists());
+    run(false);
+    let launch = fs::read_to_string(environment.home.join("launch")).unwrap();
+    let mut args = launch.lines();
+    assert_eq!(
+        Path::new(args.next().unwrap()),
+        environment.home.join(".codex")
+    );
+    assert!(args.any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
 }
 
 fn assert_missing_uuid(environment: &TestEnvironment) {
@@ -835,6 +2261,8 @@ impl TestEnvironment {
             .env("OMNISESSION_HOME", &self.state_root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
+            .env("CODEX_HOME", self.home.join(".codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("ANTIGRAVITY_CLI_HOME", self.home.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.home.join("antigravity-ide"))
             .env(
@@ -848,6 +2276,53 @@ impl TestEnvironment {
             .env("OMNI_CODEX_BIN", &self.missing_codex)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command
+    }
+
+    fn first_run_codex_command(&self) -> Command {
+        let mut command = self.command();
+        #[cfg(windows)]
+        {
+            // Windows can resolve its profile through the OS even when USERPROFILE is redirected.
+            let probe = self
+                .command()
+                .env_remove("CODEX_HOME")
+                .args(["--json", "adapters"])
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let providers: Vec<serde_json::Value> = serde_json::from_slice(&probe.stdout).unwrap();
+            let codex = providers
+                .iter()
+                .find(|row| row["provider"] == "codex")
+                .unwrap();
+            let default = Path::new(codex["data_root"].as_str().expect("first-run Codex home"));
+            assert!(default.is_absolute() && default.ends_with(".codex"));
+            if default != self.home.join(".codex") {
+                return command;
+            }
+        }
+        command.env_remove("CODEX_HOME");
+        command
+    }
+
+    fn assert_first_run_handoff(&self, plan: &serde_json::Value) {
+        assert_eq!(plan["fidelity"]["mode"], "semantic_handoff");
+        let args = plan["launch"]["args"].as_array().unwrap();
+        let pin = args
+            .windows(2)
+            .find(|pair| pair[0] == "-c")
+            .expect("SQLite home in launch plan");
+        let settings: toml::Table = toml::from_str(pin[1].as_str().unwrap()).unwrap();
+        let expected = self.home.join(".codex");
+        assert_eq!(
+            Path::new(settings["sqlite_home"].as_str().unwrap()),
+            expected
+        );
+        assert!(!expected.exists());
     }
 }
 
@@ -946,4 +2421,134 @@ fn event(
         sensitivity,
         replay_policy,
     }
+}
+
+fn write_capped_antigravity_history(
+    path: &Path,
+    changed: Option<(usize, &str)>,
+    grow_private_field: bool,
+) {
+    use std::io::{BufWriter, Read, Write};
+    let mut file = BufWriter::new(fs::File::create(path).unwrap());
+    for index in 0..62 {
+        let filler = format!(" ordinary {index:02}").repeat(3_000);
+        let marker = changed
+            .filter(|(at, _)| *at == index)
+            .map_or("", |(_, word)| word);
+        writeln!(
+            file,
+            r#"{{"type":"PLANNER_RESPONSE","content":"{marker}{filler}"}}"#
+        )
+        .unwrap();
+    }
+    write!(
+        file,
+        r#"{{"type":"PLANNER_RESPONSE","content":"{} verifiedreply","thinking":""#,
+        " ordinary".repeat(9_000)
+    )
+    .unwrap();
+    if grow_private_field {
+        std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+    }
+    writeln!(file, r#"","tool_calls":[{{"name":"firsttool","args":{{}}}},{{"name":"secondtool","args":{{}}}}]}}"#).unwrap();
+    file.flush().unwrap();
+}
+
+#[test]
+fn capped_antigravity_search_retains_only_compatible_verified_replies() {
+    use sha2::Digest;
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&environment, 63);
+    let hits = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            term,
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&environment, state, &args)["results"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let indexed_bytes = |state: &str| -> i64 {
+        Connection::open(environment.home.join(state).join("store.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT indexed_byte_count FROM session_trajectories",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    write_capped_antigravity_history(&path, None, false);
+    state_json(&environment, "shown", &["show", &session]);
+    let expected_prefix = (0..62)
+        .map(|index| format!(" ordinary {index:02}").repeat(3_000))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for state in ["shown", "searched"] {
+        assert_eq!(hits(state, "verifiedreply", false), 1);
+        assert_eq!(indexed_bytes(state), 2 * 1024 * 1024);
+        let digest: Vec<u8> = Connection::open(environment.home.join(state).join("store.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT projected_record_prefix_hash FROM session_trajectories",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            digest,
+            sha2::Sha256::digest(expected_prefix.as_bytes()).as_slice(),
+            "{state}"
+        );
+    }
+
+    for state in ["fringe-show", "fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "verifiedreply", false), 1);
+    }
+    Connection::open(environment.home.join("fringe-upgrade/store.sqlite3"))
+        .unwrap().execute("UPDATE session_trajectories SET projected_prefix_hash=projected_record_prefix_hash, projected_record_prefix_hash=NULL", []).unwrap();
+
+    Connection::open(environment.home.join("shown/store.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET projected_byte_count=NULL, projected_record_prefix_hash=NULL",
+            [],
+        )
+        .unwrap();
+
+    write_capped_antigravity_history(&path, None, true);
+    state_json(&environment, "fresh", &["show", &session]);
+    assert_eq!(hits("fresh", "ordinary", true), 1);
+    assert_eq!(hits("fresh", "verifiedreply", true), 0);
+    assert_eq!(indexed_bytes("fresh"), indexed_bytes("shown"));
+    state_json(&environment, "shown", &["show", &session]);
+    assert_eq!(hits("searched", "verifiedreply", false), 1);
+    for state in ["shown", "searched"] {
+        assert_eq!(hits(state, "verifiedreply", true), 1, "{state}");
+        assert_eq!(hits(state, "secondtool", true), 1, "{state}");
+    }
+
+    write_capped_antigravity_history(&path, Some((34, "newfringeword")), true);
+    state_json(&environment, "fringe-show", &["show", &session]);
+    for state in ["fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "newfringeword", false), 1);
+    }
+    for state in ["fringe-show", "fringe-search", "fringe-upgrade"] {
+        assert_eq!(hits(state, "newfringeword", true), 1);
+        assert_eq!(hits(state, "verifiedreply", true), 0);
+    }
+
+    write_capped_antigravity_history(&path, Some((0, "changedvisible")), true);
+    assert_eq!(hits("searched", "changedvisible", false), 1);
+    assert_eq!(hits("searched", "verifiedreply", true), 0);
 }

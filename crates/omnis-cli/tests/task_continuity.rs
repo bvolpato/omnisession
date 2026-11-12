@@ -285,7 +285,7 @@ fn codex_keeps_its_relative_store_when_launching_in_the_recorded_subdirectory() 
     workspace_git(&repo, &["init", "--quiet"]);
     let recorded = omnis_core::canonicalize_path(&member).unwrap();
     fs::write(
-        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")),
         json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":recorded}}).to_string(),
     )
     .unwrap();
@@ -361,7 +361,7 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
     for dir in [&initial, &moved, &sessions] {
         fs::create_dir_all(dir).unwrap();
     }
-    let rollout = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl"));
     let mut records = vec![
         json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":initial,
             "git":{"commit_hash":"0000000000000000000000000000000000000000"}}}),
@@ -381,9 +381,8 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
         fs::write(&rollout, lines).unwrap();
     };
     let source = format!("codex:{SESSION_ID}");
-    let check_launch = |directory: &Path, expected: bool, set_cwd: bool| {
-        let inspected = successful_json(&mut inspect_workspace(root, directory, &source));
-        for verb in ["resume", "fork"] {
+    let check_launch = |directory: &Path, expected: bool, cold_needs_cd: bool| {
+        let check_plan = |verb: &str, set_cwd: bool| {
             let mut cli = command(root, directory);
             cli.args(["--json", verb, &source, "--in", "codex", "--dry-run"]);
             if verb == "resume" {
@@ -403,8 +402,12 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
                 "{plan}"
             );
             assert_eq!(plan["fidelity"]["repository_matches"], expected);
-        }
+        };
+        check_plan("resume", cold_needs_cd);
+        let inspected = successful_json(&mut inspect_workspace(root, directory, &source));
         assert_eq!(inspected["repository_matches"], expected);
+        // Inspection caches the effective directory. The cache does not establish the native startup directory.
+        check_plan("fork", true);
     };
     write(&records);
     check_launch(&moved, true, true);
@@ -465,13 +468,14 @@ args = ["exec"]
         );
         plan["launch"]["args"].clone()
     };
+    let sqlite = format!("sqlite_home={}", json!(root.join("codex")));
     assert_eq!(
         args_for("configured"),
-        json!(["--cd=somewhere", "fork", SESSION_ID])
+        json!(["--cd=somewhere", "-c", sqlite, "fork", SESSION_ID])
     );
     assert_eq!(
         args_for("wrapper"),
-        json!(["codex", "--cd", ".", "fork", SESSION_ID])
+        json!(["codex", "--cd", ".", "-c", sqlite, "fork", SESSION_ID])
     );
     let exec = successful_json(command(root, selected).args([
         "--json",
@@ -484,7 +488,7 @@ args = ["exec"]
     ]));
     assert_eq!(
         exec["launch"]["args"],
-        json!(["exec", "--cd", ".", "resume", SESSION_ID])
+        json!(["exec", "--cd", ".", "-c", sqlite, "resume", SESSION_ID])
     );
 }
 
@@ -501,7 +505,9 @@ fn a_same_size_in_place_rewrite_invalidates_a_large_native_workspace() {
     for path in [&original, &replacement, &sessions] {
         fs::create_dir_all(path).unwrap();
     }
-    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    let mut file =
+        fs::File::create(sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")))
+            .unwrap();
     writeln!(
         file,
         "{}",
@@ -534,7 +540,14 @@ fn a_same_size_in_place_rewrite_invalidates_a_large_native_workspace() {
     assert_eq!(plan["fidelity"]["repository_matches"], true);
     assert_eq!(
         plan["launch"]["args"],
-        json!(["--cd", ".", "resume", SESSION_ID])
+        json!([
+            "--cd",
+            ".",
+            "-c",
+            format!("sqlite_home={}", json!(root.join("codex"))),
+            "resume",
+            SESSION_ID
+        ])
     );
 }
 
@@ -882,7 +895,7 @@ fn codex_repository_matches_its_recorded_remote_and_commit() {
         "git":{"commit_hash":head,"repository_url":origin}}});
     let request = json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Synthetic request"}});
     fs::write(
-        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")),
         format!("{record}\n{request}\n"),
     )
     .unwrap();
@@ -1014,7 +1027,7 @@ fn a_relative_codex_turn_directory_cannot_identify_a_native_or_imported_workspac
     }
     let sessions = root.join("codex/sessions");
     fs::create_dir_all(&sessions).unwrap();
-    let path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let path = sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl"));
     let header =
         json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":root.join("creation")}});
     let turn = json!({"type":"turn_context","payload":{"cwd":"."}});

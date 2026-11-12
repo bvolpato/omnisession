@@ -72,6 +72,8 @@ struct RawProfile {
     label: Option<String>,
     program: Option<String>,
     #[serde(default)]
+    native_codex_target: bool,
+    #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -89,6 +91,7 @@ pub(crate) struct LaunchProfile {
     /// The built-in agent that the profile starts.
     pub(crate) agent: Provider,
     program: Option<String>,
+    native_codex_target: bool,
     args: Vec<String>,
     /// Sorted by name. Values may refer to the environment of `omni` as `${NAME}`.
     env: Vec<(String, String)>,
@@ -159,7 +162,7 @@ impl LaunchProfile {
         match &self.program {
             None => installed.contains(&self.agent),
             Some(program) => match expand(program, &environment) {
-                Ok(program) => program_exists(&program, std::env::var_os("PATH").as_deref()),
+                Ok(expanded) => self.executable(program, &expanded).is_ok(),
                 Err(_) => true,
             },
         }
@@ -178,23 +181,17 @@ impl LaunchProfile {
         if let Err(error) = self.check(&environment) {
             return Some(format!("{error:#}"));
         }
-        if self.is_runnable(installed) {
-            return None;
-        }
-        Some(match &self.program {
-            None => format!("the agent `{}` is not installed", self.agent),
-            Some(program) => format!("the program `{program}` was not found or is not executable"),
-        })
+        (self.program.is_none() && !installed.contains(&self.agent))
+            .then(|| format!("the agent `{}` is not installed", self.agent))
     }
 
-    /// Checks that every value expands, without building a launch. A run calls this before it
-    /// imports or writes anything, so a missing variable never costs a rollback.
+    /// Checks the profile values and any declared native executable before an import or launch.
     ///
     /// # Errors
     ///
-    /// Returns the error that `apply` would return.
+    /// Returns an error for invalid values or an unavailable declared native target.
     pub(crate) fn check(&self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<()> {
-        self.apply(
+        let plan = self.apply(
             LaunchPlan {
                 program: String::new(),
                 args: Vec::new(),
@@ -202,8 +199,28 @@ impl LaunchProfile {
                 env: Vec::new(),
             },
             lookup,
-        )
-        .map(drop)
+        )?;
+        if let Some(configured) = &self.program {
+            self.executable(configured, &plan.program)?;
+        }
+        Ok(())
+    }
+
+    fn executable(&self, configured: &str, expanded: &str) -> Result<PathBuf> {
+        let file = resolve_program(expanded, std::env::var_os("PATH").as_deref())
+            .ok_or_else(|| anyhow!("program `{configured}` was not found or is not executable"))?;
+        let program = std::path::absolute(&file).unwrap_or(file);
+        if self.native_codex_target {
+            let primary = crate::provider_launch::resolved_provider_binary(Provider::Codex)
+                .map_err(|_| {
+                    anyhow!("cannot find the primary Codex command for `native_codex_target`")
+                })?;
+            anyhow::ensure!(
+                crate::provider_launch::manifestless_target(&program, &primary).is_some(),
+                "`native_codex_target` requires the resolved executable of the primary Codex command"
+            );
+        }
+        Ok(program)
     }
 
     /// What the profile changes, for `--json` listings. Argument and variable values are left
@@ -215,6 +232,7 @@ impl LaunchProfile {
             "agent": self.agent,
             "program": self.program,
             "arguments": self.args.len(),
+            "native_codex_target": self.native_codex_target,
             "sets": self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             "unsets": self.unset,
         })
@@ -226,6 +244,9 @@ impl LaunchProfile {
         let mut parts = vec![format!("agent {}", self.agent)];
         if let Some(program) = &self.program {
             parts.push(format!("program {program}"));
+        }
+        if self.native_codex_target {
+            parts.push("declared native Codex target".to_owned());
         }
         if !self.args.is_empty() {
             parts.push(format!("{} argument(s)", self.args.len()));
@@ -510,11 +531,6 @@ fn resolve_program(program: &str, path: Option<&std::ffi::OsStr>) -> Option<Path
         .find(|candidate| crate::provider_launch::is_executable(candidate))
 }
 
-/// Whether `program` names an executable file, as [`resolve_program`] finds it.
-fn program_exists(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
-    resolve_program(program, path).is_some()
-}
-
 /// The agents and profiles that can start now, built-in agents first. `installed` lists the
 /// built-in agents that were found, and a profile is listed only when it can start too.
 pub(crate) fn runnable_targets(
@@ -622,13 +638,8 @@ impl AgentTarget {
     /// Returns the error of a value that cannot be expanded, or of a program that does not
     /// exist or is not executable.
     pub(crate) fn check(self) -> Result<()> {
-        match self.profile {
-            Some(profile) => {
-                profile.check(&environment)?;
-                self.own_program().map(drop)
-            }
-            None => Ok(()),
-        }
+        self.profile
+            .map_or(Ok(()), |profile| profile.check(&environment))
     }
 
     /// Whether the profile runs another program instead of the agent's own command.
@@ -636,21 +647,63 @@ impl AgentTarget {
         self.profile.is_some_and(LaunchProfile::overrides_program)
     }
 
+    /// Returns the arguments that Codex receives after an opaque wrapper consumes its own prefix.
+    pub(crate) fn codex_option_plan(
+        self,
+        plan: &LaunchPlan,
+    ) -> Result<std::borrow::Cow<'_, LaunchPlan>> {
+        if self.uses_provider_program()? {
+            return Ok(std::borrow::Cow::Borrowed(plan));
+        }
+        let prefix = self.profile.map_or(0, |profile| profile.args.len());
+        let args = plan
+            .args
+            .get(prefix..)
+            .context("missing launch profile arguments")?;
+        Ok(std::borrow::Cow::Owned(LaunchPlan {
+            program: "codex".into(),
+            args: args.to_vec(),
+            ..plan.clone()
+        }))
+    }
+
     /// Whether the profile runs the installed provider executable, including through an alias.
     pub(crate) fn uses_provider_program(self) -> Result<bool> {
         let Some(program) = self.own_program()? else {
             return Ok(true);
         };
-        if let Ok(provider) = crate::provider_launch::resolved_provider_binary(self.provider)
-            && (program == provider
-                || crate::provider_launch::same_executable(&program, &provider).with_context(
-                    || format!("checking the executable of launch profile `{self}`"),
-                )?)
+        if self
+            .profile
+            .is_some_and(|profile| profile.native_codex_target)
         {
             return Ok(true);
         }
-        Ok(self.provider == Provider::Codex
-            && crate::provider_launch::is_codex_package_entrypoint(&program))
+        let provider = crate::provider_launch::resolved_provider_binary(self.provider).ok();
+        if let Some(provider) = provider.as_deref()
+            && (program == provider
+                || (crate::provider_launch::same_invocation_name(&program, provider)
+                    && program.canonicalize().is_ok_and(|resolved| {
+                        provider.canonicalize().is_ok_and(|path| path == resolved)
+                    })))
+        {
+            return Ok(true);
+        }
+        if self.provider == Provider::Codex
+            && crate::provider_launch::is_codex_package_entrypoint(&program)
+        {
+            return Ok(true);
+        }
+        let Some(provider) = provider else {
+            return Ok(false);
+        };
+        if self.provider == Provider::Codex {
+            return Ok(
+                crate::provider_launch::is_codex_executable_copy(&program, &provider)
+                    || crate::provider_launch::is_manifestless_codex_target(&program, &provider),
+            );
+        }
+        crate::provider_launch::same_executable(&program, &provider)
+            .with_context(|| format!("checking the executable of launch profile `{self}`"))
     }
 
     /// The file that a run executes when the profile replaces the agent's command, or `None`
@@ -661,15 +714,15 @@ impl AgentTarget {
     ///
     /// Returns an error when the program does not expand, does not exist, or is not executable.
     pub(crate) fn own_program(self) -> Result<Option<PathBuf>> {
-        let Some(program) = self.profile.and_then(|profile| profile.program.as_deref()) else {
+        let Some(profile) = self.profile else {
+            return Ok(None);
+        };
+        let Some(program) = profile.program.as_deref() else {
             return Ok(None);
         };
         let expanded =
             expand(program, &environment).with_context(|| format!("profile `{self}`, program"))?;
-        let file = resolve_program(&expanded, std::env::var_os("PATH").as_deref())
-            .ok_or_else(|| anyhow!("program `{expanded}` was not found or is not executable"))?;
-        // An absolute path does not depend on the directory that the program starts in.
-        Ok(Some(std::path::absolute(&file).unwrap_or(file)))
+        profile.executable(program, &expanded).map(Some)
     }
 
     /// Adds the profile to the launch plan of the agent. A built-in agent leaves it as it is.
@@ -794,6 +847,9 @@ fn build(name: String, raw: RawProfile) -> Result<LaunchProfile> {
             raw.agent
         );
     };
+    if raw.native_codex_target && (agent != Provider::Codex || raw.program.is_none()) {
+        bail!("`native_codex_target` requires a Codex profile with a `program`");
+    }
     let label = raw.label.unwrap_or_else(|| name.clone());
     if label.is_empty()
         || label.chars().count() > MAX_LABEL_CHARACTERS
@@ -828,6 +884,7 @@ fn build(name: String, raw: RawProfile) -> Result<LaunchProfile> {
         label,
         agent,
         program: raw.program,
+        native_codex_target: raw.native_codex_target,
         args: raw.args,
         env: raw.env.into_iter().collect(),
         unset,
@@ -1224,14 +1281,9 @@ program = "/nonexistent/wrapper"
             .expect("make wrapper executable");
         // The agent itself does not have to be installed when the profile brings its own program.
         assert!(profile.is_runnable(&[]));
-        assert!(super::program_exists(
-            "sh",
-            std::env::var_os("PATH").as_deref()
-        ));
-        assert!(!super::program_exists(
-            "no-such-program-anywhere",
-            std::env::var_os("PATH").as_deref()
-        ));
+        let path = std::env::var_os("PATH");
+        assert!(super::resolve_program("sh", path.as_deref()).is_some());
+        assert!(super::resolve_program("no-such-program-anywhere", path.as_deref()).is_none());
     }
 
     #[cfg(unix)]

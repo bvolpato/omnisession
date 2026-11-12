@@ -9,7 +9,7 @@ use omnis_ir::{Provider, SessionRef};
 use omnis_store::{IndexedCodexWorkspace, IndexedSession, Store};
 use sha2::{Digest, Sha256};
 
-use super::{CodexSession, RolloutStamp};
+use super::{CodexAdapter, CodexSession, RolloutStamp};
 use crate::{NativeSession, support::paths_match};
 
 pub(super) struct WorkspaceCatalog {
@@ -46,6 +46,44 @@ impl WorkspaceCatalog {
         self.with_store(|store| store.indexed_codex_workspaces(&self.home))
             .and_then(Result::ok)
             .unwrap_or_default()
+    }
+
+    pub(super) fn indexed_sessions(&self) -> HashMap<String, IndexedSession> {
+        self.with_store(|store| store.indexed_sessions_for_provider(Provider::Codex))
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.session.id.clone(), row))
+            .collect()
+    }
+
+    pub(super) fn refresh_replaced(
+        &self,
+        adapter: &CodexAdapter,
+        raw: &CodexSession,
+        listed: &NativeSession,
+        previous: &IndexedSession,
+    ) {
+        let Some((old, selected)) = previous.source_revision.zip(raw.observed_revision) else {
+            return;
+        };
+        if old.file.is_none() || old.contents.is_none() || old.matches_file_contents(selected) {
+            return;
+        }
+        let metadata =
+            raw.indexed_workspace(listed.project_path.as_deref(), listed.git_branch.as_deref());
+        let _ = self.with_store(|store| {
+            store.refresh_replaced_codex_session(previous, &metadata, || {
+                adapter
+                    .selected_rollout(&raw.id, Some(&raw.path))
+                    .is_ok_and(|chosen| {
+                        chosen.is_some_and(|chosen| {
+                            chosen.session.path == raw.path
+                                && chosen.session.observed_revision == Some(selected)
+                        })
+                    })
+            })
+        });
     }
 
     pub(super) fn find(&self, id: &str) -> Option<IndexedCodexWorkspace> {
@@ -149,6 +187,10 @@ impl WorkspaceCatalog {
         observation: &IndexedCodexWorkspace,
         project: Option<&Path>,
     ) {
+        // A preferred copy can disappear and make this exact archived document current again.
+        if observation.source_path.as_os_str() != raw.path.as_os_str() {
+            return;
+        }
         if !cfg!(unix)
             && project.is_some_and(|project| {
                 ![
@@ -178,7 +220,7 @@ impl WorkspaceCatalog {
                 session.git_branch = None;
                 return;
             }
-        } else if observation.source_path.as_os_str() == raw.path.as_os_str() {
+        } else {
             // A size and a restored write time do not identify an in-place rewrite.
             let Ok(live) = raw.live_workspace() else {
                 session.project_path = None;
@@ -218,17 +260,7 @@ impl WorkspaceCatalog {
             if RolloutStamp::read(&raw.path) != Some(stamp) {
                 return;
             }
-            let metadata = IndexedSession {
-                source_path: None,
-                session: SessionRef::new(Provider::Codex, raw.id.clone()),
-                title: raw.title.as_deref().map(omnis_core::redact_secrets),
-                project_path: directory.map(Path::to_path_buf),
-                git_branch: branch.map(str::to_owned),
-                created_at: raw.created_at,
-                updated_at: raw.updated_at,
-                updated_at_approximate: false,
-                event_count: 0,
-            };
+            let metadata = raw.indexed_workspace(directory, branch);
             let Some(key) = Self::source_key(stamp, &raw.path, directory, branch) else {
                 return;
             };
@@ -243,5 +275,25 @@ impl WorkspaceCatalog {
                 let _ = store.forget_codex_workspace(&self.home, &raw.id, &key);
             }
         });
+    }
+}
+
+impl CodexSession {
+    fn indexed_workspace(&self, directory: Option<&Path>, branch: Option<&str>) -> IndexedSession {
+        let millis = |time: Option<chrono::DateTime<chrono::Utc>>| {
+            time.and_then(|time| chrono::DateTime::from_timestamp_millis(time.timestamp_millis()))
+        };
+        IndexedSession {
+            source_path: None,
+            session: SessionRef::new(Provider::Codex, self.id.clone()),
+            source_revision: self.observed_revision,
+            title: self.title.as_deref().map(omnis_core::redact_secrets),
+            project_path: directory.map(Path::to_path_buf),
+            git_branch: branch.map(str::to_owned),
+            created_at: millis(self.created_at),
+            updated_at: millis(self.updated_at),
+            updated_at_approximate: false,
+            event_count: 0,
+        }
     }
 }

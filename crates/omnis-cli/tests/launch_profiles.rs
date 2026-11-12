@@ -10,7 +10,7 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -799,6 +799,50 @@ OPENAI_BASE_URL = "${GATEWAY_URL:-http://127.0.0.1:9999}"
 }
 
 #[test]
+fn handoff_reports_an_override_only_for_a_different_profile_workspace() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let member = fixture.workspace.join("member");
+    let foreign = fixture.root.join("other");
+    fs::create_dir(&member).unwrap();
+    fs::create_dir(&foreign).unwrap();
+    let source = Fixture::source();
+    for (directory, matches) in [(&member, true), (&foreign, false)] {
+        fixture.write_profiles(&format!(
+            "[profiles.local]\nagent = 'codex'\nargs = ['--cd', {}]\n",
+            json!(directory)
+        ));
+        let mut args = vec!["resume", &source, "--in", "local", "--dry-run"];
+        if !matches {
+            args.push("--allow-workspace-mismatch");
+        }
+        let plan = codex_plan(&fixture, &args);
+        assert_eq!(plan["fidelity"]["repository_matches"], matches);
+        let handoff = plan["handoff"].as_str().unwrap();
+        assert_eq!(handoff.contains("Cross-Workspace Override"), !matches);
+    }
+}
+
+#[test]
+fn missing_program_reports_the_configured_expression_in_profile_listings() {
+    let expression = "${TOOL_ROOT}/codex";
+    let fixture = Fixture::new(Some(&format!(
+        "[profiles.missing]\nagent = 'codex'\nprogram = '{expression}'\n"
+    )));
+    for args in [vec!["profiles"], vec!["--json", "profiles"]] {
+        let output = fixture
+            .omni()
+            .env("TOOL_ROOT", CREDENTIAL)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_no_credential(&output);
+        let listing = String::from_utf8(output.stdout).unwrap();
+        assert!(listing.contains(&format!("program `{expression}` was not found")));
+    }
+}
+
+#[test]
 fn credential_in_an_argument_is_hidden_from_output_and_reaches_the_program() {
     // Neither variable name looks like a credential, so only the value decides what is hidden.
     let fixture = Fixture::new(Some(
@@ -1150,6 +1194,90 @@ fn codex_run(fixture: &Fixture, args: &[&str]) -> Output {
         .expect("run omni")
 }
 
+#[test]
+fn codex_fork_links_the_child_in_the_profile_working_directory() {
+    const CHILD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    for (args, destination, moved) in [
+        ("[]", "workspace", false),
+        ("['-C', 'nested']", "workspace/nested", false),
+        ("['--cd', '../fork-directory']", "fork-directory", true),
+    ] {
+        let profile = format!("[profiles.local]\nagent = 'codex'\nargs = {args}\n");
+        let fixture = fixture_with_codex_session(&profile, "openai");
+        let directory = fixture.root.join(destination);
+        fs::create_dir_all(&directory).unwrap();
+        let created = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+        for (id, cwd, parent) in [
+            (CHILD, &directory, Some(CODEX_SESSION_ID)),
+            (OTHER, &fixture.workspace, None),
+        ] {
+            let header = json!({"timestamp":created, "type":"session_meta", "payload":{
+                "id":id, "cwd":cwd, "forked_from_id":parent
+            }});
+            fs::write(
+                fixture.capture.join(format!("rollout-{id}.jsonl")),
+                header.to_string(),
+            )
+            .unwrap();
+        }
+        fixture.executable(
+            "bin/codex",
+            r#"#!/bin/sh
+case " $* " in
+    *' --version '*) echo 'codex-cli 0.167.1' ;;
+    *' fork '*) day="$CODEX_HOME/sessions/$(date -u +%Y/%m/%d)"
+                mkdir -p "$day" && mv "$CAPTURE"/rollout-*.jsonl "$day/" ;;
+esac
+"#,
+        );
+        let source = format!("codex:{CODEX_SESSION_ID}");
+        for id in [&source, &Fixture::source()] {
+            let inspected = codex_plan(&fixture, &["inspect", id, "--target", "local"]);
+            assert_eq!(inspected["repository_matches"], !moved);
+            let mut dry_run = vec!["fork", id.as_str(), "--in", "local", "--dry-run"];
+            if moved {
+                let rejected = codex_run(&fixture, &dry_run);
+                assert!(!rejected.status.success());
+                assert!(
+                    String::from_utf8_lossy(&rejected.stderr)
+                        .contains("--allow-workspace-mismatch")
+                );
+                dry_run.push("--allow-workspace-mismatch");
+            }
+            let planned = codex_plan(&fixture, &dry_run);
+            assert_eq!(planned["fidelity"]["repository_matches"], !moved);
+        }
+        let mut args = vec!["fork", &source, "--in", "local"];
+        if moved {
+            let rejected = codex_run(&fixture, &args);
+            assert!(!rejected.status.success());
+            assert!(
+                fixture
+                    .capture
+                    .join(format!("rollout-{CHILD}.jsonl"))
+                    .is_file()
+            );
+            args.push("--allow-workspace-mismatch");
+        }
+        let output = codex_run(&fixture, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+        let target: String = state
+            .query_row(
+                "SELECT target_session_id FROM handoffs WHERE source_session_id = ?1",
+                [CODEX_SESSION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target, CHILD);
+    }
+}
+
 fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
     let output = codex_run(fixture, &[&["--json"], args].concat());
     assert!(
@@ -1158,6 +1286,296 @@ fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("JSON output")
+}
+
+fn assert_codex_argv(plan: &Value, profile: &[&str], command: &str, sqlite_home: &Path) {
+    let args = strings(&plan["launch"]["args"]);
+    let (prefix, [flag, assignment, action, id]) = args
+        .split_last_chunk::<4>()
+        .expect("Codex SQLite override and continuation command");
+    assert_eq!(prefix, profile);
+    assert_eq!([*flag, *action, *id], ["-c", command, CODEX_SESSION_ID]);
+    let config: toml::Table = toml::from_str(assignment).expect("Codex configuration override");
+    assert_eq!(
+        config["sqlite_home"].as_str().unwrap(),
+        sqlite_home.to_str().unwrap()
+    );
+}
+
+const REMOTE_CODEX_ERROR: &str = "cannot verify local Codex history";
+const REMOTE_AUTH_ERROR: &str = "requires `--remote` with `--remote-auth-token-env`";
+
+fn assert_remote_codex_error(fixture: &Fixture, args: &[&str], diagnostic: &str) {
+    let output = codex_run(fixture, args);
+    assert!(!output.status.success(), "omni {args:?} succeeded");
+    assert_no_credential(&output);
+    let error = String::from_utf8_lossy(&output.stderr);
+    for text in [
+        diagnostic,
+        "`--in codex`",
+        &format!("omni handoff {}", args[1]),
+    ] {
+        assert!(error.contains(text), "{error}");
+    }
+}
+
+#[test]
+fn remote_codex_profiles_cannot_plan_a_native_resume_or_fork_of_a_local_thread() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let set_args = |args: &str| {
+        fixture.write_profiles(&format!("[profiles.routed]\nagent='codex'\nargs={args}\n"));
+    };
+    for (command, flags, diagnostic) in [
+        (
+            "resume",
+            "['--remote', 'ws://127.0.0.1:9']",
+            REMOTE_CODEX_ERROR,
+        ),
+        ("fork", "['--remote=ws://127.0.0.1:9']", REMOTE_CODEX_ERROR),
+        (
+            "resume",
+            "['--remote-auth-token-env', 'GATEWAY_TOKEN']",
+            REMOTE_AUTH_ERROR,
+        ),
+        (
+            "fork",
+            "['--remote-auth-token-env=GATEWAY_TOKEN']",
+            REMOTE_AUTH_ERROR,
+        ),
+    ] {
+        set_args(flags);
+        let mut args = vec![command, &source, "--in", "routed", "--dry-run"];
+        if command == "resume" {
+            args.push("--no-fork");
+        }
+        assert_remote_codex_error(&fixture, &args, diagnostic);
+    }
+    set_args("['--remote=ws://127.0.0.1:9']");
+    for source in [source.as_str(), &Fixture::source()] {
+        assert_remote_codex_error(
+            &fixture,
+            &["inspect", source, "--target", "routed"],
+            REMOTE_CODEX_ERROR,
+        );
+    }
+    assert_eq!(
+        codex_plan(&fixture, &["inspect", &source, "--target", "codex"])["mode"],
+        "native_resume"
+    );
+    let args = ["fork", &source, "--in", "routed", "--dry-run"];
+    fixture.write_profiles("[profiles.routed]\nagent='codex'\nprogram='codex'\nargs=['--', '--remote', 'ws://127.0.0.1:9']\n");
+    let invalid = codex_run(&fixture, &args);
+    assert!(!invalid.status.success());
+    let error = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        error.contains("before the Codex continuation command"),
+        "{error}"
+    );
+    set_args(
+        r#"['-c','model_provider=remote-gateway','-c','model_providers.remote-gateway.name="--remote"']"#,
+    );
+    let fork = codex_plan(&fixture, &args);
+    assert_eq!(fork["fidelity"]["mode"], "native_fork");
+}
+
+#[test]
+fn remote_codex_materialization_stops_before_the_local_importer_runs() {
+    let profile = "[profiles.routed]\nagent='codex'\nargs=['--remote=ws://127.0.0.1:9']\n";
+    let fixture = fixture_with_codex_session(profile, "openai");
+    let version_probe = r#"#!/bin/sh
+case "$1" in
+    ''|--help) ;;
+    --version) echo 'codex-cli 0.167.1' ;;
+    *) touch "$CAPTURE/codex-action"; exit 1 ;;
+esac
+"#;
+    fixture.executable("bin/codex", version_probe);
+    let sessions = fixture.root.join("codex/sessions");
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::rename(&sessions, &archive).unwrap();
+    let path = archive.join(format!(
+        "rollout-2026-01-01T00-00-00-{CODEX_SESSION_ID}.jsonl"
+    ));
+    let header = fs::read_to_string(&path).unwrap();
+    let message = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep this draft"}]}});
+    let original = format!("{header}\n{message}\n");
+    fs::write(&path, &original).unwrap();
+
+    for source in [format!("codex:{CODEX_SESSION_ID}"), Fixture::source()] {
+        let args = ["fork", &source, "--in", "routed", "--materialize-only"];
+        assert_remote_codex_error(&fixture, &args, REMOTE_CODEX_ERROR);
+    }
+    assert!(!fixture.capture.join("codex-action").exists());
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+fn add_rollout_databases(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    fixture.executable("bin/codex", "#!/bin/sh\necho 'codex-cli 0.167.1'\n");
+    let home = fixture.root.join("codex");
+    let alternate = fixture
+        .root
+        .join("SQLite home 雪 \"branches\" \\state\u{7f}");
+    fs::create_dir(&alternate).unwrap();
+    let file = |day| {
+        home.join("sessions").join(format!(
+            "rollout-2026-01-{day:02}T00-00-00-{CODEX_SESSION_ID}.jsonl"
+        ))
+    };
+    let selected = file(1);
+    let other = file(2);
+    let header = fs::read_to_string(&selected).unwrap();
+    for (path, text) in [
+        (&selected, "Keep the visible draft"),
+        (&other, "Other branch"),
+    ] {
+        let row = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]}});
+        fs::write(path, format!("{header}\n{row}\n")).unwrap();
+    }
+    for directory in [&home, &alternate] {
+        let db = rusqlite::Connection::open(directory.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+            (CODEX_SESSION_ID, selected.to_str().unwrap()),
+        )
+        .unwrap();
+    }
+    (alternate, other)
+}
+
+fn select_alternate_rollout(alternate: &std::path::Path, other: &std::path::Path) {
+    rusqlite::Connection::open(alternate.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [other.to_str().unwrap()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn codex_launch_profile_checks_the_generation_selected_by_its_effective_config() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let (alternate, other) = add_rollout_databases(&fixture);
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let fork = ["fork", &source, "--in", "routed", "--dry-run"];
+    let original = [
+        "resume",
+        &source,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--dry-run",
+    ];
+    let alternate_toml = json!(alternate).to_string().replace('\u{7f}', "\\u007F");
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\n[profiles.routed.env]\nCODEX_SQLITE_HOME = {alternate_toml}\n"
+    ));
+
+    let plan = codex_plan(&fixture, &fork);
+    assert_eq!(plan["fidelity"]["mode"], "native_fork");
+    assert_codex_argv(&plan, &[], "fork", &alternate);
+    select_alternate_rollout(&alternate, &other);
+    let check_declined = |args: &[&str]| {
+        let output = codex_run(&fixture, args);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("different or unverified rollout"), "{error}");
+        assert!(error.contains(&format!("omni handoff {source}")), "{error}");
+    };
+    check_declined(&fork);
+    check_declined(&original);
+
+    fs::write(
+        fixture.root.join("codex/work.config.toml"),
+        format!("sqlite_home = {alternate_toml}\n"),
+    )
+    .unwrap();
+    fixture.write_profiles("[profiles.routed]\nagent = 'codex'\nargs = ['--profile', 'work']\n");
+    check_declined(&fork);
+
+    let nested = fixture.workspace.join("subdirectory");
+    fs::create_dir(&nested).unwrap();
+    fs::write(fixture.workspace.join("fixture-root"), "").unwrap();
+    fs::write(
+        fixture.root.join("codex/config.toml"),
+        format!(
+            "project_root_markers = ['fixture-root']\n[projects.{}]\ntrust_level = 'trusted'\n",
+            json!(fixture.workspace)
+        ),
+    )
+    .unwrap();
+    let config = fixture.workspace.join(".codex");
+    fs::create_dir(&config).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        format!("sqlite_home = {alternate_toml}\n"),
+    )
+    .unwrap();
+    for (assignment, can_launch) in [
+        ("project_root_markers=[]", false),
+        (r#"project_root_markers=["fixture-root"]"#, true),
+        ("projects={}", false),
+        ("model=gpt-5", true),
+    ] {
+        let args = json!(["--cd", nested, "-c", assignment]);
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nargs = {args}\n"
+        ));
+        if can_launch {
+            assert_eq!(
+                codex_plan(&fixture, &fork)["fidelity"]["mode"],
+                "native_fork",
+                "{assignment}"
+            );
+        } else {
+            check_declined(&fork);
+        }
+    }
+}
+
+#[test]
+fn codex_resume_keeps_wrapper_configuration_arguments_opaque() {
+    let fixture = fixture_with_codex_session(
+        "[profiles.selected]\nagent = 'codex'\nprogram = '${ROOT}/bin/wrapper'\nargs = ['-c', 'production', '--remote', 'origin']\n",
+        "openai",
+    );
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let inspected = codex_plan(&fixture, &["inspect", &source, "--target", "selected"]);
+    assert_eq!(inspected["mode"], "native_resume");
+    let fork = codex_plan(
+        &fixture,
+        &["fork", &source, "--in", "selected", "--dry-run"],
+    );
+    for report in [&inspected, &fork["fidelity"]] {
+        let entries = report["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|entry| entry["status"] != "preserved"));
+        assert!(entries.iter().any(|entry| {
+            entry["feature"] == "Wrapper destination verification"
+                && entry["status"] == "unsupported"
+        }));
+    }
+    let output = codex_run(
+        &fixture,
+        &["resume", &source, "--in", "selected", "--no-fork"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = fixture.captured("args");
+    let args: Vec<_> = captured.split_terminator('\0').collect();
+    assert!(args.starts_with(&["-c", "production", "--remote", "origin"]));
+    assert!(
+        args.windows(2)
+            .any(|a| a[0] == "-c" && a[1].starts_with("sqlite_home="))
+    );
+    assert!(args.ends_with(&["resume", CODEX_SESSION_ID]));
 }
 
 #[test]
@@ -1173,7 +1591,7 @@ fn codex_workspace_flags_follow_the_selected_executable() {
     for (program, is_native) in [
         (std::path::Path::new("codex"), true),
         (native.as_path(), true),
-        (alias.as_path(), true),
+        (alias.as_path(), false),
         (fixture.root.join("bin/wrapper").as_path(), false),
     ] {
         fixture.write_profiles(&format!(
@@ -1200,6 +1618,169 @@ fn codex_workspace_flags_follow_the_selected_executable() {
             assert_eq!(allowed["fidelity"]["repository_matches"], false);
         }
     }
+}
+
+#[test]
+fn copied_native_codex_rejects_remote_continuations_before_launch() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let primary = fixture.root.join("bin/codex");
+    let copy = fixture.root.join("off-path");
+    fs::copy("/usr/bin/true", &primary).unwrap();
+    fs::write(
+        fixture.root.join("codex-package.json"),
+        r#"{"layoutVersion":1,"variant":"codex","entrypoint":"bin/codex"}"#,
+    )
+    .unwrap();
+    fs::copy(&primary, &copy).unwrap();
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+        json!(copy)
+    ));
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    for args in [
+        vec!["inspect", &source, "--target", "routed"],
+        vec!["resume", &source, "--in", "routed", "--no-fork"],
+    ] {
+        assert_remote_codex_error(&fixture, &args, REMOTE_CODEX_ERROR);
+    }
+}
+
+#[test]
+fn multicall_copies_and_links_keep_their_own_profile_arguments() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let primary = fixture.root.join("bin/codex");
+    fs::copy("/usr/bin/true", &primary).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let copy = fixture.root.join("copy");
+    let hardlink = fixture.root.join("hardlink");
+    let symlink = fixture.root.join("symlink");
+    fs::copy(&primary, &copy).unwrap();
+    fs::hard_link(&primary, &hardlink).unwrap();
+    std::os::unix::fs::symlink(&primary, &symlink).unwrap();
+    let visible = fixture.root.join("visible-bin");
+    std::os::unix::fs::symlink(primary.parent().unwrap(), &visible).unwrap();
+    let linked_bin = fixture.root.join("linked-bin");
+    fs::create_dir(&linked_bin).unwrap();
+    let linked_command = linked_bin.join("codex");
+    std::os::unix::fs::symlink(&primary, &linked_command).unwrap();
+    let dispatcher = fixture.root.join("multicall");
+    fs::copy(&primary, &dispatcher).unwrap();
+    let shims = fixture.root.join("shims");
+    fs::create_dir(&shims).unwrap();
+    let shim = shims.join("codex");
+    std::os::unix::fs::symlink(&dispatcher, &shim).unwrap();
+    for route in [visible.join("codex"), linked_command, shim.clone()] {
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+            json!(route)
+        ));
+        for args in [
+            vec!["inspect", &source, "--target", "routed"],
+            vec!["resume", &source, "--in", "routed", "--no-fork"],
+        ] {
+            let run = fixture
+                .omni()
+                .env("OMNI_CODEX_BIN", &route)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!run.status.success());
+            assert!(String::from_utf8_lossy(&run.stderr).contains(REMOTE_CODEX_ERROR));
+        }
+    }
+    for (route, provider) in [
+        (copy, &primary),
+        (hardlink, &primary),
+        (symlink, &primary),
+        (dispatcher, &shim),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+            json!(route)
+        ));
+        let run = |args: &[&str]| {
+            fixture
+                .omni()
+                .env("OMNI_CODEX_BIN", provider)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let inspect = run(&["--json", "inspect", &source, "--target", "routed"]);
+        assert!(
+            inspect.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        let report: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+        assert!(
+            report["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |entry| entry["feature"] == "Wrapper destination verification"
+                        && entry["status"] == "unsupported"
+                )
+        );
+        let run = run(&["resume", &source, "--in", "routed", "--no-fork"]);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn declared_native_codex_target_must_resolve_to_the_primary_binary() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let native = fixture.root.join("unknown-release");
+    fs::copy("/usr/bin/true", &native).unwrap();
+    let primary = fixture.root.join("bin/codex");
+    fs::remove_file(&primary).unwrap();
+    std::os::unix::fs::symlink(&native, &primary).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let linked = fixture.root.join("bin/unknown-release");
+    fs::hard_link(&native, &linked).unwrap();
+    for (program, diagnostic) in [
+        (native.clone(), REMOTE_CODEX_ERROR),
+        (linked.clone(), REMOTE_CODEX_ERROR),
+        (
+            fixture.root.join("bin/wrapper"),
+            "requires the resolved executable",
+        ),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nprogram = {}\nnative_codex_target = true\nargs = ['--remote', 'origin']\n",
+            json!(program)
+        ));
+        let listing = codex_plan(&fixture, &["profiles"]);
+        assert_eq!(
+            listing["profiles"][0]["ready"],
+            diagnostic == REMOTE_CODEX_ERROR
+        );
+        let output = codex_run(
+            &fixture,
+            &["resume", &source, "--in", "routed", "--no-fork"],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+    }
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\nprogram = {}\nnative_codex_target = true\n",
+        json!(linked)
+    ));
+    fs::remove_file(&native).unwrap();
+    fs::copy("/usr/bin/true", &native).unwrap();
+    let listing = codex_plan(&fixture, &["profiles"]);
+    assert_eq!(listing["profiles"][0]["ready"], false);
+    assert!(
+        listing["profiles"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("requires the resolved executable")
+    );
 }
 
 #[test]
@@ -1273,9 +1854,12 @@ fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
 
     let plan = codex_plan(&fixture, &["resume", &source, "--dry-run"]);
     assert_eq!(plan["profile"], "codex-gateway");
-    assert_eq!(
-        strings(&plan["launch"]["args"]),
-        ["-c", "model_provider=gateway", "resume", CODEX_SESSION_ID]
+    let sqlite_home = fixture.root.join("codex");
+    assert_codex_argv(
+        &plan,
+        &["-c", "model_provider=gateway"],
+        "resume",
+        &sqlite_home,
     );
 
     // A target that the user names always wins.
@@ -1284,10 +1868,7 @@ fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
         &["resume", &source, "--in", "codex", "--no-fork", "--dry-run"],
     );
     assert_eq!(plan["profile"], Value::Null);
-    assert_eq!(
-        strings(&plan["launch"]["args"]),
-        ["resume", CODEX_SESSION_ID]
-    );
+    assert_codex_argv(&plan, &[], "resume", &sqlite_home);
 }
 
 #[test]
@@ -1308,9 +1889,10 @@ exec synthetic-runtime "$@"
         "bin/synthetic-runtime",
         &format!(
             r#"#!/bin/sh
-case "$1" in
-    --help|--version) exit 0 ;;
-    resume) [ "$2" = "{CODEX_SESSION_ID}" ] ;;
+if [ "$1" = --cd ] && [ "$2" = . ]; then shift 2; fi
+case "$1:$2:$3" in
+    --help:*|--version:*) exit 0 ;;
+    -c:sqlite_home=*:resume) [ "$#" = 4 ] && [ "$4" = "{CODEX_SESSION_ID}" ] ;;
     *) exit 2 ;;
 esac
 "#

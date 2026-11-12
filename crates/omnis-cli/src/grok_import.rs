@@ -415,7 +415,8 @@ impl GrokServer {
         );
         #[cfg(debug_assertions)]
         if std::env::var_os("GROK_LOG_FILE").is_some_and(|value| !value.is_empty()) {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "Grok ACP initialize diagnostic: elapsed_ms={}, success={}",
                 started.elapsed().as_millis(),
                 result.is_ok()

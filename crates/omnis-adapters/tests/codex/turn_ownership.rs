@@ -29,7 +29,7 @@ fn a_late_item_before_the_next_request_belongs_to_its_named_turn() {
     let command = turn_item(
         "first",
         &json!({"type":"CommandExecution","id":"cmd",
-        "command":["example"],"status":"completed","aggregated_output":"late result"}),
+        "command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"late result"}),
     );
     for start in [
         event("task_started", json!({"turn_id":"second"})),

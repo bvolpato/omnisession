@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::rollout_lines::{Admission, OrdinalGap, RolloutLines, Wire};
-use super::{CodexHistory, CodexSession, EventBuilder, RolloutStamp, declares_history_base};
+use super::{CodexHistory, CodexSession, EventBuilder, records_history_base};
+use crate::source_file::ObservedSourceFile;
 use crate::support::{
     JsonLineLocation, JsonlRecord, MAX_PREVIEW_EDGE_BYTES, MAX_PROVIDER_RECORDS,
     MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, read_json_line_at, string_at,
@@ -20,28 +21,56 @@ use crate::support::{
 };
 
 pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder> {
+    let canonical = session.path.canonicalize()?;
     let mut reader = BufReader::new(File::open(&session.path)?);
-    let metadata = reader.get_ref().metadata()?;
-    let stamp = RolloutStamp::new(&metadata);
+    let Some(observed) = ObservedSourceFile::from_open_file(
+        &canonical,
+        reader.get_ref(),
+        &reader.get_ref().metadata()?,
+    )
+    .filter(|source| {
+        source.revision.contents.is_some() && Some(source.revision) == session.observed_revision
+    }) else {
+        return Ok(unavailable(session, None));
+    };
+    let builder = project(session, &mut reader, limit)?;
+    if observed
+        .ensure_unchanged(&canonical, &session.path, reader.get_ref())
+        .is_err()
+    {
+        return Ok(unavailable(session, None));
+    }
+    Ok(builder)
+}
+
+fn project(
+    session: &CodexSession,
+    reader: &mut BufReader<File>,
+    limit: usize,
+) -> Result<EventBuilder> {
     let mut lines = RolloutLines::default();
     let mut source_index = 0;
     let mut inherited = false;
     let mut remaining = 4 * MAX_PREVIEW_EDGE_BYTES;
     let mut history = CodexHistory::new(session.project_path.clone());
     history.paginated = true;
+    history.items.tool_projection.paginated = true;
     let mut exact = Some((history, session.event_builder()));
     let mut independent = Some(IndependentItems::default());
     let source_bytes = session.id.len() + session.cli_version.as_ref().map_or(0, String::len);
 
     let oversized = visit_streamed_json_records_with_offsets(
-        &mut reader,
+        reader,
         MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
         |loc, line| {
+            let active_lines = exact
+                .as_mut()
+                .map_or(&mut lines, |(history, _)| &mut history.rollout_lines);
             let (mut record, terminated) = match line {
                 JsonlRecord::Complete(record) => (record, true),
                 JsonlRecord::Unterminated(record) => (record, false),
                 JsonlRecord::Malformed => {
-                    lines.malformed();
+                    active_lines.malformed();
                     return Ok(());
                 }
             };
@@ -55,14 +84,14 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
                             == Some(session.id.as_str()),
                     "selected Codex rollout has a different session header"
                 );
-                inherited = declares_history_base(&record);
+                inherited = records_history_base(&record);
                 if inherited {
                     independent = None;
                 }
-                lines.start_segment(&record);
+                active_lines.start_segment(&record);
             }
 
-            let admission = lines.prepare(&mut record, terminated, Some(true));
+            let admission = active_lines.prepare(&mut record, terminated, Some(true));
             if admission == Admission::Skip {
                 return Ok(());
             }
@@ -82,6 +111,7 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
                     &mut remaining,
                 )?
             {
+                lines = std::mem::take(&mut history.rollout_lines);
                 exact = None;
             }
             Ok(())
@@ -89,9 +119,9 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
     )?;
 
     let builder = if oversized > 0 {
+        let lines = exact.map_or(lines, |(history, _)| history.rollout_lines);
         unavailable(session, Some(lines))
     } else if let Some((mut history, mut builder)) = exact {
-        history.rollout_lines = lines;
         history.source_ordinal = source_index;
         history.compact(&mut builder);
         if inherited {
@@ -104,16 +134,10 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
         retain_edges(session, &mut builder, limit, source_bytes);
         builder
     } else if let Some(items) = independent {
-        items.preview(session, &mut reader, limit, lines, source_index)?
+        items.preview(session, reader, limit, lines, source_index)?
     } else {
         unavailable(session, Some(lines))
     };
-    if stamp.is_none()
-        || RolloutStamp::new(&reader.get_ref().metadata()?) != stamp
-        || RolloutStamp::read(&session.path) != stamp
-    {
-        return Ok(unavailable(session, None));
-    }
     Ok(builder)
 }
 
@@ -164,7 +188,8 @@ fn project_within_budget(
             && admission == Admission::ModelOnly);
     if !opaque {
         let directory = history
-            .project_path
+            .workspace
+            .path
             .as_deref()
             .map_or(0, |p| p.as_os_str().len());
         let copies = record["payload"]["replacement_history"]
@@ -178,6 +203,8 @@ fn project_within_budget(
         *remaining = budget;
     }
     let before = builder.checkpoint();
+    history.records_seen = usize::try_from(index)? + 1;
+    history.last_rollback_boundary = None;
     history.source_ordinal = index;
     history.push_admitted(builder, record, admission)?;
     let events = builder.events();
@@ -250,7 +277,7 @@ impl IndependentItems {
             return true;
         }
         match (record["type"].as_str(), p["type"].as_str()) {
-            (Some("session_meta"), _) => location.offset == 0 && !declares_history_base(record),
+            (Some("session_meta"), _) => location.offset == 0 && !records_history_base(record),
             (Some("progress" | "turn_context" | "inter_agent_communication"), _)
             | (Some("response_item"), Some("message" | "agent_message"))
             | (
@@ -296,7 +323,7 @@ impl IndependentItems {
         session: &CodexSession,
         reader: &mut BufReader<File>,
         limit: usize,
-        lines: RolloutLines,
+        mut lines: RolloutLines,
         end: u64,
     ) -> Result<EventBuilder> {
         let selected = select_edges(&self.items, limit, |item| item.bytes);
@@ -305,6 +332,8 @@ impl IndependentItems {
         let mut builder = session.event_builder();
         let mut history = CodexHistory::new(None);
         history.paginated = true;
+        history.items.tool_projection.paginated = true;
+        lines.finish_segment();
         let reported_loss = lines.invalid_messages > 0
             || lines.invalid_checkpoints > 0
             || lines.skipped > 0
@@ -418,10 +447,10 @@ mod tests {
             )
             .unwrap();
             drop(file);
-            let session = CodexSession::parse_metadata_path_result(&path)
+            let session = CodexSession::parse_observed_metadata(&path)
                 .expect("read the rollout fixture")
                 .expect("parse the session metadata");
-            let builder = session.preview_events().unwrap();
+            let builder = session.preview_paginated_events().unwrap();
             let events = builder.events();
             let messages: Vec<_> = events
                 .iter()

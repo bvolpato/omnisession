@@ -428,12 +428,17 @@ pub(super) struct ConfirmedPiFile {
     pub(super) directory: PathBuf,
     pub(super) path: PathBuf,
     pub(super) revision: omnis_adapters::TranscriptRevision,
+    pub(super) object: uuid::Uuid,
 }
 
 impl ConfirmedPiFile {
     pub(super) fn capture(session: &SessionRef, path: &Path, directory: &Path) -> Result<Self> {
         let revision = omnis_adapters::TranscriptRevision::read(path)?;
+        let object = omnis_adapters::source_file_revision(path)
+            .and_then(|r| r.file)
+            .context("the selected Pi file cannot be identified")?;
         let confirmed = Self {
+            object,
             session: session.clone(),
             path: path.to_owned(),
             directory: directory.to_owned(),
@@ -450,7 +455,9 @@ impl ConfirmedPiFile {
             self.session.provider == Provider::Pi
                 && self.session.id == id
                 && self.directory.as_os_str() == directory.as_os_str()
-                && self.revision == omnis_adapters::TranscriptRevision::read(&self.path)?,
+                && self.revision == omnis_adapters::TranscriptRevision::read(&self.path)?
+                && omnis_adapters::source_file_revision(&self.path).and_then(|r| r.file)
+                    == Some(self.object),
             "the selected Pi transcript changed; select it again"
         );
         Ok(())

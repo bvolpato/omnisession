@@ -88,7 +88,7 @@ impl CheckpointTurns {
                 }
                 Some("user_message") => Marker::Input,
                 Some("thread_rolled_back") => {
-                    let count = payload["num_turns"].as_u64().unwrap_or(0);
+                    let count = super::super::rollout_lines::rollback_turns(payload).unwrap_or(0);
                     if count == 0 {
                         return;
                     }

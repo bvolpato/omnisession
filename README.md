@@ -78,7 +78,7 @@ omni inspect <session> --target grok   # what gets preserved, summarized, or omi
 
 - **Run `omni`.** Sessions from every installed agent appear in one list, current workspace first. Related sessions stay grouped as a tree across agents.
 - **Fuzzy and full-text.** Titles, folders, branches, and IDs match fuzzily as you type. Conversation text matches come from a local, redacted full-text index. Quoted text matches exactly.
-- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index.
+- **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index. The next index refresh picks up a restored Codex file even if its modification time stays the same or moves backward.
 - **Scriptable.** `omni search` works without the picker, and `--json` returns structured results.
 
 ```sh
@@ -232,9 +232,11 @@ omni
 
 The mouse works too: click selects, double-click opens, and the wheel scrolls.
 
-While the picker is open, it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MiB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
+While the picker is open, it indexes conversation text in the background and shows progress in the header. It usually reads transcripts up to 16 MiB in full. It samples the beginning and end when a transcript exceeds the byte budget or the provider’s full-read limit. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
 
-Unreadable sessions are skipped by later index runs until their source changes; `omni index --retry-failed` reads them again.
+If a session remains unreadable, later index runs skip it until its source changes. Use `omni index --retry-failed` to try again. If an in-place restore preserves the operating system's file identity, size, and all available timestamps, use `omni show codex:<id>` to read the contents and refresh the cached text and workspace. This can apply to same-size restores on Windows that preserve the write time.
+
+If a Codex session changed directories, a full read records the workspace of its latest surviving turn. The picker, project listings, and search use that workspace until the rollout changes. When a rollback removes the request that supplied a search title, indexing can retire the title even when the fork's parent is unavailable. After an upgrade, live indexing checks older entries. If it cannot verify the previous search text for a large rollout, it keeps the usual head and tail. Use `omni show codex:<id>` to index the full rollout. `omni search --cached` uses the previously saved data.
 
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 
@@ -245,6 +247,8 @@ omni list --provider codex
 omni list --all-projects --provider codex
 ```
 
+If you name a thread in the Codex app, the picker shows that name above the conversation preview. `omni list --provider codex` also shows the name, and `omni --json list --provider codex` includes it in the `title` field.
+
 ### Search
 
 ```sh
@@ -254,7 +258,7 @@ omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
 ```
 
-- Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
+- Each run first indexes changed sessions in the current project. Use `--all-projects` to search every workspace. A live project search also checks recent Codex sessions that may have moved from another directory. It reports incomplete coverage if it reaches the scan limit. Run `omni index --provider codex` to index across workspaces. `--no-index` uses the existing search index.
 - `--cached` skips provider stores entirely: it searches the cached session list and the existing index, so results can include sessions changed or deleted since the last refresh. Run `omni index` to refresh.
 - The picker and search redact session titles before caching them. After an upgrade, the CLI also redacts titles saved by older pickers when it first opens the index.
 - A partial provider refresh keeps unobserved sessions available in the picker and cached search. Before resuming a cached native session, the picker checks its current workspace by session ID. If the provider reports that the session moved, you can select it again in its new location. For Claude, the picker also checks the selected transcript after a live refresh because the history index can still name a previous workspace.
@@ -283,9 +287,11 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
 - Transfers across different workspace roots require `--allow-workspace-mismatch`. If the old worktree has moved, this flag also lets an explicit native fork or resume use the current workspace.
 
-If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
+If an import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. This also applies to same-agent forks that OmniSession creates by importing a new session. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. For Pi and Oh My Pi, it includes earlier turns on the selected branch. An Oh My Pi `/clear` starts a new task and keeps the preceding task out of its handoff. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
 
-If a native cross-agent import fails and its target may still exist or appear later, OmniSession prints the path to a private handoff. If it reports a target session ID, check that session before retrying. You can give the saved path to the next agent when you continue manually.
+If a Codex source has no verified working directory, run the fork again from the directory where you want to continue and pass `--allow-workspace-mismatch`. This also applies when the new session opens in another agent.
+
+If a native cross-agent import or a Codex archive restore fails and its target may still exist or appear later, OmniSession keeps the private handoff and prints its path. A surviving session can still open the file linked in its imported history. If OmniSession reports a target session ID, check that session before retrying. You can also give the saved path to the next agent when you continue manually.
 
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
 

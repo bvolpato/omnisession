@@ -42,16 +42,20 @@ pub(super) struct ToolId {
     turn: Option<[u8; 32]>,
     id: [u8; 32],
     generated_turn: bool,
+    empty: bool,
 }
 
 impl ToolId {
     pub(super) fn new(turn: Option<&str>, id: &str) -> Option<Self> {
-        (!id.is_empty()).then(|| Self {
-            turn: turn
-                .filter(|s| !s.is_empty())
-                .map(|s| Sha256::digest(s.as_bytes()).into()),
+        let turn = turn.filter(|s| !s.is_empty());
+        if id.is_empty() && turn.is_none_or(super::is_implicit_turn) {
+            return None;
+        }
+        Some(Self {
+            turn: turn.map(|s| Sha256::digest(s.as_bytes()).into()),
             id: Sha256::digest(id.as_bytes()).into(),
             generated_turn: turn.is_some_and(super::is_implicit_turn),
+            empty: id.is_empty(),
         })
     }
 
@@ -423,7 +427,11 @@ impl PaginatedAnswers {
             }
         }
         let tool = ModelTool {
-            digest: checkpoint_tools::source_digest(record, stored.is_some()),
+            digest: checkpoint_tools::source_digest(
+                record,
+                stored.is_some(),
+                key.is_some_and(|key| key.turn.is_some() && !key.generated_turn),
+            ),
             position: Position::new(record, ordinal),
             call: call.or_else(|| stored?.call),
             key,
@@ -443,6 +451,16 @@ impl PaginatedAnswers {
             .key?
             .scoped(aliases)
             .map(|(_, turn, _)| turn)
+    }
+
+    pub(super) fn move_tool_display(&mut self, from: u64, to: u64) {
+        if let Some(display) = self.tool_displays.remove(&from) {
+            self.tool_displays.insert(to, display);
+        }
+    }
+
+    pub(super) fn forget_tool_display(&mut self, sequence: u64) {
+        self.tool_displays.remove(&sequence);
     }
 
     pub(super) fn display_tool(
@@ -479,6 +497,9 @@ impl PaginatedAnswers {
     }
 
     fn call_withdrawal(&self, key: ToolId) -> Option<Withdrawal> {
+        if key.empty {
+            return None;
+        }
         let exact = key
             .scoped(&self.aliases)
             .and_then(|k| self.removed_calls.get(&k));

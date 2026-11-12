@@ -637,7 +637,7 @@ fn rollback_uses_native_call_acceptance_and_keeps_orphaned_receipts_in_recovery(
         ("custom_tool_call", 2, false, true, true, false),
     ] {
         let call = json!({"type":"response_item","metadata":{"user_input_order":order,"inherited_user_message":inherited},
-            "payload":{"type":kind,"call_id":"cmd","name":"fixture_lookup","arguments":"{}","input":"fixture"}});
+            "payload":{"type":kind,"call_id":"cmd","name":"exec_command","arguments":json!({"cmd":"fixture_lookup"}).to_string(),"input":"fixture"}});
         let receipt = json!({"type":"response_item","metadata":{"user_input_order":5},
             "payload":{"type":format!("{kind}_output"),"call_id":"cmd","output":"original receipt"}});
         let mut queued = model("running", "u2", "user", "queued request");
@@ -655,7 +655,7 @@ fn rollback_uses_native_call_acceptance_and_keeps_orphaned_receipts_in_recovery(
         if late_receipt {
             rows.push(receipt);
         }
-        rows.extend([rollback(), turn_item("running", &json!({"type":"CommandExecution","id":"cmd","status":"completed","aggregated_output":"later display"}))]);
+        rows.extend([rollback(), turn_item("running", &json!({"type":"CommandExecution","id":"cmd","command":["fixture_lookup"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"later display"}))]);
         for preview in [false, true] {
             let snapshot =
                 read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
@@ -696,7 +696,7 @@ fn a_late_display_uses_the_function_calls_scope_and_keeps_uncertain_matches_in_r
             rollback(),
             turn_item(
                 display_turn,
-                &json!({"type":"CommandExecution","id":"cmd","status":"completed","aggregated_output":"late displayed receipt"}),
+                &json!({"type":"CommandExecution","id":"cmd","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"late displayed receipt"}),
             ),
         ];
         let snapshot = read_with_history_mode(rows, false, Some("paginated")).unwrap();
@@ -768,7 +768,7 @@ fn reused_call_ids_with_unproven_turn_aliases_leave_the_display_unverified() {
         rollback(),
         turn_item(
             "named",
-            &json!({"type":"CommandExecution","id":"reused","status":"completed","aggregated_output":"ambiguous receipt"}),
+            &json!({"type":"CommandExecution","id":"reused","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"ambiguous receipt"}),
         ),
     ];
     let snapshot = read_with_history_mode(rows, false, Some("paginated")).unwrap();

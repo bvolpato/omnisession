@@ -6,37 +6,49 @@ use serde_json::{Map, Value, json};
 use super::{checkpoint_wire, compact_tool_value};
 
 pub(super) mod assistant;
+mod command;
+mod documentary;
 mod positional;
+mod private;
+mod receipts;
 
-pub(super) fn prepare_record(record: &mut Value) -> bool {
-    match record["type"].as_str() {
-        Some("response_item") => {
-            return checkpoint_wire::prepare_response_output(&mut record["payload"]);
-        }
-        Some("compacted") => {
-            for field in ["replacement_history", "guardian_history"] {
-                if let Some(items) = record["payload"]
-                    .get_mut(field)
-                    .and_then(Value::as_array_mut)
-                {
-                    for item in items {
-                        checkpoint_wire::prepare_response_output(item);
-                    }
-                }
-            }
-            return true;
-        }
-        Some("event_msg") => {}
-        _ => return true,
-    }
-    if !positional::prepare_container(record) {
+pub(super) use receipts::{
+    ShellSources, annotate_model_receipt, clear_source_receipt, deferred_model_receipt,
+    equivalent_model_receipt, model_body, model_output_matcher, pending_command_output_matches,
+    pending_shell_agrees, pending_shell_conflicts, shell_output_conflicts, with_source_receipt,
+};
+mod status;
+
+pub(super) fn prepare_event(payload: &mut Value) -> bool {
+    if !positional::prepare_container(payload) {
         return false;
     }
-    if record["payload"]["type"] != "item_completed" {
+    if payload["type"] != "item_completed" {
         return true;
     }
-    let payload = &mut record["payload"];
     let item = &payload["item"];
+    match item
+        .get("type")
+        .or_else(|| item.get(0))
+        .and_then(Value::as_str)
+    {
+        Some(
+            "ContextCompaction" | "HookPrompt" | "Reasoning" | "SubAgentActivity"
+            | "EnteredReviewMode" | "ExitedReviewMode",
+        ) => {
+            return valid_envelope(payload) && private::prepare(&mut payload["item"]);
+        }
+        Some("CommandExecution") => {
+            return valid_envelope(payload) && command::prepare(&mut payload["item"]);
+        }
+        Some("WebSearch" | "ImageView" | "ImageGeneration" | "Extension") => {
+            return valid_envelope(payload) && documentary::prepare(&mut payload["item"]);
+        }
+        Some("DynamicToolCall" | "McpToolCall" | "CollabAgentToolCall" | "FileChange") => {
+            return valid_envelope(payload) && status::prepare(&mut payload["item"]);
+        }
+        _ => {}
+    }
     match item["type"].as_str() {
         Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput")
             if !valid_envelope(payload) || !item["id"].is_string() =>
@@ -44,15 +56,21 @@ pub(super) fn prepare_record(record: &mut Value) -> bool {
             false
         }
         Some("UserMessage") => prepare_user_message(&mut payload["item"]),
-        Some("AgentMessage") => assistant::valid(item),
+        Some("AgentMessage") => {
+            let item = &mut payload["item"];
+            item.get_mut("content")
+                .and_then(Value::as_array_mut)
+                .is_some_and(|parts| parts.iter_mut().all(positional::assistant_content))
+                && assistant::prepare_metadata(item)
+                && assistant::valid(item)
+        }
         Some("Plan") => item["text"].is_string(),
         Some("FunctionCallOutput") => {
             item["name"].is_string()
                 && checkpoint_wire::optional(&item["namespace"], Value::is_string)
-                && payload["item"].get_mut("output").is_some_and(|output| {
-                    checkpoint_wire::normalize_output(output);
-                    checkpoint_wire::output(output)
-                })
+                && payload["item"]
+                    .get_mut("output")
+                    .is_some_and(checkpoint_wire::prepare_output)
         }
         _ => true,
     }
@@ -80,18 +98,11 @@ fn prepare_user_message(item: &mut Value) -> bool {
 
 // Codex decodes the whole UserInput list before publishing its item.
 fn user_input(part: &mut Value) -> bool {
-    // Serde also accepts a tagged text sequence. Give downstream mirror and rollback checks the same named fields.
-    if let Value::Array(fields) = part {
-        if !(2..=3).contains(&fields.len()) || fields[0] != "text" {
-            return false;
-        }
-        let keys = ["type", "text", "text_elements"];
-        *part = Value::Object(
-            keys.into_iter()
-                .map(str::to_owned)
-                .zip(fields.drain(..))
-                .collect(),
-        );
+    if !positional::user_input(part)
+        || (matches!(part["type"].as_str(), Some("image" | "local_image"))
+            && !super::wire_enums::prepare_image_detail(part))
+    {
+        return false;
     }
     match part["type"].as_str() {
         Some("text") => {
@@ -128,12 +139,26 @@ fn byte_range(value: &Value) -> bool {
     checkpoint_wire::fields(value, &[("start", offset), ("end", offset)])
 }
 
+pub(super) fn model_receipt(item: &Value) -> bool {
+    matches!(
+        item["type"].as_str(),
+        Some("CommandExecution" | "FunctionCallOutput" | "DynamicToolCall" | "McpToolCall")
+    )
+}
+
 /// Select the historical fields from a completed Codex turn item. The caller handles messages.
 pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     let item_type = item["type"].as_str()?;
     let fields: &[&str] = match item_type {
         "Plan" => &["text"],
-        "CommandExecution" => &["command", "cwd", "exit_code"],
+        "ContextCompaction" | "HookPrompt" | "Reasoning" | "SubAgentActivity"
+        | "EnteredReviewMode" | "ExitedReviewMode" => {
+            return Some((
+                EventKind::ProviderEvent,
+                json!({"type":item_type,"id":item["id"].as_str()?}),
+            ));
+        }
+        "CommandExecution" => &["command", "cwd", "exit_code", "process_id"],
         "FileChange" => &["changes", "stdout", "stderr"],
         "FunctionCallOutput" => &["name", "namespace"],
         "DynamicToolCall" => &["namespace", "tool", "arguments", "error"],
@@ -141,7 +166,12 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         "WebSearch" => &["query", "action", "results"],
         "ImageView" => &["path"],
         "ImageGeneration" => &["revised_prompt", "saved_path"],
-        "CollabAgentToolCall" => &["tool", "sender_thread_id", "receiver_thread_ids"],
+        "CollabAgentToolCall" => &[
+            "tool",
+            "sender_thread_id",
+            "receiver_thread_ids",
+            "agents_states",
+        ],
         "Extension" => match item["kind"].as_str()? {
             "web.search" => &["kind", "query", "action", "results"],
             "image_gen.generation" => &["kind", "revisedPrompt", "savedPath", "failure"],
@@ -150,7 +180,7 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         },
         _ => return None,
     };
-    let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+    let id = item["id"].as_str()?;
     let mut payload = Map::from_iter([
         ("type".to_owned(), Value::from(item_type)),
         ("id".to_owned(), Value::from(id)),
@@ -159,6 +189,11 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         if let Some(value) = item.get(field).filter(|value| !value.is_null()) {
             payload.insert(field.to_owned(), compact_tool_value(value, Some(field)));
         }
+    }
+    if item_type == "CollabAgentToolCall"
+        && let Some(summary) = agent_states_summary(payload.get("agents_states"))
+    {
+        payload.insert("summary".into(), Value::String(summary));
     }
     // These output fields can carry either display text or model-only media.
     let output = match item_type {
@@ -195,6 +230,24 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     Some((kind, Value::Object(payload)))
 }
 
+fn agent_states_summary(states: Option<&Value>) -> Option<String> {
+    let states = states?.as_object()?;
+    let mut lines = Vec::with_capacity(states.len());
+    for (thread, state) in states {
+        let (kind, message) = if let Some(kind) = state.as_str() {
+            (kind, None)
+        } else {
+            let (kind, value) = state.as_object()?.iter().next()?;
+            (kind.as_str(), value.as_str())
+        };
+        lines.push(match message {
+            Some(message) => format!("{thread} {kind}: {message}"),
+            None => format!("{thread} {kind}"),
+        });
+    }
+    (!lines.is_empty()).then(|| super::compact_tool_string(&lines.join("\n")))
+}
+
 fn text_output(output: &Value) -> Option<Value> {
     if output.is_string() {
         return Some(compact_tool_value(output, None));
@@ -203,7 +256,11 @@ fn text_output(output: &Value) -> Option<Value> {
     let mut shown = Vec::new();
     for part in parts.iter().take(super::MAX_TOOL_ARRAY_ITEMS) {
         let text = match part["type"].as_str() {
-            Some("text" | "input_text" | "inputText") => part["text"].as_str(),
+            Some("text" | "input_text" | "inputText")
+                if part["_meta"]["codex/encryptedContent"] != true =>
+            {
+                part["text"].as_str()
+            }
             Some("resource") => part["resource"]["text"].as_str(),
             _ => None,
         };

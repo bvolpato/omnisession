@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -66,7 +66,7 @@ impl HermesAdapter {
         validate_provider(session, Provider::Hermes)?;
         self.with_snapshot(|connection| {
             validate_schema(connection)?;
-            let source_complete = if let Some(budget) = index_budget {
+            let (source_complete, provider_limited) = if let Some(budget) = index_budget {
                 let (count, bytes): (i64, i64) = connection.query_row(
                     "SELECT COUNT(*), COALESCE(SUM(
                        COALESCE(length(CAST(content AS BLOB)), 0)
@@ -80,9 +80,13 @@ impl HermesAdapter {
                     [&session.id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                u64::try_from(bytes)? <= budget && count <= i64::try_from(MAX_MESSAGES)?
+                let over_message_limit = count > i64::try_from(MAX_MESSAGES)?;
+                (
+                    u64::try_from(bytes)? <= budget && !over_message_limit,
+                    over_message_limit,
+                )
             } else {
-                message_limit.is_none()
+                (message_limit.is_none(), false)
             };
             let message_limit = if index_budget.is_some() && !source_complete {
                 Some(PREVIEW_MESSAGES)
@@ -111,6 +115,13 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                verified_prefix_end: None,
+                database_aliases: std::sync::Arc::default(),
+                search_record_groups: Vec::new(),
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
+                native_session: None,
+                source_revision: SourceRevision::default(),
                 snapshot: builder.snapshot(
                     session.clone(),
                     metadata.title,
@@ -119,7 +130,7 @@ impl HermesAdapter {
                     captured_at,
                 ),
                 source_complete,
-                provider_limited: false,
+                provider_limited,
             })
         })
     }
@@ -206,6 +217,7 @@ impl HermesAdapter {
                     updated_at_approximate: false,
                     event_count: metadata.message_count,
                     source_path: Some(database.clone()),
+                    source_revision: None,
                 });
             }
             sort_sessions(&mut sessions);
