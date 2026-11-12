@@ -46,6 +46,14 @@ pub(in super::super) fn with_source_receipt(mut payload: Value, source: &Value) 
         }
         if model && let Some((field, key)) = mcp_writer_body(&source["output"]) {
             witness[field] = hex::encode(key).into();
+            if field == "mcp_text"
+                && let Some(text) = source["output"].as_str()
+                && let Some((header, body)) = text.split_once("\nOutput:\n")
+                && let Some(mut cut) = shell::truncation(body)
+            {
+                cut["header"] = (header.len() + "\nOutput:\n".len()).into();
+                witness["mcp_cut"] = cut;
+            }
         }
         if let Some(key) = sanitized_mcp_key(source) {
             witness["sanitized"] = hex::encode(key).into();
@@ -89,7 +97,10 @@ fn display_keys(source: &Value) -> (Option<Key>, Option<Key>) {
                 .get("structuredContent")
                 .filter(|value| !encrypted && !value.is_null())
                 .map(|value| single_key(0, json_digest(value)));
-            (parts_key(parts, |part| mcp_part(part, true)), structured)
+            (
+                parts.as_array().and_then(|p| mcp_parts_key(p, true)),
+                structured,
+            )
         }
         _ => (None, None),
     }
@@ -137,8 +148,24 @@ fn sanitized_mcp_key(source: &Value) -> Option<Key> {
     parts
         .iter()
         .any(|part| part["type"] == "image" && part["_meta"]["codex/imageDetail"] == "original")
-        .then(|| keys_for_parts(parts, |part| mcp_part(part, false)))
+        .then(|| mcp_parts_key(parts, false))
         .flatten()
+}
+
+fn mcp_parts_key(parts: &[Value], original_supported: bool) -> Option<Key> {
+    let parts = parts.iter().filter(|part| {
+        !(part["type"] == "text"
+            && part["text"] == ""
+            && part["_meta"]["codex/encryptedContent"] != true)
+    });
+    keys_for_parts(parts, |part| mcp_part(part, original_supported))
+}
+
+fn mcp_cut_agrees(source: &str, cut: &Value) -> bool {
+    let Some(header) = cut["header"].as_u64().and_then(|n| usize::try_from(n).ok()) else {
+        return false;
+    };
+    shell::matching_edges(&shell::display_sizes(source), cut, source, header, true) == Some(true)
 }
 
 fn mcp_part(part: &Value, original_supported: bool) -> Option<(u8, Key)> {
@@ -202,7 +229,10 @@ fn parts_key(parts: &Value, part_key: impl Fn(&Value) -> Option<(u8, Key)>) -> O
     keys_for_parts(parts.as_array()?, part_key)
 }
 
-fn keys_for_parts(parts: &[Value], part_key: impl Fn(&Value) -> Option<(u8, Key)>) -> Option<Key> {
+fn keys_for_parts<'a>(
+    parts: impl IntoIterator<Item = &'a Value>,
+    part_key: impl Fn(&Value) -> Option<(u8, Key)>,
+) -> Option<Key> {
     let mut hash = Sha256::new();
     for part in parts {
         let (kind, key) = part_key(part)?;
@@ -278,6 +308,12 @@ pub(in super::super) fn model_output_matcher(
             && let Some(witness) = model[WITNESS].get("shell")
         {
             return shell::agrees(command, witness, source["aggregated_output"].as_str());
+        }
+        if structured.is_some()
+            && let Some(cut) = model[WITNESS].get("mcp_cut")
+            && mcp_cut_agrees(&source["result"]["structuredContent"].to_string(), cut)
+        {
+            return true;
         }
         body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
             || body_matches(&model[WITNESS], sanitized.as_deref(), None, mcp)
@@ -362,6 +398,12 @@ pub(in super::super) fn equivalent_model_receipt(
         Some("DynamicToolCall" | "McpToolCall")
             if matches!(display["status"].as_str(), Some("completed" | "failed")) =>
         {
+            if display["type"] == "McpToolCall"
+                && let Some(cut) = model[WITNESS].get("mcp_cut")
+                && sources.mcp_agrees(display, cut)
+            {
+                return true;
+            }
             body_matches(
                 &model[WITNESS],
                 display[WITNESS]["body"].as_str(),
@@ -385,6 +427,8 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
         display[WITNESS]["structured"].as_str(),
         true,
     );
+    let truncated_structured =
+        display[WITNESS]["structured"].is_string() && model[WITNESS]["mcp_cut"].is_object();
     let transport_error = display["type"] == "McpToolCall"
         && display["output"].is_null()
         && display["error"]["message"].is_string();
@@ -424,6 +468,9 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    if truncated_structured && let Some(content) = display["output"].get("content") {
+        metadata.insert("content".into(), content.clone());
+    }
     let retained = if structured_matches {
         "content"
     } else {

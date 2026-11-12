@@ -2859,6 +2859,10 @@ impl CodexHistory {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
         match disposition {
+            Admission::Complete if record["type"] == "realtime_item" => {
+                self.rollout_lines.project_realtime(record, index, builder);
+                Ok(())
+            }
             Admission::Complete => self.push_verified(builder, record, index),
             Admission::ModelOnly => {
                 let event_type = (record["type"] == "event_msg")
@@ -3258,6 +3262,9 @@ impl CodexHistory {
         }
         let mut has_positioned_replies = false;
         builder.visit_events_mut(|event| {
+            if event.source.raw_record_type.as_deref() == Some(rollout_lines::TRANSCRIPT_SEGMENT) {
+                return;
+            }
             if !matches!(
                 event.kind,
                 EventKind::MessageUser

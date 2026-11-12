@@ -15,6 +15,15 @@ struct RecentSources {
 
 impl ShellSources {
     pub(in crate::codex) fn remember(&self, display: &Value, item: &Value) {
+        if item["type"] == "McpToolCall" {
+            let source = &item["result"]["structuredContent"];
+            if let Some(key) = display[WITNESS]["structured"].as_str()
+                && *source != display["output"]["structuredContent"]
+            {
+                self.insert(key, &source.to_string());
+            }
+            return;
+        }
         if item["type"] != "CommandExecution" {
             return;
         }
@@ -30,6 +39,10 @@ impl ShellSources {
         let Some(key) = display[WITNESS]["body"].as_str() else {
             return;
         };
+        self.insert(key, source);
+    }
+
+    fn insert(&self, key: &str, source: &str) {
         let mut recent = self.0.borrow_mut();
         if recent.displays.iter().any(|(digest, _)| digest == key) {
             return;
@@ -49,6 +62,25 @@ impl ShellSources {
         recent
             .displays
             .push_back((key.to_owned(), source.to_owned()));
+    }
+
+    pub(super) fn mcp_agrees(&self, display: &Value, cut: &Value) -> bool {
+        let Some(key) = display[WITNESS]["structured"].as_str() else {
+            return false;
+        };
+        let recent = self.0.borrow();
+        if let Some((_, source)) = recent
+            .displays
+            .iter()
+            .rev()
+            .find(|(digest, _)| digest == key)
+        {
+            return super::mcp_cut_agrees(source, cut);
+        }
+        let projected = &display["output"]["structuredContent"];
+        !projected.is_null()
+            && hex::encode(super::single_key(0, super::json_digest(projected))) == key
+            && super::mcp_cut_agrees(&projected.to_string(), cut)
     }
 
     pub(super) fn agrees(&self, display: &Value, witness: &Value) -> bool {

@@ -13,6 +13,7 @@ fn body_key(text: &str) -> String {
 
 pub(super) fn output(output: &Value) -> Option<Value> {
     let text = output.as_str()?;
+    let mut original_tokens = None;
     let (exit, mut body, lines, timeout) = if let Some(raw) = text.strip_prefix("Exit code: ") {
         let (code, tail) = raw.split_once('\n')?;
         let exit: i32 = decimal(code)?;
@@ -60,7 +61,7 @@ pub(super) fn output(output: &Value) -> Option<Value> {
             };
         let tail = if let Some(rest) = tail.strip_prefix("Original token count: ") {
             let (count, rest) = rest.split_once('\n')?;
-            decimal::<u64>(count)?;
+            original_tokens = Some(decimal::<u64>(count)?);
             rest
         } else {
             tail
@@ -86,19 +87,11 @@ pub(super) fn output(output: &Value) -> Option<Value> {
         body = rest;
         result["timeout_body"] = body_key(body).into();
     }
-    let mut lines = lines;
-    if timeout.is_none()
-        && let Some(warning) =
-            body.strip_prefix("Warning: truncated output (original token count: ")
-        && let Some((count, tail)) = warning.split_once(")\nTotal output lines: ")
-        && decimal::<u64>(count).is_some()
-        && let Some((line_count, tail)) = tail.split_once("\n\n")
-        && let Some(line_count) = decimal::<usize>(line_count)
-    {
-        lines = Some(line_count);
-        body = tail;
-    }
-    if let Some(mut cut) = truncation(body) {
+    if let Some(mut cut) = if timeout.is_none() {
+        unified_truncation(body, original_tokens)
+    } else {
+        truncation(body)
+    } {
         if let Some(lines) = lines {
             cut["lines"] = lines
                 .saturating_sub(usize::from(result["timeout_body"].is_string()))
@@ -110,7 +103,32 @@ pub(super) fn output(output: &Value) -> Option<Value> {
     Some(result)
 }
 
-fn truncation(body: &str) -> Option<Value> {
+fn unified_truncation(body: &str, original_tokens: Option<u64>) -> Option<Value> {
+    let warning = body.strip_prefix("Warning: truncated output (original token count: ");
+    let Some((count, tail)) = warning.and_then(|s| s.split_once(")\n")) else {
+        return truncation(body);
+    };
+    let tokens = decimal::<u64>(count)?;
+    if let Some((n, snippet)) = tail
+        .strip_prefix("Total output lines: ")
+        .and_then(|s| s.split_once("\n\n"))
+    {
+        let mut cut = truncation(snippet)?;
+        cut["lines"] = decimal::<usize>(n)?.into();
+        return Some(cut);
+    }
+    let (notice, snippet) = if let Some(snippet) = tail.strip_prefix('\n') {
+        (None, snippet)
+    } else {
+        let (line, snippet) = tail.split_once("\n\n")?;
+        (Some(omission_count(line)?), snippet)
+    };
+    let mut cut = truncation(snippet)?;
+    cut["capture"] = json!({"notice":notice,"tokens":tokens,"original":original_tokens});
+    Some(cut)
+}
+
+pub(super) fn truncation(body: &str) -> Option<Value> {
     let mut markers = body.match_indices('…').filter_map(|(start, separator)| {
         let (marker, suffix) = body[start + separator.len()..].split_once('…')?;
         let (digits, unit) = marker.split_once(' ')?;
@@ -131,30 +149,115 @@ fn truncation(body: &str) -> Option<Value> {
     )
 }
 
+const CAPTURE_EDGE_BYTES: usize = 512 * 1024;
+
+fn omission_count(marker: &str) -> Option<u64> {
+    decimal::<u64>(
+        marker
+            .strip_prefix("... ")?
+            .strip_suffix(" bytes omitted ...")?,
+    )
+    .filter(|n| *n > 0)
+}
+
+fn captured_bytes(text: &str) -> Option<u64> {
+    if text.len() <= 2 * CAPTURE_EDGE_BYTES {
+        return None;
+    }
+    let total = text.matches(char::REPLACEMENT_CHARACTER).count();
+    let mut offset = 0;
+    let mut replacements = 0;
+    let mut omitted = None;
+    for (before, _) in text.match_indices("\n... ") {
+        replacements += text[offset..before]
+            .matches(char::REPLACEMENT_CHARACTER)
+            .count();
+        offset = before;
+        let Some(head_excess) = before.checked_sub(CAPTURE_EDGE_BYTES) else {
+            continue;
+        };
+        let Some((marker, tail)) = text[before + 1..].split_once('\n') else {
+            continue;
+        };
+        let Some(count) = omission_count(marker) else {
+            continue;
+        };
+        let Some(tail_excess) = tail.len().checked_sub(CAPTURE_EDGE_BYTES) else {
+            continue;
+        };
+        // CapturedStream decodes the retained byte slices with from_utf8_lossy.
+        if head_excess <= 2 * replacements && tail_excess <= 2 * (total - replacements) {
+            if omitted.is_some() {
+                return None;
+            }
+            omitted = Some(count);
+        }
+    }
+    omitted
+}
+
+fn capture_matches(capture: &Value, text: &str, prefix: &str, suffix: &str) -> bool {
+    let Some(omitted) = captured_bytes(text) else {
+        return false;
+    };
+    let marker = format!("... {omitted} bytes omitted ...");
+    let inline = prefix.contains(&marker) || suffix.contains(&marker);
+    let expected_tokens = if capture["original"].is_null() {
+        Some((text.len() as u64).div_ceil(4))
+    } else {
+        omitted
+            .checked_add(2 * CAPTURE_EDGE_BYTES as u64)
+            .map(|bytes| bytes.div_ceil(4))
+    };
+    expected_tokens.is_some()
+        && capture["tokens"].as_u64() == expected_tokens
+        && (capture["original"].is_null() || capture["original"] == capture["tokens"])
+        && if inline {
+            capture["notice"].is_null()
+        } else {
+            capture["notice"] == omitted
+        }
+}
+
 pub(super) fn display_sizes(text: &str) -> Value {
     json!({"bytes":text.len(),"chars":text.chars().count(),"lines":text.lines().count()})
 }
 
 fn truncated_matches(display: &Value, cut: &Value, source: Option<&str>) -> Option<bool> {
     let sizes = &display[WITNESS]["shell_sizes"];
+    let text = source.or_else(|| display["output"].as_str())?;
+    let header = usize::try_from(cut["timeout_bytes"].as_u64()?).ok()?;
+    matching_edges(sizes, cut, text, header, source.is_some())
+}
+
+pub(super) fn matching_edges(
+    sizes: &Value,
+    cut: &Value,
+    text: &str,
+    header: usize,
+    full_source: bool,
+) -> Option<bool> {
     let bytes = usize::try_from(sizes["bytes"].as_u64()?).ok()?;
     let chars = usize::try_from(sizes["chars"].as_u64()?).ok()?;
     let left = usize::try_from(cut["left"].as_u64()?).ok()?;
     let right = usize::try_from(cut["right"].as_u64()?).ok()?;
     let count = usize::try_from(cut["count"].as_u64()?).ok()?;
-    let text = source.or_else(|| display["output"].as_str())?;
     let prefix = text.get(..left)?;
     let suffix = text.get(text.len().checked_sub(right)?..)?;
+    if let Some(capture) = cut.get("capture")
+        && !capture_matches(capture, text, prefix, suffix)
+    {
+        return Some(false);
+    }
     let lc = prefix.chars().count();
     let rc = suffix.chars().count();
     let edge = super::super::super::MAX_TOOL_STRING_CHARACTERS / 2;
-    if source.is_none() && chars > edge * 2 && (lc > edge || rc > edge) {
+    if !full_source && chars > edge * 2 && (lc > edge || rc > edge) {
         return Some(false);
     }
     let omitted = bytes.checked_sub(left.checked_add(right)?)?;
-    let timeout_bytes = usize::try_from(cut["timeout_bytes"].as_u64()?).ok()?;
-    let source_bytes = bytes + timeout_bytes;
-    let head = left + timeout_bytes;
+    let source_bytes = bytes + header;
+    let head = left + header;
     let next_width = text.get(left..)?.chars().next()?.len_utf8();
     let last_width = text
         .get(..text.len() - right)?

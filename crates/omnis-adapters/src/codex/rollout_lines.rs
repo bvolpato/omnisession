@@ -6,6 +6,8 @@ use serde_json::Value;
 use super::{checkpoint_wire, completed_item};
 
 mod events;
+mod realtime;
+pub(super) const TRANSCRIPT_SEGMENT: &str = "realtime_item.transcript_segment";
 pub(super) use events::{ROLLBACK_TAG, rollback_turns};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub(super) enum OrdinalGap {
 
 #[derive(Default)]
 pub(super) struct RolloutLines {
+    timeline: realtime::Timeline,
     next: Option<u64>,
     // A documentary record may decode in Codex without a locally known schema.
     possible_next: Option<u64>,
@@ -53,6 +56,9 @@ impl RolloutLines {
     /// Each physical file has its own cursor, including a child that starts after an inherited prefix.
     pub(super) fn start_segment(&mut self, header: &Value) {
         self.possible_next = None;
+        self.timeline.start = header["payload"]["subagent_history_start_ordinal"]
+            .as_u64()
+            .unwrap_or_default();
         self.next = (header["type"] == "session_meta"
             && header["payload"]["history_mode"] == "paginated")
             .then(|| {
@@ -61,6 +67,18 @@ impl RolloutLines {
                     .unwrap_or(0)
             });
         self.contiguous_next = self.next.unwrap_or(0);
+    }
+
+    pub(super) fn project_realtime(
+        &mut self,
+        record: &Value,
+        index: u64,
+        builder: &mut super::EventBuilder,
+    ) {
+        let ordinal = record["ordinal"].as_u64().unwrap_or(index);
+        if !self.timeline.project(record, ordinal, builder) {
+            self.skipped += 1;
+        }
     }
 
     pub(super) fn paginated(&self) -> bool {
@@ -130,7 +148,7 @@ impl RolloutLines {
             .get("type")
             .or_else(|| payload.get(0))
             .and_then(Value::as_str);
-        let needs_timestamp = record["type"] == "realtime_item"
+        let needs_timestamp = (record["type"] == "realtime_item" && ordinal >= self.timeline.start)
             || (record["type"] == "event_msg"
                 && event == Some("item_completed")
                 && payload
@@ -163,6 +181,9 @@ impl RolloutLines {
             && (record["payload"].is_array() || record["payload"]["type"].is_number());
         // Ordinal admission and model reconstruction must see the same fields.
         let valid_content = match record["type"].as_str() {
+            Some("realtime_item") => {
+                return Wire::checked(realtime::prepare(&mut record["payload"]));
+            }
             Some("compacted") => {
                 let payload = &mut record["payload"];
                 if !checkpoint_wire::prepare(payload)

@@ -2291,3 +2291,55 @@ fn delayed_command_outputs_resolve_each_identifiable_display() {
         }
     }
 }
+
+#[test]
+fn agent_wait_preserves_each_receivers_report() {
+    let sender = super::SESSION_ID;
+    let receiver = "44444444-4444-4444-8444-444444444441";
+    let other = "44444444-4444-4444-8444-444444444442";
+    for status in ["completed", "failed"] {
+        let states = json!({receiver:{"completed":"Build failed with DiskQuotaExceeded"},other:{"errored":"Worker disconnected"}});
+        for item in [
+            json!({"type":"CollabAgentToolCall","id":"wait-a","tool":"wait","status":status,"sender_thread_id":sender,"receiver_thread_ids":[receiver,other],"agents_states":states}),
+            json!([8,"wait-a",{"wait":{}},status,sender,[receiver,other],[],null,null,null,states]),
+        ] {
+            for mode in [None, Some("paginated")] {
+                for preview in [false, true] {
+                    let mut corrupt = item.clone();
+                    let invalid = json!({receiver:{"completed":125}});
+                    if corrupt.is_array() {
+                        corrupt[10] = invalid;
+                    } else {
+                        corrupt["agents_states"] = invalid;
+                    }
+                    let rows = vec![
+                        event("task_started", json!({"turn_id":"turn"})),
+                        turn_item("turn", &item),
+                        turn_item("turn", &corrupt),
+                    ];
+                    let snap = read_with_history_mode(rows, preview, mode).unwrap();
+                    let outcome = snap
+                        .events
+                        .iter()
+                        .find(|e| e.payload["type"] == "CollabAgentToolCall")
+                        .unwrap();
+                    assert_eq!(outcome.payload["agents_states"], states);
+                    assert_eq!(
+                        outcome.kind == omnis_ir::EventKind::ToolFailed,
+                        status == "failed"
+                    );
+                    for text in [
+                        omnis_core::trajectory_search_document(&snap).text,
+                        omnis_core::render_semantic_handoff(&snap),
+                    ] {
+                        assert!(
+                            text.contains("DiskQuotaExceeded")
+                                && text.contains("Worker disconnected"),
+                            "{mode:?} {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

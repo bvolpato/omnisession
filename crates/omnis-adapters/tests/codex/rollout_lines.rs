@@ -1777,3 +1777,213 @@ fn truncated_shell_results_keep_the_display_and_use_source_bytes_for_the_verdict
         }
     }
 }
+
+fn voice(id: &str, content: &Value) -> Value {
+    let mut payload = content.clone();
+    payload["id"] = id.into();
+    payload["realtime_session_id"] = "voice".into();
+    json!({"type":"realtime_item","payload":payload})
+}
+
+#[test]
+fn damaged_realtime_content_leaves_its_ordinal_available_for_a_verified_reply() {
+    let reply = turn_item(
+        "turn",
+        &json!({"type":"AgentMessage","id":"reply","content":[{"type":"Text","text":"DiskQuotaExceeded"}]}),
+    );
+    for damaged in [
+        json!({"type":"transcript_segment","role":"user"}),
+        json!({"type":"transcript_segment","role":"speaker","text":"private"}),
+        json!({"type":"bem_item_promoted","turn_id":"turn","item_id":"item","presentation":{"type":"inline_visualization","index":-1}}),
+        json!({"type":"realtime_session_closed","outcome":"unknown"}),
+    ] {
+        let rows = vec![
+            stamped(page_user("turn", "u", "objective"), 1),
+            stamped(voice("damaged", &damaged), 2),
+            stamped(reply.clone(), 2),
+        ];
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(search.source_complete);
+            assert!(search.text.contains("DiskQuotaExceeded"));
+            assert!(
+                omnis_core::render_session_history_preview(&snap).contains("DiskQuotaExceeded")
+            );
+            assert!(omnis_core::render_semantic_handoff(&snap).contains("DiskQuotaExceeded"));
+        }
+    }
+    let rows = vec![
+        stamped(page_user("turn", "u", "objective"), 1),
+        stamped(
+            voice(
+                "spoken",
+                &json!({"type":"transcript_segment","role":{"assistant":{}},"text":"verified voice"}),
+            ),
+            2,
+        ),
+        stamped(reply, 2),
+    ];
+    for preview in [false, true] {
+        let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        let search = omnis_core::trajectory_search_document(&snap);
+        assert!(search.text.contains("verified voice"));
+        assert!(!search.text.contains("DiskQuotaExceeded"));
+    }
+}
+
+#[test]
+fn realtime_timeline_keeps_spoken_roles_and_first_published_item_ids() {
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "u", "inspect synthetic output"),
+        voice("start", &json!({"type":"realtime_session_started"})),
+        voice(
+            "u",
+            &json!({"type":"transcript_segment","role":"user","text":"Check DiskQuotaExceeded"}),
+        ),
+        voice(
+            "a",
+            &json!({"type":"transcript_segment","role":"assistant","text":"The quota was exhausted"}),
+        ),
+        voice(
+            "u",
+            &json!({"type":"transcript_segment","role":"assistant","text":"duplicate voice"}),
+        ),
+        voice(
+            "b",
+            &json!({"type":"bem_item_promoted","turn_id":"turn","item_id":"item","presentation":{"type":"inline_visualization","index":5}}),
+        ),
+        voice(
+            "end",
+            &json!({"type":"realtime_session_closed","outcome":"ended"}),
+        ),
+    ];
+    let rows: Vec<_> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| stamped(r, u64::try_from(i + 1).unwrap()))
+        .collect();
+    for mode in ["legacy", "paginated"] {
+        let mut rows = rows.clone();
+        if mode == "paginated" {
+            rows.push(stamped(
+                event("thread_rolled_back", json!({"num_turns":1})),
+                9,
+            ));
+        }
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            let speech: Vec<_> = snap
+                .events
+                .iter()
+                .filter(|e| {
+                    e.source.raw_record_type.as_deref() == Some("realtime_item.transcript_segment")
+                })
+                .map(|e| (&e.kind, e.payload["text"].as_str()))
+                .collect();
+            assert_eq!(
+                speech,
+                [
+                    (&EventKind::MessageUser, Some("Check DiskQuotaExceeded")),
+                    (
+                        &EventKind::MessageAssistant,
+                        Some("The quota was exhausted")
+                    )
+                ]
+            );
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(search.source_complete);
+            for text in [
+                search.text,
+                omnis_core::render_session_history_preview(&snap),
+                omnis_core::render_semantic_handoff(&snap),
+            ] {
+                assert!(
+                    text.contains("Check DiskQuotaExceeded")
+                        && text.contains("The quota was exhausted"),
+                    "{text}"
+                );
+                assert!(!text.contains("duplicate voice"));
+            }
+        }
+    }
+}
+
+#[test]
+fn exec_capture_limit_keeps_one_failed_result_with_matching_omission_evidence() {
+    let edge = 512 * 1024;
+    let retained = 2_000;
+    let capture = format!(
+        "{}\n... 128 bytes omitted ...\n{}",
+        "A".repeat(edge),
+        "Z".repeat(edge)
+    );
+    let tokens = (2 * edge + 128) / 4;
+    let model_cut = (capture.len() - 2 * retained).div_ceil(4);
+    let call = physical_call(
+        "exec_command",
+        &json!({"cmd":"run-check","max_output_tokens":1000}),
+    );
+    let mut display = command_display("run-check", "failed", &capture);
+    display["payload"]["item"]["exit_code"] = 1.into();
+    for (omitted, count, changed_edge, matched) in [
+        (128, tokens, false, true),
+        (129, tokens, false, false),
+        (128, tokens + 1, false, false),
+        (128, tokens, true, false),
+    ] {
+        let prefix = if changed_edge { "B" } else { "A" }.repeat(retained);
+        let suffix = "Z".repeat(retained);
+        let raw = physical_result(&format!(
+            "Chunk ID: ab12cd\nWall time: 0.0500 seconds\nProcess exited with code 1\nOriginal token count: {tokens}\nOutput:\nWarning: truncated output (original token count: {count})\n... {omitted} bytes omitted ...\n\n{prefix}…{model_cut} tokens truncated…{suffix}"
+        ));
+        for order in [
+            [raw.clone(), display.clone()],
+            [display.clone(), raw.clone()],
+        ] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                page_user("turn", "user", "request"),
+                call.clone(),
+            ];
+            rows.extend(order);
+            for mode in ["legacy", "paginated"] {
+                for preview in [false, true] {
+                    let snap = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+                    let search = omnis_core::trajectory_search_document(&snap);
+                    assert_eq!(
+                        search.source_complete, matched,
+                        "{omitted} {count} {mode} {preview}"
+                    );
+                    let result = snap
+                        .events
+                        .iter()
+                        .find(|e| {
+                            e.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .unwrap();
+                    assert_eq!(result.kind == EventKind::ToolFailed, matched);
+                    let trajectory = omnis_core::import_trajectory(&snap);
+                    let native = omnis_core::native_trajectory_items(&trajectory);
+                    let failed_pair = native.iter().any(|item| matches!(item,
+                        omnis_core::NativeTrajectoryItem::Tool { is_error: true, output, .. } if output.contains("Process exited with code 1")
+                    ));
+                    assert_eq!(failed_pair, matched);
+                    let handoff = omnis_core::plan_semantic_handoff(&snap);
+                    assert_eq!(
+                        handoff
+                            .tool_outcomes
+                            .iter()
+                            .filter(
+                                |outcome| outcome.status == omnis_core::ToolOutcomeStatus::Failed
+                            )
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+}

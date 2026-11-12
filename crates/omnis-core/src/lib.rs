@@ -1314,7 +1314,7 @@ fn search_event_text(
             // as `db_passwd`.
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
-            codex_command_search_text(event, &mut payload)
+            codex_output_search_text(event, &mut payload)
                 .or_else(|| serde_json::to_string(&payload).ok())?
         }
     };
@@ -1349,16 +1349,21 @@ fn search_event_text(
     })
 }
 
-fn codex_command_search_text(event: &OmniEvent, payload: &mut serde_json::Value) -> Option<String> {
+fn codex_output_search_text(event: &OmniEvent, payload: &mut serde_json::Value) -> Option<String> {
     if event.source.provider != Provider::Codex {
         return None;
     }
-    let display = if payload.get("omnisession_codex_tool_display").is_some() {
+    let display = if payload["omnisession_codex_tool_display"]["type"] == "CommandExecution"
+        && payload["omnisession_codex_tool_display"]["output"].is_string()
+    {
         &mut payload["omnisession_codex_tool_display"]
     } else {
         &mut *payload
     };
-    if display["type"] != "CommandExecution" || !display["output"].as_str()?.contains(['\n', '\r'])
+    if !matches!(
+        display["type"].as_str(),
+        Some("CommandExecution" | "function_call_output" | "custom_tool_call_output")
+    ) || !display["output"].as_str()?.contains(['\n', '\r'])
     {
         return None;
     }
@@ -3593,6 +3598,17 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
             .payload
             .get("omnisession_codex_tool_display")
             .unwrap_or(&event.payload);
+        if let Some(blocks) = event.payload["output"].as_array() {
+            let text: Vec<_> = blocks
+                .iter()
+                .filter(|block| matches!(block["type"].as_str(), Some("input_text" | "text")))
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| !text.is_empty())
+                .collect();
+            if !text.is_empty() {
+                summary = text.join("\n");
+            }
+        }
         if display["type"] == "CommandExecution"
             && let Some(output) = display["output"].as_str()
         {

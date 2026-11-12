@@ -1509,27 +1509,52 @@ fn repeated_commands_with_the_same_inputs_can_be_distinguished_by_their_original
     }
 }
 
-#[test]
-fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
+fn writer_receipt_cases(diagnostic: &str) -> Vec<(Value, Value, Value)> {
     let header = "Wall time: 0.0420 seconds\nOutput:";
     let near_header = "Wall time: 0.042 seconds\nOutput:";
-    let diagnostic = "No such file";
     let cancel = "dynamic tool call was cancelled before receiving a response";
     let image = "data:image/png;base64,AA==";
     let text_part = |text| json!({"type":"input_text","text":text});
     let image_part = |detail| json!({"type":"input_image","image_url":image,"detail":detail});
     let mcp = json!({"type":"McpToolCall","id":"cmd","server":"fixture","tool":"lookup","arguments":{},"status":"failed","result":{"content":[{"type":"text","text":diagnostic}],"isError":true}});
+    let mut empty = mcp.clone();
+    empty["result"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, json!({"type":"text","text":""}));
+    let mut large = mcp.clone();
+    large["result"]["structuredContent"] =
+        json!({"message": format!("{diagnostic}{}{}", "A".repeat(25_000), "Z".repeat(25_000))});
+    let full = format!("{header}\n{}", large["result"]["structuredContent"]);
+    let limit = 48_000;
+    let omitted = (full.len() - limit).div_ceil(4);
+    let cut = |count| {
+        format!(
+            "{}…{count} tokens truncated…{}",
+            &full[..limit / 2],
+            &full[full.len() - limit / 2..]
+        )
+    };
     let mut structured = mcp.clone();
     structured["result"]["structuredContent"] = json!({"code":"missing_file"});
     let dynamic = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":diagnostic},{"type":"inputImage","imageUrl":image}]});
     let cancelled = json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","arguments":{},"status":"failed","success":false,"content_items":[],"error":cancel});
-    let mut lookup = call(Some("turn"));
-    lookup["payload"]["name"] = "lookup".into();
-    for (item, body, other) in [
+    vec![
         (
             mcp,
             json!([text_part(header), text_part(diagnostic)]),
             json!([text_part(near_header), text_part(diagnostic)]),
+        ),
+        (
+            empty,
+            json!([text_part(header), text_part(diagnostic)]),
+            json!([text_part(header), text_part("other")]),
+        ),
+        (large.clone(), json!(cut(omitted)), json!(cut(omitted + 1))),
+        (
+            large,
+            json!(cut(omitted)),
+            json!(cut(omitted).replacen("ZZ", "XY", 1)),
         ),
         (
             structured,
@@ -1546,7 +1571,15 @@ fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
             json!(cancel),
             json!("different cancellation reason"),
         ),
-    ] {
+    ]
+}
+
+#[test]
+fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
+    let diagnostic = "No such file";
+    let mut lookup = call(Some("turn"));
+    lookup["payload"]["name"] = "lookup".into();
+    for (item, body, other) in writer_receipt_cases(diagnostic) {
         for (output, matched) in [(body, true), (other, false)] {
             for mode in [None, Some("paginated")] {
                 for display_first in [false, true] {

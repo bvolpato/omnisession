@@ -166,7 +166,12 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         "WebSearch" => &["query", "action", "results"],
         "ImageView" => &["path"],
         "ImageGeneration" => &["revised_prompt", "saved_path"],
-        "CollabAgentToolCall" => &["tool", "sender_thread_id", "receiver_thread_ids"],
+        "CollabAgentToolCall" => &[
+            "tool",
+            "sender_thread_id",
+            "receiver_thread_ids",
+            "agents_states",
+        ],
         "Extension" => match item["kind"].as_str()? {
             "web.search" => &["kind", "query", "action", "results"],
             "image_gen.generation" => &["kind", "revisedPrompt", "savedPath", "failure"],
@@ -184,6 +189,11 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         if let Some(value) = item.get(field).filter(|value| !value.is_null()) {
             payload.insert(field.to_owned(), compact_tool_value(value, Some(field)));
         }
+    }
+    if item_type == "CollabAgentToolCall"
+        && let Some(summary) = agent_states_summary(payload.get("agents_states"))
+    {
+        payload.insert("summary".into(), Value::String(summary));
     }
     // These output fields can carry either display text or model-only media.
     let output = match item_type {
@@ -218,6 +228,24 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         _ => EventKind::ToolCompleted,
     };
     Some((kind, Value::Object(payload)))
+}
+
+fn agent_states_summary(states: Option<&Value>) -> Option<String> {
+    let states = states?.as_object()?;
+    let mut lines = Vec::with_capacity(states.len());
+    for (thread, state) in states {
+        let (kind, message) = if let Some(kind) = state.as_str() {
+            (kind, None)
+        } else {
+            let (kind, value) = state.as_object()?.iter().next()?;
+            (kind.as_str(), value.as_str())
+        };
+        lines.push(match message {
+            Some(message) => format!("{thread} {kind}: {message}"),
+            None => format!("{thread} {kind}"),
+        });
+    }
+    (!lines.is_empty()).then(|| super::compact_tool_string(&lines.join("\n")))
 }
 
 fn text_output(output: &Value) -> Option<Value> {
