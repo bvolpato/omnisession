@@ -8,6 +8,7 @@ use std::{
 
 use serde_json::{Value, json};
 
+const STAMP: &str = "2026-01-02T00:00:00Z";
 const CLAUDE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CODEX_ID: &str = "019f0000-0000-7000-8000-000000000001";
 const OTHER_CODEX_ID: &str = "019f0000-0000-7000-8000-000000000002";
@@ -94,12 +95,12 @@ fn check_missing_current_rollout(command: &[&str]) {
     write_jsonl(
         &current,
         &[
-            json!({"type":"session_meta","ordinal":0,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
+            json!({"type":"session_meta","ordinal":0,"timestamp":STAMP,"payload":{"id":CODEX_ID,"session_id":CODEX_ID,
               "history_mode":"paginated","cwd":fixture.workspace}}),
-            json!({"type":"event_msg","ordinal":1,"payload":{"type":"item_completed","thread_id":CODEX_ID,
+            json!({"type":"event_msg","ordinal":1,"timestamp":STAMP,"payload":{"type":"item_completed","thread_id":CODEX_ID,
               "turn_id":"restored","item":{"type":"AgentMessage","id":"answer","content":[
                   {"type":"Text","text":"Restored cinnabar response"}]}}}),
-            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant",
+            json!({"type":"response_item","ordinal":2,"timestamp":STAMP,"payload":{"type":"message","role":"assistant",
               "content":[{"type":"output_text","text":"Restored cinnabar response"}]}}),
         ],
     );
@@ -1083,14 +1084,14 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
         writeln!(
             fs::OpenOptions::new().append(true).open(&path).unwrap(),
             "{}",
-            json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})
+            json!({"ordinal":11,"timestamp":STAMP,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}})
         )
         .unwrap();
         let original = fs::read(&path).unwrap();
         if show_first {
             let shown = fixture
                 .command()
-                .args(["show", &reference])
+                .args(["--json", "show", &reference])
                 .output()
                 .unwrap();
             assert!(
@@ -1098,11 +1099,27 @@ fn rolled_back_local_opener_is_removed_from_a_paginated_sessions_search_title() 
                 "{}",
                 String::from_utf8_lossy(&shown.stderr)
             );
-            assert!(!String::from_utf8_lossy(&shown.stdout).contains("backoff"));
+            let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+            let opener = snapshot["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event["kind"] == "message_user"
+                        && event["payload"]["text"] == "Tune the rate limiter backoff"
+                })
+                .expect("published opener");
+            assert_eq!(opener["payload"]["omnisession_codex_rollback"], "withdrawn");
         } else {
-            assert!(result_sessions(&search("backoff", false)).is_empty());
+            assert_eq!(
+                search("backoff", false)["results"][0]["match"],
+                "conversation"
+            );
         }
-        assert!(result_sessions(&search("backoff", true)).is_empty());
+        assert_eq!(
+            search("backoff", true)["results"][0]["match"],
+            "conversation"
+        );
         assert!(search(CODEX_ID, true)["results"][0]["title"].is_null());
         assert_eq!(fs::read(path).unwrap(), original);
     }
@@ -1121,12 +1138,10 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
             "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
         ));
         let mut source = fs::read(&plain).unwrap();
-        let pad = format!(
-            "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}\n",
-            " ".repeat(1024 * 1024)
-        );
-        for _ in 0..16 {
-            source.extend_from_slice(pad.as_bytes());
+        let padding = " ".repeat(1024 * 1024);
+        for ordinal in 11..27 {
+            let row = json!({"ordinal":ordinal,"timestamp":STAMP,"type":"event_msg","payload":{"type":"warning","message":"padding"}});
+            source.extend_from_slice(format!("{row}{padding}\n").as_bytes());
         }
         fs::remove_file(&plain).unwrap();
         let path = if gzip {
@@ -1162,13 +1177,20 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
         fixture.index_codex();
         assert_eq!(search(CODEX_ID)["results"][0]["title"], initial_title);
 
-        append(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n");
+        let rollback = json!({"ordinal":27,"timestamp":STAMP,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+        append(format!("{rollback}\n").as_bytes());
         if repeated_later {
             let new_opener = format!("New opener {}", "x".repeat(5 * 1024 * 1024));
-            for text in [new_opener.as_str(), initial_title] {
-                let row = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            for (ordinal, text) in [(28, new_opener.as_str()), (32, initial_title)] {
+                let row = json!({"timestamp":STAMP,"ordinal":ordinal,"type":"response_item","payload":{"type":"message","role":"user",
                     "content":[{"type":"input_text","text":text}]}});
-                append(format!("{row}\n").as_bytes());
+                let [mut display, mut model] = paginated_pair(row, ordinal);
+                let turn = &display["payload"]["turn_id"];
+                let start = json!({"ordinal":ordinal,"timestamp":STAMP,"type":"event_msg","payload":{"type":"task_started","turn_id":turn}});
+                let end = json!({"ordinal":ordinal+3,"timestamp":STAMP,"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}});
+                display["ordinal"] = json!(ordinal + 1);
+                model["ordinal"] = json!(ordinal + 2);
+                append(format!("{start}\n{display}\n{model}\n{end}\n").as_bytes());
             }
         }
         let original = fs::read(&path).unwrap();
@@ -1180,12 +1202,8 @@ fn sampled_fork_index_withdraws_its_rolled_back_title() {
             "backoff",
         ]);
         for results in [live, search("backoff")] {
-            if repeated_later {
-                assert_eq!(results["results"][0]["match"], "conversation");
-                assert_eq!(results["results"][0]["coverage"], "preview");
-            } else {
-                assert!(result_sessions(&results).is_empty());
-            }
+            assert_eq!(results["results"][0]["match"], "conversation");
+            assert_eq!(results["results"][0]["coverage"], "preview");
         }
         assert!(search(CODEX_ID)["results"][0]["title"].is_null());
         assert_eq!(fixture.index_codex()["indexed"], 0);
@@ -1217,6 +1235,14 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         rows[0]["payload"]["history_mode"] = json!("legacy");
+        let header = rows.remove(0);
+        let rows = std::iter::once(header)
+            .chain(rows.into_iter().flat_map(|mut row| {
+                row["timestamp"] = json!(STAMP);
+                let display = display_event(&row);
+                [row, display]
+            }))
+            .collect::<Vec<_>>();
         write_jsonl(&path, &rows);
     }
     let cached = |query: &str| {
@@ -1229,7 +1255,8 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     );
     let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
     let pad = format!(
-        "{{\"type\":\"turn_context\",\"payload\":{{}}}}{}",
+        "{}{}",
+        json!({"timestamp":STAMP,"type":"event_msg","payload":{"type":"warning","message":"padding"}}),
         " ".repeat(1024 * 1024)
     );
     for _ in 0..16 {
@@ -1243,32 +1270,18 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
         json!({"type":"response_item","payload":{"type":"message","role":"assistant",
             "content":[{"type":"output_text","text":"Queue delay explains the slowdown"}]}}),
     ] {
+        let mut row = row;
+        row["timestamp"] = json!(STAMP);
         writeln!(file, "{row}").unwrap();
+        if old_legacy_cache && row["type"] == "response_item" {
+            writeln!(file, "{}", display_event(&row)).unwrap();
+        }
     }
     drop(file.into_inner().unwrap());
     let original = fs::read(&path).unwrap();
     if old_legacy_cache {
         fixture.index_codex();
-        let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
-        db.execute_batch(
-            "DROP TABLE codex_workspace_rechecks;
-             CREATE TABLE codex_workspace_rechecks(
-                 trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
-                 source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
-        ).unwrap();
-        assert_eq!(
-            db.execute(
-                "UPDATE session_trajectories SET document_version=6, derived_title='Tune the rate limiter backoff',
-                 derived_title_is_verified=1,derived_title_is_local_opener=0
-                 WHERE provider='codex' AND session_id=?1 AND source_complete=0",
-                [CODEX_ID],
-            )
-            .unwrap(),
-            1,
-        );
-    }
-
-    if old_legacy_cache {
+        restore_legacy_title_cache(&fixture);
         let pending = fixture.search_json(&["slowdown", "--provider", "codex"]);
         assert!(result_sessions(&pending).is_empty());
         assert!(
@@ -1291,7 +1304,10 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     assert!(result_sessions(&cached("backoff")).is_empty());
     let retained = cached("slowdown");
     let scoped = fixture.search_json(&["slowdown", "--provider", "codex", "--show-text"]);
-    assert_eq!(scoped["results"][0]["title"], "Investigate latency instead");
+    assert_eq!(
+        scoped["results"][0]["title"], "Investigate latency instead",
+        "{scoped} {retained}"
+    );
     assert_eq!(
         retained["results"][0]["title"],
         "Investigate latency instead"
@@ -1299,6 +1315,27 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
     assert_eq!(retained["results"][0]["coverage"], "preview");
     assert_eq!(fixture.index_codex()["stale"], 0);
     assert_eq!(fs::read(path).unwrap(), original);
+}
+
+fn restore_legacy_title_cache(fixture: &Fixture) {
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute_batch(
+        "DROP TABLE codex_workspace_rechecks;
+         CREATE TABLE codex_workspace_rechecks(
+             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
+             source_file_id BLOB NOT NULL,source_contents_id BLOB NOT NULL);",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE session_trajectories SET document_version=6,derived_title='Tune the rate limiter backoff',
+             derived_title_is_verified=1,derived_title_is_local_opener=0
+             WHERE provider='codex' AND session_id=?1 AND source_complete=0",
+            [CODEX_ID],
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1474,7 +1511,7 @@ fn check_codex_gui_name_changes(archived: bool) {
     let (header, conversation) = source.split_once('\n').unwrap();
     let mut header: Value = serde_json::from_str(header).unwrap();
     header["payload"]["history_mode"] = json!("paginated");
-    fs::write(&rollout, format!("{header}\n{conversation}")).unwrap();
+    write_paginated_conversation(&rollout, header, conversation, 0);
     if archived {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
@@ -2264,7 +2301,7 @@ impl Fixture {
             "thread_id": "019f0000-0000-7000-8000-000000000099",
             "end_byte_offset": 512, "end_ordinal_exclusive": 4
         });
-        fs::write(path, format!("{header}\n{conversation}")).unwrap();
+        write_paginated_conversation(&path, header, conversation, 4);
     }
 
     fn index_codex(&self) -> Value {
@@ -2280,6 +2317,58 @@ impl Fixture {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+}
+
+fn write_paginated_conversation(
+    path: &Path,
+    header: Value,
+    conversation: &str,
+    first_ordinal: usize,
+) {
+    let turn = "019f0000-0000-7000-8000-000000000005";
+    let marker = |kind| json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn}});
+    let records = [header, marker("task_started")]
+        .into_iter()
+        .chain(
+            conversation
+                .lines()
+                .flat_map(|line| paginated_pair(serde_json::from_str(line).unwrap(), 5)),
+        )
+        .chain([marker("task_complete")])
+        .enumerate()
+        .map(|(i, mut row)| {
+            row["timestamp"] = json!(STAMP);
+            row["ordinal"] = json!(i + first_ordinal);
+            row
+        })
+        .collect::<Vec<_>>();
+    write_jsonl(path, &records);
+}
+
+fn paginated_pair(mut row: Value, turn_number: u64) -> [Value; 2] {
+    let user = row["payload"]["role"] == "user";
+    let (kind, part) = if user {
+        ("UserMessage", "text")
+    } else {
+        ("AgentMessage", "Text")
+    };
+    let turn = format!("019f0000-0000-7000-8000-{turn_number:012}");
+    let id = format!("{kind}-{turn_number}");
+    let text = &row["payload"]["content"][0]["text"];
+    let display = json!({"timestamp":STAMP,"type":"event_msg","payload":{"type":"item_completed","thread_id":CODEX_ID,"turn_id":turn,"item":{"type":kind,"id":id,"content":[{"type":part,"text":text}]}}});
+    row["payload"]["id"] = json!(id);
+    row["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+    [display, row]
+}
+
+fn display_event(row: &Value) -> Value {
+    let message = &row["payload"];
+    let kind = if message["role"] == "user" {
+        "user_message"
+    } else {
+        "agent_message"
+    };
+    json!({"timestamp": STAMP, "type": "event_msg", "payload": {"type": kind, "message": message["content"][0]["text"]}})
 }
 
 fn write_codex_session(root: &Path, id: &str, workspace: &Path, question: &str, answer: &str) {

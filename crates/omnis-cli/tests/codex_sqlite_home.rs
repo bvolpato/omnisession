@@ -3,18 +3,19 @@ use std::{fs, path::Path, process::Command};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+const STAMP: &str = "2026-01-01T00:00:00Z";
 const THREAD: &str = "11111111-1111-4111-8111-111111111111";
 const ENV_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 const CONFIG_GENERATION: &str = "33333333-3333-4333-8333-333333333333";
 
 fn write_rollout(path: &Path, thread: &str, workspace: &Path, text: &str) -> Result<()> {
-    let header = json!({"type":"session_meta","ordinal":0,"payload":{
+    let header = json!({"type":"session_meta","ordinal":0,"timestamp":STAMP,"payload":{
         "id":thread,"cwd":workspace,"history_mode":"paginated"
     }});
-    let raw = json!({"type":"response_item","ordinal":1,"payload":{
+    let raw = json!({"type":"response_item","ordinal":1,"timestamp":STAMP,"payload":{
         "type":"message","role":"assistant","id":"answer","content":[{"type":"output_text","text":text}]
     }});
-    let displayed = json!({"type":"event_msg","ordinal":2,"payload":{
+    let displayed = json!({"type":"event_msg","ordinal":2,"timestamp":STAMP,"payload":{
         "type":"item_completed","thread_id":thread,"turn_id":"turn-one",
         "item":{"type":"AgentMessage","id":"answer","content":[{"type":"Text","text":text}]}
     }});

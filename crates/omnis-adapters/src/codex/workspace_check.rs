@@ -98,6 +98,8 @@ pub(super) struct WorkspaceScan {
     pub(super) directory: Option<PathBuf>,
     pub(super) reconstruct_history: bool,
     rolled_back: bool,
+    inherited: bool,
+    display_replay: super::DisplayReplay,
 }
 
 impl WorkspaceScan {
@@ -107,6 +109,8 @@ impl WorkspaceScan {
             directory: directory.map(Path::to_path_buf),
             reconstruct_history: false,
             rolled_back: false,
+            inherited: false,
+            display_replay: super::DisplayReplay::default(),
         }
     }
 
@@ -117,9 +121,11 @@ impl WorkspaceScan {
         self.reconstruct_history = true;
     }
 
-    pub(super) fn observe(&mut self, session: &str, record: &Value) -> Result<()> {
+    pub(super) fn observe(&mut self, session: &str, record: &Value) {
+        self.reconstruct_history |= self.display_replay.observe(record);
         self.settings.observe(session, record);
         if records_history_base(record) {
+            self.inherited = true;
             self.directory = None;
             self.rolled_back = false;
             self.reconstruct_history = true;
@@ -128,17 +134,12 @@ impl WorkspaceScan {
                 self.directory = Some(PathBuf::from(cwd));
                 self.rolled_back = false;
             }
-        } else if record["type"] == "event_msg" && record["payload"]["type"] == "thread_rolled_back"
-        {
-            let count = record["payload"]["num_turns"]
-                .as_u64()
-                .context("Codex rollback marker has no valid num_turns")?;
-            self.rolled_back |= count > 0;
+        } else if super::encoded_rollback(record) {
+            self.rolled_back |= super::rollout_lines::rollback_turns(&record["payload"]) != Some(0);
             self.reconstruct_history = true;
         } else if record["type"] == "compacted" {
             self.reconstruct_history = true;
         }
-        Ok(())
     }
 }
 
@@ -190,9 +191,12 @@ impl CodexAdapter {
 }
 
 impl CodexSession {
-    fn effective_and_startup_directories(&self) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-        let workspace = self.scan_workspace()?;
+    fn effective_and_startup_directories(mut self) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+        let workspace = self.scan_workspace(false)?;
         let effective = if workspace.rolled_back && !workspace.settings.has_owned() {
+            if workspace.inherited {
+                self.project_path = None;
+            }
             let (_, project, verified) = self.reconstructed_preview(rollout_file::LIMITS)?;
             project.filter(|_| verified)
         } else {
@@ -201,7 +205,7 @@ impl CodexSession {
         Ok((effective, workspace.settings.startup))
     }
 
-    pub(super) fn scan_workspace(&self) -> Result<WorkspaceScan> {
+    pub(super) fn scan_workspace(&self, inspect_displays: bool) -> Result<WorkspaceScan> {
         let limits = rollout_file::LIMITS;
         let mut remaining = limits.file_bytes;
         let mut reader = BufReader::new(rollout_file::open(&self.path)?);
@@ -221,7 +225,10 @@ impl CodexSession {
             remaining -= bytes;
             let oversized = matches!(kind, BoundedLine::Oversized);
             if !oversized {
-                match rollout_file::workspace_record_kind(&line) {
+                match rollout_file::workspace_record_kind(
+                    &line,
+                    inspect_displays && !workspace.reconstruct_history,
+                ) {
                     rollout_file::WorkspaceRecord::Other => continue,
                     rollout_file::WorkspaceRecord::Compacted => {
                         workspace.reconstruct_history = true;
@@ -229,7 +236,7 @@ impl CodexSession {
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
                         if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                            workspace.observe(&self.id, &record)?;
+                            workspace.observe(&self.id, &record);
                             continue;
                         }
                     }

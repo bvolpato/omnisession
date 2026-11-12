@@ -21,11 +21,12 @@ use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 5] = [
+const PARSER_SOURCES: [&[u8]; 6] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
     include_bytes!("current_rollout.rs"),
     include_bytes!("rollout_cache.rs"),
+    include_bytes!("paginated_workspace.rs"),
     include_bytes!("rollout_file.rs"),
 ];
 const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);

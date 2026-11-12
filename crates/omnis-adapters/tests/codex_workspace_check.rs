@@ -158,6 +158,64 @@ fn workspace_settings_belong_to_the_thread_and_survive_turn_rollback() -> Result
 }
 
 #[test]
+fn cached_and_uncached_workspace_selection_decode_the_same_rollback() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let session = SessionRef::new(Provider::Codex, ID);
+    let header = json!({"type":"session_meta","payload":{"id":ID,"cwd":"original"}});
+    let turn = |id: &str, cwd: &str| {
+        [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}}),
+            json!({"type":"turn_context","payload":{"turn_id":id,"cwd":cwd}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":id}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id}}),
+        ]
+        .map(|row| row.to_string())
+        .join("\n")
+    };
+    let first = turn("first", "original");
+    let second = turn("second", "second");
+    for ext in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let home = root.path().join(ext);
+        let folder = home.join("sessions");
+        fs::create_dir_all(&folder)?;
+        let path = folder.join(format!("rollout-{ID}.{ext}"));
+        let adapter = CodexAdapter::with_root(&home);
+        for (payload, expected) in [
+            (
+                json!({"type":"thread_rolled_back","num_turns":1}),
+                "original",
+            ),
+            (json!({"type":14,"num_turns":1}), "original"),
+            (json!(["thread_rolled_back", 1]), "original"),
+            (json!([14, 1]), "original"),
+            (json!([14, 0]), "second"),
+            (json!([14, 4_294_967_296_u64]), "second"),
+            (json!([14, 1, 2]), "second"),
+        ] {
+            let rollback = json!({"type":"event_msg","payload":payload});
+            let revision =
+                write_rollout(&path, &format!("{header}\n{first}\n{second}\n{rollback}\n"))?;
+            let (uncached, _) = CodexAdapter::rollout_workspaces(&session, &path, revision)?;
+            assert_eq!(
+                uncached.as_deref(),
+                Some(Path::new(expected)),
+                "{ext} {payload}"
+            );
+            let cached = adapter.index_session(&session, Some(&path), 1)?;
+            assert_eq!(
+                cached.workspace_projection,
+                CodexWorkspaceProjection::Observed(uncached)
+            );
+            assert_eq!(
+                adapter.read_session(&session)?.workspace.current_dir,
+                Path::new(expected)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn selected_workspace_checks_the_source_and_uses_surviving_turns() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let session = SessionRef::new(Provider::Codex, ID);
@@ -258,12 +316,38 @@ fn a_missing_prefix_requires_a_surviving_local_directory_for_native_routing() ->
         "history_base":{"thread_id":"55555555-5555-4555-8555-555555555555",
         "end_ordinal_exclusive":2, "end_byte_offset":512}
     }});
-    let moved = json!({"type":"turn_context","payload":{"cwd":"next"}});
-    let later = json!({"type":"turn_context","payload":{"cwd":"later"}});
-    let started = json!({"type":"event_msg","payload":{"type":"task_started"}});
-    let user = json!({"type":"event_msg","payload":{"type":"user_message","message":"request"}});
+    let moved = json!({"type":"turn_context","payload":{"turn_id":"first","cwd":"next"}});
+    let later = json!({"type":"turn_context","payload":{"turn_id":"second","cwd":"later"}});
+    let started =
+        |id: &str| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+    let first = started("first");
+    let second = started("second");
+    let request = |turn: &str| {
+        let raw = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "internal_chat_message_metadata_passthrough":{"turn_id":turn},"id":turn,
+            "content":[{"type":"input_text","text":turn}]}});
+        let display = json!({"type":"event_msg","payload":{"type":"item_completed",
+            "thread_id":ID,"turn_id":turn,
+            "item":{"type":"UserMessage","id":turn,"content":[{"type":"text","text":turn}]}}});
+        format!("{raw}\n{display}")
+    };
+    let user = request("first");
+    let another = request("second");
     let rollback =
         json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
+    let write = |header: &serde_json::Value, tail: &str| {
+        let mut document = String::new();
+        for (index, mut row) in std::iter::once(header.clone())
+            .chain(tail.lines().map(|line| serde_json::from_str(line).unwrap()))
+            .enumerate()
+        {
+            row["ordinal"] = (2 + index).into();
+            row["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+            document.push_str(&row.to_string());
+            document.push('\n');
+        }
+        write_rollout(&path, &document)
+    };
     for (tail, effective) in [
         (String::new(), None),
         (moved.to_string(), Some(Path::new("next"))),
@@ -273,11 +357,11 @@ fn a_missing_prefix_requires_a_surviving_local_directory_for_native_routing() ->
             Some(Path::new("next")),
         ),
         (
-            format!("{started}\n{moved}\n{user}\n{started}\n{later}\n{user}\n{rollback}"),
+            format!("{first}\n{moved}\n{user}\n{second}\n{later}\n{another}\n{rollback}"),
             Some(Path::new("next")),
         ),
     ] {
-        let inherited_revision = write_rollout(&path, &format!("{inherited}\n{tail}\n"))?;
+        let inherited_revision = write(&inherited, &tail)?;
         let (effective_dir, startup) =
             CodexAdapter::rollout_workspaces(&session, &path, inherited_revision)?;
         assert_eq!(effective_dir.as_deref(), effective, "{tail}");
@@ -297,7 +381,7 @@ fn a_missing_prefix_requires_a_surviving_local_directory_for_native_routing() ->
         (String::new(), None),
         (moved.to_string(), Some("next".into())),
     ] {
-        write_rollout(&path, &format!("{subagent}\n{tail}\n"))?;
+        write(&subagent, &tail)?;
         let read = adapter.index_session(&session, Some(&path), u64::MAX)?;
         assert!(read.native_session.is_none());
         assert_eq!(

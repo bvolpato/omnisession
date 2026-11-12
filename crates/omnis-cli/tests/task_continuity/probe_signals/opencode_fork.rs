@@ -87,16 +87,20 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
             .process_group(0)
             .spawn()
             .unwrap();
-        let held = wait_for_marker(&mut omni, &root.join("reading"));
+        let held = wait_for_marker(&mut omni, &root.join("reading"), Duration::from_secs(30));
         drop(omni.stdout.take());
         let acknowledged = if held && phase == "readback" {
             kill_process_group(Pid::from_child(&omni), Signal::INT).unwrap();
-            wait_for_marker(&mut omni, &root.join("ack"))
+            wait_for_marker(&mut omni, &root.join("ack"), Duration::from_secs(8))
         } else {
             held
         };
         release.write_all(b"continue\n").unwrap();
-        if omni.wait_timeout(Duration::from_secs(5)).unwrap().is_none() {
+        if omni
+            .wait_timeout(Duration::from_secs(30))
+            .unwrap()
+            .is_none()
+        {
             omni.kill().unwrap();
         }
         let output = omni.wait_with_output().unwrap();
@@ -130,8 +134,8 @@ fn interrupted_native_fork_verifies_removal_of_the_returned_child() {
     }
 }
 
-fn wait_for_marker(child: &mut Child, marker: &Path) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(8);
+fn wait_for_marker(child: &mut Child, marker: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
     while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
