@@ -145,14 +145,17 @@ impl Store {
         let json =
             serde_json::to_string(&picked).map_err(|_| StoreError::InvalidSessionReference)?;
         let connection = self.connection.borrow();
-        let mut statement = connection.prepare_cached(
-            "SELECT doc.session_id, doc.source_file_id, doc.missing_ancestor_id, doc.source_contents_id
+        let sql = format!(
+            "SELECT trajectories.session_id, trajectories.source_file_id, trajectories.missing_ancestor_id, {contents}
              FROM json_each(?1) AS picked
-             JOIN session_trajectories AS doc ON doc.provider=?2 AND doc.session_id=(picked.value ->> 0)
-             LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
-             WHERE doc.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3 AND ((picked.value ->> 1) IS NULL OR hex(doc.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)))
-               ELSE hex(doc.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)) END"
-        ).map_err(database_error)?;
+             JOIN session_trajectories AS trajectories ON trajectories.provider=?2 AND trajectories.session_id=(picked.value ->> 0)
+             LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=trajectories.id AND origin.source_file=trajectories.source_file_id
+             {gap_join}
+             WHERE trajectories.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3 AND ((picked.value ->> 1) IS NULL OR hex(trajectories.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)))
+               ELSE hex(trajectories.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)) END"
+            ,contents = super::SEARCH_ACTIVE_CONTENTS, gap_join = super::SEARCH_GAP_JOIN
+        );
+        let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         statement
             .query_map(
                 params![

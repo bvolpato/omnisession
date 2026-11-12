@@ -273,11 +273,15 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
              ON chunks.id = session_trajectory_chunks_fts.rowid
          INNER JOIN session_trajectories AS trajectories
              ON trajectories.id = chunks.trajectory_id
+         {SEARCH_GAP_JOIN}
+         LEFT JOIN antigravity_gap_projections all_projections ON all_projections.trajectory_id=trajectories.id
          INNER JOIN eligible
              ON eligible.provider = trajectories.provider
             AND eligible.session_id = trajectories.session_id
             AND (eligible.file IS NULL OR (eligible.file = hex(trajectories.source_file_id)
-                 AND eligible.contents = hex(trajectories.source_contents_id)))
+                 AND eligible.contents = hex({SEARCH_ACTIVE_CONTENTS})))
+            AND (all_projections.trajectory_id IS NULL OR
+                 (chunks.chunk_index>=all_projections.first_chunk)=(active_projection.trajectory_id IS NOT NULL))
             AND (eligible.file IS NOT NULL OR NOT EXISTS (
                  SELECT 1 FROM session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_CODEX_CATALOG})))
             AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed
@@ -1256,7 +1260,12 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             .map_err(database_error)
     }
 
-    fn should_publish(&self, transaction: &Transaction<'_>, home: Option<&Path>) -> Result<bool> {
+    fn should_publish(
+        &self,
+        transaction: &Transaction<'_>,
+        home: Option<&Path>,
+        published: &mut HashSet<i64>,
+    ) -> Result<bool> {
         let revision = self.document.source_revision;
         let guard = if matches!(self.guard, TrajectorySourceGuard::ObservedRevision(_)) {
             self.guard
@@ -1290,7 +1299,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             return Ok(false);
         }
         guard?;
-        if let Some(accept) = database_receipts::accept_gap(transaction, self, home)? {
+        if let Some(accept) = database_receipts::accept_gap(transaction, self, home, published)? {
             return Ok(accept);
         }
         Ok(!self.retains_verified_antigravity_text(transaction, home)?)
@@ -1676,7 +1685,9 @@ const DOCUMENT_RECEIPT_SQL: &str =
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
          hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes, fully_scanned_bytes, verified_record_time, recovered_anchor_bytes,
          recovered_gap_start, observed_text_bytes, hex(observed_text_hash),
-         (SELECT hex(observed_contents) FROM antigravity_search_gaps WHERE trajectory_id=session_trajectories.id))
+         (SELECT hex(observed_contents) FROM antigravity_search_gaps WHERE trajectory_id=session_trajectories.id),
+         (SELECT json_array(document_version,hex(content_hash),derived_title,source_updated_at) FROM antigravity_gap_projections
+          WHERE trajectory_id=session_trajectories.id))
      FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
 
 fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
@@ -3213,7 +3224,7 @@ impl Store {
             .map_err(database_error)?;
         for write in prepared {
             let home = homes.get(&write.session.provider).map(PathBuf::as_path);
-            if !write.should_publish(&transaction, home)? {
+            if !write.should_publish(&transaction, home, &mut published)? {
                 continue;
             }
             let recovered = match write.legacy_sample_update(&transaction, home)? {
@@ -3604,7 +3615,7 @@ impl Store {
         Ok(())
     }
 
-    /// Returns a provider's native documents whose catalog selects a different file or contents.
+    /// Returns native documents that need a catalog or database gap check.
     ///
     /// # Errors
     ///
@@ -3614,11 +3625,23 @@ impl Store {
         provider: Provider,
     ) -> Result<std::collections::HashSet<SessionRef>> {
         let connection = self.connection.borrow();
-        let sql = format!(
-            "SELECT trajectories.session_id FROM session_trajectories AS trajectories
-             INNER JOIN session_index AS catalog ON {CONFLICTING_FILE_CATALOG}
-             WHERE trajectories.provider = ?1"
-        );
+        let sql = if matches!(
+            provider,
+            Provider::Antigravity | Provider::AntigravityDesktop
+        ) {
+            // An exact restore can match the primary receipt while a later observation still records a gap.
+            format!(
+                "SELECT trajectories.session_id FROM session_trajectories AS trajectories
+                 {SEARCH_GAP_JOIN}
+                 WHERE trajectories.provider = ?1 AND gap.trajectory_id IS NOT NULL"
+            )
+        } else {
+            format!(
+                "SELECT trajectories.session_id FROM session_trajectories AS trajectories
+                 INNER JOIN session_index AS catalog ON {CONFLICTING_FILE_CATALOG}
+                 WHERE trajectories.provider = ?1"
+            )
+        };
         let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         statement
             .query_map([provider.to_string()], |row| {
@@ -3663,8 +3686,9 @@ impl Store {
         &self,
         session: Option<&SessionRef>,
     ) -> Result<std::collections::HashMap<SessionRef, IndexedTitle>> {
-        let mut sql = format!("SELECT provider, session_id, derived_title, document_version,
-            source_updated_at, source_updated_submillis, coalesce(title_authoritative, source_complete),
+        let mut sql = format!("SELECT trajectories.provider, trajectories.session_id, {SEARCH_ACTIVE_TITLE},
+            coalesce(active_projection.document_version, trajectories.document_version),
+            coalesce(active_projection.source_updated_at, trajectories.source_updated_at), source_updated_submillis, coalesce(title_authoritative, source_complete),
             CASE WHEN trajectories.provider = 'omp' AND coalesce(trajectories.title_authoritative, trajectories.source_complete)
              THEN (SELECT coalesce(catalog.source_updated_submillis, 0)
                    FROM session_index AS catalog
@@ -3672,8 +3696,8 @@ impl Store {
                      AND catalog.updated_at = trajectories.source_updated_at AND
                      (catalog.source_updated_submillis = trajectories.source_updated_submillis
                       OR (catalog.source_updated_submillis IS NULL AND trajectories.source_complete))) END,
-            source_file_id, missing_ancestor_id, source_contents_id
-            FROM session_trajectories AS trajectories
+            trajectories.source_file_id, trajectories.missing_ancestor_id, {SEARCH_ACTIVE_CONTENTS}
+            FROM session_trajectories AS trajectories {SEARCH_GAP_JOIN}
             WHERE NOT EXISTS (SELECT 1 FROM session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_CODEX_CATALOG}))
               AND NOT EXISTS (SELECT 1 FROM trajectory_index_failures AS failed WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_CODEX_FAILURE})) ");
         let scope = if let Some(session) = session {
@@ -3682,7 +3706,7 @@ impl Store {
             vec![session.provider.to_string(), session.id.clone()]
         } else {
             sql.push_str(
-                "AND (derived_title IS NOT NULL OR (provider = 'omp' AND title_authoritative = 1))",
+                "AND (active_projection.trajectory_id IS NOT NULL OR trajectories.derived_title IS NOT NULL OR (provider = 'omp' AND title_authoritative = 1))",
             );
             Vec::new()
         };
@@ -4526,7 +4550,7 @@ impl Store {
     pub fn trajectory_titles_with_sources(&self) -> Result<Vec<IndexedTrajectoryTitle>> {
         let connection = self.connection.borrow();
         let sql = format!(
-            "{} WHERE trajectories.provider = 'codex' OR length(trajectories.derived_title) > 0 OR (trajectories.provider='omp' AND trajectories.title_authoritative)",
+            "{} WHERE trajectories.provider = 'codex' OR active_projection.trajectory_id IS NOT NULL OR length(trajectories.derived_title) > 0 OR (trajectories.provider='omp' AND trajectories.title_authoritative)",
             indexed_titles_sql()
         );
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
@@ -4751,10 +4775,13 @@ const SEARCH_GAP_JOIN: &str = "LEFT JOIN antigravity_search_gaps gap
     ON gap.trajectory_id=trajectories.id AND gap.source_file=trajectories.source_file_id
     AND gap.indexed_contents=trajectories.source_contents_id AND gap.indexed_hash=trajectories.content_hash
     AND EXISTS (SELECT 1 FROM native_search_document_homes h WHERE h.trajectory_id=trajectories.id
-                AND h.verification=1 AND h.source_file=gap.source_file AND h.source_home=gap.source_home)";
+                AND h.verification=1 AND h.source_file=gap.source_file AND h.source_home=gap.source_home)
+    LEFT JOIN antigravity_gap_projections active_projection ON active_projection.trajectory_id=gap.trajectory_id";
 
 const SEARCH_COVERAGE_COLUMNS: &str = "trajectories.source_complete AND gap.trajectory_id IS NULL,
-    trajectories.complete AND gap.trajectory_id IS NULL, trajectories.indexed_byte_count, trajectories.source_byte_count,
+    trajectories.complete AND gap.trajectory_id IS NULL,
+    CASE WHEN gap.trajectory_id IS NULL THEN trajectories.indexed_byte_count ELSE coalesce(active_projection.indexed_byte_count,trajectories.indexed_byte_count) END,
+    CASE WHEN gap.trajectory_id IS NULL THEN trajectories.source_byte_count ELSE coalesce(active_projection.source_byte_count,trajectories.source_byte_count) END,
     CASE WHEN gap.trajectory_id IS NULL THEN trajectories.truncation_strategy ELSE 'source_incomplete' END";
 
 fn single_clause_page_sql(
@@ -5626,13 +5653,21 @@ fn insert_trajectory_chunks(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
 ) -> Result<()> {
+    insert_trajectory_chunks_at(transaction, documents, 0)
+}
+
+fn insert_trajectory_chunks_at(
+    transaction: &Transaction<'_>,
+    documents: &[(i64, &str)],
+    first: i64,
+) -> Result<()> {
     rebuild_full_text_index_after_unreadable_chunk(transaction)?;
     let (mut rows, mut texts) = (Vec::new(), Vec::new());
     for (trajectory_id, text) in documents {
         for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
             let chunk_index =
                 i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
-            rows.push((*trajectory_id, chunk_index));
+            rows.push((*trajectory_id, first + chunk_index));
             texts.push(chunk);
         }
     }
@@ -5915,7 +5950,7 @@ fn stored_projection_text(
     length: usize,
 ) -> Result<Option<String>> {
     let mut statement = transaction.prepare_cached(
-        "SELECT stored_text FROM session_trajectory_chunk_rows WHERE trajectory_id=?1 ORDER BY chunk_index",
+        "SELECT stored_text FROM session_trajectory_chunk_rows WHERE trajectory_id=?1 AND NOT EXISTS (SELECT 1 FROM antigravity_gap_projections p WHERE p.trajectory_id=?1 AND chunk_index>=p.first_chunk) ORDER BY chunk_index",
     ).map_err(database_error)?;
     let mut rows = statement.query([id]).map_err(database_error)?;
     let mut previous = String::with_capacity(length);
@@ -6997,15 +7032,19 @@ impl PreparedTrajectoryWrite<'_, '_> {
     }
 }
 
+const SEARCH_ACTIVE_TITLE: &str = "CASE WHEN active_projection.trajectory_id IS NULL THEN trajectories.derived_title ELSE active_projection.derived_title END";
+const SEARCH_ACTIVE_CONTENTS: &str = "CASE WHEN active_projection.trajectory_id IS NULL THEN trajectories.source_contents_id ELSE gap.observed_contents END";
+
 fn indexed_titles_sql() -> String {
     format!("SELECT trajectories.provider, trajectories.session_id,
                 CASE WHEN failed.session_id IS NULL AND catalog.session_id IS NULL
-                     THEN nullif(trajectories.derived_title, '') END,
+                     THEN nullif({SEARCH_ACTIVE_TITLE}, '') END,
                 CASE WHEN catalog.session_id IS NOT NULL THEN catalog.source_file_id
                      WHEN failed.session_id IS NOT NULL THEN failed.source_file_id ELSE trajectories.source_file_id END,
                 CASE WHEN catalog.session_id IS NOT NULL THEN catalog.source_contents_id
-                     WHEN failed.session_id IS NOT NULL THEN failed.source_contents_id ELSE trajectories.source_contents_id END,
-                trajectories.source_updated_at, trajectories.document_version,
+                     WHEN failed.session_id IS NOT NULL THEN failed.source_contents_id ELSE {SEARCH_ACTIVE_CONTENTS} END,
+                coalesce(active_projection.source_updated_at, trajectories.source_updated_at),
+                coalesce(active_projection.document_version, trajectories.document_version),
                 CASE WHEN trajectories.provider='omp' AND failed.session_id IS NULL AND catalog.session_id IS NULL
                      AND coalesce(trajectories.title_authoritative,trajectories.source_complete)
                      THEN trajectories.source_updated_submillis END,
@@ -7016,7 +7055,7 @@ fn indexed_titles_sql() -> String {
                       AND c.updated_at=trajectories.source_updated_at AND
                       (c.source_updated_submillis=trajectories.source_updated_submillis OR
                        (c.source_updated_submillis IS NULL AND trajectories.source_complete))) END
-             FROM session_trajectories AS trajectories
+             FROM session_trajectories AS trajectories {SEARCH_GAP_JOIN}
              LEFT JOIN trajectory_index_failures AS failed ON ({CONFLICTING_CODEX_FAILURE}) OR ({HIDDEN_FAILED_TRAJECTORY})
              LEFT JOIN session_index AS catalog ON ({CONFLICTING_CODEX_CATALOG}) OR ({CONFLICTING_FILE_CATALOG})")
 }

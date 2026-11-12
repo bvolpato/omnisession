@@ -22,7 +22,31 @@ pub(crate) fn initialize(tx: &Transaction<'_>) -> Result<()> {
             trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
             source_home BLOB NOT NULL, source_file BLOB NOT NULL, indexed_contents BLOB NOT NULL,
             indexed_hash BLOB NOT NULL, observed_contents BLOB NOT NULL
-        )",
+        );
+        CREATE TABLE IF NOT EXISTS antigravity_gap_projections (
+            trajectory_id INTEGER PRIMARY KEY REFERENCES antigravity_search_gaps(trajectory_id) ON DELETE CASCADE,
+            first_chunk INTEGER NOT NULL, source_byte_count INTEGER NOT NULL,
+            indexed_byte_count INTEGER NOT NULL, content_hash BLOB NOT NULL, document_version INTEGER NOT NULL,
+            derived_title TEXT, source_updated_at INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS antigravity_gap_revision_changed AFTER UPDATE ON antigravity_search_gaps
+        WHEN (old.source_home,old.source_file,old.indexed_contents,old.indexed_hash,old.observed_contents)
+          IS NOT (new.source_home,new.source_file,new.indexed_contents,new.indexed_hash,new.observed_contents)
+        BEGIN
+            DELETE FROM antigravity_gap_projections WHERE trajectory_id=old.trajectory_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS antigravity_gap_chunks_replaced
+        AFTER DELETE ON session_trajectory_chunk_rows
+        WHEN old.chunk_index=0 AND EXISTS (
+            SELECT 1 FROM antigravity_gap_projections WHERE trajectory_id=old.trajectory_id
+        )
+        BEGIN
+            DELETE FROM antigravity_search_gaps WHERE trajectory_id=old.trajectory_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS antigravity_gap_projections_removed AFTER DELETE ON antigravity_gap_projections
+        BEGIN
+            DELETE FROM session_trajectory_chunk_rows WHERE trajectory_id=old.trajectory_id AND chunk_index>=old.first_chunk;
+        END;",
     )
     .map_err(database_error)?;
     for (provider, table) in RECEIPT_TABLES {
@@ -125,12 +149,9 @@ pub(super) fn record_verified(
     write: &crate::PreparedTrajectoryWrite<'_, '_>,
     home: &std::path::Path,
 ) -> Result<()> {
-    let Some(projection) = write.document.projection else {
+    if receipt_table(write.session.provider).is_none() {
         return Ok(());
-    };
-    let Some(steps) = projection.database_steps.as_deref() else {
-        return Ok(());
-    };
+    }
     let revision = write.document.source_revision;
     if let (Some(file), Some(contents)) = (revision.file, revision.contents) {
         let matches: bool = tx.query_row(
@@ -142,16 +163,16 @@ pub(super) fn record_verified(
         if matches {
             tx.execute(
                 "DELETE FROM antigravity_search_gaps WHERE trajectory_id=(
-                SELECT id FROM session_trajectories WHERE provider=?1 AND session_id=?2)
-                AND source_home=?3 AND source_file=?4",
-                params![
-                    write.session.provider.to_string(),
-                    write.session.id,
-                    home.as_os_str().as_encoded_bytes(),
-                    file.as_bytes()
-                ],
+                SELECT id FROM session_trajectories WHERE provider=?1 AND session_id=?2)",
+                params![write.session.provider.to_string(), write.session.id],
             )
             .map_err(database_error)?;
+            let Some(projection) = write.document.projection else {
+                return Ok(());
+            };
+            let Some(steps) = projection.database_steps.as_deref() else {
+                return Ok(());
+            };
             let canonical;
             let steps = if projection.database_aliases.is_empty() {
                 steps
@@ -181,10 +202,46 @@ pub(super) fn record_verified(
     Ok(())
 }
 
+fn write_current_projection(
+    tx: &Transaction<'_>,
+    write: &crate::PreparedTrajectoryWrite<'_, '_>,
+    id: i64,
+) -> Result<bool> {
+    let doc = write.document;
+    let timestamp = doc.source_updated_at.timestamp_millis();
+    let same: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM antigravity_gap_projections WHERE trajectory_id=?1
+         AND content_hash=?2 AND source_byte_count=?3 AND indexed_byte_count=?4 AND document_version=?5
+         AND derived_title IS ?6 AND source_updated_at=?7)",
+        params![id, write.content_hash, write.source_byte_count, write.indexed_byte_count, doc.document_version, doc.derived_title,timestamp],
+        |row| row.get(0),
+    ).map_err(database_error)?;
+    if same {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM antigravity_gap_projections WHERE trajectory_id=?1",
+        [id],
+    )
+    .map_err(database_error)?;
+    let first: i64 = tx.query_row(
+        "SELECT coalesce(max(chunk_index)+1,0) FROM session_trajectory_chunk_rows WHERE trajectory_id=?1",
+        [id], |row|row.get(0),
+    ).map_err(database_error)?;
+    tx.execute(
+        "INSERT INTO antigravity_gap_projections (trajectory_id,first_chunk,source_byte_count,indexed_byte_count,
+          content_hash,document_version,derived_title,source_updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![id, first, write.source_byte_count, write.indexed_byte_count, write.content_hash, doc.document_version,doc.derived_title,timestamp],
+    ).map_err(database_error)?;
+    crate::insert_trajectory_chunks_at(tx, &[(id, doc.redacted_text)], first)?;
+    Ok(true)
+}
+
 pub(super) fn accept_gap(
     tx: &Transaction<'_>,
     write: &crate::PreparedTrajectoryWrite<'_, '_>,
     home: Option<&std::path::Path>,
+    published: &mut std::collections::HashSet<i64>,
 ) -> Result<Option<bool>> {
     use crate::{SessionTrajectoryOrigin, optional_uuid, stored_projection_text};
     let Some(projection) = write.document.projection.filter(|p| p.database_gap) else {
@@ -220,16 +277,21 @@ pub(super) fn accept_gap(
     let Some((id, len, Some(contents), hash, strategy)) = prior else {
         return Ok(Some(false));
     };
-    let decision = |accepted: bool| -> Result<Option<bool>> {
+    let mut decision = |accepted: bool| -> Result<Option<bool>> {
         if !accepted && let Some(observed) = revision.contents {
-            tx.execute("INSERT INTO antigravity_search_gaps
+            let changed = tx.execute("INSERT INTO antigravity_search_gaps
                 (trajectory_id,source_home,source_file,indexed_contents,indexed_hash,observed_contents)
                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(trajectory_id) DO UPDATE SET
                 source_home=excluded.source_home,source_file=excluded.source_file,
                 indexed_contents=excluded.indexed_contents,indexed_hash=excluded.indexed_hash,
-                observed_contents=excluded.observed_contents",
+                observed_contents=excluded.observed_contents
+                WHERE (source_home,source_file,indexed_contents,indexed_hash,observed_contents)
+                   IS NOT (excluded.source_home,excluded.source_file,excluded.indexed_contents,excluded.indexed_hash,excluded.observed_contents)",
                 params![id,home,file.as_bytes(),contents.as_bytes(),hash,observed.as_bytes()]
             ).map_err(database_error)?;
+            if write_current_projection(tx, write, id)? || changed != 0 {
+                published.insert(id);
+            }
         }
         Ok(Some(accepted))
     };
@@ -290,6 +352,7 @@ mod tests {
             "CREATE TABLE session_trajectories (
                 provider TEXT, session_id TEXT, PRIMARY KEY(provider, session_id)
              );
+             CREATE TABLE session_trajectory_chunk_rows (trajectory_id INTEGER, chunk_index INTEGER);
              INSERT INTO session_trajectories VALUES('antigravity-desktop','session'), ('antigravity','session');",
         )
         .unwrap();

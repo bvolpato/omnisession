@@ -274,8 +274,10 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
              INSERT INTO steps VALUES (2,x'80'),(3,x'080fa2010b0a096e6578747265706c79');",
             )
             .unwrap();
-        assert!(search("nextreply", false).is_null());
-        assert_eq!(search("firstrepl", true), "preview");
+        assert_eq!(search("nextreply", false), "preview");
+        assert_eq!(search("nextreply", true), "preview");
+        assert!(search("firstrepl", true).is_null());
+        assert_eq!(search("changedxx", true), "preview");
         database
             .execute_batch(
                 "DELETE FROM steps WHERE idx>=2;
@@ -330,8 +332,8 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
                 .iter()
                 .any(|event| event["payload"]["text"] == "laterword")
         );
-        assert!(search("laterword", true).is_null());
-        assert!(search("laterword", false).is_null());
+        assert_eq!(search("laterword", true), "preview");
+        assert_eq!(search("laterword", false), "preview");
         assert_eq!(search("morevalue", true), "preview");
     }
 }
@@ -1151,6 +1153,35 @@ fn search_reads_committed_antigravity_steps_from_the_wal() {
             "{provider}"
         );
         assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+        drop(writer);
+        assert_eq!(search("restored")["results"][0]["coverage"], "complete");
+
+        let backup = root.path().join("backup.db");
+        fs::copy(&database, &backup).unwrap();
+        let backup_writer = Connection::open(&backup).unwrap();
+        backup_writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+             UPDATE steps SET step_payload=x'080e9a01070a056f74686572' WHERE idx=1;
+             INSERT INTO steps VALUES (2,x'80');",
+            )
+            .unwrap();
+        let wal = database.with_extension("db-wal");
+        for _ in 0..2 {
+            fs::copy(backup.with_extension("db-wal"), &wal).unwrap();
+            let observed = search("other");
+            assert_eq!(
+                observed["results"][0]["coverage"], "preview",
+                "{provider} {observed}"
+            );
+            fs::remove_file(&wal).unwrap();
+            assert_eq!(
+                search("restored")["results"][0]["coverage"],
+                "complete",
+                "{provider}"
+            );
+            assert_eq!(search("restored")["index"]["stale"], 0, "{provider}");
+        }
     }
 }
 

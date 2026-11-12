@@ -1301,7 +1301,7 @@ fn push_database_steps_with_limits(
         builder,
         retained,
         stored,
-        declared_steps > stored,
+        declared_steps != stored && omitted > 0,
         oldest_ambiguous_row,
     );
     let coverage = DatabaseCoverage {
@@ -1323,14 +1323,14 @@ fn push_ordered_steps(
     builder: &mut EventBuilder,
     retained: Vec<(usize, Option<i64>, DatabaseStepEvent)>,
     stored: usize,
-    missing_rows: bool,
+    require_contiguous_prefix: bool,
     oldest_ambiguous_row: Option<usize>,
 ) -> Option<u64> {
     let mut prefix_end = None;
     let mut position = stored;
     for (row, index, event) in retained.into_iter().rev() {
-        let missing_before =
-            missing_rows && index.and_then(|idx| usize::try_from(idx).ok()) != Some(stored - row);
+        let missing_before = require_contiguous_prefix
+            && index.and_then(|idx| usize::try_from(idx).ok()) != Some(stored - row);
         if missing_before
             || row != position
             || oldest_ambiguous_row.is_none_or(|oldest| row <= oldest)
@@ -1349,7 +1349,7 @@ fn push_ordered_steps(
         );
         builder.set_last_database_step_hash(event.hash);
     }
-    if position > 0 || missing_rows {
+    if position > 0 || require_contiguous_prefix {
         prefix_end.get_or_insert_with(|| builder.checkpoint());
     }
     prefix_end
