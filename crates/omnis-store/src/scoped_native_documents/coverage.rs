@@ -194,10 +194,8 @@ impl PriorCoverage {
         {
             return Ok(PartialWrite::Replace);
         }
-        let fixed_version = match write.session.provider {
-            crate::Provider::Antigravity => 11,
-            crate::Provider::AntigravityDesktop => 12,
-            _ => return Ok(PartialWrite::Keep),
+        let Some(fixed_version) = corrected_utf8_version(write.session.provider) else {
+            return Ok(PartialWrite::Keep);
         };
         let rows_survive = prior_steps.as_deref().is_none_or(|previous| {
             incoming.is_some_and(|rows| retains_steps(previous, rows, false))
@@ -227,6 +225,10 @@ impl PriorCoverage {
             let Some(incoming) = incoming else {
                 return Ok(PartialWrite::Keep);
             };
+            if write.document.provider_limited && previous == incoming && hash == write.content_hash
+            {
+                return Ok(PartialWrite::Replace);
+            }
             if !retains_steps(&previous, incoming, self.full_or_limited) {
                 return Ok(PartialWrite::Keep);
             }
@@ -318,6 +320,15 @@ fn retains_standalone_text(previous: &str, incoming: &str) -> bool {
         }
     }
     false
+}
+
+fn corrected_utf8_version(provider: crate::Provider) -> Option<u32> {
+    match provider {
+        crate::Provider::Antigravity => Some(11),
+        crate::Provider::AntigravityDesktop => Some(12),
+        crate::Provider::AntigravityIde => Some(8),
+        _ => None,
+    }
 }
 
 fn retains_steps(previous: &[Uuid], incoming: &[Uuid], strict: bool) -> bool {

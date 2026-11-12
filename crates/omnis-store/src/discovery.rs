@@ -253,7 +253,7 @@ impl CatalogWrite<'_> {
         tx: &Transaction<'_>,
         provider: Provider,
     ) -> Result<Option<i64>> {
-        if provider != Provider::AntigravityDesktop {
+        if crate::desktop_declarations::table(provider).is_none() {
             return Ok(None);
         }
         match self {
@@ -262,8 +262,12 @@ impl CatalogWrite<'_> {
             Self::Publish(attempt, _, _) => tx
                 .query_row(
                     "SELECT desktop_generation FROM session_index_reader_checks
-                 WHERE provider='antigravity-desktop' AND reader_version=?1 AND attempt_id=?2",
-                    params![attempt.version, attempt.id.into_bytes()],
+                 WHERE provider=?3 AND reader_version=?1 AND attempt_id=?2",
+                    params![
+                        attempt.version,
+                        attempt.id.into_bytes(),
+                        provider.to_string()
+                    ],
                     |r| r.get(0),
                 )
                 .optional()

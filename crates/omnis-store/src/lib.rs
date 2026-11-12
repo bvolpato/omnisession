@@ -326,7 +326,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                 CASE WHEN excluded.provider <> 'codex' OR excluded.origin <> 'native' THEN
                           excluded.derived_title IS NOT NULL
                           OR (?18 AND (excluded.native_summary <> session_trajectories.native_summary
-                              OR ((session_trajectories.source_file_id IS NOT NULL OR excluded.provider IN ('antigravity','antigravity-desktop'))
+                              OR ((session_trajectories.source_file_id IS NOT NULL OR excluded.provider IN ('antigravity','antigravity-desktop','antigravity-ide'))
                                   AND excluded.source_file_id IS NOT session_trajectories.source_file_id)))
                           OR (excluded.source_complete AND excluded.truncation_strategy IN (
                               'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
@@ -644,6 +644,7 @@ impl DiscoveryScope {
         CatalogListing {
             scope: self,
             file_at: Some(file_at),
+            database_alias_counts: None,
         }
     }
 
@@ -673,17 +674,29 @@ impl DiscoveryScope {
             Self::DesktopDatabasesWithoutSummaries => (Vec::new(), MissingDesktopSummaries::All),
             _ => return Ok((Vec::new(), MissingDesktopSummaries::None)),
         };
-        if provider != Provider::AntigravityDesktop {
+        if desktop_declarations::table(provider).is_none() {
             return Err(StoreError::InvalidSessionReference);
         }
         Ok(observed)
     }
 }
 
+type DatabaseAliasCounts<'a> = &'a dyn Fn(&str) -> Option<usize>;
+
 /// A discovery scope and any physical file identities observed in the same listing.
 pub struct CatalogListing<'a> {
     scope: DiscoveryScope,
     file_at: Option<&'a dyn Fn(usize) -> Option<Uuid>>,
+    database_alias_counts: Option<DatabaseAliasCounts<'a>>,
+}
+
+impl<'a> CatalogListing<'a> {
+    /// Supplies counts declared by verified IDE database summaries in this listing.
+    #[must_use]
+    pub fn with_database_alias_counts(mut self, counts: &'a dyn Fn(&str) -> Option<usize>) -> Self {
+        self.database_alias_counts = Some(counts);
+        self
+    }
 }
 
 impl From<DiscoveryScope> for CatalogListing<'_> {
@@ -691,6 +704,7 @@ impl From<DiscoveryScope> for CatalogListing<'_> {
         Self {
             scope,
             file_at: None,
+            database_alias_counts: None,
         }
     }
 }
@@ -1008,7 +1022,7 @@ impl TrajectorySourceGuard {
     pub const fn uses_catalog_home(provider: Provider) -> bool {
         matches!(
             provider,
-            Provider::Antigravity | Provider::AntigravityDesktop
+            Provider::Antigravity | Provider::AntigravityDesktop | Provider::AntigravityIde
         )
     }
 
@@ -1045,6 +1059,15 @@ impl TrajectorySourceGuard {
             && !summaries_unavailable
             && let Self::ObservedDocument(observation) = &mut self
         {
+            observation.desktop_steps = Some(count);
+        }
+        self
+    }
+
+    /// Records the verified summary count for an IDE session read from a Desktop-format database.
+    #[must_use]
+    pub fn with_database_alias_step_count(mut self, count: usize) -> Self {
+        if let Self::ObservedDocument(observation) = &mut self {
             observation.desktop_steps = Some(count);
         }
         self
@@ -2233,7 +2256,8 @@ impl Store {
                 "SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
                     created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
              FROM scoped_session_catalog AS catalog LEFT JOIN native_catalog_homes USING(provider,session_id)
-             WHERE catalog.provider = ?1 AND (home IS NULL OR NOT verified OR home = ?2)
+             WHERE catalog.provider = ?1 AND CASE WHEN catalog.provider='antigravity-ide' THEN verified AND home=?2
+                 ELSE home IS NULL OR NOT verified OR home=?2 END
              ORDER BY updated_at IS NULL, updated_at DESC, catalog.session_id",
             )
             .map_err(database_error)?;
@@ -2282,8 +2306,22 @@ impl Store {
         antigravity: Option<&Path>,
         desktop: Option<&Path>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
+        self.cached_picker_sessions_with_titles_for_native_homes(antigravity, desktop, None)
+    }
+
+    /// Reads cached picker entries for each selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or its title evidence cannot be read.
+    pub fn cached_picker_sessions_with_titles_for_native_homes(
+        &self,
+        antigravity: Option<&Path>,
+        desktop: Option<&Path>,
+        ide: Option<&Path>,
+    ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
         self.read_trajectory_search(|snapshot| {
-            snapshot.read_cached_sessions_with_titles(None, true, Some([antigravity, desktop]))
+            snapshot.read_cached_sessions_with_titles(None, true, Some([antigravity, desktop, ide]))
         })
     }
 
@@ -2435,10 +2473,10 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider = session.provider.to_string();
-        if session.provider == Provider::AntigravityDesktop {
+        if let Some(table) = desktop_declarations::table(session.provider) {
             transaction
                 .execute(
-                    "DELETE FROM desktop_step_declarations WHERE session_id=?1",
+                    &format!("DELETE FROM {table} WHERE session_id=?1"),
                     [&session.id],
                 )
                 .map_err(database_error)?;
@@ -2519,6 +2557,7 @@ impl Store {
             .map(|binding| binding.session);
         let provider = session.provider.to_string();
         for statement in [
+            "DELETE FROM ide_step_declarations WHERE ?1='antigravity-ide' AND session_id=?2",
             "DELETE FROM desktop_step_declarations WHERE ?1='antigravity-desktop' AND session_id=?2",
             "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
             "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
@@ -2798,7 +2837,6 @@ impl Store {
         home: &Path,
         sessions: &[IndexedSession],
     ) -> Result<Vec<IndexedSession>> {
-        validate_discovered_sessions(Provider::AntigravityDesktop, sessions)?;
         retain_desktop_summaries(
             &self.connection.borrow(),
             home,
@@ -2819,15 +2857,14 @@ impl Store {
         file: Uuid,
     ) -> Result<Option<usize>> {
         validate_session_ref(session)?;
-        if session.provider != Provider::AntigravityDesktop {
-            return Err(StoreError::InvalidSessionReference);
-        }
+        let table = desktop_declarations::table(session.provider)
+            .ok_or(StoreError::InvalidSessionReference)?;
         self.connection
             .borrow()
-            .prepare_cached(
-                "SELECT steps FROM desktop_step_declarations
-                 WHERE session_id=?1 AND source_home=?2 AND source_file=?3",
-            )
+            .prepare_cached(&format!(
+                "SELECT steps FROM {table}
+                 WHERE session_id=?1 AND source_home=?2 AND source_file=?3"
+            ))
             .and_then(|mut statement| {
                 statement
                     .query_row(
@@ -2866,7 +2903,11 @@ impl Store {
         guard: discovery::CatalogWrite<'_>,
         catalog: Option<CatalogNameObservations<'_>>,
     ) -> Result<bool> {
-        let CatalogListing { scope, file_at } = scope.into();
+        let CatalogListing {
+            scope,
+            file_at,
+            database_alias_counts,
+        } = scope.into();
         if scope == DiscoveryScope::Workspace
             && (matches!(guard, discovery::CatalogWrite::Publish(..))
                 || sessions.is_empty() && matches!(guard, discovery::CatalogWrite::Unchecked))
@@ -2934,6 +2975,7 @@ impl Store {
                         home,
                         &summaries_unavailable,
                         desktop_generation,
+                        database_alias_counts.and_then(|counts| counts(&session.session.id)),
                     )?;
                 }
             }
@@ -3254,7 +3296,8 @@ impl Store {
     ) -> Result<usize> {
         if !TrajectorySourceGuard::uses_catalog_home(metadata.session.provider)
             || (desktop_summaries_unavailable
-                && (metadata.session.provider != Provider::AntigravityDesktop || home.is_none()))
+                && (desktop_declarations::table(metadata.session.provider).is_none()
+                    || home.is_none()))
             || document.origin == SessionTrajectoryOrigin::ImportedBundle
             || document.source_revision.file.is_none()
             || document.source_revision.contents.is_none()
@@ -3884,6 +3927,46 @@ impl Store {
         Ok(TrajectorySourceGuard::ObservedDocument(observation))
     }
 
+    /// Checks whether a previously scanned archive covers this exact selected native source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive cannot be read.
+    pub fn current_limited_native_archive(
+        &self,
+        session: &SessionRef,
+        home: &Path,
+        revision: SourceRevision,
+        version: u32,
+    ) -> Result<bool> {
+        let (Some(file), Some(contents)) = (revision.file, revision.contents) else {
+            return Ok(false);
+        };
+        self.connection
+            .borrow()
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM scoped_native_documents d
+             JOIN native_catalog_homes h ON h.provider=d.provider AND h.session_id=d.session_id
+             WHERE d.provider=?1 AND d.session_id=?2 AND d.source_home=?3 AND d.source_file=?4
+               AND d.source_contents=?5 AND d.document_version=?6 AND d.provider_limited
+               AND h.verified AND h.home=d.source_home)",
+            )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    params![
+                        session.provider.to_string(),
+                        session.id,
+                        home.as_os_str().as_encoded_bytes(),
+                        file.as_bytes(),
+                        contents.as_bytes(),
+                        version
+                    ],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(database_error)
+    }
+
     /// Returns the indexing state of every cached search document.
     ///
     /// # Errors
@@ -4466,11 +4549,44 @@ impl TrajectorySearchSnapshot<'_> {
         self.read_cached_sessions_with_titles(provider, false, None)
     }
 
+    /// Reads cached sessions while limiting IDE entries to their verified home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or ownership records cannot be read.
+    pub fn cached_sessions_with_titles_for_ide_home(
+        &self,
+        provider: Option<Provider>,
+        ide_home: Option<&Path>,
+    ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
+        let (mut sessions, mut titles) = self.cached_sessions_with_titles(provider)?;
+        if provider.is_some_and(|provider| provider != Provider::AntigravityIde) {
+            return Ok((sessions, titles));
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT session_id FROM native_catalog_homes WHERE provider='antigravity-ide' AND verified AND home=?1",
+        ).map_err(database_error)?;
+        let allowed: std::collections::HashSet<String> = statement
+            .query_map(
+                [ide_home.map(|home| home.as_os_str().as_encoded_bytes())],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)?;
+        let selected = |session: &SessionRef| {
+            session.provider != Provider::AntigravityIde || allowed.contains(&session.id)
+        };
+        sessions.retain(|entry| selected(&entry.session));
+        titles.retain(|entry| selected(&entry.session));
+        Ok((sessions, titles))
+    }
+
     fn read_cached_sessions_with_titles(
         &self,
         provider: Option<Provider>,
         picker: bool,
-        homes: Option<[Option<&Path>; 2]>,
+        homes: Option<[Option<&Path>; 3]>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
         let title = if picker {
             "CASE WHEN catalog.name_observable THEN catalog.title END"
@@ -4483,12 +4599,15 @@ impl TrajectorySearchSnapshot<'_> {
             homes.map(|paths| paths.map(|path| path.map(|p| p.as_os_str().as_encoded_bytes())));
         let (filter, parameters): (&str, &[&dyn rusqlite::ToSql]) = match (&provider, &home_bytes) {
             (Some(provider), _) => ("WHERE catalog.provider=?1", &[provider]),
-            (_, Some([antigravity, desktop])) => (
-                "WHERE NOT EXISTS (SELECT 1 FROM native_catalog_homes AS native
+            (_, Some([antigravity, desktop, ide])) => (
+                "WHERE (catalog.provider <> 'antigravity-ide' OR EXISTS (
+                    SELECT 1 FROM native_catalog_homes AS native WHERE native.provider=catalog.provider
+                    AND native.session_id=catalog.session_id AND native.verified AND native.home=?3))
+                 AND NOT EXISTS (SELECT 1 FROM native_catalog_homes AS native
                  WHERE native.provider=catalog.provider AND native.session_id=catalog.session_id
                    AND native.verified AND native.home IS NOT CASE native.provider
-                     WHEN 'antigravity' THEN ?1 WHEN 'antigravity-desktop' THEN ?2 END)",
-                &[antigravity, desktop],
+                     WHEN 'antigravity' THEN ?1 WHEN 'antigravity-desktop' THEN ?2 WHEN 'antigravity-ide' THEN ?3 END)",
+                &[antigravity, desktop, ide],
             ),
             _ => ("", &[]),
         };
@@ -4522,9 +4641,13 @@ impl TrajectorySearchSnapshot<'_> {
             .map_err(|_| StoreError::CorruptStore)?;
         let mut titles = self.read_trajectory_titles(true)?;
         if let Some(homes) = homes {
-            for (provider, home) in [Provider::Antigravity, Provider::AntigravityDesktop]
-                .into_iter()
-                .zip(homes)
+            for (provider, home) in [
+                Provider::Antigravity,
+                Provider::AntigravityDesktop,
+                Provider::AntigravityIde,
+            ]
+            .into_iter()
+            .zip(homes)
             {
                 let Some(home) = home else {
                     titles.retain(|row| row.session.provider != provider);
@@ -5546,7 +5669,7 @@ fn record_verified_document_home(
     let observed_home = matches!(observation.catalog, CatalogObservation::Verified { .. });
     if !matches!(
         write.session.provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
+        Provider::Antigravity | Provider::AntigravityDesktop | Provider::AntigravityIde
     ) || !(explicit_home || observed_home)
     {
         return Ok(());
@@ -5554,9 +5677,9 @@ fn record_verified_document_home(
     if !explicit_home && let Some(steps) = observation.desktop_steps {
         let home: Vec<u8> = transaction
             .query_row(
-                "SELECT home FROM native_catalog_homes WHERE provider='antigravity-desktop'
+                "SELECT home FROM native_catalog_homes WHERE provider=?2
              AND session_id=?1 AND verified",
-                [&write.session.id],
+                params![write.session.id, write.session.provider.to_string()],
                 |r| r.get(0),
             )
             .map_err(database_error)?;
@@ -5649,16 +5772,22 @@ fn retain_desktop_summaries(
     sessions: &[IndexedSession],
     missing: &MissingDesktopSummaries,
 ) -> Result<Vec<IndexedSession>> {
+    let Some(first) = sessions.first() else {
+        return Ok(Vec::new());
+    };
+    let provider = first.session.provider;
+    validate_discovered_sessions(provider, sessions)?;
+    let table = desktop_declarations::table(provider).ok_or(StoreError::InvalidSessionReference)?;
     let mut statement = connection
         .prepare_cached(
-            "SELECT 'antigravity-desktop',session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
+            &format!("SELECT ?4,session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
                 summary->>'created_at',summary->>'updated_at',summary->>'approximate',steps,source_file,NULL
-         FROM desktop_step_declarations WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
+         FROM {table} WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
          UNION ALL SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
                created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
          FROM session_index AS catalog JOIN native_catalog_homes USING(provider,session_id)
-         WHERE catalog.provider = 'antigravity-desktop' AND catalog.session_id = ?1
-             AND verified AND home = ?2 LIMIT 1",
+         WHERE ?4='antigravity-desktop' AND catalog.provider = ?4 AND catalog.session_id = ?1
+             AND verified AND home = ?2 LIMIT 1"),
         )
         .map_err(database_error)?;
     sessions
@@ -5673,7 +5802,8 @@ fn retain_desktop_summaries(
                     params![
                         session.session.id,
                         home.as_os_str().as_encoded_bytes(),
-                        file.map(Uuid::into_bytes)
+                        file.map(Uuid::into_bytes),
+                        provider.to_string()
                     ],
                     indexed_session_from_row,
                 )
@@ -5756,7 +5886,7 @@ fn record_discovery_home(
 ) -> Result<()> {
     if !matches!(
         session.provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
+        Provider::Antigravity | Provider::AntigravityDesktop | Provider::AntigravityIde
     ) {
         return Err(StoreError::InvalidSessionReference);
     }
@@ -6582,8 +6712,26 @@ fn migrate_inferred_document_homes(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ide_home_triggers(transaction: &Transaction<'_>) -> Result<()> {
+    let old_home_triggers = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='detach_changed_legacy_locator' AND instr(sql,'antigravity-ide')=0)",
+        [], |row| row.get::<_, bool>(0),
+    ).map_err(database_error)?;
+    if old_home_triggers {
+        transaction
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS detach_changed_legacy_locator;
+             DROP TRIGGER IF EXISTS detach_removed_legacy_locator;
+             DROP TRIGGER IF EXISTS forget_changed_catalog_home;",
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
     migrate_inferred_document_homes(transaction)?;
+    migrate_ide_home_triggers(transaction)?;
     transaction
         .execute_batch(
             "
@@ -6614,7 +6762,7 @@ fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
 
                 CREATE TRIGGER IF NOT EXISTS detach_changed_legacy_locator
                 AFTER UPDATE ON session_index
-                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop')
+                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop', 'antigravity-ide')
                  AND (OLD.title, OLD.project_path, OLD.git_branch, OLD.created_at, OLD.updated_at, OLD.event_count)
                      IS NOT (NEW.title, NEW.project_path, NEW.git_branch, NEW.created_at, NEW.updated_at, NEW.event_count)
                 BEGIN
@@ -6627,7 +6775,7 @@ fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
 
                 CREATE TRIGGER IF NOT EXISTS detach_removed_legacy_locator
                 BEFORE DELETE ON session_index
-                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop')
+                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop', 'antigravity-ide')
                 BEGIN
                     INSERT INTO detached_native_documents(trajectory_id)
                     SELECT id FROM session_trajectories AS doc
@@ -6638,7 +6786,7 @@ fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
 
                 CREATE TRIGGER IF NOT EXISTS forget_changed_catalog_home
                 AFTER UPDATE ON session_index
-                WHEN NEW.provider IN ('antigravity', 'antigravity-desktop')
+                WHEN NEW.provider IN ('antigravity', 'antigravity-desktop', 'antigravity-ide')
                  AND (OLD.title, OLD.project_path, OLD.git_branch, OLD.created_at, OLD.updated_at, OLD.event_count)
                      IS NOT (NEW.title, NEW.project_path, NEW.git_branch, NEW.created_at, NEW.updated_at, NEW.event_count)
                 BEGIN
@@ -14467,6 +14615,53 @@ mod tests {
         store.upsert_indexed_session(&seen).unwrap();
         assert!(visible(&a, &seen.session));
         assert!(visible(&b, &seen.session));
+    }
+
+    #[test]
+    fn ide_listings_keep_only_explicit_database_counts_in_the_selected_home() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let store = Store::open(home.join("store.sqlite3")).unwrap();
+        let file = Uuid::from_u128(1);
+        let row = IndexedSession {
+            event_count: 2,
+            source_revision: Some(SourceRevision {
+                file: Some(file),
+                ..Default::default()
+            }),
+            ..indexed_session(Provider::AntigravityIde, "one", "IDE")
+        };
+        let listing = super::DiscoveryScope::Workspace;
+        let publish = |count| {
+            store
+                .cache_discovered_sessions(
+                    row.session.provider,
+                    std::slice::from_ref(&row),
+                    listing
+                        .clone()
+                        .with_source_files(&|_| Some(file))
+                        .with_database_alias_counts(&|_| count),
+                    Some(home),
+                )
+                .unwrap();
+        };
+        let read = |provider, home: &Path, file| {
+            store
+                .verified_desktop_step_count(&SessionRef::new(provider, "one"), home, file)
+                .unwrap()
+        };
+        publish(None);
+        assert_eq!(read(row.session.provider, home, file), None);
+        publish(Some(2));
+        publish(None);
+        assert_eq!(read(row.session.provider, home, file), Some(2));
+        assert_eq!(read(Provider::AntigravityDesktop, home, file), None);
+        assert_eq!(read(row.session.provider, &home.join("other"), file), None);
+        assert_eq!(read(row.session.provider, home, Uuid::from_u128(2)), None);
+        publish(Some(0));
+        assert_eq!(read(row.session.provider, home, file), Some(0));
+        store.forget_session(&row.session).unwrap();
+        assert_eq!(read(row.session.provider, home, file), None);
     }
 
     #[test]

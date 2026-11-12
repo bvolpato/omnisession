@@ -49,15 +49,14 @@ impl AntigravityAdapter {
     /// Each fingerprint binds the SQLite index, the native bytes, and whether the row is opaque.
     #[must_use]
     pub fn database_step_proof(snapshot: &CanonicalSnapshot) -> Option<Vec<Uuid>> {
-        if !matches!(
-            snapshot.session.provider,
-            Provider::Antigravity | Provider::AntigravityDesktop
-        ) {
-            return None;
-        }
+        let provider = match snapshot.session.provider {
+            Provider::Antigravity => Provider::Antigravity,
+            Provider::AntigravityDesktop | Provider::AntigravityIde => Provider::AntigravityDesktop,
+            _ => return None,
+        };
         let mut steps = Vec::new();
         for event in &snapshot.events {
-            if event.source.provider != snapshot.session.provider
+            if event.source.provider != provider
                 || event.source.native_session_id != snapshot.session.id
             {
                 return None;

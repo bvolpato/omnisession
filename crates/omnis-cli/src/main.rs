@@ -824,7 +824,11 @@ impl<'a> CatalogCheck<'a> {
     }
 
     fn native_project<'p>(&self, project: Option<&'p Path>) -> Option<&'p Path> {
-        if self.provider == Provider::AntigravityDesktop && self.store.is_some() {
+        if matches!(
+            self.provider,
+            Provider::AntigravityDesktop | Provider::AntigravityIde
+        ) && self.store.is_some()
+        {
             None
         } else {
             project
@@ -874,6 +878,13 @@ impl<'a> CatalogCheck<'a> {
                 .source_revision
                 .and_then(|revision| revision.file)
         };
+        let alias_counts = ide_database_alias_counts(
+            self.provider,
+            rows,
+            *unavailable,
+            missing_desktop_summary_ids,
+        );
+        let alias_count = |id: &str| alias_counts.get(id).copied();
         if let DiscoveryOwnership::Checked(checkpoint) = &self.ownership {
             if !self.persist {
                 return Ok(store.discovery_checkpoint_is_current(checkpoint)?);
@@ -886,7 +897,9 @@ impl<'a> CatalogCheck<'a> {
             return Ok(store.merge_catalog_at_discovery_checkpoint(
                 checkpoint,
                 &indexed,
-                scope.with_source_files(&file_at),
+                scope
+                    .with_source_files(&file_at)
+                    .with_database_alias_counts(&alias_count),
             )?);
         }
         if !self.persist {
@@ -903,7 +916,9 @@ impl<'a> CatalogCheck<'a> {
             )
         };
         if let DiscoveryOwnership::Wide(attempt, checkpoint) = &self.ownership {
-            let scope = scope.with_source_files(&file_at);
+            let scope = scope
+                .with_source_files(&file_at)
+                .with_database_alias_counts(&alias_count);
             return Ok(if let Some(checkpoint) = checkpoint {
                 store.publish_at_discovery_checkpoint(
                     attempt,
@@ -942,8 +957,10 @@ impl<'a> CatalogCheck<'a> {
             {
                 break;
             }
-            if self.provider == Provider::AntigravityDesktop
-                && let Some(project) = project
+            if matches!(
+                self.provider,
+                Provider::AntigravityDesktop | Provider::AntigravityIde
+            ) && let Some(project) = project
             {
                 self.restore_desktop_summaries(store, &mut listing);
                 listing.sessions.retain(|session| {
@@ -1301,6 +1318,29 @@ const SEARCH_TITLE_MIN_WIDTH: usize = 16;
 const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
 const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 
+fn ide_database_alias_counts<'a>(
+    provider: Provider,
+    sessions: &'a [NativeSession],
+    all_missing: bool,
+    missing: &[String],
+) -> HashMap<&'a str, usize> {
+    if provider != Provider::AntigravityIde || all_missing {
+        return HashMap::new();
+    }
+    let missing: HashSet<_> = missing.iter().map(String::as_str).collect();
+    sessions
+        .iter()
+        .filter(|row| {
+            row.source_path
+                .as_deref()
+                .and_then(Path::extension)
+                .is_some_and(|ext| ext == "db")
+                && !missing.contains(row.session.id.as_str())
+        })
+        .map(|row| (row.session.id.as_str(), row.event_count))
+        .collect()
+}
+
 fn discovery_scope(
     complete: bool,
     summaries_unavailable: bool,
@@ -1386,8 +1426,10 @@ fn cached_native_sessions(
     snapshot: &omnis_store::TrajectorySearchSnapshot<'_>,
     args: &SearchArgs,
     project: &Path,
+    ide_home: Option<&Path>,
 ) -> Result<(Vec<NativeSession>, Vec<IndexedTrajectoryTitle>)> {
-    let (indexed, titles) = snapshot.cached_sessions_with_titles(args.provider)?;
+    let (indexed, titles) =
+        snapshot.cached_sessions_with_titles_for_ide_home(args.provider, ide_home)?;
     let sources = titles
         .iter()
         .map(|entry| (&entry.session, entry.source_revision))
@@ -1544,7 +1586,16 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     }
     let (hits, has_more) = store.read_trajectory_search(|snapshot| {
         let titles = if args.cached {
-            let (native, titles) = cached_native_sessions(snapshot, args, &project)?;
+            let ide_home = if args
+                .provider
+                .is_none_or(|provider| provider == Provider::AntigravityIde)
+            {
+                registry.discovery_cache_home(Provider::AntigravityIde)?
+            } else {
+                None
+            };
+            let (native, titles) =
+                cached_native_sessions(snapshot, args, &project, ide_home.as_deref())?;
             sessions.extend(native);
             order_search_sessions(&mut sessions);
             index.candidates = sessions.len();
@@ -5011,7 +5062,7 @@ mod tests {
 
             let (sessions, _) = store
                 .read_trajectory_search(|snapshot| {
-                    super::cached_native_sessions(snapshot, &args, &project)
+                    super::cached_native_sessions(snapshot, &args, &project, None)
                 })
                 .expect("search local workspace");
             assert_eq!(sessions.len(), 1, "local first: {local_first}");

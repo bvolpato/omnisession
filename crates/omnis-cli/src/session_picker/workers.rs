@@ -47,6 +47,7 @@ pub(super) enum SessionCacheUpdate {
         provider: Provider,
         sessions: Vec<IndexedSession>,
         scope: DiscoveryScope,
+        database_alias_counts: HashMap<String, usize>,
         names: Option<Arc<CatalogNames>>,
         attempt: Option<SessionDiscoveryAttempt>,
         publication: Option<Sender<Option<bool>>>,
@@ -55,12 +56,46 @@ pub(super) enum SessionCacheUpdate {
 }
 
 impl SessionCacheUpdate {
+    fn from_listing(
+        provider: Provider,
+        listing: &omnis_adapters::NativeListing,
+        complete: bool,
+        names: Option<Arc<CatalogNames>>,
+        attempt: Option<SessionDiscoveryAttempt>,
+        publication: Option<Sender<Option<bool>>>,
+    ) -> Self {
+        let database_alias_counts = crate::ide_database_alias_counts(
+            provider,
+            &listing.sessions,
+            listing.desktop_summaries_unavailable,
+            &listing.missing_desktop_summary_ids,
+        )
+        .into_iter()
+        .map(|(id, count)| (id.to_owned(), count))
+        .collect();
+        Self::Listed {
+            provider,
+            sessions: listing.sessions.iter().map(indexed_session).collect(),
+            scope: crate::discovery_scope(
+                complete,
+                listing.desktop_summaries_unavailable,
+                &listing.missing_desktop_summary_ids,
+                &listing.unverified_desktop_ids,
+            ),
+            names,
+            attempt,
+            publication,
+            database_alias_counts,
+        }
+    }
+
     pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
         match self {
             Self::Listed {
                 provider,
                 sessions,
                 scope,
+                database_alias_counts,
                 names,
                 attempt,
                 publication,
@@ -81,10 +116,13 @@ impl SessionCacheUpdate {
                             .source_revision
                             .and_then(|revision| revision.file)
                     };
+                    let count = |id: &str| database_alias_counts.get(id).copied();
                     let result = store.publish_session_discovery(
                         &attempt,
                         &sessions,
-                        scope.with_source_files(&file_at),
+                        scope
+                            .with_source_files(&file_at)
+                            .with_database_alias_counts(&count),
                         Utc::now(),
                     );
                     if let Some(publication) = publication {
@@ -403,16 +441,15 @@ pub(super) fn spawn_cache_updates(
             return;
         };
         // Observe the reader before loading the catalog so a concurrent publication cannot be missed.
-        let mut selections: std::collections::HashMap<_, _> =
-            [Provider::Antigravity, Provider::AntigravityDesktop]
-                .map(|provider| {
-                    (
-                        provider,
-                        select_native_discovery(&store, &registry, provider, &sender),
-                    )
-                })
-                .into_iter()
-                .collect();
+        let mut selections: std::collections::HashMap<_, _> = super::NATIVE_HOME_PROVIDERS
+            .map(|provider| {
+                (
+                    provider,
+                    select_native_discovery(&store, &registry, provider, &sender),
+                )
+            })
+            .into_iter()
+            .collect();
         let homes: HashMap<_, _> = selections
             .iter()
             .filter_map(|(&provider, selection)| Some((provider, selection.home.clone()?)))
@@ -430,6 +467,7 @@ pub(super) fn spawn_cache_updates(
             &current_project,
             home(Provider::Antigravity),
             home(Provider::AntigravityDesktop),
+            home(Provider::AntigravityIde),
         ) else {
             return;
         };
@@ -506,7 +544,7 @@ fn discover_without_cache(
     index_sender: &Sender<SessionCacheUpdate>,
     project: &Path,
 ) {
-    let homes: HashMap<_, _> = [Provider::Antigravity, Provider::AntigravityDesktop]
+    let homes: HashMap<_, _> = super::NATIVE_HOME_PROVIDERS
         .into_iter()
         .filter_map(|provider| Some((provider, registry.discovery_cache_home(provider).ok()??)))
         .collect();
@@ -532,8 +570,9 @@ fn send_cached_picker_entries(
     project: &Path,
     antigravity: Option<&Path>,
     desktop: Option<&Path>,
+    ide: Option<&Path>,
 ) -> Option<bool> {
-    let entries = cached_picker_entries(store, project, antigravity, desktop)
+    let entries = cached_picker_entries(store, project, antigravity, desktop, ide)
         .map_err(|error| error.to_string());
     let loaded = entries.is_ok();
     sender.send(PickerUpdate::Cached(entries)).ok()?;
@@ -717,42 +756,27 @@ fn spawn_provider_update_in_home(
         let registry = AdapterRegistry::with_local_adapters();
         let result = list_picker_sessions(&registry, provider, home.as_deref(), &sender);
         match result {
-            Ok((
-                omnis_adapters::NativeListing {
-                    mut sessions,
-                    notes,
-                    desktop_summaries_unavailable: unavailable,
-                    missing_desktop_summary_ids,
-                    unverified_desktop_ids,
-                },
-                names,
-            )) => {
-                let complete = (provider == Provider::Codex || notes.is_empty())
+            Ok((mut listing, names)) => {
+                let complete = (provider == Provider::Codex || listing.notes.is_empty())
                     && registry
                         .adapter(provider)
                         .is_ok_and(ProviderAdapter::discovery_is_complete);
-                for note in notes {
+                for note in listing.notes.drain(..) {
                     if sender.send(PickerUpdate::Warning(note)).is_err() {
                         return;
                     }
                 }
-                populate_approximate_updated_at(&mut sessions);
-                let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
+                populate_approximate_updated_at(&mut listing.sessions);
                 if attempt.is_some() || home.is_none() {
                     let (reply, waiting) = attempt.as_ref().map(|_| mpsc::channel()).unzip();
-                    let update = SessionCacheUpdate::Listed {
+                    let update = SessionCacheUpdate::from_listing(
                         provider,
-                        names: names.clone(),
-                        sessions: indexed,
-                        scope: crate::discovery_scope(
-                            complete,
-                            unavailable,
-                            &missing_desktop_summary_ids,
-                            &unverified_desktop_ids,
-                        ),
-                        attempt: attempt.clone(),
-                        publication: reply,
-                    };
+                        &listing,
+                        complete,
+                        names.clone(),
+                        attempt.clone(),
+                        reply,
+                    );
                     if index_sender.send(update).is_err() {
                         let _ = sender.send(PickerUpdate::Warning(
                             "session index writer stopped".to_owned(),
@@ -774,11 +798,12 @@ fn spawn_provider_update_in_home(
                     }
                 }
                 let cached = cached_desktop_observations(
+                    provider,
                     home.as_deref(),
-                    unavailable,
-                    &mut sessions,
-                    &missing_desktop_summary_ids,
-                    &unverified_desktop_ids,
+                    listing.desktop_summaries_unavailable,
+                    &mut listing.sessions,
+                    &listing.missing_desktop_summary_ids,
+                    &listing.unverified_desktop_ids,
                 )
                 .unwrap_or_else(|error| {
                     let _ = sender.send(PickerUpdate::Warning(format!(
@@ -786,7 +811,8 @@ fn spawn_provider_update_in_home(
                     )));
                     Vec::new()
                 });
-                let mut entries = normalized_picker_entries(sessions, &current_project, false);
+                let mut entries =
+                    normalized_picker_entries(listing.sessions, &current_project, false);
                 entries.extend(normalized_picker_entries(cached, &current_project, true));
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
@@ -871,6 +897,7 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
 }
 
 fn cached_desktop_observations(
+    provider: Provider,
     home: Option<&Path>,
     summaries_unavailable: bool,
     sessions: &mut [NativeSession],
@@ -893,7 +920,7 @@ fn cached_desktop_observations(
             missing_summary_ids,
         )?;
     }
-    if unverified_ids.is_empty() {
+    if provider != Provider::AntigravityDesktop || unverified_ids.is_empty() {
         return Ok(Vec::new());
     }
     let unresolved: HashSet<_> = unverified_ids.iter().collect();

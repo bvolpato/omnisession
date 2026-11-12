@@ -184,7 +184,8 @@ pub(super) fn write(
             retain_text,
             verified_partial: same_source
                 && has_gap
-                && (write.session.provider == crate::Provider::AntigravityDesktop
+                && (write.document.database_step_proof.is_some()
+                    || write.session.provider == crate::Provider::AntigravityDesktop
                     || write.document.legacy_utf8_text.is_some()),
         });
     }

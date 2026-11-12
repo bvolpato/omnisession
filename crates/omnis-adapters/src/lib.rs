@@ -165,6 +165,26 @@ impl SearchSourceObservation {
         Ok(observed)
     }
 
+    /// Returns whether an IDE compatibility reference selected a verified Desktop conversation database.
+    #[must_use]
+    pub fn is_ide_desktop_database(&self) -> bool {
+        self.session.session.provider == Provider::AntigravityIde
+            && self
+                .session
+                .source_path
+                .as_deref()
+                .is_some_and(|path| path.extension().is_some_and(|ext| ext == "db"))
+    }
+
+    fn watch_absent(&mut self, path: PathBuf) -> Result<()> {
+        anyhow::ensure!(
+            optional_stamp(&path)?.is_none(),
+            "provider source changed during search read"
+        );
+        self.paths.push((path, None));
+        Ok(())
+    }
+
     /// Checks the selected source before publishing a captured document or failure.
     #[must_use]
     pub fn is_current(&self) -> bool {

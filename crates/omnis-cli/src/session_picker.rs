@@ -522,7 +522,7 @@ impl PickerState {
         } else {
             self.forget_replaced_sources(&entries);
         }
-        if provider == Provider::Antigravity && !complete {
+        if matches!(provider, Provider::Antigravity | Provider::AntigravityIde) && !complete {
             let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
             self.entries.retain_mut(|entry| {
                 if entry.session.session.provider != provider {
@@ -1626,6 +1626,7 @@ fn cached_picker_entries(
     current_project: &Path,
     antigravity_home: Option<&Path>,
     desktop_home: Option<&Path>,
+    ide_home: Option<&Path>,
 ) -> Result<CachedPickerEntries> {
     let desktop_ids = desktop_home
         .map(|home| {
@@ -1636,8 +1637,11 @@ fn cached_picker_entries(
         })
         .transpose()?
         .flatten();
-    let (sessions, titles) =
-        store.cached_picker_sessions_with_titles_in_homes(antigravity_home, desktop_home)?;
+    let (sessions, titles) = store.cached_picker_sessions_with_titles_for_native_homes(
+        antigravity_home,
+        desktop_home,
+        ide_home,
+    )?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -1755,11 +1759,14 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
     (!head.is_empty()).then(|| format!("detached @ {}", short_id(head)))
 }
 
-const fn has_scoped_home(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
-    )
+const NATIVE_HOME_PROVIDERS: [Provider; 3] = [
+    Provider::Antigravity,
+    Provider::AntigravityDesktop,
+    Provider::AntigravityIde,
+];
+
+fn has_scoped_home(provider: Provider) -> bool {
+    NATIVE_HOME_PROVIDERS.contains(&provider)
 }
 
 struct TrajectorySearchRequest {
@@ -3282,6 +3289,7 @@ mod tests {
             observed.title = Some("Updated observed title".to_owned());
 
             workers::SessionCacheUpdate::Listed {
+                database_alias_counts: HashMap::new(),
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 scope: if complete {
@@ -3365,7 +3373,7 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, &project, None, None).expect("cached entries");
+        } = cached_picker_entries(&store, &project, None, None, None).expect("cached entries");
         let mut state = PickerState::new(Vec::new(), &project, None, false);
         state.replace_all_entries(entries);
 
@@ -3391,6 +3399,39 @@ mod tests {
             store.indexed_sessions().unwrap()[0].project_path.as_deref(),
             Some(original.as_path())
         );
+    }
+
+    #[test]
+    fn offline_picker_uses_the_selected_ide_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let store = Store::open(root.join("index.sqlite")).unwrap();
+        let home_a = root.join("ide-a");
+        let home_b = root.join("ide-b");
+        let provider = Provider::AntigravityIde;
+        let native = session(provider, "observed", root, Some("IDE home A"));
+        let legacy = session(provider, "legacy", root, Some("Offline metadata"));
+        store
+            .upsert_indexed_session(&workers::indexed_session(&legacy))
+            .unwrap();
+        store
+            .cache_discovered_sessions(
+                provider,
+                &[workers::indexed_session(&native)],
+                omnis_store::DiscoveryScope::PartialProvider,
+                Some(&home_a),
+            )
+            .unwrap();
+        let entries = |home: &Path| {
+            cached_picker_entries(&store, root, None, None, Some(home))
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| entry.session.session.id)
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(entries(&home_a), HashSet::from(["observed".to_owned()]));
+        assert!(entries(&home_b).is_empty());
     }
 
     #[test]
@@ -3434,7 +3475,8 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, &workspace.root, None, None).expect("cached entries");
+        } = cached_picker_entries(&store, &workspace.root, None, None, None)
+            .expect("cached entries");
         assert!(warnings.is_empty());
         assert_eq!(entries.len(), 4);
         assert!(entries.iter().all(|entry| !entry.current_workspace));
@@ -3465,7 +3507,8 @@ mod tests {
 
         let CachedPickerEntries {
             entries, warnings, ..
-        } = cached_picker_entries(&store, temporary.path(), None, None).expect("cached entries");
+        } = cached_picker_entries(&store, temporary.path(), None, None, None)
+            .expect("cached entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(&missing_id));
@@ -6035,8 +6078,13 @@ mod tests {
 
     #[test]
     fn native_search_and_queued_titles_follow_the_selected_source() {
+        for provider in [Provider::Antigravity, Provider::AntigravityIde] {
+            check_native_search_and_queued_titles(provider);
+        }
+    }
+
+    fn check_native_search_and_queued_titles(provider: Provider) {
         let project = Path::new("/workspace");
-        let provider = Provider::Antigravity;
         let mut native = session(provider, "shared", project, None);
         let file = Uuid::new_v4();
         native.source_revision = Some(omnis_ir::SourceRevision {

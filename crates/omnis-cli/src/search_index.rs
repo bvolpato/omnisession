@@ -18,8 +18,9 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use omnis_adapters::{
-    AdapterRegistry, AntigravityAdapter, AntigravityDesktopAdapter, IndexRead, NativeSession,
-    NativeSessionName, ProviderAdapter, RollbackTitle, SearchSourceObservation,
+    AdapterRegistry, AntigravityAdapter, AntigravityDesktopAdapter, AntigravityIdeAdapter,
+    IndexRead, NativeSession, NativeSessionName, ProviderAdapter, RollbackTitle,
+    SearchSourceObservation,
 };
 use omnis_core::{
     SearchDocument, SessionWorkspaceMatcher, search_document_version,
@@ -269,13 +270,16 @@ fn guard_observed_home(
     observation: Option<&SearchSourceObservation>,
 ) -> TrajectorySourceGuard {
     observation.map_or(guard, |source| {
-        guard
-            .for_published_catalog_home(&source.home)
-            .with_catalog_step_count(
+        let guard = guard.for_published_catalog_home(&source.home);
+        if source.is_ide_desktop_database() && !source.desktop_summaries_unavailable {
+            guard.with_database_alias_step_count(source.session.event_count)
+        } else {
+            guard.with_catalog_step_count(
                 source.session.session.provider,
                 source.session.event_count,
                 source.desktop_summaries_unavailable,
             )
+        }
     })
 }
 
@@ -567,6 +571,20 @@ fn pending(
             {
                 recovered.push((candidate, *prior, failure.copied()));
             }
+            continue;
+        }
+        if failure.is_none()
+            && TrajectorySourceGuard::uses_catalog_home(candidate.session.provider)
+            && prior
+                .is_some_and(|state| state.source_revision.file != candidate.source_revision.file)
+            && let Some(home) = registry.discovery_cache_home(candidate.session.provider)?
+            && store.current_limited_native_archive(
+                &candidate.session,
+                &home,
+                candidate.source_revision,
+                search_document_version(candidate.session.provider),
+            )?
+        {
             continue;
         }
         if !retry_failed && failure.is_some_and(|failure| failure_is_current(&candidate, failure)) {
@@ -1615,15 +1633,25 @@ pub(crate) fn observe_native_read<T>(
         {
             store
                 .verified_desktop_step_count(session, &source.home, file)?
-                .map(|count| {
-                    AntigravityDesktopAdapter::with_cached_step_count(&source.home, file, count)
+                .map(|count| -> Box<dyn ProviderAdapter> {
+                    if source.is_ide_desktop_database() {
+                        Box::new(AntigravityIdeAdapter::with_cached_step_count(
+                            &source.home,
+                            file,
+                            count,
+                        ))
+                    } else {
+                        Box::new(AntigravityDesktopAdapter::with_cached_step_count(
+                            &source.home,
+                            file,
+                            count,
+                        ))
+                    }
                 })
         } else {
             None
         };
-        let reader = desktop
-            .as_ref()
-            .map_or(adapter, |desktop| desktop as &dyn ProviderAdapter);
+        let reader = desktop.as_deref().unwrap_or(adapter);
         let (value, time) = read(reader, path)?;
         let origin = if adapter.search_source_is_summary(session, path)? {
             SessionTrajectoryOrigin::NativeSummary
@@ -1644,7 +1672,10 @@ pub(crate) fn observe_native_read<T>(
         updated_at
             .filter(|_| {
                 current
-                    && (session.provider != Provider::AntigravityDesktop || observation.is_some())
+                    && (!matches!(
+                        session.provider,
+                        Provider::AntigravityDesktop | Provider::AntigravityIde
+                    ) || observation.is_some())
             })
             .map(|updated_at| SearchSource {
                 updated_at,

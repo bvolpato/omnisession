@@ -5,9 +5,10 @@ use crate::{Provider, Result, SessionRef, StoreError, database_error};
 
 const MAX_DATABASE_STEPS: usize = 100_000;
 
-const RECEIPT_TABLES: [(Provider, &str); 2] = [
+const RECEIPT_TABLES: [(Provider, &str); 3] = [
     (Provider::AntigravityDesktop, "desktop_search_receipts"),
     (Provider::Antigravity, "antigravity_cli_search_receipts"),
+    (Provider::AntigravityIde, "antigravity_ide_search_receipts"),
 ];
 
 fn receipt_table(provider: Provider) -> Option<&'static str> {
@@ -126,12 +127,13 @@ mod tests {
             "CREATE TABLE session_trajectories (
                 provider TEXT, session_id TEXT, PRIMARY KEY(provider, session_id)
              );
-             INSERT INTO session_trajectories VALUES('antigravity-desktop','session'), ('antigravity','session');",
+             INSERT INTO session_trajectories VALUES('antigravity-desktop','session'), ('antigravity','session'), ('antigravity-ide','session');",
         )
         .unwrap();
         initialize(&tx).unwrap();
         let session = &SessionRef::new(Provider::AntigravityDesktop, "session");
         let cli = &SessionRef::new(Provider::Antigravity, "session");
+        let ide = &SessionRef::new(Provider::AntigravityIde, "session");
         let (file, contents) = (Uuid::new_v4(), Uuid::new_v4());
         let hash = [1; 32];
         let proof = [Uuid::new_v4(), Uuid::new_v4()];
@@ -142,6 +144,12 @@ mod tests {
         save(&tx, session, b"a", file, contents, &hash, Some(&proof)).unwrap();
         assert_eq!(read(&tx, cli, b"a", file, contents, &hash).unwrap(), None);
         save(&tx, cli, b"a", file, contents, &hash, Some(&[])).unwrap();
+        assert_eq!(read(&tx, ide, b"a", file, contents, &hash).unwrap(), None);
+        save(&tx, ide, b"a", file, contents, &hash, Some(&proof[..1])).unwrap();
+        assert_eq!(
+            read(&tx, ide, b"a", file, contents, &hash).unwrap(),
+            Some(proof[..1].to_vec())
+        );
         save(&tx, session, b"b", file, contents, &hash, Some(&[])).unwrap();
         assert_eq!(lookup(b"a", file, contents, &hash), Some(proof.to_vec()));
         assert_eq!(lookup(b"a", file, contents, &[2; 32]), None);

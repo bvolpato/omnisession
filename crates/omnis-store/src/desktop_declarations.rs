@@ -6,6 +6,18 @@ use crate::{IndexedSession, MissingDesktopSummaries, Result, StoreError, databas
 use std::path::Path;
 
 pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ide_step_declarations(
+            generation INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            source_home BLOB NOT NULL,
+            source_file BLOB NOT NULL CHECK(length(source_file)=16),
+            steps INTEGER NOT NULL CHECK(steps>=0),
+            summary TEXT,
+            UNIQUE(session_id,source_home,source_file)
+         );",
+    )
+    .map_err(database_error)?;
     if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='desktop_step_declarations')",
         [], |row| row.get::<_, bool>(0),
@@ -54,13 +66,21 @@ fn initialize_summary_column(tx: &Transaction<'_>) -> Result<()> {
     ).map_err(database_error)
 }
 
-pub(super) fn generation(connection: &Connection, provider: Provider) -> Result<Option<i64>> {
-    if provider != Provider::AntigravityDesktop {
-        return Ok(None);
+pub(super) fn table(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::AntigravityDesktop => Some("desktop_step_declarations"),
+        Provider::AntigravityIde => Some("ide_step_declarations"),
+        _ => None,
     }
+}
+
+pub(super) fn generation(connection: &Connection, provider: Provider) -> Result<Option<i64>> {
+    let Some(table) = table(provider) else {
+        return Ok(None);
+    };
     connection
         .query_row(
-            "SELECT coalesce(max(generation),0) FROM desktop_step_declarations",
+            &format!("SELECT coalesce(max(generation),0) FROM {table}"),
             [],
             |row| row.get(0),
         )
@@ -76,6 +96,7 @@ pub(super) fn record(
     observed_generation: Option<i64>,
     metadata: Option<&IndexedSession>,
 ) -> Result<()> {
+    let table = table(session.provider).ok_or(StoreError::InvalidSessionReference)?;
     let summary = metadata
         .map(|row| -> Result<String> {
             let project = row
@@ -94,10 +115,10 @@ pub(super) fn record(
         .transpose()?;
     let steps = i64::try_from(steps).map_err(|_| StoreError::InvalidSessionReference)?;
     let previous = tx
-        .prepare_cached(
-            "SELECT generation,steps,summary FROM desktop_step_declarations
-         WHERE session_id=?1 AND source_home=?2 AND source_file=?3",
-        )
+        .prepare_cached(&format!(
+            "SELECT generation,steps,summary FROM {table}
+         WHERE session_id=?1 AND source_home=?2 AND source_file=?3"
+        ))
         .map_err(database_error)?
         .query_row(params![session.id, home, file.as_bytes()], |r| {
             Ok((
@@ -119,11 +140,13 @@ pub(super) fn record(
     }
     // A newer confirmation of the same count also supersedes an older listing in flight.
     let summary = summary.or_else(|| previous.and_then(|(_, _, summary)| summary));
-    tx.prepare_cached(
-        "INSERT OR REPLACE INTO desktop_step_declarations(session_id,source_home,source_file,steps,summary)
-         VALUES(?1,?2,?3,?4,?5)",
-    )
-    .and_then(|mut statement| statement.execute(params![session.id, home, file.as_bytes(), steps, summary]))
+    tx.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO {table}(session_id,source_home,source_file,steps,summary)
+         VALUES(?1,?2,?3,?4,?5)"
+    ))
+    .and_then(|mut statement| {
+        statement.execute(params![session.id, home, file.as_bytes(), steps, summary])
+    })
     .map_err(database_error)?;
     Ok(())
 }
@@ -134,8 +157,14 @@ pub(super) fn record_listing(
     home: &Path,
     missing: &MissingDesktopSummaries,
     generation: Option<i64>,
+    database_alias_count: Option<usize>,
 ) -> Result<()> {
-    if row.session.provider == Provider::AntigravityDesktop
+    let count = match row.session.provider {
+        Provider::AntigravityDesktop => Some(row.event_count),
+        Provider::AntigravityIde => database_alias_count,
+        _ => None,
+    };
+    if let Some(count) = count
         && !missing.contains(&row.session.id)
         && let Some(file) = row.source_revision.and_then(|revision| revision.file)
     {
@@ -144,7 +173,7 @@ pub(super) fn record_listing(
             &row.session,
             home.as_os_str().as_encoded_bytes(),
             file,
-            row.event_count,
+            count,
             generation,
             Some(row),
         )?;
