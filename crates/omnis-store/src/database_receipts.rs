@@ -81,7 +81,7 @@ pub(super) fn promote_gap_projections(tx: &Transaction<'_>) -> Result<()> {
         )
         .map_err(database_error)?;
     if !pending {
-        return Ok(());
+        return clear_unverified_preview_catalogs(tx);
     }
     tx.execute_batch(&format!(
         "CREATE TEMP TABLE promoted_gap_documents AS
@@ -119,7 +119,58 @@ pub(super) fn promote_gap_projections(tx: &Transaction<'_>) -> Result<()> {
          DROP TABLE temp.promoted_gap_chunks;
          DROP TABLE temp.promoted_gap_documents;",
         crate::SEARCH_GAP_JOIN,
-    )).map_err(database_error)
+    )).map_err(database_error)?;
+    clear_unverified_preview_catalogs(tx)
+}
+
+fn clear_unverified_preview_catalogs(tx: &Transaction<'_>) -> Result<()> {
+    const PROMOTED_PREVIEW: &str = "projected_byte_count IS NULL AND source_complete=0
+        AND truncation_strategy='source_incomplete'
+        AND ((provider='antigravity' AND document_version=10)
+          OR (provider='antigravity-desktop' AND document_version=8))";
+    tx.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS antigravity_legacy_preview_catalogs
+         ON session_trajectories(provider,session_id) WHERE {PROMOTED_PREVIEW}"
+    ))
+    .map_err(database_error)?;
+    let sql = format!(
+        "SELECT d.provider,d.session_id,d.source_file_id,d.source_contents_id,h.source_home
+         FROM (SELECT * FROM session_trajectories WHERE {PROMOTED_PREVIEW}) d
+         JOIN native_search_document_homes h ON h.trajectory_id=d.id AND h.verification=1
+             AND h.source_file=d.source_file_id
+         JOIN session_index c ON c.provider=d.provider AND c.session_id=d.session_id
+         JOIN native_catalog_homes scope ON scope.provider=d.provider AND scope.session_id=d.session_id
+             AND scope.home=h.source_home
+         WHERE d.origin='native' AND d.source_contents_id IS NOT NULL
+           AND (c.source_file_id IS NULL OR c.source_file_id=d.source_file_id)
+           AND (c.source_contents_id IS NOT d.source_contents_id OR NOT scope.verified)"
+    );
+    let mut selected = tx.prepare(&sql).map_err(database_error)?;
+    let mut rows = selected.query([]).map_err(database_error)?;
+    let mut affected = Vec::new();
+    while let Some(row) = rows.next().map_err(database_error)? {
+        affected.push((
+            row.get::<_, String>(0).map_err(database_error)?,
+            row.get::<_, String>(1).map_err(database_error)?,
+            row.get::<_, Vec<u8>>(2).map_err(database_error)?,
+            row.get::<_, Vec<u8>>(3).map_err(database_error)?,
+            row.get::<_, Vec<u8>>(4).map_err(database_error)?,
+        ));
+    }
+    for (provider, session, file, contents, home) in affected {
+        tx.execute(
+            "UPDATE session_index SET title=NULL,project_path=NULL,git_branch=NULL,created_at=NULL,
+             updated_at=NULL,updated_at_approximate=0,event_count=0,source_updated_submillis=NULL,
+             source_file_id=?3,source_contents_id=?4 WHERE provider=?1 AND session_id=?2",
+            params![provider, session, file, contents],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "UPDATE native_catalog_homes SET verified=1 WHERE provider=?1 AND session_id=?2 AND home=?3",
+            params![provider,session,home],
+        ).map_err(database_error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -269,6 +320,10 @@ impl crate::Store {
              JOIN session_trajectories doc ON doc.provider=?2 AND doc.session_id=(picked.value ->> 0)
              JOIN antigravity_read_catalogs r ON r.trajectory_id=doc.id AND r.source_home=?3
              JOIN native_search_document_homes h ON h.trajectory_id=doc.id AND h.verification=1 AND h.source_home=r.source_home AND h.source_file=r.source_file
+             JOIN native_catalog_homes catalog_home ON catalog_home.provider=doc.provider AND catalog_home.session_id=doc.session_id
+               AND catalog_home.verified=1 AND catalog_home.home=r.source_home
+             JOIN session_index catalog ON catalog.provider=doc.provider AND catalog.session_id=doc.session_id
+               AND catalog.source_file_id=r.source_file AND catalog.source_contents_id=r.source_contents
              WHERE r.source_file=doc.source_file_id AND r.source_contents=doc.source_contents_id AND r.document_version=doc.document_version AND r.content_hash=doc.content_hash
                AND hex(r.source_file)=upper(picked.value ->> 1) AND hex(r.source_contents)=upper(picked.value ->> 2)
                AND r.catalog_hash=(picked.value ->> 3) AND r.document_version=(picked.value ->> 4)"

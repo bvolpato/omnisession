@@ -267,9 +267,30 @@ fn check_moved_antigravity_catalog(env: &TestEnvironment, home: &Path, workspace
     let cached = state_json(env, "state", &args);
     assert_eq!(cached["results"][0]["title"], "Moved session");
     assert_eq!(
-        cached["results"][0]["project_path"],
-        workspace.to_str().unwrap()
+        Path::new(cached["results"][0]["project_path"].as_str().unwrap()),
+        workspace
     );
+}
+
+fn check_legacy_catalog_recovery(env: &TestEnvironment, provider: &str) {
+    let store = Connection::open(env.home.join("state/store.sqlite3")).unwrap();
+    store.execute("UPDATE session_index SET source_file_id=NULL,source_contents_id=NULL WHERE provider=?1", [provider]).unwrap();
+    let args = [
+        "search",
+        "--provider",
+        provider,
+        "--all-projects",
+        "firstrepl",
+    ];
+    let live = state_json(env, "state", &args);
+    assert_eq!(live["index"]["stale"], 1, "{live}");
+    let mut cached = args.to_vec();
+    cached.push("--cached");
+    assert_eq!(
+        state_json(env, "state", &cached)["results"][0]["coverage"],
+        "complete"
+    );
+    assert_eq!(state_json(env, "state", &args)["index"]["stale"], 0);
 }
 
 #[test]
@@ -298,6 +319,12 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
         };
         assert_eq!(index()["indexed"], 1);
         assert_eq!(search("firstrepl", true), "complete");
+        check_legacy_catalog_recovery(&env, provider);
+        database
+            .execute("UPDATE steps SET step_payload=x'082a2003' WHERE idx=1", [])
+            .unwrap();
+        assert!(search("firstrepl", false).is_null());
+        assert!(search("firstrepl", true).is_null());
         database
             .execute_batch(
                 "UPDATE steps SET step_payload=x'080fa2010b0a096368616e6765647878' WHERE idx=1;
@@ -342,14 +369,14 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
             )
             .unwrap();
         let reference = format!("{provider}:{id}");
-        let show = || state_json(&env, "state", &["show", &reference]);
-        assert!(
-            show()["events"]
+        let shown = |word: &str| {
+            state_json(&env, "state", &["show", &reference])["events"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|event| event["payload"]["text"] == "morevalue")
-        );
+                .any(|event| event["payload"]["text"] == word)
+        };
+        assert!(shown("morevalue"));
         assert_eq!(search("morevalue", true), "preview");
         assert_eq!(search("morevalue", false), "preview");
         assert_eq!(search("nextreply", true), "preview");
@@ -359,13 +386,7 @@ fn complete_sqlite_scans_publish_new_replies_after_an_opaque_step() {
              INSERT INTO steps VALUES (6,x'080fa2010b0a096c61746572776f7264');",
             )
             .unwrap();
-        assert!(
-            show()["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|event| event["payload"]["text"] == "laterword")
-        );
+        assert!(shown("laterword"));
         assert_eq!(search("laterword", true), "preview");
         assert_eq!(search("laterword", false), "preview");
         assert_eq!(search("morevalue", true), "preview");

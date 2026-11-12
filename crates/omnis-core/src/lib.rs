@@ -1230,9 +1230,7 @@ fn trajectory_search_document_with_limits(
             .filter(|rows| rows.len() <= omnis_ir::ANTIGRAVITY_DATABASE_STEP_LIMIT);
         let database_gap = snapshot.events.iter().any(|event| {
             event.source.raw_record_type.as_deref() == Some("omnisession.antigravity_step_limit")
-                && event.payload["omitted_events"]
-                    .as_u64()
-                    .is_some_and(|n| n > 0)
+                && reports_omitted_events(event)
         });
         if proof.is_some() || database_gap {
             let projection = document.projection.get_or_insert_with(|| {
