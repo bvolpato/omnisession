@@ -2896,34 +2896,40 @@ fn linear_retries_keep_distinct_native_pairs_and_original_provider_ids() {
 }
 
 #[test]
-fn selected_results_with_equal_provenance_and_conflicting_outputs_are_omitted() {
-    for linked in [false, true] {
-        let mut output = message(
-            3,
-            2,
-            "user",
-            json!([
-                result("id", "first outcome", false),
-                result("id", "other outcome", false)
-            ]),
-        );
-        if linked {
-            output["sourceToolAssistantUUID"] = json!(Uuid::from_u128(2));
-        }
-        let snapshot = read(&[
+fn conflicting_results_keep_the_first_native_output_and_both_observed_texts() {
+    for (linked, split) in [(true, false), (false, true), (false, false), (true, true)] {
+        let mut rows = vec![
             message(1, 0, "user", json!("Inspect")),
-            block(2, 1, "r", json!([call("id")])),
-            output,
-        ]);
-        assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
-        assert!(import_trajectory(&snapshot).truncated);
-        assert!(tool_outcomes(&snapshot).is_empty());
-        assert!(
-            !snapshot
-                .events
-                .iter()
-                .any(|e| matches!(e.kind, EventKind::ToolCompleted | EventKind::ToolFailed))
-        );
+            file_calls(2, 1, "file.txt", &["id"]),
+        ];
+        let mut first = linked_result(3, 2, 2, "id", "First outcome");
+        let mut second = linked_result(4, 3, 2, "id", "Other outcome");
+        if !linked {
+            for row in [&mut first, &mut second] {
+                row.as_object_mut()
+                    .unwrap()
+                    .remove("sourceToolAssistantUUID");
+            }
+        }
+        if split {
+            rows.extend([first, second]);
+        } else {
+            first["message"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(result("id", "Other outcome", false));
+            rows.push(first);
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(tool_outcomes(&snapshot), [("First outcome".into(), false)]);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("First outcome") && text.contains("Other outcome"));
+            }
+        }
     }
 }
 
@@ -6312,6 +6318,85 @@ fn an_older_follow_up_cannot_select_a_tied_duration_reply() {
                 &["Known request"],
                 &["Known reply", "Follow-up request"],
             );
+        }
+    }
+}
+
+#[test]
+fn a_trailing_duration_under_the_request_keeps_its_completed_exchange() {
+    let hidden = meta_user(3, 2);
+    let mut rows = retained_hidden_tail(&hidden);
+    rows.extend([
+        message(8, 3, "user", json!("Current request")),
+        message(9, 8, "assistant", json!("Current answer")),
+        turn_duration(10, 8),
+        hidden,
+    ]);
+    check_copied_tail(&rows, true, &[]);
+}
+
+#[test]
+fn a_hidden_user_sibling_forks_the_retained_tails_new_exchange() {
+    let hidden = meta_user(3, 2);
+    let mut rows = retained_hidden_tail(&hidden);
+    rows.extend([
+        message(8, 3, "user", json!("Current request")),
+        meta_user(9, 8),
+        message(10, 8, "assistant", json!("Current answer")),
+        hidden,
+    ]);
+    check_copied_tail(&rows, false, &[]);
+}
+
+#[test]
+fn an_unknown_result_naming_the_issuer_cannot_hide_the_next_known_output() {
+    for declared in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read file")),
+            file_calls(2, 1, "file.txt", &["y"]),
+            meta_user(3, 2),
+        ];
+        rows.extend(compaction(6, 3, &[3]));
+        let mut unknown = linked_result(9, 8, 2, "unknown", "Unknown output");
+        if !declared {
+            unknown
+                .as_object_mut()
+                .unwrap()
+                .remove("sourceToolAssistantUUID");
+        }
+        rows.extend([
+            meta_user(8, 3),
+            unknown,
+            linked_result(10, 9, 2, "y", "Known output"),
+            message(11, 10, "assistant", json!("Done")),
+        ]);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert!(tool_outcomes(&snapshot).is_empty());
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Known output"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_repaired_duration_uses_its_own_timestamp_for_pending_replies() {
+    for second in [6, 4] {
+        let duration = at_second(turn_duration(2, 1), 5);
+        let rows = [
+            duration.clone(),
+            at_second(message(3, 2, "assistant", json!("Known reply")), second),
+            at_second(message(1, 0, "user", json!("Known request")), 2),
+            duration,
+        ];
+        if second > 5 {
+            check_selected_messages(&rows, &["Known request", "Known reply"], &[]);
+        } else {
+            check_selected_messages(&rows, &["Known request"], &["Known reply"]);
         }
     }
 }

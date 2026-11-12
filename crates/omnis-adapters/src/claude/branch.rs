@@ -809,8 +809,8 @@ impl Branch {
         for index in state.indexed..self.nodes.len() {
             let node = &self.nodes[index];
             if node.summary != Some(summary)
-                || node.events.is_empty()
-                || self.hidden_parents.contains_key(&index)
+                || (!node.user
+                    && (node.events.is_empty() || self.hidden_parents.contains_key(&index)))
                 || node.uuid.is_some_and(|id| {
                     records
                         .get(&id)
@@ -828,11 +828,25 @@ impl Branch {
             state.leaf = Some(index);
         }
         state.indexed = self.nodes.len();
-        !state.forked
-            && state.leaf.is_none_or(|leaf| {
-                self.tip
-                    .is_some_and(|tip| self.copy_paths.distance(leaf, tip).is_some())
-            })
+        if state.forked {
+            return false;
+        }
+        let Some(leaf) = state.leaf else {
+            return true;
+        };
+        let Some(tip) = self.tip else {
+            return false;
+        };
+        if self.copy_paths.distance(leaf, tip).is_some() {
+            return true;
+        }
+        if self.hidden_parents.contains_key(&tip) && !self.nodes[tip].user {
+            self.tip = Some(leaf);
+            self.active_rejection = self.unverified_retention();
+            self.select_retention();
+            return true;
+        }
+        false
     }
 
     fn raw_copy_parent(
@@ -877,9 +891,6 @@ impl Branch {
         let mut changes = HashMap::new();
         let mut visited = HashSet::new();
         let clock = records[&uuid].millis;
-        let request_clock = records[&uuid]
-            .parent
-            .and_then(|id| records.get(&id)?.millis);
         let mut candidates = Vec::new();
         while let Some(alias) = pending.pop() {
             if !visited.insert(alias) {
@@ -919,7 +930,7 @@ impl Branch {
                     .branch
                     .node
                     .is_some_and(|i| self.nodes[i].uuid == Some(id))
-                    && (clock.is_none() || clock != request_clock || record.millis > clock)
+                    && (clock.is_none() || record.millis > clock)
                 {
                     let rank = (record.millis, record.order, id);
                     latest = Some(latest.map_or(rank, |old| std::cmp::max(old, rank)));
@@ -3295,7 +3306,7 @@ impl Branch {
                             continue;
                         }
                         MatchedOutput::Unresolved => {
-                            if declared.retained && declared.source == ToolSource::Absent {
+                            if declared.retained_issuer(self).is_some() {
                                 documentary_transport = declared.issuer;
                             }
                             transport = None;
@@ -3318,7 +3329,7 @@ impl Branch {
                     );
                 let repeated = available && call.repeated && selected && active[call.node];
                 if !paired && !retained && !repeated {
-                    if selected && declared.returned_to_removed_call(self, call) {
+                    if selected && declared.retained_issuer(self) == Some(call.node) {
                         documentary_transport = declared.issuer;
                         found.results.keep_recovery_only(position);
                     } else if active[index] && priority == ResultSource::Linked {
@@ -3443,14 +3454,9 @@ impl<'a> ResultEvidence<'a> {
                 .outcomes
                 .get(&(call, false, None))
                 .is_some_and(|prior| {
-                    (priority == ResultSource::CallId
-                        && prior.priority == ResultSource::SelectedLinked
-                        || (prior.direct
-                            && lookup.parent != Some(call.node)
-                            && matches!(
-                                declared.source,
-                                ToolSource::Record(_) | ToolSource::Duplicate { .. }
-                            )))
+                    ((prior.direct && prior.priority >= ResultSource::Selected)
+                        || (priority == ResultSource::CallId
+                            && prior.priority == ResultSource::SelectedLinked))
                         && prior.differs(position, events)
                 })
         {
@@ -3531,11 +3537,11 @@ impl DeclaredResult<'_> {
         }
     }
 
-    fn returned_to_removed_call(&self, branch: &Branch, call: ToolCall) -> bool {
-        self.retained
-            && (self.source == ToolSource::Absent
-                || matches!(self.source, ToolSource::Record(id) if id == call.node))
-            && branch.call_parent(self.issuer) == Some(call.node)
+    fn retained_issuer(&self, branch: &Branch) -> Option<usize> {
+        let issuer = branch.call_parent(self.issuer)?;
+        (self.retained
+            && (self.source == ToolSource::Absent || self.source == ToolSource::Record(issuer)))
+        .then_some(issuer)
     }
 
     fn observe(
