@@ -114,19 +114,31 @@ enum UpdateOwnership {
 }
 
 fn update_ownership(record: &Value, session_id: &str) -> Result<UpdateOwnership> {
+    let Some(object) = record.as_object() else {
+        return Ok(UpdateOwnership::Damaged);
+    };
+    if object.is_empty()
+        || (object.len() == 1
+            && object
+                .get("params")
+                .is_some_and(|params| params.as_object().is_none_or(serde_json::Map::is_empty)))
+    {
+        return Ok(UpdateOwnership::Damaged);
+    }
     let Some(value) = record.pointer("/params/sessionId") else {
         return Ok(UpdateOwnership::Implicit);
     };
     if value.as_str() == Some(session_id) {
         return Ok(UpdateOwnership::Explicit);
     }
-    if value
-        .as_str()
-        .is_some_and(|owner| Uuid::parse_str(owner).is_ok())
-    {
-        return Err(GrokHistoryError::ForeignOwner.into());
+    let Some(owner) = value.as_str().and_then(|owner| Uuid::parse_str(owner).ok()) else {
+        return Ok(UpdateOwnership::Damaged);
+    };
+    if Uuid::parse_str(session_id).ok() == Some(owner) {
+        Ok(UpdateOwnership::Explicit)
+    } else {
+        Err(GrokHistoryError::ForeignOwner.into())
     }
-    Ok(UpdateOwnership::Damaged)
 }
 
 impl GrokAdapter {
@@ -462,10 +474,11 @@ impl GrokAdapter {
             let mut previous_owner_damaged = false;
             let mut push = |record: Value, gap: bool| -> Result<()> {
                 read_any = true;
-                if is_update_record(&record) {
+                let ownership = update_ownership(&record, &session.id)?;
+                if ownership == UpdateOwnership::Damaged || is_update_record(&record) {
                     observed += 1;
                 }
-                if update_ownership(&record, &session.id)? == UpdateOwnership::Damaged {
+                if ownership == UpdateOwnership::Damaged {
                     updates.malformed_updates += 1;
                     previous_owner_damaged = true;
                 } else {
@@ -652,7 +665,9 @@ fn native_message_block(content: &Value) -> bool {
         return false;
     }
     match content["type"].as_str() {
-        Some("text") => content["text"].is_string(),
+        Some("text") => content["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
         Some("image") => {
             content["data"].is_string()
                 && content["mimeType"].is_string()
@@ -678,6 +693,13 @@ fn native_message_block(content: &Value) -> bool {
     }
 }
 
+fn native_tool_status(value: &Value) -> bool {
+    matches!(
+        value.as_str(),
+        Some("pending" | "in_progress" | "completed" | "failed")
+    )
+}
+
 // A native fork rekeys every update it copies. Check the source owners before handing it to Grok.
 fn native_update_headers(
     path: &Path,
@@ -695,7 +717,9 @@ fn native_update_headers(
             return Ok(false);
         }
         let update = &record["params"]["update"];
-        if !optional_native_field(update, "_meta", Value::is_object) {
+        if !optional_native_field(&record["params"], "_meta", Value::is_object)
+            || !optional_native_field(update, "_meta", Value::is_object)
+        {
             return Ok(false);
         }
         Ok(match update["sessionUpdate"].as_str() {
@@ -707,16 +731,29 @@ fn native_update_headers(
                 update["toolCallId"].is_string()
                     && update["title"].is_string()
                     && update.get("kind").is_none_or(Value::is_string)
+                    && update.get("status").is_none_or(native_tool_status)
             }
             Some("tool_call_update") => {
                 update["toolCallId"].is_string()
                     && optional_native_field(update, "kind", Value::is_string)
+                    && optional_native_field(update, "status", native_tool_status)
+                    && optional_native_field(update, "title", Value::is_string)
             }
             Some("session_info_update") => {
                 optional_native_field(update, "title", Value::is_string)
                     && optional_native_field(update, "updatedAt", Value::is_string)
             }
-            Some("plan") => update["entries"].is_array(),
+            Some("plan") => update["entries"].as_array().is_some_and(|entries| {
+                entries.iter().all(|entry| {
+                    entry["content"].is_string()
+                        && matches!(entry["priority"].as_str(), Some("low" | "medium" | "high"))
+                        && matches!(
+                            entry["status"].as_str(),
+                            Some("pending" | "in_progress" | "completed")
+                        )
+                        && optional_native_field(entry, "_meta", Value::is_object)
+                })
+            }),
             Some("current_mode_update") => update["currentModeId"].is_string(),
             Some("available_commands_update") => update["availableCommands"].is_array(),
             Some("config_option_update") => update["configOptions"].is_array(),
@@ -860,7 +897,7 @@ impl GrokMetadata {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
         // Invalidate cached projections when recovery changes which source records are visible.
-        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v3");
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v4");
         let checked = Uuid::new_v5(
             &checked,
             &self.expected_updates.unwrap_or_default().to_le_bytes(),
@@ -1216,6 +1253,7 @@ fn message_content(
             historical_content.push(block.clone());
         }
     };
+    let empty_text = |block: &Value| block.as_str().or_else(|| block["text"].as_str()) == Some("");
     let body = [
         update.get("content"),
         update.get("text"),
@@ -1224,7 +1262,13 @@ fn message_content(
     ]
     .into_iter()
     .flatten()
-    .find(|value| !value.is_null() && !value.as_array().is_some_and(Vec::is_empty));
+    .find(|value| {
+        !value.is_null()
+            && !empty_text(value)
+            && !value
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().all(empty_text))
+    });
     if let Some(content) = body {
         if let Some(blocks) = content.as_array() {
             for block in blocks {
@@ -1935,6 +1979,47 @@ mod tests {
     }
 
     #[test]
+    fn empty_text_blocks_use_the_readable_message_body() {
+        let root = tempfile::tempdir().unwrap();
+        let update = |message: Value| json!({"sessionUpdate":"agent_message_chunk", "messageId":"reply", "message":message});
+        let empty = json!([{"type":"text","text":""}]);
+        for (message, expected, partial) in [
+            (
+                json!({"content":empty,"text":"fallback reply"}),
+                "fallback reply",
+                false,
+            ),
+            (
+                json!({"content":empty}),
+                "\n[Source message content unreadable]\n",
+                true,
+            ),
+            (
+                json!({"content":[{"text":""},{"text":"primary reply"}],"text":"fallback"}),
+                "primary reply",
+                false,
+            ),
+        ] {
+            write_session(
+                root.path(),
+                SESSION_ID,
+                &json!({"id":SESSION_ID}),
+                &[json!({"params":{"sessionId":SESSION_ID,"update":update(message)}})],
+            );
+            let snapshot = GrokAdapter::with_root(root.path())
+                .read_session(&SessionRef::new(Provider::Grok, SESSION_ID))
+                .unwrap();
+            let assistant = &snapshot.events[0];
+            assert_eq!(assistant.kind, EventKind::MessageAssistant);
+            assert_eq!(assistant.payload["text"], expected);
+            assert_eq!(
+                omnis_core::import_conversation(&snapshot).truncated,
+                partial
+            );
+        }
+    }
+
+    #[test]
     fn malformed_blocks_preserve_the_gap_and_opaque_evidence() {
         let root = tempfile::tempdir().expect("synthetic Grok root");
         let block = json!({"type": "text", "text": {"part": "opaque"}, "annotations": {"audience": ["user"]}});
@@ -2079,6 +2164,7 @@ mod tests {
 
     #[test]
     fn damaged_owners_leave_a_gap_between_verified_chunks() {
+        let id = "abcdefab-1234-4123-8123-abcdefabcdef";
         let root = tempfile::tempdir().unwrap();
         let chunk = |owner: Value, text| {
             json!({"params":{"sessionId":owner,"update":{
@@ -2087,18 +2173,21 @@ mod tests {
         };
         write_session(
             root.path(),
-            SESSION_ID,
-            &json!({"id":SESSION_ID,"num_messages":5}),
+            id,
+            &json!({"id":id,"num_messages":8}),
             &[
-                chunk(json!(SESSION_ID), "north"),
+                chunk(json!(id), "north"),
                 chunk(Value::Null, "hidden"),
                 chunk(json!(7), "hidden"),
                 chunk(json!("broken-id"), "hidden"),
-                chunk(json!(SESSION_ID), "star"),
+                Value::Null,
+                json!({}),
+                json!({"params":7}),
+                chunk(json!(id.to_ascii_uppercase()), "star"),
             ],
         );
         let adapter = GrokAdapter::with_root(root.path());
-        let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        let session = SessionRef::new(Provider::Grok, id);
         for budget in [0, u64::MAX] {
             let read = adapter.index_session(&session, None, budget).unwrap();
             assert_eq!(
@@ -2109,7 +2198,7 @@ mod tests {
                 read.snapshot
                     .events
                     .iter()
-                    .any(|e| e.payload["malformed_updates"] == 3)
+                    .any(|e| e.payload["malformed_updates"] == 6)
             );
             GrokAdapter::verify_update_owners(
                 &session,
@@ -2340,6 +2429,49 @@ mod tests {
             fs::write(
                 &log,
                 json!({"params": {"sessionId": SESSION_ID, "update": update}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                native_update_headers(&log, SESSION_ID, 1).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_fork_checks_envelope_metadata_and_history_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("updates.jsonl");
+        let plan = |status| json!({"sessionUpdate": "plan", "entries": [{"content": "inspect", "priority": "high", "status": status}]});
+        let call = |status| json!({"sessionUpdate": "tool_call", "toolCallId": "call", "title": "Read", "status": status});
+        for (meta, update, expected) in [
+            (
+                json!({}),
+                call(json!("failed")),
+                NativeResumeSupport::Direct,
+            ),
+            (
+                json!(7),
+                call(json!("failed")),
+                NativeResumeSupport::ImportOnly,
+            ),
+            (Value::Null, call(json!(7)), NativeResumeSupport::ImportOnly),
+            (
+                Value::Null,
+                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": ""}, "message": {"text": "recovered"}}),
+                NativeResumeSupport::ImportOnly,
+            ),
+            (Value::Null, plan(json!(7)), NativeResumeSupport::ImportOnly),
+            (
+                Value::Null,
+                plan(json!("completed")),
+                NativeResumeSupport::Direct,
+            ),
+        ] {
+            fs::write(
+                &log,
+                json!({"params": {"sessionId": SESSION_ID, "_meta": meta, "update": update}})
+                    .to_string(),
             )
             .unwrap();
             assert_eq!(
