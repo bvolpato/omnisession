@@ -3013,3 +3013,64 @@ fn native_legacy_empty_tasks_count_but_unsubmitted_raws_do_not() -> anyhow::Resu
     }
     Ok(())
 }
+
+#[test]
+fn an_omitted_raw_user_separates_saved_replies_and_preserves_implicit_rollback()
+-> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace","history_mode":"legacy"}});
+    let reply = || event("agent_message", json!({"message":"reply"}));
+    for completed in [false, true] {
+        for count in [0, 1] {
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"old"})),
+                event("user_message", json!({"message":"older"})),
+                message("assistant", "reply"),
+                reply(),
+            ];
+            if completed {
+                rows.push(event("task_complete", json!({"turn_id":"old"})));
+            }
+            rows.extend([
+                message("user", "unsubmitted"),
+                reply(),
+                event("thread_rolled_back", json!({"num_turns":count})),
+            ]);
+            let (direct, sampled) = rollback_title_reads(&header, &rows, "")?;
+            for read in [direct, sampled] {
+                let expected: &[&str] = match (completed, count) {
+                    (_, 0) => &["older", "reply", "reply"],
+                    (true, _) => &["older", "reply"],
+                    (false, _) => &[],
+                };
+                assert_eq!(visible_text(&read.snapshot), expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn one_raw_reply_matches_one_saved_reply_in_the_same_implicit_turn() -> anyhow::Result<()> {
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace","history_mode":"legacy"}});
+    for count in 0..=2 {
+        let rows = [
+            event("task_started", json!({"turn_id":"old"})),
+            event("user_message", json!({"message":"older"})),
+            event("task_complete", json!({"turn_id":"old"})),
+            message("assistant", "reply"),
+            event("agent_message", json!({"message":"reply"})),
+            event("agent_message", json!({"message":"reply"})),
+            event("thread_rolled_back", json!({"num_turns":count})),
+        ];
+        let (full, preview) = rollback_title_reads(&header, &rows, "")?;
+        let expected: &[&str] = match count {
+            0 => &["older", "reply", "reply"],
+            1 => &["older"],
+            _ => &[],
+        };
+        for read in [full, preview] {
+            assert_eq!(visible_text(&read.snapshot), expected);
+        }
+    }
+    Ok(())
+}

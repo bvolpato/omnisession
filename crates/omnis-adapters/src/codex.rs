@@ -2621,6 +2621,12 @@ struct NativeTask {
     last_ordinal: Option<u64>,
 }
 
+enum ImplicitTurn {
+    Closed,
+    RawReply(TurnCheckpoint),
+    Open,
+}
+
 struct CodexHistory {
     project_path: Option<PathBuf>,
     settings: workspace_check::WorkspaceSettings,
@@ -2636,6 +2642,7 @@ struct CodexHistory {
     pending_turn: Option<TurnCheckpoint>,
     seen_client_submission: Option<bool>,
     first_native_request: Option<u64>,
+    implicit_turn: ImplicitTurn,
     native_start: Option<NativeTask>,
     tool_events: usize,
     omitted_tool_events: usize,
@@ -2660,6 +2667,7 @@ impl CodexHistory {
             pending_turn: None,
             seen_client_submission: None,
             first_native_request: None,
+            implicit_turn: ImplicitTurn::Closed,
             native_start: None,
             tool_events: 0,
             omitted_tool_events: 0,
@@ -2750,6 +2758,7 @@ impl CodexHistory {
                 self.workspace_record = None;
             }
             self.native_start = None;
+            self.implicit_turn = ImplicitTurn::Closed;
             self.last_visible = None;
             self.pending_turn = None;
             self.seen_client_submission = None;
@@ -2798,6 +2807,7 @@ impl CodexHistory {
             self.finish_native_task();
         }
         self.native_start = None;
+        self.implicit_turn = ImplicitTurn::Closed;
         self.pending_turn = None;
         self.seen_client_submission = None;
         self.last_visible = None;
@@ -2843,6 +2853,7 @@ impl CodexHistory {
             }
         }
         if start {
+            self.implicit_turn = ImplicitTurn::Closed;
             self.finish_native_task();
             self.pending_turn = Some(self.checkpoint(builder));
             self.first_native_request = None;
@@ -2874,10 +2885,56 @@ impl CodexHistory {
                 }
             }
             self.native_start = None;
+            self.implicit_turn = ImplicitTurn::Closed;
             self.pending_turn = None;
             self.seen_client_submission = None;
             self.last_visible = None;
         }
+    }
+
+    fn push_turn_record(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        confirmed: bool,
+    ) -> bool {
+        let outside_turn = builder.codex_saved_users.is_some()
+            && self.native_start.is_none()
+            && !matches!(self.implicit_turn, ImplicitTurn::Open);
+        if outside_turn
+            && record["type"] == "response_item"
+            && record["payload"]["type"] == "message"
+            && record["payload"]["role"] == "assistant"
+        {
+            self.implicit_turn = ImplicitTurn::RawReply(self.checkpoint(builder));
+        }
+        let user = push_record(builder, record, &mut self.last_visible, confirmed);
+        let implicit_reply = outside_turn
+            && record["type"] == "event_msg"
+            && record["payload"]["type"] == "agent_message"
+            && string_at(&record["payload"], &[&["message"], &["text"]])
+                .is_some_and(|text| !text.is_empty() && text != omnis_core::CODEX_IMPORT_MARKER);
+        if !user && !implicit_reply {
+            return false;
+        }
+        let next = if self.native_start.is_some() {
+            ImplicitTurn::Closed
+        } else {
+            ImplicitTurn::Open
+        };
+        let previous = std::mem::replace(&mut self.implicit_turn, next);
+        if implicit_reply
+            && self.pending_turn.is_none()
+            && let ImplicitTurn::RawReply(raw) = previous
+            && let Some(paired) = self
+                .last_visible
+                .as_ref()
+                .and_then(|group| group.paired_position)
+            && usize::try_from(raw.sequence) == Ok(paired)
+        {
+            self.pending_turn = Some(raw);
+        }
+        true
     }
 
     fn push_recovered(
@@ -2921,7 +2978,7 @@ impl CodexHistory {
         }
         let checkpoint = self.checkpoint(builder);
         let client_submission = client_submission(record);
-        if push_record(builder, record, &mut self.last_visible, confirmed) {
+        if self.push_turn_record(builder, record, confirmed) {
             if let Some(start) = self
                 .last_visible
                 .as_mut()
@@ -3057,6 +3114,7 @@ fn push_record(
         && payload["type"] == "message"
         && payload["role"] == "user"
     {
+        MirrorGroup::barrier(last_visible);
         return false;
     }
     if confirmed {
@@ -3966,6 +4024,15 @@ fn push_message_text(
     };
     let observation = MirrorGroup::observe(last_visible, message, emitted);
     let paired = matches!(observation, MirrorObservation::Paired(_));
+    if let MirrorObservation::Paired(position) = observation
+        && kind == EventKind::MessageAssistant
+        && builder.codex_saved_users.is_some()
+        && let Some(group) = last_visible
+    {
+        *group = MirrorGroup::new(group.scoped);
+        group.paired_position = position;
+        return false;
+    }
     if suppressed && !paired {
         return false;
     }

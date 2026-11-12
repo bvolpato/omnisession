@@ -1596,3 +1596,124 @@ fn a_suppressed_raw_request_cannot_replace_a_receipt_confirmed_child_message() -
     }
     Ok(())
 }
+
+#[test]
+fn conflicting_attachment_markers_do_not_expose_an_interrupted_parent() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for kind in [
+        "item_started",
+        "item_completed",
+        "task_started",
+        "turn_started",
+        "turn_aborted",
+    ] {
+        let mut rows = interrupted_fork(&dir)?;
+        rows.truncate(2);
+        if kind == "item_started" || kind == "turn_aborted" {
+            rows[0]["payload"]["history_base"] = json!({});
+        }
+        rows.push(json!({"type":"event_msg","ordinal":4,"thread_id":PARENT,"payload":{"type":kind,"thread_id":CHILD,"turn_id":"foreign","reason":"interrupted"}}));
+        let mut copied = message(5, "interrupted parent content");
+        copied["thread_id"] = json!(PARENT);
+        rows.push(copied);
+        let mut abort = json!({"type":"event_msg","ordinal":6,"payload":{"type":"turn_aborted","thread_id":PARENT,"reason":"interrupted"}});
+        if matches!(kind, "item_started" | "task_started") {
+            abort["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("thread_id");
+        }
+        rows.extend([
+            abort,
+            message(7,"after the parent abort"),
+            json!({"type":"event_msg","ordinal":8,"payload":{"type":"task_started","thread_id":CHILD,"turn_id":"local"}}),
+            message(9,"verified child request"),
+        ]);
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, 10, Some(bookmark(CHILD, &rows)), false),
+                message(11, "detached request"),
+            ],
+        )?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [CHILD, REVERT] {
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let texts: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            let mut expected = if id == REVERT && rows[0]["payload"]["history_base"] == json!({}) {
+                vec![]
+            } else {
+                vec!["after the parent abort", "verified child request"]
+            };
+            if id == REVERT {
+                expected.push("detached request");
+            }
+            assert_eq!(texts, expected, "{kind} {id}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn paired_attachment_requests_survive_metadata_until_an_inherited_abort() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for ending in ["metadata", "task_started", "turn_aborted"] {
+        let mut rows = interrupted_fork(&dir)?;
+        rows.truncate(3);
+        rows.push(json!({"type":"event_msg","ordinal":5,"payload":{"type":"damaged_marker"}}));
+        for (ordinal, text) in [(6, "first pair"), (8, "second pair"), (10, "foreign pair")] {
+            let mut raw = message(ordinal, text);
+            if ordinal == 10 {
+                raw["thread_id"] = json!(PARENT);
+            }
+            rows.push(raw);
+            rows.push(json!({"type":"event_msg","ordinal":ordinal+1,"payload":{"type":"user_message","message":text}}));
+        }
+        rows.push(json!({"type":"event_msg","ordinal":12,"payload":{"type":"token_count"}}));
+        if ending != "metadata" {
+            rows.push(json!({"type":"event_msg","ordinal":13,"payload":{"type":ending,"turn_id":"next","reason":"interrupted"}}));
+        }
+        let end = rows.len() + 2;
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, end, Some(bookmark(CHILD, &rows)), false),
+                message(end + 1, "detached request"),
+            ],
+        )?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [CHILD, REVERT] {
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let texts: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            for text in ["first pair", "second pair"] {
+                assert_eq!(
+                    texts.contains(&text),
+                    ending != "turn_aborted",
+                    "{id} {ending}: {texts:?}"
+                );
+            }
+            assert!(
+                !texts.contains(&"foreign pair")
+                    && !texts.contains(&"interrupted parent generation"),
+                "{id} {ending}: {texts:?}"
+            );
+        }
+    }
+    Ok(())
+}

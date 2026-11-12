@@ -126,6 +126,7 @@ struct AttachmentStart {
     owner: Option<Uuid>,
     hidden_rows: usize,
     hidden_records: usize,
+    saved_pairs: Vec<(usize, usize)>,
     literal_tags: Option<LiteralTags>,
     incomplete: bool,
 }
@@ -163,7 +164,19 @@ impl VisibleStart {
     }
 
     fn hides_parsed_row(&self, row: usize, record: &Value) -> bool {
-        self.hides_row(row) && !self.owned_settings(record)
+        self.hides_row(row)
+            && !self.owned_settings(record)
+            && !self.in_saved_pair(row, |pair| pair.0)
+    }
+
+    fn in_saved_pair(&self, index: usize, end: impl Fn(&(usize, usize)) -> usize) -> bool {
+        self.attached.as_ref().is_some_and(|start| {
+            let pos = start.saved_pairs.partition_point(|pair| end(pair) < index);
+            start
+                .saved_pairs
+                .get(pos)
+                .is_some_and(|pair| end(pair) - index <= 1)
+        })
     }
 
     fn owned_settings(&self, record: &Value) -> bool {
@@ -173,7 +186,7 @@ impl VisibleStart {
             && self
                 .attached
                 .as_ref()
-                .is_some_and(|start| start.owns(&record["payload"]))
+                .is_some_and(|start| start.owns(record))
     }
 
     fn hides_record(&self, index: usize, record: &Value) -> bool {
@@ -181,6 +194,7 @@ impl VisibleStart {
             .as_ref()
             .is_some_and(|start| index > 1 && index <= start.hidden_records)
             && !self.owned_settings(record)
+            && !self.in_saved_pair(index, |pair| pair.1)
     }
 
     fn ordinal(&self) -> Option<u64> {
@@ -493,6 +507,7 @@ fn attached_history_start(
             ordinal,
             ..Default::default()
         },
+        parent: pos.map(|base| base.thread_id),
         gap: pos.is_none(),
         ..Default::default()
     };
@@ -536,6 +551,7 @@ fn attached_history_start(
 
 #[derive(Default)]
 struct AttachmentPreamble {
+    parent: Option<Uuid>,
     start: AttachmentStart,
     row: usize,
     records: usize,
@@ -548,6 +564,41 @@ struct AttachmentPreamble {
 }
 
 impl AttachmentPreamble {
+    fn observe_header(&mut self, payload: &Value) {
+        self.parent = payload["forked_from_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .or(self.parent);
+        self.start.owner = payload["id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok());
+    }
+
+    fn matches_saved_pair(&self, raw: &Value, saved: &Value, previous: Option<u64>) -> bool {
+        let Some((left, right)) = previous.zip(self.previous_ordinal) else {
+            return false;
+        };
+        if left < self.start.ordinal
+            || left.checked_add(1) != Some(right)
+            || !self.start.matches_scope(raw)
+            || !self.start.matches_scope(saved)
+            || raw["payload"]
+                .get("turn_id")
+                .zip(saved["payload"].get("turn_id"))
+                .is_some_and(|(raw, saved)| raw != saved)
+        {
+            return false;
+        }
+        let identity = |row: &Value| {
+            request_text(row).map(|text| {
+                super::VisibleMessage::new(row, omnis_ir::EventKind::MessageUser, &text)
+            })
+        };
+        identity(raw)
+            .zip(identity(saved))
+            .is_some_and(|(raw, saved)| raw.mirrors(&saved))
+    }
+
     fn observe(&mut self, record: Value) -> bool {
         let payload = &record["payload"];
         let previous_ordinal =
@@ -555,9 +606,7 @@ impl AttachmentPreamble {
         let request = self.request.take();
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("session_meta"), _) if self.row == 1 => {
-                self.start.owner = payload["id"]
-                    .as_str()
-                    .and_then(|id| Uuid::parse_str(id).ok());
+                self.observe_header(payload);
             }
             (Some("event_msg"), Some("thread_settings_applied"))
                 if payload["thread_settings"].is_object() =>
@@ -565,17 +614,24 @@ impl AttachmentPreamble {
                 self.settings = true;
             }
             (Some("dynamic_tools_updated"), _)
-                if super::is_dynamic_tool_catalog(&record) && self.start.owns(payload) => {}
+                if super::is_dynamic_tool_catalog(&record) && self.start.owns(&record) => {}
             (Some("response_item"), Some(kind)) => {
                 self.responses += 1;
                 if kind == "message" && payload["role"] == "user" {
                     self.request = Some(record);
                 }
             }
-            (Some("event_msg"), Some("turn_aborted")) if payload["reason"].is_string() => {
+            (Some("event_msg"), Some("turn_aborted"))
+                if payload["reason"].is_string()
+                    && (self.start.matches_scope(&record)
+                        || self.parent.is_some_and(|parent| {
+                            super::event_scope_matches(&record, &parent.to_string())
+                        })) =>
+            {
                 if let (Some(prev), Some(abort)) = (previous_ordinal, self.previous_ordinal) {
                     self.start.incomplete |= prev.checked_add(1) != Some(abort);
                 }
+                self.start.saved_pairs.clear();
                 self.start.hidden_rows = self.row;
                 self.start.hidden_records = self.records;
                 return true;
@@ -584,13 +640,9 @@ impl AttachmentPreamble {
                 Some("event_msg"),
                 Some(kind @ ("task_started" | "turn_started" | "item_started" | "item_completed")),
             ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
-                && (if matches!(kind, "task_started" | "turn_started") {
-                    self.start.owner.is_some_and(|owner| {
-                        super::event_scope_matches(&record, &owner.to_string())
-                    })
-                } else {
-                    self.start.owns(payload)
-                }) =>
+                && self.start.matches_scope(&record)
+                && (matches!(kind, "task_started" | "turn_started")
+                    || payload["thread_id"].is_string()) =>
             {
                 let verified = request.as_ref().and_then(|request| {
                     (kind == "item_completed"
@@ -624,14 +676,23 @@ impl AttachmentPreamble {
                 }
                 return true;
             }
+            (Some("event_msg"), Some("user_message"))
+                if self.start.ordinal > 1
+                    && self.gap
+                    && request.as_ref().is_some_and(|raw| {
+                        self.matches_saved_pair(raw, &record, previous_ordinal)
+                    }) =>
+            {
+                if self.start.saved_pairs.len() < super::MAX_CANONICAL_EVENTS {
+                    self.start.saved_pairs.push((self.row, self.records));
+                } else {
+                    self.start.incomplete = true;
+                }
+            }
             _ => {
                 self.gap = true;
                 self.start.incomplete = true;
-                if self
-                    .start
-                    .owner
-                    .is_some_and(|owner| super::event_scope_matches(&record, &owner.to_string()))
-                {
+                if self.start.matches_scope(&record) {
                     self.turn_hint = payload["turn_id"].as_str().map(str::to_owned);
                 }
             }
@@ -641,13 +702,13 @@ impl AttachmentPreamble {
 }
 
 impl AttachmentStart {
-    fn owns(&self, payload: &Value) -> bool {
-        self.owner.is_some_and(|owner| {
-            payload["thread_id"]
-                .as_str()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                == Some(owner)
-        })
+    fn matches_scope(&self, record: &Value) -> bool {
+        self.owner
+            .is_some_and(|owner| super::event_scope_matches(record, &owner.to_string()))
+    }
+
+    fn owns(&self, record: &Value) -> bool {
+        record["payload"]["thread_id"].is_string() && self.matches_scope(record)
     }
 }
 
