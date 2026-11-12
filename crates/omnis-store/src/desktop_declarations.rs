@@ -5,9 +5,40 @@ use uuid::Uuid;
 use crate::{IndexedSession, MissingDesktopSummaries, Result, StoreError, database_error};
 use std::path::Path;
 
+mod physical_summaries;
+
 pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     initialize_provider_counts(tx)?;
-    initialize_physical_counts(tx)
+    initialize_physical_counts(tx)?;
+    recover_historical_counts(tx)?;
+    physical_summaries::initialize(tx)
+}
+
+fn recover_historical_counts(tx: &Transaction<'_>) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use sha2::{Digest, Sha256};
+    let first = tx.execute(
+        "INSERT OR IGNORE INTO session_trajectory_migrations(name) VALUES('recover_verified_desktop_counts')",
+        [],
+    ).map_err(database_error)?;
+    if first != 0 {
+        tx.create_scalar_function(
+            "omnis_receipt_matches_text",
+            2,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            |args| {
+                let text = args.get_raw(0).as_str()?;
+                let hash = args.get_raw(1).as_blob()?;
+                Ok(Sha256::digest(text.as_bytes()).as_slice() == hash)
+            },
+        )
+        .map_err(database_error)?;
+        tx.execute_batch(include_str!("desktop_declarations/historical_counts.sql"))
+            .map_err(database_error)?;
+        tx.remove_function("omnis_receipt_matches_text", 2)
+            .map_err(database_error)?;
+    }
+    Ok(())
 }
 
 fn initialize_provider_counts(tx: &Transaction<'_>) -> Result<()> {
@@ -86,23 +117,6 @@ fn initialize_physical_counts(tx: &Transaction<'_>) -> Result<()> {
              steps INTEGER NOT NULL CHECK(steps>=0),
              UNIQUE(session_id,source_home,source_file)
          );
-         INSERT OR IGNORE INTO ide_step_declarations(session_id,source_home,source_file,steps)
-         SELECT r.session_id,r.source_home,r.source_file,c.event_count
-         FROM antigravity_ide_search_receipts r
-         JOIN session_trajectories d ON d.provider=r.provider AND d.session_id=r.session_id
-             AND d.origin='native' AND d.source_complete AND NOT d.provider_limited
-             AND d.source_file_id=r.source_file AND d.source_contents_id=r.source_contents AND d.content_hash=r.content_hash
-         JOIN native_search_document_homes o ON o.trajectory_id=d.id AND o.verification=1
-             AND o.source_home=r.source_home AND o.source_file=r.source_file
-         JOIN session_index c ON c.provider=r.provider AND c.session_id=r.session_id
-             AND c.source_file_id=r.source_file AND c.source_contents_id=r.source_contents
-         JOIN native_catalog_homes h ON h.provider=c.provider AND h.session_id=c.session_id
-             AND h.verified AND h.home=r.source_home
-         WHERE c.event_count>0 AND length(r.step_proof)=16*c.event_count
-             AND NOT EXISTS(SELECT 1 FROM desktop_step_declarations
-                 WHERE session_id=r.session_id AND source_home=r.source_home AND source_file=r.source_file)
-             AND NOT EXISTS(SELECT 1 FROM ide_step_declarations
-                 WHERE session_id=r.session_id AND source_home=r.source_home AND source_file=r.source_file);
          INSERT INTO sqlite_sequence(name,seq)
          SELECT 'physical_step_declarations',coalesce(max(seq),0) FROM sqlite_sequence
          WHERE name IN ('desktop_step_declarations','ide_step_declarations');
@@ -111,7 +125,8 @@ fn initialize_physical_counts(tx: &Transaction<'_>) -> Result<()> {
              SELECT session_id,source_home,source_file,steps FROM desktop_step_declarations
              UNION ALL SELECT session_id,source_home,source_file,steps FROM ide_step_declarations
          ) GROUP BY session_id,source_home,source_file HAVING min(steps)=max(steps);",
-    ).map_err(database_error)?;
+    )
+    .map_err(database_error)?;
     for (table, peer) in [
         ("desktop_step_declarations", "ide_step_declarations"),
         ("ide_step_declarations", "desktop_step_declarations"),
@@ -159,11 +174,12 @@ pub(super) fn verified(
 
 pub(super) fn reconcile(
     connection: &Connection,
-    id: &str,
+    session: &SessionRef,
     home: &[u8],
     file: Uuid,
     matches: impl Fn(usize, Uuid) -> bool,
 ) -> Result<Option<usize>> {
+    let id = &session.id;
     let tx = connection.unchecked_transaction().map_err(database_error)?;
     if let Some(count) = verified(&tx, id, home, file)? {
         return Ok(Some(count));
@@ -174,31 +190,49 @@ pub(super) fn reconcile(
               WHERE session_id=?1 AND source_home=?2 AND source_file=?3
             UNION ALL SELECT 'antigravity-ide',steps FROM ide_step_declarations
               WHERE session_id=?1 AND source_home=?2 AND source_file=?3)
-         SELECT c.steps,d.source_contents_id FROM candidates c
+         SELECT c.steps,d.source_contents_id,c.provider=?4,0 FROM candidates c
          JOIN session_trajectories d ON d.provider=c.provider AND d.session_id=?1 AND d.source_file_id=?3
          JOIN native_search_document_homes o ON o.trajectory_id=d.id AND o.verification=1
              AND o.source_home=?2 AND o.source_file=?3
          WHERE d.source_contents_id IS NOT NULL
-         UNION ALL SELECT c.steps,d.source_contents FROM candidates c JOIN scoped_native_documents d
+         UNION ALL SELECT c.steps,d.source_contents,c.provider=?4,1 FROM candidates c JOIN scoped_native_documents d
              ON d.provider=c.provider AND d.session_id=?1 AND d.source_home=?2 AND d.source_file=?3",
     ).map_err(database_error)?;
     let mut rows = query
-        .query(params![id, home, file.as_bytes()])
+        .query(params![
+            id,
+            home,
+            file.as_bytes(),
+            session.provider.to_string()
+        ])
         .map_err(database_error)?;
     let mut proven = None;
+    let mut ambiguous = false;
+    let mut local = None;
+    let mut foreign = None;
+    let mut archived = false;
     while let Some(row) = rows.next().map_err(database_error)? {
         let count = usize::try_from(row.get::<_, i64>(0).map_err(database_error)?)
             .map_err(|_| StoreError::CorruptStore)?;
         let contents = Uuid::from_bytes(row.get(1).map_err(database_error)?);
+        if row.get(2).map_err(database_error)? {
+            local = Some(count);
+        } else {
+            foreign = Some(count);
+        }
+        archived |= row.get::<_, bool>(3).map_err(database_error)?;
         if matches(count, contents) {
             if proven.is_some_and(|prior| prior != count) {
-                return Ok(None);
+                ambiguous = true;
             }
             proven = Some(count);
         }
     }
     drop(rows);
     drop(query);
+    if ambiguous || (archived && local.is_some() && foreign.is_some() && local != foreign) {
+        return Ok(local);
+    }
     if let Some(count) = proven {
         tx.execute(
             "INSERT INTO physical_step_declarations(session_id,source_home,source_file,steps)
@@ -213,7 +247,7 @@ pub(super) fn reconcile(
         .map_err(database_error)?;
     }
     tx.commit().map_err(database_error)?;
-    Ok(proven)
+    Ok(proven.or(local))
 }
 
 pub(super) fn table(provider: Provider) -> Option<&'static str> {
@@ -266,11 +300,11 @@ pub(super) fn record(
         .transpose()?;
     let steps = i64::try_from(steps).map_err(|_| StoreError::InvalidSessionReference)?;
     let previous = tx
-        .prepare_cached(&format!(
+        .prepare_cached(
             "SELECT p.generation,p.steps,d.summary FROM physical_step_declarations p
-         LEFT JOIN {table} d USING(session_id,source_home,source_file)
-         WHERE p.session_id=?1 AND p.source_home=?2 AND p.source_file=?3"
-        ))
+         LEFT JOIN physical_database_summaries d USING(session_id,source_home,source_file)
+         WHERE p.session_id=?1 AND p.source_home=?2 AND p.source_file=?3",
+        )
         .map_err(database_error)?
         .query_row(params![session.id, home, file.as_bytes()], |r| {
             Ok((

@@ -131,6 +131,7 @@ pub struct SearchSourceObservation {
     /// Canonical native home verified together with this session.
     pub home: PathBuf,
     selected_home: PathBuf,
+    database_contents: Option<uuid::Uuid>,
     paths: Vec<(PathBuf, FileObservation)>,
 }
 
@@ -173,6 +174,7 @@ impl SearchSourceObservation {
             desktop_summaries_unavailable: false,
             home,
             selected_home: root.to_path_buf(),
+            database_contents: None,
             paths,
         };
         anyhow::ensure!(
@@ -191,6 +193,12 @@ impl SearchSourceObservation {
                 .source_path
                 .as_deref()
                 .is_some_and(|path| path.extension().is_some_and(|ext| ext == "db"))
+    }
+
+    /// Returns the observed Desktop database and WAL revision, independent of summary metadata.
+    #[must_use]
+    pub fn database_contents(&self) -> Option<uuid::Uuid> {
+        self.database_contents
     }
 
     /// Checks a historical declaration against the selected database and WAL.

@@ -278,6 +278,7 @@ pub(super) fn guard_observed_steps(
     guard: TrajectorySourceGuard,
     source: &SearchSourceObservation,
 ) -> TrajectorySourceGuard {
+    let guard = guard.with_database_contents(source.database_contents());
     if source.is_ide_desktop_database() && !source.desktop_summaries_unavailable {
         guard.with_database_alias_step_count(source.session.event_count)
     } else {

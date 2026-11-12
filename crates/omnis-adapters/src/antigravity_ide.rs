@@ -1126,6 +1126,18 @@ mod tests {
         assert_eq!(listed.source_revision, Some(observation.revision));
         assert_eq!(observation.home, desktop.canonicalize().unwrap());
         assert!(observation.is_ide_desktop_database());
+        assert!(observation.database_contents().is_some());
+        let physical = AntigravityDesktopAdapter::with_root(&desktop)
+            .observe_search_source(
+                &SessionRef::new(Provider::AntigravityDesktop, ID),
+                listed.source_path.as_deref(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observation.database_contents(),
+            physical.database_contents()
+        );
         let legacy = AntigravityIdeAdapter {
             root: Some(ide.clone()),
             legacy_desktop: false,
@@ -1180,6 +1192,7 @@ mod tests {
             .unwrap();
         assert_eq!(standalone.home, ide.canonicalize().unwrap());
         assert!(!standalone.is_ide_desktop_database());
+        assert_eq!(standalone.database_contents(), None);
         assert_ne!(standalone.revision.file, observation.revision.file);
         assert_eq!(fs::read(&database).unwrap(), before);
     }

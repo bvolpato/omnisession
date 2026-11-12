@@ -26,7 +26,7 @@ const ALIAS_SOURCES: &str = "
         SELECT provider,session_id,source_home,source_file,source_contents,content_hash,length(step_proof)/16
         FROM antigravity_ide_search_receipts
     ), primary_docs AS (
-        SELECT r.*,d.id AS document_id,d.derived_title,d.source_complete AND d.complete AND NOT d.provider_limited AS complete
+        SELECT r.*,d.id AS document_id,d.indexed_at,d.derived_title,d.complete AS projection_complete,d.source_complete AND NOT d.provider_limited AS complete
         FROM receipts r JOIN session_trajectories d USING(provider,session_id)
         JOIN native_search_document_homes o ON o.trajectory_id=d.id AND o.verification=1
             AND o.source_home=r.source_home AND o.source_file=r.source_file
@@ -38,7 +38,7 @@ const ALIAS_SOURCES: &str = "
     ), documents AS (
         SELECT * FROM primary_docs
         UNION ALL
-        SELECT r.*,-s.id,s.derived_title,s.source_complete AND s.complete AND NOT s.provider_limited
+        SELECT r.*,-s.id,NULL,s.derived_title,s.complete,s.source_complete AND NOT s.provider_limited
         FROM receipts r JOIN scoped_native_documents s USING(provider,session_id,source_home,source_file,source_contents)
         WHERE NOT EXISTS(SELECT 1 FROM primary_docs p WHERE p.provider=r.provider AND p.session_id=r.session_id
             AND p.source_home=r.source_home AND p.source_file=r.source_file)
@@ -48,26 +48,51 @@ const ALIAS_SOURCES: &str = "
         SELECT 'antigravity-desktop',session_id,source_home,source_file,steps,summary FROM desktop_step_declarations
     )
     SELECT cur.provider,cur.session_id,
-        CASE WHEN cur.document_id>0 THEN c.title ELSE s.summary->>'title' END,
-        CASE WHEN cur.document_id>0 THEN c.project_path ELSE s.summary->>'project_path' END,
-        CASE WHEN cur.document_id>0 THEN c.git_branch ELSE s.summary->>'git_branch' END,
-        CASE WHEN cur.document_id>0 THEN c.created_at ELSE s.summary->>'created_at' END,
-        CASE WHEN cur.document_id>0 THEN c.updated_at ELSE s.summary->>'updated_at' END,
-        CASE WHEN cur.document_id>0 THEN c.updated_at_approximate ELSE coalesce(s.summary->>'approximate',0) END,
+        CASE WHEN shared.summary IS NOT NULL THEN shared.summary->>'title'
+             WHEN cur.document_id>0 THEN c.title ELSE s.summary->>'title' END AS donor_title,
+        CASE WHEN shared.summary IS NOT NULL THEN shared.summary->>'project_path'
+             WHEN cur.document_id>0 THEN c.project_path ELSE s.summary->>'project_path' END AS donor_project_path,
+        CASE WHEN shared.summary IS NOT NULL THEN shared.summary->>'git_branch'
+             WHEN cur.document_id>0 THEN c.git_branch ELSE s.summary->>'git_branch' END AS donor_git_branch,
+        CASE WHEN shared.summary IS NOT NULL THEN shared.summary->>'created_at'
+             WHEN cur.document_id>0 THEN c.created_at ELSE s.summary->>'created_at' END AS donor_created_at,
+        CASE WHEN shared.summary IS NOT NULL THEN shared.summary->>'updated_at'
+             WHEN cur.document_id>0 THEN c.updated_at ELSE s.summary->>'updated_at' END AS donor_updated_at,
+        CASE WHEN shared.summary IS NOT NULL THEN coalesce(shared.summary->>'approximate',0)
+             WHEN cur.document_id>0 THEN c.updated_at_approximate ELSE coalesce(s.summary->>'approximate',0) END AS donor_approximate,
         cur.steps,cur.source_file,cur.source_contents,cur.derived_title,
         cur.document_id,cur.content_hash,older.document_id,older.content_hash
-    FROM documents older JOIN physical_step_declarations declaration USING(session_id,source_home,source_file)
+    FROM documents older
+    LEFT JOIN physical_database_body_reads witness USING(session_id,source_home,source_file)
+    LEFT JOIN physical_step_declarations declaration USING(session_id,source_home,source_file)
     JOIN documents cur USING(session_id,source_home,source_file)
     JOIN native_catalog_homes selected ON selected.provider=older.provider AND selected.session_id=older.session_id
         AND selected.verified AND selected.home=older.source_home
     JOIN session_index selected_catalog ON selected_catalog.provider=older.provider AND selected_catalog.session_id=older.session_id
         AND selected_catalog.source_file_id=older.source_file AND selected_catalog.source_contents_id=older.source_contents
     LEFT JOIN session_index c ON cur.document_id>0 AND c.provider=cur.provider AND c.session_id=cur.session_id
+    LEFT JOIN physical_database_summaries shared ON shared.session_id=cur.session_id
+        AND shared.source_home=cur.source_home AND shared.source_file=cur.source_file
     LEFT JOIN summaries s ON cur.document_id<0 AND s.provider=cur.provider AND s.session_id=cur.session_id
         AND s.source_file=cur.source_file AND s.source_home=cur.source_home AND s.steps=cur.steps
     WHERE (?1 IS NULL OR older.provider=?1) AND (older.provider<>'antigravity-ide' OR selected.home=?2)
-        AND older.provider<>cur.provider AND older.steps>declaration.steps
-        AND cur.source_contents=declaration.source_contents AND cur.complete AND cur.steps=declaration.steps";
+        AND (older.content_hash,older.steps,older.complete,older.projection_complete,older.derived_title,
+             selected_catalog.title,selected_catalog.project_path,selected_catalog.git_branch,
+             selected_catalog.created_at,selected_catalog.updated_at,selected_catalog.updated_at_approximate,
+             selected_catalog.event_count)
+          IS NOT (cur.content_hash,cur.steps,cur.complete,cur.projection_complete,cur.derived_title,
+             donor_title,donor_project_path,donor_git_branch,donor_created_at,donor_updated_at,donor_approximate,cur.steps)
+        AND older.provider<>cur.provider AND cur.complete AND (
+            ((witness.declaration_generation IS declaration.generation
+                  OR (declaration.source_contents=witness.source_contents AND declaration.steps=cur.steps))
+                AND cur.provider=witness.provider
+                AND cur.source_contents=witness.source_contents AND cur.content_hash=witness.content_hash)
+            OR (witness.session_id IS NULL
+                AND cur.source_contents=declaration.source_contents AND cur.steps=declaration.steps
+                AND ((older.steps>cur.steps AND (cur.indexed_at>older.indexed_at
+                        OR (cur.projection_complete AND (NOT older.complete OR cur.indexed_at IS NULL OR older.indexed_at IS NULL))))
+                    OR (older.steps=cur.steps AND older.complete AND cur.indexed_at>older.indexed_at)))
+        )";
 
 fn archived_body_matches(
     connection: &Connection,
@@ -87,7 +112,7 @@ fn archived_body_matches(
 }
 
 impl TrajectorySearchSnapshot<'_> {
-    /// Finds an alias document that covers the latest declared revision of the same database.
+    /// Finds the alias document from the latest verified read of the same database.
     ///
     /// # Errors
     ///

@@ -980,6 +980,8 @@ mod tests {
         let healthy = observe();
         assert!(!healthy.desktop_summaries_unavailable);
         assert_ne!(healthy.revision, missing.revision);
+        assert!(missing.database_contents().is_some());
+        assert_eq!(healthy.database_contents(), missing.database_contents());
         writer
             .execute(
                 "INSERT INTO steps SELECT idx + 10, step_type, step_payload FROM steps",
@@ -989,6 +991,7 @@ mod tests {
         assert!(!healthy.is_current());
         let with_wal = observe();
         assert_ne!(with_wal.revision.contents, healthy.revision.contents);
+        assert_ne!(with_wal.database_contents(), healthy.database_contents());
         write_summaries(
             root,
             vec![(
@@ -1005,6 +1008,7 @@ mod tests {
             Some(with_count.revision)
         );
         assert_ne!(with_count.revision.contents, with_wal.revision.contents);
+        assert_eq!(with_count.database_contents(), with_wal.database_contents());
         let annotations = root.join("annotations");
         fs::create_dir(&annotations).unwrap();
         fs::write(

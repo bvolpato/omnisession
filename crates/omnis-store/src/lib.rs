@@ -27,6 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod cached_database_aliases;
+mod physical_database_bodies;
 pub use cached_database_aliases::CachedDatabaseAliasSource;
 mod codex_legacy_home;
 mod codex_title_recheck;
@@ -1013,6 +1014,7 @@ pub struct TrajectoryDocumentObservation {
     document: Option<[u8; 32]>,
     failure: Option<[u8; 32]>,
     desktop_steps: Option<usize>,
+    database_contents: Option<Uuid>,
     desktop_generation: Option<i64>,
     incomplete_native_history: bool,
 }
@@ -1055,6 +1057,15 @@ impl TrajectorySourceGuard {
     pub fn with_incomplete_native_history(mut self, incomplete: bool) -> Self {
         if let Self::ObservedDocument(observed) = &mut self {
             observed.incomplete_native_history = incomplete;
+        }
+        self
+    }
+
+    /// Binds the read to the observed database and WAL independently of the optional summary.
+    #[must_use]
+    pub fn with_database_contents(mut self, contents: Option<Uuid>) -> Self {
+        if let Self::ObservedDocument(observed) = &mut self {
+            observed.database_contents = contents;
         }
         self
     }
@@ -2894,7 +2905,7 @@ impl Store {
         desktop_declarations::table(session.provider).ok_or(StoreError::InvalidSessionReference)?;
         desktop_declarations::reconcile(
             &self.connection.borrow(),
-            &session.id,
+            session,
             home.as_os_str().as_encoded_bytes(),
             file,
             matches,
@@ -3924,6 +3935,7 @@ impl Store {
                 document: document_receipt(&transaction, session)?,
                 failure: native_failure_receipt(&transaction, session)?,
                 desktop_steps: None,
+                database_contents: None,
                 desktop_generation: desktop_declarations::generation(
                     &transaction,
                     session.provider,
@@ -3938,6 +3950,7 @@ impl Store {
                 document: document_receipt(&connection, session)?,
                 failure: None,
                 desktop_steps: None,
+                database_contents: None,
                 desktop_generation: None,
                 incomplete_native_history: false,
             }
@@ -5840,6 +5853,7 @@ fn record_primary_database_receipt(
             &write.content_hash,
             write.document.database_step_proof,
         )?;
+        physical_database_bodies::record(tx, write, &home)?;
     }
     Ok(())
 }
@@ -5855,17 +5869,17 @@ fn retain_desktop_summaries(
     };
     let provider = first.session.provider;
     validate_discovered_sessions(provider, sessions)?;
-    let table = desktop_declarations::table(provider).ok_or(StoreError::InvalidSessionReference)?;
+    desktop_declarations::table(provider).ok_or(StoreError::InvalidSessionReference)?;
     let mut statement = connection
         .prepare_cached(
-            &format!("SELECT ?4,session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
+            "SELECT ?4,session_id,summary->>'title',summary->>'project_path',summary->>'git_branch',
                 summary->>'created_at',summary->>'updated_at',summary->>'approximate',p.steps,source_file,NULL
-         FROM {table} d JOIN physical_step_declarations p USING(session_id,source_home,source_file) WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
+         FROM physical_database_summaries d JOIN physical_step_declarations p USING(session_id,source_home,source_file) WHERE session_id=?1 AND source_home=?2 AND source_file=?3 AND summary IS NOT NULL
          UNION ALL SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
                created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
          FROM session_index AS catalog JOIN native_catalog_homes USING(provider,session_id)
          WHERE ?4='antigravity-desktop' AND catalog.provider = ?4 AND catalog.session_id = ?1
-             AND verified AND home = ?2 LIMIT 1"),
+             AND verified AND home = ?2 LIMIT 1",
         )
         .map_err(database_error)?;
     sessions

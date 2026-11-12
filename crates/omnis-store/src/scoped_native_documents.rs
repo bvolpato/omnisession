@@ -96,6 +96,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<()> {
     )
     .map_err(database_error)?;
     database_receipts::initialize(tx)?;
+    super::physical_database_bodies::initialize(tx)?;
     chunks::initialize(tx)
 }
 
@@ -295,7 +296,7 @@ fn publish_read(
         )?;
     }
     context.publish_locator(tx, write, true)?;
-    Ok(())
+    super::physical_database_bodies::record(tx, write, home)
 }
 
 fn archive_primary(tx: &Transaction<'_>, trajectory_id: i64, text: &str) -> Result<()> {
