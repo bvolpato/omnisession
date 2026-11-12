@@ -2312,6 +2312,29 @@ fn native_image_mirrors_prefer_explicit_detail() -> anyhow::Result<()> {
             }
         }
     }
+    let multipart = |detail| {
+        let mut record = raw(detail);
+        let parts = record["payload"]["content"].as_array_mut().unwrap();
+        parts[0]["text"] = json!("im");
+        parts.insert(1, json!({"type":"input_text","text":"age"}));
+        record
+    };
+    for (first, second) in [(None, Some("low")), (Some("low"), None)] {
+        let body = [
+            event("task_started", json!({"turn_id":"image"})),
+            multipart(Some("low")),
+            multipart(Some("high")),
+            saved(first),
+            saved(second),
+            event("task_complete", json!({"turn_id":"image"})),
+        ];
+        for preview in [true, false] {
+            assert_eq!(
+                visible_text(&read_records_with_preview(body.to_vec(), preview)?),
+                ["image", "image"]
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2364,6 +2387,36 @@ fn native_multipart_mirrors_preserve_event_text_and_unmatched_raw() -> anyhow::R
             omnis_adapters::RollbackTitle::Known(Some("Keystone".into()))
         );
     }
+    let mut legacy = message("user", "Key");
+    legacy["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":"stone"}));
+    for count in [0, 1, 2] {
+        let rows = [
+            legacy.clone(),
+            legacy.clone(),
+            event(
+                "user_message",
+                json!({"message":"Keystone","client_id":"first"}),
+            ),
+            event(
+                "user_message",
+                json!({"message":"Keystone","client_id":"second"}),
+            ),
+            event("thread_rolled_back", json!({"num_turns":count})),
+        ];
+        let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
+        for read in [full, sampled] {
+            assert_eq!(visible_text(&read.snapshot), vec!["Keystone"; 2 - count]);
+            if count > 0 {
+                assert_eq!(
+                    read.rollback_title,
+                    omnis_adapters::RollbackTitle::Known((count == 1).then(|| "Keystone".into()))
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2402,13 +2455,13 @@ fn sampled_mirror_order_preserves_the_surviving_native_opener() -> anyhow::Resul
 
 #[test]
 fn named_raw_requests_and_anonymous_interruptions_each_count_as_one_task() -> anyhow::Result<()> {
-    for (terminal, payload, attributed) in [
-        ("turn_aborted", json!({}), true),
-        ("turn_aborted", json!({"turn_id":null}), true),
-        ("turn_aborted", json!({"turn_id":"C"}), true),
-        ("turn_aborted", json!({"turn_id":"other"}), false),
-        ("task_complete", json!({}), true),
-        ("task_complete", json!({"turn_id":null}), true),
+    for (terminal, payload) in [
+        ("turn_aborted", json!({})),
+        ("turn_aborted", json!({"turn_id":null})),
+        ("turn_aborted", json!({"turn_id":"C"})),
+        ("turn_aborted", json!({"turn_id":"other"})),
+        ("task_complete", json!({})),
+        ("task_complete", json!({"turn_id":null})),
     ] {
         let rows = vec![
             event("task_started", json!({"turn_id":"A"})),
@@ -2427,10 +2480,9 @@ fn named_raw_requests_and_anonymous_interruptions_each_count_as_one_task() -> an
         for count in [1, 2] {
             let mut records = rows.clone();
             records.push(event("thread_rolled_back", json!({"num_turns":count})));
-            let expected: &[&str] = match (attributed, count) {
-                (true, 1) => &["older", "first", "first reply", "second", "second reply"],
-                (true, _) | (false, 1) => &["older"],
-                _ => &[],
+            let expected: &[&str] = match count {
+                1 => &["older", "first", "first reply", "second", "second reply"],
+                _ => &["older"],
             };
             for preview in [true, false] {
                 assert_eq!(
@@ -2438,6 +2490,93 @@ fn named_raw_requests_and_anonymous_interruptions_each_count_as_one_task() -> an
                     expected
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn only_a_named_completion_separates_a_following_implicit_request() -> anyhow::Result<()> {
+    for (terminal, payload, closed) in [
+        ("turn_aborted", json!({"reason":"interrupted"}), false),
+        (
+            "turn_aborted",
+            json!({"turn_id":null,"reason":"interrupted"}),
+            false,
+        ),
+        (
+            "turn_aborted",
+            json!({"turn_id":"B","reason":"interrupted"}),
+            false,
+        ),
+        ("task_complete", json!({}), false),
+        ("task_complete", json!({"turn_id":null}), false),
+        ("task_complete", json!({"turn_id":"B"}), true),
+        (
+            "turn_aborted",
+            json!({"turn_id":"other", "reason":"interrupted"}),
+            false,
+        ),
+        ("task_complete", json!({"turn_id":"other"}), true),
+    ] {
+        let rows = [
+            event("task_started", json!({"turn_id":"A"})),
+            event("user_message", json!({"message":"older"})),
+            event("task_complete", json!({"turn_id":"A"})),
+            event("task_started", json!({"turn_id":"B"})),
+            message("assistant", "before interruption"),
+            event(terminal, payload),
+            event("user_message", json!({"message":"continuation"})),
+            message("assistant", "after interruption"),
+        ];
+        for count in [1, 2] {
+            let expected: &[&str] = match (closed, count) {
+                (true, 1) => &["older", "before interruption"],
+                (true, _) | (false, 1) => &["older"],
+                _ => &[],
+            };
+            let mut records = rows.to_vec();
+            records.push(event("thread_rolled_back", json!({"num_turns":count})));
+            for preview in [true, false] {
+                assert_eq!(
+                    visible_text(&read_records_with_preview(records.clone(), preview)?),
+                    expected
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rollback_keeps_the_first_implicit_multipart_request_at_its_checkpoint() -> anyhow::Result<()> {
+    let mut raw = message("user", "Key");
+    raw["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":"stone"}));
+    let saved = event("user_message", json!({"message":"Keystone"}));
+    let rows = [
+        event("task_started", json!({"turn_id":"A"})),
+        event("user_message", json!({"message":"older"})),
+        event("task_complete", json!({"turn_id":"A"})),
+        raw.clone(),
+        raw,
+        saved.clone(),
+        saved,
+    ];
+    for (count, expected) in [
+        (0, &["older", "Keystone", "Keystone"][..]),
+        (1, &["older", "Keystone"]),
+        (2, &["older"]),
+    ] {
+        let mut records = rows.to_vec();
+        records.push(event("thread_rolled_back", json!({"num_turns":count})));
+        for preview in [true, false] {
+            assert_eq!(
+                visible_text(&read_records_with_preview(records.clone(), preview)?),
+                expected
+            );
         }
     }
     Ok(())

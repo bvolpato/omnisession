@@ -1919,6 +1919,7 @@ impl CodexSession {
             {
                 return Ok(false);
             }
+            let record = lineage.project_leaf_request(record);
             let rollback = history.push(&mut builder, &record)?;
             if let Some(boundary) = rollback
                 && let Some((_, matched)) = opener.take_if(|(sequence, _)| *sequence >= boundary)
@@ -2814,11 +2815,17 @@ impl CodexHistory {
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
-            if self.native_start.as_ref().is_some_and(|task| {
+            if let Some(task) = &self.native_start {
                 let id = &record["payload"]["turn_id"];
-                *id == task.id || id.is_null()
-            }) {
-                self.finish_native_task();
+                let named = id
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && (!recovering || id == task.id));
+                if id.is_null() || (event_type == Some("turn_aborted") && named) {
+                    return;
+                }
+                if named {
+                    self.finish_native_task();
+                }
             }
             self.native_start = None;
             self.pending_turn = None;
@@ -2999,7 +3006,9 @@ fn push_record(
                         *last_visible = payload["turn_id"].as_str().filter(|id| !id.is_empty()).map(|_| MirrorGroup::new(true));
                         builder.track_codex_mirror_openers(last_visible.is_some());
                     }
-                    Some("task_complete" | "turn_complete" | "turn_aborted" | "thread_rolled_back") => {
+                    Some("turn_aborted") => MirrorGroup::barrier(last_visible),
+                    Some("task_complete" | "turn_complete") if payload["turn_id"].is_null() => MirrorGroup::barrier(last_visible),
+                    Some("task_complete" | "turn_complete" | "thread_rolled_back") => {
                         *last_visible = None;
                         builder.track_codex_mirror_openers(false);
                     }
@@ -3196,7 +3205,6 @@ impl ImagePairs {
         let parts =
             first.media.as_ref().map_or(0, Vec::len) + other.media.as_ref().map_or(0, Vec::len);
         if self.retained_parts + parts > MAX_CANONICAL_EVENTS
-            || first.text != other.text
             || ![first, other].iter().any(|row| {
                 row.media
                     .iter()
@@ -3211,7 +3219,7 @@ impl ImagePairs {
         } else {
             [first.clone(), other.clone()]
         };
-        self.by_text.entry(first.text).or_default().push(pair);
+        self.by_text.entry(pair[1].text).or_default().push(pair);
         self.retained_parts += parts;
     }
 
@@ -3224,18 +3232,32 @@ impl ImagePairs {
         if let Some(index) = pending.matching(row, &mut direct_budget) {
             return Some((index, None));
         }
-        if !pending.indexes.contains_key(&MirrorKey::Text(row.text)) {
-            return None;
+        for text in std::iter::once(row.text).chain(row.alternative) {
+            if pending.indexes.contains_key(&MirrorKey::Text(text))
+                && let Some(pairs) = self.by_text.get_mut(&text)
+                && let Some(matched) = Self::rematch(pairs, text, pending, row, &mut self.credit)
+            {
+                return Some(matched);
+            }
         }
-        let pairs = self.by_text.get_mut(&row.text)?;
+        None
+    }
+
+    fn rematch(
+        pairs: &mut [[VisibleMessage; 2]],
+        text: MediaDigest,
+        pending: &PendingMessages,
+        row: &VisibleMessage,
+        credit: &mut usize,
+    ) -> Option<(usize, Option<VisibleMessage>)> {
         let side = usize::from(row.event);
         let mut visited = HashMap::<usize, Option<usize>>::new();
         let mut queue = VecDeque::<Option<usize>>::from([None]);
         while let Some(source) = queue.pop_front() {
             let current = source.map_or(row, |index| &pairs[index][side]);
             if let Some(mut index) = source
-                && let Some(open) = pending.matching(current, &mut self.credit)
-                && pending.rows[&open].0.text == row.text
+                && let Some(open) = pending.matching(current, credit)
+                && pending.rows[&open].0.matches_text(text, None)
             {
                 let displaced = current.clone();
                 loop {
@@ -3247,9 +3269,7 @@ impl ImagePairs {
                 return Some((open, Some(displaced)));
             }
             for (index, pair) in pairs.iter().enumerate() {
-                self.credit = self
-                    .credit
-                    .checked_sub(1 + current.media.as_ref().map_or(0, Vec::len))?;
+                *credit = credit.checked_sub(1 + current.media.as_ref().map_or(0, Vec::len))?;
                 if !visited.contains_key(&index) && current.mirrors(&pair[1 - side]) {
                     visited.insert(index, source);
                     queue.push_back(Some(index));
@@ -3757,6 +3777,10 @@ fn push_message_text(
             return false;
         }
         if let Some(position) = position.and_then(|pos| u64::try_from(pos).ok()) {
+            if !last_visible.as_ref().is_some_and(|group| group.scoped) {
+                builder.replace_codex_user_text(position, text, timestamp);
+                return false;
+            }
             builder.remove_codex_mirror(position);
         }
     }

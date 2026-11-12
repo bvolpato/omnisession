@@ -1025,8 +1025,16 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
                 .map(|m| m.text.as_str())
                 .collect();
             assert_eq!(
-                messages.contains(&"confirmed child opening"),
+                messages
+                    .iter()
+                    .any(|m| m.starts_with("confirmed child opening")),
                 diff.starts_with("matching"),
+                "{id} {diff}"
+            );
+            let literal = "confirmed child opening\n<audio name=[Audio #1] path=\"/synthetic/voice memo.wav\">\n</audio>";
+            assert_eq!(
+                messages.contains(&literal),
+                diff == "matching literal audio",
                 "{id} {diff}"
             );
             assert!(
@@ -1363,12 +1371,18 @@ fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Resul
 }
 
 #[test]
-fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests() -> Result<()> {
+fn a_fork_keeps_numbered_subagent_messages_after_recognized_unplaced_records() -> Result<()> {
     let home = tempfile::tempdir()?;
     let dir = home.path().join("sessions");
     for (missing, gap) in [
         (2, "requests"),
         (4, "requests"),
+        (1, "assistant"),
+        (1, "token"),
+        (2, "context"),
+        (2, "completion"),
+        (2, "foreign token"),
+        (2, "opaque"),
         (2, "foreign"),
         (2, "rollback"),
         (2, "malformed"),
@@ -1382,6 +1396,17 @@ fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests()
             rows.push(request);
         }
         match gap {
+            "assistant" => rows[1]["payload"]["role"] = json!("assistant"),
+            "token" => rows[1] = json!({"type":"event_msg","payload":{"type":"token_count"}}),
+            "context" => rows[1] = json!({"type":"turn_context","payload":{"turn_id":"local"}}),
+            "completion" => {
+                rows[1] = json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"local","thread_id":PARENT}});
+            }
+            "foreign token" => {
+                rows[1] =
+                    json!({"type":"event_msg","payload":{"type":"token_count","thread_id":REVERT}});
+            }
+            "opaque" => rows[1] = json!({"type":"event_msg","payload":{"type":"unknown_control"}}),
             "foreign" => rows[1]["payload"]["thread_id"] = json!(REVERT),
             "rollback" => {
                 rows[1] = json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}});
@@ -1389,6 +1414,10 @@ fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests()
             "malformed" => rows[1] = json!({"type":"damaged_marker"}),
             _ => (),
         }
+        let preserves_suffix = matches!(
+            gap,
+            "requests" | "assistant" | "token" | "context" | "completion"
+        );
         let first = 3 + missing;
         for (ordinal, text, role) in [
             (first, "first reply", "assistant"),
@@ -1417,7 +1446,7 @@ fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests()
         }
         let adapter = CodexAdapter::with_root(home.path());
         for id in [PARENT, REVERT] {
-            if id == PARENT && gap != "requests" {
+            if id == PARENT && !preserves_suffix {
                 continue;
             }
             let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
@@ -1427,7 +1456,7 @@ fn a_fork_keeps_numbered_subagent_messages_after_consecutive_unplaced_requests()
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect();
-            let mut expected = if gap == "requests" {
+            let mut expected = if preserves_suffix {
                 vec!["first reply", "next request", "next reply"]
             } else {
                 vec![]

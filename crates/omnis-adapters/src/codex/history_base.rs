@@ -114,48 +114,82 @@ pub(super) enum HistoryScope {
     ModelContext,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct VisibleStart {
     attached: Option<AttachmentStart>,
     subagent: Option<u64>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct AttachmentStart {
     ordinal: u64,
     owner: Option<Uuid>,
     hidden_rows: usize,
     hidden_records: usize,
+    literal_audio: Option<LiteralAudio>,
     incomplete: bool,
 }
 
+#[derive(Clone)]
+struct LiteralAudio {
+    ordinal: u64,
+    request_digest: super::MediaDigest,
+    openings: Vec<usize>,
+}
+
 impl VisibleStart {
-    fn hides_row(self, row: usize) -> bool {
+    fn project_request(&self, mut record: Value) -> Value {
+        if let Some(literal) = self
+            .attached
+            .as_ref()
+            .and_then(|a| a.literal_audio.as_ref())
+            && record["ordinal"].as_u64() == Some(literal.ordinal)
+            && super::media_digest(&record.to_string()) == literal.request_digest
+            && let Some(parts) = record["payload"]["content"].as_array_mut()
+        {
+            for &index in &literal.openings {
+                if super::local_audio_path(parts, index + 1).is_some() {
+                    // The receipt identifies both tags as ordinary text around inline audio.
+                    parts[index]["type"] = Value::from("text");
+                    parts[index + 2]["type"] = Value::from("text");
+                }
+            }
+        }
+        record
+    }
+
+    fn hides_row(&self, row: usize) -> bool {
         self.attached
+            .as_ref()
             .is_some_and(|start| row > 1 && row <= start.hidden_rows)
     }
 
-    fn hides_parsed_row(self, row: usize, record: &Value) -> bool {
+    fn hides_parsed_row(&self, row: usize, record: &Value) -> bool {
         self.hides_row(row) && !self.owned_settings(record)
     }
 
-    fn owned_settings(self, record: &Value) -> bool {
+    fn owned_settings(&self, record: &Value) -> bool {
         // The child keeps its own settings even when Codex hides interrupted parent output.
         record["type"] == "event_msg"
             && record["payload"]["type"] == "thread_settings_applied"
             && self
                 .attached
+                .as_ref()
                 .is_some_and(|start| start.owns(&record["payload"]))
     }
 
-    fn hides_record(self, index: usize, record: &Value) -> bool {
+    fn hides_record(&self, index: usize, record: &Value) -> bool {
         self.attached
+            .as_ref()
             .is_some_and(|start| index > 1 && index <= start.hidden_records)
             && !self.owned_settings(record)
     }
 
-    fn ordinal(self) -> Option<u64> {
-        self.attached.map(|start| start.ordinal).max(self.subagent)
+    fn ordinal(&self) -> Option<u64> {
+        self.attached
+            .as_ref()
+            .map(|start| start.ordinal)
+            .max(self.subagent)
     }
 }
 
@@ -269,6 +303,7 @@ impl HistoryBase {
         Ok(Lineage {
             unavailable: visible_leaf_start
                 .attached
+                .as_ref()
                 .filter(|start| start.incomplete)
                 .map(|_| UNCERTAIN_ATTACHMENT),
             visible_leaf_start,
@@ -555,12 +590,25 @@ impl AttachmentPreamble {
                     || matches!(kind, "task_started" | "turn_started")
                         && payload.get("thread_id").is_none()) =>
             {
+                let mut literal_audio = Vec::new();
                 let recovered = kind == "item_completed"
                     && self
                         .turn_hint
                         .as_deref()
                         .is_none_or(|id| payload["turn_id"] == id)
-                    && request.is_some_and(|request| matches_request_receipt(&request, &record));
+                    && request.as_ref().is_some_and(|request| {
+                        matches_request_receipt(request, &record, &mut literal_audio)
+                    });
+                if recovered
+                    && !literal_audio.is_empty()
+                    && let Some((ordinal, request)) = previous_ordinal.zip(request)
+                {
+                    self.start.literal_audio = Some(LiteralAudio {
+                        ordinal,
+                        request_digest: super::media_digest(&request.to_string()),
+                        openings: literal_audio,
+                    });
+                }
                 let omitted = self.responses > usize::from(recovered);
                 if self.gap || omitted {
                     let keep = 1 + usize::from(recovered);
@@ -581,7 +629,7 @@ impl AttachmentPreamble {
 }
 
 impl AttachmentStart {
-    fn owns(self, payload: &Value) -> bool {
+    fn owns(&self, payload: &Value) -> bool {
         self.owner.is_some_and(|owner| {
             payload["thread_id"]
                 .as_str()
@@ -591,7 +639,11 @@ impl AttachmentStart {
     }
 }
 
-fn matches_request_receipt(request: &Value, completed: &Value) -> bool {
+fn matches_request_receipt(
+    request: &Value,
+    completed: &Value,
+    literal_audio: &mut Vec<usize>,
+) -> bool {
     let response = &request["payload"];
     let receipt = &completed["payload"];
     let item = &receipt["item"];
@@ -624,6 +676,9 @@ fn matches_request_receipt(request: &Value, completed: &Value) -> bool {
             .next_if(|candidate| same_input_part(part, candidate))
             .is_some()
         {
+            if super::local_audio_path(raw, index + 1).is_some() {
+                literal_audio.push(index);
+            }
             continue;
         }
         if let Some(path) = super::local_audio_path(raw, index + 1)
@@ -712,7 +767,8 @@ impl Segment {
 
     fn uncertain_attachment(&self) -> bool {
         self.visible_start
-            .and_then(|start| start.attached)
+            .as_ref()
+            .and_then(|start| start.attached.as_ref())
             .is_some_and(|start| start.incomplete)
     }
 
@@ -893,13 +949,18 @@ impl Lineage {
         {
             return;
         }
-        let uncertain = std::iter::once(self.visible_leaf_start)
+        let uncertain = std::iter::once(&self.visible_leaf_start)
             .chain(
                 self.segments[self.first_available..]
                     .iter()
-                    .filter_map(|s| s.visible_start),
+                    .filter_map(|s| s.visible_start.as_ref()),
             )
-            .any(|visible| visible.attached.is_some_and(|start| start.incomplete));
+            .any(|visible| {
+                visible
+                    .attached
+                    .as_ref()
+                    .is_some_and(|start| start.incomplete)
+            });
         self.unavailable = uncertain.then_some(UNCERTAIN_ATTACHMENT);
     }
 
@@ -969,6 +1030,10 @@ impl Lineage {
         read(self)
     }
 
+    pub(super) fn project_leaf_request(&self, record: Value) -> Value {
+        self.visible_leaf_start.project_request(record)
+    }
+
     pub(super) fn leaf_row_visibility(&self, record: &Value, row: usize) -> Option<bool> {
         if self.visible_leaf_start.hides_parsed_row(row, record) {
             return Some(false);
@@ -1007,7 +1072,10 @@ impl Lineage {
         let skipped = read(&mut |record, skipped| {
             row += 1;
             match self.leaf_record_visibility(&record, row) {
-                Some(true) => visit(record, skipped.combined(unplaced))?,
+                Some(true) => visit(
+                    self.visible_leaf_start.project_request(record),
+                    skipped.combined(unplaced),
+                )?,
                 Some(false) => {}
                 None => unplaced.observe_unplaced(unplaced_workspace_gap(&record, session)),
             }
@@ -1018,10 +1086,10 @@ impl Lineage {
 
     pub(super) fn hidden_context_types(&self) -> impl Iterator<Item = &'static str> {
         let starts = || {
-            std::iter::once(self.visible_leaf_start).chain(
+            std::iter::once(&self.visible_leaf_start).chain(
                 self.segments[self.first_available..]
                     .iter()
-                    .filter_map(|s| s.visible_start),
+                    .filter_map(|s| s.visible_start.as_ref()),
             )
         };
         [
@@ -1245,7 +1313,7 @@ impl RecoveryPlan {
         ordinal.checked_add(u64::try_from(row.checked_sub(first)?).ok()?)
     }
 
-    fn withheld_workspace(&self, row: usize, start: VisibleStart, record: &Value) -> bool {
+    fn withheld_workspace(&self, row: usize, start: &VisibleStart, record: &Value) -> bool {
         record["type"] == "turn_context"
             && start.ordinal().is_none_or(|first| {
                 record["ordinal"]
@@ -1255,14 +1323,20 @@ impl RecoveryPlan {
             })
     }
 
-    fn withheld_request(&self, row: usize, start: VisibleStart) -> bool {
+    fn withheld_request(&self, row: usize, start: &VisibleStart) -> bool {
         self.withheld_requests.binary_search(&row).is_ok()
             && self
                 .ordinal(row)
                 .is_some_and(|ordinal| start.ordinal().is_none_or(|begin| ordinal >= begin))
     }
 
-    fn withheld_reply(&self, row: usize, start: VisibleStart, record: &Value, path: &Path) -> bool {
+    fn withheld_reply(
+        &self,
+        row: usize,
+        start: &VisibleStart,
+        record: &Value,
+        path: &Path,
+    ) -> bool {
         row > self.opaque_through
             && self
                 .ordinal(row)
@@ -1277,7 +1351,7 @@ impl RecoveryPlan {
     fn withheld_record(
         &self,
         row: usize,
-        start: VisibleStart,
+        start: &VisibleStart,
         record: &Value,
         path: &Path,
     ) -> Option<InheritedRecord> {
@@ -1605,13 +1679,20 @@ fn is_owned_completion(record: &Value, path: &Path) -> bool {
         && owned_event(record, path)
 }
 
+fn preserves_subagent_suffix(record: &Value, path: &Path) -> bool {
+    owned_event(record, path)
+        && (message_role(record).is_some()
+            || is_non_turn_body(record)
+            || (recoverable_control(record, path) && !is_owned_rollback(record, path)))
+}
+
 struct PrefixCursor {
     next: u64,
     max_reserved_gap: u64,
     malformed: bool,
     damage: Option<&'static str>,
     damaged_preamble_settings: bool,
-    missing_subagent_requests: bool,
+    recoverable_subagent_gap: bool,
     evidence: SequenceEvidence,
 }
 
@@ -1623,24 +1704,23 @@ impl PrefixCursor {
             malformed: false,
             damage: None,
             damaged_preamble_settings: false,
-            missing_subagent_requests: false,
+            recoverable_subagent_gap: false,
             evidence: SequenceEvidence::default(),
         }
     }
 
-    fn missing_ordinal(&mut self, start: VisibleStart, record: &Value, segment: &Segment) {
-        self.missing_subagent_requests = start.subagent.is_some()
+    fn missing_ordinal(&mut self, start: &VisibleStart, record: &Value, segment: &Segment) {
+        self.recoverable_subagent_gap = start.subagent.is_some()
             && !self.malformed
-            && (self.damage.is_none() || self.missing_subagent_requests)
-            && owned_event(record, &segment.path)
-            && request_text(record).is_some();
+            && (self.damage.is_none() || self.recoverable_subagent_gap)
+            && preserves_subagent_suffix(record, &segment.path);
         self.damage = Some(MISSING_ORDINAL);
     }
 
     fn observe(
         &mut self,
         segment: &Segment,
-        start: VisibleStart,
+        start: &VisibleStart,
         record: &Value,
         row: usize,
     ) -> Result<bool> {
@@ -1673,22 +1753,17 @@ impl PrefixCursor {
                 && segment.recovery.is_some()
                 && (self.damage.is_some() || inferred.is_some())
                 && (through_subagent_start
-                    || (self.missing_subagent_requests
+                    || (self.recoverable_subagent_gap
                         && self.damage == Some(MISSING_ORDINAL)
                         && inferred.is_none()
-                        && owned_event(record, &segment.path)
                         && start.subagent.is_some_and(|cutoff| ordinal >= cutoff)
-                        && (message_role(record) == Some("assistant")
-                            || request_text(record).is_some()
-                            || is_non_turn_body(record)
-                            || (recoverable_control(record, &segment.path)
-                                && !is_owned_rollback(record, &segment.path))))
+                        && preserves_subagent_suffix(record, &segment.path))
                     || ((is_owned_turn_start(record, &segment.path)
                         || (self.damaged_preamble_settings && !preamble))
                         && start.ordinal().is_none_or(|begin| ordinal >= begin)))
             {
                 self.damage = None;
-                self.missing_subagent_requests = false;
+                self.recoverable_subagent_gap = false;
                 self.damaged_preamble_settings = false;
             }
             if !hidden
@@ -1771,7 +1846,7 @@ fn read_prefix_from(
     source: &mut dyn Read,
     visit: &mut dyn FnMut(InheritedRecord, usize) -> Result<()>,
 ) -> Result<PrefixRead> {
-    let Some(visible_start) = segment.visible_start else {
+    let Some(visible_start) = segment.visible_start.as_ref() else {
         return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
     };
     let position = segment.position;
@@ -1835,7 +1910,10 @@ fn read_prefix_from(
                     }
                 };
                 if cursor.observe(segment, visible_start, &record, row)? {
-                    visit(InheritedRecord::Native(record), skipped)?;
+                    visit(
+                        InheritedRecord::Native(visible_start.project_request(record)),
+                        skipped,
+                    )?;
                 } else if !visible_start.hides_parsed_row(row, &record)
                     && let Some(withheld) = segment.recovery.as_ref().and_then(|plan| {
                         plan.withheld_record(row, visible_start, &record, &segment.path)

@@ -1899,6 +1899,59 @@ impl EventBuilder {
         }
     }
 
+    pub(crate) fn replace_codex_user_text(
+        &mut self,
+        sequence: u64,
+        text: &str,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let retained = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok();
+        let tracks_opener = self.rollback_opener.as_ref().is_some_and(|opener| {
+            !opener.gap
+                && (opener.mirror_openers.is_some()
+                    || opener
+                        .first_message
+                        .as_ref()
+                        .is_none_or(|(pos, _)| sequence <= *pos))
+        });
+        if retained.is_none() && !tracks_opener {
+            return;
+        }
+        let event = self.event_at(
+            (sequence, None),
+            EventKind::MessageUser,
+            serde_json::json!({"text":text}),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("event_msg".to_owned()),
+        );
+        if tracks_opener && let Some(opener) = &mut self.rollback_opener {
+            let replacement =
+                omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event));
+            if let Some(candidates) = &mut opener.mirror_openers {
+                if let Some((_, title)) = &replacement {
+                    candidates.insert(sequence, title.clone());
+                } else {
+                    candidates.remove(&sequence);
+                }
+                opener.first_message = candidates
+                    .first_key_value()
+                    .map(|(&pos, title)| (pos, title.clone()));
+            } else {
+                opener.first_message = replacement;
+            }
+            if let Some((_, Some(title))) = &opener.first_message {
+                opener.withdrawn.reissued(title);
+            }
+        }
+        if let Some(index) = retained {
+            self.events[index] = event;
+        }
+    }
+
     pub(crate) fn remove_codex_mirror(&mut self, sequence: u64) {
         self.removed_mirrors.insert(sequence);
         if let Some(opener) = &mut self.rollback_opener
@@ -2102,38 +2155,24 @@ impl EventBuilder {
                 + raw_record_type.as_ref().map_or(0, String::len);
             preview.record(sequence, &kind, &payload, source_bytes)
         });
-        let observe = self.rollback_opener.as_mut().filter(|opener| {
+        let observe = self.rollback_opener.as_ref().is_some_and(|opener| {
             !opener.gap
                 && (opener.first_message.is_none() || opener.mirror_openers.is_some())
                 && matches!(kind, EventKind::MessageUser | EventKind::MessageAssistant)
         });
-        if !retained && observe.is_none() {
+        if !retained && !observe {
             return;
         }
-        let event_seed = event_id.map_or_else(
-            || sequence.to_string(),
-            |native_id| format!("{sequence}:{native_id}"),
-        );
-        let event = OmniEvent {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            event_id: Uuid::new_v5(&self.thread_id, event_seed.as_bytes()),
-            thread_id: self.thread_id,
-            branch_id: self.branch_id,
-            sequence,
-            timestamp,
-            source: EventSource {
-                provider: self.provider,
-                native_session_id: self.session_id.clone(),
-                provider_version: self.provider_version.clone(),
-                raw_record_type,
-            },
+        let event = self.event_at(
+            (sequence, event_id),
             kind,
             payload,
-            raw_blob_hash: None,
-            sensitivity: Sensitivity::Normal,
+            timestamp,
             replay_policy,
-        };
-        if let Some(opener) = observe
+            raw_record_type,
+        );
+        if observe
+            && let Some(opener) = &mut self.rollback_opener
             && let Some((pos, title)) =
                 omnis_core::search_title_opener_from_messages(std::slice::from_ref(&event))
         {
@@ -2152,6 +2191,40 @@ impl EventBuilder {
         }
         if retained {
             self.events.push(event);
+        }
+    }
+
+    fn event_at(
+        &self,
+        (sequence, event_id): (u64, Option<Uuid>),
+        kind: EventKind,
+        payload: Value,
+        timestamp: Option<DateTime<Utc>>,
+        replay_policy: ReplayPolicy,
+        raw_record_type: Option<String>,
+    ) -> OmniEvent {
+        let event_seed = event_id.map_or_else(
+            || sequence.to_string(),
+            |native_id| format!("{sequence}:{native_id}"),
+        );
+        OmniEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            event_id: Uuid::new_v5(&self.thread_id, event_seed.as_bytes()),
+            thread_id: self.thread_id,
+            branch_id: self.branch_id,
+            sequence,
+            timestamp,
+            source: EventSource {
+                provider: self.provider,
+                native_session_id: self.session_id.clone(),
+                provider_version: self.provider_version.clone(),
+                raw_record_type,
+            },
+            kind,
+            payload,
+            raw_blob_hash: None,
+            sensitivity: Sensitivity::Normal,
+            replay_policy,
         }
     }
 
