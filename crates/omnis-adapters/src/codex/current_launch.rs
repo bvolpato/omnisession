@@ -47,19 +47,17 @@ pub(super) fn verified_sqlite_home(
         let database = destination.join("state_5.sqlite");
         let stamp = SqliteSourceStamp::read(&destination, &database);
         let lookup = || database_selects(adapter, home, &destination, id, &source.path, revision);
+        let filenames_select = |inventory: Option<&CodexFileScan>| {
+            filesystem_selects(
+                home,
+                id,
+                &source.path,
+                inventory,
+                source.history_mode == CodexHistoryMode::Paginated,
+            )
+        };
         let selected = lookup()?;
-        let agrees = selected.map_or_else(
-            || {
-                filesystem_selects(
-                    home,
-                    id,
-                    &source.path,
-                    fresh.as_deref(),
-                    source.history_mode == CodexHistoryMode::Paginated,
-                )
-            },
-            Ok,
-        )?;
+        let agrees = selected.map_or_else(|| filenames_select(fresh.as_deref()), Ok)?;
         if !agrees
             || adapter.current.root(home)? != origin
             || adapter
@@ -69,10 +67,15 @@ pub(super) fn verified_sqlite_home(
         {
             return Ok(false);
         }
-        Ok(match stamp {
-            Some(expected) => SqliteSourceStamp::read(&destination, &database) == Some(expected),
-            None => lookup()? == selected,
-        })
+        if stamp.is_some() && stamp == SqliteSourceStamp::read(&destination, &database) {
+            return Ok(true);
+        }
+        // Other threads share this database. Recheck how Codex selects this rollout.
+        match (selected, lookup()?) {
+            (Some(true), Some(true)) => Ok(true),
+            (None, None) => filenames_select(None),
+            _ => Ok(false),
+        }
     })?;
     Ok(verified.then_some(destination))
 }
