@@ -36,7 +36,7 @@ use omnis_core::{
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
     HandoffRecord, IndexedSession, IndexedTrajectoryTitle, SessionTrajectoryMatch,
-    SessionTrajectorySearchPage, Store, TrajectorySelection,
+    SessionTrajectorySearchPage, Store, TrajectorySelection, TrajectorySourceGuard,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -142,18 +142,22 @@ pub enum PickerOutcome {
 struct PickerEntry {
     key: String,
     session: NativeSession,
-    has_provider_title: bool,
     current_workspace: bool,
+    listed_title: Option<String>,
+    retired_names: Vec<String>,
     fields: SearchFields,
     cached: bool,
 }
 
 impl PickerEntry {
     fn provider_name(&self) -> Option<&str> {
-        self.session
-            .title
-            .as_deref()
-            .filter(|_| self.has_provider_title)
+        self.listed_title.as_deref()
+    }
+
+    fn retire_previous_name(&mut self, name: &str) {
+        if self.provider_name() != Some(name) && !self.retired_names.iter().any(|old| old == name) {
+            self.retired_names.push(name.to_owned());
+        }
     }
 
     fn source_revision(&self) -> Option<SourceRevision> {
@@ -214,6 +218,7 @@ struct PickerState {
     visible_cache: RefCell<Option<VisibleCache>>,
     indexed_titles: HashMap<String, (SourceRevision, String)>,
     preview_titles: HashMap<String, (PreviewKey, String)>,
+    derived_titles: HashMap<String, omnis_store::IndexedTitle>,
     workspace_updates: HashMap<SourceRevision, omnis_store::CodexWorkspaceUpdate>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
@@ -302,6 +307,7 @@ impl PickerState {
             selected: 0,
             selection_touched: false,
             visible_cache: RefCell::new(None),
+            derived_titles: HashMap::new(),
             indexed_titles: HashMap::new(),
             preview_titles: HashMap::new(),
             workspace_updates: HashMap::new(),
@@ -492,6 +498,7 @@ impl PickerState {
             provider,
             picker_entries(sessions, current_project, cached),
             true,
+            &[],
         );
     }
 
@@ -500,14 +507,29 @@ impl PickerState {
         provider: Provider,
         mut entries: Vec<PickerEntry>,
         complete: bool,
+        unavailable: &[IndexedSession],
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         self.forget_replaced_sources(&entries);
         if provider == Provider::Codex && !complete {
             let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
-            self.entries
-                .retain(|entry| !observed.contains(entry.key.as_str()));
+            let unavailable: HashMap<_, _> = unavailable
+                .iter()
+                .map(|row| (&row.session, row.source_revision.map(preview_revision)))
+                .collect();
+            self.entries.retain(|entry| {
+                if unavailable.get(&entry.session.session)
+                    == Some(&entry.session.source_revision.map(preview_revision))
+                {
+                    self.indexed_titles.remove(&entry.key);
+                    self.preview_titles.remove(&entry.key);
+                    self.trajectory_matches.remove(&entry.key);
+                    self.previews.remove_session(&entry.session.session);
+                    return false;
+                }
+                !observed.contains(entry.key.as_str())
+            });
         } else {
             self.entries
                 .retain(|entry| entry.session.session.provider != provider);
@@ -608,22 +630,20 @@ impl PickerState {
                     && old_name != observed_name
                     && entry.provider_name() != old_name)
             {
-                entry.has_provider_title = old_name.is_some();
+                entry.listed_title = old_name.map(str::to_owned);
                 entry.session.title = old_name.map(str::to_owned);
                 entry.fields = SearchFields::new(&entry.session, None);
             }
-            if old_name != entry.provider_name()
-                && old_name.is_some_and(|old_name| {
-                    self.indexed_titles
-                        .get(&entry.key)
-                        .is_some_and(|(source, title)| {
-                            *source == revision
-                                && omnis_core::compact_search_title(old_name).as_ref()
-                                    == Some(title)
-                        })
-                })
+            if let Some(current) = current {
+                entry.retired_names.clone_from(&current.retired_names);
+            }
+            if names
+                .and_then(|names| names.selected_names.get(&entry.session.session.id))
+                .is_some_and(|name| name.confirms(entry.provider_name()))
             {
-                self.indexed_titles.remove(&entry.key);
+                for prior in [old_name, observed_name].into_iter().flatten() {
+                    entry.retire_previous_name(prior);
+                }
             }
         }
     }
@@ -694,7 +714,7 @@ impl PickerState {
         let key = self.preview_key(entry);
         let dialog = DeleteDialog {
             session: entry.session.session.clone(),
-            title: display_title(&entry.session, self.previews.get(&key)),
+            title: display_title(entry, self.previews.get(&key)),
             workspace: entry.session.project_path.clone(),
             branch: entry.session.git_branch.clone(),
             phase: DeletePhase::Confirm,
@@ -904,9 +924,9 @@ impl PickerState {
             {
                 return false;
             }
-            if matches!(key.source, Some(PreviewSource::CachedCodex(_))) {
+            if matches!(key.source, Some(PreviewSource::Workspace(_))) {
                 self.entries[index].session.source_revision = Some(revision);
-                key.source = Some(PreviewSource::CodexFile(revision));
+                key.source = Some(PreviewSource::File(revision));
             }
         }
         let selected = self.selected_entry().map(|entry| entry.key.clone());
@@ -955,28 +975,14 @@ impl PickerState {
         }
         let selected = self.selected_entry().map(|entry| entry.key.clone());
         let entry = &mut self.entries[index];
-        entry.has_provider_title = change.current.is_some();
+        entry.listed_title.clone_from(&change.current);
         entry.session.title = change.current;
+        if let Some(previous) = change.previous {
+            entry.retire_previous_name(&previous);
+        }
         self.refresh_entry_title(index);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.restore_selection(selected);
-    }
-
-    fn remember_source_titles(&mut self, titles: impl IntoIterator<Item = IndexedTrajectoryTitle>) {
-        let selected = self.selected_entry().map(|entry| entry.key.clone());
-        let mut changed = false;
-        for receipt in titles {
-            if let Some(&index) = self.entry_positions.get(&receipt.session.to_string())
-                && self.update_indexed_title(index, receipt)
-            {
-                self.refresh_entry_title(index);
-                changed = true;
-            }
-        }
-        if changed {
-            self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.restore_selection(selected);
-        }
     }
 
     fn update_indexed_title(&mut self, index: usize, receipt: IndexedTrajectoryTitle) -> bool {
@@ -1009,14 +1015,20 @@ impl PickerState {
                 entry.session.session.provider != Provider::Codex
                     || entry.source_revision().unwrap_or_default() == *revision
             })
-            .map(|(_, title)| title.as_str());
+            .map(|(_, title)| title.as_str())
+            .filter(|title| {
+                !entry
+                    .retired_names
+                    .iter()
+                    .any(|old| crate::matches_previous_name(title, old))
+            });
         let preview = self
             .preview_titles
             .get(&entry.key)
             .filter(|(key, _)| *key == self.preview_key(entry))
             .map(|(_, title)| title.as_str());
         let entry = &mut self.entries[index];
-        if !entry.has_provider_title {
+        if entry.listed_title.is_none() {
             entry.session.title = indexed.or(preview).map(str::to_owned);
         }
         entry.fields = SearchFields::new(&entry.session, indexed.into_iter().chain(preview));
@@ -1024,11 +1036,179 @@ impl PickerState {
 
     fn apply_derived_titles(&mut self) {
         for index in 0..self.entries.len() {
-            let key = &self.entries[index].key;
-            if self.indexed_titles.contains_key(key) || self.preview_titles.contains_key(key) {
+            let key = self.entries[index].key.clone();
+            if let Some(record) = self.derived_titles.get(&key) {
+                apply_derived_title(&mut self.entries[index], record);
+            }
+            if self.indexed_titles.contains_key(&key) || self.preview_titles.contains_key(&key) {
                 self.refresh_entry_title(index);
             }
         }
+    }
+
+    fn remember_source_titles(
+        &mut self,
+        titles: impl IntoIterator<Item = omnis_store::IndexedTrajectoryTitle>,
+    ) {
+        self.remember_derived_titles(titles.into_iter().map(|receipt| {
+            (
+                receipt.session,
+                omnis_store::IndexedTitle {
+                    title: receipt.title,
+                    document_version: receipt.document_version,
+                    source_revision: preview_revision(receipt.source_revision),
+                    verified_at: receipt.verified_at,
+                    cached_at: receipt.cached_at,
+                },
+            )
+        }));
+    }
+
+    fn accept_preview(
+        &mut self,
+        mut key: PreviewKey,
+        value: PreviewValue,
+        read_revision: Option<SourceRevision>,
+    ) -> bool {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return false;
+        };
+        if self.preview_key(&self.entries[index]) != key {
+            return false;
+        }
+        if matches!(key.source, Some(PreviewSource::Workspace(_)))
+            && let Some(revision) = read_revision
+        {
+            self.entries[index].session.source_revision = Some(revision);
+            key.source = Some(PreviewSource::File(revision));
+            self.query_changed();
+        }
+        if key
+            .revision()
+            .is_some_and(|revision| self.previews.rejected(&key.session, revision))
+        {
+            return false;
+        }
+        self.remember_other_preview_title(&key, &value);
+        self.previews.insert(key, value, &self.preview_window);
+        self.trajectory_index_changed();
+        true
+    }
+
+    fn remember_other_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
+        let title = preview_continuation_title(value).or_else(|| preview_title(value));
+        let PreviewValue::Ready { preview, .. } = value else {
+            return;
+        };
+        if title.is_none() && preview.title != omnis_core::SessionPreviewTitle::AfterClear(None) {
+            return;
+        }
+        let source_revision = key.revision().unwrap_or_default();
+        let verified_at = key
+            .updated_at
+            .filter(|_| preview.title_authoritative && key.continuation_after.is_none())
+            .map(|time| (omnis_core::search_document_version(Provider::OhMyPi), time));
+        if verified_at.is_none()
+            && key.session.provider == Provider::OhMyPi
+            && self
+                .derived_titles
+                .get(&key.session.to_string())
+                .is_some_and(|record| {
+                    record.verified_at.is_some() && record.source_revision == source_revision
+                })
+        {
+            return;
+        }
+        let record = omnis_store::IndexedTitle {
+            document_version: omnis_core::search_document_version(key.session.provider),
+            title,
+            verified_at,
+            cached_at: key.updated_at,
+            source_revision,
+        };
+        self.remember_derived_titles([(key.session.clone(), record)]);
+    }
+
+    fn remember_derived_titles(
+        &mut self,
+        titles: impl IntoIterator<Item = (SessionRef, omnis_store::IndexedTitle)>,
+    ) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let mut changed = false;
+        for (session, record) in titles {
+            let key = session.to_string();
+            if session.provider == Provider::Codex {
+                if let Some(&index) = self.entry_positions.get(&key)
+                    && self.update_indexed_title(
+                        index,
+                        IndexedTrajectoryTitle {
+                            session,
+                            title: record.title,
+                            document_version: record.document_version,
+                            source_revision: record.source_revision,
+                            verified_at: record.verified_at,
+                            cached_at: record.cached_at,
+                        },
+                    )
+                {
+                    self.refresh_entry_title(index);
+                    changed = true;
+                }
+                continue;
+            }
+            if self.previews.rejected(&session, record.source_revision)
+                || self.derived_titles.get(&key) == Some(&record)
+            {
+                continue;
+            }
+            if let Some(entry) = self
+                .entry_positions
+                .get(&key)
+                .and_then(|index| self.entries.get_mut(*index))
+            {
+                if !crate::title_matches_search_source(&entry.session, &record, entry.cached) {
+                    continue;
+                }
+                apply_derived_title(entry, &record);
+            }
+            self.derived_titles.insert(key, record);
+            changed = true;
+        }
+        if changed {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.restore_selection(selected_key);
+        }
+    }
+
+    fn replace_preview_failures(
+        &mut self,
+        failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
+    ) {
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        for (session, failure) in &failures {
+            let key = session.to_string();
+            if self
+                .derived_titles
+                .get(&key)
+                .is_some_and(|title| failure.matches_file_revision(title.source_revision))
+            {
+                self.derived_titles.remove(&key);
+                if let Some(index) = self.entry_positions.get(&key) {
+                    let entry = &mut self.entries[*index];
+                    entry.session.title.clone_from(&entry.listed_title);
+                    entry.fields = SearchFields::new(&entry.session, None);
+                }
+            }
+        }
+        self.previews.replace_failures(failures);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected);
+        self.preview_deadline = self
+            .preview_window
+            .iter()
+            .any(|key| !self.previews.contains(key))
+            .then(|| Instant::now() + PREVIEW_DEBOUNCE);
+        self.trajectory_index_changed();
     }
 
     fn due_index_request(&mut self) -> Option<Vec<IndexCandidate>> {
@@ -1096,8 +1276,11 @@ impl PickerState {
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
                 .map(|(_, entry)| TrajectorySelection {
                     session: entry.session.session.clone(),
-                    source: (entry.session.session.provider == Provider::Codex)
-                        .then(|| entry.source_revision().unwrap_or_default()),
+                    source: if entry.session.session.provider == Provider::Codex {
+                        Some(entry.source_revision().unwrap_or_default())
+                    } else {
+                        crate::selected_search_source(&entry.session, entry.cached)
+                    },
                 })
                 .collect(),
         })
@@ -1167,10 +1350,13 @@ impl PickerState {
         PreviewKey {
             session: entry.session.session.clone(),
             source: if let Some(revision) = entry.source_revision() {
-                Some(PreviewSource::CodexFile(revision))
+                Some(PreviewSource::File(revision))
             } else if entry.cached && entry.session.session.provider == Provider::Codex {
-                Some(PreviewSource::CachedCodex(
-                    entry.session.project_path.clone(),
+                Some(PreviewSource::Workspace(entry.session.project_path.clone()))
+            } else if TrajectorySourceGuard::uses_file_time(entry.session.session.provider) {
+                Some(entry.session.source_revision.map_or_else(
+                    || PreviewSource::Workspace(entry.session.project_path.clone()),
+                    PreviewSource::File,
                 ))
             } else {
                 entry.session.source_path.clone().map(PreviewSource::Path)
@@ -1256,16 +1442,16 @@ impl PickerState {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum PreviewSource {
-    CodexFile(SourceRevision),
-    CachedCodex(Option<PathBuf>),
+    File(SourceRevision),
+    Workspace(Option<PathBuf>),
     Path(PathBuf),
 }
 
 impl PreviewSource {
     const fn revision(&self) -> Option<SourceRevision> {
         match self {
-            Self::CodexFile(revision) => Some(*revision),
-            Self::Path(_) | Self::CachedCodex(_) => None,
+            Self::File(revision) => Some(*revision),
+            Self::Path(_) | Self::Workspace(_) => None,
         }
     }
 }
@@ -1283,6 +1469,15 @@ struct PreviewKey {
     continuation_after: Option<DateTime<Utc>>,
 }
 
+impl PreviewKey {
+    const fn revision(&self) -> Option<SourceRevision> {
+        match &self.source {
+            Some(source) => source.revision(),
+            None => None,
+        }
+    }
+}
+
 struct PreviewRequest {
     key: PreviewKey,
     source_path: Option<PathBuf>,
@@ -1295,6 +1490,7 @@ struct ProviderNameChange {
     current: Option<String>,
 }
 
+#[derive(Clone)]
 enum PreviewValue {
     Ready {
         preview: Box<SessionPreview>,
@@ -1311,15 +1507,44 @@ enum PreviewValue {
 struct PreviewCache {
     values: HashMap<PreviewKey, PreviewValue>,
     order: VecDeque<PreviewKey>,
+    failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
 }
 
 impl PreviewCache {
+    fn rejected(&self, session: &SessionRef, revision: SourceRevision) -> bool {
+        self.failures
+            .get(session)
+            .is_some_and(|failure| failure.matches_file_revision(revision))
+    }
+
+    fn replace_failures(
+        &mut self,
+        failures: HashMap<SessionRef, omnis_store::TrajectoryIndexFailure>,
+    ) {
+        self.values.retain(|key, _| {
+            !key.revision().is_some_and(|revision| {
+                failures
+                    .get(&key.session)
+                    .is_some_and(|failure| failure.matches_file_revision(revision))
+            })
+        });
+        self.order.retain(|key| self.values.contains_key(key));
+        self.failures = failures;
+    }
+
     fn contains(&self, key: &PreviewKey) -> bool {
-        self.values.contains_key(key)
+        self.get(key).is_some()
     }
 
     fn get(&self, key: &PreviewKey) -> Option<&PreviewValue> {
-        self.values.get(key)
+        if key
+            .revision()
+            .is_some_and(|revision| self.rejected(&key.session, revision))
+        {
+            Some(&PreviewValue::Unavailable)
+        } else {
+            self.values.get(key)
+        }
     }
 
     fn insert(&mut self, key: PreviewKey, value: PreviewValue, protected: &[PreviewKey]) {
@@ -1551,7 +1776,7 @@ struct CachedPickerEntries {
 }
 
 fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<CachedPickerEntries> {
-    let (sessions, titles) = store.cached_picker_sessions_with_titles()?;
+    let (sessions, mut titles) = store.cached_picker_sessions_with_titles()?;
     let sources: HashMap<_, _> = titles
         .iter()
         .filter(|row| row.session.provider == Provider::Codex && row.source_revision.file.is_some())
@@ -1567,6 +1792,23 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
             session
         })
         .collect::<Vec<_>>();
+    let observed = omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+    let mut retired = HashMap::new();
+    if !observed.is_empty() {
+        let mut effective = titles
+            .iter()
+            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
+            .collect();
+        crate::apply_live_search_titles(store, &mut sessions, observed, &mut effective)?;
+        for receipt in &mut titles {
+            let current = effective.remove(&receipt.session);
+            if current != receipt.title
+                && let Some(previous) = std::mem::replace(&mut receipt.title, current)
+            {
+                retired.insert(receipt.session.clone(), previous);
+            }
+        }
+    }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -1574,7 +1816,12 @@ fn cached_picker_entries(store: &Store, current_project: &Path) -> Result<Cached
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
         if session.session.provider != Provider::Imported {
-            entries.push(picker_entry(session, &mut paths, true));
+            let previous = retired.remove(&session.session);
+            let mut entry = picker_entry(session, &mut paths, true);
+            if let Some(previous) = previous {
+                entry.retire_previous_name(&previous);
+            }
+            entries.push(entry);
             continue;
         }
         let current = match imports.matches(&session.session, session.project_path.as_deref()) {
@@ -1629,8 +1876,9 @@ impl PickerEntry {
     fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
         Self {
             key: session.session.to_string(),
-            has_provider_title: session.title.is_some(),
             current_workspace,
+            listed_title: session.title.clone(),
+            retired_names: Vec::new(),
             fields: SearchFields::new(&session, None),
             session,
             cached,
@@ -1683,6 +1931,26 @@ impl ClickTracker {
         self.last = (!double).then_some((now, row));
         double
     }
+}
+
+fn apply_derived_title(entry: &mut PickerEntry, record: &omnis_store::IndexedTitle) {
+    entry.session.title.clone_from(&entry.listed_title);
+    if !crate::title_matches_search_source(&entry.session, record, entry.cached) {
+        entry.fields = SearchFields::new(&entry.session, None);
+        return;
+    }
+    let mut derived = record.title.as_deref();
+    if entry.session.session.provider == Provider::OhMyPi {
+        if crate::omp_title_is_current(record, &entry.session, entry.cached) {
+            entry.session.title.clone_from(&record.title);
+        } else if record.verified_at.is_some() || entry.listed_title.is_some() {
+            derived = None;
+        }
+    }
+    if entry.session.title.is_none() {
+        entry.session.title = derived.map(str::to_owned);
+    }
+    entry.fields = SearchFields::new(&entry.session, derived);
 }
 
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
@@ -2313,18 +2581,20 @@ pub fn pick_fork_target(
     }
 }
 
-fn pick_target_for(
+fn prepare_target_choices(
     intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
     no_fork: bool,
-) -> Result<TargetOutcome> {
+) -> Result<(Vec<TargetRow>, Option<usize>)> {
     if targets.is_empty() && intent.source().is_none() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     let mut choices = target_choices(intent, targets);
     if no_fork {
         choices.retain(|choice| !choice.fork);
@@ -2346,7 +2616,18 @@ fn pick_target_for(
         .and_then(|target| profile_target_index(intent, target, &choices))
         .or_else(|| default_target_index(intent, preferred_target, &choices))
         .or_else(|| intent.source().map(|_| 0));
-    let mut choices = target_rows(intent, choices);
+    Ok((target_rows(intent, choices), default_selected))
+}
+
+fn pick_target_for(
+    intent: TargetIntent<'_>,
+    preferred_target: Option<Provider>,
+    targets: &[AgentTarget],
+    requested_mode: Option<ModeKind>,
+    no_fork: bool,
+) -> Result<TargetOutcome> {
+    let (mut choices, default_selected) =
+        prepare_target_choices(intent, preferred_target, targets, requested_mode, no_fork)?;
     let mut selected = default_selected;
     let mut filter = String::new();
     let mut visible = (0..choices.len()).collect::<Vec<_>>();
@@ -3163,6 +3444,7 @@ mod tests {
             indexed_byte_count: text.len(),
             truncation_strategy: "none",
             source_complete: true,
+            provider_limited: false,
             document_version: omnis_core::search_document_version(Provider::Codex),
             origin: omnis_store::SessionTrajectoryOrigin::Native,
             derived_title: None,
@@ -3199,12 +3481,21 @@ mod tests {
             observed.title = Some("Updated observed title".to_owned());
 
             workers::SessionCacheUpdate {
-                provider: Provider::Codex,
-                sessions: vec![workers::indexed_session(&observed)],
-                complete,
+                catalog: crate::DiscoveredCatalog::new(
+                    Provider::Codex,
+                    None,
+                    std::slice::from_ref(&observed),
+                    complete,
+                    false,
+                    workers::indexed_session,
+                ),
+                reply: None,
+                retry: None,
                 names: Some(std::sync::Arc::new(workers::CatalogNames {
                     inventory: store.observe_codex_catalog_inventory().unwrap(),
+                    unavailable: Vec::new(),
                     prior_assignments: HashMap::new(),
+                    selected_names: HashMap::new(),
                     complete: true,
                 })),
             }
@@ -3233,6 +3524,189 @@ mod tests {
                 },
             );
         }
+    }
+
+    fn replace_picker_session(root: &Path, id: &str, workspace: &Path) -> io::Result<()> {
+        let header = serde_json::json!({
+            "type": "session", "version": 3, "id": id, "cwd": workspace
+        });
+        let staging = root.join("replacement.tmp");
+        fs::write(&staging, format!("{header}\n"))?;
+        fs::rename(staging, root.join(format!("{id}.jsonl")))
+    }
+
+    fn record_unreadable_picker_replacement(store: &Store, root: &Path, id: &str) -> Result<()> {
+        let path = root.join(format!("{id}.jsonl"));
+        fs::write(&path, b"unreadable session header\n")?;
+        let revision = omnis_adapters::source_file_revision(&path).context("replacement file")?;
+        store.record_trajectory_index_failure(
+            &SessionRef::new(Provider::Pi, id),
+            &omnis_store::TrajectoryIndexFailure {
+                ancestor_revisions: Vec::new(),
+                source_file: revision.file,
+                source_contents: revision.contents,
+                source_updated_at: None,
+                source_time_precise: true,
+                document_version: omnis_core::search_document_version(Provider::Pi),
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_queued_picker_catalog_relists_before_returning_workspace() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        let previous = temporary.path().join("previous");
+        let current = temporary.path().join("current");
+        for path in [&root, &previous, &current] {
+            fs::create_dir(path)?;
+        }
+        replace_picker_session(&root, "selected", &previous)?;
+        let store = Store::open(temporary.path().join("state.sqlite"))?;
+        let prior = store.observe_session_catalog(Provider::Pi)?;
+        let adapter = omnis_adapters::PiAdapter::with_root(&root);
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter.clone());
+        let (jobs, queued) = mpsc::channel();
+        let (updates, _updates_received) = mpsc::channel();
+        let project = current.clone();
+        let discovery = thread::spawn(move || {
+            workers::discover_for_picker(&registry, Provider::Pi, &project, prior, &jobs, &updates)
+        });
+
+        let stale = queued.recv_timeout(Duration::from_secs(5))?;
+        replace_picker_session(&root, "selected", &current)?;
+        let selected = omnis_adapters::ProviderAdapter::find_native_session(&adapter, "selected")?
+            .context("select replaced session")?;
+        store.upsert_indexed_session(&workers::indexed_session(&selected))?;
+        stale.persist(&store)?;
+        queued
+            .recv_timeout(Duration::from_secs(5))?
+            .persist(&store)?;
+        let rows = discovery.join().expect("picker discovery finished")?;
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].current_workspace);
+        assert_eq!(rows[0].session.project_path.as_ref(), Some(&current));
+        let cached = store.indexed_sessions_for_provider(Provider::Pi)?;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].project_path.as_ref(), Some(&current));
+        assert_eq!(cached[0].source_revision, selected.source_revision);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_picker_discovery_conflict_publishes_stable_peers_and_keeps_offline_entries()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        fs::create_dir(&root)?;
+        let project = temporary.path().to_path_buf();
+        replace_picker_session(&root, "stable", &project)?;
+        replace_picker_session(&root, "changing", &project)?;
+        let adapter = omnis_adapters::PiAdapter::with_root(&root);
+        let changing = omnis_adapters::ProviderAdapter::find_native_session(&adapter, "changing")?
+            .context("select original session")?;
+        let offline = session(Provider::Pi, "offline", &project, None);
+        let withdrawn = session(Provider::Pi, "withdrawn", &project, None);
+        let legacy = session(Provider::Pi, "stable", &project.join("legacy"), None);
+        let store = Store::open(temporary.path().join("state.sqlite"))?;
+        for previous in [&changing, &offline, &withdrawn, &legacy] {
+            store.upsert_indexed_session(&workers::indexed_session(previous))?;
+        }
+        fs::copy(root.join("stable.jsonl"), root.join("zzz-backup.jsonl"))?;
+        record_unreadable_picker_replacement(&store, &root, "repaired")?;
+        replace_picker_session(&root, "repaired", &project)?;
+        store.upsert_session_trajectory(
+            &legacy.session,
+            "previous complete document",
+            Utc::now(),
+            true,
+        )?;
+        let mut state = PickerState::new(vec![changing, offline, withdrawn], &project, None, false);
+        let prior = store.observe_session_catalog(Provider::Pi)?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter.clone());
+        let (jobs, queued) = mpsc::channel();
+        let (updates, receiver) = mpsc::channel();
+        let discovery = thread::spawn(move || {
+            let result = workers::discover_for_picker(
+                &registry,
+                Provider::Pi,
+                &project,
+                prior,
+                &jobs,
+                &updates,
+            );
+            updates
+                .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider: Provider::Pi,
+                    result,
+                    complete: true,
+                    names: None,
+                }))
+                .expect("return discovered entries");
+        });
+        for moved in ["first", "second"] {
+            let snapshot = queued.recv_timeout(Duration::from_secs(5))?;
+            replace_picker_session(&root, "changing", &temporary.path().join(moved))?;
+            if moved == "first" {
+                let selected =
+                    omnis_adapters::ProviderAdapter::find_native_session(&adapter, "changing")?
+                        .context("select moved session")?;
+                store.upsert_indexed_session(&workers::indexed_session(&selected))?;
+                record_unreadable_picker_replacement(&store, &root, "withdrawn")?;
+            }
+            snapshot.persist(&store)?;
+        }
+        discovery.join().expect("picker discovery finished");
+        let mut warnings = Vec::new();
+        let mut pending = HashSet::from([Provider::Pi]);
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut pending,
+            &mut warnings,
+            temporary.path(),
+        );
+        assert!(pending.is_empty());
+        assert_eq!(
+            warnings,
+            vec![crate::discovery_conflict_note(Provider::Pi, 3, 2)]
+        );
+        check_partial_picker_entries(&state, temporary.path())?;
+        let cached = store.indexed_sessions_for_provider(Provider::Pi)?;
+        assert_eq!(cached.len(), 3);
+        let retained = cached
+            .iter()
+            .find(|row| row.session == legacy.session)
+            .context("preserved full document catalog")?;
+        assert_eq!(retained.project_path, legacy.project_path);
+        assert!(retained.source_revision.is_none());
+        assert!(store.session_index_checked_at(Provider::Pi)?.is_none());
+        Ok(())
+    }
+
+    fn check_partial_picker_entries(state: &PickerState, project: &Path) -> Result<()> {
+        assert_eq!(state.entries.len(), 4);
+        let find = |id: &str| {
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.session.session.id == id)
+        };
+        let stable = find("stable").context("stable peer")?;
+        assert!(!stable.cached && stable.current_workspace && stable.session.source_path.is_some());
+        let repaired = find("repaired").context("accepted replacement for a failed read")?;
+        assert!(!repaired.cached && repaired.current_workspace);
+        assert!(IndexCandidate::from_session(&repaired.session).is_some());
+        let moving = find("changing").context("moving peer")?;
+        assert!(moving.cached && !moving.current_workspace && moving.session.source_path.is_none());
+        assert_eq!(moving.session.project_path, Some(project.join("first")));
+        assert!(find("offline").is_some_and(|entry| entry.cached && entry.current_workspace));
+        assert!(find("withdrawn").is_none());
+        Ok(())
     }
 
     #[test]
@@ -3921,7 +4395,10 @@ mod tests {
 
         let mut key = state.preview_key(&state.entries[0]);
         let receipt = |title: Option<&str>| IndexedTrajectoryTitle {
+            verified_at: None,
+            cached_at: None,
             session: original.session.clone(),
+            document_version: omnis_core::search_document_version(Provider::Codex),
             source_revision: revision,
             title: title.map(str::to_owned),
         };
@@ -3952,7 +4429,7 @@ mod tests {
         state.remember_preview_title(&mut key, &sampled, None, Some(receipt(None)));
         assert!(state.visible_indices().is_empty());
         assert_eq!(
-            display_title(&state.entries[0].session, Some(&sampled)),
+            display_title(&state.entries[0], Some(&sampled)),
             "Untitled session"
         );
 
@@ -3962,7 +4439,7 @@ mod tests {
         state.remember_source_titles([receipt(None)]);
         assert_eq!(state.visible_indices().len(), 1);
         assert_eq!(
-            display_title(&state.entries[0].session, None),
+            display_title(&state.entries[0], None),
             "Fix pagination without changing the API"
         );
 
@@ -4113,6 +4590,14 @@ mod tests {
             contents: Some(uuid::Uuid::from_u128(2)),
             ..Default::default()
         });
+        let old_title = IndexedTrajectoryTitle {
+            session: native.session.clone(),
+            title: native.title.clone(),
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            source_revision: native.source_revision.unwrap(),
+            verified_at: None,
+            cached_at: native.updated_at,
+        };
         let mut state = PickerState::new(vec![native], project, None, true);
         let key = state.preview_key(&state.entries[0]);
         let name = |previous: &str, current: &str| ProviderNameChange {
@@ -4122,6 +4607,7 @@ mod tests {
         let changed = name("Amber Heron", "Violet Quokka");
         assert!(state.accepts_provider_name(&key, &changed));
         state.remember_provider_name(&key, changed);
+        state.remember_source_titles([old_title]);
         assert!(!state.accepts_provider_name(&key, &name("Amber Heron", "Amber Heron")));
         state.query = "amberheron".to_owned();
         assert!(state.visible_indices().is_empty());
@@ -4236,15 +4722,36 @@ mod tests {
     }
 
     #[test]
-    fn an_unseen_cached_codex_session_needs_complete_discovery_for_removal() {
+    fn partial_codex_discovery_removes_only_the_confirmed_unavailable_revision() {
         let project = Path::new("/workspace");
         let cached = session(Provider::Codex, "unseen", project, Some("Cached session"));
+        let unavailable = session(Provider::Codex, "unavailable", project, Some("Retired"));
+        let mut restored = session(Provider::Codex, "restored", project, Some("Restored"));
+        let prior = workers::indexed_session(&restored);
+        restored.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let confirmed = [workers::indexed_session(&unavailable), prior];
         let found = session(Provider::Codex, "found", project, Some("Fresh session"));
-        let mut state = PickerState::new(vec![cached], project, None, true);
+        let mut state = PickerState::new(
+            vec![cached.clone(), unavailable, restored.clone()],
+            project,
+            None,
+            true,
+        );
         let found_entries = || picker_entries(vec![found.clone()], project, false);
-        state.replace_provider_entries(Provider::Codex, found_entries(), false);
-        assert_eq!(state.entries.len(), 2);
-        state.replace_provider_entries(Provider::Codex, found_entries(), true);
+        state.replace_provider_entries(Provider::Codex, found_entries(), false, &confirmed);
+        let visible: HashSet<_> = state
+            .entries
+            .iter()
+            .map(|entry| &entry.session.session)
+            .collect();
+        assert_eq!(
+            visible,
+            HashSet::from([&cached.session, &restored.session, &found.session])
+        );
+        state.replace_provider_entries(Provider::Codex, found_entries(), true, &[]);
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].session.session, found.session);
     }
@@ -4260,7 +4767,7 @@ mod tests {
         let mut state = PickerState::new(vec![native.clone()], project, None, true);
         let key = state.preview_key(&state.entries[0]);
         let other = PreviewKey {
-            source: Some(PreviewSource::CodexFile(SourceRevision::default())),
+            source: Some(PreviewSource::File(SourceRevision::default())),
             ..key.clone()
         };
         state.discard_stale_cached_preview(&other);
@@ -4340,6 +4847,9 @@ mod tests {
         let receipt = |source_revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
             session: key.session.clone(),
             title: title.map(str::to_owned),
+            document_version: omnis_core::search_document_version(Provider::Codex),
+            verified_at: None,
+            cached_at: None,
             source_revision,
         };
         state.remember_source_titles([receipt(revision, Some("Archived title"))]);
@@ -4348,11 +4858,8 @@ mod tests {
         assert_eq!(state.visible_indices().len(), 1);
         let generation = state.trajectory_search_generation;
 
-        restore_picker_rollout(
-            &rollout,
-            &original.replace("Archived title", "Restored title"),
-            in_place,
-        )?;
+        let restored = original.replace("Archived title", "Restored title");
+        restore_picker_rollout(&rollout, &restored, in_place)?;
         assert!(read_preview(&key).is_err());
         state.replace_provider(Provider::Codex, vec![selected()?], home.path(), false);
         assert_ne!(generation, state.trajectory_search_generation);
@@ -4366,14 +4873,13 @@ mod tests {
         );
         assert_eq!(revision.file == current.source_revision.file, in_place);
         assert_ne!(revision.contents, current.source_revision.contents);
-        sender.send(PickerUpdate::Indexing(crate::search_index::IndexProgress {
-            titles: vec![
-                receipt(current.source_revision, Some("Restored title")),
-                receipt(revision, Some("Archived title")),
-                receipt(revision, None),
-            ],
-            ..Default::default()
-        }))?;
+        let mut progress = crate::search_index::IndexProgress::default();
+        progress.titles.extend([
+            receipt(current.source_revision, Some("Restored title")),
+            receipt(revision, Some("Archived title")),
+            receipt(revision, None),
+        ]);
+        sender.send(PickerUpdate::Indexing(progress))?;
         sender.send(preview)?;
         receive_updates(
             &receiver,
@@ -4426,25 +4932,27 @@ mod tests {
             None,
             false,
         );
-        state.remember_source_titles([
-            omnis_store::IndexedTrajectoryTitle {
-                session: SessionRef::new(Provider::Codex, "untitled"),
-                title: Some("Rate limiter retry".to_owned()),
-                source_revision: SourceRevision::default(),
-            },
-            omnis_store::IndexedTrajectoryTitle {
-                session: SessionRef::new(Provider::Claude, "titled"),
-                title: Some("First prompt text".to_owned()),
-                source_revision: SourceRevision::default(),
-            },
+        state.remember_derived_titles(vec![
+            (
+                SessionRef::new(Provider::Codex, "untitled"),
+                omnis_store::IndexedTitle {
+                    title: Some("Rate limiter retry".to_owned()),
+                    document_version: omnis_core::search_document_version(Provider::Codex),
+                    ..Default::default()
+                },
+            ),
+            (
+                SessionRef::new(Provider::Claude, "titled"),
+                omnis_store::IndexedTitle {
+                    title: Some("First prompt text".to_owned()),
+                    ..Default::default()
+                },
+            ),
         ]);
 
-        let untitled = &state.entries[0].session;
+        let untitled = &state.entries[0];
         assert_eq!(display_title(untitled, None), "Rate limiter retry");
-        assert_eq!(
-            display_title(&state.entries[1].session, None),
-            "Provider title"
-        );
+        assert_eq!(display_title(&state.entries[1], None), "Provider title");
         state.query = "ratelimiter".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
@@ -4453,7 +4961,10 @@ mod tests {
             [(Provider::Codex, "untitled"), (Provider::Claude, "titled")]
                 .into_iter()
                 .map(|(provider, id)| IndexedTrajectoryTitle {
+                    verified_at: None,
+                    cached_at: None,
                     session: SessionRef::new(provider, id),
+                    document_version: omnis_core::search_document_version(provider),
                     title: None,
                     source_revision: SourceRevision::default(),
                 }),
@@ -4466,6 +4977,148 @@ mod tests {
             state.entries[1].session.title.as_deref(),
             Some("Provider title")
         );
+    }
+
+    #[test]
+    fn cached_omp_picker_discards_a_prior_title_within_the_same_millisecond() {
+        let root = Path::new("/workspace");
+        let provider = Provider::OhMyPi;
+        let mut listed = session(provider, "example", root, Some("File title"));
+        let time = DateTime::from_timestamp(1000, 150).unwrap();
+        listed.updated_at = Some(time);
+        let mut state = PickerState::new(vec![listed.clone()], root, None, true);
+        state.remember_derived_titles([(
+            listed.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Verified rename".into()),
+                verified_at: Some((8, time)),
+                cached_at: Some(time),
+                ..Default::default()
+            },
+        )]);
+        state.query = "Verified rename".into();
+        assert_eq!(state.visible_indices().len(), 1);
+        listed.updated_at = Some(time + chrono::Duration::nanoseconds(100));
+        state.replace_provider(provider, vec![listed], root, true);
+        assert!(state.visible_indices().is_empty());
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("File title")
+        );
+    }
+
+    #[test]
+    fn replacement_at_the_same_time_rejects_delayed_preview_and_title() {
+        let root = Path::new("/workspace");
+        let mut listed = session(Provider::OhMyPi, "example", root, None);
+        let revision = |n| SourceRevision {
+            file: Some(uuid::Uuid::from_u128(n)),
+            contents: Some(uuid::Uuid::from_u128(n + 10)),
+            ..Default::default()
+        };
+        let prior = revision(1);
+        let current = revision(2);
+        listed.source_revision = Some(prior);
+        let mut state = PickerState::new(vec![listed.clone()], root, None, false);
+        let old_key = state.preview_key(&state.entries[0]);
+        listed.source_revision = Some(current);
+        state.replace_provider(listed.session.provider, vec![listed.clone()], root, false);
+        let new_key = state.preview_key(&state.entries[0]);
+        let preview_value = |title: &str| {
+            let mut preview = synthetic_preview(title);
+            preview.title = omnis_core::SessionPreviewTitle::AfterClear(Some(title.to_owned()));
+            preview.title_authoritative = true;
+            PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                complete: false,
+                source_provider: Provider::OhMyPi,
+                can_use_first_title: true,
+                message_count_is_complete: false,
+            }
+        };
+        state.accept_preview(
+            new_key.clone(),
+            preview_value("Restored title"),
+            Some(current),
+        );
+        state.accept_preview(
+            old_key.clone(),
+            preview_value("Superseded title"),
+            Some(prior),
+        );
+        state.remember_derived_titles([(
+            listed.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Delayed index result".into()),
+                source_revision: prior,
+                ..Default::default()
+            },
+        )]);
+
+        let rendered = display_title(&state.entries[0], state.previews.get(&new_key));
+        assert_eq!(rendered, "Restored title");
+        assert!(!state.previews.contains(&old_key));
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Restored title")
+        );
+        state.query = "restored".into();
+        state.query_changed();
+        state.trajectory_search_deadline = Some(Instant::now());
+        assert_eq!(
+            state
+                .due_trajectory_search_request()
+                .unwrap()
+                .eligible_sessions,
+            vec![TrajectorySelection {
+                session: listed.session,
+                source: Some(current)
+            }]
+        );
+    }
+
+    #[test]
+    fn omp_picker_uses_the_active_title_and_drops_it_after_an_empty_clear() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::OhMyPi, "omp", current, None)],
+            current,
+            None,
+            false,
+        );
+        let key = PreviewKey {
+            session: state.entries[0].session.session.clone(),
+            source: None,
+            updated_at: None,
+            continuation_after: None,
+        };
+        state.remember_derived_titles([(
+            key.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Archived request".into()),
+                ..Default::default()
+            },
+        )]);
+        for title in [Some("Current request"), None] {
+            let mut preview = synthetic_preview("Assistant reply");
+            preview.title = omnis_core::SessionPreviewTitle::AfterClear(title.map(str::to_owned));
+            let value = PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                complete: true,
+                source_provider: Provider::OhMyPi,
+                can_use_first_title: true,
+                message_count_is_complete: true,
+            };
+            state.remember_other_preview_title(&key, &value);
+            assert_eq!(
+                display_title(&state.entries[0], Some(&value)),
+                title.unwrap_or("Untitled session")
+            );
+            state.query = "Current request".into();
+            assert_eq!(state.visible_indices().is_empty(), title.is_none());
+        }
     }
 
     #[test]
@@ -4530,8 +5183,86 @@ mod tests {
         assert!(!rendered.contains("? he…"));
     }
 
+    #[test]
+    fn strict_file_failure_withdraws_a_cached_preview_and_rejects_late_updates() {
+        let root = Path::new("/workspace");
+        let source = SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        };
+        let failed = omnis_store::TrajectoryIndexFailure {
+            ancestor_revisions: Vec::new(),
+            source_file: source.file,
+            source_contents: source.contents,
+            source_updated_at: None,
+            source_time_precise: true,
+            document_version: 7,
+        };
+        let ready = || PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("Bounded title")),
+            continuation: None,
+            complete: false,
+            source_provider: Provider::OhMyPi,
+            can_use_first_title: true,
+            message_count_is_complete: false,
+        };
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let mut native = session(provider, "selected", root, None);
+            native.source_revision = Some(source);
+            let mut state = PickerState::new(vec![native.clone()], root, None, true);
+            let key = state.preview_key(&state.entries[0]);
+            state.preview_window = vec![key.clone()];
+            state.accept_preview(key.clone(), ready(), Some(source));
+            assert_eq!(
+                state.entries[0].session.title.as_deref(),
+                Some("Bounded title")
+            );
+            let failures = HashMap::from([(native.session.clone(), failed.clone())]);
+            state.replace_preview_failures(failures.clone());
+            state.accept_preview(key.clone(), ready(), Some(source));
+            state.remember_derived_titles([(
+                native.session.clone(),
+                omnis_store::IndexedTitle {
+                    title: Some("Delayed title".to_owned()),
+                    source_revision: source,
+                    ..Default::default()
+                },
+            )]);
+            assert!(matches!(
+                state.previews.get(&key),
+                Some(PreviewValue::Unavailable)
+            ));
+            assert!(state.entries[0].session.title.is_none());
+            state.query = "Bounded title".into();
+            assert!(state.visible_indices().is_empty());
+
+            state.replace_preview_failures(HashMap::new());
+            state.preview_deadline = state.preview_deadline.map(|_| Instant::now());
+            assert_eq!(state.due_preview_request().unwrap()[0].key, key);
+            state.accept_preview(key, ready(), Some(source));
+            assert_eq!(state.visible_indices().len(), 1);
+            state.replace_preview_failures(failures);
+            let repaired = SourceRevision {
+                contents: Some(uuid::Uuid::from_u128(3)),
+                ..source
+            };
+            native.source_revision = Some(repaired);
+            state.replace_provider(provider, vec![native.clone()], root, false);
+            let repaired_key = state.preview_key(&state.entries[0]);
+            state.accept_preview(repaired_key.clone(), ready(), Some(repaired));
+            assert!(matches!(
+                state.previews.get(&repaired_key),
+                Some(PreviewValue::Ready { .. })
+            ));
+            assert_eq!(state.visible_indices().len(), 1);
+        }
+    }
+
     fn synthetic_preview(first: &str) -> SessionPreview {
         SessionPreview {
+            title: omnis_core::SessionPreviewTitle::FirstMessage,
+            title_authoritative: false,
             first: Some(HandoffMessage {
                 role: HandoffRole::User,
                 text: first.to_owned(),
@@ -5008,6 +5739,8 @@ mod tests {
             key,
             PreviewValue::Ready {
                 preview: Box::new(SessionPreview {
+                    title: omnis_core::SessionPreviewTitle::FirstMessage,
+                    title_authoritative: false,
                     first: Some(HandoffMessage {
                         role: HandoffRole::User,
                         text: "Start with cursor pagination.".to_owned(),
@@ -5291,6 +6024,8 @@ mod tests {
         let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
+                title: omnis_core::SessionPreviewTitle::FirstMessage,
+                title_authoritative: false,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Fix pagination without changing the API".to_owned(),
@@ -5375,6 +6110,51 @@ mod tests {
     }
 
     #[test]
+    fn codex_name_leads_the_picker_after_a_rename_with_a_cached_preview() {
+        let root = Path::new("/workspace");
+        let mut listed = session(Provider::Codex, "example", root, Some("Former name"));
+        listed.source_revision = Some(SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..Default::default()
+        });
+        let mut state = PickerState::new(vec![listed.clone()], root, None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let first = "<external_codex_apps_open_page>{}</external_codex_apps_open_page>";
+        state.accept_preview(
+            key.clone(),
+            PreviewValue::Ready {
+                preview: Box::new(synthetic_preview(first)),
+                continuation: Some(HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Continue the synthetic task".into(),
+                }),
+                source_provider: Provider::Codex,
+                can_use_first_title: true,
+                complete: true,
+                message_count_is_complete: true,
+            },
+            None,
+        );
+        let name = "🛰️ Orbit";
+        listed.title = Some(name.to_owned());
+        state.replace_provider(Provider::Codex, vec![listed], root, false);
+        let lines = selected_detail_lines(&state, 120, 40);
+        assert_eq!(lines[1].text, name);
+        assert!(lines.iter().any(|line| line.text.contains(first)));
+        let row = render::session_row(
+            &state.entries[0],
+            true,
+            "",
+            &ListColumns::for_width(100, false),
+            state.previews.get(&key),
+            false,
+            &[],
+        );
+        assert!(row.text.contains(name));
+    }
+
+    #[test]
     fn continuation_message_replaces_import_placeholder_title() {
         let session = session(
             Provider::OpenCode,
@@ -5384,6 +6164,8 @@ mod tests {
         );
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
+                title: omnis_core::SessionPreviewTitle::FirstMessage,
+                title_authoritative: false,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Inherited question".to_owned(),
@@ -5916,14 +6698,16 @@ mod tests {
             .due_trajectory_search_request()
             .expect("all-projects request");
         assert_eq!(
-            all_projects_request
-                .eligible_sessions
-                .into_iter()
-                .map(|selection| selection.session)
-                .collect::<Vec<_>>(),
+            all_projects_request.eligible_sessions,
             vec![
-                SessionRef::new(Provider::Codex, "current-codex"),
-                SessionRef::new(Provider::Codex, "other-codex"),
+                TrajectorySelection {
+                    session: SessionRef::new(Provider::Codex, "current-codex"),
+                    source: Some(SourceRevision::default()),
+                },
+                TrajectorySelection {
+                    session: SessionRef::new(Provider::Codex, "other-codex"),
+                    source: Some(SourceRevision::default()),
+                },
             ]
         );
 

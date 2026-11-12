@@ -47,6 +47,7 @@ fn shown(root: &Path, environment: Option<&Path>) -> Result<Option<Vec<String>>>
         .env("OMNISESSION_HOME", root.join("omni"))
         .env("OMNI_NO_UPDATE_CHECK", "1")
         .env("CODEX_HOME", root.join("codex"))
+        .env("OMNI_CODEX_BIN", root.join("bin/codex"))
         .args(["--json", "show", &format!("codex:{THREAD}")]);
     if let Some(environment) = environment {
         cmd.env("CODEX_SQLITE_HOME", environment);
@@ -144,5 +145,62 @@ fn configured_sqlite_home_controls_which_generation_of_a_thread_is_visible() -> 
         shown(&root, Some(&environment))?,
         Some(vec!["filename fallback".into()])
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn tilde_in_the_sqlite_environment_selects_the_installed_versions_rollout() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().canonicalize()?;
+    let workspace = root.join("workspace");
+    let day = root.join("codex/sessions/2026/01/01");
+    let binary = root.join("bin/codex");
+    fs::create_dir_all(&day)?;
+    fs::create_dir_all(binary.parent().unwrap())?;
+    fs::create_dir_all(&workspace)?;
+    let literal = workspace.join("~/state");
+    let expanded = root.join("home/state");
+    let environment = Some(Path::new("~/state"));
+    let original = day.join(format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"));
+    write_rollout(&original, THREAD, &workspace, "filesystem selection")?;
+    assert_eq!(
+        shown(&root, environment)?,
+        Some(vec!["filesystem selection".into()])
+    );
+    for (generation, directory, answer) in [
+        (ENV_GENERATION, literal, "literal selection"),
+        (CONFIG_GENERATION, expanded, "expanded selection"),
+    ] {
+        let rollout = day.join(format!(
+            "rollout-2026-01-01T00-00-00-{THREAD}_{generation}.jsonl"
+        ));
+        write_rollout(&rollout, THREAD, &workspace, answer)?;
+        select(&directory, &rollout)?;
+    }
+    let probes = root.join("bin/codex.probes");
+    for (version, expected) in [
+        ("0.137.0", Some("literal selection")),
+        ("0.167.1", Some("expanded selection")),
+        ("0.999.0", None),
+    ] {
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && [ -z \"$CODEX_SQLITE_HOME\" ] && [ ! -e \"$CODEX_HOME/sessions\" ] || exit 1\necho probe >> \"$0.probes\"\necho 'codex-cli {version}'\n"
+            ),
+        )?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+        assert_eq!(
+            shown(&root, environment)?,
+            expected.map(|text| vec![text.to_owned()])
+        );
+        assert_eq!(fs::read_to_string(&probes)?, "probe\n");
+        fs::remove_file(&probes)?;
+    }
+    fs::remove_file(binary)?;
+    assert_eq!(shown(&root, environment)?, None);
     Ok(())
 }

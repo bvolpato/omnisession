@@ -388,7 +388,9 @@ pub(super) fn discovery_path(home: &Path, path: &Path) -> bool {
             .components()
             .all(|part| matches!(part, std::path::Component::Normal(_)))
         && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
-        && fs::canonicalize(path).is_ok_and(|actual| actual == root.join(relative))
+        && fs::canonicalize(path).is_ok_and(|actual| {
+            omnis_core::codex_rollout_path_in_home(&root, relative).as_deref() == Some(&actual)
+        })
 }
 
 /// A state pointer or a stale discovery hint can name an obsolete path outside both rollout roots.
@@ -397,7 +399,8 @@ pub(super) fn managed_path(home: &Path, path: &Path) -> Option<PathBuf> {
     let root = home.canonicalize().ok()?;
     ["sessions", "archived_sessions"]
         .iter()
-        .any(|name| path.starts_with(root.join(name)))
+        .filter_map(|name| omnis_core::codex_rollout_path_in_home(&root, Path::new(name)))
+        .any(|directory| path.starts_with(directory))
         .then_some(path)
 }
 

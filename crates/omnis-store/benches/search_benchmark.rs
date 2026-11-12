@@ -160,7 +160,6 @@ fn synthetic_document(index: usize) -> String {
 fn synthetic_indexed_session(index: usize) -> IndexedSession {
     let timestamp = benchmark_timestamp();
     IndexedSession {
-        source_revision: None,
         session: SessionRef::new(Provider::Claude, format!("refresh-{index:04}")),
         title: Some(format!("Synthetic refresh session {index}")),
         project_path: None,
@@ -169,6 +168,7 @@ fn synthetic_indexed_session(index: usize) -> IndexedSession {
         updated_at: Some(timestamp),
         updated_at_approximate: false,
         event_count: index + 1,
+        source_revision: None,
     }
 }
 
@@ -196,6 +196,7 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         indexed_byte_count: text.len(),
         truncation_strategy: "none",
         source_complete: true,
+        provider_limited: false,
         origin: SessionTrajectoryOrigin::Native,
         document_version: omnis_core::search_document_version(Provider::Codex),
         derived_title: None,

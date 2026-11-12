@@ -49,6 +49,79 @@ fn clipboard_unavailable_keeps_context_and_reports_partial_success() {
     }
 }
 
+#[test]
+fn returning_home_recovers_its_verified_title_for_show_and_handoff() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new();
+    let outer = fixture.root.join("codex");
+    let inner = outer.join("sessions/restored");
+    let nested_sessions = inner.join("sessions");
+    fs::create_dir_all(&nested_sessions).unwrap();
+    let source = nested_sessions.join(fixture.source.file_name().unwrap());
+    fs::rename(&fixture.source, &source).unwrap();
+    let session = format!("codex:{SESSION_ID}");
+    let run = |home: &Path, args: &[&str]| {
+        let output = fixture
+            .command()
+            .env("CODEX_HOME", home)
+            .env("CODEX_SQLITE_HOME", home)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let title = format!("{}verified tag", "Cobalt ".repeat(41));
+    let sidecar = outer.join("session_index.jsonl");
+    let assignment = json!({"id":SESSION_ID, "thread_name":title});
+    fs::write(&sidecar, format!("{assignment}\n")).unwrap();
+    run(&outer, &["index", "--provider", "codex"]);
+    fs::write(&sidecar, format!("{assignment}\n{{")).unwrap();
+    let visit_inner = || {
+        run(
+            &inner,
+            &[
+                "search",
+                "synthetic",
+                "--provider",
+                "codex",
+                "--all-projects",
+            ],
+        )
+    };
+    let append_reply = || {
+        let reply = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"Additional verified reply"}]}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{reply}"
+        )
+        .unwrap();
+    };
+    append_reply();
+    assert_eq!(run(&outer, &["show", &session])["title"], title);
+    append_reply();
+    let check_handoff = || {
+        let handoff = run(&outer, &["handoff", &session]);
+        let document = fs::read_to_string(handoff["output"].as_str().unwrap()).unwrap();
+        assert!(document.contains(&title));
+        assert!(document.contains("Additional verified reply"));
+    };
+    check_handoff();
+    visit_inner();
+    check_handoff();
+
+    visit_inner();
+    append_reply();
+    assert_eq!(run(&outer, &["show", &session])["title"], title);
+    fs::write(&sidecar, "").unwrap();
+    assert!(run(&outer, &["show", &session])["title"].is_null());
+    fs::write(&sidecar, "{").unwrap();
+    assert!(run(&outer, &["show", &session])["title"].is_null());
+}
+
 #[cfg(unix)]
 #[test]
 fn clipboard_receives_compact_instructions_and_the_saved_file_keeps_full_history() {
@@ -75,6 +148,41 @@ fn clipboard_receives_compact_instructions_and_the_saved_file_keeps_full_history
     let clipboard = String::from_utf8(clipboard).expect("compact clipboard text");
     assert_compact_context(&fixture, &clipboard, files[0].to_str().unwrap());
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn cleared_omp_title_is_absent_from_both_handoff_documents() {
+    let fixture = Fixture::new();
+    fixture.clipboard_helper("/bin/cat > \"$CLIPBOARD_CAPTURE\"");
+    let sessions = fixture.root.join("omp");
+    fs::create_dir_all(&sessions).unwrap();
+    let rows = [
+        json!({"type":"title","title":"Previous task name"}),
+        json!({"type":"session","version":3,"id":SESSION_ID,"cwd":fixture.workspace,"timestamp":"2026-01-01T00:00:00Z"}),
+        json!({"type":"reset_boundary","id":"clear","parentId":null,"timestamp":"2026-01-01T00:00:01Z"}),
+        json!({"type":"message","id":"current","parentId":"clear","message":{"role":"user","content":"Current task","timestamp":2}}),
+    ];
+    fs::write(
+        sessions.join(format!("archive_{SESSION_ID}.jsonl")),
+        rows.map(|row| format!("{row}\n")).concat(),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .env("OMP_SESSION_DIR", &sessions)
+        .args(["--json", "handoff", &format!("omp:{SESSION_ID}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["clipboard_copied"], true);
+    let file = fs::read_to_string(report["output"].as_str().unwrap()).unwrap();
+    let clipboard = fs::read_to_string(fixture.root.join("clipboard.txt")).unwrap();
+    for document in [file, clipboard] {
+        assert!(document.contains("Current task"));
+        assert!(!document.contains("Previous task name"));
+    }
 }
 
 #[cfg(unix)]

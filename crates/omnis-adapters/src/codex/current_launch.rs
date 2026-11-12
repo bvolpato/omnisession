@@ -223,8 +223,8 @@ pub(super) fn filesystem_selects(
             5,
             &mut walked,
             SCAN_LIMIT + 1,
-            &mut unreadable,
-            &mut depth_limited,
+            (&mut unreadable, &mut depth_limited),
+            &mut Vec::new(),
             (!paginated).then_some(&mut walked_links),
         );
         if unreadable != 0

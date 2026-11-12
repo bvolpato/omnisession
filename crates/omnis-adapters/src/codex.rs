@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
+use omnis_core::{CODEX_ROLLOUT_DIRECTORY_DEPTH as SCAN_DEPTH, unique_codex_rollout_home};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -37,6 +38,7 @@ use rollout_identity::{IdKind, RolloutCatalog, RolloutSelector};
 
 mod current_launch;
 mod current_rollout;
+mod gui_names;
 mod rollout_cache;
 mod rollout_file;
 mod saved_message;
@@ -51,7 +53,6 @@ use current_rollout::{
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 
 const SCAN_LIMIT: usize = 10_000;
-const SCAN_DEPTH: usize = 5;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
@@ -62,6 +63,7 @@ const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
+    directories: Vec<(PathBuf, Option<RolloutStamp>)>,
     files: Vec<PathBuf>,
     candidates: HashMap<String, Vec<usize>>,
     notes: Vec<String>,
@@ -70,6 +72,31 @@ struct CodexFileScan {
     active_links: Vec<PathBuf>,
     ids: OnceLock<HashMap<String, Vec<usize>>>,
     skipped_directories: bool,
+}
+
+#[derive(Default)]
+struct LegacyPaths<'a> {
+    native_ids: HashSet<String>,
+    by_id: HashMap<Uuid, Vec<&'a Path>>,
+    revisions: Vec<(PathBuf, Option<SourceRevision>)>,
+    unidentified: HashMap<&'a Path, Vec<&'a Path>>,
+}
+
+impl<'a> LegacyPaths<'a> {
+    fn add_filename(&mut self, path: &'a Path) {
+        if let Some((thread, _)) = current_rollout::ids(path)
+            && let Ok(owner) = Uuid::parse_str(thread)
+        {
+            self.by_id.entry(owner).or_default().push(path);
+        }
+    }
+
+    fn title_paths(&self, id: &str) -> &[&'a Path] {
+        Uuid::parse_str(id)
+            .ok()
+            .and_then(|owner| self.by_id.get(&owner))
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 impl CodexFileScan {
@@ -103,25 +130,53 @@ impl CodexFileScan {
             .unwrap_or_default()
     }
 
-    fn legacy_paths(
-        &self,
-        home: &Path,
-        mut cache: Option<&mut RolloutCache>,
-    ) -> HashMap<String, Vec<&Path>> {
-        let mut legacy = HashMap::<String, Vec<&Path>>::new();
-        let Ok(root) = fs::canonicalize(home) else {
-            return legacy;
-        };
+    fn current(&self) -> bool {
+        self.directories.len() <= SCAN_LIMIT
+            && self
+                .directories
+                .iter()
+                .all(|(dir, stamp)| match fs::symlink_metadata(dir) {
+                    Ok(metadata) => stamp.is_some() && RolloutStamp::new(&metadata) == *stamp,
+                    Err(error) => stamp.is_none() && error.kind() == ErrorKind::NotFound,
+                })
+    }
+
+    fn legacy_paths(&self, home: &Path, mut cache: Option<&mut RolloutCache>) -> LegacyPaths<'_> {
+        let mut legacy = LegacyPaths::default();
+        let root = fs::canonicalize(home).ok();
         for path in &self.files {
-            if !current_rollout::canonical_name(path)
-                && live_rollout_path(home, &root, path)
+            if current_rollout::canonical_name(path) {
+                legacy.add_filename(path);
+                continue;
+            }
+            if root
+                .as_ref()
+                .is_some_and(|root| live_rollout_path(home, root, path))
                 && let Ok(Some(session)) = listed_session(path, cache.as_deref_mut())
+                && let Ok(owner) = Uuid::parse_str(&session.id)
             {
                 // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
-                legacy.entry(session.id).or_default().push(path);
+                legacy.native_ids.insert(session.id);
+                legacy.by_id.entry(owner).or_default().push(path);
+                legacy
+                    .revisions
+                    .push((path.clone(), session.observed_revision));
+            } else if let Some(name) = rollout_file::jsonl_file_name(path) {
+                legacy.add_filename(path);
+                legacy.unidentified.entry(name).or_default().push(path);
+                legacy.revisions.push((path.clone(), None));
             }
         }
         legacy
+    }
+
+    fn thread_ids<'a>(&'a self, legacy: &'a LegacyPaths<'_>) -> impl Iterator<Item = &'a String> {
+        self.candidates.keys().chain(
+            legacy
+                .native_ids
+                .iter()
+                .filter(|id| !self.candidates.contains_key(*id)),
+        )
     }
 
     fn listed_rollout(
@@ -153,12 +208,55 @@ impl CodexFileScan {
         self.paths(id).all(current_rollout::canonical_name)
     }
 
+    fn unique_path(&self, id: &str) -> Option<&Path> {
+        let [index] = self.candidates.get(id)?.as_slice() else {
+            return None;
+        };
+        self.notes.is_empty().then(|| self.files[*index].as_path())
+    }
+
+    fn index_paths(
+        &self,
+        selected: &SelectedRollout,
+        legacy: &LegacyPaths<'_>,
+    ) -> Option<Vec<PathBuf>> {
+        if !self.notes.is_empty() {
+            return None;
+        }
+        let session = &selected.session;
+        let mut paths: Vec<_> = legacy
+            .title_paths(&session.id)
+            .iter()
+            .copied()
+            .map(Path::to_owned)
+            .collect();
+        if selected.from_registry {
+            // SQLite can select a physical representation whose filename has no thread ID.
+            paths.push(session.path.clone());
+        }
+        if let Some(name) = rollout_file::jsonl_file_name(&session.path)
+            && let Some(unknown) = legacy.unidentified.get(name)
+        {
+            paths.extend(unknown.iter().map(|path| path.to_path_buf()));
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths)
+    }
+
     fn paths(&self, id: &str) -> impl Iterator<Item = &Path> {
         self.candidates
             .get(id)
             .into_iter()
             .flatten()
             .map(|&i| self.files[i].as_path())
+    }
+
+    fn observed_file_paths(&self) -> HashMap<Uuid, &Path> {
+        self.files
+            .iter()
+            .filter_map(|path| Some((CodexAdapter::index_file_id(path)?, path.as_path())))
+            .collect()
     }
 
     fn remember(&mut self, id: &str, path: &Path, active: &Path) {
@@ -178,6 +276,7 @@ struct InvalidHeaders {
 }
 
 struct SelectedRollout {
+    name: NativeSessionName,
     session: CodexSession,
     shadowed: bool,
     from_registry: bool,
@@ -187,6 +286,7 @@ impl From<CurrentFile> for SelectedRollout {
     fn from(file: CurrentFile) -> Self {
         debug_assert_eq!(file.session.observed_revision, Some(file.revision));
         Self {
+            name: NativeSessionName::Unknown,
             session: file.session,
             shadowed: !file.native,
             from_registry: true,
@@ -212,6 +312,7 @@ fn select_rollout<'a>(
                 }
                 let dual = thread != file;
                 return Some(SelectedRollout {
+                    name: NativeSessionName::Unknown,
                     session,
                     shadowed: shadowed || (dual && !current_rollout::canonical_name(path)),
                     from_registry: false,
@@ -231,11 +332,48 @@ fn select_rollout<'a>(
 
 #[derive(Debug, Default)]
 struct CodexListing {
+    scan: Arc<CodexFileScan>,
     sessions: Vec<CodexSession>,
+    listed_names: HashMap<String, (usize, NativeSessionName)>,
+    registry_rows: HashMap<String, current_rollout::CurrentRollout>,
     rollout_notes: Vec<String>,
     names: Arc<TitleIndex>,
     selected_files: HashMap<String, (PathBuf, SourceRevision)>,
+    legacy_revisions: Vec<(PathBuf, Option<SourceRevision>)>,
     requires_scan: bool,
+}
+
+impl CodexListing {
+    fn matching_names(
+        &self,
+        sessions: &[(&str, &Path, SourceRevision)],
+        registry_matches: impl Fn(&str) -> bool,
+    ) -> HashMap<String, NativeSessionName> {
+        let mut result = HashMap::new();
+        let mut seen = HashSet::with_capacity(sessions.len());
+        for &(id, path, revision) in sessions {
+            if !seen.insert(id) {
+                result.remove(id);
+                continue;
+            }
+            let Some((position, name)) = self.listed_names.get(id) else {
+                continue;
+            };
+            let selected = &self.sessions[*position];
+            if selected.path == path
+                && revision.contents.is_some()
+                && selected
+                    .observed_revision
+                    .is_some_and(|observed| observed.matches_file_contents(revision))
+                && registry_matches(id)
+                && CodexAdapter::index_file_revision(path)
+                    .is_some_and(|current| current.matches_file_contents(revision))
+            {
+                result.insert(id.to_owned(), name.clone());
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -246,7 +384,7 @@ struct CachedListing {
 
 #[derive(Debug, Default)]
 struct TitleIndex {
-    titles: HashMap<String, String>,
+    titles: Arc<HashMap<String, String>>,
     prior_titles: HashMap<String, String>,
     notes: Vec<String>,
     complete: bool,
@@ -302,6 +440,16 @@ impl CodexAdapter {
                 .events
                 .iter()
                 .any(|event| event.source.raw_record_type.as_deref() == Some(UNAVAILABLE_ANCESTRY))
+    }
+
+    /// Returns the verified treatment of a leading tilde in `CODEX_SQLITE_HOME` for this Codex release.
+    #[must_use]
+    pub fn expands_sqlite_env_tilde(version: &str) -> Option<bool> {
+        match version {
+            "0.137.0" => Some(false),
+            "0.167.1" => Some(true),
+            _ => None,
+        }
     }
 
     /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
@@ -444,6 +592,7 @@ impl CodexAdapter {
                 workspace_projection,
                 snapshot,
                 source_complete: document.source_complete,
+                provider_limited: read.provider_limited,
                 source_revision: read.source_revision,
                 native_session: read.native_session.clone(),
             }))
@@ -545,6 +694,14 @@ impl CodexAdapter {
         }
     }
 
+    /// Selects existing threads from the SQLite directory used for the native import.
+    #[must_use]
+    pub fn for_import(codex_home: &Path, sqlite_home: &Path) -> Self {
+        let mut adapter = Self::with_root(codex_home);
+        adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
+        adapter
+    }
+
     fn discover_session_scan(&self) -> CodexFileScan {
         let Some(home) = self.codex_home.as_deref() else {
             return CodexFileScan::default();
@@ -569,6 +726,43 @@ impl CodexAdapter {
         (scan, false)
     }
 
+    fn rollouts_to_recheck<'a>(
+        &self,
+        home: &Path,
+        prior: &'a [(String, Option<SourceRevision>)],
+    ) -> Vec<&'a (String, Option<SourceRevision>)> {
+        let cached = self
+            .listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let valid = cached.as_ref().filter(|cached| {
+            cached.database.is_some() && cached.database == self.current.stamp(home)
+        });
+        prior
+            .iter()
+            .filter(|(id, prior)| {
+                let known = valid.and_then(|cached| cached.listing.selected_files.get(id.as_str()));
+                if let Some((path, selected)) = known
+                    && Self::index_file_revision(path) == Some(*selected)
+                {
+                    return prior
+                        .and_then(|revision| revision.file)
+                        .is_some_and(|file| Some(file) != selected.file);
+                }
+                true
+            })
+            .collect()
+    }
+
+    fn current_session_scan(&self) -> (Arc<CodexFileScan>, bool) {
+        let (scan, reused) = self.session_scan(None);
+        if reused && !scan.current() {
+            self.session_scan(Some(&scan))
+        } else {
+            (scan, reused)
+        }
+    }
+
     fn scan_for_lookup(
         &self,
         id: &str,
@@ -576,7 +770,7 @@ impl CodexAdapter {
         home: &Path,
         canonical_home: &Path,
     ) -> (Arc<CodexFileScan>, bool) {
-        let (scan, reused) = self.session_scan(None);
+        let (scan, reused) = self.current_session_scan();
         let Some(path) = source_path else {
             return (scan, reused);
         };
@@ -671,7 +865,7 @@ impl CodexAdapter {
                     );
                 }
                 TitleIndex {
-                    titles,
+                    titles: Arc::new(titles),
                     prior_titles,
                     complete: notes.is_empty(),
                     notes,
@@ -694,7 +888,7 @@ impl CodexAdapter {
         let Some(observed) = ObservedRollout::read(path) else {
             return false;
         };
-        if !observed.has_file_identity
+        if observed.physical_identity.is_none()
             || observed.revision.contents.is_none()
             || reported.source_revision != Some(observed.revision)
             || !uniquely_scoped_rollout(home, path)
@@ -708,6 +902,146 @@ impl CodexAdapter {
                         && current.session.observed_revision == Some(observed.revision)
                 })
             })
+    }
+
+    fn header_cache(&self, home: &Path) -> Option<RolloutCache> {
+        self.rollout_cache
+            .as_deref()
+            .and_then(|path| RolloutCache::load(path, home))
+    }
+
+    fn selected_name(
+        &self,
+        selected: &SelectedRollout,
+        row: Option<&current_rollout::CurrentRollout>,
+        index: &TitleIndex,
+        candidates: impl FnOnce() -> Option<Vec<PathBuf>>,
+    ) -> NativeSessionName {
+        let session = &selected.session;
+        let indexed = || {
+            let Some(title) = index.titles.get(&session.id) else {
+                return if index.complete {
+                    NativeSessionName::Absent
+                } else {
+                    NativeSessionName::Unknown
+                };
+            };
+            let Some(paths) = candidates() else {
+                return NativeSessionName::Unknown;
+            };
+            if paths.as_slice() == [session.path.as_path()] {
+                return NativeSessionName::Named(title.clone());
+            }
+            if let Some(row) = row
+                && row.corroborates_index()
+                && let Some(home) = self.codex_home.as_deref()
+                && row
+                    .index_copies_match(
+                        home,
+                        &session.id,
+                        &session.path,
+                        paths.iter().map(PathBuf::as_path),
+                    )
+                    .unwrap_or(false)
+            {
+                return NativeSessionName::Named(title.clone());
+            }
+            NativeSessionName::Absent
+        };
+        match row {
+            Some(row) if selected.from_registry || row.ordinary_path_is(&session.path) => {
+                row.observed_name(indexed)
+            }
+            Some(_) => NativeSessionName::Absent,
+            None => indexed(),
+        }
+    }
+
+    /// Refreshes cached names and metadata from the currently selected rollouts.
+    pub fn refresh_session_titles(
+        &self,
+        sessions: &mut [NativeSession],
+    ) -> HashMap<String, NativeSessionName> {
+        let mut names = HashMap::new();
+        if !sessions
+            .iter()
+            .any(|s| s.session.provider == Provider::Codex)
+        {
+            return names;
+        }
+        let Some(home) = self.codex_home.as_deref() else {
+            return names;
+        };
+        let (scan, _) = self.current_session_scan();
+        let ids = sessions
+            .iter()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .map(|s| s.session.id.as_str());
+        let index = self.title_index();
+        let rows = self.current.rows_with_titles(home, ids, &index.titles);
+        let mut cache = self.header_cache(home);
+        let legacy = scan.legacy_paths(home, cache.as_mut());
+        for cached in sessions
+            .iter_mut()
+            .filter(|s| s.session.provider == Provider::Codex)
+        {
+            let id = cached.session.id.as_str();
+            let Ok(rows) = &rows else {
+                cached.title = None;
+                continue;
+            };
+            let row = rows.get(id);
+            if let Some(path) = scan.unique_path(id)
+                && current_rollout::canonical_name(path)
+                && legacy.title_paths(id).iter().all(|&file| file == path)
+                && row.is_none_or(|row| row.ordinary_path_is(path))
+                && cached
+                    .source_revision
+                    .zip(Self::index_file_revision(path))
+                    .is_some_and(|(old, new)| old.matches_file_contents(new))
+            {
+                let indexed = || match index.titles.get(id) {
+                    Some(title) => NativeSessionName::Named(title.clone()),
+                    None if index.complete => NativeSessionName::Absent,
+                    None => NativeSessionName::Unknown,
+                };
+                let name = row.map_or_else(indexed, |row| row.observed_name(indexed));
+                if name != NativeSessionName::Unknown {
+                    names.insert(id.to_owned(), name.clone());
+                }
+                cached.title = name.into_title();
+                cached.source_path = Some(path.to_owned());
+                continue;
+            }
+            let Ok(Some(selected)) = scan.listed_rollout(
+                home,
+                id,
+                row,
+                cache.as_mut(),
+                &mut InvalidHeaders::default(),
+            ) else {
+                cached.title = None;
+                continue;
+            };
+            let name = self.selected_name(&selected, row, &index, || {
+                scan.index_paths(&selected, &legacy)
+            });
+            if name != NativeSessionName::Unknown {
+                names.insert(id.to_owned(), name.clone());
+            }
+            let current = selected.session;
+            if cached
+                .source_revision
+                .zip(current.observed_revision)
+                .is_some_and(|(old, new)| old.matches_file_contents(new))
+            {
+                cached.source_path = Some(current.path);
+            } else {
+                *cached = current.native_session();
+            }
+            cached.title = name.into_title();
+        }
+        names
     }
 
     fn listing(&self, refresh: bool) -> (Arc<CodexListing>, bool) {
@@ -727,6 +1061,18 @@ impl CodexAdapter {
                     && cached.database == database
                     && !cached.listing.requires_scan
                     && Arc::ptr_eq(&cached.listing.names, &self.title_index())
+                    && cached.listing.scan.current()
+                    && cached
+                        .listing
+                        .legacy_revisions
+                        .iter()
+                        .all(|(path, previous)| {
+                            previous.is_some() && Self::index_file_revision(path) == *previous
+                        })
+                    && cached.listing.sessions.iter().all(|session| {
+                        cached.listing.selected_files.contains_key(&session.id)
+                            || Self::index_file_revision(&session.path) == session.observed_revision
+                    })
                     && cached
                         .listing
                         .selected_files
@@ -752,34 +1098,30 @@ impl CodexAdapter {
         let Some(home) = self.codex_home.as_deref() else {
             return CodexListing::default();
         };
-        let mut cache = self
-            .rollout_cache
-            .as_deref()
-            .zip(self.codex_home.as_deref())
-            .and_then(|(path, home)| RolloutCache::load(path, home));
+        let mut cache = self.header_cache(home);
         let legacy = scan.legacy_paths(home, cache.as_mut());
-        let ids = || {
-            scan.candidates.keys().chain(
-                legacy
-                    .keys()
-                    .filter(|id| !scan.candidates.contains_key(*id)),
-            )
-        };
-        let rows = match self.current.rows(home, ids().map(String::as_str)) {
+        let title_index = self.title_index();
+        let rows = match self.current.rows_with_titles(
+            home,
+            scan.thread_ids(&legacy).map(String::as_str),
+            &title_index.titles,
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 return CodexListing {
                     rollout_notes: vec![format!(
                         "Codex could not verify the current rollouts: {}.",
-                        compact_discovery_error(&error)
+                        compact_discovery_error(&anyhow!("{error:#}"))
                     )],
+                    scan,
+                    names: title_index,
                     requires_scan: true,
                     ..CodexListing::default()
                 };
             }
         };
-        let title_index = self.title_index();
         let mut sessions = Vec::new();
+        let mut listed_names = HashMap::new();
         let mut selected_files = HashMap::new();
         let mut requires_scan = false;
         let mut subagents = 0_usize;
@@ -788,7 +1130,7 @@ impl CodexAdapter {
                 - scan.candidates.values().map(Vec::len).sum::<usize>(),
             ..Default::default()
         };
-        for id in ids() {
+        for id in scan.thread_ids(&legacy) {
             let row = rows.get(id);
             let selected = match scan.listed_rollout(home, id, row, cache.as_mut(), &mut invalid) {
                 Ok(Some(selected)) => selected,
@@ -800,11 +1142,19 @@ impl CodexAdapter {
                     continue;
                 }
             };
+            if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
+                && (scan.unique_path(id).is_none()
+                    || !current_rollout::canonical_name(&selected.session.path)
+                    || legacy.title_paths(id).len() > 1)
+            {
+                requires_scan = true;
+            }
+            let name = self.selected_name(&selected, row, &title_index, || {
+                scan.index_paths(&selected, &legacy)
+            });
             let mut session = selected.session;
             if current_rollout::ids(&session.path).is_none()
-                && legacy
-                    .get(id)
-                    .is_some_and(|files| files.contains(&session.path.as_path()))
+                && legacy.title_paths(id).contains(&session.path.as_path())
             {
                 invalid.without_metadata -= 1;
             }
@@ -820,26 +1170,20 @@ impl CodexAdapter {
                 subagents += 1;
                 continue;
             }
-            session.title = title_index.titles.get(&session.id).cloned();
+            session.title = name.clone().into_title();
+            listed_names.insert(id.clone(), (sessions.len(), name));
             sessions.push(session);
         }
         if let Some(cache) = cache {
             cache.save();
         }
-        let rollout_notes = listing_notes(
-            &scan,
-            sessions.len(),
-            subagents,
-            invalid.unreadable,
-            invalid.without_metadata,
-            invalid
-                .first_error
-                .as_ref()
-                .map(compact_discovery_error)
-                .as_deref(),
-        );
+        let rollout_notes = listing_notes(&scan, sessions.len(), subagents, &invalid);
         CodexListing {
+            legacy_revisions: legacy.revisions,
+            scan,
             sessions,
+            listed_names,
+            registry_rows: rows,
             rollout_notes,
             names: title_index,
             selected_files,
@@ -848,9 +1192,10 @@ impl CodexAdapter {
     }
 
     fn find_session(&self, id: &str, source_path: Option<&Path>) -> Result<CodexSession> {
-        let mut session = self.require_rollout(id, source_path)?.session;
-        session.title = self.title_index().titles.get(id).cloned();
-        Ok(session)
+        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
+        self.resolve_rollout(id, source_path, true)?
+            .map(|s| s.session)
+            .ok_or_else(|| anyhow!("Codex session {id} was not found"))
     }
 
     fn require_rollout(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedRollout> {
@@ -910,17 +1255,42 @@ impl CodexAdapter {
         id: &str,
         source_path: Option<&Path>,
     ) -> Result<Option<SelectedRollout>> {
+        self.resolve_rollout(id, source_path, false)
+    }
+
+    fn resolve_rollout(
+        &self,
+        id: &str,
+        source_path: Option<&Path>,
+        with_title: bool,
+    ) -> Result<Option<SelectedRollout>> {
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(None);
         };
         let Ok(canonical_home) = fs::canonicalize(home) else {
             return Ok(None);
         };
-        let rows = self.current.rows(home, [id])?;
+        let title_index = with_title.then(|| self.title_index());
+        let rows = if let Some(index) = &title_index {
+            self.current.rows_with_titles(home, [id], &index.titles)?
+        } else {
+            self.current.rows(home, [id])?
+        };
         let row = rows.get(id);
+        let finish = |mut selected: SelectedRollout| {
+            if let Some(index) = &title_index {
+                selected.name = self.selected_name(&selected, row, index, || {
+                    let (scan, _) = self.current_session_scan();
+                    let legacy = scan.legacy_paths(home, None);
+                    scan.index_paths(&selected, &legacy)
+                });
+                selected.session.title = selected.name.clone().into_title();
+            }
+            Ok(Some(selected))
+        };
         if let Some(row) = row {
             match row.resolve(home, id, std::iter::empty(), false) {
-                Ok(Some(file)) => return Ok(Some(file.into())),
+                Ok(Some(file)) => return finish(file.into()),
                 Err(error) if row.has_legacy_name() => return Err(error),
                 _ => {}
             }
@@ -933,7 +1303,7 @@ impl CodexAdapter {
                 scan = self.session_scan(Some(&scan)).0;
             }
             if let Some(file) = row.resolve(home, id, scan.paths(id), scan.notes.is_empty())? {
-                return Ok(Some(file.into()));
+                return finish(file.into());
             }
         }
         anyhow::ensure!(
@@ -943,7 +1313,7 @@ impl CodexAdapter {
         if let Some(selected) =
             select_live_rollout(home, &canonical_home, scan.paths(id), &mut invalid)
         {
-            return Ok(Some(selected));
+            return finish(selected);
         }
         if cached {
             // A remaining malformed sibling does not prove that the last valid file is still here.
@@ -958,20 +1328,21 @@ impl CodexAdapter {
                 if let Some(selected) =
                     select_live_rollout(home, &canonical_home, fresh.paths(id), &mut invalid)
                 {
-                    return Ok(Some(selected));
+                    return finish(selected);
                 }
             }
         }
         if !scan.notes.is_empty()
             && invalid.first_error.is_none()
             && let Some(path) = self.selector.find_exact(home, id, IdKind::Thread)?
-        {
-            return Ok(select_live_rollout(
+            && let Some(selected) = select_live_rollout(
                 home,
                 &canonical_home,
                 std::iter::once(path.as_path()),
                 &mut invalid,
-            ));
+            )
+        {
+            return finish(selected);
         }
         invalid.first_error.map_or(Ok(None), Err)
     }
@@ -996,15 +1367,14 @@ impl CodexAdapter {
         self.selector.find_exact(home, id, IdKind::Rollout)
     }
 
-    fn index_session_in(
+    fn index_rollout(
         &self,
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
+        native: CodexSession,
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<IndexRead> {
-        validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id, source_path)?;
         let changed = source_path.is_some_and(|path| path != native.path);
         let read = self.read_selected(native, |native, revision| {
             let selected_path = native.path.clone();
@@ -1075,8 +1445,8 @@ impl CodexAdapter {
                 0,
                 &mut paths,
                 SCAN_LIMIT,
-                &mut unreadable_dirs,
-                &mut depth_limited_dirs,
+                (&mut unreadable_dirs, &mut depth_limited_dirs),
+                &mut Vec::new(),
                 None,
             );
             for ((_, name), siblings) in physical_rollouts(&paths) {
@@ -1251,6 +1621,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut files = Vec::new();
     let mut active_links = Vec::new();
+    let mut directories = Vec::new();
     let mut unreadable_dirs = 0_usize;
     let mut depth_limited_dirs = 0_usize;
     let collect_limit = limit.saturating_add(1);
@@ -1259,8 +1630,8 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         SCAN_DEPTH,
         &mut files,
         collect_limit,
-        &mut unreadable_dirs,
-        &mut depth_limited_dirs,
+        (&mut unreadable_dirs, &mut depth_limited_dirs),
+        &mut directories,
         Some(&mut active_links),
     );
     let active_entries_complete = unreadable_dirs == 0
@@ -1273,8 +1644,8 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             SCAN_DEPTH,
             &mut files,
             collect_limit,
-            &mut unreadable_dirs,
-            &mut depth_limited_dirs,
+            (&mut unreadable_dirs, &mut depth_limited_dirs),
+            &mut directories,
             None,
         );
     }
@@ -1298,6 +1669,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     }
     let candidates = ranked_rollouts(&files, &home.join("sessions"));
     CodexFileScan {
+        directories,
         files,
         candidates,
         notes,
@@ -1409,24 +1781,17 @@ fn live_rollout_path(home: &Path, canonical_home: &Path, path: &Path) -> bool {
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
         && path.is_file()
-        && fs::canonicalize(path).is_ok_and(|actual| actual == canonical_home.join(relative))
+        && fs::canonicalize(path).is_ok_and(|actual| {
+            omnis_core::codex_rollout_path_in_home(canonical_home, relative).as_deref()
+                == Some(&actual)
+        })
 }
 
 fn uniquely_scoped_rollout(home: &Path, path: &Path) -> bool {
     let Ok(actual) = fs::canonicalize(path) else {
         return false;
     };
-    // Nested Codex homes can discover the same file. The legacy catalog did not store its home.
-    let mut homes = actual
-        .ancestors()
-        .skip(1)
-        .take(SCAN_DEPTH + 1)
-        .filter(|dir| {
-            dir.file_name()
-                .is_some_and(|name| name == "sessions" || name == "archived_sessions")
-        })
-        .filter_map(Path::parent);
-    homes.next() == Some(home) && homes.next().is_none()
+    unique_codex_rollout_home(&actual) == Some(home)
 }
 
 // Codex restores archived files into the active directory named by their original date.
@@ -1465,18 +1830,20 @@ fn listing_notes(
     scan: &CodexFileScan,
     listed: usize,
     subagents: usize,
-    unreadable_files: usize,
-    skipped_metadata: usize,
-    first_unreadable: Option<&str>,
+    invalid: &InvalidHeaders,
 ) -> Vec<String> {
+    let unreadable_files = invalid.unreadable;
+    let skipped_metadata = invalid.without_metadata;
     let mut notes = scan.notes.clone();
     if unreadable_files > 0 {
-        notes.push(match first_unreadable {
-            Some(error) if !error.is_empty() => {
-                format!("Codex skipped {unreadable_files} unreadable session file(s): {error}.")
-            }
-            _ => format!("Codex skipped {unreadable_files} unreadable session file(s)."),
-        });
+        notes.push(
+            match invalid.first_error.as_ref().map(compact_discovery_error) {
+                Some(error) if !error.is_empty() => {
+                    format!("Codex skipped {unreadable_files} unreadable session file(s): {error}.")
+                }
+                _ => format!("Codex skipped {unreadable_files} unreadable session file(s)."),
+            },
+        );
     }
     if skipped_metadata > 0 {
         notes.push(format!(
@@ -1508,14 +1875,22 @@ fn collect_jsonl(
     depth: usize,
     output: &mut Vec<PathBuf>,
     limit: usize,
-    unreadable_dirs: &mut usize,
-    depth_limited_dirs: &mut usize,
+    errors: (&mut usize, &mut usize),
+    stamps: &mut Vec<(PathBuf, Option<RolloutStamp>)>,
     mut skipped_links: Option<&mut Vec<PathBuf>>,
 ) {
     if output.len() >= limit {
         return;
     }
-    if fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    let (unreadable_dirs, depth_limited_dirs) = errors;
+    let metadata = fs::symlink_metadata(root);
+    if stamps.len() <= SCAN_LIMIT {
+        stamps.push((
+            root.to_owned(),
+            metadata.as_ref().ok().and_then(RolloutStamp::new),
+        ));
+    }
+    if metadata.is_ok_and(|meta| meta.file_type().is_symlink()) {
         *unreadable_dirs = unreadable_dirs.saturating_add(1);
         return;
     }
@@ -1590,8 +1965,8 @@ fn collect_jsonl(
                     depth - 1,
                     output,
                     limit,
-                    unreadable_dirs,
-                    depth_limited_dirs,
+                    (unreadable_dirs, depth_limited_dirs),
+                    stamps,
                     skipped_links.as_deref_mut(),
                 );
             } else {
@@ -2239,6 +2614,7 @@ impl CodexSession {
             snapshot,
             rollback_title,
             workspace_projection,
+            provider_limited: false,
             source_revision,
             source_complete,
         })
@@ -2284,6 +2660,7 @@ impl CodexSession {
             ),
             snapshot: events.snapshot(session.clone(), self.title, project, branch, captured_at),
             source_complete: retained_all,
+            provider_limited: false,
             source_revision: SourceRevision {
                 missing_ancestor: lineage.missing_rollout,
                 ..Default::default()
@@ -2353,23 +2730,19 @@ impl CodexSession {
                     saved_messages,
                     directory,
                 } => {
-                    let preview = JsonLinesPreview {
+                    let preview = JsonLinesPreview::from_records(
                         records,
                         run_starts,
-                        omissions: unreadable,
-                        sampled: omitted > 0,
+                        unreadable,
+                        omitted > 0,
                         prefix_records,
-                    };
+                    );
                     if requires_assistant_reconstruction(&preview, saved_messages) {
                         let (events, project, verified) =
                             self.reconstructed_preview(rollout_file::LIMITS)?;
                         (events, project, false, verified)
                     } else {
-                        let events = self.events_from_preview(
-                            preview,
-                            Some(omitted),
-                            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-                        )?;
+                        let events = self.events_from_preview(preview, Some(omitted))?;
                         (events, directory, false, true)
                     }
                 }
@@ -2388,6 +2761,7 @@ impl CodexSession {
             rollback_title,
             snapshot,
             source_complete,
+            provider_limited: false,
             source_revision: SourceRevision::default(),
         })
     }
@@ -2509,7 +2883,7 @@ impl CodexSession {
         {
             return self.reconstructed_preview(rollout_file::LIMITS);
         }
-        let events = self.events_from_preview(preview, None, MAX_STREAMED_TRANSCRIPT_LINE_SIZE)?;
+        let events = self.events_from_preview(preview, None)?;
         Ok((events, directory, true))
     }
 
@@ -2517,7 +2891,6 @@ impl CodexSession {
         &self,
         mut preview: JsonLinesPreview,
         omitted: Option<usize>,
-        line_limit: u64,
     ) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
         preview
@@ -2588,7 +2961,7 @@ impl CodexSession {
         }
         builder.push_json_line_omissions(
             preview.omissions,
-            line_limit,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             Some(prefix_end),
             self.updated_at,
         );
@@ -4621,17 +4994,87 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn session_titles_are_complete(&self) -> bool {
+        self.observed_session_names()
+            .is_some_and(|observed| observed.complete)
+    }
+
+    fn observed_session_names(&self) -> Option<crate::ObservedSessionNames> {
         let current = self.title_index();
-        current.complete
-            && self
-                .listing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current))
+        self.listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|cached| Arc::ptr_eq(&cached.listing.names, &current))
+            .then(|| crate::ObservedSessionNames {
+                names: Arc::clone(&current.titles),
+                complete: current.complete,
+            })
+    }
+
+    fn listed_session_names(
+        &self,
+        sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        if sessions.is_empty() {
+            return HashMap::new();
+        }
+        let (listing, _) = self.listing(true);
+        listing.matching_names(sessions, |_| true)
+    }
+
+    fn listed_session_names_still_current(
+        &self,
+        sessions: &[(&str, &Path, SourceRevision)],
+    ) -> HashMap<String, NativeSessionName> {
+        if sessions.is_empty() {
+            return HashMap::new();
+        }
+        let Some(home) = self.codex_home.as_deref() else {
+            return HashMap::new();
+        };
+        let cache = self
+            .listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = cache.as_ref() else {
+            return HashMap::new();
+        };
+        let listing = &cached.listing;
+        if !Arc::ptr_eq(&listing.names, &self.title_index()) || !listing.scan.current() {
+            return HashMap::new();
+        }
+        if listing.requires_scan
+            || listing.legacy_revisions.iter().any(|(path, previous)| {
+                previous.is_none() || Self::index_file_revision(path) != *previous
+            })
+        {
+            drop(cache);
+            return self.listed_session_names(sessions);
+        }
+        let rows = if cached.database.is_some() && self.current.stamp(home) == cached.database {
+            None
+        } else {
+            let ids = sessions.iter().map(|&(id, _, _)| id);
+            let Ok(rows) = self
+                .current
+                .rows_with_titles(home, ids, &listing.names.titles)
+            else {
+                return HashMap::new();
+            };
+            Some(rows)
+        };
+        listing.matching_names(sessions, |id| {
+            rows.as_ref()
+                .is_none_or(|rows| rows.get(id) == listing.registry_rows.get(id))
+        })
     }
 
     fn native_session_name(&self, id: &str) -> NativeSessionName {
+        match self.resolve_rollout(id, None, true) {
+            Ok(Some(selected)) => return selected.name,
+            Ok(None) => {}
+            Err(_) => return NativeSessionName::Unknown,
+        }
         let index = self.title_index();
         match index.titles.get(id) {
             Some(name) => NativeSessionName::Named(name.clone()),
@@ -4681,29 +5124,8 @@ impl ProviderAdapter for CodexAdapter {
         let Some(home) = self.codex_home.as_deref().filter(|home| home.is_dir()) else {
             return Ok(HashSet::new());
         };
-        let cached = self
-            .listing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let valid = cached.as_ref().filter(|cached| {
-            cached.database.is_some() && cached.database == self.current.stamp(home)
-        });
+        let prior = self.rollouts_to_recheck(home, prior);
         let mut unavailable = HashSet::new();
-        let prior = prior
-            .iter()
-            .filter(|(id, prior)| {
-                let known = valid.and_then(|cached| cached.listing.selected_files.get(id.as_str()));
-                if let Some((path, selected)) = known
-                    && Self::index_file_revision(path) == Some(*selected)
-                {
-                    return prior
-                        .and_then(|revision| revision.file)
-                        .is_some_and(|file| Some(file) != selected.file);
-                }
-                true
-            })
-            .collect::<Vec<_>>();
-        drop(cached);
         if prior.is_empty() {
             return Ok(unavailable);
         }
@@ -4711,19 +5133,20 @@ impl ProviderAdapter for CodexAdapter {
             .current
             .rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
         let (scan, _) = self.session_scan(None);
+        let observed_paths = std::cell::LazyCell::new(|| scan.observed_file_paths());
+        let mut replacements = Vec::new();
         for (id, revision) in prior {
+            let prior_file = revision.and_then(|source| source.file);
             match rows.get(id) {
                 Some(row) if row.requires_selection(home) => {
                     // A custom filename cannot identify the home of an older source receipt.
                     if row.has_legacy_name()
-                        && !revision
-                            .and_then(|revision| revision.file)
-                            .is_some_and(|file| {
-                                scan.paths(id).any(|path| {
-                                    rollout_identity::discovery_path(home, path)
-                                        && Self::index_file_id(path) == Some(file)
-                                }) || row.recorded_file_is(home, file)
-                            })
+                        && !prior_file.is_some_and(|file| {
+                            observed_paths
+                                .get(&file)
+                                .is_some_and(|path| rollout_identity::discovery_path(home, path))
+                                || row.recorded_file_is(home, file)
+                        })
                     {
                         continue;
                     }
@@ -4732,10 +5155,19 @@ impl ProviderAdapter for CodexAdapter {
                             unavailable.insert(id.clone());
                         }
                         Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
-                            if row.has_legacy_name() || row.outside_home(home) {
-                                unavailable.insert(id.clone());
+                            let Some(file) = prior_file else {
+                                continue;
+                            };
+                            if row.has_legacy_name() {
+                                if let Some(prior) = scan
+                                    .paths(id)
+                                    .find(|path| Self::index_file_id(path) == Some(file))
+                                    .or_else(|| observed_paths.get(&file).copied())
+                                    && row.recorded_file_replaces(home, prior, file)
+                                {
+                                    replacements.push((id, row, prior, file));
+                                }
                             } else if let Some(selected) = row.generation(id)
-                                && let Some(file) = revision.and_then(|revision| revision.file)
                                 && scan.paths(id).any(|path| {
                                     current_rollout::ids(path)
                                         .is_some_and(|(_, generation)| generation != selected)
@@ -4747,8 +5179,7 @@ impl ProviderAdapter for CodexAdapter {
                         }
                         Err(error) => return Err(error),
                         Ok(Some(selected))
-                            if revision
-                                .and_then(|revision| revision.file)
+                            if prior_file
                                 .is_some_and(|file| Some(file) != selected.revision.file) =>
                         {
                             unavailable.insert(id.clone());
@@ -4760,6 +5191,16 @@ impl ProviderAdapter for CodexAdapter {
                     unavailable.insert(id.clone());
                 }
                 _ => {}
+            }
+        }
+        if !replacements.is_empty() {
+            let current = self
+                .current
+                .rows(home, replacements.iter().map(|(id, ..)| id.as_str()))?;
+            for (id, row, prior, file) in replacements {
+                if current.get(id) == Some(row) && row.recorded_file_replaces(home, prior, file) {
+                    unavailable.insert(id.clone());
+                }
             }
         }
         Ok(unavailable)
@@ -4786,14 +5227,12 @@ impl ProviderAdapter for CodexAdapter {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let Some(selected) = self.selected_rollout(id, None)? else {
+        let Some(selected) = self.resolve_rollout(id, None, true)? else {
             return Ok(None);
         };
-        let mut session = selected.session;
-        session.title = self.title_index().titles.get(id).cloned();
-        let mut native = session.native_session();
+        let mut native = selected.session.native_session();
         if self.use_workspace_index
-            && !session.needs_visible_projection()
+            && !selected.session.needs_visible_projection()
             && let Some(file) = native.source_revision.and_then(|revision| revision.file)
             && let Ok(workspaces) = omnis_store::CodexWorkspace::discovery_index(Some(file))
         {
@@ -4885,7 +5324,16 @@ impl ProviderAdapter for CodexAdapter {
         })
     }
 
-    fn index_batch(&self, _ids: &[&str]) -> Option<Box<crate::IndexSessionReader<'_>>> {
+    fn index_batch(&self, ids: &[&str]) -> Option<Box<crate::IndexSessionReader<'_>>> {
+        self.index_search_batch(ids, &HashSet::new())
+    }
+
+    fn index_search_batch(
+        &self,
+        _ids: &[&str],
+        listed: &HashSet<&str>,
+    ) -> Option<Box<crate::IndexSessionReader<'_>>> {
+        let listed: HashSet<String> = listed.iter().map(|&id| id.to_owned()).collect();
         let home = self.codex_home.as_deref()?;
         let (scan, cached) = self.session_scan(None);
         let mut catalog = RolloutCatalog::new(home);
@@ -4893,7 +5341,13 @@ impl ProviderAdapter for CodexAdapter {
             catalog.fresh_scan = Some(scan);
         }
         Some(Box::new(move |session, hint, budget| {
-            self.index_session_in(session, hint, budget, Some(&catalog))
+            validate_provider(session, Provider::Codex)?;
+            let native = if listed.contains(&session.id) {
+                self.require_rollout(&session.id, hint)?.session
+            } else {
+                self.find_session(&session.id, hint)?
+            };
+            self.index_rollout(session, hint, budget, native, Some(&catalog))
         }))
     }
 
@@ -4914,13 +5368,34 @@ impl ProviderAdapter for CodexAdapter {
             .unwrap_or_default()
     }
 
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, u64::MAX)
+    }
+
     fn index_session(
         &self,
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        self.index_session_in(session, source_path, full_read_bytes, None)
+        validate_provider(session, Provider::Codex)?;
+        let native = self.find_session(&session.id, source_path)?;
+        self.index_rollout(session, source_path, full_read_bytes, native, None)
+    }
+
+    fn index_search_document(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::Codex)?;
+        let native = self.require_rollout(&session.id, source_path)?.session;
+        self.index_rollout(session, source_path, full_read_bytes, native, None)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -5290,14 +5765,22 @@ mod tests {
     fn listing_notes_describe_empty_and_partial_scans() {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
-            candidates: HashMap::new(),
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),
             ],
             ..CodexFileScan::default()
         };
-        let notes = listing_notes(&scan, 0, 1, 1, 0, Some("permission denied"));
+        let notes = listing_notes(
+            &scan,
+            0,
+            1,
+            &super::InvalidHeaders {
+                unreadable: 1,
+                first_error: Some(anyhow::anyhow!("permission denied")),
+                ..Default::default()
+            },
+        );
         assert!(notes.iter().any(|note| note.contains("stopped after 2")));
         assert!(
             notes
@@ -5310,7 +5793,7 @@ mod tests {
                 .any(|note| note.contains("listed 0 user sessions") && note.contains("1 subagent"))
         );
 
-        let readable = listing_notes(&scan, 4, 0, 0, 0, None);
+        let readable = listing_notes(&scan, 4, 0, &super::InvalidHeaders::default());
         assert_eq!(readable.len(), 1);
         assert!(readable[0].contains("stopped after 2"));
     }

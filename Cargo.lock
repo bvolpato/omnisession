@@ -1019,6 +1019,7 @@ dependencies = [
  "proptest",
  "regex",
  "rustix",
+ "same-file",
  "serde_json",
  "serde_json_lenient",
  "sha2",

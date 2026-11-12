@@ -22,6 +22,68 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[test]
+fn list_leads_with_the_assigned_codex_name_and_keeps_unnamed_sessions_metadata_only() {
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = root.path().join("codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let named = Uuid::from_u128(1);
+    let unnamed = Uuid::from_u128(2);
+    for id in [named, unnamed] {
+        let meta = json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta",
+            "payload":{"id":id,"cwd":root.path()}});
+        let request = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"private first prompt"}]}});
+        fs::write(
+            home.join(format!("sessions/rollout-{id}.jsonl")),
+            format!("{meta}\n{request}\n"),
+        )
+        .unwrap();
+    }
+    let index = json!({"id":named,"thread_name":format!("🛰️ Orbit\n{SECRET_VALUE}")});
+    fs::write(home.join("session_index.jsonl"), index.to_string()).unwrap();
+    let list = |json_output| {
+        let mut cmd = environment.command();
+        cmd.env("CODEX_HOME", &home).env_remove("CODEX_SQLITE_HOME");
+        if json_output {
+            cmd.arg("--json");
+        }
+        let output = cmd
+            .args(["list", "--provider", "codex", "--all-projects"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains(SECRET_VALUE));
+        assert!(!text.contains("private first prompt"));
+        text
+    };
+    let text = list(false);
+    let named_row = text
+        .lines()
+        .find(|line| line.contains(&named.to_string()))
+        .unwrap();
+    assert!(named_row.starts_with("🛰️ Orbit "));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&format!("codex:{unnamed}")))
+    );
+    let rows: serde_json::Value = serde_json::from_str(&list(true)).unwrap();
+    let rows = rows["sessions"].as_array().unwrap();
+    let named_row = rows
+        .iter()
+        .find(|row| row["session"]["id"] == named.to_string())
+        .unwrap();
+    let title = named_row["title"].as_str().unwrap();
+    assert!(title.starts_with("🛰️ Orbit "));
+    assert!(!title.contains('\n'));
+    assert!(
+        rows.iter()
+            .any(|row| row["session"]["id"] == unnamed.to_string() && row.get("title").is_none())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
@@ -34,9 +96,10 @@ fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
         &binary,
         r##"#!/bin/sh
 case "$*" in
-  --version) echo 1.18.18 ;;
-  *export*) echo '{"id":"ses_guide","updated_at":"2026-01-01T00:00:00Z","messages":[{"role":"assistant","text":"# AGENTS.md instructions for receiptguide"}]}' ;;
-  *) echo '[]' ;;
+  --version) echo 2.0.0 ;;
+  "session export ses_guide --standalone")
+    echo '{"info":{"id":"ses_guide","time":{"updated":1767225600000}},"messages":[{"type":"assistant","content":[{"type":"text","text":"# AGENTS.md instructions for receiptguide"}]}]}' ;;
+  *) exit 1 ;;
 esac
 "##,
     )
@@ -135,6 +198,83 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
     assert_first_run_codex_probes(&environment, &imported);
     assert_missing_uuid(&environment);
     assert_uuid_collision_fails(&environment, bundle, temporary_directory.path());
+}
+
+#[test]
+fn imported_documents_refresh_at_their_source_providers_version() {
+    let temporary = tempdir().unwrap();
+    let environment = TestEnvironment::new(temporary.path(), temporary.path().to_owned());
+    let path = temporary.path().join("bundle.json");
+    let providers = [Provider::OhMyPi, Provider::Pi, Provider::Claude];
+    let mut locators = Vec::new();
+    for provider in providers {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.session.provider = provider;
+        for event in &mut snapshot.events {
+            event.source.provider = provider;
+        }
+        let bundle_id = Uuid::new_v4();
+        let bundle = PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.into(),
+                bundle_id,
+                created_at: snapshot.captured_at,
+                source: snapshot.session.clone(),
+                event_count: snapshot.events.len(),
+                redactions: Vec::new(),
+            },
+            snapshot,
+            fidelity: None,
+        };
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert_import_succeeds(&environment, &path, "seed imported locator");
+        locators.push(SessionRef::new(Provider::Imported, bundle_id.to_string()));
+    }
+    let database = environment.state_root.join("store.sqlite3");
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE session_trajectories SET document_version = 4, derived_title = 'Old title'
+         WHERE provider = 'imported'",
+            [],
+        )
+        .unwrap();
+    let shown = environment
+        .command()
+        .args(["show", &locators[0].to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let indexed = environment
+        .command()
+        .args(["--json", "index", "--provider", "imported"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let expected = providers[1..]
+        .iter()
+        .filter(|&&provider| omnis_core::search_document_version(provider) > 4)
+        .count();
+    assert_eq!(summary["stale"], expected);
+    assert_eq!(summary["indexed"], expected);
+    let store = Store::open(&database).unwrap();
+    for (provider, locator) in providers.into_iter().zip(&locators) {
+        let version = omnis_core::search_document_version(provider);
+        let state = store.trajectory_index_state(locator).unwrap().unwrap();
+        assert_eq!(state.document_version, version);
+        assert!(state.source_complete);
+        let title = store.trajectory_title(locator).unwrap().unwrap();
+        assert_eq!(title == "Old title", version == 4);
+    }
 }
 
 #[test]
