@@ -649,6 +649,7 @@ pub(super) struct Branch {
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
+    suffix_children: HashMap<(usize, Uuid), usize>,
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
@@ -685,6 +686,19 @@ impl Branch {
             self.copied_rejection = None;
             self.clear_transparent_paths();
         }
+    }
+
+    pub(super) fn excludes_copy(
+        &self,
+        uuid: Uuid,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        compactions: &Compactions,
+    ) -> bool {
+        self.latest_attachment_checkpoint(compactions)
+            .is_some_and(|summary| {
+                compactions.precedes_cutoff(summary, records[&uuid].order)
+                    && !compactions.contains(summary, uuid, records)
+            })
     }
 
     pub(super) fn reselect_hidden(
@@ -742,9 +756,16 @@ impl Branch {
         while let Some(node) = cursor {
             if let Some(retained) = self.suffix_parents.get(&node) {
                 return retained.node.is_some_and(|node| {
-                    self.copy_paths
-                        .distance(original, node)
-                        .is_some_and(|n| n > 0 || tail)
+                    self.copy_paths.distance(original, node).is_some_and(|n| {
+                        n > 0
+                            || (tail
+                                && self
+                                    .suffix_children
+                                    .get(&(summary, retained.uuid))
+                                    .copied()
+                                    .unwrap_or_default()
+                                    <= 1)
+                    })
                 });
             }
             if node == summary {
@@ -787,19 +808,49 @@ impl Branch {
         let Some(node) = parent.node else {
             return;
         };
-        let mut changes = HashMap::new();
+        let mut children = HashMap::<Uuid, Vec<Uuid>>::new();
         for (&id, record) in records.iter() {
-            if record.parent == Some(uuid)
-                && let Some(child) = record.branch.node
-                && self.nodes[child].uuid == Some(id)
-                && self.nodes[child].parent != Some(node)
-            {
-                changes.insert(child, node);
+            if let Some(parent) = record.parent {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        let mut pending = vec![uuid];
+        let mut changes = HashMap::new();
+        let mut visited = HashSet::new();
+        let clock = records[&uuid].millis;
+        let request_clock = records[&uuid]
+            .parent
+            .and_then(|id| records.get(&id)?.millis);
+        let mut select_child = false;
+        while let Some(alias) = pending.pop() {
+            if !visited.insert(alias) {
+                continue;
+            }
+            for &id in children.get(&alias).into_iter().flatten() {
+                let record = records.get_mut(&id).expect("indexed child");
+                if let Some(child) = record
+                    .branch
+                    .node
+                    .filter(|&child| self.nodes[child].uuid == Some(id))
+                {
+                    if self.nodes[child].parent != Some(node) {
+                        changes.insert(child, node);
+                        select_child |=
+                            clock.is_none() || clock != request_clock || record.millis != clock;
+                    }
+                } else if record.branch.transparent {
+                    record.branch.node = Some(node);
+                    record.branch.source = Some(node);
+                    record.branch.missing_ancestor = parent.missing_ancestor;
+                    pending.push(id);
+                }
             }
         }
         if !changes.is_empty() {
             self.reparent_copies(&changes, records);
-            self.observe_existing(parent, compactions);
+            if select_child {
+                self.observe_existing(parent, compactions);
+            }
         }
     }
 
@@ -809,22 +860,32 @@ impl Branch {
         parent: Option<Uuid>,
         records: &mut HashMap<Uuid, ClaudeRecord>,
     ) -> bool {
-        let Some(parent) = parent else {
+        let Some(mut cursor) = parent else {
             return false;
         };
-        let Some(node) = self.raw_copy_parent(parent, records) else {
+        let Some(node) = self.raw_copy_parent(cursor, records) else {
             return false;
         };
         if self.nodes[node].missing_ancestor || self.nodes[node].uuid == Some(id) {
             return false;
         }
-        let Some(record) = records.get_mut(&parent) else {
-            return false;
-        };
-        if record.branch.missing_ancestor && record.branch.transparent {
-            record.branch.node = Some(node);
-            record.branch.source = Some(node);
-            record.branch.missing_ancestor = false;
+        let mut visited = HashSet::new();
+        while visited.insert(cursor) {
+            let Some(record) = records.get_mut(&cursor) else {
+                break;
+            };
+            if !record.branch.transparent || self.nodes[node].uuid == Some(cursor) {
+                break;
+            }
+            if record.branch.missing_ancestor {
+                record.branch.node = Some(node);
+                record.branch.source = Some(node);
+                record.branch.missing_ancestor = false;
+            }
+            let Some(parent) = record.parent else {
+                break;
+            };
+            cursor = parent;
         }
         true
     }
@@ -1537,6 +1598,9 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
     ) {
         if let Some(id) = parent.suffix {
+            if let Some(summary) = parent.node {
+                *self.suffix_children.entry((summary, id)).or_default() += 1;
+            }
             let retained = records
                 .get(&id)
                 .filter(|_| !duplicates.contains(&id))
@@ -3088,16 +3152,15 @@ impl Branch {
         eligible: &impl Fn(usize, usize) -> bool,
         rewind: &Rewind,
     ) -> ToolResults {
-        let mut calls = ToolCalls::default();
-        let mut results = ToolResults::default();
-        let mut outcomes = HashMap::<_, Outcome>::new();
+        let mut found = ResultEvidence::default();
         let mut transports = HashMap::new();
         let mut retained_links = HashSet::new();
-        let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             let hidden = self.hidden_parents.contains_key(&index);
             if !node.user && !hidden {
-                calls.observe(index, self, anchors[index].is_some(), rewind, events);
+                found
+                    .calls
+                    .observe(index, self, anchors[index].is_some(), rewind, events);
                 continue;
             }
             let partial = active[index] && rewind.results_only(index);
@@ -3111,36 +3174,26 @@ impl Branch {
             for position in node.events.clone() {
                 // A withdrawn row contributes only individually verified outcomes.
                 if partial {
-                    results.withhold(position);
+                    found.results.withhold(position);
                 }
                 if !is_tool_outcome(&events[position]) {
                     continue;
                 }
-                let id = events[position].payload["tool_use_id"].as_str();
-                let prior = calls.prior_result(origin, id, &outcomes);
-                if selected {
-                    declared.observe(self, &calls, &mut results, position, (id, &prior));
-                }
-                let Some(id) = id else {
-                    transport = None;
-                    continue;
+                let lookup = ToolLookup {
+                    selected,
+                    epoch: epoch[index],
+                    parent: call_parent,
+                    origin,
                 };
-                let ambiguous = |key| {
-                    if selected {
-                        unresolved.insert((key, epoch[index]), index);
-                        if declared.source == ToolSource::Absent
-                            && calls.distinct_result(key, &prior, position, events)
-                        {
-                            results.keep_recovery_only(position);
+                let (call, priority) =
+                    match found.resolve(self, &declared, lookup, events, position) {
+                        MatchedOutput::Call(call, priority) => (call, priority),
+                        MatchedOutput::Documentary => continue,
+                        MatchedOutput::Unresolved => {
+                            transport = None;
+                            continue;
                         }
-                    }
-                };
-                let Some((call, mut priority)) =
-                    calls.resolve(self, call_parent, declared.source, node, id, ambiguous)
-                else {
-                    transport = None;
-                    continue;
-                };
+                    };
                 let available = anchors[call.node].is_some_and(|owner| eligible(index, owner));
                 let paired = available && !call.repeated;
                 let original_parent = origin.is_some() && origin == self.response_unit(call.node);
@@ -3158,26 +3211,25 @@ impl Branch {
                 let repeated = available && call.repeated && selected && active[call.node];
                 if !paired && !retained && !repeated {
                     if selected && declared.returned_to_removed_call(self, call) {
-                        results.keep_recovery_only(position);
+                        found.results.keep_recovery_only(position);
                     } else if active[index] && priority == ResultSource::Linked {
-                        results.withhold(position);
+                        found.results.withhold(position);
                     }
                     continue;
                 }
-                if paired && selected {
-                    calls.record_output(&self.nodes[call.node], id, &events[position]);
-                }
-                if selected {
-                    results.withhold(position);
-                    priority = ResultSource::Selected;
-                }
-                // A result retained without its call stays in that summary's documentary history.
-                let documentary = !paired;
-                let scope = if documentary { epoch[index] } else { None };
-                outcomes
-                    .entry((call, documentary, scope))
-                    .and_modify(|outcome| outcome.consider(priority, position, events))
-                    .or_insert(Outcome::new(priority, position));
+                found.record(
+                    CandidateOutput {
+                        call,
+                        priority,
+                        paired,
+                        epoch: epoch[index],
+                    },
+                    selected.then_some(declared.source),
+                    self,
+                    events,
+                    position,
+                    rewind,
+                );
             }
             declared.finish_transport(
                 self,
@@ -3187,10 +3239,143 @@ impl Branch {
                 &mut retained_links,
             );
         }
-        results.ambiguous_selected =
-            self.has_ambiguous_selected_result(&unresolved, events, anchors, epoch, rewind);
-        results.accept_outcomes(outcomes);
-        results
+        found.results.ambiguous_selected =
+            self.has_ambiguous_selected_result(&found.unresolved, events, anchors, epoch, rewind);
+        found.results.accept_outcomes(found.outcomes);
+        found.results
+    }
+}
+
+enum MatchedOutput {
+    Call(ToolCall, ResultSource),
+    Documentary,
+    Unresolved,
+}
+
+#[derive(Clone, Copy)]
+struct ToolLookup<'a> {
+    selected: bool,
+    epoch: Option<usize>,
+    parent: Option<usize>,
+    origin: Option<ResponseUnit<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateOutput {
+    call: ToolCall,
+    priority: ResultSource,
+    paired: bool,
+    epoch: Option<usize>,
+}
+
+#[derive(Default)]
+struct ResultEvidence<'a> {
+    unresolved: HashMap<(CandidateCall<'a>, Option<usize>), usize>,
+    calls: ToolCalls<'a>,
+    results: ToolResults,
+    outcomes: HashMap<(ToolCall, bool, Option<usize>), Outcome>,
+}
+
+impl<'a> ResultEvidence<'a> {
+    fn resolve(
+        &mut self,
+        branch: &'a Branch,
+        declared: &DeclaredResult<'_>,
+        lookup: ToolLookup<'a>,
+        events: &'a [ClaudeEvent],
+        position: usize,
+    ) -> MatchedOutput {
+        let id = events[position].payload["tool_use_id"].as_str();
+        let prior = self.calls.prior_result(lookup.origin, id, &self.outcomes);
+        if lookup.selected {
+            declared.observe(
+                branch,
+                &self.calls,
+                &mut self.results,
+                position,
+                (id, &prior),
+            );
+        }
+        let Some(id) = id else {
+            return MatchedOutput::Unresolved;
+        };
+        let ambiguous = |key| {
+            if lookup.selected {
+                self.unresolved.insert((key, lookup.epoch), declared.index);
+                if declared.source == ToolSource::Absent
+                    && self.calls.distinct_result(key, &prior, position, events)
+                {
+                    self.results.keep_recovery_only(position);
+                }
+            }
+        };
+        let Some((call, priority)) = self.calls.resolve(
+            branch,
+            lookup.parent,
+            declared.source,
+            &branch.nodes[declared.index],
+            id,
+            ambiguous,
+        ) else {
+            if lookup.selected
+                && declared.retained
+                && declared.source == ToolSource::Absent
+                && prior.unanswered()
+            {
+                self.results.keep_recovery_only(position);
+                return MatchedOutput::Documentary;
+            }
+            return MatchedOutput::Unresolved;
+        };
+        if lookup.selected
+            && priority == ResultSource::CallId
+            && self
+                .outcomes
+                .get(&(call, false, None))
+                .is_some_and(|prior| prior.has_explicit_output(position, events))
+        {
+            self.results.keep_recovery_only(position);
+            return MatchedOutput::Unresolved;
+        }
+        MatchedOutput::Call(call, priority)
+    }
+    fn record(
+        &mut self,
+        candidate: CandidateOutput,
+        selected: Option<ToolSource>,
+        branch: &'a Branch,
+        events: &'a [ClaudeEvent],
+        position: usize,
+        rewind: &Rewind,
+    ) {
+        let CandidateOutput {
+            call,
+            mut priority,
+            paired,
+            epoch,
+        } = candidate;
+        let node = &branch.nodes[call.node];
+        if let Some(source) = selected {
+            if paired && let Some(id) = events[position].payload["tool_use_id"].as_str() {
+                self.calls.record_output(
+                    node,
+                    id,
+                    &events[position],
+                    rewind.epochs_for_call(call.position, node.summary),
+                );
+            }
+            self.results.withhold(position);
+            priority = if matches!(source, ToolSource::Record(_) | ToolSource::Duplicate { .. }) {
+                ResultSource::SelectedLinked
+            } else {
+                ResultSource::Selected
+            };
+        }
+        let scope = if paired { None } else { epoch };
+        self.outcomes
+            .entry((call, !paired, scope))
+            .and_modify(|outcome| outcome.consider(priority, position, events))
+            .or_insert(Outcome::new(priority, position));
     }
 }
 
@@ -3279,7 +3464,7 @@ impl ToolResults {
                 } else {
                     self.pairs.push((call.position, position));
                 }
-            } else if outcome.priority == ResultSource::Selected {
+            } else if outcome.priority >= ResultSource::Selected {
                 self.ambiguous_selected = true;
             }
         }
@@ -3449,17 +3634,25 @@ impl PriorResult {
 }
 
 impl<'a> ToolCalls<'a> {
-    fn record_output(&mut self, node: &'a Node, id: &'a str, event: &'a ClaudeEvent) {
-        let key = (
-            node.writer.as_deref(),
-            CandidateOwner::Turn(node.turn),
-            node.summary,
-            id,
-        );
-        self.recorded
-            .entry(key)
-            .or_default()
-            .insert((event.kind == EventKind::ToolFailed, &event.payload));
+    fn record_output(
+        &mut self,
+        node: &'a Node,
+        id: &'a str,
+        event: &'a ClaudeEvent,
+        scopes: impl Iterator<Item = Option<usize>>,
+    ) {
+        for scope in scopes {
+            let key = (
+                node.writer.as_deref(),
+                CandidateOwner::Turn(node.turn),
+                scope,
+                id,
+            );
+            self.recorded
+                .entry(key)
+                .or_default()
+                .insert((event.kind == EventKind::ToolFailed, &event.payload));
+        }
     }
 
     fn distinct_result(
@@ -3619,6 +3812,7 @@ enum ResultSource {
     CallId,
     Linked,
     Selected,
+    SelectedLinked,
 }
 
 struct Outcome {
@@ -3627,6 +3821,14 @@ struct Outcome {
 }
 
 impl Outcome {
+    fn has_explicit_output(&self, position: usize, events: &[ClaudeEvent]) -> bool {
+        self.priority == ResultSource::SelectedLinked
+            && self.position.is_some_and(|prior| {
+                events[prior].kind != events[position].kind
+                    || events[prior].payload != events[position].payload
+            })
+    }
+
     fn new(priority: ResultSource, position: usize) -> Self {
         Self {
             priority,

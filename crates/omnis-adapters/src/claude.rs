@@ -337,6 +337,7 @@ impl ClaudeEvent {
 
 #[derive(Clone)]
 struct ClaudeRecord {
+    millis: Option<i64>,
     order: usize,
     is_summary: bool,
     native_transcript: bool,
@@ -1643,6 +1644,13 @@ impl ClaudeTranscript {
     fn reconnects_copy(&mut self, id: Uuid, parent: Option<Uuid>, record: &Value) -> bool {
         if (is_meta_message(record) || is_turn_duration(record))
             && self
+                .branch
+                .excludes_copy(id, &self.records, &self.compactions)
+        {
+            return false;
+        }
+        if (is_meta_message(record) || is_turn_duration(record))
+            && self
                 .record_copies
                 .missing
                 .get(&id)
@@ -1728,6 +1736,7 @@ impl ClaudeTranscript {
         self.update_retention(record, previous_summary, verified_anchor);
         if let Some(id) = id {
             let definition = ClaudeRecord {
+                millis: native_millis,
                 order: restored_order.unwrap_or(self.records.len()),
                 is_summary,
                 native_transcript: is_transcript_record(record),
