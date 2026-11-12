@@ -184,6 +184,18 @@ impl IndexedSessionReader for AdapterRegistry {
         let snapshot = &mut read.snapshot;
         match cache {
             Ok((store, observation)) => {
+                let retained_name = read.native_session.as_ref().and_then(|native| {
+                    retained_snapshot_name(
+                        &store,
+                        native,
+                        read.source_revision,
+                        name_observation.as_ref(),
+                    )
+                    .unwrap_or_else(|error| {
+                        eprintln!("warning: local session title unavailable: {error}");
+                        None
+                    })
+                });
                 let prior = observation.state;
                 let selected = read.native_session.as_ref().map(|native| {
                     selected_read_metadata(
@@ -195,7 +207,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         Some(&observation),
                     )
                 });
-                if let Err(error) = store_search_document(
+                match store_search_document(
                     &store,
                     selected.as_ref().map_or(
                         SearchDocumentTarget::Session(session),
@@ -211,13 +223,40 @@ impl IndexedSessionReader for AdapterRegistry {
                     Some(self),
                     search_index::source_guard(session.provider, prior.as_ref()),
                 ) {
-                    eprintln!("warning: local trajectory index write: {error}");
+                    Ok(_) if read.snapshot.title.is_none() => read.snapshot.title = retained_name,
+                    Ok(_) => {}
+                    Err(error) => {
+                        if name_observation == Some(NativeSessionName::Unknown) {
+                            read.snapshot.title = None;
+                        }
+                        eprintln!("warning: local trajectory index write: {error}");
+                    }
                 }
             }
             Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
         }
         Ok(read)
     }
+}
+
+fn retained_snapshot_name(
+    store: &Store,
+    native: &NativeSession,
+    revision: SourceRevision,
+    name: Option<&NativeSessionName>,
+) -> Result<Option<String>> {
+    if !native
+        .source_revision
+        .is_some_and(|selected| selected.matches_file_contents(revision))
+    {
+        return Ok(None);
+    }
+    let confirmed = search_index::verified_name_coverage(name, Some(native))?;
+    search_index::observe_codex_name_source(store, native, revision, name)?;
+    if !confirmed && name == Some(&NativeSessionName::Unknown) {
+        return Ok(store.retained_codex_name(&native.session, revision)?);
+    }
+    Ok(None)
 }
 
 fn selected_read_metadata(

@@ -8,9 +8,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::source_file::ObservedSourceFile;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
+use omnis_ir::SourceRevision;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::workspace_check::{WorkspaceScan, same_thread};
 use super::workspace_damage::{self, DamagedWorkspace};
@@ -30,6 +33,54 @@ pub(super) fn jsonl_file_name(path: &Path) -> Option<&Path> {
         _ => return None,
     };
     (plain.extension()? == "jsonl").then_some(plain)
+}
+
+const TITLE_PREFIX_LIMIT: u64 = 8 * 1024 * 1024;
+
+impl super::CodexAdapter {
+    /// Hashes all raw bytes of a verified rollout, or its exact former length after an append.
+    /// Returns no evidence if the requested prefix exceeds 8 MiB or the file changes during the read.
+    #[must_use]
+    pub fn rollout_prefix_hash(
+        path: &Path,
+        expected: SourceRevision,
+        bytes: Option<u64>,
+    ) -> Option<(u64, [u8; 32])> {
+        jsonl_file_name(path)?;
+        if expected.contents.is_none()
+            || omnis_core::may_reach_network(path)
+            || !fs::symlink_metadata(path).ok()?.is_file()
+        {
+            return None;
+        }
+        let canonical = fs::canonicalize(path).ok()?;
+        if omnis_core::may_reach_network(&canonical) {
+            return None;
+        }
+        let file = File::open(&canonical).ok()?;
+        let metadata = file.metadata().ok()?;
+        let source = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)?;
+        let length = bytes.unwrap_or(metadata.len());
+        if source.physical_identity.is_none()
+            || !expected.matches_file_contents(source.revision)
+            || !(1..=TITLE_PREFIX_LIMIT).contains(&length)
+            || bytes.is_some_and(|prior| prior >= metadata.len())
+        {
+            return None;
+        }
+        let mut reader = (&file).take(length);
+        let mut hash = Sha256::new();
+        let mut chunk = [0; 16 * 1024];
+        while reader.limit() > 0 {
+            let read = reader.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            hash.update(&chunk[..read]);
+        }
+        source.ensure_unchanged(&canonical, path, &file).ok()?;
+        Some((length, hash.finalize().into()))
+    }
 }
 
 pub(super) fn compressed(path: &Path) -> bool {
@@ -320,4 +371,34 @@ pub(super) fn sample(
         directory: workspace.settings.directory(workspace.directory),
         records: head,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CodexAdapter;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn a_retained_name_requires_every_original_byte_to_survive_the_append() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let path = fixture.path().join("rollout.jsonl");
+        let original = vec![b'a'; 64 * 1024];
+        fs::write(&path, &original)?;
+        let revision = || CodexAdapter::index_file_revision(&path).unwrap();
+        let capture = |bytes| CodexAdapter::rollout_prefix_hash(&path, revision(), bytes);
+        let prior = revision();
+        let receipt = capture(None).unwrap();
+        assert_eq!(receipt.1.as_slice(), &Sha256::digest(&original)[..]);
+        assert!(capture(Some(receipt.0)).is_none());
+        let mut file = fs::OpenOptions::new().write(true).open(&path)?;
+        file.set_len(TITLE_PREFIX_LIMIT + 1)?;
+        assert!(capture(None).is_none());
+        assert!(CodexAdapter::rollout_prefix_hash(&path, prior, Some(receipt.0)).is_none());
+        assert_eq!(capture(Some(receipt.0)), Some(receipt));
+        file.seek(SeekFrom::Start(receipt.0 / 2))?;
+        file.write_all(b"b")?;
+        assert_ne!(capture(Some(receipt.0)).unwrap().1, receipt.1);
+        Ok(())
+    }
 }

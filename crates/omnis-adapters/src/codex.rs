@@ -113,6 +113,13 @@ impl CodexFileScan {
             .map(|&i| self.files[i].as_path())
     }
 
+    fn observed_file_paths(&self) -> HashMap<Uuid, &Path> {
+        self.files
+            .iter()
+            .filter_map(|path| Some((CodexAdapter::index_file_id(path)?, path.as_path())))
+            .collect()
+    }
+
     fn remember(&mut self, id: &str, path: &Path, active: &Path) {
         let indices = self.candidates.entry(id.to_owned()).or_default();
         let rank = rollout_priority(path, active);
@@ -2849,6 +2856,7 @@ impl ProviderAdapter for CodexAdapter {
             .current
             .rows(home, prior.iter().map(|(id, _)| id.as_str()))?;
         let (scan, _) = self.session_scan(None);
+        let observed_paths = std::cell::LazyCell::new(|| scan.observed_file_paths());
         let mut replacements = Vec::new();
         for (id, revision) in prior {
             match rows.get(id) {
@@ -2865,6 +2873,7 @@ impl ProviderAdapter for CodexAdapter {
                                 if let Some(prior) = scan
                                     .paths(id)
                                     .find(|path| Self::index_file_id(path) == Some(file))
+                                    .or_else(|| observed_paths.get(&file).copied())
                                     && row.recorded_file_replaces(home, prior, file)
                                 {
                                     replacements.push((id, row, prior, file));

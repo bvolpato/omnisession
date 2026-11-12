@@ -3172,6 +3172,143 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Reads a provider assignment retained for the selected revision in this home.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the receipts cannot be read.
+    pub fn retained_codex_name(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+    ) -> Result<Option<String>> {
+        if session.provider != Provider::Codex {
+            return Ok(None);
+        }
+        self.connection.borrow().query_row("SELECT title FROM (
+            SELECT title,source_file_id,source_contents_id,codex_home FROM codex_inactive_pending_names
+             WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
+               AND codex_home=(SELECT home FROM current_codex_home) AND evidence='provider_name'
+            UNION ALL SELECT title,source_file_id,source_contents_id,codex_home FROM codex_pending_catalog_titles
+             WHERE trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1) AND evidence='provider_name')
+            WHERE codex_home=(SELECT home FROM current_codex_home) AND source_file_id=?2 AND source_contents_id=?3 LIMIT 1",
+            params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)],|r|r.get(0)).optional().map_err(database_error)
+    }
+
+    /// Checks whether this home's name source already has a digest for the selected revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the receipt cannot be read.
+    pub fn has_codex_name_source(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+    ) -> Result<bool> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_name_source_prefixes
+                WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+                  AND source_file_id=?2 AND source_contents_id=?3)",
+                params![
+                    session.id,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+                |r| r.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    /// Saves the raw bytes digest captured with an observed provider assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the digest cannot be saved.
+    pub fn record_codex_name_source(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+        bytes: u64,
+        digest: [u8; 32],
+    ) -> Result<()> {
+        if let (Provider::Codex, Some(file), Some(contents)) =
+            (session.provider, revision.file, revision.contents)
+        {
+            self.connection.borrow().execute("INSERT INTO codex_name_source_prefixes
+              SELECT ?1,home,?2,?3,?4,?5 FROM current_codex_home WHERE home IS NOT NULL
+              ON CONFLICT(session_id,codex_home) DO UPDATE SET source_file_id=excluded.source_file_id,
+              source_contents_id=excluded.source_contents_id,source_bytes=excluded.source_bytes,digest=excluded.digest",
+              params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(bytes).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the original byte length of a retained name whose physical file may have grown.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the source receipt cannot be read.
+    pub fn codex_name_prefix_length(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+    ) -> Result<Option<u64>> {
+        if session.provider != Provider::Codex {
+            return Ok(None);
+        }
+        self.connection.borrow().query_row("SELECT b.source_bytes FROM codex_name_source_prefixes b
+             JOIN session_trajectories t ON t.provider='codex' AND t.session_id=b.session_id
+             JOIN codex_inactive_pending_names n ON n.trajectory_id=t.id AND n.codex_home=b.codex_home
+             WHERE b.session_id=?1 AND b.codex_home=(SELECT home FROM current_codex_home)
+             AND n.evidence='provider_name' AND n.source_file_id=b.source_file_id AND n.source_contents_id=b.source_contents_id
+             AND b.source_file_id=?2 AND b.source_contents_id<>?3",
+             params![session.id,revision.file.map(Uuid::into_bytes),revision.contents.map(Uuid::into_bytes)],|r|r.get::<_,u32>(0)).optional().map_err(database_error).map(|size|size.map(u64::from))
+    }
+
+    /// Advances a saved assignment when the old file's entire byte sequence is still its prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the source receipts cannot be checked or updated.
+    pub fn verify_codex_name_append(
+        &self,
+        session: &SessionRef,
+        revision: SourceRevision,
+        prior: (u64, [u8; 32]),
+        current: Option<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        let (Provider::Codex, Some(file), Some(contents)) =
+            (session.provider, revision.file, revision.contents)
+        else {
+            return Ok(());
+        };
+        if prior.0 == 0 || current.is_some_and(|(length, _)| length <= prior.0) {
+            return Ok(());
+        }
+        let mut connection = self.connection.borrow_mut();
+        let tx = immediate_transaction(&mut connection)?;
+        let changed=tx.execute("UPDATE codex_inactive_pending_names AS n SET source_contents_id=?3
+            FROM codex_name_source_prefixes b WHERE b.session_id=?1 AND b.codex_home=(SELECT home FROM current_codex_home)
+            AND b.source_file_id=?2 AND b.source_contents_id<>?3 AND b.source_bytes=?4 AND b.digest=?5
+            AND n.trajectory_id=(SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
+            AND n.codex_home=b.codex_home AND n.evidence='provider_name'
+            AND n.source_file_id=b.source_file_id AND n.source_contents_id=b.source_contents_id",
+            params![session.id,file.into_bytes(),contents.into_bytes(),i64::try_from(prior.0).map_err(|_| StoreError::InvalidSessionReference)?,prior.1]).map_err(database_error)?;
+        if changed != 0 {
+            if let Some((length, digest)) = current {
+                tx.execute("UPDATE codex_name_source_prefixes SET source_contents_id=?2,source_bytes=?3,digest=?4
+                       WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+                       params![session.id,contents.into_bytes(),i64::try_from(length).map_err(|_| StoreError::InvalidSessionReference)?,digest]).map_err(database_error)?;
+            } else {
+                tx.execute("DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
+                    [&session.id]).map_err(database_error)?;
+            }
+        }
+        tx.commit().map_err(database_error)
+    }
+
     /// Returns the derived title that survived a search document update.
     ///
     /// # Errors
@@ -4996,6 +5133,11 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
                 codex_home TEXT,
                 evidence TEXT NOT NULL DEFAULT 'uncataloged' CHECK (evidence IN ('uncataloged', 'provider_name', 'unattributed'))
             );
+            CREATE TABLE IF NOT EXISTS codex_name_source_prefixes (
+                session_id TEXT NOT NULL,codex_home TEXT NOT NULL,source_file_id BLOB NOT NULL,
+                source_contents_id BLOB NOT NULL,source_bytes INTEGER NOT NULL,digest BLOB NOT NULL,
+                PRIMARY KEY(session_id,codex_home)
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS codex_inactive_pending_names (
                 trajectory_id INTEGER NOT NULL REFERENCES session_trajectories(id) ON DELETE CASCADE,
                 codex_home TEXT NOT NULL,
@@ -7525,8 +7667,20 @@ fn select_pending_name(
             "DELETE FROM codex_inactive_pending_names WHERE trajectory_id=(
             SELECT id FROM session_trajectories WHERE provider='codex' AND session_id=?1)
          AND codex_home=(SELECT home FROM current_codex_home)
+         AND (?2 OR source_file_id IS NOT ?3 OR evidence <> 'provider_name'
+              OR (source_contents_id=?4 AND EXISTS (SELECT 1 FROM session_trajectories t
+                   WHERE t.id=trajectory_id AND t.source_file_id=?3 AND t.source_contents_id=?4))
+              OR (source_contents_id IS NOT ?4 AND NOT EXISTS (SELECT 1 FROM codex_name_source_prefixes b
+                   WHERE b.session_id=?1 AND b.codex_home=codex_inactive_pending_names.codex_home
+                     AND b.source_file_id=codex_inactive_pending_names.source_file_id
+                     AND b.source_contents_id=codex_inactive_pending_names.source_contents_id)))
          RETURNING trajectory_id,source_file_id,source_contents_id,title,evidence",
-            [&session.id],
+            params![
+                session.id,
+                name_observed,
+                revision.file.map(Uuid::into_bytes),
+                revision.contents.map(Uuid::into_bytes)
+            ],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -13838,6 +13992,99 @@ mod tests {
         assert_eq!(
             store.trajectory_title(&row.session).unwrap().as_deref(),
             Some("Known opener")
+        );
+    }
+
+    #[test]
+    fn inactive_name_advances_only_with_its_complete_prior_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        let outer = Store::open(&path).unwrap();
+        let inner = Store::open(&path).unwrap();
+        inner
+            .connection
+            .borrow()
+            .execute("UPDATE current_codex_home SET home='/inner'", [])
+            .unwrap();
+        let (mut row, doc) =
+            old_explicit_title(&outer, "append", Uuid::from_u128(9), Some("Old label"));
+        row.updated_at = Some(doc.source_updated_at);
+        row.updated_at_approximate = false;
+        outer.upsert_indexed_session(&row).unwrap();
+        let original = doc.source_revision;
+        outer
+            .record_codex_name_source(&row.session, original, 10, [1; 32])
+            .unwrap();
+        row.title = None;
+        let refresh = |store: &Store, row: &IndexedSession, complete| {
+            let inventory = store.observe_codex_catalog_inventory().unwrap();
+            store
+                .merge_codex_search_catalog(
+                    std::slice::from_ref(row),
+                    complete,
+                    &inventory.observed,
+                )
+                .unwrap();
+        };
+        refresh(&inner, &row, true);
+        let appended = SourceRevision {
+            contents: Some(Uuid::from_u128(99)),
+            ..original
+        };
+        row.source_revision = Some(appended);
+        refresh(&outer, &row, false);
+        assert_eq!(
+            outer
+                .codex_name_prefix_length(&row.session, appended)
+                .unwrap(),
+            Some(10)
+        );
+        outer
+            .verify_codex_name_append(&row.session, appended, (10, [4; 32]), Some((12, [2; 32])))
+            .unwrap();
+        assert_eq!(
+            outer.retained_codex_name(&row.session, appended).unwrap(),
+            None
+        );
+        outer
+            .verify_codex_name_append(&row.session, appended, (10, [1; 32]), Some((12, [2; 32])))
+            .unwrap();
+        assert_eq!(
+            inner.retained_codex_name(&row.session, appended).unwrap(),
+            None
+        );
+        assert_eq!(
+            outer
+                .retained_codex_name(&row.session, appended)
+                .unwrap()
+                .as_deref(),
+            doc.derived_title
+        );
+        let oversized = SourceRevision {
+            contents: Some(Uuid::from_u128(101)),
+            ..appended
+        };
+        outer
+            .verify_codex_name_append(&row.session, oversized, (12, [2; 32]), None)
+            .unwrap();
+        assert_eq!(
+            outer
+                .retained_codex_name(&row.session, oversized)
+                .unwrap()
+                .as_deref(),
+            doc.derived_title
+        );
+        assert_eq!(
+            outer
+                .codex_name_prefix_length(&row.session, appended)
+                .unwrap(),
+            None
+        );
+        row.source_revision = Some(oversized);
+        refresh(&outer, &row, true);
+        assert_eq!(
+            outer.retained_codex_name(&row.session, oversized).unwrap(),
+            None
         );
     }
 

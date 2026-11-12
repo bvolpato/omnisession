@@ -483,11 +483,37 @@ fn imported_document_versions(store: &Store) -> Result<HashMap<String, u32>> {
     Ok(versions)
 }
 
+fn verify_cached_codex_name(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidate: &IndexCandidate,
+) -> Result<()> {
+    if candidate
+        .metadata
+        .as_ref()
+        .is_some_and(|row| row.title.is_none())
+        && let Some(path) = candidate.source_path.as_deref()
+        && let Some(bytes) =
+            store.codex_name_prefix_length(&candidate.session, candidate.source_revision)?
+        && native_codex_name(registry, &candidate.session)? == Some(NativeSessionName::Unknown)
+    {
+        verify_codex_name_prefix(
+            store,
+            &candidate.session,
+            path,
+            candidate.source_revision,
+            bytes,
+        )?;
+    }
+    Ok(())
+}
+
 fn pending(
     registry: &AdapterRegistry,
     store: &Store,
     candidates: Vec<IndexCandidate>,
     retry_failed: bool,
+    verify_current_names: bool,
 ) -> Result<Pending> {
     let imported_versions = if candidates
         .iter()
@@ -548,6 +574,9 @@ fn pending(
             && !needs_index(&candidate, prior)
             && let Some(&prior) = prior
         {
+            if verify_current_names {
+                verify_cached_codex_name(registry, store, &candidate)?;
+            }
             if conflicts.contains(&candidate.session) || (failure.is_some() && !current_failure) {
                 recovered.push((candidate, prior, failure.copied()));
             }
@@ -586,7 +615,7 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    let pending = pending(registry, store, candidates, false)?;
+    let pending = pending(registry, store, candidates, false, false)?;
     restore_cached_sources(registry, store, pending.recovered)?;
     Ok(pending.summary)
 }
@@ -721,7 +750,7 @@ pub(crate) fn index_candidates(
         recovered,
         mut hidden,
         mut summary,
-    } = pending(registry, store, candidates, retry_failed)?;
+    } = pending(registry, store, candidates, retry_failed, true)?;
     hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
         titles: hidden,
@@ -816,6 +845,15 @@ fn finish_preparation(
     let mut read = prepared
         .unwrap_or_else(|| prepare_session(registry, candidate, guard, budget, Some(store)))?;
     if candidate.session.provider == Provider::Codex {
+        if let Some(path) = candidate.source_path.as_deref() {
+            verify_codex_name_source(
+                store,
+                &candidate.session,
+                path,
+                read.candidate.source_revision,
+                read.native_name.as_ref(),
+            )?;
+        }
         read.title.check_withdrawal(
             registry,
             store,
@@ -1354,6 +1392,64 @@ fn progress(
         failed: summary.failed,
         ..std::mem::take(updates)
     }
+}
+
+pub(crate) fn observe_codex_name_source(
+    store: &Store,
+    native: &NativeSession,
+    revision: SourceRevision,
+    name: Option<&NativeSessionName>,
+) -> Result<()> {
+    if native
+        .source_revision
+        .is_some_and(|source| source.matches_file_contents(revision))
+        && let Some(path) = native.source_path.as_deref()
+    {
+        verify_codex_name_source(store, &native.session, path, revision, name)?;
+    }
+    Ok(())
+}
+
+fn verify_codex_name_source(
+    store: &Store,
+    session: &SessionRef,
+    path: &Path,
+    revision: SourceRevision,
+    name: Option<&NativeSessionName>,
+) -> Result<()> {
+    use omnis_adapters::CodexAdapter;
+    match name {
+        Some(NativeSessionName::Named(_)) => {
+            if !store.has_codex_name_source(session, revision)?
+                && let Some((bytes, digest)) =
+                    CodexAdapter::rollout_prefix_hash(path, revision, None)
+            {
+                store.record_codex_name_source(session, revision, bytes, digest)?;
+            }
+        }
+        Some(NativeSessionName::Unknown) => {
+            if let Some(bytes) = store.codex_name_prefix_length(session, revision)? {
+                verify_codex_name_prefix(store, session, path, revision, bytes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn verify_codex_name_prefix(
+    store: &Store,
+    session: &SessionRef,
+    path: &Path,
+    revision: SourceRevision,
+    bytes: u64,
+) -> Result<()> {
+    use omnis_adapters::CodexAdapter;
+    if let Some(prior) = CodexAdapter::rollout_prefix_hash(path, revision, Some(bytes)) {
+        let current = CodexAdapter::rollout_prefix_hash(path, revision, None);
+        store.verify_codex_name_append(session, revision, prior, current)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn native_codex_name(

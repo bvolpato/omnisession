@@ -49,6 +49,67 @@ fn clipboard_unavailable_keeps_context_and_reports_partial_success() {
     }
 }
 
+#[test]
+fn returning_home_recovers_its_verified_title_for_show_and_handoff() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new();
+    let outer = fixture.root.join("codex");
+    let inner = outer.join("sessions/restored");
+    let nested_sessions = inner.join("sessions");
+    fs::create_dir_all(&nested_sessions).unwrap();
+    let source = nested_sessions.join(fixture.source.file_name().unwrap());
+    fs::rename(&fixture.source, &source).unwrap();
+    let session = format!("codex:{SESSION_ID}");
+    let run = |home: &Path, args: &[&str]| {
+        let output = fixture
+            .command()
+            .env("CODEX_HOME", home)
+            .env("CODEX_SQLITE_HOME", home)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let title = "Verified outer name";
+    let sidecar = outer.join("session_index.jsonl");
+    let assignment = json!({"id":SESSION_ID, "thread_name":title});
+    fs::write(&sidecar, format!("{assignment}\n")).unwrap();
+    run(&outer, &["index", "--provider", "codex"]);
+    fs::write(&sidecar, format!("{assignment}\n{{")).unwrap();
+    let visit_inner = || {
+        run(
+            &inner,
+            &[
+                "search",
+                "synthetic",
+                "--provider",
+                "codex",
+                "--all-projects",
+            ],
+        )
+    };
+    visit_inner();
+    let handoff = run(&outer, &["handoff", &session]);
+    let document = fs::read_to_string(handoff["output"].as_str().unwrap()).unwrap();
+    assert!(document.contains(title));
+    assert!(document.contains(FINAL_PROMPT));
+
+    visit_inner();
+    let reply = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"Additional verified reply"}]}});
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&source).unwrap(),
+        "{reply}"
+    )
+    .unwrap();
+    assert_eq!(run(&outer, &["show", &session])["title"], title);
+    fs::write(&sidecar, "").unwrap();
+    assert!(run(&outer, &["show", &session])["title"].is_null());
+}
+
 #[cfg(unix)]
 #[test]
 fn clipboard_receives_compact_instructions_and_the_saved_file_keeps_full_history() {

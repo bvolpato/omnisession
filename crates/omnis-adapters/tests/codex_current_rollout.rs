@@ -170,11 +170,16 @@ fn legacy_sqlite_path_without_uuid_owns_the_thread_and_fails_closed() -> Result<
 
 #[test]
 fn an_unreadable_renamed_selection_only_retires_a_proven_different_file() -> Result<()> {
+    check_unreadable_selection(&format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"))?;
+    check_unreadable_selection("rollout-original.jsonl")
+}
+
+fn check_unreadable_selection(old_name: &str) -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let home = fixture.path().canonicalize()?;
     let logs = home.join("sessions");
     fs::create_dir(&logs)?;
-    let old = logs.join(format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl"));
+    let old = logs.join(old_name);
     let selected = logs.join("rollout-imported.jsonl");
     let metadata = json!({"type":"session_meta","payload":{"id":THREAD, "history_mode":"legacy"}});
     fs::write(&old, format!("{metadata}\n"))?;
