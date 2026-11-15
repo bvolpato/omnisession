@@ -223,9 +223,9 @@ fn is_supported_version(version: &str) -> bool {
 
 /// Publishes the import as a new Antigravity CLI conversation. Antigravity CLI may be running:
 /// concurrent CLI sessions share `conversation_summaries.db` through SQLite transactions while
-/// each conversation owns a fresh UUID database and annotation file, and rollback removes an
-/// imported conversation only while its summary row, database, and annotation still match the
-/// generated image. Deletion still requires Antigravity CLI to be closed.
+/// each conversation owns a fresh UUID database and annotation file. Rollback and deletion
+/// require Antigravity CLI to be closed, because unchanged database bytes do not exclude live
+/// connections or uncommitted writes. Rollback also requires the generated artifacts to match.
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {
     ensure_supported(binary)?;
     validate_import_paths(import, "initializing")?;
@@ -237,22 +237,27 @@ pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<Antigrav
 
 #[cfg(test)]
 pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
-    materialize_store_locked(import)
+    materialize_store_with_verification(import, verify_materialized, || Ok(()))
 }
 
 #[cfg(test)]
 fn materialize_store_with_lock(import: &AntigravityImport) -> Result<()> {
     let _guard = lock_import_root(import)?;
-    materialize_store_locked(import)
+    materialize_store(import)
 }
 
 fn materialize_store_locked(import: &AntigravityImport) -> Result<()> {
-    materialize_store_with_verification(import, verify_materialized)
+    materialize_store_with_verification(
+        import,
+        verify_materialized,
+        ensure_no_active_antigravity_process,
+    )
 }
 
 fn materialize_store_with_verification(
     import: &AntigravityImport,
     verify: impl FnOnce(&AntigravityImport) -> Result<()>,
+    check_rollback: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     validate_import_paths(import, "writing")?;
     ensure_directory(&import.root)?;
@@ -321,7 +326,13 @@ fn materialize_store_with_verification(
         Ok(())
     })();
     if let Err(error) = result {
-        return rollback_after_publish(import, published_annotation, published_summary, error);
+        return rollback_after_publish(
+            import,
+            published_annotation,
+            published_summary,
+            error,
+            check_rollback,
+        );
     }
     Ok(())
 }
@@ -422,6 +433,7 @@ pub(crate) fn rollback_locked(
     import: &AntigravityImport,
     _guard: &PrivateStoreGuard,
 ) -> Result<()> {
+    ensure_no_active_antigravity_process()?;
     rollback_store_locked(import)
 }
 
@@ -854,9 +866,12 @@ fn rollback_after_publish(
     published_annotation: bool,
     published_summary: bool,
     error: anyhow::Error,
+    check_rollback: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     // An unreadable summary is a failed rollback too: the published conversation may remain.
-    let rollback = stored_summary(import).and_then(|stored| {
+    let rollback = (|| {
+        check_rollback()?;
+        let stored = stored_summary(import)?;
         if published_summary || stored.is_some() {
             if !published_annotation {
                 bail!("Antigravity summary row exists without generated annotation");
@@ -875,7 +890,7 @@ fn rollback_after_publish(
                 .context("removing unpublished Antigravity target")?;
             sync_directory(&import.conversations_root)
         }
-    });
+    })();
     match rollback {
         Ok(()) => Err(error),
         Err(rollback_error) => Err(crate::transfer::rollback_failure(
@@ -1820,13 +1835,17 @@ mod tests {
         fs::write(&sentinel, b"synthetic unrelated data").unwrap();
         let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
         let mut live_provider = None;
-        let error = materialize_store_with_verification(&import, |import| {
-            verify_materialized(import)?;
-            let connection = Connection::open(&import.summary_path)?;
-            assert!(summary_row(&connection, &import.target.id)?.is_some());
-            live_provider = Some(connection);
-            bail!("synthetic read-back failure")
-        })
+        let error = materialize_store_with_verification(
+            &import,
+            |import| {
+                verify_materialized(import)?;
+                let connection = Connection::open(&import.summary_path)?;
+                assert!(summary_row(&connection, &import.target.id)?.is_some());
+                live_provider = Some(connection);
+                bail!("synthetic read-back failure")
+            },
+            || Ok(()),
+        )
         .expect_err("the injected read-back failure must abort publication");
         assert!(!crate::rollback_failed(&error), "{error:#}");
         assert!(import.summary_path.is_file());
@@ -1958,9 +1977,14 @@ mod tests {
         let import = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
             .expect("Antigravity import");
         materialize_store(&import).expect("materialize Antigravity import");
-        let rolled_back =
-            rollback_after_publish(&import, true, true, anyhow::anyhow!("verify failed"))
-                .expect_err("publish failure stays an error");
+        let rolled_back = rollback_after_publish(
+            &import,
+            true,
+            true,
+            anyhow::anyhow!("verify failed"),
+            || Ok(()),
+        )
+        .expect_err("publish failure stays an error");
         assert!(!crate::rollback_failed(&rolled_back));
         assert!(!import.target_path.exists());
         assert!(!import.annotation_path.exists());
@@ -1969,8 +1993,14 @@ mod tests {
             .expect("Antigravity import");
         materialize_store(&stranded).expect("materialize Antigravity import");
         fs::write(&stranded.target_path, b"changed").expect("tamper target");
-        let error = rollback_after_publish(&stranded, true, true, anyhow::anyhow!("verify failed"))
-            .expect_err("publish failure stays an error");
+        let error = rollback_after_publish(
+            &stranded,
+            true,
+            true,
+            anyhow::anyhow!("verify failed"),
+            || Ok(()),
+        )
+        .expect_err("publish failure stays an error");
         assert!(crate::rollback_failed(&error));
         assert!(
             format!("{error:#}")
@@ -2299,24 +2329,23 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn import_publishes_and_rolls_back_while_antigravity_is_running() {
+    struct RunningAntigravity(std::process::Child);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for RunningAntigravity {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn start_synthetic_antigravity(root: &Path) -> RunningAntigravity {
         use std::{
-            os::unix::fs::PermissionsExt,
-            process::{Child, Command, Stdio},
+            process::{Command, Stdio},
             time::Instant,
         };
 
-        struct Running(Child);
-        impl Drop for Running {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-
-        let temporary = tempfile::tempdir().expect("temporary Antigravity home");
-        let root = temporary.path().canonicalize().expect("canonical home");
         let source = root.join("agy.rs");
         let process = root.join("agy");
         fs::write(
@@ -2336,7 +2365,7 @@ mod tests {
             "compiling synthetic Antigravity binary failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        let _running = Running(
+        let running = RunningAntigravity(
             Command::new(&process)
                 .stdin(Stdio::piped())
                 .spawn()
@@ -2350,6 +2379,17 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        running
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn import_publishes_but_preserves_live_session_on_rollback() {
+        use std::{os::unix::fs::PermissionsExt, process::Command};
+
+        let temporary = tempfile::tempdir().expect("temporary Antigravity home");
+        let root = temporary.path().canonicalize().expect("canonical home");
+        let running = start_synthetic_antigravity(&root);
 
         let binary = root.join("agy-launcher");
         fs::write(&binary, "#!/bin/sh\necho '1.5.7'\n").expect("launcher");
@@ -2366,9 +2406,75 @@ mod tests {
         let guard = materialize(&import, &binary).expect("import while Antigravity CLI is running");
         assert!(import.target_path.is_file());
         assert!(import.annotation_path.is_file());
-        rollback_locked(&import, &guard).expect("rollback while Antigravity CLI is running");
-        assert!(!import.target_path.exists());
-        assert!(!import.annotation_path.exists());
+        let connection = Connection::open(&import.target_path).expect("live conversation writer");
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE steps SET step_payload = X'0801' WHERE idx = 0;",
+            )
+            .expect("begin live conversation update");
+        assert_eq!(fs::read(&import.target_path).unwrap(), import.document);
+        rollback_locked(&import, &guard).expect_err("active provider must block rollback");
+        assert!(import.target_path.is_file());
+        assert_eq!(
+            fs::read(&import.annotation_path).unwrap(),
+            import.annotation
+        );
+        assert_eq!(
+            stored_summary(&import).unwrap(),
+            Some(import.summary.clone())
+        );
+        connection
+            .execute_batch("COMMIT")
+            .expect("live update must remain writable after refused rollback");
+        let stored: Vec<u8> = Connection::open(&import.target_path)
+            .unwrap()
+            .query_row("SELECT step_payload FROM steps WHERE idx = 0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, [8, 1]);
+
+        let failed = build_with_root(&snapshot(), &workspace, import.root.clone()).unwrap();
+        let error = materialize_store_with_verification(
+            &failed,
+            |_| bail!("synthetic read-back failure"),
+            ensure_no_active_antigravity_process,
+        )
+        .expect_err("failed verification must preserve a published live conversation");
+        assert!(crate::rollback_failed(&error));
+        assert_eq!(fs::read(&failed.target_path).unwrap(), failed.document);
+        assert_eq!(
+            fs::read(&failed.annotation_path).unwrap(),
+            failed.annotation
+        );
+        assert_eq!(
+            stored_summary(&failed).unwrap(),
+            Some(failed.summary.clone())
+        );
+
+        let unpublished = build_with_root(&snapshot(), &workspace, import.root.clone()).unwrap();
+        write_atomic_private_file(
+            &unpublished.conversations_root,
+            &unpublished.target_path,
+            &unpublished.document,
+            "synthetic unpublished conversation",
+        )
+        .unwrap();
+        let error = rollback_after_publish(
+            &unpublished,
+            false,
+            false,
+            anyhow::anyhow!("synthetic annotation publication failure"),
+            ensure_no_active_antigravity_process,
+        )
+        .expect_err("failed publication must preserve a live conversation database");
+        assert!(crate::rollback_failed(&error));
+        assert_eq!(
+            fs::read(&unpublished.target_path).unwrap(),
+            unpublished.document
+        );
+        assert!(!unpublished.annotation_path.exists());
+        assert!(stored_summary(&unpublished).unwrap().is_none());
 
         let refusal =
             ensure_no_active_antigravity_process().expect_err("deletion guard still refuses");
@@ -2377,6 +2483,11 @@ mod tests {
                 .to_string()
                 .contains("while Antigravity CLI is running")
         );
+        drop(running);
+        rollback_store(&failed).expect("unchanged conversation can be rolled back after shutdown");
+        assert!(!failed.target_path.exists());
+        assert!(!failed.annotation_path.exists());
+        assert!(stored_summary(&failed).unwrap().is_none());
     }
 
     #[test]

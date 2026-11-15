@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Allow importing sessions into Antigravity CLI while `agy` is running, while keeping active-writer exclusion on native session deletion.
+- Allow importing sessions into Antigravity CLI while `agy` is running, while keeping active-writer exclusion on rollback and native session deletion.
 - Support Antigravity CLI `conversation_summaries.db` schema versions 2 and 3 (including WAL mode) without migrating existing databases.
 - Populate `ProtoUserInput` `user_response`, text `items`, and `last_user_input_step_index`, and write `annotations/<id>.pbtxt` title metadata so current Antigravity CLI releases preserve imported titles and replay imported user turns on resume.
 
