@@ -703,8 +703,10 @@ pub enum StoreError {
     BundleEncoding,
     #[error("bundle already exists")]
     BundleAlreadyExists,
-    #[error("store was written by a newer version of OmniSession")]
-    NewerStoreFormat,
+    #[error(
+        "store was written by a newer version of OmniSession (store format {found}, this build supports up to {supported}); upgrade OmniSession or use a compatible newer build"
+    )]
+    NewerStoreFormat { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -6088,7 +6090,10 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .map_err(database_error)?;
         if stored_format > STORE_FORMAT {
-            return Err(StoreError::NewerStoreFormat);
+            return Err(StoreError::NewerStoreFormat {
+                found: stored_format,
+                supported: STORE_FORMAT,
+            });
         }
         Self::initialize_base_tables(&transaction)?;
         initialize_index_schemas(&transaction, stored_format)?;
@@ -17862,14 +17867,53 @@ mod tests {
         store
             .connection
             .borrow()
+            .execute_batch(
+                "CREATE TABLE newer_format_sentinel (value TEXT NOT NULL);
+                 INSERT INTO newer_format_sentinel VALUES ('preserve newer state');",
+            )
+            .expect("newer store data");
+        store
+            .connection
+            .borrow()
             .pragma_update(None, "user_version", super::STORE_FORMAT + 1)
             .expect("mark a newer format");
         drop(store);
 
+        let Err(error) = Store::open(&path) else {
+            panic!("newer store format must be rejected");
+        };
         assert!(matches!(
-            Store::open(&path),
-            Err(StoreError::NewerStoreFormat)
+            &error,
+            StoreError::NewerStoreFormat { found, supported }
+                if *found == super::STORE_FORMAT + 1 && *supported == super::STORE_FORMAT
         ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "store was written by a newer version of OmniSession (store format {}, this build supports up to {}); upgrade OmniSession or use a compatible newer build",
+                super::STORE_FORMAT + 1,
+                super::STORE_FORMAT,
+            )
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("inspect rejected store");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            super::STORE_FORMAT + 1,
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM newer_format_sentinel", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "preserve newer state",
+        );
     }
 
     #[test]

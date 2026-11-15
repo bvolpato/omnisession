@@ -802,6 +802,7 @@ fn resume_opencode_v2_fork(
     task_binding: Option<&BindingRecord>,
 ) -> Result<()> {
     let binary = resolved_provider_binary(Provider::OpenCode)?;
+    check_transfer_state()?;
     print_fidelity(report)?;
     flush_stdout()?;
     let operation = "OpenCode native fork";
@@ -2134,6 +2135,11 @@ fn notify_stdout(message: fmt::Arguments<'_>) {
     let _ = writeln!(stdout, "{message}").and_then(|()| stdout.flush());
 }
 
+fn check_transfer_state() -> Result<()> {
+    Store::open_default().context("opening OmniSession state before native transfer")?;
+    Ok(())
+}
+
 fn record_import_lineage(
     context: &ResumeContext<'_>,
     target: &SessionRef,
@@ -2429,6 +2435,7 @@ fn resume_via_codex_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Codex");
@@ -2530,6 +2537,7 @@ fn resume_via_opencode_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("OpenCode");
@@ -2594,6 +2602,7 @@ fn resume_via_claude_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Claude");
@@ -2677,6 +2686,7 @@ fn resume_via_grok_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Grok");
@@ -2757,6 +2767,7 @@ fn resume_via_hermes_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Hermes");
@@ -2837,6 +2848,7 @@ fn resume_via_cursor_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Cursor CLI");
@@ -2918,6 +2930,7 @@ fn resume_via_pi_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install(name);
@@ -2999,6 +3012,7 @@ fn resume_via_cursor_ide_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Cursor IDE");
@@ -3089,6 +3103,7 @@ fn resume_via_antigravity_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Antigravity CLI");

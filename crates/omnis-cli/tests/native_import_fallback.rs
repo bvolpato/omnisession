@@ -602,6 +602,75 @@ impl Route {
 }
 
 #[test]
+fn newer_state_blocks_native_import_before_creating_a_target() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.require_newer_store();
+    let run = fixture.run(&Route::Resume.args(), &[("FAKE_CODEX_ROLLOUT", "faithful")]);
+    assert!(!run.status.success());
+    assert!(
+        !fixture
+            .rpc_log()
+            .iter()
+            .any(|method| method == "externalAgentConfig/import"),
+        "incompatible state must be rejected before creating a target"
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
+    assert!(
+        run.stderr.contains("newer version of OmniSession"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn newer_state_allows_native_import_previews() {
+    if !tools_available() {
+        return;
+    }
+    for json in [false, true] {
+        let fixture = Fixture::new();
+        fixture.require_newer_store();
+        let mut args = Route::Resume.args();
+        args.push("--dry-run".to_owned());
+        if json {
+            args.push("--json".to_owned());
+        }
+        let run = fixture.run(&args, &[]);
+        assert!(run.status.success(), "json={json}: {}", run.stderr);
+        assert!(!fixture.generated_rollout().exists());
+        assert!(fixture.rpc_log().is_empty());
+        assert_eq!(fixture.launch_arguments(), None);
+    }
+}
+
+#[test]
+fn newer_state_allows_native_resume_in_place() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    write_codex_source(&fixture, &fixture.root.join("codex/sessions"));
+    fixture.require_newer_store();
+    let source = format!("codex:{SOURCE_ID}");
+    let run = fixture.run(
+        &strings(&["resume", &source, "--in", "codex", "--no-fork"]),
+        &[],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let arguments = fixture.launch_arguments().expect("native resume launched");
+    assert!(
+        arguments
+            .windows(2)
+            .any(|args| args == ["resume", SOURCE_ID])
+    );
+    assert!(!fixture.generated_rollout().exists());
+}
+
+#[test]
 fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     if !tools_available() {
         return;
@@ -2918,6 +2987,16 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         fixture
+    }
+
+    fn require_newer_store(&self) {
+        let connection = rusqlite::Connection::open(self.root.join("state/store.sqlite3")).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", version + 1)
+            .unwrap();
     }
 
     fn command(&self) -> Command {
