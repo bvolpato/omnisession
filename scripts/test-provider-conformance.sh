@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | replies | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
+    matrix | replies | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp | antigravity) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -137,6 +137,7 @@ case "$mode" in
         ;;
     hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
     omp) require_binary OMNI_TEST_OMP_BIN omp ;;
+    antigravity) require_binary OMNI_TEST_ANTIGRAVITY_BIN agy ;;
     pi)
         require_binary OMNI_TEST_PI_BIN pi
         export PI_SKIP_VERSION_CHECK=1
@@ -248,6 +249,11 @@ print(paths[0])'
     omp)
         cargo test --locked --package omnisession-cli --test native_conformance \
             installed_omp_loads_imported_history_without_prompting \
+            -- --ignored --exact --nocapture
+        ;;
+    antigravity)
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_antigravity_round_trips_isolated_synthetic_history \
             -- --ignored --exact --nocapture
         ;;
 esac
