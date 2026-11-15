@@ -70,6 +70,23 @@ fn write_claude_transcript(projects: &Path, workspace: &Path, id: &str) {
     .unwrap();
 }
 
+fn write_launch_profiles(root: &Path, contents: &str) {
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let profiles = state.join("profiles.toml");
+    fs::write(&profiles, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 fn successful_json(command: &mut Command) -> Value {
     let output = command.output().expect("run synthetic CLI");
     assert!(
@@ -289,12 +306,10 @@ fn codex_keeps_its_relative_store_when_launching_in_the_recorded_subdirectory() 
         json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":recorded}}).to_string(),
     )
     .unwrap();
-    fs::create_dir_all(root.join("state")).unwrap();
-    fs::write(
-        root.join("state/profiles.toml"),
+    write_launch_profiles(
+        root,
         "[profiles.configured]\nagent = \"codex\"\n[profiles.configured.env]\nFIXTURE_OPTION = \"configured\"\n",
-    )
-    .unwrap();
+    );
 
     let session = format!("codex:{SESSION_ID}");
     let selected = omnis_core::canonicalize_path(&home).unwrap();
@@ -445,8 +460,8 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
 fn check_codex_profile_directory(root: &Path, selected: &Path, source: &str) {
     workspace_git(selected, &["init", "--quiet"]);
     fs::create_dir(selected.join("somewhere")).unwrap();
-    fs::write(
-        root.join("state/profiles.toml"),
+    write_launch_profiles(
+        root,
         r#"[profiles.configured]
 agent = "codex"
 args = ["--cd=somewhere"]
@@ -458,8 +473,7 @@ args = ["codex"]
 agent = "codex"
 args = ["exec"]
 "#,
-    )
-    .unwrap();
+    );
     let args_for = |profile| {
         let plan = successful_json(
             command(root, selected)
@@ -808,12 +822,10 @@ fn check_profile_worktree_identity(root: &Path, workspace: &Path, source: &str) 
             other.to_str().unwrap(),
         ],
     );
-    let profiles = root.join("state/profiles.toml");
-    fs::write(
-        &profiles,
+    write_launch_profiles(
+        root,
         "[profiles.checkout]\nagent = \"codex\"\nargs = [\"-C\", \"${PROFILE_WORKTREE}\"]\n",
-    )
-    .unwrap();
+    );
     // The launcher probe receives `-C <directory> --help`. Git accepts that profile syntax.
     let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX)))

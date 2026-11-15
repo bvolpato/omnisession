@@ -33,6 +33,7 @@ const STEP_STATUS_DONE: i32 = 3;
 const STEP_SOURCE_MODEL: i32 = 2;
 const STEP_SOURCE_USER_EXPLICIT: i32 = 4;
 const ANTIGRAVITY_LOCK_NAMESPACE: &str = "antigravity";
+const SUMMARY_WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct AntigravityImport {
     pub target: SessionRef,
@@ -42,9 +43,12 @@ pub struct AntigravityImport {
     pub truncated: bool,
     root: PathBuf,
     conversations_root: PathBuf,
+    annotations_root: PathBuf,
     summary_path: PathBuf,
     target_path: PathBuf,
+    annotation_path: PathBuf,
     document: Vec<u8>,
+    annotation: Vec<u8>,
     summary: SummaryRow,
     lock_root: Option<PathBuf>,
 }
@@ -70,6 +74,8 @@ struct SummaryRow {
     last_user_input_time: String,
     last_user_input_step_index: i64,
     app_data_dir: String,
+    raw_summary: Option<Vec<u8>>,
+    group_id: String,
 }
 
 pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<AntigravityImport> {
@@ -140,14 +146,20 @@ fn build_with_roots(
         now.timestamp_subsec_nanos(),
         &expected_messages,
     )?;
+    let summary_title = snapshot
+        .title
+        .as_deref()
+        .map(redact_secrets)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("Imported from {}", snapshot.session));
+    let annotation = build_title_annotation(&summary_title);
+    let last_user_input_step_index = expected_messages
+        .iter()
+        .rposition(|message| message.role == HandoffRole::User)
+        .map_or(Ok(-1), i64::try_from)?;
     let summary = SummaryRow {
         conversation_id: id.clone(),
-        title: snapshot
-            .title
-            .as_deref()
-            .map(redact_secrets)
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| format!("Imported from {}", snapshot.session)),
+        title: summary_title,
         preview: String::new(),
         step_count: i64::try_from(expected_messages.len())?,
         last_modified_time: timestamp.clone(),
@@ -163,12 +175,16 @@ fn build_with_roots(
         not_fully_idle: false,
         killed: false,
         last_user_input_time: timestamp,
-        last_user_input_step_index: -1,
+        last_user_input_step_index,
         app_data_dir: "antigravity-cli".to_owned(),
+        raw_summary: None,
+        group_id: String::new(),
     };
     let conversations_root = root.join("conversations");
+    let annotations_root = root.join("annotations");
     let summary_path = root.join("conversation_summaries.db");
     let target_path = conversations_root.join(format!("{id}.db"));
+    let annotation_path = annotations_root.join(format!("{id}.pbtxt"));
     Ok(AntigravityImport {
         target,
         expected_messages,
@@ -177,9 +193,12 @@ fn build_with_roots(
         truncated: trajectory.truncated,
         root,
         conversations_root,
+        annotations_root,
         summary_path,
         target_path,
+        annotation_path,
         document,
+        annotation,
         summary,
         lock_root,
     })
@@ -202,102 +221,165 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_release_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
 }
 
+/// Publishes the import as a new Antigravity CLI conversation. Antigravity CLI may be running:
+/// concurrent CLI sessions share `conversation_summaries.db` through SQLite transactions while
+/// each conversation owns a fresh UUID database and annotation file. Rollback and deletion
+/// require Antigravity CLI to be closed, because unchanged database bytes do not exclude live
+/// connections or uncommitted writes. Rollback also requires the generated artifacts to match.
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {
     ensure_supported(binary)?;
-    ensure_no_active_antigravity_process()?;
     validate_import_paths(import, "initializing")?;
     ensure_directory(&import.root)?;
     let guard = lock_import_root(import)?;
-    ensure_no_active_antigravity_process()?;
     materialize_store_locked(import)?;
     Ok(guard)
 }
 
 #[cfg(test)]
 pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
-    materialize_store_locked(import)
+    materialize_store_with_verification(import, verify_materialized, || Ok(()))
 }
 
 #[cfg(test)]
 fn materialize_store_with_lock(import: &AntigravityImport) -> Result<()> {
     let _guard = lock_import_root(import)?;
-    materialize_store_locked(import)
+    materialize_store(import)
 }
 
 fn materialize_store_locked(import: &AntigravityImport) -> Result<()> {
-    materialize_store_with_verification(import, verify_materialized)
+    materialize_store_with_verification(
+        import,
+        verify_materialized,
+        ensure_no_active_antigravity_process,
+    )
 }
 
 fn materialize_store_with_verification(
     import: &AntigravityImport,
     verify: impl FnOnce(&AntigravityImport) -> Result<()>,
+    check_rollback: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     validate_import_paths(import, "writing")?;
     ensure_directory(&import.root)?;
+    validate_optional_directory_for(&import.conversations_root, &import.root, "writing")?;
+    validate_optional_directory_for(&import.annotations_root, &import.root, "writing")?;
     let fresh_summary = summary_database_is_missing(import)?;
     if !fresh_summary {
-        let connection = Connection::open_with_flags(
-            &import.summary_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let connection = open_summary_readonly(&import.summary_path)?;
         if summary_row(&connection, &import.target.id)?.is_some() {
             bail!("generated Antigravity summary already exists");
         }
     }
-    ensure_directory(&import.conversations_root)?;
-    validate_directory_chain(&import.conversations_root, &import.root, "writing")?;
-    if import.target_path.exists() {
+    if path_entry_exists(&import.target_path)? {
         bail!("generated Antigravity target session already exists");
     }
+    if path_entry_exists(&import.annotation_path)? {
+        bail!("generated Antigravity target annotation already exists");
+    }
+    ensure_directory(&import.conversations_root)?;
+    validate_directory_chain(&import.conversations_root, &import.root, "writing")?;
+    ensure_directory(&import.annotations_root)?;
+    validate_directory_chain(&import.annotations_root, &import.root, "writing")?;
 
-    let mut temporary = NamedTempFile::new_in(&import.conversations_root)
-        .context("creating temporary Antigravity conversation database")?;
-    #[cfg(unix)]
-    set_private_permissions(temporary.as_file())?;
-    std::io::Write::write_all(&mut temporary, &import.document)
-        .context("writing Antigravity conversation database")?;
-    std::io::Write::flush(&mut temporary)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist_noclobber(&import.target_path)
-        .map_err(|error| error.error)
-        .context("publishing Antigravity conversation database")?;
-    let mut initialized_summary = None;
+    write_atomic_private_file(
+        &import.conversations_root,
+        &import.target_path,
+        &import.document,
+        "Antigravity conversation database",
+    )?;
+    let mut published_annotation = false;
+    let mut published_summary = false;
     let result = (|| {
         sync_directory(&import.conversations_root)?;
+        write_atomic_private_file(
+            &import.annotations_root,
+            &import.annotation_path,
+            &import.annotation,
+            "Antigravity conversation annotation",
+        )?;
+        published_annotation = true;
+        sync_directory(&import.annotations_root)?;
         if fresh_summary {
             let temporary = build_summary_database(import)?;
-            initialized_summary = Some(fs::read(temporary.path())?);
-            temporary
-                .persist_noclobber(&import.summary_path)
-                .map_err(|error| error.error)
-                .context("publishing Antigravity summary database")?;
-            sync_directory(&import.root)?;
-        } else {
-            let mut connection = Connection::open_with_flags(
-                &import.summary_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            )
-            .context("opening Antigravity summary database")?;
-            connection.busy_timeout(Duration::ZERO)?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if summary_row(&transaction, &import.target.id)?.is_some() {
-                bail!("generated Antigravity summary already exists");
+            match temporary.persist_noclobber(&import.summary_path) {
+                Ok(_) => {
+                    published_summary = true;
+                    sync_directory(&import.root)?;
+                }
+                Err(persist_error)
+                    if persist_error.error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    validate_summary_database(import)?;
+                    insert_summary_into_existing(import)?;
+                    published_summary = true;
+                }
+                Err(persist_error) => {
+                    return Err(persist_error.error)
+                        .context("publishing Antigravity summary database");
+                }
             }
-            insert_summary(&transaction, &import.summary)?;
-            transaction.commit()?;
+        } else {
+            insert_summary_into_existing(import)?;
+            published_summary = true;
         }
         verify(import)?;
         Ok(())
     })();
     if let Err(error) = result {
-        if fresh_summary {
-            return rollback_fresh_profile(import, initialized_summary.as_deref(), error);
-        }
-        return rollback_after_publish(import, error);
+        return rollback_after_publish(
+            import,
+            published_annotation,
+            published_summary,
+            error,
+            check_rollback,
+        );
     }
     Ok(())
+}
+
+fn write_atomic_private_file(
+    directory: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    description: &str,
+) -> Result<()> {
+    let mut temporary = NamedTempFile::new_in(directory)
+        .with_context(|| format!("creating temporary {description}"))?;
+    #[cfg(unix)]
+    set_private_permissions(temporary.as_file())?;
+    std::io::Write::write_all(&mut temporary, bytes)
+        .with_context(|| format!("writing {description}"))?;
+    std::io::Write::flush(&mut temporary)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publishing {description}"))?;
+    Ok(())
+}
+
+fn insert_summary_into_existing(import: &AntigravityImport) -> Result<()> {
+    let mut connection = Connection::open_with_flags(
+        &import.summary_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .context("opening Antigravity summary database")?;
+    connection.busy_timeout(SUMMARY_WRITE_BUSY_TIMEOUT)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_summary_connection(&transaction)?;
+    if summary_row(&transaction, &import.target.id)?.is_some() {
+        bail!("generated Antigravity summary already exists");
+    }
+    insert_summary(&transaction, &import.summary)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn open_summary_readonly(summary_path: &Path) -> Result<Connection> {
+    let connection =
+        Connection::open_with_flags(summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(SUMMARY_WRITE_BUSY_TIMEOUT)?;
+    Ok(connection)
 }
 
 fn summary_database_is_missing(import: &AntigravityImport) -> Result<bool> {
@@ -307,24 +389,27 @@ fn summary_database_is_missing(import: &AntigravityImport) -> Result<bool> {
             Ok(false)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let path = import
-                    .root
-                    .join(format!("conversation_summaries.db{suffix}"));
-                match fs::symlink_metadata(path) {
-                    Ok(_) => bail!(
-                        "refusing to initialize Antigravity summaries while a database sidecar exists"
-                    ),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).context("checking Antigravity summary sidecars");
-                    }
-                }
-            }
+            ensure_no_summary_sidecars(&import.root)?;
             Ok(true)
         }
         Err(error) => Err(error).context("checking Antigravity summary database"),
     }
+}
+
+fn ensure_no_summary_sidecars(root: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let path = root.join(format!("conversation_summaries.db{suffix}"));
+        match fs::symlink_metadata(path) {
+            Ok(_) => bail!(
+                "refusing to initialize or remove Antigravity summaries while a database sidecar exists"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("checking Antigravity summary sidecars");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_summary_database(import: &AntigravityImport) -> Result<NamedTempFile> {
@@ -342,43 +427,6 @@ fn build_summary_database(import: &AntigravityImport) -> Result<NamedTempFile> {
     validate_summary_database_at(&import.root, temporary.path())?;
     temporary.as_file().sync_all()?;
     Ok(temporary)
-}
-
-fn rollback_fresh_profile(
-    import: &AntigravityImport,
-    image: Option<&[u8]>,
-    error: anyhow::Error,
-) -> Result<()> {
-    let rollback = (|| {
-        validate_generated_file(import)?;
-        match fs::symlink_metadata(&import.summary_path) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && image.is_some_and(|image| {
-                        fs::read(&import.summary_path).is_ok_and(|bytes| bytes == image)
-                    }) =>
-            {
-                fs::remove_file(&import.summary_path)
-                    .context("removing initialized Antigravity summaries")?;
-                sync_directory(&import.root)?;
-            }
-            Ok(_) => bail!("refusing to remove changed initialized Antigravity summaries"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("checking initialized Antigravity summaries"),
-        }
-        fs::remove_file(&import.target_path).context("removing unpublished Antigravity target")?;
-        sync_directory(&import.conversations_root)
-    })();
-    match rollback {
-        Ok(()) => Err(error),
-        Err(rollback_error) => Err(crate::transfer::rollback_failure(
-            error,
-            format!(
-                "Antigravity import failed and exact fresh-profile rollback also failed: {rollback_error}"
-            ),
-        )),
-    }
 }
 
 pub(crate) fn rollback_locked(
@@ -424,6 +472,110 @@ fn delete_session_at_with_lock_root(
     delete_session_at_locked(session, root)
 }
 
+struct DeletionPayloads {
+    conversations_root: PathBuf,
+    annotations_root: PathBuf,
+    brain_root: PathBuf,
+    conversation: PathBuf,
+    staged_conversation: PathBuf,
+    annotation: PathBuf,
+    staged_annotation: PathBuf,
+    brain: PathBuf,
+    staged_brain: PathBuf,
+    staged_conversation_exists: bool,
+    staged_annotation_exists: bool,
+    staged_brain_exists: bool,
+}
+
+impl DeletionPayloads {
+    fn prepare(root: &Path, id: &str, summary_path: &Path) -> Result<Self> {
+        let conversations_root = root.join("conversations");
+        validate_optional_directory(&conversations_root, root)?;
+        let annotations_root = root.join("annotations");
+        validate_optional_directory(&annotations_root, root)?;
+        let brain_root = root.join("brain");
+        validate_optional_directory(&brain_root, root)?;
+        retry_pending_antigravity_deletions(
+            &conversations_root,
+            &annotations_root,
+            &brain_root,
+            summary_path,
+        )?;
+        let payloads = Self {
+            conversation: conversations_root.join(format!("{id}.db")),
+            staged_conversation: conversations_root.join(format!(".omnisession-delete-{id}.db")),
+            annotation: annotations_root.join(format!("{id}.pbtxt")),
+            staged_annotation: annotations_root.join(format!(".omnisession-delete-{id}.pbtxt")),
+            brain: brain_root.join(id),
+            staged_brain: brain_root.join(format!(".omnisession-delete-{id}")),
+            conversations_root,
+            annotations_root,
+            brain_root,
+            staged_conversation_exists: false,
+            staged_annotation_exists: false,
+            staged_brain_exists: false,
+        };
+        if path_entry_exists(&payloads.staged_conversation)?
+            || path_entry_exists(&payloads.staged_annotation)?
+            || path_entry_exists(&payloads.staged_brain)?
+        {
+            bail!("Antigravity deletion staging path already exists");
+        }
+        validate_optional_payload(&payloads.conversation, false)?;
+        validate_optional_payload(&payloads.annotation, false)?;
+        validate_optional_payload(&payloads.brain, true)?;
+        Ok(payloads)
+    }
+
+    fn stage(&mut self) -> Result<()> {
+        if self.conversation.exists() {
+            fs::rename(&self.conversation, &self.staged_conversation)
+                .context("staging Antigravity conversation for deletion")?;
+            self.staged_conversation_exists = true;
+        }
+        if self.annotation.exists() {
+            fs::rename(&self.annotation, &self.staged_annotation)
+                .context("staging Antigravity conversation annotation for deletion")?;
+            self.staged_annotation_exists = true;
+        }
+        if self.brain.exists() {
+            fs::rename(&self.brain, &self.staged_brain)
+                .context("staging Antigravity transcript directory for deletion")?;
+            self.staged_brain_exists = true;
+        }
+        Ok(())
+    }
+
+    fn restore(&self) -> Result<()> {
+        if self.staged_brain_exists {
+            fs::rename(&self.staged_brain, &self.brain)
+                .context("restoring Antigravity transcript after failed deletion")?;
+        }
+        if self.staged_annotation_exists {
+            fs::rename(&self.staged_annotation, &self.annotation)
+                .context("restoring Antigravity conversation annotation after failed deletion")?;
+        }
+        if self.staged_conversation_exists {
+            fs::rename(&self.staged_conversation, &self.conversation)
+                .context("restoring Antigravity conversation after failed deletion")?;
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        if self.staged_conversation_exists {
+            let _ =
+                remove_staged_payload(&self.staged_conversation, false, &self.conversations_root);
+        }
+        if self.staged_annotation_exists {
+            let _ = remove_staged_payload(&self.staged_annotation, false, &self.annotations_root);
+        }
+        if self.staged_brain_exists {
+            let _ = remove_staged_payload(&self.staged_brain, true, &self.brain_root);
+        }
+    }
+}
+
 fn delete_session_at_locked(session: &SessionRef, root: &Path) -> Result<()> {
     if session.provider != Provider::Antigravity || Uuid::parse_str(&session.id).is_err() {
         bail!("refusing Antigravity deletion with invalid session identity");
@@ -437,41 +589,17 @@ fn delete_session_at_locked(session: &SessionRef, root: &Path) -> Result<()> {
     validate_directory_chain(&root, &root, "deleting")?;
     let summary_path = root.join("conversation_summaries.db");
     validate_summary_database_at(&root, &summary_path)?;
-    let conversations_root = root.join("conversations");
-    validate_optional_directory(&conversations_root, &root)?;
-    let conversation = conversations_root.join(format!("{}.db", session.id));
-    let staged_conversation =
-        conversations_root.join(format!(".omnisession-delete-{}.db", session.id));
-    let brain_root = root.join("brain");
-    validate_optional_directory(&brain_root, &root)?;
-    retry_pending_antigravity_deletions(&conversations_root, &brain_root, &summary_path)?;
-    let brain = brain_root.join(&session.id);
-    let staged_brain = brain_root.join(format!(".omnisession-delete-{}", session.id));
-    if path_entry_exists(&staged_conversation)? || path_entry_exists(&staged_brain)? {
-        bail!("Antigravity deletion staging path already exists");
-    }
-    validate_optional_payload(&conversation, false)?;
-    validate_optional_payload(&brain, true)?;
+    let mut payloads = DeletionPayloads::prepare(&root, &session.id, &summary_path)?;
 
-    let mut staged_conversation_exists = false;
-    let mut staged_brain_exists = false;
     let result = (|| -> Result<()> {
         let mut connection = Connection::open(&summary_path)
             .context("opening Antigravity summary database for deletion")?;
         connection.busy_timeout(Duration::ZERO)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_summary_connection(&transaction)?;
         summary_row(&transaction, &session.id)?
             .context("selected Antigravity session no longer exists")?;
-        if conversation.exists() {
-            fs::rename(&conversation, &staged_conversation)
-                .context("staging Antigravity conversation for deletion")?;
-            staged_conversation_exists = true;
-        }
-        if brain.exists() {
-            fs::rename(&brain, &staged_brain)
-                .context("staging Antigravity transcript directory for deletion")?;
-            staged_brain_exists = true;
-        }
+        payloads.stage()?;
         let deleted = transaction.execute(
             "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
             [&session.id],
@@ -484,22 +612,10 @@ fn delete_session_at_locked(session: &SessionRef, root: &Path) -> Result<()> {
             .context("committing Antigravity session deletion")
     })();
     if let Err(error) = result {
-        if staged_brain_exists {
-            fs::rename(&staged_brain, &brain)
-                .context("restoring Antigravity transcript after failed deletion")?;
-        }
-        if staged_conversation_exists {
-            fs::rename(&staged_conversation, &conversation)
-                .context("restoring Antigravity conversation after failed deletion")?;
-        }
+        payloads.restore()?;
         return Err(error);
     }
-    if staged_conversation_exists {
-        let _ = remove_staged_payload(&staged_conversation, false, &conversations_root);
-    }
-    if staged_brain_exists {
-        let _ = remove_staged_payload(&staged_brain, true, &brain_root);
-    }
+    payloads.cleanup();
     let connection =
         Connection::open_with_flags(&summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     if summary_row(&connection, &session.id)?.is_some() {
@@ -510,6 +626,7 @@ fn delete_session_at_locked(session: &SessionRef, root: &Path) -> Result<()> {
 
 fn retry_pending_antigravity_deletions(
     conversations_root: &Path,
+    annotations_root: &Path,
     brain_root: &Path,
     summary_path: &Path,
 ) -> Result<()> {
@@ -520,6 +637,13 @@ fn retry_pending_antigravity_deletions(
         conversations_root,
         ".omnisession-delete-",
         ".db",
+        false,
+    )?;
+    retry_staged_entries(
+        &connection,
+        annotations_root,
+        ".omnisession-delete-",
+        ".pbtxt",
         false,
     )?;
     retry_staged_entries(&connection, brain_root, ".omnisession-delete-", "", true)
@@ -564,14 +688,18 @@ fn remove_staged_payload(path: &Path, directory: bool, parent: &Path) -> Result<
     if directory {
         fs::remove_dir_all(path).context("removing staged Antigravity transcript directory")?;
     } else {
-        fs::remove_file(path).context("removing staged Antigravity conversation")?;
+        fs::remove_file(path).context("removing staged Antigravity payload")?;
     }
     sync_directory(parent)
 }
 
 fn validate_optional_directory(path: &Path, root: &Path) -> Result<()> {
+    validate_optional_directory_for(path, root, "deleting")
+}
+
+fn validate_optional_directory_for(path: &Path, root: &Path, operation: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_directory_chain(path, root, "deleting"),
+        Ok(_) => validate_directory_chain(path, root, operation),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("reading `{}`", path.display())),
     }
@@ -620,42 +748,84 @@ fn rollback_store_with_lock(import: &AntigravityImport) -> Result<()> {
 
 fn rollback_store_locked(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "rolling back")?;
-    validate_generated_file(import)?;
+    validate_directory_chain(&import.conversations_root, &import.root, "rolling back")?;
+    validate_directory_chain(&import.annotations_root, &import.root, "rolling back")?;
     let mut connection = Connection::open(&import.summary_path)
         .context("opening Antigravity summary database for rollback")?;
-    connection.busy_timeout(Duration::ZERO)?;
+    connection.busy_timeout(SUMMARY_WRITE_BUSY_TIMEOUT)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_summary_connection(&transaction)?;
     if summary_row(&transaction, &import.target.id)?.as_ref() != Some(&import.summary) {
         bail!("refusing to delete changed Antigravity summary row");
     }
-    let rollback_path = import
+    let staged_target = import
         .conversations_root
         .join(format!(".omnisession-rollback-{}.db", import.target.id));
-    if rollback_path.exists() {
+    let staged_annotation = import
+        .annotations_root
+        .join(format!(".omnisession-rollback-{}.pbtxt", import.target.id));
+    if path_entry_exists(&staged_target)? || path_entry_exists(&staged_annotation)? {
         bail!("Antigravity rollback staging path already exists");
     }
-    fs::rename(&import.target_path, &rollback_path)
+    fs::rename(&import.target_path, &staged_target)
         .context("staging Antigravity target for rollback")?;
-    if let Err(error) = transaction
-        .execute(
-            "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
-            [&import.target.id],
-        )
-        .and_then(|deleted| {
-            if deleted == 1 {
-                Ok(())
-            } else {
-                Err(rusqlite::Error::QueryReturnedNoRows)
-            }
-        })
-        .and_then(|()| transaction.commit())
+    if let Err(error) = fs::rename(&import.annotation_path, &staged_annotation)
+        .context("staging Antigravity target annotation for rollback")
     {
-        fs::rename(&rollback_path, &import.target_path)
-            .context("restoring Antigravity target after rollback failure")?;
-        return Err(error).context("deleting Antigravity summary row");
+        return Err(
+            match restore_staged_file(&staged_target, &import.target_path) {
+                Ok(()) => error,
+                Err(restore) => error.context(format!(
+                    "restoring `{}` failed: {restore}",
+                    staged_target.display()
+                )),
+            },
+        );
     }
-    fs::remove_file(&rollback_path).context("removing generated Antigravity target")?;
+    let commit_result = (|| -> Result<()> {
+        validate_generated_target_file(import, &staged_target)?;
+        validate_generated_annotation_file(import, &staged_annotation)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+                [&import.target.id],
+            )
+            .context("deleting Antigravity summary row")?;
+        if deleted != 1 {
+            bail!("Antigravity rollback did not remove exact summary row");
+        }
+        transaction
+            .commit()
+            .context("committing Antigravity summary rollback")
+    })();
+    if let Err(error) = commit_result {
+        let restore_annotation = restore_staged_file(&staged_annotation, &import.annotation_path);
+        let restore_target = restore_staged_file(&staged_target, &import.target_path);
+        let mut combined = error;
+        if let Err(restore) = restore_annotation {
+            combined = combined.context(format!(
+                "restoring `{}` failed: {restore}",
+                staged_annotation.display()
+            ));
+        }
+        if let Err(restore) = restore_target {
+            combined = combined.context(format!(
+                "restoring `{}` failed: {restore}",
+                staged_target.display()
+            ));
+        }
+        return Err(combined);
+    }
+    fs::remove_file(&staged_annotation)
+        .context("removing generated Antigravity target annotation")?;
+    sync_directory(&import.annotations_root)?;
+    fs::remove_file(&staged_target).context("removing generated Antigravity target")?;
     sync_directory(&import.conversations_root)
+}
+
+fn restore_staged_file(staged: &Path, original: &Path) -> std::io::Result<()> {
+    fs::hard_link(staged, original)?;
+    fs::remove_file(staged)
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
@@ -677,8 +847,8 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
 }
 
 fn verify_materialized(import: &AntigravityImport) -> Result<()> {
-    validate_generated_file(import)?;
-    let connection = Connection::open(&import.summary_path)?;
+    validate_generated_files(import)?;
+    let connection = open_summary_readonly(&import.summary_path)?;
     if summary_row(&connection, &import.target.id)?.as_ref() != Some(&import.summary) {
         bail!("Antigravity summary read-back changed imported metadata");
     }
@@ -691,19 +861,36 @@ fn verify_materialized(import: &AntigravityImport) -> Result<()> {
     Ok(())
 }
 
-fn rollback_after_publish(import: &AntigravityImport, error: anyhow::Error) -> Result<()> {
+fn rollback_after_publish(
+    import: &AntigravityImport,
+    published_annotation: bool,
+    published_summary: bool,
+    error: anyhow::Error,
+    check_rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     // An unreadable summary is a failed rollback too: the published conversation may remain.
-    let rollback = stored_summary(import).and_then(|stored| {
-        if stored.as_ref() == Some(&import.summary) {
+    let rollback = (|| {
+        check_rollback()?;
+        let stored = stored_summary(import)?;
+        if published_summary || stored.is_some() {
+            if !published_annotation {
+                bail!("Antigravity summary row exists without generated annotation");
+            }
             rollback_store_locked(import)
         } else {
-            validate_generated_file(import).and_then(|()| {
-                fs::remove_file(&import.target_path)
-                    .context("removing unpublished Antigravity target")?;
-                sync_directory(&import.conversations_root)
-            })
+            validate_import_paths(import, "rolling back")?;
+            validate_generated_target_file(import, &import.target_path)?;
+            if published_annotation {
+                validate_generated_annotation_file(import, &import.annotation_path)?;
+                fs::remove_file(&import.annotation_path)
+                    .context("removing unpublished Antigravity target annotation")?;
+                sync_directory(&import.annotations_root)?;
+            }
+            fs::remove_file(&import.target_path)
+                .context("removing unpublished Antigravity target")?;
+            sync_directory(&import.conversations_root)
         }
-    });
+    })();
     match rollback {
         Ok(()) => Err(error),
         Err(rollback_error) => Err(crate::transfer::rollback_failure(
@@ -727,26 +914,32 @@ fn lock_root(root: &Path, configured_lock_root: Option<&Path>) -> Result<Private
 }
 
 fn stored_summary(import: &AntigravityImport) -> Result<Option<SummaryRow>> {
-    let connection = Connection::open(&import.summary_path)?;
+    match fs::symlink_metadata(&import.summary_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("checking Antigravity summary database"),
+    }
+    let connection = open_summary_readonly(&import.summary_path)?;
     summary_row(&connection, &import.target.id)
 }
 
-fn validate_generated_file(import: &AntigravityImport) -> Result<()> {
+fn validate_generated_files(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "validating")?;
-    let metadata = fs::symlink_metadata(&import.target_path)
-        .context("reading generated Antigravity target metadata")?;
+    validate_generated_target_file(import, &import.target_path)?;
+    validate_generated_annotation_file(import, &import.annotation_path)
+}
+
+fn validate_generated_target_file(import: &AntigravityImport, path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).context("reading generated Antigravity target metadata")?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         bail!("generated Antigravity target is not a regular file");
     }
-    let content = fs::read(&import.target_path)
-        .context("reading generated Antigravity conversation database")?;
+    let content = fs::read(path).context("reading generated Antigravity conversation database")?;
     if content != import.document {
         bail!("generated Antigravity target changed after materialization");
     }
-    let connection = Connection::open_with_flags(
-        &import.target_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let identity = connection.query_row(
         "SELECT trajectory_id, cascade_id, trajectory_type, source FROM trajectory_meta",
         [],
@@ -769,17 +962,36 @@ fn validate_generated_file(import: &AntigravityImport) -> Result<()> {
     Ok(())
 }
 
+fn validate_generated_annotation_file(import: &AntigravityImport, path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .context("reading generated Antigravity target annotation metadata")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("generated Antigravity target annotation is not a regular file");
+    }
+    let content =
+        fs::read(path).context("reading generated Antigravity conversation annotation")?;
+    if content != import.annotation {
+        bail!("generated Antigravity target annotation changed after materialization");
+    }
+    Ok(())
+}
+
 fn validate_import_paths(import: &AntigravityImport, operation: &str) -> Result<()> {
     if !import.root.is_absolute()
         || import.target.provider != Provider::Antigravity
         || Uuid::parse_str(&import.target.id).is_err()
         || import.summary.conversation_id != import.target.id
         || import.conversations_root != import.root.join("conversations")
+        || import.annotations_root != import.root.join("annotations")
         || import.summary_path != import.root.join("conversation_summaries.db")
         || import.target_path
             != import
                 .conversations_root
                 .join(format!("{}.db", import.target.id))
+        || import.annotation_path
+            != import
+                .annotations_root
+                .join(format!("{}.pbtxt", import.target.id))
     {
         bail!("refusing {operation} with unverified Antigravity target paths");
     }
@@ -797,18 +1009,22 @@ fn validate_summary_database_at(root: &Path, summary_path: &Path) -> Result<()> 
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         bail!("Antigravity summary database is not a regular file");
     }
-    let connection =
-        Connection::open_with_flags(summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if version != 1 {
-        bail!("Antigravity summary schema version {version} is not supported");
-    }
-    validate_summary_schema(&connection)?;
+    let connection = open_summary_readonly(summary_path)?;
+    validate_summary_connection(&connection)?;
     Ok(())
 }
 
-fn validate_summary_schema(connection: &Connection) -> Result<()> {
-    const EXPECTED: [(&str, &str, bool, Option<&str>, bool); 19] = [
+fn validate_summary_connection(connection: &Connection) -> Result<i64> {
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if !matches!(version, 1..=3) {
+        bail!("Antigravity summary schema version {version} is not supported");
+    }
+    validate_summary_schema(connection, version)?;
+    Ok(version)
+}
+
+fn validate_summary_schema(connection: &Connection, version: i64) -> Result<()> {
+    const BASE_EXPECTED: [(&str, &str, bool, Option<&str>, bool); 19] = [
         ("conversation_id", "text", false, None, true),
         ("title", "text", true, Some(""), false),
         ("preview", "text", true, Some(""), false),
@@ -848,7 +1064,14 @@ fn validate_summary_schema(connection: &Connection) -> Result<()> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let expected = EXPECTED
+    let mut expected_columns = BASE_EXPECTED.to_vec();
+    if version >= 2 {
+        expected_columns.push(("raw_summary", "blob", false, None, false));
+    }
+    if version >= 3 {
+        expected_columns.push(("group_id", "text", true, Some(""), false));
+    }
+    let expected = expected_columns
         .into_iter()
         .map(|(name, kind, not_null, default, primary_key)| {
             (
@@ -914,40 +1137,84 @@ fn insert_summary(connection: &Connection, row: &SummaryRow) -> Result<()> {
 }
 
 fn summary_row(connection: &Connection, id: &str) -> Result<Option<SummaryRow>> {
-    connection
-        .query_row(
+    let version = validate_summary_connection(connection)?;
+    let query = match version {
+        1 => {
             "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris,
-                    status, source, project_id, agent_name, parent_conversation_id, nesting_depth,
-                    battle_id, winning_conversation_id, not_fully_idle, killed,
-                    last_user_input_time, last_user_input_step_index, app_data_dir
-             FROM conversation_summaries WHERE conversation_id = ?1",
-            [id],
-            |row| {
-                Ok(SummaryRow {
-                    conversation_id: row.get(0)?,
-                    title: row.get(1)?,
-                    preview: row.get(2)?,
-                    step_count: row.get(3)?,
-                    last_modified_time: row.get(4)?,
-                    workspace_uris: row.get(5)?,
-                    status: row.get(6)?,
-                    source: row.get(7)?,
-                    project_id: row.get(8)?,
-                    agent_name: row.get(9)?,
-                    parent_conversation_id: row.get(10)?,
-                    nesting_depth: row.get(11)?,
-                    battle_id: row.get(12)?,
-                    winning_conversation_id: row.get(13)?,
-                    not_fully_idle: row.get(14)?,
-                    killed: row.get(15)?,
-                    last_user_input_time: row.get(16)?,
-                    last_user_input_step_index: row.get(17)?,
-                    app_data_dir: row.get(18)?,
-                })
-            },
-        )
+                     status, source, project_id, agent_name, parent_conversation_id, nesting_depth,
+                     battle_id, winning_conversation_id, not_fully_idle, killed,
+                     last_user_input_time, last_user_input_step_index, app_data_dir,
+                     NULL AS raw_summary, '' AS group_id
+              FROM conversation_summaries WHERE conversation_id = ?1"
+        }
+        2 => {
+            "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris,
+                     status, source, project_id, agent_name, parent_conversation_id, nesting_depth,
+                     battle_id, winning_conversation_id, not_fully_idle, killed,
+                     last_user_input_time, last_user_input_step_index, app_data_dir,
+                     raw_summary, '' AS group_id
+              FROM conversation_summaries WHERE conversation_id = ?1"
+        }
+        3 => {
+            "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris,
+                     status, source, project_id, agent_name, parent_conversation_id, nesting_depth,
+                     battle_id, winning_conversation_id, not_fully_idle, killed,
+                     last_user_input_time, last_user_input_step_index, app_data_dir,
+                     raw_summary, group_id
+              FROM conversation_summaries WHERE conversation_id = ?1"
+        }
+        _ => bail!("Antigravity summary schema version {version} is not supported"),
+    };
+    connection
+        .query_row(query, [id], |row| {
+            Ok(SummaryRow {
+                conversation_id: row.get(0)?,
+                title: row.get(1)?,
+                preview: row.get(2)?,
+                step_count: row.get(3)?,
+                last_modified_time: row.get(4)?,
+                workspace_uris: row.get(5)?,
+                status: row.get(6)?,
+                source: row.get(7)?,
+                project_id: row.get(8)?,
+                agent_name: row.get(9)?,
+                parent_conversation_id: row.get(10)?,
+                nesting_depth: row.get(11)?,
+                battle_id: row.get(12)?,
+                winning_conversation_id: row.get(13)?,
+                not_fully_idle: row.get(14)?,
+                killed: row.get(15)?,
+                last_user_input_time: row.get(16)?,
+                last_user_input_step_index: row.get(17)?,
+                app_data_dir: row.get(18)?,
+                raw_summary: row.get(19)?,
+                group_id: row.get(20)?,
+            })
+        })
         .optional()
         .map_err(Into::into)
+}
+
+fn build_title_annotation(title: &str) -> Vec<u8> {
+    use std::fmt::Write;
+
+    let mut escaped = String::with_capacity(title.len() + 10);
+    escaped.push_str("title: \"");
+    for character in title.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_ascii_control() => {
+                let _ = write!(escaped, "\\{:03o}", u32::from(control));
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped.push_str("\"\n");
+    escaped.into_bytes()
 }
 
 fn build_database(
@@ -999,6 +1266,10 @@ fn build_database(
                     STEP_SOURCE_USER_EXPLICIT,
                     proto_step::Step::UserInput(ProtoUserInput {
                         query: message.text.clone(),
+                        user_response: message.text.clone(),
+                        items: vec![ProtoTextOrScopeItem {
+                            text: message.text.clone(),
+                        }],
                     }),
                 ),
                 HandoffRole::Assistant => (
@@ -1283,6 +1554,16 @@ struct ProtoStepMetadata {
 struct ProtoUserInput {
     #[prost(string, tag = "1")]
     query: String,
+    #[prost(string, tag = "2")]
+    user_response: String,
+    #[prost(message, repeated, tag = "3")]
+    items: Vec<ProtoTextOrScopeItem>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoTextOrScopeItem {
+    #[prost(string, tag = "1")]
+    text: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1492,6 +1773,10 @@ mod tests {
             .expect("Antigravity import");
 
         materialize_store(&import).expect("materialize Antigravity import");
+        assert_eq!(
+            fs::read(&import.annotation_path).expect("annotation file"),
+            b"title: \"Synthetic import\"\n"
+        );
         let readback = AntigravityAdapter::with_root(temporary.path())
             .read_session(&import.target)
             .expect("Antigravity readback");
@@ -1499,6 +1784,7 @@ mod tests {
         assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
         rollback_store(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
+        assert!(!import.annotation_path.exists());
         let connection = Connection::open(&import.summary_path).expect("summary database");
         assert!(
             summary_row(&connection, &import.target.id)
@@ -1539,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_profile_failed_readback_removes_only_generated_databases_and_allows_retry() {
+    fn fresh_profile_failed_readback_retains_catalog_for_live_connections_and_allows_retry() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         let root = temporary.path().join("fresh-profile");
@@ -1548,14 +1834,23 @@ mod tests {
         let sentinel = root.join("unrelated-file");
         fs::write(&sentinel, b"synthetic unrelated data").unwrap();
         let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
-        let error = materialize_store_with_verification(&import, |import| {
-            verify_materialized(import)?;
-            bail!("synthetic read-back failure")
-        })
+        let mut live_provider = None;
+        let error = materialize_store_with_verification(
+            &import,
+            |import| {
+                verify_materialized(import)?;
+                let connection = Connection::open(&import.summary_path)?;
+                assert!(summary_row(&connection, &import.target.id)?.is_some());
+                live_provider = Some(connection);
+                bail!("synthetic read-back failure")
+            },
+            || Ok(()),
+        )
         .expect_err("the injected read-back failure must abort publication");
         assert!(!crate::rollback_failed(&error), "{error:#}");
-        assert!(!import.summary_path.exists());
+        assert!(import.summary_path.is_file());
         assert!(!import.target_path.exists());
+        assert!(!import.annotation_path.exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"synthetic unrelated data");
         assert!(
             fs::read_dir(&import.conversations_root)
@@ -1563,19 +1858,44 @@ mod tests {
                 .next()
                 .is_none()
         );
+        assert!(
+            fs::read_dir(&import.annotations_root)
+                .unwrap()
+                .next()
+                .is_none()
+        );
         assert_eq!(
             fs::read_dir(&root).unwrap().count(),
-            2,
-            "temporary database images must be cleaned up"
+            4,
+            "temporary database and annotation images must be cleaned up while retaining the catalog"
         );
+        let live_provider = live_provider.expect("opened live provider connection");
+        assert!(
+            summary_row(&live_provider, &import.target.id)
+                .unwrap()
+                .is_none()
+        );
+        let mut live_row = import.summary.clone();
+        live_row.conversation_id = Uuid::new_v4().to_string();
+        insert_summary(&live_provider, &live_row).expect(
+            "retained catalog must remain writable through an existing provider connection",
+        );
+        drop(live_provider);
+
         materialize_store(&import)
-            .expect("the same generated import can retry after exact cleanup");
+            .expect("the same generated import can retry after exact row rollback");
         assert!(readback_matches(
-            &AntigravityAdapter::with_root(root)
+            &AntigravityAdapter::with_root(&root)
                 .read_session(&import.target)
                 .unwrap(),
             &import.expected_messages
         ));
+        let verify_conn = Connection::open(&import.summary_path).unwrap();
+        assert!(
+            summary_row(&verify_conn, &live_row.conversation_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1583,7 +1903,13 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
-        for conflict in ["schema", "malformed", "sidecar", "conversations"] {
+        for conflict in [
+            "schema",
+            "malformed",
+            "sidecar",
+            "conversations",
+            "annotations",
+        ] {
             let root = temporary.path().join(conflict);
             fs::create_dir(&root).unwrap();
             let path = match conflict {
@@ -1597,6 +1923,7 @@ mod tests {
                 }
                 "malformed" => root.join("conversation_summaries.db"),
                 "sidecar" => root.join("conversation_summaries.db-wal"),
+                "annotations" => root.join("annotations"),
                 _ => root.join("conversations"),
             };
             if conflict != "schema" {
@@ -1650,17 +1977,30 @@ mod tests {
         let import = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
             .expect("Antigravity import");
         materialize_store(&import).expect("materialize Antigravity import");
-        let rolled_back = rollback_after_publish(&import, anyhow::anyhow!("verify failed"))
-            .expect_err("publish failure stays an error");
+        let rolled_back = rollback_after_publish(
+            &import,
+            true,
+            true,
+            anyhow::anyhow!("verify failed"),
+            || Ok(()),
+        )
+        .expect_err("publish failure stays an error");
         assert!(!crate::rollback_failed(&rolled_back));
         assert!(!import.target_path.exists());
+        assert!(!import.annotation_path.exists());
 
         let stranded = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
             .expect("Antigravity import");
         materialize_store(&stranded).expect("materialize Antigravity import");
         fs::write(&stranded.target_path, b"changed").expect("tamper target");
-        let error = rollback_after_publish(&stranded, anyhow::anyhow!("verify failed"))
-            .expect_err("publish failure stays an error");
+        let error = rollback_after_publish(
+            &stranded,
+            true,
+            true,
+            anyhow::anyhow!("verify failed"),
+            || Ok(()),
+        )
+        .expect_err("publish failure stays an error");
         assert!(crate::rollback_failed(&error));
         assert!(
             format!("{error:#}")
@@ -1680,6 +2020,39 @@ mod tests {
         fs::write(&import.target_path, b"changed").expect("tamper target");
         assert!(rollback_store(&import).is_err());
         assert!(import.target_path.exists());
+        assert!(import.annotation_path.exists());
+    }
+
+    #[test]
+    fn rollback_refuses_changed_annotation_and_restores_staged_files() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let import = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("Antigravity import");
+        materialize_store(&import).expect("materialize Antigravity import");
+        fs::write(&import.annotation_path, b"title: \"live edit\"\n").expect("tamper annotation");
+        let error = rollback_store(&import).expect_err("changed annotation must block rollback");
+        assert!(format!("{error:#}").contains("annotation changed"));
+        assert_eq!(fs::read(&import.target_path).unwrap(), import.document);
+        assert_eq!(
+            fs::read(&import.annotation_path).unwrap(),
+            b"title: \"live edit\"\n"
+        );
+        for parent in [&import.conversations_root, &import.annotations_root] {
+            let leftovers = fs::read_dir(parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".omnisession-rollback-")
+                })
+                .count();
+            assert_eq!(leftovers, 0, "staged rollback files must not remain");
+        }
     }
 
     #[test]
@@ -1706,6 +2079,7 @@ mod tests {
             .expect("delete selected Antigravity session");
 
         assert!(!selected.target_path.exists());
+        assert!(!selected.annotation_path.exists());
         assert!(
             !temporary
                 .path()
@@ -1714,6 +2088,7 @@ mod tests {
                 .exists()
         );
         assert!(sibling.target_path.exists());
+        assert!(sibling.annotation_path.exists());
         let connection = Connection::open(&selected.summary_path).expect("summary database");
         assert!(
             summary_row(&connection, &selected.target.id)
@@ -1805,7 +2180,11 @@ mod tests {
         let staged = selected
             .conversations_root
             .join(format!(".omnisession-delete-{}.db", selected.target.id));
+        let staged_annotation = selected
+            .annotations_root
+            .join(format!(".omnisession-delete-{}.pbtxt", selected.target.id));
         fs::rename(&selected.target_path, &staged).expect("stage conversation");
+        fs::rename(&selected.annotation_path, &staged_annotation).expect("stage annotation");
         Connection::open(&selected.summary_path)
             .expect("summary database")
             .execute(
@@ -1816,12 +2195,14 @@ mod tests {
 
         retry_pending_antigravity_deletions(
             &selected.conversations_root,
+            &selected.annotations_root,
             &temporary.path().join("brain"),
             &selected.summary_path,
         )
         .expect("retry staged cleanup");
 
         assert!(!staged.exists());
+        assert!(!staged_annotation.exists());
     }
 
     #[test]
@@ -1851,6 +2232,262 @@ mod tests {
             .expect("summary read")
             .is_some()
         );
+    }
+
+    #[test]
+    fn materializes_and_deletes_across_summary_schema_versions_v2_and_v3() {
+        for (label, ddl) in [
+            (
+                "v2",
+                "ALTER TABLE conversation_summaries ADD COLUMN raw_summary blob;\nPRAGMA user_version = 2;\n",
+            ),
+            (
+                "v3-double-quoted-default",
+                "PRAGMA journal_mode = WAL;\nALTER TABLE conversation_summaries ADD COLUMN raw_summary blob;\nALTER TABLE conversation_summaries ADD COLUMN group_id text NOT NULL DEFAULT \"\";\nPRAGMA user_version = 3;\n",
+            ),
+            (
+                "v3-single-quoted-default",
+                "PRAGMA journal_mode = WAL;\nALTER TABLE conversation_summaries ADD COLUMN raw_summary blob;\nALTER TABLE conversation_summaries ADD COLUMN group_id text NOT NULL DEFAULT '';\nPRAGMA user_version = 3;\n",
+            ),
+        ] {
+            let temporary = tempfile::tempdir().expect("temporary root");
+            let workspace = temporary.path().join("workspace");
+            fs::create_dir(&workspace).expect("workspace");
+            create_summary_database(temporary.path());
+            let connection = Connection::open(temporary.path().join("conversation_summaries.db"))
+                .expect("open summary database");
+            connection.execute_batch(ddl).expect(label);
+            drop(connection);
+
+            let first = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+                .expect(label);
+            materialize_store(&first).expect(label);
+            let readback = AntigravityAdapter::with_root(temporary.path())
+                .read_session(&first.target)
+                .expect(label);
+            assert!(readback_matches(&readback, &first.expected_messages));
+            rollback_store(&first).expect(label);
+            assert!(!first.target_path.exists());
+            assert!(!first.annotation_path.exists());
+
+            let second = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+                .expect(label);
+            materialize_store(&second).expect(label);
+            Connection::open(&second.summary_path)
+                .expect(label)
+                .execute(
+                    "UPDATE conversation_summaries SET raw_summary = X'0801' WHERE conversation_id = ?1",
+                    [&second.target.id],
+                )
+                .expect(label);
+            assert!(
+                rollback_store(&second).is_err(),
+                "{label}: live raw_summary cache update must block rollback"
+            );
+            assert!(second.target_path.exists());
+
+            delete_session_at(&second.target, temporary.path()).expect(label);
+            assert!(!second.target_path.exists());
+            assert!(!second.annotation_path.exists());
+        }
+    }
+
+    #[test]
+    fn writes_escaped_title_annotation_and_populates_user_input_items() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let mut custom = snapshot();
+        custom.title = Some("Fix \"Agy\" \\ path\nline\t\x07 café".to_owned());
+        let import = build_with_root(&custom, &workspace, temporary.path().to_path_buf())
+            .expect("Antigravity import");
+        assert_eq!(import.summary.last_user_input_step_index, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&import.annotation),
+            "title: \"Fix \\\"Agy\\\" \\\\ path\\nline\\t\\007 café\"\n"
+        );
+        materialize_store(&import).expect("materialize Antigravity import");
+
+        let connection = Connection::open(&import.target_path).expect("open target database");
+        let payload: Vec<u8> = connection
+            .query_row("SELECT step_payload FROM steps WHERE idx = 0", [], |row| {
+                row.get(0)
+            })
+            .expect("first step payload");
+        let decoded = ProtoStep::decode(payload.as_slice()).expect("decode user step");
+        assert_eq!(
+            decoded.step,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "question".to_owned(),
+                user_response: "question".to_owned(),
+                items: vec![ProtoTextOrScopeItem {
+                    text: "question".to_owned(),
+                }],
+            }))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct RunningAntigravity(std::process::Child);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for RunningAntigravity {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn start_synthetic_antigravity(root: &Path) -> RunningAntigravity {
+        use std::{
+            process::{Command, Stdio},
+            time::Instant,
+        };
+
+        let source = root.join("agy.rs");
+        let process = root.join("agy");
+        fs::write(
+            &source,
+            "fn main() { let _ = std::io::stdin().read_line(&mut String::new()); }\n",
+        )
+        .expect("synthetic Antigravity source");
+        let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = Command::new(rustc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&process)
+            .output()
+            .expect("compile synthetic Antigravity binary");
+        assert!(
+            compiled.status.success(),
+            "compiling synthetic Antigravity binary failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let running = RunningAntigravity(
+            Command::new(&process)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("start synthetic Antigravity process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ensure_no_active_antigravity_process().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic Antigravity CLI process never appeared"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        running
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn import_publishes_but_preserves_live_session_on_rollback() {
+        use std::{os::unix::fs::PermissionsExt, process::Command};
+
+        let temporary = tempfile::tempdir().expect("temporary Antigravity home");
+        let root = temporary.path().canonicalize().expect("canonical home");
+        let running = start_synthetic_antigravity(&root);
+
+        let binary = root.join("agy-launcher");
+        fs::write(&binary, "#!/bin/sh\necho '1.5.7'\n").expect("launcher");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+        crate::test_support::output_after_write(Command::new(&binary).arg("--version"));
+
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let data_root = root.join("store");
+        let lock_root = root.join("locks/antigravity");
+        let import = build_with_lock_root(&snapshot(), &workspace, data_root, lock_root)
+            .expect("build import");
+
+        let guard = materialize(&import, &binary).expect("import while Antigravity CLI is running");
+        assert!(import.target_path.is_file());
+        assert!(import.annotation_path.is_file());
+        let connection = Connection::open(&import.target_path).expect("live conversation writer");
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE steps SET step_payload = X'0801' WHERE idx = 0;",
+            )
+            .expect("begin live conversation update");
+        assert_eq!(fs::read(&import.target_path).unwrap(), import.document);
+        rollback_locked(&import, &guard).expect_err("active provider must block rollback");
+        assert!(import.target_path.is_file());
+        assert_eq!(
+            fs::read(&import.annotation_path).unwrap(),
+            import.annotation
+        );
+        assert_eq!(
+            stored_summary(&import).unwrap(),
+            Some(import.summary.clone())
+        );
+        connection
+            .execute_batch("COMMIT")
+            .expect("live update must remain writable after refused rollback");
+        let stored: Vec<u8> = Connection::open(&import.target_path)
+            .unwrap()
+            .query_row("SELECT step_payload FROM steps WHERE idx = 0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, [8, 1]);
+
+        let failed = build_with_root(&snapshot(), &workspace, import.root.clone()).unwrap();
+        let error = materialize_store_with_verification(
+            &failed,
+            |_| bail!("synthetic read-back failure"),
+            ensure_no_active_antigravity_process,
+        )
+        .expect_err("failed verification must preserve a published live conversation");
+        assert!(crate::rollback_failed(&error));
+        assert_eq!(fs::read(&failed.target_path).unwrap(), failed.document);
+        assert_eq!(
+            fs::read(&failed.annotation_path).unwrap(),
+            failed.annotation
+        );
+        assert_eq!(
+            stored_summary(&failed).unwrap(),
+            Some(failed.summary.clone())
+        );
+
+        let unpublished = build_with_root(&snapshot(), &workspace, import.root.clone()).unwrap();
+        write_atomic_private_file(
+            &unpublished.conversations_root,
+            &unpublished.target_path,
+            &unpublished.document,
+            "synthetic unpublished conversation",
+        )
+        .unwrap();
+        let error = rollback_after_publish(
+            &unpublished,
+            false,
+            false,
+            anyhow::anyhow!("synthetic annotation publication failure"),
+            ensure_no_active_antigravity_process,
+        )
+        .expect_err("failed publication must preserve a live conversation database");
+        assert!(crate::rollback_failed(&error));
+        assert_eq!(
+            fs::read(&unpublished.target_path).unwrap(),
+            unpublished.document
+        );
+        assert!(!unpublished.annotation_path.exists());
+        assert!(stored_summary(&unpublished).unwrap().is_none());
+
+        let refusal =
+            ensure_no_active_antigravity_process().expect_err("deletion guard still refuses");
+        assert!(
+            refusal
+                .to_string()
+                .contains("while Antigravity CLI is running")
+        );
+        drop(running);
+        rollback_store(&failed).expect("unchanged conversation can be rolled back after shutdown");
+        assert!(!failed.target_path.exists());
+        assert!(!failed.annotation_path.exists());
+        assert!(stored_summary(&failed).unwrap().is_none());
     }
 
     #[test]

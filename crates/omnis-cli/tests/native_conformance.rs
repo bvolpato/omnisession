@@ -438,19 +438,250 @@ fn run_omp_history_probe(mut command: Command) -> Result<serde_json::Value, Stri
 
 #[test]
 #[ignore = "requires OMNI_TEST_ANTIGRAVITY_BIN"]
+#[allow(clippy::too_many_lines)]
 fn installed_antigravity_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
     fs::remove_file(fixture.antigravity.join("conversation_summaries.db"))
         .expect("remove only the fixture's synthetic Antigravity catalog");
     fs::remove_dir(&fixture.antigravity).expect("start without an initialized Antigravity profile");
     let source = fixture.write_codex_source();
-    fixture.assert_materializes(
-        &format!("codex:{CODEX_SOURCE_ID}"),
+    let source_ref = format!("codex:{CODEX_SOURCE_ID}");
+    let target = fixture.assert_materializes(
+        &source_ref,
         "antigravity",
         "OMNI_TEST_ANTIGRAVITY_BIN",
         "OMNI_ANTIGRAVITY_BIN",
         &source,
     );
+    let binary =
+        PathBuf::from(env::var_os("OMNI_TEST_ANTIGRAVITY_BIN").expect("OMNI_TEST_ANTIGRAVITY_BIN"));
+    if !antigravity_supports_acp(&binary, &fixture) {
+        return;
+    }
+
+    let session_id = target
+        .strip_prefix("antigravity:")
+        .expect("Antigravity target session ID");
+    fixture.assert_antigravity_permission_modes(&target, &binary, session_id);
+
+    let runtime_dir = fixture.root.join("xdg-runtime");
+    for directory in [
+        fixture.root.join("xdg"),
+        fixture.root.join("xdg-data"),
+        fixture.root.join("xdg-cache"),
+        runtime_dir.clone(),
+    ] {
+        fs::create_dir_all(&directory).expect("create isolated Antigravity directory");
+    }
+    set_fixture_mode(&runtime_dir, 0o700);
+
+    let live_store = fixture.home.join(".gemini/antigravity-cli");
+    let mut acp = AntigravityAcpProbe::spawn(&binary, &fixture, &runtime_dir);
+    let (_, init_response) = acp.call(
+        1,
+        "initialize",
+        &json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    assert!(
+        init_response.get("error").is_none(),
+        "Antigravity ACP initialize failed: {init_response}"
+    );
+    let (_, auth_response) = acp.call(2, "authenticate", &json!({"methodId": "gemini-api-key"}));
+    assert!(
+        auth_response.get("error").is_none(),
+        "Antigravity ACP offline authenticate failed: {auth_response}"
+    );
+    let (_, initial_list) = acp.call(3, "session/list", &json!({}));
+    assert!(
+        initial_list.get("error").is_none(),
+        "Antigravity ACP initial session/list failed: {initial_list}"
+    );
+
+    let source_before = fs::read(&source).expect("source before concurrent Antigravity import");
+    let live_import = fixture
+        .command(&source_ref, "antigravity")
+        .env("ANTIGRAVITY_CLI_HOME", &live_store)
+        .env("OMNI_ANTIGRAVITY_BIN", &binary)
+        .output()
+        .expect("import into live Antigravity CLI store while ACP server is running");
+    assert_success("antigravity", &live_import);
+    assert_eq!(
+        fs::read(&source).expect("source after concurrent Antigravity import"),
+        source_before
+    );
+    let live_target =
+        materialized_target_ref(&live_import.stdout).expect("live Antigravity target ref");
+    let live_id = live_target
+        .strip_prefix("antigravity:")
+        .expect("live Antigravity UUID");
+
+    let (_, listed) = acp.call(4, "session/list", &json!({}));
+    assert!(
+        listed.get("error").is_none(),
+        "Antigravity ACP post-import session/list failed: {listed}"
+    );
+    let listed_session = listed["result"]["sessions"]
+        .as_array()
+        .expect("ACP sessions array")
+        .iter()
+        .find(|entry| entry["sessionId"].as_str() == Some(live_id))
+        .unwrap_or_else(|| panic!("ACP session/list omitted imported session {live_id}: {listed}"));
+    assert_eq!(
+        listed_session["title"].as_str(),
+        Some(format!("Imported from {source_ref}").as_str()),
+        "Antigravity ACP session/list did not preserve imported title"
+    );
+
+    let (updates, loaded) = acp.call(
+        5,
+        "session/load",
+        &json!({"sessionId": live_id, "cwd": fixture.workspace}),
+    );
+    assert!(
+        loaded.get("error").is_none(),
+        "Antigravity ACP session/load failed: {loaded}"
+    );
+    let mut user_chunks = String::new();
+    let mut agent_chunks = String::new();
+    for notification in &updates {
+        let update = &notification["params"]["update"];
+        let Some(text) = update["content"]["text"].as_str() else {
+            continue;
+        };
+        match update["sessionUpdate"].as_str() {
+            Some("user_message_chunk") => {
+                user_chunks.push_str(text);
+                user_chunks.push('\n');
+            }
+            Some("agent_message_chunk") => {
+                agent_chunks.push_str(text);
+                agent_chunks.push('\n');
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        user_chunks.contains("OMNISESSION_ALPHA_7319"),
+        "Antigravity ACP session/load missed imported user history: {user_chunks}"
+    );
+    assert!(
+        agent_chunks.contains("Synthetic final answer"),
+        "Antigravity ACP session/load missed imported assistant history: {agent_chunks}"
+    );
+    assert!(
+        !user_chunks.contains("synthetic-value") && !agent_chunks.contains("synthetic-value"),
+        "Antigravity ACP session/load exposed redacted synthetic secret"
+    );
+}
+
+fn antigravity_supports_acp(binary: &Path, fixture: &Fixture) -> bool {
+    fixture
+        .isolated_binary_command(binary)
+        .args(["acp", "--help"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("Agent Client Protocol")
+        })
+}
+
+struct AntigravityAcpProbe {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    messages: mpsc::Receiver<io::Result<serde_json::Value>>,
+}
+
+impl AntigravityAcpProbe {
+    fn spawn(binary: &Path, fixture: &Fixture, runtime_dir: &Path) -> Self {
+        let mut command = Command::new(binary);
+        command.env_clear();
+        for variable in ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
+        command
+            .current_dir(&fixture.workspace)
+            .args([
+                "acp",
+                "--stdio",
+                "--disable-telemetry",
+                "--cloud_code_endpoint=http://127.0.0.1:1",
+            ])
+            .env("HOME", &fixture.home)
+            .env("TMPDIR", fixture.root.join("tmp"))
+            .env("TMP", fixture.root.join("tmp"))
+            .env("TEMP", fixture.root.join("tmp"))
+            .env("XDG_CONFIG_HOME", fixture.root.join("xdg"))
+            .env("XDG_DATA_HOME", fixture.root.join("xdg-data"))
+            .env("XDG_CACHE_HOME", fixture.root.join("xdg-cache"))
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env("GEMINI_API_KEY", "synthetic-offline-key")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn Antigravity ACP server");
+        let stdin = child.stdin.take().expect("Antigravity ACP stdin");
+        let stdout = child.stdout.take().expect("Antigravity ACP stdout");
+        let (sender, messages) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let parsed = match line {
+                    Ok(line) if line.trim().is_empty() => continue,
+                    Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(value) => Ok(value),
+                        Err(_) => continue,
+                    },
+                    Err(error) => Err(error),
+                };
+                if sender.send(parsed).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            messages,
+        }
+    }
+
+    fn call(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> (Vec<serde_json::Value>, serde_json::Value) {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        writeln!(self.stdin, "{request}").expect("write Antigravity ACP request");
+        self.stdin.flush().expect("flush Antigravity ACP request");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut notifications = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = self
+                .messages
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("waiting for Antigravity ACP {method}: {error}"))
+                .unwrap_or_else(|error| panic!("reading Antigravity ACP {method}: {error}"));
+            if message["id"].as_u64() == Some(id) {
+                return (notifications, message);
+            }
+            notifications.push(message);
+        }
+    }
+}
+
+impl Drop for AntigravityAcpProbe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
@@ -1498,6 +1729,33 @@ impl Fixture {
                 .chain(["--session", session_path.to_str().unwrap()])
                 .collect::<Vec<_>>();
             assert_eq!(plan["launch"]["args"], json!(expected), "OMP {mode}");
+        }
+    }
+
+    fn assert_antigravity_permission_modes(&self, target: &str, binary: &Path, session_id: &str) {
+        for (mode, prefix) in [
+            ("default", vec![]),
+            ("accept-edits", vec!["--mode", "accept-edits"]),
+            ("auto", vec!["--mode", "auto"]),
+            ("yolo", vec!["--dangerously-skip-permissions"]),
+        ] {
+            let output = self
+                .isolated_command()
+                .env("OMNI_ANTIGRAVITY_BIN", binary)
+                .args(["--json", "resume", target, "--dry-run", "--mode", mode])
+                .output()
+                .expect("plan installed Antigravity permission mode");
+            assert_successful_command("Antigravity permission mode", &output);
+            let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let expected = prefix
+                .into_iter()
+                .chain(["--conversation", session_id])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                plan["launch"]["args"],
+                json!(expected),
+                "Antigravity {mode}"
+            );
         }
     }
 

@@ -146,6 +146,7 @@ const ANTIGRAVITY: &[LaunchMode] = &[
         &["--mode", "accept-edits"],
         &["--mode", "accept-edits"],
     ),
+    mode(ModeKind::Auto, &["--mode", "auto"], &["--mode", "auto"]),
     mode(
         ModeKind::Yolo,
         &["--dangerously-skip-permissions"],
@@ -775,6 +776,38 @@ mod tests {
             assert_eq!(resolved.mode.kind, requested);
             assert_eq!(resolved.downgraded_from, None);
         }
+    }
+
+    #[test]
+    fn antigravity_auto_mode_uses_advertised_flag_and_steps_down_on_older_help() {
+        let current_help = "  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting\n\
+                            --mode                          Set the agent execution mode for this session (accept-edits, auto, plan)";
+        for (requested, expected_args) in [
+            (ModeKind::Default, &[][..]),
+            (ModeKind::AcceptEdits, &["--mode", "accept-edits"][..]),
+            (ModeKind::Auto, &["--mode", "auto"][..]),
+            (ModeKind::Yolo, &["--dangerously-skip-permissions"][..]),
+        ] {
+            let resolved = resolve(Provider::Antigravity, Some(requested), |mode| {
+                help_lists(current_help, mode)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolved.mode.kind, requested);
+            assert_eq!(resolved.mode.args, expected_args);
+            assert_eq!(resolved.downgraded_from, None);
+        }
+
+        let older_help = "  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting\n\
+                          --mode                          Set the agent execution mode for this session (accept-edits, plan)";
+        let downgraded = resolve(Provider::Antigravity, Some(ModeKind::Auto), |mode| {
+            help_lists(older_help, mode)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(downgraded.mode.kind, ModeKind::AcceptEdits);
+        assert_eq!(downgraded.mode.args, &["--mode", "accept-edits"]);
+        assert_eq!(downgraded.downgraded_from, Some(ModeKind::Auto));
     }
 
     #[test]

@@ -305,7 +305,7 @@ By default OmniSession passes no permission flags, so the target agent starts in
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `default` | No flags: the agent's own settings decide | no flag | no flag | no flag | no flag | no flag | no flag | no flag |
 | `accept-edits` | Edits apply without asking; commands still ask | `--permission-mode acceptEdits` | | `--permission-mode acceptEdits` | | `--mode accept-edits` | | |
-| `auto` | Safe actions run on their own; the agent's own review still stops risky ones | `--permission-mode auto` | `--approve-for-me` | `--permission-mode auto` | `--auto-review` | | | |
+| `auto` | Safe actions run on their own; the agent's own review still stops risky ones | `--permission-mode auto` | `--approve-for-me` | `--permission-mode auto` | `--auto-review` | `--mode auto` | | |
 | `yolo` | Nothing asks; every command runs | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--always-approve` | `--force` | `--dangerously-skip-permissions` | `--auto` | `--yolo` |
 
 - The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
