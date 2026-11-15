@@ -2337,7 +2337,7 @@ mod tests {
     #[test]
     fn import_publishes_and_rolls_back_while_antigravity_is_running() {
         use std::{
-            os::unix::fs::{PermissionsExt, symlink},
+            os::unix::fs::PermissionsExt,
             process::{Child, Command, Stdio},
             time::Instant,
         };
@@ -2352,11 +2352,27 @@ mod tests {
 
         let temporary = tempfile::tempdir().expect("temporary Antigravity home");
         let root = temporary.path().canonicalize().expect("canonical home");
+        let source = root.join("agy.rs");
         let process = root.join("agy");
-        symlink("/bin/sh", &process).expect("synthetic Antigravity process name");
+        fs::write(
+            &source,
+            "fn main() { let _ = std::io::stdin().read_line(&mut String::new()); }\n",
+        )
+        .expect("synthetic Antigravity source");
+        let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = Command::new(rustc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&process)
+            .output()
+            .expect("compile synthetic Antigravity binary");
+        assert!(
+            compiled.status.success(),
+            "compiling synthetic Antigravity binary failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
         let _running = Running(
             Command::new(&process)
-                .args(["-c", "read _"])
                 .stdin(Stdio::piped())
                 .spawn()
                 .expect("start synthetic Antigravity process"),
