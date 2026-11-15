@@ -258,7 +258,7 @@ fn materialize_store_with_verification(
     ensure_directory(&import.root)?;
     validate_optional_directory_for(&import.conversations_root, &import.root, "writing")?;
     validate_optional_directory_for(&import.annotations_root, &import.root, "writing")?;
-    let mut fresh_summary = summary_database_is_missing(import)?;
+    let fresh_summary = summary_database_is_missing(import)?;
     if !fresh_summary {
         let connection = open_summary_readonly(&import.summary_path)?;
         if summary_row(&connection, &import.target.id)?.is_some() {
@@ -284,7 +284,6 @@ fn materialize_store_with_verification(
     )?;
     let mut published_annotation = false;
     let mut published_summary = false;
-    let mut initialized_summary = None;
     let result = (|| {
         sync_directory(&import.conversations_root)?;
         write_atomic_private_file(
@@ -297,17 +296,14 @@ fn materialize_store_with_verification(
         sync_directory(&import.annotations_root)?;
         if fresh_summary {
             let temporary = build_summary_database(import)?;
-            let summary_image = fs::read(temporary.path())?;
             match temporary.persist_noclobber(&import.summary_path) {
                 Ok(_) => {
-                    initialized_summary = Some(summary_image);
                     published_summary = true;
                     sync_directory(&import.root)?;
                 }
                 Err(persist_error)
                     if persist_error.error.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
-                    fresh_summary = false;
                     validate_summary_database(import)?;
                     insert_summary_into_existing(import)?;
                     published_summary = true;
@@ -325,14 +321,6 @@ fn materialize_store_with_verification(
         Ok(())
     })();
     if let Err(error) = result {
-        if fresh_summary {
-            return rollback_fresh_profile(
-                import,
-                initialized_summary.as_deref(),
-                published_annotation,
-                error,
-            );
-        }
         return rollback_after_publish(import, published_annotation, published_summary, error);
     }
     Ok(())
@@ -428,57 +416,6 @@ fn build_summary_database(import: &AntigravityImport) -> Result<NamedTempFile> {
     validate_summary_database_at(&import.root, temporary.path())?;
     temporary.as_file().sync_all()?;
     Ok(temporary)
-}
-
-fn rollback_fresh_profile(
-    import: &AntigravityImport,
-    image: Option<&[u8]>,
-    published_annotation: bool,
-    error: anyhow::Error,
-) -> Result<()> {
-    let rollback = (|| {
-        validate_import_paths(import, "rolling back")?;
-        validate_generated_target_file(import, &import.target_path)?;
-        if published_annotation {
-            validate_generated_annotation_file(import, &import.annotation_path)?;
-        }
-        if let Some(expected_image) = image {
-            ensure_no_summary_sidecars(&import.root)?;
-            match fs::symlink_metadata(&import.summary_path) {
-                Ok(metadata)
-                    if metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && fs::read(&import.summary_path)
-                            .is_ok_and(|bytes| bytes == expected_image) =>
-                {
-                    fs::remove_file(&import.summary_path)
-                        .context("removing initialized Antigravity summaries")?;
-                    sync_directory(&import.root)?;
-                }
-                Ok(_) => bail!("refusing to remove changed initialized Antigravity summaries"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).context("checking initialized Antigravity summaries");
-                }
-            }
-        }
-        if published_annotation {
-            fs::remove_file(&import.annotation_path)
-                .context("removing unpublished Antigravity target annotation")?;
-            sync_directory(&import.annotations_root)?;
-        }
-        fs::remove_file(&import.target_path).context("removing unpublished Antigravity target")?;
-        sync_directory(&import.conversations_root)
-    })();
-    match rollback {
-        Ok(()) => Err(error),
-        Err(rollback_error) => Err(crate::transfer::rollback_failure(
-            error,
-            format!(
-                "Antigravity import failed and exact fresh-profile rollback also failed: {rollback_error}"
-            ),
-        )),
-    }
 }
 
 pub(crate) fn rollback_locked(
@@ -962,6 +899,11 @@ fn lock_root(root: &Path, configured_lock_root: Option<&Path>) -> Result<Private
 }
 
 fn stored_summary(import: &AntigravityImport) -> Result<Option<SummaryRow>> {
+    match fs::symlink_metadata(&import.summary_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("checking Antigravity summary database"),
+    }
     let connection = open_summary_readonly(&import.summary_path)?;
     summary_row(&connection, &import.target.id)
 }
@@ -1868,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_profile_failed_readback_removes_only_generated_databases_and_allows_retry() {
+    fn fresh_profile_failed_readback_retains_catalog_for_live_connections_and_allows_retry() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         let root = temporary.path().join("fresh-profile");
@@ -1877,13 +1819,17 @@ mod tests {
         let sentinel = root.join("unrelated-file");
         fs::write(&sentinel, b"synthetic unrelated data").unwrap();
         let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
+        let mut live_provider = None;
         let error = materialize_store_with_verification(&import, |import| {
             verify_materialized(import)?;
+            let connection = Connection::open(&import.summary_path)?;
+            assert!(summary_row(&connection, &import.target.id)?.is_some());
+            live_provider = Some(connection);
             bail!("synthetic read-back failure")
         })
         .expect_err("the injected read-back failure must abort publication");
         assert!(!crate::rollback_failed(&error), "{error:#}");
-        assert!(!import.summary_path.exists());
+        assert!(import.summary_path.is_file());
         assert!(!import.target_path.exists());
         assert!(!import.annotation_path.exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"synthetic unrelated data");
@@ -1901,17 +1847,36 @@ mod tests {
         );
         assert_eq!(
             fs::read_dir(&root).unwrap().count(),
-            3,
-            "temporary database and annotation images must be cleaned up"
+            4,
+            "temporary database and annotation images must be cleaned up while retaining the catalog"
         );
+        let live_provider = live_provider.expect("opened live provider connection");
+        assert!(
+            summary_row(&live_provider, &import.target.id)
+                .unwrap()
+                .is_none()
+        );
+        let mut live_row = import.summary.clone();
+        live_row.conversation_id = Uuid::new_v4().to_string();
+        insert_summary(&live_provider, &live_row).expect(
+            "retained catalog must remain writable through an existing provider connection",
+        );
+        drop(live_provider);
+
         materialize_store(&import)
-            .expect("the same generated import can retry after exact cleanup");
+            .expect("the same generated import can retry after exact row rollback");
         assert!(readback_matches(
-            &AntigravityAdapter::with_root(root)
+            &AntigravityAdapter::with_root(&root)
                 .read_session(&import.target)
                 .unwrap(),
             &import.expected_messages
         ));
+        let verify_conn = Connection::open(&import.summary_path).unwrap();
+        assert!(
+            summary_row(&verify_conn, &live_row.conversation_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
