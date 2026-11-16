@@ -1,12 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.10.2 - 2026-11-16
 
 ### Added
+
+- Show native Codex GUI names in session listings and the picker.
 
 - Support `--mode auto` when launching Antigravity CLI (`agy --mode auto`).
 
 ### Fixed
+
+- Preserve assistant replies and completed plans in cross-agent handoffs.
+
+- Preserve Codex history across compressed sessions, native forks, rollbacks, and migrated completed items, and keep native forks working while other threads write.
+- Keep cached session titles, workspaces, and search text tied to verified source revisions across partial discovery, restored files, and multiple provider homes.
+- Preserve compacted Pi and Oh My Pi history, truncated native forks, and active Claude session history during continuation.
+- Preserve task bindings and recovery handoffs after uncertain imports, verify Codex targets before fallback, and retry failed permission-mode probes on the next launch.
+- Recover Grok sessions with incomplete summaries, resolve exact OpenCode IDs outside listings, preserve fast OpenCode exports on macOS, and retain recent Antigravity steps and complete JSONL tail records.
 
 - Check local state before native imports and report incompatible state formats with upgrade guidance, avoiding a successful provider import followed by a lineage failure.
 
