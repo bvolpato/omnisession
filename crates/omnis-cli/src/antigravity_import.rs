@@ -9,7 +9,8 @@ use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use omnis_adapters::{AntigravityAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -29,17 +30,21 @@ const TRAJECTORY_TYPE_CASCADE: i64 = 4;
 const TRAJECTORY_SOURCE_CLI: i64 = 17;
 const STEP_USER_INPUT: i32 = 14;
 const STEP_PLANNER_RESPONSE: i32 = 15;
+const STEP_MCP_TOOL: i32 = 38;
 const STEP_STATUS_DONE: i32 = 3;
+const STEP_STATUS_ERROR: i32 = 7;
 const STEP_SOURCE_MODEL: i32 = 2;
 const STEP_SOURCE_USER_EXPLICIT: i32 = 4;
+const MCP_SERVER_NAME: &str = "omnisession";
 const ANTIGRAVITY_LOCK_NAMESPACE: &str = "antigravity";
 const SUMMARY_WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct AntigravityImport {
     pub target: SessionRef,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
     pub history_items: usize,
     pub tool_events: usize,
+    pub native_tool_records: usize,
     pub truncated: bool,
     root: PathBuf,
     conversations_root: PathBuf,
@@ -119,32 +124,31 @@ fn build_with_roots(
         bail!("source has no visible trajectory eligible for Antigravity import");
     }
     let history_items = trajectory.items.len();
-    let expected_messages = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
+    let native_items = native_trajectory_items(&trajectory);
+    let native_tool_records = native_items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
+    let expected_items = native_trajectory_signature(&trajectory);
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::Antigravity, &id);
     let trajectory_id = Uuid::new_v4().to_string();
     let initialization_state_id = Uuid::new_v4().to_string();
     let workspace_uri = native_path::file_uri(&canonical_cwd)?;
+    let (git_root_uri, branch_name) =
+        workspace_git_metadata(snapshot, &canonical_cwd, &workspace_uri);
     let now = Utc::now();
     let timestamp = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let document = build_database(
+    let database = build_database(
         &target.id,
         &trajectory_id,
         &initialization_state_id,
         &workspace_uri,
+        &git_root_uri,
+        &branch_name,
         now.timestamp(),
         now.timestamp_subsec_nanos(),
-        &expected_messages,
+        &native_items,
     )?;
     let summary_title = snapshot
         .title
@@ -153,15 +157,11 @@ fn build_with_roots(
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| format!("Imported from {}", snapshot.session));
     let annotation = build_title_annotation(&summary_title);
-    let last_user_input_step_index = expected_messages
-        .iter()
-        .rposition(|message| message.role == HandoffRole::User)
-        .map_or(Ok(-1), i64::try_from)?;
     let summary = SummaryRow {
         conversation_id: id.clone(),
         title: summary_title,
         preview: String::new(),
-        step_count: i64::try_from(expected_messages.len())?,
+        step_count: database.step_count,
         last_modified_time: timestamp.clone(),
         workspace_uris: serde_json::to_string(&[workspace_uri])?,
         status: String::new(),
@@ -175,7 +175,7 @@ fn build_with_roots(
         not_fully_idle: false,
         killed: false,
         last_user_input_time: timestamp,
-        last_user_input_step_index,
+        last_user_input_step_index: database.last_user_input_step_index,
         app_data_dir: "antigravity-cli".to_owned(),
         raw_summary: None,
         group_id: String::new(),
@@ -187,9 +187,10 @@ fn build_with_roots(
     let annotation_path = annotations_root.join(format!("{id}.pbtxt"));
     Ok(AntigravityImport {
         target,
-        expected_messages,
+        expected_items,
         history_items,
         tool_events: trajectory.tool_events,
+        native_tool_records,
         truncated: trajectory.truncated,
         root,
         conversations_root,
@@ -197,11 +198,32 @@ fn build_with_roots(
         summary_path,
         target_path,
         annotation_path,
-        document,
+        document: database.document,
         annotation,
         summary,
         lock_root,
     })
+}
+
+fn workspace_git_metadata(
+    snapshot: &CanonicalSnapshot,
+    canonical_cwd: &Path,
+    workspace_uri: &str,
+) -> (String, String) {
+    let git_root_uri = fs::canonicalize(&snapshot.workspace.root)
+        .ok()
+        .filter(|git_root| git_root.is_dir() && canonical_cwd.starts_with(git_root))
+        .and_then(|git_root| native_path::file_uri(&git_root).ok())
+        .unwrap_or_else(|| workspace_uri.to_owned());
+    let branch_name = snapshot
+        .workspace
+        .git
+        .branch
+        .as_deref()
+        .map(redact_secrets)
+        .filter(|branch| !branch.trim().is_empty())
+        .unwrap_or_default();
+    (git_root_uri, branch_name)
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
@@ -828,22 +850,9 @@ fn restore_staged_file(staged: &Path, original: &Path) -> std::io::Result<()> {
     fs::remove_file(staged)
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let Some(trajectory) = readback_trajectory(snapshot) else {
-        return false;
-    };
-    let actual = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
-    actual == expected
+pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
+    readback_trajectory(snapshot)
+        .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
 fn verify_materialized(import: &AntigravityImport) -> Result<()> {
@@ -855,7 +864,7 @@ fn verify_materialized(import: &AntigravityImport) -> Result<()> {
     let snapshot = AntigravityAdapter::with_root(&import.root)
         .read_session(&import.target)
         .context("reading back imported Antigravity trajectory")?;
-    if !readback_matches(&snapshot, &import.expected_messages) {
+    if !readback_matches(&snapshot, &import.expected_items) {
         bail!("Antigravity trajectory read-back did not match imported history");
     }
     Ok(())
@@ -1217,17 +1226,37 @@ fn build_title_annotation(title: &str) -> Vec<u8> {
     escaped.into_bytes()
 }
 
+struct BuiltDatabase {
+    document: Vec<u8>,
+    step_count: i64,
+    last_user_input_step_index: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_database(
     cascade_id: &str,
     trajectory_id: &str,
     initialization_state_id: &str,
     workspace_uri: &str,
+    git_root_uri: &str,
+    branch_name: &str,
     seconds: i64,
     nanos: u32,
-    messages: &[HandoffMessage],
-) -> Result<Vec<u8>> {
+    items: &[NativeTrajectoryItem],
+) -> Result<BuiltDatabase> {
+    let nanos_i32 = i32::try_from(nanos)?;
+    let total_steps = items
+        .iter()
+        .map(|item| match item {
+            NativeTrajectoryItem::Message { .. } => 1usize,
+            NativeTrajectoryItem::Tool { .. } => 2usize,
+        })
+        .sum::<usize>();
+    let base_seconds = seconds.saturating_sub(i64::try_from(total_steps.saturating_sub(1))?);
     let temporary = NamedTempFile::new().context("creating Antigravity database image")?;
     let temporary_path = temporary.into_temp_path();
+    let mut step_index = 0usize;
+    let mut last_user_input_step_index = -1i64;
     {
         let mut connection = Connection::open(&temporary_path)?;
         connection.execute_batch(CONVERSATION_SCHEMA)?;
@@ -1244,11 +1273,12 @@ fn build_database(
         let metadata = ProtoTrajectoryMetadata {
             workspaces: vec![ProtoWorkspaceMetadata {
                 workspace_folder_absolute_uri: workspace_uri.to_owned(),
-                git_root_absolute_uri: workspace_uri.to_owned(),
+                git_root_absolute_uri: git_root_uri.to_owned(),
+                branch_name: branch_name.to_owned(),
             }],
             created_at: Some(ProtoTimestamp {
                 seconds,
-                nanos: i32::try_from(nanos)?,
+                nanos: nanos_i32,
             }),
             initialization_state_id: initialization_state_id.to_owned(),
             root_conversation_id: cascade_id.to_owned(),
@@ -1259,64 +1289,234 @@ fn build_database(
             "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
             [&metadata],
         )?;
-        for (index, message) in messages.iter().enumerate() {
-            let (step_type, source, step) = match message.role {
-                HandoffRole::User => (
-                    STEP_USER_INPUT,
-                    STEP_SOURCE_USER_EXPLICIT,
-                    proto_step::Step::UserInput(ProtoUserInput {
-                        query: message.text.clone(),
-                        user_response: message.text.clone(),
-                        items: vec![ProtoTextOrScopeItem {
-                            text: message.text.clone(),
-                        }],
-                    }),
-                ),
-                HandoffRole::Assistant => (
-                    STEP_PLANNER_RESPONSE,
-                    STEP_SOURCE_MODEL,
-                    proto_step::Step::PlannerResponse(ProtoPlannerResponse {
-                        response: message.text.clone(),
-                    }),
-                ),
-            };
-            let step_seconds = seconds.saturating_add(i64::try_from(index)?);
-            let metadata = ProtoStepMetadata {
-                created_at: Some(ProtoTimestamp {
-                    seconds: step_seconds,
-                    nanos: i32::try_from(nanos)?,
-                }),
-                source,
-                execution_id: Uuid::new_v4().to_string(),
-            };
-            let metadata_bytes = metadata.encode_to_vec();
-            let payload = ProtoStep {
-                r#type: step_type,
-                status: STEP_STATUS_DONE,
-                metadata: Some(metadata),
-                step: Some(step),
-            }
-            .encode_to_vec();
-            transaction.execute(
-                "INSERT INTO steps (
-                    idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format
-                 ) VALUES (?1, ?2, ?3, false, ?4, ?5, 0)",
-                params![
-                    i64::try_from(index)?,
-                    step_type,
-                    STEP_STATUS_DONE,
-                    metadata_bytes,
-                    payload
-                ],
+        for item in items {
+            insert_native_item(
+                &transaction,
+                item,
+                base_seconds,
+                nanos_i32,
+                &mut step_index,
+                &mut last_user_input_step_index,
             )?;
         }
         transaction.commit()?;
         connection.pragma_update(None, "user_version", 1)?;
         connection.execute_batch("PRAGMA optimize;")?;
     }
-    let bytes = fs::read(&temporary_path)?;
+    let document = fs::read(&temporary_path)?;
     TempPath::close(temporary_path)?;
-    Ok(bytes)
+    Ok(BuiltDatabase {
+        document,
+        step_count: i64::try_from(step_index)?,
+        last_user_input_step_index,
+    })
+}
+
+fn make_step_metadata(
+    base_seconds: i64,
+    nanos: i32,
+    index: usize,
+    source: i32,
+    tool_call: Option<ProtoToolCall>,
+) -> Result<ProtoStepMetadata> {
+    Ok(ProtoStepMetadata {
+        created_at: Some(ProtoTimestamp {
+            seconds: base_seconds.saturating_add(i64::try_from(index)?),
+            nanos,
+        }),
+        source,
+        tool_call,
+        execution_id: Uuid::new_v4().to_string(),
+    })
+}
+
+fn insert_native_item(
+    transaction: &rusqlite::Transaction<'_>,
+    item: &NativeTrajectoryItem,
+    base_seconds: i64,
+    nanos: i32,
+    step_index: &mut usize,
+    last_user_input_step_index: &mut i64,
+) -> Result<()> {
+    match item {
+        NativeTrajectoryItem::Message {
+            role: HandoffRole::User,
+            text,
+        } => {
+            *last_user_input_step_index = i64::try_from(*step_index)?;
+            let metadata = make_step_metadata(
+                base_seconds,
+                nanos,
+                *step_index,
+                STEP_SOURCE_USER_EXPLICIT,
+                None,
+            )?;
+            insert_step(
+                transaction,
+                *step_index,
+                STEP_USER_INPUT,
+                STEP_STATUS_DONE,
+                metadata,
+                None,
+                proto_step::Step::UserInput(ProtoUserInput {
+                    query: text.clone(),
+                    user_response: text.clone(),
+                    items: vec![ProtoTextOrScopeItem { text: text.clone() }],
+                }),
+            )?;
+            *step_index += 1;
+        }
+        NativeTrajectoryItem::Message {
+            role: HandoffRole::Assistant,
+            text,
+        } => {
+            let metadata =
+                make_step_metadata(base_seconds, nanos, *step_index, STEP_SOURCE_MODEL, None)?;
+            insert_step(
+                transaction,
+                *step_index,
+                STEP_PLANNER_RESPONSE,
+                STEP_STATUS_DONE,
+                metadata,
+                None,
+                proto_step::Step::PlannerResponse(ProtoPlannerResponse {
+                    response: text.clone(),
+                    tool_calls: Vec::new(),
+                }),
+            )?;
+            *step_index += 1;
+        }
+        NativeTrajectoryItem::Tool {
+            call_id,
+            name,
+            input,
+            output,
+            is_error,
+        } => {
+            insert_native_tool_pair(
+                transaction,
+                base_seconds,
+                nanos,
+                step_index,
+                call_id,
+                name,
+                input,
+                output,
+                *is_error,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_native_tool_pair(
+    transaction: &rusqlite::Transaction<'_>,
+    base_seconds: i64,
+    nanos: i32,
+    step_index: &mut usize,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    output: &str,
+    is_error: bool,
+) -> Result<()> {
+    let tool_call = ProtoToolCall {
+        id: call_id.to_owned(),
+        name: name.to_owned(),
+        arguments_json: serde_json::to_string(input)?,
+    };
+    let call_metadata =
+        make_step_metadata(base_seconds, nanos, *step_index, STEP_SOURCE_MODEL, None)?;
+    insert_step(
+        transaction,
+        *step_index,
+        STEP_PLANNER_RESPONSE,
+        STEP_STATUS_DONE,
+        call_metadata,
+        None,
+        proto_step::Step::PlannerResponse(ProtoPlannerResponse {
+            response: String::new(),
+            tool_calls: vec![tool_call.clone()],
+        }),
+    )?;
+    *step_index += 1;
+
+    let result_metadata = make_step_metadata(
+        base_seconds,
+        nanos,
+        *step_index,
+        STEP_SOURCE_MODEL,
+        Some(tool_call.clone()),
+    )?;
+    let (status, error_details) = if is_error {
+        let message = if output.is_empty() {
+            format!("Historical tool `{name}` failed")
+        } else {
+            output.to_owned()
+        };
+        (
+            STEP_STATUS_ERROR,
+            Some(ProtoErrorDetails {
+                user_error_message: message.clone(),
+                model_error_message: message,
+                short_error: "historical_tool_failed".to_owned(),
+                full_error: output.to_owned(),
+            }),
+        )
+    } else {
+        (STEP_STATUS_DONE, None)
+    };
+    insert_step(
+        transaction,
+        *step_index,
+        STEP_MCP_TOOL,
+        status,
+        result_metadata,
+        error_details,
+        proto_step::Step::McpTool(ProtoMcpTool {
+            server_name: MCP_SERVER_NAME.to_owned(),
+            tool_call: Some(tool_call),
+            result_string: output.to_owned(),
+        }),
+    )?;
+    *step_index += 1;
+    Ok(())
+}
+
+fn insert_step(
+    transaction: &rusqlite::Transaction<'_>,
+    index: usize,
+    step_type: i32,
+    status: i32,
+    metadata: ProtoStepMetadata,
+    error_details: Option<ProtoErrorDetails>,
+    step: proto_step::Step,
+) -> Result<()> {
+    let metadata_bytes = metadata.encode_to_vec();
+    let error_bytes = error_details.as_ref().map(Message::encode_to_vec);
+    let payload = ProtoStep {
+        r#type: step_type,
+        status,
+        metadata: Some(metadata),
+        error: error_details,
+        step: Some(step),
+    }
+    .encode_to_vec();
+    transaction.execute(
+        "INSERT INTO steps (
+            idx, step_type, status, has_subtrajectory, metadata, error_details, step_payload, step_format
+         ) VALUES (?1, ?2, ?3, false, ?4, ?5, ?6, 0)",
+        params![
+            i64::try_from(index)?,
+            step_type,
+            status,
+            metadata_bytes,
+            error_bytes,
+            payload
+        ],
+    )?;
+    Ok(())
 }
 
 const CONVERSATION_SCHEMA: &str = r#"
@@ -1514,14 +1714,16 @@ struct ProtoStep {
     status: i32,
     #[prost(message, optional, tag = "5")]
     metadata: Option<ProtoStepMetadata>,
-    #[prost(oneof = "proto_step::Step", tags = "19, 20")]
+    #[prost(message, optional, tag = "31")]
+    error: Option<ProtoErrorDetails>,
+    #[prost(oneof = "proto_step::Step", tags = "19, 20, 47")]
     step: Option<proto_step::Step>,
 }
 
 mod proto_step {
     use prost::Oneof;
 
-    use super::{ProtoPlannerResponse, ProtoUserInput};
+    use super::{ProtoMcpTool, ProtoPlannerResponse, ProtoUserInput};
 
     #[derive(Clone, PartialEq, Oneof)]
     pub(super) enum Step {
@@ -1529,6 +1731,8 @@ mod proto_step {
         UserInput(ProtoUserInput),
         #[prost(message, tag = "20")]
         PlannerResponse(ProtoPlannerResponse),
+        #[prost(message, tag = "47")]
+        McpTool(ProtoMcpTool),
     }
 }
 
@@ -1546,6 +1750,8 @@ struct ProtoStepMetadata {
     created_at: Option<ProtoTimestamp>,
     #[prost(int32, tag = "3")]
     source: i32,
+    #[prost(message, optional, tag = "4")]
+    tool_call: Option<ProtoToolCall>,
     #[prost(string, tag = "12")]
     execution_id: String,
 }
@@ -1570,6 +1776,40 @@ struct ProtoTextOrScopeItem {
 struct ProtoPlannerResponse {
     #[prost(string, tag = "1")]
     response: String,
+    #[prost(message, repeated, tag = "7")]
+    tool_calls: Vec<ProtoToolCall>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoToolCall {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    arguments_json: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoMcpTool {
+    #[prost(string, tag = "1")]
+    server_name: String,
+    #[prost(message, optional, tag = "2")]
+    tool_call: Option<ProtoToolCall>,
+    #[prost(string, tag = "3")]
+    result_string: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoErrorDetails {
+    #[prost(string, tag = "1")]
+    user_error_message: String,
+    #[prost(string, tag = "2")]
+    model_error_message: String,
+    #[prost(string, tag = "3")]
+    short_error: String,
+    #[prost(string, tag = "9")]
+    full_error: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1592,6 +1832,8 @@ struct ProtoWorkspaceMetadata {
     workspace_folder_absolute_uri: String,
     #[prost(string, tag = "2")]
     git_root_absolute_uri: String,
+    #[prost(string, tag = "4")]
+    branch_name: String,
 }
 
 #[cfg(test)]
@@ -1780,7 +2022,7 @@ mod tests {
         let readback = AntigravityAdapter::with_root(temporary.path())
             .read_session(&import.target)
             .expect("Antigravity readback");
-        assert!(readback_matches(&readback, &import.expected_messages));
+        assert!(readback_matches(&readback, &import.expected_items));
         assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
         rollback_store(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
@@ -1806,7 +2048,7 @@ mod tests {
         let adapter = AntigravityAdapter::with_root(&root);
         assert!(readback_matches(
             &adapter.read_session(&import.target).unwrap(),
-            &import.expected_messages
+            &import.expected_items
         ));
         validate_summary_database(&import).expect("verified initialized schema");
         let conversation = fs::read(&import.target_path).unwrap();
@@ -1888,7 +2130,7 @@ mod tests {
             &AntigravityAdapter::with_root(&root)
                 .read_session(&import.target)
                 .unwrap(),
-            &import.expected_messages
+            &import.expected_items
         ));
         let verify_conn = Connection::open(&import.summary_path).unwrap();
         assert!(
@@ -2265,7 +2507,7 @@ mod tests {
             let readback = AntigravityAdapter::with_root(temporary.path())
                 .read_session(&first.target)
                 .expect(label);
-            assert!(readback_matches(&readback, &first.expected_messages));
+            assert!(readback_matches(&readback, &first.expected_items));
             rollback_store(&first).expect(label);
             assert!(!first.target_path.exists());
             assert!(!first.annotation_path.exists());
@@ -2326,6 +2568,115 @@ mod tests {
                 }],
             }))
         );
+    }
+
+    fn codex_test_event(
+        sequence: u64,
+        kind: EventKind,
+        payload: serde_json::Value,
+        replay_policy: ReplayPolicy,
+    ) -> OmniEvent {
+        OmniEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            event_id: Uuid::new_v4(),
+            thread_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            sequence,
+            timestamp: None,
+            source: EventSource {
+                provider: Provider::Codex,
+                native_session_id: "codex-source".to_owned(),
+                provider_version: None,
+                raw_record_type: None,
+            },
+            kind,
+            payload,
+            raw_blob_hash: None,
+            sensitivity: Sensitivity::Normal,
+            replay_policy,
+        }
+    }
+
+    #[test]
+    fn materializes_paired_tool_calls_as_native_steps_and_keeps_orphans_documentary() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let mut custom = snapshot();
+        custom.session = SessionRef::new(Provider::Codex, "codex-source");
+        custom.workspace.root.clone_from(&workspace);
+        custom.workspace.current_dir.clone_from(&workspace);
+        custom.workspace.git.branch = Some("feature/native-tools".to_owned());
+        custom.events = vec![
+            codex_test_event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "inspect workspace"}),
+                ReplayPolicy::Contextual,
+            ),
+            codex_test_event(
+                1,
+                EventKind::ToolCalled,
+                json!({"name": "exec_command", "call_id": "call_1", "arguments": {"cmd": "cargo check"}}),
+                ReplayPolicy::HistoricalOnly,
+            ),
+            codex_test_event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"name": "exec_command", "call_id": "call_1", "output": "ok"}),
+                ReplayPolicy::HistoricalOnly,
+            ),
+            codex_test_event(
+                3,
+                EventKind::ToolCalled,
+                json!({"name": "exec_command", "call_id": "call_2", "arguments": {"cmd": "false"}}),
+                ReplayPolicy::HistoricalOnly,
+            ),
+            codex_test_event(
+                4,
+                EventKind::ToolFailed,
+                json!({"name": "exec_command", "call_id": "call_2", "output": ""}),
+                ReplayPolicy::HistoricalOnly,
+            ),
+            codex_test_event(
+                5,
+                EventKind::ToolCompleted,
+                json!({"text": "orphan documentary output"}),
+                ReplayPolicy::HistoricalOnly,
+            ),
+            codex_test_event(
+                6,
+                EventKind::MessageAssistant,
+                json!({"text": "done"}),
+                ReplayPolicy::Contextual,
+            ),
+        ];
+
+        let import = build_with_root(&custom, &workspace, temporary.path().to_path_buf())
+            .expect("Antigravity import with paired tool calls");
+        assert_eq!(import.native_tool_records, 2);
+        assert_eq!(import.summary.step_count, 7);
+        materialize_store(&import).expect("materialize Antigravity import");
+
+        let readback = AntigravityAdapter::with_root(temporary.path())
+            .read_session(&import.target)
+            .expect("Antigravity readback");
+        assert!(readback_matches(&readback, &import.expected_items));
+
+        let connection = Connection::open(&import.target_path).expect("open target database");
+        let meta_bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("trajectory metadata");
+        let meta = ProtoTrajectoryMetadata::decode(meta_bytes.as_slice()).expect("decode metadata");
+        assert_eq!(meta.workspaces[0].branch_name, "feature/native-tools");
+        assert!(!meta.workspaces[0].git_root_absolute_uri.is_empty());
+
+        rollback_store(&import).expect("exact rollback");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

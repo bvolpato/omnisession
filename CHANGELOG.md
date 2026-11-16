@@ -5,6 +5,7 @@
 ### Added
 
 - Support `--mode auto` when launching Antigravity CLI (`agy --mode auto`).
+- Persist complete tool call and result pairs as native `STEP_PLANNER_RESPONSE` and `STEP_MCP_TOOL` steps named `hist_<provider>_<tool>` (with `error_details` on failed results) and record workspace Git root and branch metadata when importing sessions into Antigravity CLI.
 
 ### Fixed
 

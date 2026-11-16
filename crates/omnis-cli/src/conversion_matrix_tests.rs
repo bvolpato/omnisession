@@ -808,7 +808,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
         assert!(
             antigravity_import::readback_matches(
                 &antigravity_readback,
-                &antigravity.expected_messages
+                &antigravity.expected_items
             ),
             "{source} -> antigravity native readback"
         );
@@ -844,7 +844,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
                 Provider::Hermes,
                 documentary_messages(&hermes.expected_items),
             ),
-            (Provider::Antigravity, antigravity.expected_messages),
+            (
+                Provider::Antigravity,
+                documentary_messages(&antigravity.expected_items),
+            ),
             (Provider::CursorCli, cursor.expected_messages),
             (Provider::Pi, documentary_messages(&pi.expected_items)),
             (Provider::OhMyPi, documentary_messages(&omp.expected_items)),

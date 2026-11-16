@@ -3068,7 +3068,7 @@ fn resume_via_antigravity_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
-        0,
+        import.native_tool_records,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -3461,15 +3461,17 @@ pub(super) fn materialize_antigravity_import(
     ))?;
     let write_guard = antigravity_import::materialize(import, binary)?;
     notify_verifying_import(&import.target);
-    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
-        antigravity_import::readback_matches(&snapshot, &import.expected_messages)
+    let readback = registry.read_session(&import.target);
+    let verified = readback.as_ref().is_ok_and(|snapshot| {
+        antigravity_import::readback_matches(snapshot, &import.expected_items)
     });
     if verified {
         notify_verified_import(&import.target);
         Ok(write_guard)
     } else {
+        let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
-            anyhow!("Antigravity CLI import failed read-back verification"),
+            anyhow!("Antigravity CLI import failed read-back verification ({details})"),
             antigravity_import::rollback_locked(import, &write_guard),
             "Antigravity CLI",
         ))
