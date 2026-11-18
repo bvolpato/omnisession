@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.3 - 2026-11-18
+
+### Added
+
+- Prompt interactively on workspace mismatches during `omni fork` and `omni resume` to switch to the source workspace, continue in the current folder, or cancel, while keeping fail-closed `--allow-workspace-mismatch` behavior for non-interactive runs, `--json`, `--dry-run`, and `--materialize-only`.
+- Show selectable `Saved` and `Current` folder presets in the TUI `Choose workspace` screen (using `Up`, `Down`, or `Ctrl-S`) when the recorded workspace is a usable local directory different from the current directory.
+
 ## 0.10.2 - 2026-11-16
 
 ### Added
