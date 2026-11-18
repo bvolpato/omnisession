@@ -1,6 +1,6 @@
 {
   "name": "omnisession-website",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "private": true,
   "packageManager": "pnpm@11.1.0",
   "engines": {
