@@ -2863,6 +2863,87 @@ fn workspace_picker_reason(
     Ok(reason)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspacePreset {
+    Saved,
+    Current,
+}
+
+struct WorkspaceInputState {
+    input: String,
+    saved: Option<String>,
+    current: String,
+    message: String,
+}
+
+impl WorkspaceInputState {
+    fn new(original: Option<&Path>, target: Provider, current: &Path) -> Self {
+        let saved = usable_saved_workspace(original, target, current)
+            .map(|path| path.display().to_string());
+        let current = current.display().to_string();
+        Self {
+            input: current.clone(),
+            saved,
+            current,
+            message: String::new(),
+        }
+    }
+
+    fn selected_preset(&self) -> Option<WorkspacePreset> {
+        if self.saved.as_deref() == Some(self.input.as_str()) {
+            Some(WorkspacePreset::Saved)
+        } else if self.saved.is_some() && self.input == self.current {
+            Some(WorkspacePreset::Current)
+        } else {
+            None
+        }
+    }
+
+    fn select_saved(&mut self) -> bool {
+        let Some(saved) = self.saved.as_ref() else {
+            return false;
+        };
+        self.input.clone_from(saved);
+        self.message.clear();
+        true
+    }
+
+    fn toggle_preset(&mut self, prefer_saved_from_custom: bool) -> bool {
+        let Some(saved) = self.saved.as_ref() else {
+            return false;
+        };
+        let next = match self.selected_preset() {
+            Some(WorkspacePreset::Current) => saved,
+            None if prefer_saved_from_custom => saved,
+            Some(WorkspacePreset::Saved) | None => &self.current,
+        };
+        self.input.clone_from(next);
+        self.message.clear();
+        true
+    }
+}
+
+fn usable_saved_workspace(
+    original: Option<&Path>,
+    target: Provider,
+    current: &Path,
+) -> Option<PathBuf> {
+    let path =
+        original.filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path))?;
+    let folder = if target == Provider::CursorIde {
+        omnis_core::cursor_launch_folder(path)?
+    } else if path.is_dir() {
+        path.canonicalize().ok()?
+    } else {
+        return None;
+    };
+    let current_canonical = current.canonicalize().ok();
+    if current_canonical.as_deref() == Some(folder.as_path()) || current == folder {
+        return None;
+    }
+    Some(folder)
+}
+
 fn pick_workspace(
     source: &SessionRef,
     target: Provider,
@@ -2870,12 +2951,11 @@ fn pick_workspace(
     current: &Path,
     reason: &str,
 ) -> Result<WorkspaceOutcome> {
-    let mut input = current.display().to_string();
-    let mut message = String::new();
+    let mut state = WorkspaceInputState::new(original, target, current);
     let mut needs_render = true;
     loop {
         if needs_render {
-            render_workspace(source, original, &input, &message, reason)?;
+            render_workspace(source, original, &state, reason)?;
             needs_render = false;
         }
         let key = match event::read().context("reading workspace picker input")? {
@@ -2895,8 +2975,17 @@ fn pick_workspace(
         }
         match key.code {
             KeyCode::Esc => return Ok(WorkspaceOutcome::Back),
+            KeyCode::Up => {
+                state.toggle_preset(true);
+            }
+            KeyCode::Down => {
+                state.toggle_preset(false);
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select_saved();
+            }
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
-                let path = resolve_workspace_input(&input, current);
+                let path = resolve_workspace_input(&state.input, current);
                 let folder = if target == Provider::CursorIde {
                     omnis_core::cursor_launch_folder(&path)
                 } else if path.is_dir() {
@@ -2910,30 +2999,32 @@ fn pick_workspace(
                 if let Some(folder) = folder {
                     return Ok(WorkspaceOutcome::Selected(folder));
                 }
-                message.clear();
-                message.push_str("Folder does not exist or is not a directory.");
+                state.message.clear();
+                state
+                    .message
+                    .push_str("Folder does not exist or is not a directory.");
             }
             KeyCode::Tab => {
-                let completion = complete_directory_input(&input, current, target);
-                input = completion.value;
-                message = completion.message;
+                let completion = complete_directory_input(&state.input, current, target);
+                state.input = completion.value;
+                state.message = completion.message;
             }
             KeyCode::Backspace => {
-                input.pop();
-                message.clear();
+                state.input.pop();
+                state.message.clear();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.clear();
-                message.clear();
+                state.input.clear();
+                state.message.clear();
             }
             KeyCode::Char(character)
-                if input.chars().count() < 4096
+                if state.input.chars().count() < 4096
                     && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                input.push(character);
-                message.clear();
+                state.input.push(character);
+                state.message.clear();
             }
             _ => {}
         }
@@ -3701,16 +3792,11 @@ fn render_target(
 fn render_workspace(
     source: &SessionRef,
     original: Option<&Path>,
-    input: &str,
-    message: &str,
+    state: &WorkspaceInputState,
     reason: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
-    let original = original.map_or_else(
-        || "not recorded".to_owned(),
-        |path| path.display().to_string(),
-    );
     let mut frame = Vec::new();
     queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     queue_styled(
@@ -3727,36 +3813,63 @@ fn render_workspace(
     queue!(frame, Print("\r\n\r\n"))?;
     queue_styled(&mut frame, DetailStyle::Warning, reason)?;
     queue!(frame, Print("\r\n"))?;
-    queue_styled(
-        &mut frame,
-        DetailStyle::Muted,
-        &truncate(&format!("Saved: {original}"), width),
-    )?;
+    if let Some(saved) = state.saved.as_deref() {
+        let selected = state.selected_preset();
+        queue!(frame, Print("\r\n"))?;
+        for (preset, label, path) in [
+            (WorkspacePreset::Saved, "Saved:  ", saved),
+            (WorkspacePreset::Current, "Current:", state.current.as_str()),
+        ] {
+            let is_selected = selected == Some(preset);
+            let marker = if is_selected { "›" } else { " " };
+            let style = if is_selected {
+                DetailStyle::Selected
+            } else {
+                DetailStyle::Muted
+            };
+            let line = format!("{marker} {label} {}", safe_terminal_line(path));
+            queue_styled(&mut frame, style, &truncate(&line, width))?;
+            queue!(frame, Print("\r\n"))?;
+        }
+    } else {
+        let original = original.map_or_else(
+            || "not recorded".to_owned(),
+            |path| safe_terminal_line(&path.display().to_string()),
+        );
+        queue_styled(
+            &mut frame,
+            DetailStyle::Muted,
+            &truncate(&format!("Saved: {original}"), width),
+        )?;
+        queue!(frame, Print("\r\n"))?;
+    }
     queue!(
         frame,
-        Print("\r\n\r\n"),
+        Print("\r\n"),
         Print("Open session from folder:"),
         Print("\r\n")
     )?;
     queue_styled(
         &mut frame,
         DetailStyle::Accent,
-        &truncate(&format!("> {input}"), width),
+        &truncate(&format!("> {}", safe_terminal_line(&state.input)), width),
     )?;
     queue!(frame, Print("\r\n"))?;
-    if !message.is_empty() {
-        queue_styled(&mut frame, DetailStyle::Warning, &truncate(message, width))?;
+    if !state.message.is_empty() {
+        queue_styled(
+            &mut frame,
+            DetailStyle::Warning,
+            &truncate(&state.message, width),
+        )?;
         queue!(frame, Print("\r\n"))?;
     }
     queue!(frame, Print("\r\n"))?;
-    queue_styled(
-        &mut frame,
-        DetailStyle::Muted,
-        &truncate(
-            "Tab complete  Enter use folder  Ctrl-U clear  Esc back  Ctrl-C cancel",
-            width,
-        ),
-    )?;
+    let footer = if state.saved.is_some() {
+        "↑/↓ switch saved/current  Tab complete  Enter use folder  Ctrl-U clear  Esc back  Ctrl-C cancel"
+    } else {
+        "Tab complete  Enter use folder  Ctrl-U clear  Esc back  Ctrl-C cancel"
+    };
+    queue_styled(&mut frame, DetailStyle::Muted, &truncate(footer, width))?;
     present_frame(&frame).context("drawing workspace picker")
 }
 
@@ -9036,5 +9149,44 @@ agent = "codex"
             source_byte_count: snippet.len(),
             truncation_strategy: if complete { "none" } else { "legacy_bounded" }.to_owned(),
         }
+    }
+
+    #[test]
+    fn workspace_picker_toggles_between_usable_saved_and_current_folders() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let saved = root.path().join("saved");
+        let current = root.path().join("current");
+        let missing = root.path().join("missing");
+        fs::create_dir(&saved).expect("saved dir");
+        fs::create_dir(&current).expect("current dir");
+        let saved_canon = saved.canonicalize().expect("canonical saved");
+        let current_canon = current.canonicalize().expect("canonical current");
+
+        let mut state = WorkspaceInputState::new(Some(&saved), Provider::Claude, &current_canon);
+        assert_eq!(state.selected_preset(), Some(WorkspacePreset::Current));
+        assert_eq!(state.input, current_canon.display().to_string());
+
+        assert!(state.toggle_preset(true));
+        assert_eq!(state.selected_preset(), Some(WorkspacePreset::Saved));
+        assert_eq!(state.input, saved_canon.display().to_string());
+
+        assert!(state.toggle_preset(false));
+        assert_eq!(state.selected_preset(), Some(WorkspacePreset::Current));
+        assert_eq!(state.input, current_canon.display().to_string());
+
+        // Custom text clears preset selection, and Up / Ctrl-S still jump back to Saved.
+        state.input.push_str("/sub");
+        assert_eq!(state.selected_preset(), None);
+        assert!(state.select_saved());
+        assert_eq!(state.selected_preset(), Some(WorkspacePreset::Saved));
+
+        // Unavailable or identical saved paths do not offer a Saved toggle.
+        let missing_state =
+            WorkspaceInputState::new(Some(&missing), Provider::Claude, &current_canon);
+        assert!(missing_state.saved.is_none());
+        assert_eq!(missing_state.selected_preset(), None);
+
+        let same_state = WorkspaceInputState::new(Some(&current), Provider::Claude, &current_canon);
+        assert!(same_state.saved.is_none());
     }
 }
