@@ -84,6 +84,7 @@ mod transfer;
 mod version_gate;
 #[cfg(windows)]
 mod windows_console;
+mod workspace_choice;
 
 use launch_profile::AgentTarget;
 use provider_launch::{

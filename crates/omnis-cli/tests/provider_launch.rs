@@ -164,6 +164,182 @@ esac
 }
 
 #[cfg(unix)]
+fn write_cwd_capture_probe(path: &std::path::Path, version_output: &str) {
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n    printf '{version_output}\\n'\n    exit 0\nfi\npwd -P > \"$LAUNCH_CAPTURE/cwd\"\nprintf '%s\\n' \"$@\" > \"$LAUNCH_CAPTURE/args\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output_after_write(Command::new(path).arg("--version"))
+            .status
+            .success()
+    );
+}
+
+#[cfg(unix)]
+fn run_with_workspace_answer(
+    fixture: &Fixture,
+    cwd: &std::path::Path,
+    args: &[&str],
+    bin_env: (&str, &std::path::Path),
+    answer: Option<&str>,
+) -> Output {
+    let _ = fs::remove_file(fixture.capture.join("cwd"));
+    let _ = fs::remove_file(fixture.capture.join("args"));
+    let mut command = fixture.command();
+    command
+        .current_dir(cwd)
+        .env(bin_env.0, bin_env.1)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if answer.is_some() {
+        command
+            .env("OMNI_TEST_WORKSPACE_CHOICES", "1")
+            .stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut child = command.spawn().expect("launch omni");
+    if let Some(answer) = answer {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(answer.as_bytes())
+            .expect("write choice");
+    }
+    child.wait_with_output().expect("wait for omni")
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_mismatch_prompt_switches_or_stays_for_cross_provider_fork() {
+    let fixture = Fixture::new();
+    let other = fixture.root.join("other-workspace");
+    fs::create_dir(&other).unwrap();
+    let other = fs::canonicalize(&other).unwrap();
+
+    let claude_probe = fixture.root.join("claude-cwd-capture");
+    write_cwd_capture_probe(&claude_probe, "0.0.0 (Claude Code)");
+    let bin = ("OMNI_CLAUDE_BIN", claude_probe.as_path());
+    let args = ["fork", SOURCE_ID, "--in", "claude"];
+
+    // Non-interactive callers still fail closed without prompting.
+    let non_interactive = run_with_workspace_answer(&fixture, &other, &args, bin, None);
+    assert!(!non_interactive.status.success());
+    let stderr = String::from_utf8_lossy(&non_interactive.stderr);
+    assert!(stderr.contains("--allow-workspace-mismatch"));
+    assert!(!stderr.contains("[s] switch to source workspace"));
+    assert!(!fixture.capture.join("cwd").exists());
+
+    // Choosing `s` switches cwd to the source workspace and preserves repository match.
+    let switch = run_with_workspace_answer(&fixture, &other, &args, bin, Some("s\n"));
+    assert!(
+        switch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+    assert!(String::from_utf8_lossy(&switch.stderr).contains("[s] switch to source workspace"));
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("cwd"))
+            .unwrap()
+            .trim(),
+        fixture.workspace.to_str().unwrap()
+    );
+    assert!(String::from_utf8_lossy(&switch.stdout).contains("Repository match: true"));
+
+    // Choosing `c` continues in the current folder without requiring `--allow-workspace-mismatch`.
+    let stay = run_with_workspace_answer(&fixture, &other, &args, bin, Some("c\n"));
+    assert!(
+        stay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stay.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("cwd"))
+            .unwrap()
+            .trim(),
+        other.to_str().unwrap()
+    );
+    assert!(String::from_utf8_lossy(&stay.stdout).contains("Repository match: false"));
+
+    // Choosing `q` cancels without launching.
+    let cancel = run_with_workspace_answer(&fixture, &other, &args, bin, Some("q\n"));
+    assert!(!cancel.status.success());
+    assert!(!fixture.capture.join("cwd").exists());
+
+    // When the source directory no longer exists, only continuing in current folder is offered.
+    fs::remove_dir_all(&fixture.workspace).unwrap();
+    let missing = run_with_workspace_answer(&fixture, &other, &args, bin, Some("s\nc\n"));
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(missing_stderr.contains("Source workspace is unavailable:"));
+    assert!(!missing_stderr.contains("[s] switch to source workspace"));
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("cwd"))
+            .unwrap()
+            .trim(),
+        other.to_str().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_mismatch_prompt_switches_or_stays_for_native_codex_resume() {
+    let fixture = Fixture::new();
+    let other = fixture.root.join("other-workspace");
+    fs::create_dir(&other).unwrap();
+    let other = fs::canonicalize(&other).unwrap();
+
+    let codex_probe = fixture.root.join("codex-cwd-capture");
+    write_cwd_capture_probe(&codex_probe, "codex-cli 0.167.1");
+    let bin = ("OMNI_CODEX_BIN", codex_probe.as_path());
+    let args = ["resume", SOURCE_ID, "--in", "codex", "--no-fork"];
+
+    let switch = run_with_workspace_answer(&fixture, &other, &args, bin, Some("s\n"));
+    assert!(
+        switch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("cwd"))
+            .unwrap()
+            .trim(),
+        fixture.workspace.to_str().unwrap()
+    );
+    assert!(String::from_utf8_lossy(&switch.stdout).contains("Repository match: true"));
+
+    let stay = run_with_workspace_answer(&fixture, &other, &args, bin, Some("c\n"));
+    assert!(
+        stay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stay.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("cwd"))
+            .unwrap()
+            .trim(),
+        other.to_str().unwrap()
+    );
+    assert!(String::from_utf8_lossy(&stay.stdout).contains("Repository match: false"));
+    let stay_args = fs::read_to_string(fixture.capture.join("args")).unwrap();
+    assert!(
+        stay_args.lines().any(|arg| arg == "--cd"),
+        "continuing in current folder should pass `--cd .`: {stay_args}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn native_fork_and_cached_resume_follow_the_directory_at_the_bookmark() {
     const CHILD: &str = "22222222-2222-4222-8222-222222222222";
