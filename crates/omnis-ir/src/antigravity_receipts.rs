@@ -20,6 +20,9 @@ enum Schema {
     User,
     Item,
     Reply,
+    ToolCall,
+    McpTool,
+    ErrorDetails,
 }
 
 enum Value<'a> {
@@ -65,7 +68,12 @@ impl Schema {
             (Self::Step, 5, 2) => Some(FieldType::Message(Self::Metadata)),
             (Self::Step, 19, 2) => Some(FieldType::Message(Self::User)),
             (Self::Step, 20, 2) => Some(FieldType::Message(Self::Reply)),
+            (Self::Step, 31, 2) => Some(FieldType::Message(Self::ErrorDetails)),
+            (Self::Step, 47, 2) => Some(FieldType::Message(Self::McpTool)),
             (Self::Metadata, 1, 2) => Some(FieldType::Message(Self::Timestamp)),
+            (Self::Metadata, 4, 2) | (Self::Reply, 7, 2) | (Self::McpTool, 2, 2) => {
+                Some(FieldType::Message(Self::ToolCall))
+            }
             (Self::User, 3, 2) => Some(FieldType::Message(Self::Item)),
             (Self::Step, 1 | 4, 0)
             | (Self::Metadata, 3, 0)
@@ -73,6 +81,9 @@ impl Schema {
             | (Self::User, 1 | 2, 2)
             | (Self::Item, 1, 2)
             | (Self::Reply, 1 | 8, 2)
+            | (Self::ToolCall, 1..=3, 2)
+            | (Self::McpTool, 1 | 3, 2)
+            | (Self::ErrorDetails, 1..=3 | 9, 2)
             | (Self::Metadata, 12, 2) => Some(FieldType::Scalar),
             _ => None,
         }
@@ -84,7 +95,7 @@ impl<'a> Node<'a> {
         let mut fields = Vec::new();
         let mut ordered = true;
         let mut prior_tag = 0;
-        let mut seen = 0u32;
+        let mut seen = 0u64;
         while !wire.is_empty() {
             *remaining = remaining.checked_sub(1)?;
             let start = wire;
@@ -94,14 +105,14 @@ impl<'a> Node<'a> {
             prior_tag = tag;
             let kind = key & 7;
             let child = schema.field(tag, kind)?;
-            let bit = 1u32 << tag;
+            let bit = 1u64.checked_shl(tag)?;
             // Singular duplicates and competing message bodies have order-dependent meaning.
-            if seen & bit != 0 && !(matches!(schema, Schema::User) && tag == 3) {
+            if seen & bit != 0 && !matches!((schema, tag), (Schema::User, 3) | (Schema::Reply, 7)) {
                 return None;
             }
             if matches!(schema, Schema::Step)
-                && matches!(tag, 19 | 20)
-                && seen & ((1 << 19) | (1 << 20)) != 0
+                && matches!(tag, 19 | 20 | 47)
+                && seen & ((1u64 << 19) | (1u64 << 20) | (1u64 << 47)) != 0
             {
                 return None;
             }
@@ -225,5 +236,23 @@ mod tests {
             receipt(&first).unwrap().canonical,
             receipt(&reversed).unwrap().canonical
         );
+    }
+
+    #[test]
+    fn mcp_tool_and_error_details_tags_above_31_canonicalize_field_order() {
+        let canonical = [
+            8, 38, 32, 7, 250, 1, 6, 10, 1, b'u', 18, 1, b'm', 250, 2, 10, 10, 3, b's', b'r', b'v',
+            26, 3, b'o', b'u', b't',
+        ];
+        let reversed = [
+            250, 2, 10, 26, 3, b'o', b'u', b't', 10, 3, b's', b'r', b'v', 250, 1, 6, 18, 1, b'm',
+            10, 1, b'u', 32, 7, 8, 38,
+        ];
+        assert_eq!(
+            receipt(&canonical).unwrap().canonical,
+            receipt(&reversed).unwrap().canonical
+        );
+        // Competing oneof body with McpTool (tag 47) and PlannerResponse (tag 20) is rejected.
+        assert!(receipt(&[8, 38, 162, 1, 0, 250, 2, 0]).is_none());
     }
 }

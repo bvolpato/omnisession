@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Persist complete tool call and result pairs as native `STEP_PLANNER_RESPONSE` and `STEP_MCP_TOOL` steps named `hist_<provider>_<tool>` (with `error_details` on failed results) and record workspace Git root and branch metadata when importing sessions into Antigravity CLI.
+
 ## 0.10.3 - 2026-11-18
 
 ### Added

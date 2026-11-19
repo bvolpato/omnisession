@@ -802,7 +802,7 @@ mod tests {
                     15,
                     Some(proto_step::Step::PlannerResponse(ProtoPlannerResponse {
                         response: "synthetic answer".to_owned(),
-                        modified_response: String::new(),
+                        ..ProtoPlannerResponse::default()
                     })),
                 ),
                 synthetic_step(21, None),

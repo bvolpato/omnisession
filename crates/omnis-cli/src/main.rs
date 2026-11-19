@@ -4953,7 +4953,14 @@ fn inspect_import_stats(
         Provider::Antigravity => resolved_provider_binary(target)
             .and_then(|binary| antigravity_import::ensure_supported(&binary))
             .and_then(|_| antigravity_import::build(snapshot, project))
-            .map(|import| (import.truncated, import.tool_events, 0, false)),
+            .map(|import| {
+                (
+                    import.truncated,
+                    import.tool_events,
+                    import.native_tool_records,
+                    false,
+                )
+            }),
         Provider::Pi | Provider::OhMyPi => resolved_provider_binary(target)
             .and_then(|binary| pi_import::ensure_supported_for(target, &binary))
             .and_then(|_| pi_import::build_for(target, snapshot, project))

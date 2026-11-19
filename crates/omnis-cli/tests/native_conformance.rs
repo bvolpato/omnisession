@@ -572,6 +572,73 @@ fn installed_antigravity_round_trips_isolated_synthetic_history() {
         !user_chunks.contains("synthetic-value") && !agent_chunks.contains("synthetic-value"),
         "Antigravity ACP session/load exposed redacted synthetic secret"
     );
+
+    let claude_source = fixture.write_claude_source();
+    let claude_before = fs::read(&claude_source).expect("Claude source before import");
+    let claude_ref = format!("claude:{CLAUDE_SOURCE_ID}");
+    let claude_import = fixture
+        .command(&claude_ref, "antigravity")
+        .env("ANTIGRAVITY_CLI_HOME", &live_store)
+        .env("OMNI_ANTIGRAVITY_BIN", &binary)
+        .output()
+        .expect("import paired Claude tool history into live Antigravity CLI store");
+    assert_success("antigravity", &claude_import);
+    assert_eq!(
+        fs::read(&claude_source).expect("Claude source after import"),
+        claude_before
+    );
+    let claude_target =
+        materialized_target_ref(&claude_import.stdout).expect("Antigravity paired-tool target ref");
+    let claude_id = claude_target
+        .strip_prefix("antigravity:")
+        .expect("Antigravity paired-tool UUID");
+    let claude_db = live_store
+        .join("conversations")
+        .join(format!("{claude_id}.db"));
+    let connection =
+        rusqlite::Connection::open(&claude_db).expect("open Antigravity paired-tool database");
+    let mcp_steps: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM steps WHERE step_type = 38 AND status = 3",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count native Antigravity MCP tool steps");
+    assert_eq!(
+        mcp_steps, 1,
+        "expected one native Antigravity MCP tool step"
+    );
+    drop(connection);
+
+    let (tool_updates, tool_loaded) = acp.call(
+        6,
+        "session/load",
+        &json!({"sessionId": claude_id, "cwd": fixture.workspace}),
+    );
+    assert!(
+        tool_loaded.get("error").is_none(),
+        "Antigravity ACP session/load with native tool steps failed: {tool_loaded}"
+    );
+    let mut tool_user_chunks = String::new();
+    let mut tool_agent_chunks = String::new();
+    for notification in &tool_updates {
+        let update = &notification["params"]["update"];
+        let Some(text) = update["content"]["text"].as_str() else {
+            continue;
+        };
+        match update["sessionUpdate"].as_str() {
+            Some("user_message_chunk") => tool_user_chunks.push_str(text),
+            Some("agent_message_chunk") => tool_agent_chunks.push_str(text),
+            _ => {}
+        }
+    }
+    assert!(tool_user_chunks.contains("Synthetic opening question"));
+    assert!(tool_agent_chunks.contains("Synthetic final answer"));
+    assert!(
+        !tool_user_chunks.contains("synthetic-value")
+            && !tool_agent_chunks.contains("synthetic-value"),
+        "Antigravity ACP session/load exposed redacted tool result secret"
+    );
 }
 
 fn antigravity_supports_acp(binary: &Path, fixture: &Fixture) -> bool {
@@ -1018,9 +1085,12 @@ fn real_native_sources_round_trip_to_isolated_targets() {
         let imported_snapshot_output =
             run_private_command(&mut imported_readback, "imported bundle read-back");
         assert_private_command_success("imported bundle read-back", &imported_snapshot_output);
-        let imported_snapshot: CanonicalSnapshot =
-            serde_json::from_slice(&imported_snapshot_output.stdout)
-                .unwrap_or_else(|_| panic!("imported bundle returned invalid read-back metadata"));
+        let _: CanonicalSnapshot = serde_json::from_slice(&imported_snapshot_output.stdout)
+            .unwrap_or_else(|_| panic!("imported bundle returned invalid read-back metadata"));
+        let exported_bundle: omnis_ir::PortableBundle =
+            serde_json::from_slice(&fs::read(&bundle).expect("read exported portable bundle"))
+                .expect("exported portable bundle JSON");
+        let imported_snapshot = exported_bundle.snapshot;
         let expected = import_trajectory(&imported_snapshot);
         assert!(
             !expected.items.is_empty(),
@@ -1142,7 +1212,7 @@ fn real_readback_comparison(
 ) -> (bool, usize, usize) {
     if matches!(
         target,
-        "claude" | "grok" | "hermes" | "pi" | "omp" | "opencode"
+        "claude" | "grok" | "hermes" | "pi" | "omp" | "opencode" | "antigravity"
     ) {
         let expected = native_trajectory_signature(expected);
         let actual = actual.map(native_trajectory_signature);
