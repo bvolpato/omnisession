@@ -1797,7 +1797,7 @@ fn push_database_steps_with_limits(
         };
         decoded += 1;
         let mut event = database_step_event(step, &payload);
-        unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
+        unsupported += usize::from(event.opaque);
         let bytes = estimated_event_bytes(&event.payload);
         if bytes <= remaining_history {
             remaining_history -= bytes;
@@ -1862,7 +1862,7 @@ fn push_ordered_steps(
         if missing_before
             || row != position
             || oldest_ambiguous_row.is_none_or(|oldest| row <= oldest)
-            || event.replay_policy == ReplayPolicy::HistoricalOnly
+            || event.opaque
         {
             prefix_end.get_or_insert_with(|| builder.checkpoint());
         }
@@ -1911,7 +1911,7 @@ fn record_database_proof(
     index: i64,
     wire: &[u8],
 ) {
-    let opaque = event.replay_policy == ReplayPolicy::HistoricalOnly;
+    let opaque = event.opaque;
     let namespace = builder.database_step_namespace(index, opaque);
     let raw = uuid::Uuid::new_v5(&namespace, wire);
     event.hash = Some(raw);
@@ -1945,6 +1945,9 @@ pub(super) fn mark_unverified_database(builder: &mut EventBuilder, reason: &str)
     );
 }
 
+const STEP_STATUS_DONE: i32 = 3;
+const STEP_STATUS_ERROR: i32 = 7;
+
 struct DatabaseStepEvent {
     hash: Option<uuid::Uuid>,
     kind: EventKind,
@@ -1952,23 +1955,31 @@ struct DatabaseStepEvent {
     timestamp: Option<DateTime<Utc>>,
     replay_policy: ReplayPolicy,
     record_type: String,
+    opaque: bool,
 }
 
+type DecodedStepFields = (EventKind, Value, ReplayPolicy, String, bool);
+
 fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
-    let timestamp = step
-        .metadata
-        .and_then(|metadata| metadata.created_at)
+    let metadata = step.metadata;
+    let timestamp = metadata
         .as_ref()
+        .and_then(|metadata| metadata.created_at.as_ref())
         .and_then(proto_timestamp);
-    let opaque = || {
+    let metadata_tool_call = metadata.and_then(|metadata| metadata.tool_call);
+    let error = step.error;
+    let status = step.status;
+    let step_type = step.r#type;
+    let opaque = || -> DecodedStepFields {
         (
             EventKind::ProviderEvent,
-            json!({"status": step.status.to_string(), "step_payload_base64": STANDARD.encode(wire)}),
+            json!({"status": status.to_string(), "step_payload_base64": STANDARD.encode(wire)}),
             ReplayPolicy::HistoricalOnly,
-            format!("STEP_TYPE_{}", step.r#type),
+            format!("STEP_TYPE_{step_type}"),
+            true,
         )
     };
-    let (kind, payload, replay_policy, record_type) = match step.step {
+    let (kind, payload, replay_policy, record_type, is_opaque) = match step.step {
         Some(proto_step::Step::UserInput(input)) => {
             let text = user_input_text(&input);
             let query = antigravity_user_request(&text);
@@ -1980,27 +1991,17 @@ fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
                     json!({"text": query}),
                     ReplayPolicy::Contextual,
                     "USER_INPUT".to_owned(),
+                    false,
                 )
             }
         }
         Some(proto_step::Step::PlannerResponse(response)) => {
-            let text = if response.modified_response.is_empty() {
-                response.response
-            } else {
-                response.modified_response
-            };
-            if text.is_empty() {
-                opaque()
-            } else {
-                (
-                    EventKind::MessageAssistant,
-                    json!({"text": text}),
-                    ReplayPolicy::Contextual,
-                    "PLANNER_RESPONSE".to_owned(),
-                )
-            }
+            planner_response_step_event(response).unwrap_or_else(opaque)
         }
-        _ => opaque(),
+        Some(proto_step::Step::McpTool(mcp)) => {
+            mcp_tool_step_event(mcp, metadata_tool_call, status, error).unwrap_or_else(opaque)
+        }
+        None => opaque(),
     };
     DatabaseStepEvent {
         hash: None,
@@ -2009,7 +2010,97 @@ fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
         timestamp,
         replay_policy,
         record_type,
+        opaque: is_opaque,
     }
+}
+
+fn planner_response_step_event(response: ProtoPlannerResponse) -> Option<DecodedStepFields> {
+    let text = if response.modified_response.is_empty() {
+        response.response
+    } else {
+        response.modified_response
+    };
+    if !text.is_empty() {
+        return Some((
+            EventKind::MessageAssistant,
+            json!({"text": text}),
+            ReplayPolicy::Contextual,
+            "PLANNER_RESPONSE".to_owned(),
+            false,
+        ));
+    }
+    let [call] = response.tool_calls.as_slice() else {
+        return None;
+    };
+    if call.id.trim().is_empty() || call.name.trim().is_empty() {
+        return None;
+    }
+    let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&call.arguments_json) else {
+        return None;
+    };
+    Some((
+        EventKind::ToolCalled,
+        json!({
+            "call_id": call.id,
+            "name": call.name,
+            "input": input,
+        }),
+        ReplayPolicy::HistoricalOnly,
+        "PLANNER_RESPONSE".to_owned(),
+        false,
+    ))
+}
+
+fn mcp_tool_step_event(
+    mcp: ProtoMcpTool,
+    metadata_tool_call: Option<ProtoToolCall>,
+    status: i32,
+    error: Option<ProtoErrorDetails>,
+) -> Option<DecodedStepFields> {
+    if !matches!(status, STEP_STATUS_DONE | STEP_STATUS_ERROR) {
+        return None;
+    }
+    let call = mcp.tool_call.or(metadata_tool_call)?;
+    if call.id.trim().is_empty() || call.name.trim().is_empty() {
+        return None;
+    }
+    let is_error = status == STEP_STATUS_ERROR;
+    let output = if !mcp.result_string.is_empty() {
+        mcp.result_string
+    } else if is_error {
+        error
+            .map(|details| {
+                if details.short_error == "historical_tool_failed" {
+                    details.full_error
+                } else if !details.model_error_message.is_empty() {
+                    details.model_error_message
+                } else {
+                    details.user_error_message
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut payload = json!({
+        "call_id": call.id,
+        "name": call.name,
+        "output": output,
+    });
+    if !mcp.server_name.is_empty() {
+        payload["server_name"] = json!(mcp.server_name);
+    }
+    Some((
+        if is_error {
+            EventKind::ToolFailed
+        } else {
+            EventKind::ToolCompleted
+        },
+        payload,
+        ReplayPolicy::HistoricalOnly,
+        "MCP_TOOL".to_owned(),
+        false,
+    ))
 }
 
 /// Antigravity CLI writes `query`. The desktop app leaves it empty and stores typed text in
@@ -2036,14 +2127,16 @@ pub(crate) struct ProtoStep {
     pub(crate) status: i32,
     #[prost(message, optional, tag = "5")]
     pub(crate) metadata: Option<ProtoStepMetadata>,
-    #[prost(oneof = "proto_step::Step", tags = "19, 20")]
+    #[prost(message, optional, tag = "31")]
+    pub(crate) error: Option<ProtoErrorDetails>,
+    #[prost(oneof = "proto_step::Step", tags = "19, 20, 47")]
     pub(crate) step: Option<proto_step::Step>,
 }
 
 pub(crate) mod proto_step {
     use prost::Oneof;
 
-    use super::{ProtoPlannerResponse, ProtoUserInput};
+    use super::{ProtoMcpTool, ProtoPlannerResponse, ProtoUserInput};
 
     #[derive(Clone, PartialEq, Oneof)]
     pub(crate) enum Step {
@@ -2051,6 +2144,8 @@ pub(crate) mod proto_step {
         UserInput(ProtoUserInput),
         #[prost(message, tag = "20")]
         PlannerResponse(ProtoPlannerResponse),
+        #[prost(message, tag = "47")]
+        McpTool(ProtoMcpTool),
     }
 }
 
@@ -2060,6 +2155,8 @@ pub(crate) struct ProtoStepMetadata {
     pub(crate) created_at: Option<ProtoTimestamp>,
     #[prost(int32, tag = "3")]
     pub(crate) source: i32,
+    #[prost(message, optional, tag = "4")]
+    pub(crate) tool_call: Option<ProtoToolCall>,
     #[prost(string, tag = "12")]
     pub(crate) execution_id: String,
 }
@@ -2090,26 +2187,62 @@ pub(crate) struct ProtoTextOrScopeItem {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoToolCall {
+    #[prost(string, tag = "1")]
+    pub(crate) id: String,
+    #[prost(string, tag = "2")]
+    pub(crate) name: String,
+    #[prost(string, tag = "3")]
+    pub(crate) arguments_json: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(crate) struct ProtoPlannerResponse {
     #[prost(string, tag = "1")]
     pub(crate) response: String,
+    #[prost(message, repeated, tag = "7")]
+    pub(crate) tool_calls: Vec<ProtoToolCall>,
     #[prost(string, tag = "8")]
     pub(crate) modified_response: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoMcpTool {
+    #[prost(string, tag = "1")]
+    pub(crate) server_name: String,
+    #[prost(message, optional, tag = "2")]
+    pub(crate) tool_call: Option<ProtoToolCall>,
+    #[prost(string, tag = "3")]
+    pub(crate) result_string: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoErrorDetails {
+    #[prost(string, tag = "1")]
+    pub(crate) user_error_message: String,
+    #[prost(string, tag = "2")]
+    pub(crate) model_error_message: String,
+    #[prost(string, tag = "3")]
+    pub(crate) short_error: String,
+    #[prost(string, tag = "9")]
+    pub(crate) full_error: String,
 }
 
 #[cfg(test)]
 pub(crate) fn synthetic_step(step_type: i32, step: Option<proto_step::Step>) -> ProtoStep {
     ProtoStep {
         r#type: step_type,
-        status: 3,
+        status: STEP_STATUS_DONE,
         metadata: Some(ProtoStepMetadata {
             created_at: Some(ProtoTimestamp {
                 seconds: 1_785_240_000,
                 nanos: 0,
             }),
             source: 0,
+            tool_call: None,
             execution_id: String::new(),
         }),
+        error: None,
         step,
     }
 }
@@ -2250,7 +2383,7 @@ mod tests {
                     15,
                     Some(proto_step::Step::PlannerResponse(ProtoPlannerResponse {
                         response: "answer".to_owned(),
-                        modified_response: String::new(),
+                        ..ProtoPlannerResponse::default()
                     })),
                 ),
             ],
@@ -2757,5 +2890,93 @@ mod tests {
             ..ProtoUserInput::default()
         };
         assert_eq!(user_input_text(&input), "first second");
+    }
+
+    #[test]
+    fn reads_native_mcp_tool_calls_without_marking_history_unsupported() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let database = temporary.path().join("conversation.db");
+        let ok_call = super::ProtoToolCall {
+            id: "omni_000000000001".to_owned(),
+            name: "hist_codex_exec_command".to_owned(),
+            arguments_json: r#"{"cmd":"git status"}"#.to_owned(),
+        };
+        let err_call = super::ProtoToolCall {
+            id: "omni_000000000002".to_owned(),
+            name: "hist_codex_exec_command".to_owned(),
+            arguments_json: r#"{"cmd":"false"}"#.to_owned(),
+        };
+        let mut failed_step = synthetic_step(
+            38,
+            Some(proto_step::Step::McpTool(super::ProtoMcpTool {
+                server_name: "omnisession".to_owned(),
+                tool_call: Some(err_call.clone()),
+                result_string: String::new(),
+            })),
+        );
+        failed_step.status = super::STEP_STATUS_ERROR;
+        failed_step.error = Some(super::ProtoErrorDetails {
+            user_error_message: "Tool failed".to_owned(),
+            model_error_message: String::new(),
+            short_error: "Tool failed".to_owned(),
+            full_error: String::new(),
+        });
+
+        write_steps_database(
+            &database,
+            &[
+                synthetic_step(
+                    15,
+                    Some(proto_step::Step::PlannerResponse(ProtoPlannerResponse {
+                        tool_calls: vec![ok_call.clone()],
+                        ..ProtoPlannerResponse::default()
+                    })),
+                ),
+                synthetic_step(
+                    38,
+                    Some(proto_step::Step::McpTool(super::ProtoMcpTool {
+                        server_name: "omnisession".to_owned(),
+                        tool_call: Some(ok_call),
+                        result_string: "clean".to_owned(),
+                    })),
+                ),
+                synthetic_step(
+                    15,
+                    Some(proto_step::Step::PlannerResponse(ProtoPlannerResponse {
+                        tool_calls: vec![err_call],
+                        ..ProtoPlannerResponse::default()
+                    })),
+                ),
+                failed_step,
+            ],
+        );
+
+        let session = SessionRef::new(
+            Provider::Antigravity,
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let mut builder = EventBuilder::new(session.provider, &session.id);
+        let (decoded, coverage) =
+            push_database_steps(temporary.path(), &database, &mut builder, 4).unwrap();
+        assert_eq!((decoded, coverage.omitted), (4, 0));
+        let snapshot = builder.snapshot(session, None, None, None, Utc::now());
+        assert_eq!(snapshot.events.len(), 4);
+        assert_eq!(snapshot.events[0].kind, EventKind::ToolCalled);
+        assert_eq!(
+            snapshot.events[0].payload["name"],
+            "hist_codex_exec_command"
+        );
+        assert_eq!(snapshot.events[1].kind, EventKind::ToolCompleted);
+        assert_eq!(snapshot.events[1].payload["output"], "clean");
+        assert_eq!(snapshot.events[2].kind, EventKind::ToolCalled);
+        assert_eq!(snapshot.events[3].kind, EventKind::ToolFailed);
+        assert_eq!(snapshot.events[3].payload["output"], "Tool failed");
+        assert!(!omnis_core::import_conversation(&snapshot).truncated);
+        assert_eq!(
+            super::AntigravityAdapter::database_step_proof(&snapshot)
+                .unwrap()
+                .len(),
+            4
+        );
     }
 }
