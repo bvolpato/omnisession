@@ -20,6 +20,7 @@ use super::provider_compatibility::{
     CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
 };
 use super::recovery::{ImportSource, write_temp_handoff};
+use super::workspace_choice::{self, WorkspaceChoice, WorkspacePrompt};
 use super::{
     AdapterRegistry, CanonicalSnapshot, Context, DELETE_PROVIDERS, FidelityReport, ForkArgs,
     IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result, ResumeArgs,
@@ -72,6 +73,59 @@ pub(super) fn resume(
     resume_request(registry, args, json_output, task_binding, &request)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorkspacePromptState {
+    interactive: bool,
+    chosen: Option<WorkspaceChoice>,
+}
+
+impl WorkspacePromptState {
+    fn new(args: &ResumeArgs, json_output: bool, chosen: Option<WorkspaceChoice>) -> Self {
+        Self {
+            interactive: !json_output
+                && !args.dry_run
+                && !args.materialize_only
+                && workspace_choice::can_ask(),
+            chosen,
+        }
+    }
+
+    const fn non_interactive() -> Self {
+        Self {
+            interactive: false,
+            chosen: None,
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        source_display: Option<&Path>,
+        can_use_source: bool,
+        current: &Path,
+    ) -> Result<Option<WorkspaceChoice>> {
+        if let Some(choice) = self.chosen
+            && (choice != WorkspaceChoice::Source || can_use_source)
+        {
+            return Ok(Some(choice));
+        }
+        if !self.interactive {
+            return Ok(None);
+        }
+        let source_text =
+            source_display.map(|path| safe_terminal_line(&path.display().to_string()));
+        let current_text = safe_terminal_line(&current.display().to_string());
+        #[cfg(windows)]
+        crate::provider_launch::release_codex_identity();
+        let choice = workspace_choice::ask(WorkspacePrompt {
+            source: source_text.as_deref(),
+            can_use_source,
+            current: &current_text,
+        })?;
+        self.chosen = Some(choice);
+        Ok(Some(choice))
+    }
+}
+
 fn resume_request(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
@@ -79,12 +133,25 @@ fn resume_request(
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
 ) -> Result<()> {
+    resume_request_with_workspace(registry, args, json_output, task_binding, request, None)
+}
+
+fn resume_request_with_workspace(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    json_output: bool,
+    task_binding: Option<&BindingRecord>,
+    request: &ResolvedResumeRequest,
+    initial_workspace_choice: Option<WorkspaceChoice>,
+) -> Result<()> {
     #[cfg(windows)]
     let _identity = crate::provider_launch::codex_identity_scope();
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
     codex_import::check_continuation_target(request.agent_target(), &request.source)?;
+    let mut workspace_prompt =
+        WorkspacePromptState::new(args, json_output, initial_workspace_choice);
     let mut restore_source =
         requires_import_for_native_resume(registry, &request.source, request.agent_target())?;
     // `switch` sets no_fork to prefer the bound session. The picker lets the user explicitly
@@ -100,7 +167,14 @@ fn resume_request(
         );
     }
     if can_resume_without_snapshot(request) && !restore_source {
-        match resume_native_without_snapshot(registry, args, task_binding, request, json_output) {
+        match resume_native_without_snapshot(
+            registry,
+            args,
+            task_binding,
+            request,
+            json_output,
+            &mut workspace_prompt,
+        ) {
             Err(error) if error.is::<CodexLaunchMismatch>() => {
                 if request.resume_in_place && (task_binding.is_none() || require_original) {
                     let source = safe_terminal_line(&request.source.to_string());
@@ -122,6 +196,7 @@ fn resume_request(
             task_binding,
             request,
             restore_source,
+            &mut workspace_prompt,
         ) {
             // The user closed whatever blocked the import and asked for another try. The source
             // is read again: closing its agent may have flushed the session's last records.
@@ -138,6 +213,7 @@ fn resume_from_snapshot(
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
     restore_source: bool,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<()> {
     let materialize_fork = requires_materialized_fork(request);
     let source = &request.source;
@@ -166,8 +242,13 @@ fn resume_from_snapshot(
         progress_line("Checking workspace state...")?;
     }
     let current = continuation_caller_directory(source.provider == Provider::Codex)?;
-    let (process_directory, matches) =
-        resume_workspace(&read, request, &current, args.allow_workspace_mismatch)?;
+    let (process_directory, matches) = resume_workspace(
+        &read,
+        request,
+        &current,
+        args.allow_workspace_mismatch,
+        workspace_prompt,
+    )?;
     let project = profile_workspace(
         request.agent_target(),
         &process_directory,
@@ -206,6 +287,7 @@ fn resume_from_snapshot(
         mode_args: &mode_args,
         picker_selection: request.picker_selection.as_ref(),
         profile: request.profile,
+        workspace_choice: workspace_prompt.chosen,
         recovery_file: Cell::default(),
     };
     let result = continue_in_target(&context, materialize_fork, request.picked_target);
@@ -534,12 +616,31 @@ pub(super) fn can_materialize_target(
         })
 }
 
+#[cfg(test)]
 pub(super) fn resume_project(
     source: &SessionRef,
     snapshot: &CanonicalSnapshot,
     current: &Path,
     allow_workspace_mismatch: bool,
     selection: Option<&session_picker::PickerSelection>,
+) -> Result<PathBuf> {
+    resume_project_with_prompt(
+        source,
+        snapshot,
+        current,
+        allow_workspace_mismatch,
+        selection,
+        &mut WorkspacePromptState::non_interactive(),
+    )
+}
+
+fn resume_project_with_prompt(
+    source: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    current: &Path,
+    allow_workspace_mismatch: bool,
+    selection: Option<&session_picker::PickerSelection>,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<PathBuf> {
     if let Some(selection) = selection.filter(|selection| {
         selection.workspace.replacement().is_some()
@@ -559,6 +660,25 @@ pub(super) fn resume_project(
         }
         return selected_workspace(snapshot, selection);
     }
+    if selection.is_none() {
+        let recorded = (!snapshot.workspace.root.as_os_str().is_empty())
+            .then_some(snapshot.workspace.root.as_path());
+        let usable_source = recorded
+            .filter(|path| {
+                path.is_absolute()
+                    && !omnis_core::may_reach_network(path)
+                    && !is_cursor_workspace_file(snapshot.session.provider, path)
+            })
+            .and_then(|path| omnis_core::canonicalize_path(path).ok())
+            .filter(|path| path.is_dir());
+        match workspace_prompt.resolve(recorded, usable_source.is_some(), current)? {
+            Some(WorkspaceChoice::Source) => {
+                return usable_source.context("source session workspace no longer exists");
+            }
+            Some(WorkspaceChoice::Current) => return Ok(current.to_path_buf()),
+            Some(WorkspaceChoice::Cancel) | None => {}
+        }
+    }
     bail!(
         "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
         safe_terminal_line(&snapshot.workspace.root.display().to_string()),
@@ -571,6 +691,7 @@ fn resume_workspace(
     request: &ResolvedResumeRequest,
     current: &Path,
     allow_workspace_mismatch: bool,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<(PathBuf, bool)> {
     let selection = request.picker_selection.as_ref();
     if request.source.provider == Provider::Codex {
@@ -579,11 +700,12 @@ fn resume_workspace(
             Some(selection) => selected_native_workspace(selection, directory.as_deref(), current)?,
             None => current.to_path_buf(),
         };
-        let (project, matches) = codex_continuation_directory(
+        let (project, matches, _) = codex_continuation_directory(
             directory.as_deref(),
             &target,
             selection,
             allow_workspace_mismatch,
+            workspace_prompt,
         )?;
         let matches = matches
             && super::codex_repository_matches(&read.snapshot, directory.as_deref(), &project)?;
@@ -593,20 +715,22 @@ fn resume_workspace(
         && request.source.provider == Provider::CursorIde
         && request.target == Provider::CursorIde
     {
-        return cursor_session_workspace(
+        return cursor_session_workspace_with_prompt(
             request.target,
             Some(&read.snapshot.workspace.root),
             current,
             allow_workspace_mismatch,
             selection,
+            workspace_prompt,
         );
     }
-    let project = resume_project(
+    let project = resume_project_with_prompt(
         &request.source,
         &read.snapshot,
         current,
         allow_workspace_mismatch,
         selection,
+        workspace_prompt,
     )?;
     let matches = if selection.is_some_and(|choice| choice.workspace.replacement().is_some())
         && !(request.source.provider == Provider::Imported
@@ -628,11 +752,13 @@ fn resume_native_without_snapshot(
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
     json_output: bool,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<()> {
     if args.materialize_only && request.target != Provider::Codex {
         bail!("`--materialize-only` requires a supported native import");
     }
-    let (project, repository_matches) = native_resume_workspace(registry, request, args)?;
+    let (project, repository_matches) =
+        native_resume_workspace(registry, request, args, workspace_prompt)?;
     let mode_args = |directory: &Path| {
         launch_mode_args(request.agent_target(), request.mode, directory, json_output)
     };
@@ -668,6 +794,7 @@ fn resume_native_without_snapshot(
             plan,
             mode_args,
             args.allow_workspace_mismatch,
+            workspace_prompt,
             |file| omnis_store::CodexWorkspace::discovery_index(Some(file)).ok(),
         )?
     } else {
@@ -802,6 +929,7 @@ fn resume_opencode_v2_fork(
     task_binding: Option<&BindingRecord>,
 ) -> Result<()> {
     let binary = resolved_provider_binary(Provider::OpenCode)?;
+    check_transfer_state()?;
     print_fidelity(report)?;
     flush_stdout()?;
     let operation = "OpenCode native fork";
@@ -919,6 +1047,7 @@ fn native_resume_workspace(
     registry: &AdapterRegistry,
     request: &ResolvedResumeRequest,
     args: &ResumeArgs,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<(PathBuf, bool)> {
     let current = continuation_caller_directory(request.target == Provider::Codex)?;
     if request.target != Provider::CursorCli {
@@ -958,12 +1087,13 @@ fn native_resume_workspace(
             .project_path
     };
     if request.target == Provider::CursorCli {
-        return cursor_session_workspace(
+        return cursor_session_workspace_with_prompt(
             request.target,
             recorded.as_deref(),
             &current,
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
+            workspace_prompt,
         );
     }
     let matches = recorded
@@ -971,6 +1101,25 @@ fn native_resume_workspace(
         .is_some_and(|recorded| workspace_paths_match(recorded, &current));
     if matches || args.allow_workspace_mismatch {
         return Ok((current, matches));
+    }
+    if request.picker_selection.is_none() {
+        let usable_source = recorded
+            .as_deref()
+            .filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path))
+            .and_then(|path| omnis_core::canonicalize_path(path).ok())
+            .filter(|path| path.is_dir());
+        match workspace_prompt.resolve(recorded.as_deref(), usable_source.is_some(), &current)? {
+            Some(WorkspaceChoice::Source) => {
+                let source_dir =
+                    usable_source.context("source session workspace no longer exists")?;
+                let matches = recorded
+                    .as_deref()
+                    .is_some_and(|folder| workspace_paths_match(folder, &source_dir));
+                return Ok((source_dir, matches));
+            }
+            Some(WorkspaceChoice::Current) => return Ok((current, false)),
+            Some(WorkspaceChoice::Cancel) | None => {}
+        }
     }
     let recorded = recorded.context("source session has no recorded workspace")?;
     bail!(
@@ -987,6 +1136,24 @@ pub(super) fn cursor_session_workspace(
     current: &Path,
     allow_workspace_mismatch: bool,
     selection: Option<&session_picker::PickerSelection>,
+) -> Result<(PathBuf, bool)> {
+    cursor_session_workspace_with_prompt(
+        provider,
+        recorded,
+        current,
+        allow_workspace_mismatch,
+        selection,
+        &mut WorkspacePromptState::non_interactive(),
+    )
+}
+
+fn cursor_session_workspace_with_prompt(
+    provider: Provider,
+    recorded: Option<&Path>,
+    current: &Path,
+    allow_workspace_mismatch: bool,
+    selection: Option<&session_picker::PickerSelection>,
+    workspace_prompt: &mut WorkspacePromptState,
 ) -> Result<(PathBuf, bool)> {
     let local_workspace = |path: &Path| -> Result<Option<PathBuf>> {
         Ok(omnis_core::local_cursor_workspace_path(path)?
@@ -1048,6 +1215,24 @@ pub(super) fn cursor_session_workspace(
     }
     if allow_workspace_mismatch {
         return Ok((current.to_owned(), repository_matches));
+    }
+    if selection.is_none() {
+        let can_use_source = stored.zip(physical.as_deref()).is_some();
+        match workspace_prompt.resolve(stored.or(recorded), can_use_source, current)? {
+            Some(WorkspaceChoice::Source) => {
+                let (stored, physical) = stored
+                    .zip(physical)
+                    .context("the recorded Cursor workspace is unavailable")?;
+                let open_path = if provider == Provider::CursorIde {
+                    stored.to_path_buf()
+                } else {
+                    physical
+                };
+                return Ok((open_path, true));
+            }
+            Some(WorkspaceChoice::Current) => return Ok((current.to_owned(), repository_matches)),
+            Some(WorkspaceChoice::Cancel) | None => {}
+        }
     }
     bail!(
         "the recorded Cursor workspace is unavailable or outside this worktree. To allow a different workspace, run `omni resume <session> --no-fork --allow-workspace-mismatch`"
@@ -1134,6 +1319,7 @@ fn codex_native_launch(
     mut plan: LaunchPlan,
     mode_args: impl FnOnce(&Path) -> Result<Vec<String>>,
     allow_workspace_mismatch: bool,
+    workspace_prompt: &mut WorkspacePromptState,
     cached_workspace: impl FnOnce(uuid::Uuid) -> Option<omnis_store::CodexWorkspaceIndex>,
 ) -> Result<(LaunchPlan, bool)> {
     let source = &request.source;
@@ -1169,15 +1355,16 @@ fn codex_native_launch(
     )?;
     let workspace = directories.workspace;
     let startup = directories.startup;
-    let (directory, matches) = codex_continuation_directory(
+    let (directory, matches, used_caller_override) = codex_continuation_directory(
         workspace.as_deref(),
         project,
         selection,
         allow_workspace_mismatch,
+        workspace_prompt,
     )?;
     let override_dir = selection
         .is_some_and(|selection| selection.workspace.replacement().is_some())
-        || (selection.is_none() && allow_workspace_mismatch);
+        || used_caller_override;
     let startup_matches = codex_startup_matches(startup.as_deref(), &directory);
     let effective = profile_workspace(target, &directory, allow_workspace_mismatch)?;
     let matches = if effective.as_os_str() == directory.as_os_str() {
@@ -1352,11 +1539,29 @@ fn codex_continuation_directory(
     project: &Path,
     selection: Option<&session_picker::PickerSelection>,
     allow_workspace_mismatch: bool,
-) -> Result<(PathBuf, bool)> {
+    workspace_prompt: &mut WorkspacePromptState,
+) -> Result<(PathBuf, bool, bool)> {
     let chosen = selection.and_then(|selection| selection.workspace.replacement());
     let use_caller = selection.is_none() && allow_workspace_mismatch;
     let matches = codex_directory_matches(workspace, project);
     if !matches && chosen.is_none() && !use_caller {
+        if selection.is_none() {
+            let usable_source = workspace
+                .filter(|dir| dir.is_absolute() && !omnis_core::may_reach_network(dir))
+                .and_then(|dir| omnis_core::canonicalize_path(dir).ok())
+                .filter(|dir| dir.is_dir());
+            match workspace_prompt.resolve(workspace, usable_source.is_some(), project)? {
+                Some(WorkspaceChoice::Source) => {
+                    let directory =
+                        usable_source.context("selected Codex working directory is unavailable")?;
+                    return Ok((directory, true, false));
+                }
+                Some(WorkspaceChoice::Current) => {
+                    return Ok((project.to_path_buf(), false, true));
+                }
+                Some(WorkspaceChoice::Cancel) | None => {}
+            }
+        }
         let workspace = workspace.context(
             "source session has no verified workspace; use `--allow-workspace-mismatch` to choose the current workspace",
         )?;
@@ -1371,7 +1576,7 @@ fn codex_continuation_directory(
     }
     let selected = chosen.or(workspace.filter(|_| matches && !use_caller));
     let Some(directory) = selected else {
-        return Ok((project.to_path_buf(), matches));
+        return Ok((project.to_path_buf(), matches, use_caller));
     };
     let directory = omnis_core::canonicalize_path(directory)
         .context("selected Codex working directory is unavailable")?;
@@ -1379,7 +1584,7 @@ fn codex_continuation_directory(
         directory.is_dir() && workspace_paths_match(&directory, project),
         "selected Codex working directory is outside the verified workspace or is not a directory"
     );
-    Ok((directory, matches))
+    Ok((directory, matches, use_caller))
 }
 
 struct CodexLaunchDirectories {
@@ -1482,6 +1687,8 @@ struct ResumeContext<'a> {
     picker_selection: Option<&'a session_picker::PickerSelection>,
     /// The launch profile that starts `target`, or `None` for the agent itself.
     profile: Option<&'static LaunchProfile>,
+    /// Workspace mismatch choice already made at the terminal, if any.
+    workspace_choice: Option<WorkspaceChoice>,
     recovery_file: Cell<Option<NamedTempFile>>,
 }
 
@@ -1935,12 +2142,13 @@ fn fork_in_source(context: &ResumeContext<'_>) -> Result<()> {
         }),
         picked_target: true,
     };
-    resume_request(
+    resume_request_with_workspace(
         context.registry,
         context.args,
         context.json_output,
         context.task_binding,
         &request,
+        context.workspace_choice,
     )
 }
 
@@ -1971,6 +2179,7 @@ fn handoff_workspace_warning(context: &ResumeContext<'_>) -> Result<Option<&'sta
             None
         } else if context.source.provider != Provider::Codex
             && (context.args.allow_workspace_mismatch
+                || context.workspace_choice == Some(WorkspaceChoice::Current)
                 || context
                     .picker_selection
                     .is_some_and(|selection| selection.workspace.replacement().is_some()))
@@ -2132,6 +2341,11 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
 fn notify_stdout(message: fmt::Arguments<'_>) {
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{message}").and_then(|()| stdout.flush());
+}
+
+fn check_transfer_state() -> Result<()> {
+    Store::open_default().context("opening OmniSession state before native transfer")?;
+    Ok(())
 }
 
 fn record_import_lineage(
@@ -2429,6 +2643,7 @@ fn resume_via_codex_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Codex");
@@ -2530,6 +2745,7 @@ fn resume_via_opencode_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("OpenCode");
@@ -2594,6 +2810,7 @@ fn resume_via_claude_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Claude");
@@ -2677,6 +2894,7 @@ fn resume_via_grok_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Grok");
@@ -2757,6 +2975,7 @@ fn resume_via_hermes_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Hermes");
@@ -2837,6 +3056,7 @@ fn resume_via_cursor_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Cursor CLI");
@@ -2918,6 +3138,7 @@ fn resume_via_pi_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install(name);
@@ -2999,6 +3220,7 @@ fn resume_via_cursor_ide_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Cursor IDE");
@@ -3089,6 +3311,7 @@ fn resume_via_antigravity_import(
         return Ok(());
     }
 
+    check_transfer_state()?;
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Antigravity CLI");
@@ -3862,6 +4085,7 @@ mod tests {
             plan,
             |_| Ok(Vec::new()),
             false,
+            &mut super::WorkspacePromptState::non_interactive(),
             |_| None,
         )
     }

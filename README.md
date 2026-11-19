@@ -240,6 +240,8 @@ If a Codex session changed directories, a full read records the workspace of its
 
 The picker checks for releases in the background. The footer shows the installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows the executable path. Package-manager installs still update through their manager.
 
+If OmniSession reports that its state was written by a newer version, keep the existing state and upgrade the executable or return to the compatible source build that created it. A release and a newer source build can report the same package version while supporting different state formats. Native imports check state compatibility before creating a target session. Native-import previews and direct in-place native resume do not require writable local state.
+
 If the picker looks empty, `omni doctor` reports this-workspace vs all-workspace counts and any discovery notes. Press `Tab` for every workspace, or list without the current-project filter:
 
 ```sh

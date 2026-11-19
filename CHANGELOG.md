@@ -4,10 +4,34 @@
 
 ### Added
 
-- Support `--mode auto` when launching Antigravity CLI (`agy --mode auto`).
 - Persist complete tool call and result pairs as native `STEP_PLANNER_RESPONSE` and `STEP_MCP_TOOL` steps named `hist_<provider>_<tool>` (with `error_details` on failed results) and record workspace Git root and branch metadata when importing sessions into Antigravity CLI.
 
+## 0.10.3 - 2026-11-18
+
+### Added
+
+- Prompt interactively on workspace mismatches during `omni fork` and `omni resume` to switch to the source workspace, continue in the current folder, or cancel, while keeping fail-closed `--allow-workspace-mismatch` behavior for non-interactive runs, `--json`, `--dry-run`, and `--materialize-only`.
+- Show selectable `Saved` and `Current` folder presets in the TUI `Choose workspace` screen (using `Up`, `Down`, or `Ctrl-S`) when the recorded workspace is a usable local directory different from the current directory.
+
+## 0.10.2 - 2026-11-16
+
+### Added
+
+- Show native Codex GUI names in session listings and the picker.
+
+- Support `--mode auto` when launching Antigravity CLI (`agy --mode auto`).
+
 ### Fixed
+
+- Preserve assistant replies and completed plans in cross-agent handoffs.
+
+- Preserve Codex history across compressed sessions, native forks, rollbacks, and migrated completed items, and keep native forks working while other threads write.
+- Keep cached session titles, workspaces, and search text tied to verified source revisions across partial discovery, restored files, and multiple provider homes.
+- Preserve compacted Pi and Oh My Pi history, truncated native forks, and active Claude session history during continuation.
+- Preserve task bindings and recovery handoffs after uncertain imports, verify Codex targets before fallback, and retry failed permission-mode probes on the next launch.
+- Recover Grok sessions with incomplete summaries, resolve exact OpenCode IDs outside listings, preserve fast OpenCode exports on macOS, and retain recent Antigravity steps and complete JSONL tail records.
+
+- Check local state before native imports and report incompatible state formats with upgrade guidance, avoiding a successful provider import followed by a lineage failure.
 
 - Allow importing sessions into Antigravity CLI while `agy` is running, while keeping active-writer exclusion on rollback and native session deletion.
 - Support Antigravity CLI `conversation_summaries.db` schema versions 2 and 3 (including WAL mode) without migrating existing databases.

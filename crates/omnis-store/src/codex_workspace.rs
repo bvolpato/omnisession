@@ -273,7 +273,10 @@ fn with_index<T>(read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(database_error)?;
     if format > crate::STORE_FORMAT {
-        return Err(StoreError::NewerStoreFormat);
+        return Err(StoreError::NewerStoreFormat {
+            found: format,
+            supported: crate::STORE_FORMAT,
+        });
     }
     if format < 2 {
         snapshot
