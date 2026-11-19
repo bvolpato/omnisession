@@ -2672,6 +2672,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("trajectory metadata");
+        drop(connection);
         let meta = ProtoTrajectoryMetadata::decode(meta_bytes.as_slice()).expect("decode metadata");
         assert_eq!(meta.workspaces[0].branch_name, "feature/native-tools");
         assert!(!meta.workspaces[0].git_root_absolute_uri.is_empty());
