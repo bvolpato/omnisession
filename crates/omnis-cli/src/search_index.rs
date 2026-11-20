@@ -4296,9 +4296,9 @@ mod tests {
             json!({"info":{"id":id},"num_messages":1}).to_string(),
         )
         .unwrap();
-        let update = |owner: &str| {
+        let update = |owner: &str, text: &str| {
             json!({"params":{"sessionId":owner,"update":{
-                "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"healthy"}
+                "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
             }}})
             .to_string()
         };
@@ -4309,13 +4309,17 @@ mod tests {
             root.path().join("sessions"),
         ));
         let before = store.observe_selected_session(&session).unwrap();
-        fs::write(&updates, update("00000000-1111-4222-8333-444444444444")).unwrap();
+        fs::write(
+            &updates,
+            update("00000000-1111-4222-8333-444444444444", "foreign-owner"),
+        )
+        .unwrap();
         let error = registry
             .index_session(&session, Some(&summary), u64::MAX)
             .err()
             .unwrap();
 
-        fs::write(&updates, update(id)).unwrap();
+        fs::write(&updates, update(id, "healthy")).unwrap();
         let row = registry
             .find_native_session(Provider::Grok, id)
             .unwrap()

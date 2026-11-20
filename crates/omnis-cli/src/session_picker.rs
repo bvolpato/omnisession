@@ -2933,11 +2933,11 @@ fn usable_saved_workspace(
     let folder = if target == Provider::CursorIde {
         omnis_core::cursor_launch_folder(path)?
     } else if path.is_dir() {
-        path.canonicalize().ok()?
+        omnis_core::canonicalize_path(path).ok()?
     } else {
         return None;
     };
-    let current_canonical = current.canonicalize().ok();
+    let current_canonical = omnis_core::canonicalize_path(current).ok();
     if current_canonical.as_deref() == Some(folder.as_path()) || current == folder {
         return None;
     }
@@ -2990,7 +2990,7 @@ fn pick_workspace(
                     omnis_core::cursor_launch_folder(&path)
                 } else if path.is_dir() {
                     Some(
-                        path.canonicalize()
+                        omnis_core::canonicalize_path(&path)
                             .context("resolving selected workspace")?,
                     )
                 } else {
@@ -9159,8 +9159,8 @@ agent = "codex"
         let missing = root.path().join("missing");
         fs::create_dir(&saved).expect("saved dir");
         fs::create_dir(&current).expect("current dir");
-        let saved_canon = saved.canonicalize().expect("canonical saved");
-        let current_canon = current.canonicalize().expect("canonical current");
+        let saved_canon = omnis_core::canonicalize_path(&saved).expect("canonical saved");
+        let current_canon = omnis_core::canonicalize_path(&current).expect("canonical current");
 
         let mut state = WorkspaceInputState::new(Some(&saved), Provider::Claude, &current_canon);
         assert_eq!(state.selected_preset(), Some(WorkspacePreset::Current));

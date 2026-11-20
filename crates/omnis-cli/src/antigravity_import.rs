@@ -114,7 +114,7 @@ fn build_with_roots(
     if !cwd.is_absolute() {
         bail!("Antigravity native import requires an absolute workspace path");
     }
-    let canonical_cwd = fs::canonicalize(cwd)
+    let canonical_cwd = omnis_core::canonicalize_path(cwd)
         .with_context(|| format!("canonicalizing Antigravity workspace `{}`", cwd.display()))?;
     if !canonical_cwd.is_dir() {
         bail!("Antigravity native import workspace is not a directory");
@@ -210,16 +210,28 @@ fn workspace_git_metadata(
     canonical_cwd: &Path,
     workspace_uri: &str,
 ) -> (String, String) {
-    let git_root_uri = fs::canonicalize(&snapshot.workspace.root)
-        .ok()
-        .filter(|git_root| git_root.is_dir() && canonical_cwd.starts_with(git_root))
-        .and_then(|git_root| native_path::file_uri(&git_root).ok())
-        .unwrap_or_else(|| workspace_uri.to_owned());
-    let branch_name = snapshot
+    let source_root = snapshot
         .workspace
         .git
-        .branch
+        .worktree
         .as_deref()
+        .unwrap_or(&snapshot.workspace.root);
+    let matched_root = (!source_root.as_os_str().is_empty()
+        && !omnis_core::may_reach_network(source_root))
+    .then(|| omnis_core::canonicalize_path(source_root).ok())
+    .flatten()
+    .filter(|git_root| {
+        git_root.is_dir()
+            && canonical_cwd.starts_with(git_root)
+            && omnis_core::workspace_root(canonical_cwd)
+                .is_ok_and(|target_root| target_root == *git_root)
+    });
+    let git_root_uri = matched_root
+        .as_deref()
+        .and_then(|git_root| native_path::file_uri(git_root).ok())
+        .unwrap_or_else(|| workspace_uri.to_owned());
+    let branch_name = matched_root
+        .and(snapshot.workspace.git.branch.as_deref())
         .map(redact_secrets)
         .filter(|branch| !branch.trim().is_empty())
         .unwrap_or_default();
@@ -2678,6 +2690,38 @@ mod tests {
         assert!(!meta.workspaces[0].git_root_absolute_uri.is_empty());
 
         rollback_store(&import).expect("exact rollback");
+    }
+
+    #[test]
+    fn workspace_git_metadata_does_not_leak_across_workspaces_or_parent_dirs() {
+        let temporary = tempfile::tempdir().expect("temporary workspace root");
+        let parent = omnis_core::canonicalize_path(temporary.path()).expect("canonical temp root");
+        let source_repo = parent.join("repo-a");
+        let other_repo = parent.join("repo-b");
+        let nested_repo = parent.join("nested-repo");
+        for dir in [&source_repo, &other_repo, &nested_repo] {
+            fs::create_dir(dir).expect("create workspace");
+        }
+        let mut custom = snapshot();
+        custom.workspace.root.clone_from(&source_repo);
+        custom.workspace.current_dir.clone_from(&source_repo);
+        custom.workspace.git.branch = Some("feature/source-only".to_owned());
+
+        // Cross-workspace import into another directory must not copy the source branch.
+        let other_uri = native_path::file_uri(&other_repo).expect("other uri");
+        let (git_root_uri, branch_name) = workspace_git_metadata(&custom, &other_repo, &other_uri);
+        assert_eq!(git_root_uri, other_uri);
+        assert!(branch_name.is_empty());
+
+        // Importing from a non-git parent directory into a nested directory must not treat the
+        // parent as the nested directory's git root.
+        custom.workspace.root = parent;
+        custom.workspace.git.branch = Some("stale-parent-branch".to_owned());
+        let nested_uri = native_path::file_uri(&nested_repo).expect("nested uri");
+        let (nested_git_root, nested_branch) =
+            workspace_git_metadata(&custom, &nested_repo, &nested_uri);
+        assert_eq!(nested_git_root, nested_uri);
+        assert!(nested_branch.is_empty());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
