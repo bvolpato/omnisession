@@ -114,7 +114,7 @@ fn build_with_roots(
     if !cwd.is_absolute() {
         bail!("Antigravity native import requires an absolute workspace path");
     }
-    let canonical_cwd = fs::canonicalize(cwd)
+    let canonical_cwd = omnis_core::canonicalize_path(cwd)
         .with_context(|| format!("canonicalizing Antigravity workspace `{}`", cwd.display()))?;
     if !canonical_cwd.is_dir() {
         bail!("Antigravity native import workspace is not a directory");
