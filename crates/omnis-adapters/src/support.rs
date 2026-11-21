@@ -1198,6 +1198,9 @@ fn open_snapshot(directory: TempDir) -> Result<Option<SqliteSnapshot>> {
     ) else {
         return Ok(None);
     };
+    let _ = connection.pragma_update(None, "cache_size", -64 * 1024);
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    let _ = connection.pragma_update(None, "mmap_size", 1024_i64 * 1024 * 1024);
     let integrity = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
         .unwrap_or_default();

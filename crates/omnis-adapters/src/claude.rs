@@ -72,12 +72,15 @@ impl ClaudeAdapter {
         let Some(root) = self.projects_root.as_deref() else {
             return ClaudeFiles::default();
         };
-        // Subagent logs and tool results outnumber transcripts, so skip them before the budgets apply.
+        // Subagent logs, tool results, memory, and workflow artifacts outnumber transcripts, so skip them before the budgets apply.
         let (paths, limited) = nested_file_inventory(root, 8, &|path, is_dir| {
             if is_dir {
-                return path
-                    .file_name()
-                    .is_none_or(|name| name != "subagents" && name != "tool-results");
+                return path.file_name().is_none_or(|name| {
+                    !matches!(
+                        name.to_str(),
+                        Some("subagents" | "tool-results" | "memory" | "workflows")
+                    )
+                });
             }
             path.extension()
                 .is_some_and(|extension| extension == "jsonl")

@@ -120,6 +120,7 @@ struct CodexFileScan {
     // Native filename verification checks these link targets before authorizing an in-place resume.
     active_links: Vec<PathBuf>,
     ids: OnceLock<HashMap<String, Vec<usize>>>,
+    canonical_home: Option<PathBuf>,
     skipped_directories: bool,
 }
 
@@ -238,7 +239,14 @@ impl CodexFileScan {
     ) -> Result<Option<SelectedRollout>> {
         if let Some(row) = row
             && !matches!(self.candidates.get(id).map(Vec::as_slice), Some([i]) if row.ordinary_path_is(&self.files[*i]))
-            && let Some(file) = row.resolve(home, id, self.paths(id), self.notes.is_empty())?
+            && let Some(file) = row.resolve_cached(
+                home,
+                self.canonical_home.as_deref(),
+                id,
+                self.paths(id),
+                self.notes.is_empty(),
+                cache.as_deref_mut(),
+            )?
         {
             return Ok(Some(file.into()));
         }
@@ -1777,6 +1785,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         active_entries_complete,
         active_links,
         ids: OnceLock::new(),
+        canonical_home: fs::canonicalize(home).ok(),
         skipped_directories: unreadable_dirs != 0 || depth_limited_dirs != 0,
     }
 }
@@ -2285,6 +2294,7 @@ impl CodexSession {
             git: self.git.clone(),
             cli_version: self.cli_version.clone(),
             history_mode: self.history_mode,
+            current_header: rollout_cache::CachedCurrentHeader::Unverified,
             history_base: self.history_base,
             subagent_history_start: self.subagent_history_start,
             is_subagent: self.is_subagent,
