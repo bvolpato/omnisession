@@ -488,6 +488,49 @@ fn is_automount_root(name: &str) -> bool {
         .any(|root| name.eq_ignore_ascii_case(root))
 }
 
+pub(crate) struct RequestedWorkspace {
+    reach: PathReach,
+    canonical: PathBuf,
+    root: Option<PathBuf>,
+}
+
+impl RequestedWorkspace {
+    pub(crate) fn new(requested: &Path) -> Self {
+        let reach = path_reach(requested);
+        let canonical = canonicalize_path(requested).unwrap_or_else(|_| requested.to_path_buf());
+        let root = workspace_root(&canonical).ok();
+        Self {
+            reach,
+            canonical,
+            root,
+        }
+    }
+
+    pub(crate) fn matches_recorded(&self, recorded: &Path, raw_requested: &Path) -> bool {
+        let resolvable = match path_reach(recorded) {
+            PathReach::Local => true,
+            PathReach::Network(location) => {
+                matches!(&self.reach, PathReach::Network(current) if *current == location)
+            }
+            PathReach::Unresolved => false,
+        };
+        if !resolvable {
+            // `Path` equality would fold `//server` into `/server`, so compare the exact spelling.
+            return recorded.as_os_str() == raw_requested.as_os_str();
+        }
+        let recorded = canonicalize_path(recorded).unwrap_or_else(|_| recorded.to_path_buf());
+        if recorded == self.canonical {
+            return true;
+        }
+        let Some(requested_root) = self.root.as_deref() else {
+            return false;
+        };
+        // A repository root always contains its members, so skip spawning Git for outside paths.
+        recorded.starts_with(requested_root)
+            && workspace_root(&recorded).is_ok_and(|recorded_root| recorded_root == requested_root)
+    }
+}
+
 /// Reports whether two paths identify the same workspace.
 ///
 /// Existing paths are canonicalized first. Paths within the same Git worktree
