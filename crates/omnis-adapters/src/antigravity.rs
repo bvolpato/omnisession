@@ -801,6 +801,46 @@ impl ProviderAdapter for AntigravityAdapter {
         Ok(sessions)
     }
 
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        if validate_id(id).is_err() {
+            return Ok(None);
+        }
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
+        let database = root.join(SUMMARY_DATABASE);
+        if store_is_missing(&database) {
+            return Ok(None);
+        }
+        self.summaries
+            .read_snapshot(root, &database, |snapshot| {
+                let Some(summary) = snapshot
+                    .connection
+                    .query_row(
+                        "SELECT conversation_id, title, step_count, last_modified_time, \
+                         workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
+                        [id],
+                        summary_from_row,
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+                let catalog_wal_verified = snapshot.verify_wal().is_ok();
+                let source_path = self
+                    .source(&summary)
+                    .ok()
+                    .filter(|path| catalog_wal_verified || !Self::is_summary_catalog(path));
+                let source_revision = source_path.as_deref().and_then(|path| {
+                    summary
+                        .search_revision(root, path, catalog_wal_verified)
+                        .ok()
+                });
+                Ok(Some(summary.native_session(source_path, source_revision)))
+            })
+            .context("failed to snapshot Antigravity summary database")
+    }
+
     fn selected_session_at(&self, id: &str, path: &Path) -> Result<Option<NativeSession>> {
         let (_, _, native) = self.observed_native(id)?;
         Ok((native.source_path.as_deref() == Some(path)).then_some(native))

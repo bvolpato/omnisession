@@ -1,12 +1,41 @@
 use std::{
-    io::ErrorKind,
-    path::Path,
+    collections::HashMap,
+    fs,
+    io::{ErrorKind, Read},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    sync::{Mutex, OnceLock},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use omnis_ir::Provider;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+const MAX_CACHED_VERSIONS: usize = 64;
+
+static PREPROBED_VERSIONS: OnceLock<Mutex<HashMap<(Provider, PathBuf), String>>> = OnceLock::new();
+
+fn preprobed_versions() -> &'static Mutex<HashMap<(Provider, PathBuf), String>> {
+    PREPROBED_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clears any in-process preprobed versions so retries always probe fresh.
+pub(crate) fn clear_preprobed() {
+    if let Ok(mut map) = preprobed_versions().lock() {
+        map.clear();
+    }
+}
+
+/// Probes `binary` ahead of time on a background thread while another probe runs concurrently.
+pub(crate) fn preprobe_version(binary: &Path, provider: Provider) {
+    if let Ok(version) = installed_version_uncached_in_process(binary, provider)
+        && let Ok(mut map) = preprobed_versions().lock()
+    {
+        map.insert((provider, binary.to_path_buf()), version);
+    }
+}
 
 /// Bound on a provider's `--version` probe. The first launch after a provider update can take
 /// several seconds on macOS, and a timeout sends the transfer to semantic handoff.
@@ -47,11 +76,111 @@ pub(crate) fn isolate_first_codex_probe(
 
 /// Reads the installed provider version with one deadline for the launcher and its workers.
 pub(crate) fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
-    command_version(
+    if let Ok(mut map) = preprobed_versions().lock()
+        && let Some(version) = map.remove(&(provider, binary.to_path_buf()))
+    {
+        return Ok(version);
+    }
+    installed_version_uncached_in_process(binary, provider)
+}
+
+fn installed_version_uncached_in_process(binary: &Path, provider: Provider) -> Result<String> {
+    let cache_path = version_cache_path();
+    let cache_key = cache_path
+        .as_deref()
+        .and_then(|_| native_binary_cache_key(binary, provider));
+    let mut cache = if cache_key.is_some() {
+        cache_path.as_deref().map_or_else(|| json!({}), read_cache)
+    } else {
+        json!({})
+    };
+    if let Some(key) = &cache_key
+        && let Some(version) = cache.get(key).and_then(Value::as_str)
+    {
+        return Ok(version.to_owned());
+    }
+    let version = command_version(
         crate::provider_launch::provider_process(binary)?,
         binary,
         provider,
-    )
+    )?;
+    if let (Some(key), Some(path), Some(entries)) =
+        (cache_key, cache_path.as_deref(), cache.as_object_mut())
+    {
+        if entries.len() >= MAX_CACHED_VERSIONS {
+            entries.clear();
+        }
+        entries.insert(key, json!(version));
+        let _ = write_cache(path, &cache);
+    }
+    Ok(version)
+}
+
+fn version_cache_path() -> Option<PathBuf> {
+    omnis_store::state_root()
+        .ok()
+        .map(|root| root.join("cache").join("provider-versions.json"))
+}
+
+/// Only cache compiled native executables (never `#!` scripts or Windows command shims whose
+/// downstream target can change independently of the wrapper file).
+fn native_binary_cache_key(binary: &Path, provider: Provider) -> Option<String> {
+    let canonical = fs::canonicalize(binary).ok()?;
+    #[cfg(windows)]
+    if canonical.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("cmd")
+            || ext.eq_ignore_ascii_case("bat")
+            || ext.eq_ignore_ascii_case("ps1")
+    }) {
+        return None;
+    }
+    let mut header = [0_u8; 2];
+    let mut file = fs::File::open(&canonical).ok()?;
+    if file.read(&mut header).ok()? >= 2 && &header == b"#!" {
+        return None;
+    }
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(env!("CARGO_PKG_VERSION").as_bytes());
+    digest.update([0]);
+    digest.update(provider.to_string().as_bytes());
+    digest.update([0]);
+    let path_bytes = canonical.as_os_str().as_encoded_bytes();
+    digest.update(path_bytes.len().to_le_bytes());
+    digest.update(path_bytes);
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(modified.as_nanos().to_le_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+        digest.update(metadata.ctime().to_le_bytes());
+        digest.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn read_cache(path: &Path) -> Value {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|mut cache| cache.get_mut("versions_v1").map(Value::take))
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_cache(path: &Path, cache: &Value) -> Result<()> {
+    let directory = path.parent().context("version cache has no directory")?;
+    fs::create_dir_all(directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(&mut temporary, &json!({ "versions_v1": cache }))?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub(crate) fn command_version(
@@ -240,5 +369,26 @@ mod tests {
         assert!(!is_at_least("0.145.9", "0.146.0"));
         assert!(!is_at_least("0.146", "0.146.0"));
         assert!(!is_at_least("current", "0.146.0"));
+    }
+
+    #[test]
+    fn native_binary_cache_skips_scripts_and_invalidates_on_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("wrapper");
+        fs::write(&script, b"#!/bin/sh\necho 1.0.0\n").expect("write script");
+        assert!(native_binary_cache_key(&script, Provider::Antigravity).is_none());
+
+        let binary = dir.path().join("native-bin");
+        fs::write(&binary, b"\x7fELFfake-binary-v1").expect("write binary");
+        let first =
+            native_binary_cache_key(&binary, Provider::Antigravity).expect("native binary key");
+        let other_provider =
+            native_binary_cache_key(&binary, Provider::Codex).expect("codex binary key");
+        assert_ne!(first, other_provider);
+
+        fs::write(&binary, b"\x7fELFfake-binary-v2-longer").expect("update binary");
+        let updated =
+            native_binary_cache_key(&binary, Provider::Antigravity).expect("updated binary key");
+        assert_ne!(first, updated);
     }
 }

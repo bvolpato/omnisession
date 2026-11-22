@@ -31,7 +31,7 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, ProviderFiles, nested_file_inventory, omitted_images_text, parse_timestamp,
-        paths_match, provider_executable, provider_file, provider_root, sample_files_concurrently,
+        provider_executable, provider_file, provider_root, sample_files_concurrently,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
     },
 };
@@ -101,6 +101,66 @@ impl ClaudeAdapter {
     fn session_files(&self) -> &ClaudeFiles {
         self.session_files
             .get_or_init(|| self.discover_session_files())
+    }
+
+    fn session_from_path(
+        &self,
+        id: &str,
+        path: PathBuf,
+        indexed: Option<&HistoryEntry>,
+        matcher: Option<&mut omnis_core::SessionWorkspaceMatcher<'_>>,
+        buffer: &mut Vec<u8>,
+    ) -> Option<NativeSession> {
+        let _ = self;
+        let mut sample = TranscriptSample::head(&path, indexed.is_none(), buffer).ok();
+        let project_path = indexed
+            .map(|entry| entry.project.clone())
+            .or_else(|| sample.as_mut()?.workspace.project_path.take());
+        if let Some(matcher) = matcher
+            && project_path
+                .as_deref()
+                .is_none_or(|recorded| !matcher.matches(Provider::Claude, recorded))
+        {
+            return None;
+        }
+        let title = sample
+            .as_mut()
+            .and_then(|sample| {
+                // Head titles still apply when the tail cannot be read.
+                let _ = sample.read_tail_metadata(buffer);
+                std::mem::take(&mut sample.titles).title()
+            })
+            .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
+        let fallback = sample
+            .as_mut()
+            .map(|sample| std::mem::take(&mut sample.workspace))
+            .unwrap_or_default();
+        let created_at = indexed
+            .and_then(|entry| entry.created_at)
+            .or(fallback.created_at);
+        let file_updated_at = sample
+            .as_ref()
+            .and_then(|sample| sample.modified)
+            .or_else(|| {
+                std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+            })
+            .map(DateTime::<Utc>::from);
+        Some(NativeSession {
+            session: SessionRef::new(Provider::Claude, id.to_owned()),
+            title,
+            project_path,
+            git_branch: fallback.git_branch,
+            created_at,
+            updated_at: file_updated_at
+                .or_else(|| indexed.and_then(|entry| entry.updated_at))
+                .or(fallback.updated_at),
+            updated_at_approximate: file_updated_at.is_some(),
+            event_count: 0,
+            source_path: Some(path),
+            source_revision: None,
+        })
     }
 
     fn find_session(&self, id: &str) -> Result<PathBuf> {
@@ -2679,62 +2739,22 @@ impl ProviderAdapter for ClaudeAdapter {
         let selected = self.listed_transcripts(&mut history.notes);
         let mut sessions = sample_files_concurrently(&selected, |session_files| {
             let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
+            let mut matcher = project.map(omnis_core::SessionWorkspaceMatcher::new);
             let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
             let mut sessions = Vec::new();
             for (id, path) in session_files {
                 let Some(path) = files.as_mut().and_then(|files| files.resolve(path)) else {
                     continue;
                 };
-                let indexed = history.sessions.get(id);
-                let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
-                let project_path = indexed
-                    .map(|entry| entry.project.clone())
-                    .or_else(|| sample.as_mut()?.workspace.project_path.take());
-                if project.is_some_and(|project| {
-                    project_path
-                        .as_deref()
-                        .is_none_or(|recorded| !paths_match(recorded, project))
-                }) {
-                    continue;
+                if let Some(session) = self.session_from_path(
+                    id,
+                    path,
+                    history.sessions.get(id),
+                    matcher.as_mut(),
+                    &mut buffer,
+                ) {
+                    sessions.push(session);
                 }
-                let title = sample
-                    .as_mut()
-                    .and_then(|sample| {
-                        // Head titles still apply when the tail cannot be read.
-                        let _ = sample.read_tail_metadata(&mut buffer);
-                        std::mem::take(&mut sample.titles).title()
-                    })
-                    .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
-                let fallback = sample
-                    .as_mut()
-                    .map(|sample| std::mem::take(&mut sample.workspace))
-                    .unwrap_or_default();
-                let created_at = indexed
-                    .and_then(|entry| entry.created_at)
-                    .or(fallback.created_at);
-                let file_updated_at = sample
-                    .as_ref()
-                    .and_then(|sample| sample.modified)
-                    .or_else(|| {
-                        std::fs::metadata(&path)
-                            .ok()
-                            .and_then(|metadata| metadata.modified().ok())
-                    })
-                    .map(DateTime::<Utc>::from);
-                sessions.push(NativeSession {
-                    session: SessionRef::new(Provider::Claude, id.clone()),
-                    title,
-                    project_path,
-                    git_branch: fallback.git_branch,
-                    created_at,
-                    updated_at: file_updated_at
-                        .or_else(|| indexed.and_then(|entry| entry.updated_at))
-                        .or(fallback.updated_at),
-                    updated_at_approximate: file_updated_at.is_some(),
-                    event_count: 0,
-                    source_path: Some(path),
-                    source_revision: None,
-                });
             }
             sessions
         });
@@ -2749,6 +2769,58 @@ impl ProviderAdapter for ClaudeAdapter {
         *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(root) = self.projects_root.as_deref() else {
+            return Ok(None);
+        };
+        let filename = format!("{id}.jsonl");
+        let direct = if let Ok(entries) = std::fs::read_dir(root) {
+            let directories = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path()));
+            let candidates = std::iter::once(root.to_owned())
+                .chain(directories)
+                .filter_map(|directory| provider_file(root, &directory.join(&filename)));
+            unique_transcript(id, candidates)?
+        } else {
+            None
+        };
+        let path = if let Some(path) = direct {
+            Some(path)
+        } else {
+            unique_transcript(
+                id,
+                self.session_files()
+                    .paths
+                    .iter()
+                    .filter(|(candidate, _)| candidate == id)
+                    .filter_map(|(_, path)| provider_file(root, path)),
+            )?
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let history = self.history_index();
+        let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
+        let session = self.session_from_path(
+            id,
+            path.clone(),
+            history.sessions.get(id),
+            None,
+            &mut buffer,
+        );
+        if session.is_some() {
+            self.listed_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id.to_owned(), path);
+        }
+        Ok(session)
     }
 
     fn selected_workspace(&self, listed: &NativeSession) -> Result<Option<PathBuf>> {
