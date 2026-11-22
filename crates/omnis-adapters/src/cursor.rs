@@ -16,9 +16,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, nested_files, parse_timestamp, paths_match, percent_decode,
-        provider_executable, provider_file, provider_root, read_json, selected_metadata,
-        sort_sessions, sqlite_snapshot, store_is_missing, string_at, validate_provider, value_at,
+        EventBuilder, nested_files, parse_timestamp, percent_decode, provider_executable,
+        provider_file, provider_root, read_json, selected_metadata, sort_sessions, sqlite_snapshot,
+        store_is_missing, string_at, validate_provider, value_at,
     },
 };
 
@@ -262,6 +262,7 @@ impl ProviderAdapter for CursorCliAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        let mut matcher = project.map(omnis_core::SessionWorkspaceMatcher::new);
         let mut sessions = Vec::new();
         for path in self.metadata_files() {
             let value: Value = match read_json(&path) {
@@ -272,11 +273,11 @@ impl ProviderAdapter for CursorCliAdapter {
                 continue;
             };
             let metadata = metadata(&value);
-            if project.is_some_and(|project| {
+            if matcher.as_mut().is_some_and(|matcher| {
                 metadata
                     .project_path
                     .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, project))
+                    .is_none_or(|recorded| !matcher.matches(Provider::CursorCli, recorded))
             }) {
                 continue;
             }

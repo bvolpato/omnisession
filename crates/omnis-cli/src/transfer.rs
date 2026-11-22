@@ -200,7 +200,9 @@ fn resume_request_with_workspace(
         ) {
             // The user closed whatever blocked the import and asked for another try. The source
             // is read again: closing its agent may have flushed the session's last records.
-            Err(error) if error.is::<RetryNativeImport>() => {}
+            Err(error) if error.is::<RetryNativeImport>() => {
+                crate::version_gate::clear_preprobed();
+            }
             outcome => return outcome,
         }
     }
@@ -259,12 +261,29 @@ fn resume_from_snapshot(
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
-        launch_mode_args(
-            request.agent_target(),
-            request.mode,
-            &cursor_working_directory(target, &process_directory)?,
-            json_output,
-        )?
+        let mode_dir = cursor_working_directory(target, &process_directory)?;
+        let should_preprobe = target != Provider::CursorIde
+            && may_attempt_native_import(target)
+            && (request.mode.is_some() || env::var_os("OMNI_MODE").is_some())
+            && (materialize_fork
+                || (source.provider != target
+                    && cross_provider_route(target, request.picked_target)
+                        != CrossProviderRoute::SemanticHandoff));
+        if should_preprobe {
+            std::thread::scope(|scope| {
+                let preprobe = scope.spawn(omnis_adapters::inherit_provider_probes(move || {
+                    if let Ok(binary) = resolved_provider_binary(target) {
+                        crate::version_gate::preprobe_version(&binary, target);
+                    }
+                }));
+                let resolved =
+                    launch_mode_args(request.agent_target(), request.mode, &mode_dir, json_output);
+                let _ = preprobe.join();
+                resolved
+            })?
+        } else {
+            launch_mode_args(request.agent_target(), request.mode, &mode_dir, json_output)?
+        }
     };
     let context = ResumeContext {
         registry,
