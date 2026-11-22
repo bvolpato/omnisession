@@ -67,6 +67,10 @@ const STORE_FORMAT: i64 = 9;
 /// dirty pages to the write-ahead log and read them back before it committed.
 const PAGE_CACHE_KIBIBYTES: i64 = -64 * 1024;
 
+/// Memory-mapped read window on 64-bit Unix, avoiding per-page copies during full-text scans.
+#[cfg(all(unix, target_pointer_width = "64"))]
+const MMAP_SIZE_BYTES: i64 = 1024 * 1024 * 1024;
+
 const TRAJECTORY_PHRASE_MAX_TOKENS: usize = 64;
 
 const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
@@ -248,14 +252,44 @@ const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' â
 /// matches many chunks read one such page per match only to learn the trajectory.
 const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
 
-// A confirmed file failure hides conversation text and titles until a verified read clears it.
-const HIDDEN_FAILED_TRAJECTORY: &str = "trajectories.provider IN ('pi', 'omp')
-    AND trajectories.origin = 'native' AND failed.provider = trajectories.provider
-    AND failed.session_id = trajectories.session_id AND failed.source_file_id IS NOT NULL
-    AND (failed.source_contents_id IS NOT NULL OR failed.source_file_id IS NOT trajectories.source_file_id
-        OR failed.source_contents_id IS NOT trajectories.source_contents_id
-        OR failed.source_updated_at IS NOT trajectories.source_updated_at
-        OR failed.source_updated_submillis IS NOT trajectories.source_updated_submillis)";
+// Discovery can select a replacement before its first transcript read succeeds.
+const CONFLICTING_FILE_CATALOG: &str = "trajectories.provider IN ('pi', 'omp')
+    AND trajectories.origin = 'native' AND catalog.provider = trajectories.provider
+    AND catalog.session_id = trajectories.session_id
+    AND (catalog.source_file_id IS NOT trajectories.source_file_id
+        OR catalog.source_contents_id IS NOT trajectories.source_contents_id)";
+
+// Factored predicates keep provider/session_id equalities at top level so SQLite uses indexes
+// and bloom filters instead of scanning `observed_session_index` or `scoped_trajectory_failures`.
+const CONFLICTING_TRAJECTORY_FAILURE: &str = "trajectories.origin = 'native'
+    AND failed.provider = trajectories.provider
+    AND failed.session_id = trajectories.session_id
+    AND failed.source_file_id IS NOT NULL
+    AND (
+        (trajectories.provider IN ('codex', 'grok')
+            AND (trajectories.provider = 'grok'
+                OR failed.source_file_id IS NOT trajectories.source_file_id
+                OR failed.source_contents_id IS NOT trajectories.source_contents_id
+                OR failed.source_updated_at IS NOT trajectories.source_updated_at
+                OR (failed.source_updated_submillis IS NOT NULL
+                    AND failed.source_updated_submillis IS NOT trajectories.source_updated_submillis)))
+        OR (trajectories.provider IN ('pi', 'omp')
+            AND (failed.source_contents_id IS NOT NULL
+                OR failed.source_file_id IS NOT trajectories.source_file_id
+                OR failed.source_contents_id IS NOT trajectories.source_contents_id
+                OR failed.source_updated_at IS NOT trajectories.source_updated_at
+                OR failed.source_updated_submillis IS NOT trajectories.source_updated_submillis))
+    )";
+
+const CONFLICTING_TRAJECTORY_CATALOG: &str = "trajectories.origin = 'native'
+    AND catalog.provider = trajectories.provider
+    AND catalog.session_id = trajectories.session_id
+    AND (catalog.source_file_id IS NOT trajectories.source_file_id
+        OR catalog.source_contents_id IS NOT trajectories.source_contents_id)
+    AND (
+        (trajectories.provider IN ('codex', 'grok') AND catalog.source_file_id IS NOT NULL)
+        OR trajectories.provider IN ('pi', 'omp')
+    )";
 
 const VISIBLE_CATALOG_ROW: &str = "(catalog.provider NOT IN ('pi','omp') OR NOT EXISTS (
                     SELECT 1 FROM scoped_trajectory_failures AS failed
@@ -263,13 +297,6 @@ const VISIBLE_CATALOG_ROW: &str = "(catalog.provider NOT IN ('pi','omp') OR NOT 
                       AND failed.source_file_id IS NOT NULL AND failed.source_contents_id IS NOT NULL
                       AND (failed.source_file_id IS NOT catalog.source_file_id
                            OR failed.source_contents_id IS NOT catalog.source_contents_id)))";
-
-// Discovery can select a replacement before its first transcript read succeeds.
-const CONFLICTING_FILE_CATALOG: &str = "trajectories.provider IN ('pi', 'omp')
-    AND trajectories.origin = 'native' AND catalog.provider = trajectories.provider
-    AND catalog.session_id = trajectories.session_id
-    AND (catalog.source_file_id IS NOT trajectories.source_file_id
-        OR catalog.source_contents_id IS NOT trajectories.source_contents_id)";
 
 fn visible_trajectory_sql() -> String {
     format!(
@@ -306,9 +333,9 @@ fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
             AND (all_projections.trajectory_id IS NULL OR
                  ((chunks.chunk_index>=all_projections.first_chunk AND chunks.chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK})=(active_projection.trajectory_id IS NOT NULL)))
             AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
-                 SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_NATIVE_CATALOG})))
+                 SELECT 1 FROM observed_session_index AS catalog WHERE {CONFLICTING_TRAJECTORY_CATALOG}))
             AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed
-                            WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_NATIVE_FAILURE}))",
+                            WHERE {CONFLICTING_TRAJECTORY_FAILURE})",
         visible = visible_trajectory_sql(),
     )
 }
@@ -2563,6 +2590,8 @@ impl Store {
         connection
             .pragma_update(None, "temp_store", "MEMORY")
             .map_err(database_error)?;
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        let _ = connection.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
 
         let store = Self {
             connection: RefCell::new(connection),
@@ -5910,8 +5939,8 @@ impl Store {
                       OR (catalog.source_updated_submillis IS NULL AND trajectories.source_complete))) END,
             trajectories.source_file_id, trajectories.missing_ancestor_id, {SEARCH_ACTIVE_CONTENTS}
             FROM visible_trajectories AS trajectories {SEARCH_GAP_JOIN}
-            WHERE NOT EXISTS (SELECT 1 FROM observed_session_index AS catalog WHERE ({CONFLICTING_FILE_CATALOG}) OR ({CONFLICTING_NATIVE_CATALOG}))
-              AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed WHERE ({HIDDEN_FAILED_TRAJECTORY}) OR ({CONFLICTING_NATIVE_FAILURE})) ");
+            WHERE NOT EXISTS (SELECT 1 FROM observed_session_index AS catalog WHERE {CONFLICTING_TRAJECTORY_CATALOG})
+              AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed WHERE {CONFLICTING_TRAJECTORY_FAILURE}) ");
         let scope = if let Some(session) = session {
             validate_session_ref(session)?;
             sql.push_str("AND provider = ?1 AND session_id = ?2");
@@ -7602,9 +7631,10 @@ impl TrajectorySearchSnapshot<'_> {
                     THEN w.git_branch ELSE catalog.git_branch END,
                catalog.created_at,catalog.updated_at,catalog.updated_at_approximate,catalog.event_count,catalog.source_updated_submillis,
                catalog.source_file_id,catalog.source_contents_id
-             FROM observed_session_index catalog LEFT JOIN visible_trajectories trajectories ON catalog.provider='codex'
-               AND trajectories.provider=catalog.provider AND trajectories.session_id=catalog.session_id
-               AND trajectories.origin='native'
+             FROM observed_session_index catalog LEFT JOIN main.session_trajectories trajectories ON catalog.provider='codex'
+               AND trajectories.provider='codex' AND trajectories.session_id=catalog.session_id
+               AND trajectories.origin='native' AND trajectories.codex_workspace_current
+               AND trajectories.codex_home=(SELECT home FROM current_codex_home) AND trajectories.pi_workspace=''
                AND ((catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL)
                     OR (trajectories.document_version < {floor} AND catalog.source_file_id=trajectories.source_file_id
                         AND catalog.source_contents_id=trajectories.source_contents_id))
@@ -8888,10 +8918,16 @@ fn initialize_trajectory_scope(connection: &Connection, codex_home: Option<&str>
              JOIN main.pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id
              WHERE CASE WHEN json_valid(c.metadata) THEN json_extract(c.metadata,'$.project_path') END=i.project_path AND c.project<>p.project;
          CREATE TEMP TABLE pi_document_aliases(id INTEGER PRIMARY KEY,selector TEXT NOT NULL);
-         CREATE TEMP VIEW visible_trajectories AS SELECT coalesce(a.selector,t.pi_native_id,t.session_id) AS session_id,t.*
+         CREATE TEMP VIEW visible_trajectories AS
+             SELECT t.session_id AS session_id,t.*
+             FROM main.session_trajectories t
+             WHERE t.provider NOT IN ('pi','omp') AND t.pi_workspace=''
+               AND (t.provider<>'codex' OR (t.origin='native' AND t.codex_workspace_current AND t.codex_home=(SELECT home FROM current_codex_home)))
+             UNION ALL
+             SELECT coalesce(a.selector,t.pi_native_id,t.session_id) AS session_id,t.*
              FROM main.session_trajectories t LEFT JOIN pi_document_aliases a ON a.id=t.id
-             WHERE (a.id IS NOT NULL OR t.pi_workspace=CASE WHEN t.provider IN ('pi','omp') THEN coalesce((SELECT project FROM selected_pi_copies p WHERE p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id)),'') ELSE '' END)
-               AND (t.provider<>'codex' OR (t.origin='native' AND t.codex_workspace_current AND t.codex_home=(SELECT home FROM current_codex_home)));
+             WHERE t.provider IN ('pi','omp')
+               AND (a.id IS NOT NULL OR t.pi_workspace=coalesce((SELECT project FROM selected_pi_copies p WHERE p.provider=t.provider AND p.session_id=coalesce(t.pi_native_id,t.session_id)),''));
          CREATE TEMP VIEW scoped_session_index AS SELECT * FROM main.session_index
          WHERE provider <> 'codex' OR codex_home = (SELECT home FROM current_codex_home);
          CREATE TEMP VIEW scoped_trajectory_failures AS SELECT * FROM main.trajectory_index_failures AS f
@@ -12374,8 +12410,8 @@ fn indexed_titles_sql() -> String {
                       (c.source_updated_submillis=trajectories.source_updated_submillis OR
                        (c.source_updated_submillis IS NULL AND trajectories.source_complete))) END
              FROM visible_trajectories AS trajectories {SEARCH_GAP_JOIN}
-             LEFT JOIN scoped_trajectory_failures AS failed ON ({CONFLICTING_NATIVE_FAILURE}) OR ({HIDDEN_FAILED_TRAJECTORY})
-             LEFT JOIN observed_session_index AS catalog ON ({CONFLICTING_NATIVE_CATALOG}) OR ({CONFLICTING_FILE_CATALOG})")
+             LEFT JOIN scoped_trajectory_failures AS failed ON {CONFLICTING_TRAJECTORY_FAILURE}
+             LEFT JOIN observed_session_index AS catalog ON {CONFLICTING_TRAJECTORY_CATALOG}")
 }
 
 fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTrajectoryTitle> {

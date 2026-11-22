@@ -9,7 +9,7 @@ use std::{
 use omnis_ir::Provider;
 use serde_json::Value;
 
-use crate::{git_worktree_root, may_reach_network, workspace_paths_match};
+use crate::{RequestedWorkspace, git_worktree_root, may_reach_network, workspace_paths_match};
 
 const MAX_WORKSPACE_BYTES: u64 = 1024 * 1024;
 const MAX_FOLDERS: usize = 256;
@@ -18,6 +18,7 @@ const MAX_SYMLINKS: usize = 32;
 /// Reuses workspace membership checks during one pass over session metadata.
 pub struct SessionWorkspaceMatcher<'a> {
     requested: &'a Path,
+    requested_workspace: Option<RequestedWorkspace>,
     directories: HashMap<OsString, bool>,
     cursor_workspaces: HashMap<OsString, bool>,
 }
@@ -27,6 +28,7 @@ impl<'a> SessionWorkspaceMatcher<'a> {
     pub fn new(requested: &'a Path) -> Self {
         Self {
             requested,
+            requested_workspace: None,
             directories: HashMap::new(),
             cursor_workspaces: HashMap::new(),
         }
@@ -48,8 +50,21 @@ impl<'a> SessionWorkspaceMatcher<'a> {
         if let Some(&matches) = cache.get(recorded.as_os_str()) {
             return matches;
         }
-        let matches = session_workspace_matches(provider, recorded, self.requested);
-        cache.insert(recorded.as_os_str().to_owned(), matches);
+        let matches = if provider == Provider::CursorIde {
+            cursor_workspace_matches(recorded, self.requested)
+        } else {
+            let requested = self
+                .requested_workspace
+                .get_or_insert_with(|| RequestedWorkspace::new(self.requested));
+            requested.matches_recorded(recorded, self.requested)
+        };
+        if provider == Provider::CursorIde {
+            self.cursor_workspaces
+                .insert(recorded.as_os_str().to_owned(), matches);
+        } else {
+            self.directories
+                .insert(recorded.as_os_str().to_owned(), matches);
+        }
         matches
     }
 }
