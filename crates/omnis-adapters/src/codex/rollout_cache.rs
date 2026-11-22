@@ -252,6 +252,16 @@ impl RolloutStamp {
     }
 }
 
+/// Verified header classification cached for `CurrentRollout` checks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) enum CachedCurrentHeader {
+    #[default]
+    Unverified,
+    Legacy,
+    PaginatedWithId,
+    PaginatedNative,
+}
+
 /// Session metadata from a rollout's `session_meta` record.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RolloutHeader {
@@ -263,6 +273,8 @@ pub(super) struct RolloutHeader {
     pub(super) history_base: super::HistoryBase,
     pub(super) subagent_history_start: Option<u64>,
     pub(super) history_mode: super::CodexHistoryMode,
+    #[serde(default)]
+    pub(super) current_header: CachedCurrentHeader,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }
@@ -310,11 +322,14 @@ impl RolloutCache {
     /// Returns the cached entry while the rollout's stamp is unchanged.
     pub(super) fn get(&mut self, rollout: &Path, stamp: RolloutStamp) -> Option<&CachedRollout> {
         let key = rollout.to_str()?;
-        let cached = self
+        if let Some(cached) = self
             .previous
             .remove(key)
-            .filter(|cached| cached.stamp == stamp)?;
-        Some(&*self.current.entry(key.to_owned()).or_insert(cached))
+            .filter(|cached| cached.stamp == stamp)
+        {
+            return Some(&*self.current.entry(key.to_owned()).or_insert(cached));
+        }
+        self.current.get(key).filter(|cached| cached.stamp == stamp)
     }
 
     pub(super) fn insert(

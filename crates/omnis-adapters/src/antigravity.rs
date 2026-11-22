@@ -25,9 +25,9 @@ use crate::{
     support::{
         EventBuilder, JsonLineDamage, JsonLineTail, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
         SqliteSnapshotCache, estimated_event_bytes, json_lines_preview_with_prefix,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root, sidecar,
-        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
-        visit_json_lines_with_tail, visit_limited_search_edges, visit_streamed_json_file,
+        parse_timestamp, provider_executable, provider_file, provider_root, sidecar, sort_sessions,
+        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines_with_tail,
+        visit_limited_search_edges, visit_streamed_json_file,
     },
 };
 
@@ -761,38 +761,42 @@ impl ProviderAdapter for AntigravityAdapter {
         if store_is_missing(&database) {
             return Ok(Vec::new());
         }
-        let snapshot = sqlite_snapshot(root, &database)
+        let mut matcher = project.map(omnis_core::SessionWorkspaceMatcher::new);
+        let mut sessions = self
+            .summaries
+            .read_snapshot(root, &database, |snapshot| {
+                let catalog_wal_verified = snapshot.verify_wal().is_ok();
+                let mut statement = snapshot.connection.prepare(
+                    "SELECT conversation_id, title, step_count, last_modified_time, workspace_uris \
+                     FROM conversation_summaries",
+                )?;
+                let rows = statement.query_map([], summary_from_row)?;
+                let mut sessions = Vec::new();
+                for row in rows {
+                    let summary = row?;
+                    if validate_id(&summary.id).is_err()
+                        || matcher.as_mut().is_some_and(|matcher| {
+                            summary.project_path.as_deref().is_none_or(|recorded| {
+                                !matcher.matches(Provider::Antigravity, recorded)
+                            })
+                        })
+                    {
+                        continue;
+                    }
+                    let source_path = self
+                        .source(&summary)
+                        .ok()
+                        .filter(|path| catalog_wal_verified || !Self::is_summary_catalog(path));
+                    let source_revision = source_path.as_deref().and_then(|path| {
+                        summary
+                            .search_revision(root, path, catalog_wal_verified)
+                            .ok()
+                    });
+                    sessions.push(summary.native_session(source_path, source_revision));
+                }
+                Ok(sessions)
+            })
             .context("failed to snapshot Antigravity summary database")?;
-        let catalog_wal_verified = snapshot.verify_wal().is_ok();
-        let mut statement = snapshot.connection.prepare(
-            "SELECT conversation_id, title, step_count, last_modified_time, workspace_uris \
-             FROM conversation_summaries",
-        )?;
-        let rows = statement.query_map([], summary_from_row)?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            let summary = row?;
-            if validate_id(&summary.id).is_err()
-                || project.is_some_and(|requested| {
-                    summary
-                        .project_path
-                        .as_deref()
-                        .is_none_or(|recorded| !paths_match(recorded, requested))
-                })
-            {
-                continue;
-            }
-            let source_path = self
-                .source(&summary)
-                .ok()
-                .filter(|path| catalog_wal_verified || !Self::is_summary_catalog(path));
-            let source_revision = source_path.as_deref().and_then(|path| {
-                summary
-                    .search_revision(root, path, catalog_wal_verified)
-                    .ok()
-            });
-            sessions.push(summary.native_session(source_path, source_revision));
-        }
         sort_sessions(&mut sessions);
         Ok(sessions)
     }

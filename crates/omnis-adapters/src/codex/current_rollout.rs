@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, gui_names, live_rollout_path,
-    representations, restored_rollout, rollout_file,
+    CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, RolloutCache, gui_names,
+    live_rollout_path, representations, restored_rollout,
+    rollout_cache::CachedCurrentHeader,
+    rollout_file,
     rollout_identity::{self, HeaderEvidence, HistoryMode},
 };
 use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
@@ -172,8 +174,10 @@ impl CurrentRollouts {
                 );
                 let mut statement = conn.prepare(&query)?;
                 let parameter_count = statement.parameter_count();
-                let mut selected = HashMap::new();
-                for id in ids {
+                let mut sorted_ids: Vec<&str> = ids.collect();
+                sorted_ids.sort_unstable();
+                let mut selected = HashMap::with_capacity(sorted_ids.len());
+                for id in sorted_ids {
                     if let Some(pointer) = statement
                         .query_row(
                             rusqlite::params_from_iter(
@@ -403,8 +407,20 @@ impl CurrentRollout {
         paths: impl IntoIterator<Item = &'a Path>,
         complete: bool,
     ) -> Result<Option<CurrentFile>> {
+        self.resolve_cached(home, None, id, paths, complete, None)
+    }
+
+    pub(super) fn resolve_cached<'a>(
+        &self,
+        home: &Path,
+        canonical_home: Option<&Path>,
+        id: &str,
+        paths: impl IntoIterator<Item = &'a Path>,
+        complete: bool,
+        cache: Option<&mut RolloutCache>,
+    ) -> Result<Option<CurrentFile>> {
         ensure!(self.paginated.is_some(), CurrentRolloutUnavailable);
-        let selected = self.resolve_path(home, id, paths, complete)?;
+        let selected = self.resolve_path(home, canonical_home, id, paths, complete, cache)?;
         if selected.is_none() && self.requires_selection(home) {
             return Err(CurrentRolloutUnavailable.into());
         }
@@ -414,27 +430,35 @@ impl CurrentRollout {
     fn resolve_path<'a>(
         &self,
         home: &Path,
+        canonical_home: Option<&Path>,
         id: &str,
         paths: impl IntoIterator<Item = &'a Path>,
         complete: bool,
+        mut cache: Option<&mut RolloutCache>,
     ) -> Result<Option<CurrentFile>> {
         if self.has_legacy_name() {
-            return self.resolve_recorded_path(home, id);
+            return self.resolve_recorded_path(home, canonical_home, id, cache);
         }
         ensure!(self.generation(id).is_some(), CurrentRolloutUnavailable);
         let name = recorded_file_name(&self.path)
             .and_then(rollout_file::jsonl_file_name)
             .context(CurrentRolloutUnavailable)?;
-        let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+        let owned_root;
+        let root = if let Some(root) = canonical_home {
+            root
+        } else {
+            owned_root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+            &owned_root
+        };
         let mut copies = Vec::new();
-        let local = local_recording(home, &root, &self.path)?;
+        let local = local_recording(home, root, &self.path)?;
         let mut checked_gzip = None;
         if let Some(recorded) = &local {
             let plain = recorded.with_file_name(name);
             let native_recording = self.path.extension().is_some_and(|ext| ext != "gz");
             let mut native = native_recording && recorded.starts_with(home.join("sessions"));
             for candidate in representations(&plain) {
-                if !accessible(home, &root, &candidate)? {
+                if !accessible(home, root, &candidate)? {
                     // A symlink or a directory can still shadow a lower native representation.
                     native &= fs::symlink_metadata(&candidate)
                         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
@@ -442,7 +466,8 @@ impl CurrentRollout {
                 }
                 if candidate.extension().is_some_and(|ext| ext != "gz")
                     && native_recording
-                    && let Some(mut current) = self.check_recorded(home, &root, &candidate, id)?
+                    && let Some(mut current) =
+                        self.check_recorded(home, root, &candidate, id, cache.as_deref_mut())?
                 {
                     current.native = native
                         && current.path == candidate
@@ -453,7 +478,8 @@ impl CurrentRollout {
                     return Ok(Some(current));
                 }
                 if !native_recording && candidate == *recorded {
-                    let current = self.check_recorded(home, &root, recorded, id)?;
+                    let current =
+                        self.check_recorded(home, root, recorded, id, cache.as_deref_mut())?;
                     if self.paginated == Some(true)
                         && current
                             .as_ref()
@@ -497,10 +523,10 @@ impl CurrentRollout {
         copies.dedup();
         if let Some(expected) = expected {
             return self
-                .agreeing_copies(home, &root, id, copies, Some(&expected), checked_gzip)?
+                .agreeing_copies(home, root, id, copies, Some(&expected), checked_gzip)?
                 .finish(id);
         }
-        self.resolve_relocated(home, &root, id, name, copies)
+        self.resolve_relocated(home, root, id, name, copies)
     }
 
     fn resolve_relocated(
@@ -651,7 +677,13 @@ impl CurrentRollout {
         header.file(path, id)
     }
 
-    fn resolve_recorded_path(&self, home: &Path, id: &str) -> Result<Option<CurrentFile>> {
+    fn resolve_recorded_path(
+        &self,
+        home: &Path,
+        canonical_home: Option<&Path>,
+        id: &str,
+        mut cache: Option<&mut RolloutCache>,
+    ) -> Result<Option<CurrentFile>> {
         let paginated = self.paginated.context(CurrentRolloutUnavailable)?;
         // A renamed paginated file can be recovered when its suffix identifies the selected generation.
         ensure!(
@@ -661,10 +693,43 @@ impl CurrentRollout {
                     .is_some_and(|generation| generation != id),
             CurrentRolloutUnavailable
         );
-        let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
-        for path in self.recorded_representations(home, &root)? {
+        let owned_root;
+        let root = if let Some(root) = canonical_home {
+            root
+        } else {
+            owned_root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+            &owned_root
+        };
+        for path in self.recorded_representations(home, root)? {
             let path = path?;
-            let Some(header) = FileHeader::read(&path)? else {
+            let observed = ObservedRollout::read(&path).context(CurrentRolloutUnconfirmed)?;
+            if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), observed.stamp)
+                && let Some(cached) = cache.get(&path, stamp)
+                && let Some(header) = &cached.header
+                && header.id == id
+            {
+                let reusable = if paginated {
+                    header.current_header == CachedCurrentHeader::PaginatedNative
+                } else {
+                    header.current_header == CachedCurrentHeader::Legacy
+                        && header.history_mode == CodexHistoryMode::Legacy
+                };
+                if reusable {
+                    let mut current = CurrentFile {
+                        session: CodexSession::from_header(&path, header.clone(), observed),
+                        path: path.clone(),
+                        revision: observed.revision,
+                        paginated: header.current_header == CachedCurrentHeader::PaginatedNative,
+                        native: false,
+                    };
+                    current.native = !paginated
+                        && path.extension().is_none_or(|ext| ext != "gz")
+                        && !self.archived
+                        && path.starts_with(home.join("sessions"));
+                    return Ok(Some(current));
+                }
+            }
+            let Some(header) = FileHeader::read_with_observation(&path, observed)? else {
                 return Ok(None);
             };
             if paginated
@@ -673,11 +738,19 @@ impl CurrentRollout {
             {
                 continue;
             }
-            let Some(mut current) = self.recorded_header(home, &root, &path, id, &header)? else {
+            let Some(mut current) = self.recorded_header(home, root, &path, id, &header)? else {
                 return Ok(None);
             };
             if !paginated && current.session.history_mode != CodexHistoryMode::Legacy {
                 return Ok(None);
+            }
+            if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), header.observed.stamp)
+                && current.path == path
+            {
+                let mut cached_header = current.session.header();
+                cached_header.current_header =
+                    classify_current_header(&header.value, id, current.paginated);
+                cache.insert(&path, stamp, Some(cached_header));
             }
             current.native = !paginated
                 && path.extension().is_none_or(|ext| ext != "gz")
@@ -732,11 +805,43 @@ impl CurrentRollout {
         root: &Path,
         path: &Path,
         id: &str,
+        mut cache: Option<&mut RolloutCache>,
     ) -> Result<Option<CurrentFile>> {
-        let Some(first) = FileHeader::read(path)? else {
+        let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
+        if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), observed.stamp)
+            && let Some(cached) = cache.get(path, stamp)
+            && let Some(header) = &cached.header
+            && header.id == id
+        {
+            let paginated = match header.current_header {
+                CachedCurrentHeader::PaginatedNative => Some(true),
+                CachedCurrentHeader::PaginatedWithId if self.paginated != Some(true) => Some(true),
+                CachedCurrentHeader::Legacy if self.paginated != Some(true) => Some(false),
+                _ => None,
+            };
+            if let Some(paginated) = paginated {
+                let session = CodexSession::from_header(path, header.clone(), observed);
+                return Ok(Some(CurrentFile {
+                    session,
+                    path: path.to_owned(),
+                    revision: observed.revision,
+                    paginated,
+                    native: false,
+                }));
+            }
+        }
+        let Some(first) = FileHeader::read_with_observation(path, observed)? else {
             return Ok(None);
         };
-        self.recorded_header(home, root, path, id, &first)
+        let result = self.recorded_header(home, root, path, id, &first)?;
+        if let (Some(cache), Some(stamp), Some(file)) = (cache, first.observed.stamp, &result)
+            && file.path == path
+        {
+            let mut header = file.session.header();
+            header.current_header = classify_current_header(&first.value, id, file.paginated);
+            cache.insert(path, stamp, Some(header));
+        }
+        Ok(result)
     }
 
     fn recorded_header(
@@ -787,6 +892,18 @@ impl CurrentRollout {
             Err(error) => Err(error),
             Ok(None) => Err(CurrentRolloutUnavailable.into()),
         }
+    }
+}
+
+fn classify_current_header(value: &Value, id: &str, paginated: bool) -> CachedCurrentHeader {
+    if !paginated {
+        CachedCurrentHeader::Legacy
+    } else if HeaderEvidence::read(value, id) == HeaderEvidence::Native(HistoryMode::Paginated) {
+        CachedCurrentHeader::PaginatedNative
+    } else if value["payload"]["id"].as_str() == Some(id) {
+        CachedCurrentHeader::PaginatedWithId
+    } else {
+        CachedCurrentHeader::Unverified
     }
 }
 
@@ -930,8 +1047,21 @@ impl FileHeader {
         }
     }
 
+    fn read_with_observation(path: &Path, observed: ObservedRollout) -> Result<Option<Self>> {
+        let mut limit = MAX_TRANSCRIPT_LINE_SIZE;
+        Self::read_bounded_with_observation(path, observed, &mut limit)
+    }
+
     fn read_bounded(path: &Path, remaining: &mut u64) -> Result<Option<Self>> {
         let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
+        Self::read_bounded_with_observation(path, observed, remaining)
+    }
+
+    fn read_bounded_with_observation(
+        path: &Path,
+        observed: ObservedRollout,
+        remaining: &mut u64,
+    ) -> Result<Option<Self>> {
         let header = selected_header(path, remaining);
         ensure!(
             CodexAdapter::index_file_revision(path) == Some(observed.revision),
@@ -1517,6 +1647,84 @@ mod tests {
             row.resolve(home.path(), THREAD, paths, true)
                 .unwrap_err()
                 .is::<CurrentRolloutUnavailable>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cached_reuses_rollout_cache_for_paginated_rollouts_and_rechecks_changes()
+    -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let cache_file = cache_dir.path().join("codex-rollouts.json");
+        let sessions = home.path().join("sessions/2026/01/01");
+        let path = rollout(&sessions, None, "cached")?;
+        let canonical_home = fs::canonicalize(home.path())?;
+        let row = CurrentRollout {
+            path: path.clone(),
+            paginated: Some(true),
+            archived: false,
+            name: gui_names::StateName::Index,
+        };
+
+        let mut cache = RolloutCache::load(&cache_file, home.path()).expect("empty cache");
+        let first = row
+            .resolve_cached(
+                home.path(),
+                Some(&canonical_home),
+                THREAD,
+                [path.as_path()],
+                true,
+                Some(&mut cache),
+            )?
+            .expect("first resolve");
+        assert!(first.paginated);
+        assert!(first.native);
+        cache.save();
+
+        // Reload cache and confirm the unchanged paginated rollout resolves via RolloutCache.
+        let mut reloaded = RolloutCache::load(&cache_file, home.path()).expect("reloaded cache");
+        let stamp = ObservedRollout::read(&path)
+            .expect("observed")
+            .stamp
+            .expect("stamp");
+        let cached_entry = reloaded
+            .get(&path, stamp)
+            .expect("paginated rollout should be cached");
+        assert!(
+            cached_entry
+                .header
+                .as_ref()
+                .is_some_and(|header| header.current_header == CachedCurrentHeader::PaginatedNative)
+        );
+        let second = row
+            .resolve_cached(
+                home.path(),
+                Some(&canonical_home),
+                THREAD,
+                [path.as_path()],
+                true,
+                Some(&mut reloaded),
+            )?
+            .expect("cached resolve");
+        assert_eq!(second.session.id, first.session.id);
+        assert_eq!(second.revision, first.revision);
+        assert!(second.paginated);
+        assert!(second.native);
+
+        // Replacing the file with corrupt bytes changes its stamp and must not reuse the cached header.
+        fs::write(&path, b"not json at all\n")?;
+        assert!(
+            row.resolve_cached(
+                home.path(),
+                Some(&canonical_home),
+                THREAD,
+                [path.as_path()],
+                true,
+                Some(&mut reloaded),
+            )
+            .unwrap_err()
+            .is::<CurrentRolloutUnavailable>()
         );
         Ok(())
     }
