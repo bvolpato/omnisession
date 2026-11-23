@@ -1,10 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.10.4 - 2026-11-22
 
 ### Added
 
-- Persist complete tool call and result pairs as native `STEP_PLANNER_RESPONSE` and `STEP_MCP_TOOL` steps named `hist_<provider>_<tool>` (with `error_details` on failed results) and record workspace Git root and branch metadata when importing sessions into Antigravity CLI.
+- Persist complete tool call and result pairs as native `STEP_PLANNER_RESPONSE` and `STEP_MCP_TOOL` steps named `hist_<provider>_<tool>` (with `error_details` on failed results) and record workspace Git root and branch metadata when importing sessions into Antigravity CLI. ([#301](https://github.com/bvolpato/omnisession/pull/301))
+
+### Changed
+
+- Speed up `omni` TUI startup, scrolling, filtering, and idle polling by moving Codex GUI title refreshes off the initial cached render, caching filtered rows with `Arc<[usize]>`, prefiltering fuzzy matches with 64-bit ASCII bitmasks, scoping partial-update work to changed providers, and skipping idle row-count and preview refreshes. ([#306](https://github.com/bvolpato/omnisession/pull/306))
+- Speed up bare session ID lookups and `omni fork` startup by adding direct `find_native_session` lookups for Claude Code and Antigravity, precomputing workspace matchers across Claude Code and Cursor CLI discovery, caching provider binary version checks on disk, and pre-probing target version and launch support in parallel. ([#305](https://github.com/bvolpato/omnisession/pull/305))
+- Speed up provider discovery and Codex rollout reads by caching parsed paginated and compressed Codex headers, sorting `state_5.sqlite` title lookups, configuring SQLite cache and 64-bit Unix `mmap_size`, reusing Antigravity snapshots, and skipping non-session `memory` and `workflows` folders in Claude Code discovery. ([#304](https://github.com/bvolpato/omnisession/pull/304))
+- Speed up cached listing, search, and store reads by replacing the `visible_trajectories` `OR` join with `UNION ALL`, adding an indexed Codex title join, factoring search SQL predicates, enabling 64-bit Unix SQLite `mmap_size`, and reusing precomputed workspace matchers. ([#303](https://github.com/bvolpato/omnisession/pull/303))
+
+### Fixed
+
+- Stop leaking source-workspace Git root and branch metadata into Antigravity CLI imports when the target workspace differs, normalize Windows verbatim `\\?\` paths during picker workspace matching and Antigravity imports, and make the Windows Grok search-index test deterministic. ([#302](https://github.com/bvolpato/omnisession/pull/302))
+
+### Internal
+
+- Update `url` to 2.5.9 in `Cargo.toml` and `Cargo.lock` (along with `form_urlencoded` 1.2.3) to resolve `RUSTSEC-2026-0592`.
+- Update `next` from 16.4.3 to 16.4.5 in `website`. ([#298](https://github.com/bvolpato/omnisession/pull/298))
 
 ## 0.10.3 - 2026-11-18
 
