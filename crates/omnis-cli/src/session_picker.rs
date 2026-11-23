@@ -647,6 +647,7 @@ impl PickerState {
         } else {
             self.forget_replaced_sources(&entries);
         }
+        let mut mutated_retained = false;
         if matches!(provider, Provider::Antigravity | Provider::AntigravityIde) && !complete {
             let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
             let archived: HashSet<_> = archived_ids.iter().map(String::as_str).collect();
@@ -662,6 +663,7 @@ impl PickerState {
                 entry.cached = true;
                 entry.session.source_path = None;
                 entry.session.source_revision = None;
+                mutated_retained = true;
                 true
             });
         } else if complete {
@@ -689,7 +691,18 @@ impl PickerState {
         let inserted_start = self.entries.len();
         self.entries.extend(entries);
         self.apply_verified_workspaces(inserted_start..self.entries.len());
-        self.apply_derived_titles_for(inserted_start..self.entries.len());
+        if mutated_retained {
+            let retained_for_provider: Vec<usize> = (0..inserted_start)
+                .filter(|&index| self.entries[index].session.session.provider == provider)
+                .collect();
+            self.apply_derived_titles_for(
+                retained_for_provider
+                    .into_iter()
+                    .chain(inserted_start..self.entries.len()),
+            );
+        } else {
+            self.apply_derived_titles_for(inserted_start..self.entries.len());
+        }
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.rebuild_entry_positions();
@@ -699,76 +712,147 @@ impl PickerState {
         self.restore_selection(selected_key);
     }
 
-    fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
+    #[cfg(test)]
+    fn replace_all_entries(&mut self, entries: Vec<PickerEntry>) {
+        self.replace_all_entries_with_titles(entries, Vec::new());
+    }
+
+    fn replace_all_entries_with_titles(
+        &mut self,
+        mut entries: Vec<PickerEntry>,
+        titles: Vec<IndexedTrajectoryTitle>,
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         self.forget_replaced_sources(&entries);
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
         self.apply_verified_workspaces(0..self.entries.len());
-        self.apply_derived_titles_for(0..self.entries.len());
         self.rebuild_entry_positions();
+        for receipt in titles {
+            let source_revision = preview_revision(receipt.source_revision);
+            let key = self.matching_title_key(&receipt.session, source_revision);
+            if !uses_strict_preview_failures(receipt.session.provider) {
+                if let Some(&index) = self.entry_positions.get(&key) {
+                    let _ = self.update_indexed_title(
+                        index,
+                        IndexedTrajectoryTitle {
+                            source_revision,
+                            ..receipt
+                        },
+                    );
+                }
+                continue;
+            }
+            let record = omnis_store::IndexedTitle {
+                title: receipt.title,
+                document_version: receipt.document_version,
+                source_revision,
+                verified_at: receipt.verified_at,
+                cached_at: receipt.cached_at,
+            };
+            if self.previews.rejected(&receipt.session, source_revision)
+                || self.derived_titles.get(&key) == Some(&record)
+            {
+                continue;
+            }
+            if let Some(entry) = self
+                .entry_positions
+                .get(&key)
+                .and_then(|index| self.entries.get(*index))
+                && !crate::title_matches_search_source(&entry.session, &record, entry.cached)
+            {
+                continue;
+            }
+            self.derived_titles.insert(key, record);
+        }
+        self.apply_derived_titles_for(0..self.entries.len());
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
     }
 
-    fn replace_all_entries_with_titles(
-        &mut self,
-        entries: Vec<PickerEntry>,
-        titles: Vec<IndexedTrajectoryTitle>,
-    ) {
-        for receipt in titles {
-            let record = omnis_store::IndexedTitle {
-                title: receipt.title,
-                document_version: receipt.document_version,
-                source_revision: preview_revision(receipt.source_revision),
-                verified_at: receipt.verified_at,
-                cached_at: receipt.cached_at,
-            };
-            let key = receipt.session.to_string();
-            if self.derived_titles.get(&key) != Some(&record) {
-                self.derived_titles.insert(key, record);
-            }
-        }
-        self.replace_all_entries(entries);
-    }
-
     fn apply_refreshed_codex_titles(&mut self, refreshed: workers::RefreshedCodexTitles) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let current_project = self.current_project.clone();
+        let mut matcher = SessionWorkspaceMatcher::new(&current_project);
         let mut changed = false;
-        for (session, title, retired_name) in refreshed.entries {
-            let key = session.to_string();
+        let mut needs_resort = false;
+        let mut needs_reindex = false;
+        let mut needs_query_refresh = false;
+        let mut changed_indices = Vec::new();
+        for (updated, retired_name) in refreshed.entries {
+            let key = updated.session.to_string();
             let Some(&index) = self.entry_positions.get(&key) else {
                 continue;
             };
-            let entry = &mut self.entries[index];
+            let entry = &self.entries[index];
             if !entry.cached || entry.session.session.provider != Provider::Codex {
                 continue;
             }
-            if entry.listed_title != title || retired_name.is_some() {
-                entry.listed_title.clone_from(&title);
-                entry.session.title = title;
-                if let Some(previous) = retired_name {
-                    entry.retire_previous_name(&previous);
-                }
-                if let Some(record) = self.derived_titles.get(&key) {
-                    apply_derived_title(entry, record);
-                } else {
-                    entry.fields = SearchFields::new(&entry.session, None);
-                }
-                if self.indexed_titles.contains_key(&key) || self.preview_titles.contains_key(&key)
-                {
-                    self.refresh_entry_title(index);
-                }
-                changed = true;
+            let source_changed = entry.session.source_revision != updated.source_revision
+                || (entry.session.source_revision.is_none()
+                    && entry.session.source_path != updated.source_path);
+            let source_path_changed = entry.session.source_path != updated.source_path;
+            let updated_at_changed = entry.session.updated_at != updated.updated_at;
+            let project_changed = entry.session.project_path != updated.project_path;
+            if source_changed {
+                self.indexed_titles.remove(&key);
+                self.preview_titles.remove(&key);
+                self.previews.remove_session(&updated.session);
             }
+            let entry = &mut self.entries[index];
+            entry.listed_title.clone_from(&updated.title);
+            entry.session = updated;
+            if project_changed {
+                entry.current_workspace = entry
+                    .session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(Provider::Codex, path));
+            }
+            if let Some(previous) = retired_name {
+                entry.retire_previous_name(&previous);
+            }
+            needs_resort |= updated_at_changed;
+            needs_reindex |=
+                entry.session.source_path.is_some() && (source_changed || source_path_changed);
+            needs_query_refresh |= source_changed || project_changed;
+            changed_indices.push(index);
+            changed = true;
         }
-        if !refreshed.titles.is_empty() {
-            self.remember_source_titles(refreshed.titles);
+        let cached_titles: Vec<_> = refreshed
+            .titles
+            .into_iter()
+            .filter(|receipt| {
+                self.entry_positions
+                    .get(&receipt.session.to_string())
+                    .and_then(|&index| self.entries.get(index))
+                    .is_some_and(|entry| {
+                        entry.cached && entry.session.session.provider == Provider::Codex
+                    })
+            })
+            .collect();
+        let workspaces_changed = self.apply_verified_workspaces(changed_indices.iter().copied());
+        for index in changed_indices {
+            self.refresh_entry_title(index);
+        }
+        if !cached_titles.is_empty() {
+            self.remember_source_titles(cached_titles);
         }
         if changed {
+            if needs_resort {
+                self.entries
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+                self.rebuild_entry_positions();
+            }
+            if needs_reindex {
+                self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
+            }
+            if needs_query_refresh || workspaces_changed {
+                self.query_changed();
+            }
             self.entries_generation = self.entries_generation.wrapping_add(1);
             self.restore_selection(selected_key);
         }
@@ -9294,5 +9378,138 @@ agent = "codex"
 
         let same_state = WorkspaceInputState::new(Some(&current), Provider::Claude, &current_canon);
         assert!(same_state.saved.is_none());
+    }
+
+    #[test]
+    fn replace_all_entries_with_titles_routes_strict_and_non_strict_providers() {
+        let project = fixture_workspace();
+        let codex_rev = SourceRevision {
+            file: Some(Uuid::new_v4()),
+            contents: Some(Uuid::new_v4()),
+            ..SourceRevision::default()
+        };
+        let mut codex = session(Provider::Codex, "codex-retire", project, None);
+        codex.source_revision = Some(codex_rev);
+        let pi_rev = SourceRevision {
+            file: Some(Uuid::new_v4()),
+            contents: Some(Uuid::new_v4()),
+            ..SourceRevision::default()
+        };
+        let mut pi = session(Provider::Pi, "pi-scoped", project, None);
+        pi.source_revision = Some(pi_rev);
+
+        let mut state = PickerState::new(Vec::new(), project, None, false);
+        state.replace_all_entries_with_titles(
+            vec![
+                PickerEntry::new(codex.clone(), true, true),
+                PickerEntry::new(pi.clone(), true, true),
+            ],
+            vec![
+                IndexedTrajectoryTitle {
+                    session: codex.session.clone(),
+                    title: Some("Old Codex Title".to_owned()),
+                    document_version: omnis_core::search_document_version(Provider::Codex),
+                    source_revision: codex_rev,
+                    verified_at: None,
+                    cached_at: codex.updated_at,
+                },
+                IndexedTrajectoryTitle {
+                    session: pi.session.clone(),
+                    title: Some("Scoped Pi Title".to_owned()),
+                    document_version: omnis_core::search_document_version(Provider::Pi),
+                    source_revision: pi_rev,
+                    verified_at: None,
+                    cached_at: pi.updated_at,
+                },
+            ],
+        );
+
+        // Pi receives its title under its workspace-qualified key; Codex uses indexed_titles.
+        let pi_entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.session.session == pi.session)
+            .expect("pi entry");
+        assert_eq!(pi_entry.session.title.as_deref(), Some("Scoped Pi Title"));
+        let codex_entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.session.session == codex.session)
+            .expect("codex entry");
+        assert_eq!(
+            codex_entry.session.title.as_deref(),
+            Some("Old Codex Title")
+        );
+        assert!(
+            !state
+                .derived_titles
+                .contains_key(&codex.session.to_string()),
+            "non-strict Codex title must live in indexed_titles, not derived_titles"
+        );
+
+        // Retiring the Codex title via apply_refreshed_codex_titles clears it completely.
+        let mut cleared = codex.clone();
+        cleared.title = None;
+        state.apply_refreshed_codex_titles(workers::RefreshedCodexTitles {
+            entries: vec![(cleared, Some("Old Codex Title".to_owned()))],
+            titles: vec![IndexedTrajectoryTitle {
+                session: codex.session.clone(),
+                title: None,
+                document_version: omnis_core::search_document_version(Provider::Codex),
+                source_revision: codex_rev,
+                verified_at: None,
+                cached_at: codex.updated_at,
+            }],
+        });
+        let codex_after = state
+            .entries
+            .iter()
+            .find(|entry| entry.session.session == codex.session)
+            .expect("codex entry after retirement");
+        assert_eq!(codex_after.session.title, None);
+        state.query = "Old Codex Title".to_owned();
+        assert!(state.visible_indices().is_empty());
+    }
+
+    #[test]
+    fn partial_antigravity_update_clears_stale_preview_title_on_retained_row() {
+        let project = fixture_workspace();
+        let rev = SourceRevision {
+            file: Some(Uuid::new_v4()),
+            contents: Some(Uuid::new_v4()),
+            ..SourceRevision::default()
+        };
+        let mut retained = session(Provider::Antigravity, "ag-retained", project, None);
+        retained.source_path = Some(project.join("ag-retained.db"));
+        retained.source_revision = Some(rev);
+
+        let mut state = PickerState::new(vec![retained.clone()], project, None, false);
+        let key = state.preview_key(&state.entries[0]);
+        state.preview_titles.insert(
+            state.entries[0].key.clone(),
+            (key, "Stale Preview Title".to_owned()),
+        );
+        state.refresh_entry_title(0);
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Stale Preview Title")
+        );
+
+        let observed = session(Provider::Antigravity, "ag-observed", project, Some("Fresh"));
+        state.update_provider_entries(
+            Provider::Antigravity,
+            vec![PickerEntry::new(observed, true, false)],
+            false,
+            &[],
+            &[],
+        );
+        let after = state
+            .entries
+            .iter()
+            .find(|entry| entry.session.session == retained.session)
+            .expect("retained antigravity entry");
+        assert!(after.cached);
+        assert_eq!(after.session.source_path, None);
+        assert_eq!(after.session.title, None);
     }
 }

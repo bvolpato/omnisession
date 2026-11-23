@@ -241,7 +241,7 @@ fn publish_catalog(
 }
 
 pub(super) struct RefreshedCodexTitles {
-    pub(super) entries: Vec<(SessionRef, Option<String>, Option<String>)>,
+    pub(super) entries: Vec<(NativeSession, Option<String>)>,
     pub(super) titles: Vec<IndexedTrajectoryTitle>,
 }
 
@@ -888,47 +888,62 @@ fn spawn_codex_title_refresh(
     mut titles: Vec<IndexedTrajectoryTitle>,
 ) {
     thread::spawn(move || {
-        let original_titles: HashMap<_, _> = sessions
+        let original_snapshots: HashMap<_, _> = sessions
             .iter()
-            .map(|session| (session.session.clone(), session.title.clone()))
+            .map(|session| {
+                (
+                    session.session.clone(),
+                    (
+                        session.title.clone(),
+                        session.source_path.clone(),
+                        session.source_revision,
+                        session.project_path.clone(),
+                        session.git_branch.clone(),
+                        session.updated_at,
+                    ),
+                )
+            })
             .collect();
         let observed =
             omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
-        if observed.is_empty() {
-            return;
-        }
-        let Ok(store) = Store::open_default() else {
-            return;
-        };
-        let mut effective = titles
-            .iter()
-            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
-            .collect();
-        if crate::apply_live_search_titles(&store, &mut sessions, observed, &mut effective).is_err()
-        {
-            return;
-        }
         let mut retired = HashMap::new();
         let mut updated_titles = Vec::new();
-        for mut receipt in titles.drain(..) {
-            let current = effective.remove(&receipt.session);
-            if current != receipt.title {
-                if let Some(previous) = std::mem::replace(&mut receipt.title, current) {
-                    retired.insert(receipt.session.clone(), previous);
+        if !observed.is_empty()
+            && let Ok(store) = Store::open_default()
+        {
+            let mut effective = titles
+                .iter()
+                .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
+                .collect();
+            if crate::apply_live_search_titles(&store, &mut sessions, observed, &mut effective)
+                .is_ok()
+            {
+                for mut receipt in titles.drain(..) {
+                    let current = effective.remove(&receipt.session);
+                    if current != receipt.title {
+                        if let Some(previous) = std::mem::replace(&mut receipt.title, current) {
+                            retired.insert(receipt.session.clone(), previous);
+                        }
+                        updated_titles.push(receipt);
+                    }
                 }
-                updated_titles.push(receipt);
             }
         }
         let updated_entries: Vec<_> = sessions
             .into_iter()
             .filter_map(|session| {
                 let retired_name = retired.remove(&session.session);
-                let title_changed = original_titles.get(&session.session) != Some(&session.title);
-                (title_changed || retired_name.is_some()).then_some((
-                    session.session,
-                    session.title,
-                    retired_name,
-                ))
+                let changed = original_snapshots.get(&session.session).is_none_or(
+                    |(title, path, revision, project, branch, updated_at)| {
+                        *title != session.title
+                            || *path != session.source_path
+                            || *revision != session.source_revision
+                            || *project != session.project_path
+                            || *branch != session.git_branch
+                            || *updated_at != session.updated_at
+                    },
+                );
+                (changed || retired_name.is_some()).then_some((session, retired_name))
             })
             .collect();
         if !updated_entries.is_empty() || !updated_titles.is_empty() {
