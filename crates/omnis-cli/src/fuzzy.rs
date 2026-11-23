@@ -13,7 +13,13 @@ const FIELD_CHARACTER_LIMIT: usize = 512;
 /// Lowercased searchable metadata. Fields are scored independently so a match never spans a
 /// title and a path.
 pub(crate) struct SearchFields {
-    fields: Vec<(Vec<char>, i64)>,
+    fields: Vec<IndexedField>,
+}
+
+struct IndexedField {
+    chars: Box<[char]>,
+    mask: u64,
+    bonus: i64,
 }
 
 impl SearchFields {
@@ -61,8 +67,8 @@ impl SearchFields {
                         .into_iter()
                         .map(|title| (Some(title.to_owned()), TITLE_BONUS)),
                 )
-                .filter_map(|(value, bonus)| value.map(|value| (lowercase_chars(&value), bonus)))
-                .filter(|(value, _)| !value.is_empty())
+                .filter_map(|(value, bonus)| value.map(|value| IndexedField::new(&value, bonus)))
+                .filter(|field| !field.chars.is_empty())
                 .collect(),
         }
     }
@@ -72,7 +78,7 @@ impl SearchFields {
         Self {
             fields: names
                 .into_iter()
-                .map(|name| (lowercase_chars(name), 0))
+                .map(|name| IndexedField::new(name, 0))
                 .collect(),
         }
     }
@@ -82,16 +88,25 @@ impl SearchFields {
         terms.iter().try_fold(0_i64, |total, term| {
             self.fields
                 .iter()
-                .filter_map(|(field, bonus)| term_score(field, term).map(|score| score + bonus))
+                .filter_map(|field| term_score(field, term).map(|score| score + field.bonus))
                 .max()
                 .map(|best| total.saturating_add(best))
         })
     }
 }
 
+impl IndexedField {
+    fn new(value: &str, bonus: i64) -> Self {
+        let chars = lowercase_chars(value).into_boxed_slice();
+        let mask = ascii_char_mask(&chars);
+        Self { chars, mask, bonus }
+    }
+}
+
 /// One folded query term from [`SearchQuery::parse`].
 pub(crate) struct QueryTerm {
     characters: Vec<char>,
+    mask: u64,
     /// Plain words may match as a tight subsequence. Quoted phrases and words with inner
     /// punctuation must appear contiguously.
     fuzzy: bool,
@@ -101,9 +116,14 @@ pub(crate) fn query_terms(query: &str) -> Vec<QueryTerm> {
     SearchQuery::parse(query)
         .terms()
         .iter()
-        .map(|term| QueryTerm {
-            characters: term.text().chars().map(fold_case).collect(),
-            fuzzy: !term.requires_substring(),
+        .map(|term| {
+            let characters: Vec<char> = term.text().chars().map(fold_case).collect();
+            let mask = ascii_char_mask(&characters);
+            QueryTerm {
+                characters,
+                mask,
+                fuzzy: !term.requires_substring(),
+            }
         })
         .collect()
 }
@@ -139,9 +159,36 @@ fn lowercase_chars(value: &str) -> Vec<char> {
         .collect()
 }
 
-fn term_score(field: &[char], term: &QueryTerm) -> Option<i64> {
+fn ascii_char_mask(chars: &[char]) -> u64 {
+    let mut mask = 0_u64;
+    for &character in chars {
+        let bit = match character {
+            'a'..='z' => Some(u32::from(character as u8 - b'a')),
+            '0'..='9' => Some(26 + u32::from(character as u8 - b'0')),
+            '-' => Some(36),
+            '_' => Some(37),
+            '/' => Some(38),
+            '.' => Some(39),
+            ':' => Some(40),
+            ' ' => Some(41),
+            '@' => Some(42),
+            '\\' => Some(43),
+            _ => None,
+        };
+        if let Some(bit) = bit {
+            mask |= 1_u64 << bit;
+        }
+    }
+    mask
+}
+
+fn term_score(indexed: &IndexedField, term: &QueryTerm) -> Option<i64> {
+    let field = &indexed.chars;
     let term_characters = &term.characters;
-    if term_characters.is_empty() || term_characters.len() > field.len() {
+    if term_characters.is_empty()
+        || term_characters.len() > field.len()
+        || (indexed.mask & term.mask) != term.mask
+    {
         return None;
     }
     if let Some(start) = find_substring(field, term_characters) {
@@ -160,10 +207,20 @@ fn term_score(field: &[char], term: &QueryTerm) -> Option<i64> {
 }
 
 fn find_substring(field: &[char], term: &[char]) -> Option<usize> {
-    if term.is_empty() || term.len() > field.len() {
-        return None;
+    let (&first, rest) = term.split_first()?;
+    let last_start = field.len().checked_sub(term.len())?;
+    let mut start = 0;
+    while start <= last_start {
+        let offset = field[start..=last_start]
+            .iter()
+            .position(|&character| character == first)?;
+        start += offset;
+        if field[start + 1..start + term.len()] == *rest {
+            return Some(start);
+        }
+        start += 1;
     }
-    field.windows(term.len()).position(|window| window == term)
+    None
 }
 
 // The window bound keeps scattered letters across unrelated words from matching.
@@ -345,5 +402,14 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(highlighted, "RateLim");
+    }
+
+    #[test]
+    fn ascii_bitmask_preserves_unicode_case_folding_and_non_ascii_terms() {
+        let kelvin = fields("Temperature in \u{212A}elvin", "/workspace/caf\u{00E9}");
+        assert!(kelvin.score(&query_terms("kelvin")).is_some());
+        assert!(kelvin.score(&query_terms("caf\u{00E9}")).is_some());
+        assert!(kelvin.score(&query_terms("CAF\u{00C9}")).is_some());
+        assert!(kelvin.score(&query_terms("missing")).is_none());
     }
 }

@@ -5,7 +5,10 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{MAIN_SEPARATOR, Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -43,7 +46,7 @@ use uuid::Uuid;
 
 use crate::{
     DELETE_PROVIDERS, PROVIDERS, ResumeArgs,
-    fuzzy::{SearchFields, query_terms},
+    fuzzy::{QueryTerm, SearchFields, query_terms},
     launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
     search_index::IndexCandidate,
@@ -305,7 +308,20 @@ struct VisibleKey {
 
 struct VisibleCache {
     key: VisibleKey,
-    indices: Vec<usize>,
+    indices: Arc<[usize]>,
+}
+
+impl VisibleCache {
+    fn matches(&self, state: &PickerState) -> bool {
+        self.key.entries_generation == state.entries_generation
+            && self.key.entry_count == state.entries.len()
+            && self.key.provider_index == state.provider_index
+            && self.key.all_projects == state.all_projects
+            && self.key.trajectory_matches_generation == state.trajectory_matches_generation
+            && self.key.trajectory_match_count == state.trajectory_matches.len()
+            && self.key.lineage_generation == state.lineage.generation
+            && self.key.query == state.query
+    }
 }
 
 impl PickerState {
@@ -433,26 +449,27 @@ impl PickerState {
             .and_then(|index| PICKER_PROVIDERS.get(index).copied())
     }
 
-    fn visible_indices(&self) -> Vec<usize> {
-        let key = self.visible_key();
+    fn visible_indices(&self) -> Arc<[usize]> {
         if let Some(cache) = self
             .visible_cache
             .borrow()
             .as_ref()
-            .filter(|cache| cache.key == key)
+            .filter(|cache| cache.matches(self))
         {
-            return cache.indices.clone();
+            return Arc::clone(&cache.indices);
         }
+        let key = self.visible_key();
         let matches = self.matching_indices();
-        let indices = if self.query.trim().is_empty() {
+        let indices: Arc<[usize]> = if self.query.trim().is_empty() {
             self.lineage
                 .grouped_indices(matches, &self.entries, &self.entry_positions)
         } else {
             matches
-        };
+        }
+        .into();
         *self.visible_cache.borrow_mut() = Some(VisibleCache {
             key,
-            indices: indices.clone(),
+            indices: Arc::clone(&indices),
         });
         indices
     }
@@ -669,11 +686,12 @@ impl PickerState {
                 !observed.contains(entry.key.as_str())
             });
         }
+        let inserted_start = self.entries.len();
         self.entries.extend(entries);
+        self.apply_verified_workspaces(inserted_start..self.entries.len());
+        self.apply_derived_titles_for(inserted_start..self.entries.len());
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
-        self.apply_verified_workspaces(0..self.entries.len());
-        self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
@@ -688,12 +706,72 @@ impl PickerState {
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
         self.apply_verified_workspaces(0..self.entries.len());
-        self.apply_derived_titles();
+        self.apply_derived_titles_for(0..self.entries.len());
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
+    }
+
+    fn replace_all_entries_with_titles(
+        &mut self,
+        entries: Vec<PickerEntry>,
+        titles: Vec<IndexedTrajectoryTitle>,
+    ) {
+        for receipt in titles {
+            let record = omnis_store::IndexedTitle {
+                title: receipt.title,
+                document_version: receipt.document_version,
+                source_revision: preview_revision(receipt.source_revision),
+                verified_at: receipt.verified_at,
+                cached_at: receipt.cached_at,
+            };
+            let key = receipt.session.to_string();
+            if self.derived_titles.get(&key) != Some(&record) {
+                self.derived_titles.insert(key, record);
+            }
+        }
+        self.replace_all_entries(entries);
+    }
+
+    fn apply_refreshed_codex_titles(&mut self, refreshed: workers::RefreshedCodexTitles) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let mut changed = false;
+        for (session, title, retired_name) in refreshed.entries {
+            let key = session.to_string();
+            let Some(&index) = self.entry_positions.get(&key) else {
+                continue;
+            };
+            let entry = &mut self.entries[index];
+            if !entry.cached || entry.session.session.provider != Provider::Codex {
+                continue;
+            }
+            if entry.listed_title != title || retired_name.is_some() {
+                entry.listed_title.clone_from(&title);
+                entry.session.title = title;
+                if let Some(previous) = retired_name {
+                    entry.retire_previous_name(&previous);
+                }
+                if let Some(record) = self.derived_titles.get(&key) {
+                    apply_derived_title(entry, record);
+                } else {
+                    entry.fields = SearchFields::new(&entry.session, None);
+                }
+                if self.indexed_titles.contains_key(&key) || self.preview_titles.contains_key(&key)
+                {
+                    self.refresh_entry_title(index);
+                }
+                changed = true;
+            }
+        }
+        if !refreshed.titles.is_empty() {
+            self.remember_source_titles(refreshed.titles);
+        }
+        if changed {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.restore_selection(selected_key);
+        }
     }
 
     fn forget_replaced_sources(&mut self, entries: &[PickerEntry]) {
@@ -1187,8 +1265,8 @@ impl PickerState {
         entry.fields = SearchFields::new(&entry.session, indexed.into_iter().chain(preview));
     }
 
-    fn apply_derived_titles(&mut self) {
-        for index in 0..self.entries.len() {
+    fn apply_derived_titles_for(&mut self, rows: impl IntoIterator<Item = usize>) {
+        for index in rows {
             let key = self.entries[index].key.clone();
             if let Some(record) = self.derived_titles.get(&key) {
                 apply_derived_title(&mut self.entries[index], record);
@@ -1423,9 +1501,32 @@ impl PickerState {
         )
     }
 
-    fn content_only_match(&self, entry: &PickerEntry) -> bool {
-        self.trajectory_matches.contains_key(&entry.key)
-            && entry.fields.score(&query_terms(&self.query)).is_none()
+    fn content_only_match(&self, entry: &PickerEntry, terms: &[QueryTerm]) -> bool {
+        self.trajectory_matches.contains_key(&entry.key) && entry.fields.score(terms).is_none()
+    }
+
+    fn poll_timeout(&self, pending_count: usize) -> Duration {
+        const ACTIVE_POLL: Duration = Duration::from_millis(16);
+        const IDLE_POLL: Duration = Duration::from_millis(75);
+        let now = Instant::now();
+        let next_deadline = [
+            self.preview_deadline,
+            self.trajectory_search_deadline,
+            self.index_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(deadline) = next_deadline {
+            return deadline
+                .saturating_duration_since(now)
+                .clamp(Duration::from_millis(1), ACTIVE_POLL);
+        }
+        if self.loading(pending_count) || self.trajectory_search_pending {
+            ACTIVE_POLL
+        } else {
+            IDLE_POLL
+        }
     }
 
     const fn loading(&self, pending_count: usize) -> bool {
@@ -2116,7 +2217,7 @@ fn cached_picker_entries(
         })
         .transpose()?
         .flatten();
-    let (sessions, mut titles) = store.cached_picker_sessions_with_titles_for_native_homes(
+    let (sessions, titles) = store.cached_picker_sessions_with_titles_for_native_homes(
         antigravity_home,
         desktop_home,
         ide_home,
@@ -2143,23 +2244,6 @@ fn cached_picker_entries(
         })
         .collect::<Vec<_>>();
     add_cached_pi_entries(store, &mut sessions)?;
-    let observed = omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
-    let mut retired = HashMap::new();
-    if !observed.is_empty() {
-        let mut effective = titles
-            .iter()
-            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
-            .collect();
-        crate::apply_live_search_titles(store, &mut sessions, observed, &mut effective)?;
-        for receipt in &mut titles {
-            let current = effective.remove(&receipt.session);
-            if current != receipt.title
-                && let Some(previous) = std::mem::replace(&mut receipt.title, current)
-            {
-                retired.insert(receipt.session.clone(), previous);
-            }
-        }
-    }
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
@@ -2167,12 +2251,7 @@ fn cached_picker_entries(
     let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
     for mut session in sessions {
         if session.session.provider != Provider::Imported {
-            let previous = retired.remove(&session.session);
-            let mut entry = picker_entry(session, &mut paths, true);
-            if let Some(previous) = previous {
-                entry.retire_previous_name(&previous);
-            }
-            entries.push(entry);
+            entries.push(picker_entry(session, &mut paths, true));
             continue;
         }
         let current = match imports.matches(&session.session, session.project_path.as_deref()) {
@@ -2420,23 +2499,29 @@ pub(super) fn pick_session(
     render_state.render(&state, target, &warnings, pending.len())?;
 
     let mut dirty = false;
+    let mut needs_preview_refresh = true;
     let mut clicks = ClickTracker::default();
     let mut late_reply = theme::LateReplyGuard::default();
     loop {
-        dirty |= receive_updates(
+        let received = receive_updates(
             &workers.receiver,
             &mut state,
             &mut pending,
             &mut warnings,
             current_project,
         );
-        state.refresh_preview_window(terminal_list_row_count()?);
+        dirty |= received;
+        if dirty || needs_preview_refresh {
+            state.refresh_preview_window(terminal_list_row_count()?);
+            needs_preview_refresh = false;
+        }
         dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
             render_state.render(&state, target, &warnings, pending.len())?;
             dirty = false;
         }
-        let Some(event) = next_picker_event(&mut late_reply)? else {
+        let Some(event) = next_picker_event(&mut late_reply, state.poll_timeout(pending.len()))?
+        else {
             continue;
         };
         let (width, height) = terminal::size().context("reading terminal size")?;
@@ -2455,32 +2540,15 @@ pub(super) fn pick_session(
                 }
             }
             PickerAction::ConfirmDelete => {
-                let Some(dialog) = state.delete_dialog.as_mut() else {
-                    continue;
-                };
-                dialog.phase = DeletePhase::Deleting;
-                let session = dialog.session.clone();
-                let pi_file = dialog.pi_file.clone();
-                let row_key = dialog.row_key.clone();
-                let workspace = dialog.workspace_or(current_project);
-                render_state.render(&state, target, &warnings, pending.len())?;
-                let deletion =
-                    delete_selected_source(registry, &session, &workspace, pi_file.as_ref());
-                match deletion {
-                    Ok(()) => {
-                        state.remove_session(&session, &row_key);
-                        state.delete_dialog = None;
-                        state.notice = Some(format!("Deleted source session {session}"));
-                    }
-                    Err(error) => {
-                        let message = safe_terminal_line(&error.to_string());
-                        if let Some(dialog) = &mut state.delete_dialog {
-                            dialog.phase = DeletePhase::Failed(message);
-                        }
-                    }
-                }
-                render_state.invalidate();
-                dirty = true;
+                dirty |= confirm_picker_delete(
+                    &mut state,
+                    &mut render_state,
+                    target,
+                    &warnings,
+                    pending.len(),
+                    registry,
+                    current_project,
+                )?;
             }
             PickerAction::Select => {
                 match select_picker_row(
@@ -2502,6 +2570,41 @@ pub(super) fn pick_session(
             }
         }
     }
+}
+
+fn confirm_picker_delete(
+    state: &mut PickerState,
+    render_state: &mut PickerRenderState,
+    target: Option<AgentTarget>,
+    warnings: &[String],
+    pending_count: usize,
+    registry: &AdapterRegistry,
+    current_project: &Path,
+) -> Result<bool> {
+    let Some(dialog) = state.delete_dialog.as_mut() else {
+        return Ok(false);
+    };
+    dialog.phase = DeletePhase::Deleting;
+    let session = dialog.session.clone();
+    let pi_file = dialog.pi_file.clone();
+    let row_key = dialog.row_key.clone();
+    let workspace = dialog.workspace_or(current_project);
+    render_state.render(state, target, warnings, pending_count)?;
+    match delete_selected_source(registry, &session, &workspace, pi_file.as_ref()) {
+        Ok(()) => {
+            state.remove_session(&session, &row_key);
+            state.delete_dialog = None;
+            state.notice = Some(format!("Deleted source session {session}"));
+        }
+        Err(error) => {
+            let message = safe_terminal_line(&error.to_string());
+            if let Some(dialog) = &mut state.delete_dialog {
+                dialog.phase = DeletePhase::Failed(message);
+            }
+        }
+    }
+    render_state.invalidate();
+    Ok(true)
 }
 
 fn delete_selected_source(
@@ -2736,8 +2839,11 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
 }
 
 /// Next input event within one refresh tick, skipping a late terminal reply.
-fn next_picker_event(late_reply: &mut theme::LateReplyGuard) -> Result<Option<Event>> {
-    if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
+fn next_picker_event(
+    late_reply: &mut theme::LateReplyGuard,
+    timeout: Duration,
+) -> Result<Option<Event>> {
+    if !event::poll(timeout).context("polling session picker input")? {
         return Ok(None);
     }
     let event = event::read().context("reading session picker input")?;
@@ -7192,8 +7298,8 @@ mod tests {
         state.query = "ratelimiter".to_owned();
         let visible = state
             .visible_indices()
-            .into_iter()
-            .map(|index| state.entries[index].key.clone())
+            .iter()
+            .map(|&index| state.entries[index].key.clone())
             .collect::<Vec<_>>();
         assert_eq!(visible, ["claude:title", "codex:path-only"]);
         state.query = "limiter rate".to_owned();
@@ -7223,8 +7329,8 @@ mod tests {
         let visible = |state: &PickerState| {
             state
                 .visible_indices()
-                .into_iter()
-                .map(|index| state.entries[index].key.clone())
+                .iter()
+                .map(|&index| state.entries[index].key.clone())
                 .collect::<Vec<_>>()
         };
 
@@ -7944,8 +8050,8 @@ mod tests {
 
         let visible = state
             .visible_indices()
-            .into_iter()
-            .map(|index| state.entries[index].session.session.clone())
+            .iter()
+            .map(|&index| state.entries[index].session.session.clone())
             .collect::<Vec<_>>();
         assert_eq!(
             visible,

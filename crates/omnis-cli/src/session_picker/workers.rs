@@ -240,8 +240,14 @@ fn publish_catalog(
     }
 }
 
+pub(super) struct RefreshedCodexTitles {
+    pub(super) entries: Vec<(SessionRef, Option<String>, Option<String>)>,
+    pub(super) titles: Vec<IndexedTrajectoryTitle>,
+}
+
 pub(super) enum PickerUpdate {
     Cached(Result<CachedPickerEntries, String>),
+    RefreshedCodexTitles(RefreshedCodexTitles),
     StaleCachedPreview(Box<PreviewKey>),
     ResumeIndex(Vec<NativeSession>),
     NativeHomes(HashMap<Provider, PathBuf>),
@@ -657,7 +663,7 @@ pub(super) fn spawn_cache_updates(
             return;
         }
         let home = |provider| homes.get(&provider).map(PathBuf::as_path);
-        let Some(cache_loaded) = send_cached_picker_entries(
+        let Some((cache_loaded, mut cached_codex)) = send_cached_picker_entries(
             &store,
             &sender,
             &current_project,
@@ -673,51 +679,18 @@ pub(super) fn spawn_cache_updates(
         }
         let mut refreshed_codex = false;
         for provider in PROVIDERS {
-            let decision = provider_discovery_decision(
+            refreshed_codex |= dispatch_provider_discovery(
+                &registry,
                 &store,
+                &sender,
+                &index_sender,
+                &current_project,
                 provider,
                 selections.remove(&provider),
+                homes.get(&provider),
                 cache_loaded,
+                &mut cached_codex,
             );
-            match decision.unwrap_or_else(|error| {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "{provider} session index: {error}"
-                )));
-                PickerDiscovery::Due(None)
-            }) {
-                PickerDiscovery::Fresh => {
-                    if let Err(error) = resume_pending_sources(&registry, &store, provider, &sender)
-                    {
-                        let _ = sender.send(PickerUpdate::Warning(format!(
-                            "{provider} search upgrade: {error}"
-                        )));
-                    }
-                }
-                PickerDiscovery::Wait(attempt) => {
-                    if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
-                        super::discovery_watch::spawn(
-                            sender.clone(),
-                            index_sender.clone(),
-                            current_project.clone(),
-                            provider,
-                            attempt,
-                        );
-                    }
-                }
-                PickerDiscovery::Due(attempt) => {
-                    refreshed_codex |= provider == Provider::Codex;
-                    start_provider_update(
-                        &registry,
-                        &sender,
-                        &index_sender,
-                        &current_project,
-                        provider,
-                        attempt,
-                        homes.get(&provider),
-                        Some(&store),
-                    );
-                }
-            }
         }
         drop(store);
         // A cached row can change before the discovery cache expires. Refresh once if a
@@ -735,6 +708,67 @@ pub(super) fn spawn_cache_updates(
             );
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_provider_discovery(
+    registry: &Arc<AdapterRegistry>,
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    index_sender: &Sender<SessionCacheUpdate>,
+    current_project: &Path,
+    provider: Provider,
+    selection: Option<HomeDiscovery>,
+    home: Option<&PathBuf>,
+    cache_loaded: bool,
+    cached_codex: &mut Option<CachedCodexSnapshot>,
+) -> bool {
+    let decision = provider_discovery_decision(store, provider, selection, cache_loaded);
+    match decision.unwrap_or_else(|error| {
+        let _ = sender.send(PickerUpdate::Warning(format!(
+            "{provider} session index: {error}"
+        )));
+        PickerDiscovery::Due(None)
+    }) {
+        PickerDiscovery::Fresh => {
+            if provider == Provider::Codex
+                && let Some((sessions, titles)) = cached_codex.take()
+            {
+                spawn_codex_title_refresh(sender.clone(), sessions, titles);
+            }
+            if let Err(error) = resume_pending_sources(registry, store, provider, sender) {
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "{provider} search upgrade: {error}"
+                )));
+            }
+            false
+        }
+        PickerDiscovery::Wait(attempt) => {
+            if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+                super::discovery_watch::spawn(
+                    sender.clone(),
+                    index_sender.clone(),
+                    current_project.to_path_buf(),
+                    provider,
+                    attempt,
+                );
+            }
+            false
+        }
+        PickerDiscovery::Due(attempt) => {
+            start_provider_update(
+                registry,
+                sender,
+                index_sender,
+                current_project,
+                provider,
+                attempt,
+                home,
+                Some(store),
+            );
+            provider == Provider::Codex
+        }
+    }
 }
 
 fn resume_pending_sources(
@@ -813,6 +847,8 @@ fn discover_without_cache(
     }
 }
 
+type CachedCodexSnapshot = (Vec<NativeSession>, Vec<IndexedTrajectoryTitle>);
+
 fn send_cached_picker_entries(
     store: &Store,
     sender: &Sender<PickerUpdate>,
@@ -820,12 +856,88 @@ fn send_cached_picker_entries(
     antigravity: Option<&Path>,
     desktop: Option<&Path>,
     ide: Option<&Path>,
-) -> Option<bool> {
+) -> Option<(bool, Option<CachedCodexSnapshot>)> {
     let entries = cached_picker_entries(store, project, antigravity, desktop, ide)
         .map_err(|error| error.to_string());
     let loaded = entries.is_ok();
+    let cached_codex = entries.as_ref().ok().and_then(|cached| {
+        let sessions: Vec<_> = cached
+            .entries
+            .iter()
+            .filter(|entry| entry.session.session.provider == Provider::Codex)
+            .map(|entry| entry.session.clone())
+            .collect();
+        if sessions.is_empty() {
+            return None;
+        }
+        let titles: Vec<_> = cached
+            .titles
+            .iter()
+            .filter(|receipt| receipt.session.provider == Provider::Codex)
+            .cloned()
+            .collect();
+        Some((sessions, titles))
+    });
     sender.send(PickerUpdate::Cached(entries)).ok()?;
-    Some(loaded)
+    Some((loaded, cached_codex))
+}
+
+fn spawn_codex_title_refresh(
+    sender: Sender<PickerUpdate>,
+    mut sessions: Vec<NativeSession>,
+    mut titles: Vec<IndexedTrajectoryTitle>,
+) {
+    thread::spawn(move || {
+        let original_titles: HashMap<_, _> = sessions
+            .iter()
+            .map(|session| (session.session.clone(), session.title.clone()))
+            .collect();
+        let observed =
+            omnis_adapters::CodexAdapter::default().refresh_session_titles(&mut sessions);
+        if observed.is_empty() {
+            return;
+        }
+        let Ok(store) = Store::open_default() else {
+            return;
+        };
+        let mut effective = titles
+            .iter()
+            .filter_map(|receipt| Some((receipt.session.clone(), receipt.title.clone()?)))
+            .collect();
+        if crate::apply_live_search_titles(&store, &mut sessions, observed, &mut effective).is_err()
+        {
+            return;
+        }
+        let mut retired = HashMap::new();
+        let mut updated_titles = Vec::new();
+        for mut receipt in titles.drain(..) {
+            let current = effective.remove(&receipt.session);
+            if current != receipt.title {
+                if let Some(previous) = std::mem::replace(&mut receipt.title, current) {
+                    retired.insert(receipt.session.clone(), previous);
+                }
+                updated_titles.push(receipt);
+            }
+        }
+        let updated_entries: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                let retired_name = retired.remove(&session.session);
+                let title_changed = original_titles.get(&session.session) != Some(&session.title);
+                (title_changed || retired_name.is_some()).then_some((
+                    session.session,
+                    session.title,
+                    retired_name,
+                ))
+            })
+            .collect();
+        if !updated_entries.is_empty() || !updated_titles.is_empty() {
+            let _ = sender.send(PickerUpdate::RefreshedCodexTitles(RefreshedCodexTitles {
+                entries: updated_entries,
+                titles: updated_titles,
+            }));
+        }
+    });
 }
 
 enum PickerDiscovery {
@@ -2505,11 +2617,13 @@ pub(super) fn receive_updates(
             PickerUpdate::NativeTitles(titles) => remember_native_titles(state, titles),
             PickerUpdate::Cached(Ok(cached)) => {
                 state.cache_loaded = true;
-                state.replace_all_entries(cached.entries);
-                state.remember_source_titles(cached.titles);
+                state.replace_all_entries_with_titles(cached.entries, cached.titles);
                 for warning in cached.warnings {
                     record_picker_warning(warnings, warning);
                 }
+            }
+            PickerUpdate::RefreshedCodexTitles(refreshed) => {
+                state.apply_refreshed_codex_titles(refreshed);
             }
             PickerUpdate::Cached(Err(error)) => {
                 state.cache_loaded = true;
