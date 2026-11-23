@@ -19,6 +19,7 @@
 
 ### Internal
 
+- Update `url` to 2.5.9 in `Cargo.toml` and `Cargo.lock` (along with `form_urlencoded` 1.2.3) to resolve `RUSTSEC-2026-0592`.
 - Update `next` from 16.4.3 to 16.4.5 in `website`. ([#298](https://github.com/bvolpato/omnisession/pull/298))
 
 ## 0.10.3 - 2026-11-18
