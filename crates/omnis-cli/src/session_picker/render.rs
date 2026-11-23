@@ -485,7 +485,7 @@ pub(super) fn render_picker_list_row(
         &list_lineage_prefix(state, entry),
         columns,
         preview,
-        state.content_only_match(picker_entry),
+        state.content_only_match(picker_entry, terms),
         terms,
     );
     draw_marked_line(
