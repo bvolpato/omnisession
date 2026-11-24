@@ -284,10 +284,7 @@ pub(super) fn read_first_plain_line(path: &Path, line: &mut Vec<u8>) -> Result<b
         }
         line.extend_from_slice(slice);
     }
-    if line.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(!line.iter().all(u8::is_ascii_whitespace))
 }
 
 pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
