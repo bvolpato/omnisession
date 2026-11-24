@@ -1803,7 +1803,7 @@ impl SearchDocumentBuilder {
             .source_byte_count
             .saturating_add(text.source_byte_count);
         self.event_truncated |= text.truncated;
-        self.retained.push(&text.text);
+        self.retained.push_owned(text.text);
     }
 
     /// Counts the searchable bytes observed before the document text limit.
@@ -1891,23 +1891,23 @@ fn search_event_text(
         return None;
     }
 
-    let raw_text = match event.kind {
+    let raw_text: Cow<'_, str> = match event.kind {
         EventKind::CompactionCreated
             if event.source.provider == Provider::Claude && snapshot.is_none() =>
         {
             return None;
         }
-        EventKind::CompactionCreated => recorded_compaction_text(event)?.to_owned(),
+        EventKind::CompactionCreated => Cow::Borrowed(recorded_compaction_text(event)?),
         EventKind::MessageUser | EventKind::MessageAssistant => {
             if event.replay_policy != ReplayPolicy::Contextual {
                 return None;
             }
             let text =
-                text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
-            if is_user_harness_envelope(event, &text) {
+                text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
+            if is_user_harness_envelope(event, text) {
                 return None;
             }
-            text
+            Cow::Borrowed(text)
         }
         _ => {
             // Both passes are needed. This one sees each string before JSON escapes it, so it
@@ -1916,25 +1916,33 @@ fn search_event_text(
             // as `db_passwd`.
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
-            search_payload_text(event.source.provider, &payload)?
+            Cow::Owned(search_payload_text(event.source.provider, &payload)?)
         }
     };
-    let safe_text = safe_terminal_text(&raw_text);
-    let mut redacted = redact_secrets(&safe_text);
-    let mut older = String::new();
-    for previous in snapshot
-        .into_iter()
-        .flat_map(|snapshot| codex_replies::previous_spellings(snapshot, event))
+    let safe_text = safe_terminal_text_cow(&raw_text);
+    let mut redacted = match redact_secrets_cow(&safe_text) {
+        Cow::Owned(owned) => Cow::Owned(owned),
+        Cow::Borrowed(_) => match safe_text {
+            Cow::Owned(owned) => Cow::Owned(owned),
+            Cow::Borrowed(_) => raw_text,
+        },
+    };
+    if let Some(previous_iter) =
+        snapshot.and_then(|snapshot| codex_replies::previous_spellings(snapshot, event))
     {
-        let previous = redact_secrets(&safe_terminal_text(previous));
-        if !previous.trim().is_empty() && previous != redacted {
-            older.push_str(&previous);
-            older.push_str("\n\n");
+        let mut older = String::new();
+        for previous in previous_iter {
+            let safe_previous = safe_terminal_text_cow(previous);
+            let previous = redact_secrets_cow(&safe_previous);
+            if !previous.trim().is_empty() && previous.as_ref() != redacted.as_ref() {
+                older.push_str(&previous);
+                older.push_str("\n\n");
+            }
         }
-    }
-    if !older.is_empty() {
-        older.push_str(&redacted);
-        redacted = older;
+        if !older.is_empty() {
+            older.push_str(&redacted);
+            redacted = Cow::Owned(older);
+        }
     }
     let source_byte_count = redacted.len();
     let edge_limit = if matches!(
@@ -1945,7 +1953,7 @@ fn search_event_text(
     } else {
         edge_limit.min(SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT)
     };
-    let (text, truncated) = head_tail_text(&redacted, edge_limit);
+    let (text, truncated) = head_tail_text_cow(redacted, edge_limit);
     Some(SearchEventText {
         text,
         source_byte_count,
@@ -1998,17 +2006,22 @@ const fn search_truncation_strategy(
     }
 }
 
+#[cfg(test)]
 fn head_tail_text(input: &str, edge_limit: usize) -> (String, bool) {
+    head_tail_text_cow(Cow::Borrowed(input), edge_limit)
+}
+
+fn head_tail_text_cow(input: Cow<'_, str>, edge_limit: usize) -> (String, bool) {
     if input.len() <= edge_limit.saturating_mul(2) {
-        return (input.to_owned(), false);
+        return (input.into_owned(), false);
     }
     let notice = truncation_notice(edge_limit.saturating_mul(2));
     let notice_budget = notice.len();
     let retained_budget = edge_limit.saturating_mul(2).saturating_sub(notice_budget);
     let head_budget = retained_budget.div_ceil(2);
     let tail_budget = retained_budget / 2;
-    let head = &input[..utf8_prefix_boundary(input, head_budget)];
-    let tail = &input[utf8_suffix_boundary(input, tail_budget)..];
+    let head = &input[..utf8_prefix_boundary(&input, head_budget)];
+    let tail = &input[utf8_suffix_boundary(&input, tail_budget)..];
     (format!("{head}{notice}{tail}"), true)
 }
 
@@ -2054,26 +2067,42 @@ impl HeadTailText {
 
     fn push(&mut self, value: &str) {
         self.push_with_head_budget(
-            value,
+            Cow::Borrowed(value),
+            self.edge_limit.saturating_sub(self.total_byte_count),
+            false,
+        );
+    }
+
+    fn push_owned(&mut self, value: String) {
+        self.push_with_head_budget(
+            Cow::Owned(value),
             self.edge_limit.saturating_sub(self.total_byte_count),
             false,
         );
     }
 
     fn push_legacy(&mut self, value: &str) {
-        self.push_with_head_budget(value, self.edge_limit - self.head.len(), true);
+        self.push_with_head_budget(
+            Cow::Borrowed(value),
+            self.edge_limit - self.head.len(),
+            true,
+        );
     }
 
-    fn push_with_head_budget(&mut self, value: &str, head_remaining: usize, legacy: bool) {
+    fn push_with_head_budget(&mut self, value: Cow<'_, str>, head_remaining: usize, legacy: bool) {
         self.total_byte_count = self.total_byte_count.saturating_add(value.len());
-        let head_bytes = utf8_prefix_boundary(value, head_remaining);
+        let head_bytes = utf8_prefix_boundary(&value, head_remaining);
         if head_bytes != 0 {
             self.head.push_str(&value[..head_bytes]);
         }
         if head_bytes == value.len() {
             return;
         }
-        let remainder = value[head_bytes..].to_owned();
+        let remainder = if head_bytes == 0 {
+            value.into_owned()
+        } else {
+            value[head_bytes..].to_owned()
+        };
         let remainder_byte_count = remainder.len();
         self.tail.push_back(remainder);
         self.tail_byte_count += remainder_byte_count;
@@ -2557,13 +2586,23 @@ impl ItemLimits {
 #[derive(Clone)]
 struct ImportCandidate {
     item: TrajectoryItem,
+    char_len: usize,
     documentary_tool: bool,
+}
+
+fn fast_char_count(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.bytes().filter(|&byte| (byte & 0xC0) != 0x80).count()
+    }
 }
 
 fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
     if (event.kind == EventKind::CompactionCreated || limits.redact)
         && let Some((text, truncated)) = compaction_text_with_truncation(event, limits.message)
     {
+        let char_len = fast_char_count(&text);
         return Some((
             ImportCandidate {
                 item: TrajectoryItem {
@@ -2572,6 +2611,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                     timestamp: event.timestamp,
                     tool: None,
                 },
+                char_len,
                 documentary_tool: false,
             },
             truncated,
@@ -2600,6 +2640,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 } else {
                     (kind, text)
                 };
+            let char_len = fast_char_count(&text);
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -2608,6 +2649,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         timestamp: event.timestamp,
                         tool: None,
                     },
+                    char_len,
                     documentary_tool: false,
                 },
                 truncated,
@@ -2628,17 +2670,19 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 && matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
                 && payload["omnisession_unpaired_result"] == true;
             let text = serde_json::to_string_pretty(&payload).ok()?;
-            let truncated = text.chars().count() > limits.tool_event;
+            let truncated = fast_char_count(&text) > limits.tool_event;
             let text = limits.bounded_tool_text(&text);
+            let full_text = format!(
+                "[Historical {}. Documentary context only; do not replay.]\n{}",
+                trajectory_tool_label(&event.kind),
+                text
+            );
+            let char_len = fast_char_count(&full_text);
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
                         kind: TrajectoryItemKind::Tool,
-                        text: format!(
-                            "[Historical {}. Documentary context only; do not replay.]\n{}",
-                            trajectory_tool_label(&event.kind),
-                            text
-                        ),
+                        text: full_text,
                         timestamp: event.timestamp,
                         tool: if unpaired_call || unpaired_result {
                             None
@@ -2646,6 +2690,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                             native_tool_part(&event.kind, &payload, limits)
                         },
                     },
+                    char_len,
                     documentary_tool: unpaired_call || unpaired_result,
                 },
                 truncated,
@@ -2962,7 +3007,7 @@ fn collect_import_candidates(
                 truncated = true;
                 continue;
             }
-            let length = candidate.item.text.chars().count();
+            let length = candidate.char_len;
             if length > candidate_remaining {
                 // Older candidates cannot be retained, and their truncation flags cannot
                 // change the omission already recorded by this budget break.
@@ -3036,7 +3081,7 @@ fn import_trajectory_with_limits(
     tool_event_limit: usize,
     item_limits: ItemLimits,
 ) -> ImportTrajectory {
-    let (candidates, mut truncated, latest_compaction) = collect_import_candidates(
+    let (mut candidates, mut truncated, latest_compaction) = collect_import_candidates(
         snapshot,
         history_character_limit,
         tool_event_limit,
@@ -3048,7 +3093,9 @@ fn import_trajectory_with_limits(
         latest_compaction.unwrap_or(0)
     };
     truncated |= start > 0;
-    let candidates = &candidates[start..];
+    if start > 0 {
+        candidates.drain(..start);
+    }
     let summary = latest_compaction.map(|i| i - start);
     let (mut indices, mut remaining) = retained_import_indices(
         candidates.len(),
@@ -3056,10 +3103,10 @@ fn import_trajectory_with_limits(
         history_character_limit,
         tool_event_limit,
         |i| {
-            let item = &candidates[i].item;
+            let candidate = &candidates[i];
             (
-                item.text.chars().count(),
-                item.kind == TrajectoryItemKind::Tool,
+                candidate.char_len,
+                candidate.item.kind == TrajectoryItemKind::Tool,
             )
         },
         &mut truncated,
@@ -3072,7 +3119,7 @@ fn import_trajectory_with_limits(
             let Some(&i) = indices.get(remove_at) else {
                 break;
             };
-            remaining += candidates[i].item.text.chars().count();
+            remaining += candidates[i].char_len;
             indices.remove(remove_at);
         }
     }
@@ -3100,11 +3147,17 @@ fn import_trajectory_with_limits(
         }
     }
     let offset = items.len();
-    items.extend(indices.iter().map(|&i| candidates[i].item.clone()));
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    let mut documentary_flags = Vec::with_capacity(indices.len());
+    for i in indices {
+        let candidate = candidates[i].take().expect("retained index is unique");
+        documentary_flags.push(candidate.documentary_tool);
+        items.push(candidate.item);
+    }
     let mut native = items[offset..]
         .iter_mut()
-        .zip(indices)
-        .filter_map(|(item, i)| (!candidates[i].documentary_tool).then_some(item))
+        .zip(documentary_flags)
+        .filter_map(|(item, documentary)| (!documentary).then_some(item))
         .collect::<Vec<_>>();
     validate_native_tools(&mut native, snapshot.session.provider);
     let tool_events = items
@@ -3538,13 +3591,32 @@ fn quote_untrusted(markdown: &mut String, value: &str) {
     }
 }
 
+fn is_safe_terminal_char(character: char) -> bool {
+    !character.is_control() || matches!(character, '\n' | '\t')
+}
+
+// Every Unicode `Cc` control character is either ASCII < 0x20, 0x7F, or UTF-8 starting with 0xC2
+// (U+0080..=U+009F). When none of those bytes appear, the input has no disallowed control chars.
+fn safe_terminal_text_cow(input: &str) -> Cow<'_, str> {
+    if input.bytes().all(|byte| {
+        (byte >= 0x20 && byte != 0x7f && byte != 0xc2) || byte == b'\n' || byte == b'\t'
+    }) || input.chars().all(is_safe_terminal_char)
+    {
+        return Cow::Borrowed(input);
+    }
+    let mut output = String::with_capacity(input.len());
+    for character in input.chars() {
+        if is_safe_terminal_char(character) {
+            output.push(character);
+        }
+    }
+    Cow::Owned(output)
+}
+
 /// Removes terminal control characters from untrusted human-readable output.
 #[must_use]
 pub fn safe_terminal_text(input: &str) -> String {
-    input
-        .chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-        .collect()
+    safe_terminal_text_cow(input).into_owned()
 }
 
 /// Converts untrusted text to one terminal-safe line.
@@ -3717,16 +3789,17 @@ fn restored_codex_answer<'a>(
     snapshot: &CanonicalSnapshot,
     event: &'a OmniEvent,
 ) -> Option<&'a str> {
+    if event.kind != EventKind::MessageAssistant
+        || event.replay_policy != ReplayPolicy::Contextual
+        || event.source.raw_record_type.as_deref() != Some("event_msg.item_completed")
+    {
+        return None;
+    }
     let text = event
         .payload
         .get("omnisession_codex_prior_display")?
         .as_str()?;
-    (event.kind == EventKind::MessageAssistant
-        && event.replay_policy == ReplayPolicy::Contextual
-        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
-        && codex_rollback(snapshot, event).is_some()
-        && !text.trim().is_empty())
-    .then_some(text)
+    (codex_rollback(snapshot, event).is_some() && !text.trim().is_empty()).then_some(text)
 }
 
 fn has_active_codex_event(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> bool {
@@ -4424,7 +4497,7 @@ fn bounded_message_text(
     if event.replay_policy != ReplayPolicy::Contextual {
         return None;
     }
-    let mut text = text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
+    let text = text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
     // A published Codex message can be cleared in place. Its empty display has no text to send.
     if redact
         && text.is_empty()
@@ -4433,10 +4506,12 @@ fn bounded_message_text(
     {
         return None;
     }
-    if redact {
-        text = redact_secrets(&text);
-    }
-    Some(bounded_text_with_truncation(&text, character_limit))
+    let text = if redact {
+        redact_secrets_cow(text)
+    } else {
+        Cow::Borrowed(text)
+    };
+    Some(bounded_text_with_truncation_cow(text, character_limit))
 }
 
 fn compaction_text_with_truncation(
@@ -4654,8 +4729,7 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
 }
 
 fn bounded_redacted(input: &str, character_limit: usize) -> String {
-    let redacted = redact_secrets(input);
-    bounded_text(&redacted, character_limit)
+    bounded_text_with_truncation_cow(redact_secrets_cow(input), character_limit).0
 }
 
 fn bounded_text(input: &str, character_limit: usize) -> String {
@@ -4663,15 +4737,29 @@ fn bounded_text(input: &str, character_limit: usize) -> String {
 }
 
 fn bounded_text_with_truncation(input: &str, character_limit: usize) -> (String, bool) {
-    let mut characters = input.chars();
-    let bounded = characters
-        .by_ref()
-        .take(character_limit)
-        .collect::<String>();
-    if characters.next().is_some() {
-        (format!("{bounded}\n[truncated by OmniSession]"), true)
-    } else {
-        (bounded, false)
+    bounded_text_with_truncation_cow(Cow::Borrowed(input), character_limit)
+}
+
+fn bounded_text_with_truncation_cow(input: Cow<'_, str>, character_limit: usize) -> (String, bool) {
+    const SUFFIX: &str = "\n[truncated by OmniSession]";
+    if input.len() <= character_limit {
+        return (input.into_owned(), false);
+    }
+    let Some((byte_end, _)) = input.char_indices().nth(character_limit) else {
+        return (input.into_owned(), false);
+    };
+    match input {
+        Cow::Owned(mut owned) => {
+            owned.truncate(byte_end);
+            owned.push_str(SUFFIX);
+            (owned, true)
+        }
+        Cow::Borrowed(borrowed) => {
+            let mut bounded = String::with_capacity(byte_end + SUFFIX.len());
+            bounded.push_str(&borrowed[..byte_end]);
+            bounded.push_str(SUFFIX);
+            (bounded, true)
+        }
     }
 }
 
@@ -4770,26 +4858,128 @@ fn text_from_value_ref(value: &serde_json::Value) -> Option<&str> {
 /// without retaining the original value.
 #[must_use]
 pub fn redact_secrets(input: &str) -> String {
-    let private_keys = private_key_regex().replace_all(input, "[REDACTED: PRIVATE_KEY]");
-    let api_keys = api_key_regex().replace_all(&private_keys, "[REDACTED: API_KEY]");
-    let bearer_tokens = bearer_token_regex().replace_all(&api_keys, "Bearer [REDACTED: TOKEN]");
-    let authorization =
-        authorization_regex().replace_all(&bearer_tokens, |captures: &regex::Captures<'_>| {
-            format!("{}{}", &captures[1], redacted_value(&captures[2], "TOKEN"))
-        });
-    let url_passwords =
-        url_password_regex().replace_all(&authorization, "${1}[REDACTED: PASSWORD]@");
-    let flags =
-        credential_flag_regex().replace_all(&url_passwords, |captures: &regex::Captures<'_>| {
-            let label = redaction_label(&captures[2]);
-            format!("{}{}", &captures[1], redacted_value(&captures[3], label))
-        });
-    let assignments = replace_credential_assignments(&flags);
+    redact_secrets_cow(input).into_owned()
+}
+
+fn rare_credential_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"-----BEGIN|sk-|gh[pousr]_|github_pat_|glpat-|npm_|AKIA|AIza|xox[baprs]-|eyJ|://|(?i:bearer|authorization|cookie|curl)",
+        )
+        .expect("valid rare-credential prefilter regex")
+    })
+}
+
+fn dash_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new("-").expect("valid dash regex"))
+}
+
+fn redact_secrets_cow(input: &str) -> Cow<'_, str> {
+    let has_rare = rare_credential_regex().is_match(input);
+    let mut current = Cow::Borrowed(input);
+    if has_rare {
+        if let Cow::Owned(replaced) =
+            private_key_regex().replace_all(&current, "[REDACTED: PRIVATE_KEY]")
+        {
+            current = Cow::Owned(replaced);
+        }
+        if let Cow::Owned(replaced) = api_key_regex().replace_all(&current, "[REDACTED: API_KEY]") {
+            current = Cow::Owned(replaced);
+        }
+        if let Cow::Owned(replaced) =
+            bearer_token_regex().replace_all(&current, "Bearer [REDACTED: TOKEN]")
+        {
+            current = Cow::Owned(replaced);
+        }
+        if let Cow::Owned(replaced) =
+            authorization_regex().replace_all(&current, |captures: &regex::Captures<'_>| {
+                format!("{}{}", &captures[1], redacted_value(&captures[2], "TOKEN"))
+            })
+        {
+            current = Cow::Owned(replaced);
+        }
+        if let Cow::Owned(replaced) =
+            url_password_regex().replace_all(&current, "${1}[REDACTED: PASSWORD]@")
+        {
+            current = Cow::Owned(replaced);
+        }
+    }
+    if dash_regex().is_match(&current)
+        && let Cow::Owned(replaced) = replace_credential_flags(&current)
+    {
+        current = Cow::Owned(replaced);
+    }
+    if let Cow::Owned(replaced) = replace_credential_assignments(&current) {
+        current = Cow::Owned(replaced);
+    }
     // Cookies run after flags and assignments, which can consume a quote that ended the pair list.
-    let cookies = cookie_header_regex().replace_all(&assignments, redact_cookie_header);
-    curl_user_regex()
-        .replace_all(&cookies, redact_curl_user)
-        .into_owned()
+    if has_rare {
+        if let Cow::Owned(replaced) =
+            cookie_header_regex().replace_all(&current, redact_cookie_header)
+        {
+            current = Cow::Owned(replaced);
+        }
+        if let Cow::Owned(replaced) = curl_user_regex().replace_all(&current, redact_curl_user) {
+            current = Cow::Owned(replaced);
+        }
+    }
+    current
+}
+
+/// Replaces every credential flag, exactly like `replace_all` with [`credential_flag_regex`].
+fn replace_credential_flags(input: &str) -> Cow<'_, str> {
+    let replaced = replace_credential_flags_at_candidates(input);
+    debug_assert!(
+        replaced == replace_credential_flags_in_whole_text(input),
+        "candidate search and whole-text search redacted credential flags differently"
+    );
+    replaced
+}
+
+fn replace_credential_flags_in_whole_text(input: &str) -> Cow<'_, str> {
+    credential_flag_regex().replace_all(input, |captures: &regex::Captures<'_>| {
+        let label = redaction_label(&captures[2]);
+        format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+    })
+}
+
+fn replace_credential_flags_at_candidates(input: &str) -> Cow<'_, str> {
+    let mut output = String::new();
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(candidate) = credential_flag_candidate_regex().find_at(input, search) {
+        let name_start = credential_name_run_start(input, candidate.start(), copied);
+        let from = input[copied..name_start]
+            .chars()
+            .next_back()
+            .filter(|character| character.is_whitespace())
+            .map_or(name_start, |character| name_start - character.len_utf8());
+        if !credential_flag_end_regex().is_match(&input[from..candidate.end()]) {
+            search = candidate.start()
+                + input[candidate.start()..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8);
+            continue;
+        }
+        let Some(captures) = credential_flag_regex().captures_at(input, from) else {
+            break;
+        };
+        let flag = captures.get(0).expect("group 0 is the whole match");
+        let label = redaction_label(&captures[2]);
+        output.push_str(&input[copied..flag.start()]);
+        output.push_str(&captures[1]);
+        output.push_str(&redacted_value(&captures[3], label));
+        copied = flag.end();
+        search = copied;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(input);
+    }
+    output.push_str(&input[copied..]);
+    Cow::Owned(output)
 }
 
 /// Replaces every credential assignment, exactly like `replace_all` with
@@ -4870,12 +5060,14 @@ fn credential_name_run_start(input: &str, index: usize, floor: usize) -> usize {
 /// Returns `true` when any value changed.
 pub fn redact_json_secrets(value: &mut serde_json::Value) -> bool {
     match value {
-        serde_json::Value::String(text) => {
-            let redacted = redact_secrets(text);
-            let changed = redacted != *text;
-            *text = redacted;
-            changed
-        }
+        serde_json::Value::String(text) => match redact_secrets_cow(text) {
+            Cow::Borrowed(_) => false,
+            Cow::Owned(redacted) => {
+                let changed = redacted != *text;
+                *text = redacted;
+                changed
+            }
+        },
         serde_json::Value::Array(items) => {
             let mut changed = false;
             for item in items {
@@ -4902,35 +5094,50 @@ pub fn redact_json_secrets(value: &mut serde_json::Value) -> bool {
 }
 
 fn sensitive_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
+    let mut stack = [0_u8; 64];
+    let mut len = 0_usize;
+    let mut overflow = None::<Vec<u8>>;
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            let lower = byte.to_ascii_lowercase();
+            if let Some(buf) = &mut overflow {
+                buf.push(lower);
+            } else if len < stack.len() {
+                stack[len] = lower;
+                len += 1;
+            } else {
+                let mut buf = Vec::with_capacity(key.len());
+                buf.extend_from_slice(&stack);
+                buf.push(lower);
+                overflow = Some(buf);
+            }
+        }
+    }
+    let normalized = overflow.as_deref().unwrap_or(&stack[..len]);
     matches!(
-        normalized.as_str(),
-        "apikey"
-            | "accesstoken"
-            | "authtoken"
-            | "authorization"
-            | "credential"
-            | "credentials"
-            | "password"
-            | "passwd"
-            | "privatekey"
-            | "secret"
-            | "token"
-            | "cookie"
-            | "setcookie"
-            | "accesskey"
-    ) || normalized.ends_with("secret")
-        || normalized.ends_with("token")
-        || normalized.ends_with("apikey")
-        || normalized.ends_with("password")
-        || normalized.ends_with("privatekey")
-        || normalized.ends_with("accesskey")
-        || normalized.ends_with("credential")
-        || normalized.ends_with("credentials")
+        normalized,
+        b"apikey"
+            | b"accesstoken"
+            | b"authtoken"
+            | b"authorization"
+            | b"credential"
+            | b"credentials"
+            | b"password"
+            | b"passwd"
+            | b"privatekey"
+            | b"secret"
+            | b"token"
+            | b"cookie"
+            | b"setcookie"
+            | b"accesskey"
+    ) || normalized.ends_with(b"secret")
+        || normalized.ends_with(b"token")
+        || normalized.ends_with(b"apikey")
+        || normalized.ends_with(b"password")
+        || normalized.ends_with(b"privatekey")
+        || normalized.ends_with(b"accesskey")
+        || normalized.ends_with(b"credential")
+        || normalized.ends_with(b"credentials")
 }
 
 fn private_key_regex() -> &'static Regex {
@@ -5019,6 +5226,26 @@ fn credential_flag_regex() -> &'static Regex {
     REGEX.get_or_init(|| {
         Regex::new(&format!(r#"(?i)((?:^|\s)(--?(?:{CREDENTIAL_NAME}))[ \t]+)({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;&|<>"'-][^\s,;]*)"#))
             .expect("valid credential-flag regex")
+    })
+}
+
+fn credential_flag_candidate_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)(?:{CREDENTIAL_NAME_LAST_WORD})[ \t]+[^\s,;&|<>-]"
+        ))
+        .expect("valid credential-flag candidate regex")
+    })
+}
+
+fn credential_flag_end_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)(?:^|\s)--?(?:{CREDENTIAL_NAME})[ \t]+[^\s,;&|<>-]\z"
+        ))
+        .expect("valid credential-flag end regex")
     })
 }
 

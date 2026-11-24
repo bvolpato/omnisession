@@ -242,6 +242,51 @@ impl std::fmt::Display for CompressedHeaderError {
     }
 }
 
+pub(super) fn has_search_budget() -> bool {
+    SEARCH_BYTES.get().is_some()
+}
+
+/// Reads the first line of an uncompressed rollout without allocating a `BufReader`.
+///
+/// Returns `Ok(true)` when a bounded, non-empty line was read into `line`; returns `Ok(false)`
+/// when the caller should fall back to `header(path)` (for compressed files, blank leading lines,
+/// or oversized lines).
+pub(super) fn read_first_plain_line(path: &Path, line: &mut Vec<u8>) -> Result<bool> {
+    if compressed(path) || has_search_budget() {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    line.clear();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            break;
+        }
+        let slice = &chunk[..read];
+        if let Some(newline) = memchr::memchr(b'\n', slice) {
+            let needed = line.len().saturating_add(newline + 1);
+            if u64::try_from(needed)? > MAX_TRANSCRIPT_LINE_SIZE {
+                return Ok(false);
+            }
+            line.extend_from_slice(&slice[..=newline]);
+            break;
+        }
+        if u64::try_from(line.len().saturating_add(read))? > MAX_TRANSCRIPT_LINE_SIZE {
+            return Ok(false);
+        }
+        line.extend_from_slice(slice);
+    }
+    Ok(!line.iter().all(u8::is_ascii_whitespace))
+}
+
 pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     if !compressed(path) && SEARCH_BYTES.get().is_none() {
         return json_lines_prefix(path, 1);

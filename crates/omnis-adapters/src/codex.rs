@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell::OnceCell,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsString,
@@ -28,8 +29,8 @@ use crate::{
         EventBuilder, JsonLine, JsonLineSkips, JsonlRecord, MAX_PREVIEW_TAIL_SIZE,
         MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
         json_lines_preview_with_omissions, omitted_images_text, parse_timestamp, paths_match,
-        provider_executable, provider_file, sort_sessions, string_at, validate_provider, value_at,
-        visit_index_json_lines_with_gaps, visit_json_lines_tail,
+        provider_executable, provider_file, sample_files_concurrently, sort_sessions, string_at,
+        validate_provider, value_at, visit_index_json_lines_with_gaps, visit_json_lines_tail,
     },
 };
 
@@ -82,7 +83,9 @@ use paginated_compaction::{
     DisplayEvidence, PaginatedCompactions, ProjectedReplacement, WindowKind,
 };
 use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};
-use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_cache::{
+    CanonicalDirCache, ObservedRollout, RawRolloutStat, RolloutCache, RolloutHeader, RolloutStamp,
+};
 use rollout_lines::{Admission, OrdinalGap, RolloutLines, Wire};
 use tool_history::{NativeCalls, PendingOutcomes};
 use tool_revisions::{DisplayRevisions, PreviousDisplay};
@@ -128,24 +131,37 @@ struct CodexFileScan {
 struct LegacyPaths<'a> {
     native_ids: HashSet<String>,
     by_id: HashMap<Uuid, Vec<&'a Path>>,
+    deferred_filenames: Vec<&'a Path>,
+    resolved_by_id: OnceCell<HashMap<Uuid, Vec<&'a Path>>>,
     revisions: Vec<(PathBuf, Option<SourceRevision>)>,
     unidentified: HashMap<&'a Path, Vec<&'a Path>>,
 }
 
 impl<'a> LegacyPaths<'a> {
     fn add_filename(&mut self, path: &'a Path) {
-        if let Some((thread, _)) = current_rollout::ids(path)
-            && let Ok(owner) = Uuid::parse_str(thread)
-        {
-            self.by_id.entry(owner).or_default().push(path);
-        }
+        self.deferred_filenames.push(path);
     }
 
     fn title_paths(&self, id: &str) -> &[&'a Path] {
-        Uuid::parse_str(id)
-            .ok()
-            .and_then(|owner| self.by_id.get(&owner))
-            .map_or(&[], Vec::as_slice)
+        let Ok(owner) = Uuid::parse_str(id) else {
+            return &[];
+        };
+        if self.deferred_filenames.is_empty() {
+            return self.by_id.get(&owner).map_or(&[], Vec::as_slice);
+        }
+        let resolved = self.resolved_by_id.get_or_init(|| {
+            let mut merged = self.by_id.clone();
+            merged.reserve(self.deferred_filenames.len());
+            for &path in &self.deferred_filenames {
+                if let Some((thread, _)) = current_rollout::ids(path)
+                    && let Ok(owner) = Uuid::parse_str(thread)
+                {
+                    merged.entry(owner).or_default().push(path);
+                }
+            }
+            merged
+        });
+        resolved.get(&owner).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -234,7 +250,23 @@ impl CodexFileScan {
         home: &Path,
         id: &str,
         row: Option<&current_rollout::CurrentRollout>,
+        cache: Option<&mut RolloutCache>,
+        invalid: &mut InvalidHeaders,
+    ) -> Result<Option<SelectedRollout>> {
+        let mut dir_cache = CanonicalDirCache::default();
+        let mut line_buf = Vec::new();
+        self.listed_rollout_buffered(home, id, row, cache, &mut dir_cache, &mut line_buf, invalid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn listed_rollout_buffered(
+        &self,
+        home: &Path,
+        id: &str,
+        row: Option<&current_rollout::CurrentRollout>,
         mut cache: Option<&mut RolloutCache>,
+        dir_cache: &mut CanonicalDirCache,
+        line_buf: &mut Vec<u8>,
         invalid: &mut InvalidHeaders,
     ) -> Result<Option<SelectedRollout>> {
         if let Some(row) = row
@@ -256,7 +288,7 @@ impl CodexFileScan {
         );
         Ok(select_rollout(
             self.paths(id),
-            |path| listed_session(path, cache.as_deref_mut()),
+            |path| listed_session_buffered(path, cache.as_deref_mut(), dir_cache, line_buf),
             invalid,
         ))
     }
@@ -1193,9 +1225,11 @@ impl CodexAdapter {
                 };
             }
         };
-        let mut sessions = Vec::new();
-        let mut listed_names = HashMap::new();
+        let mut sessions = Vec::with_capacity(scan.candidates.len());
+        let mut listed_names = HashMap::with_capacity(scan.candidates.len());
         let mut selected_files = HashMap::new();
+        let mut dir_cache = CanonicalDirCache::default();
+        let mut line_buf = Vec::with_capacity(4096);
         let mut requires_scan = false;
         let mut subagents = 0_usize;
         let mut invalid = InvalidHeaders {
@@ -1203,17 +1237,19 @@ impl CodexAdapter {
                 - scan.candidates.values().map(Vec::len).sum::<usize>(),
             ..Default::default()
         };
-        for id in scan.thread_ids(&legacy) {
+        for (id, item) in preload_rollouts(&scan, &legacy, &rows, cache.as_ref()) {
             let row = rows.get(id);
-            let selected = match scan.listed_rollout(home, id, row, cache.as_mut(), &mut invalid) {
-                Ok(Some(selected)) => selected,
-                Ok(None) => continue,
-                Err(error) => {
-                    requires_scan = true;
-                    invalid.unreadable += 1;
-                    invalid.first_error.get_or_insert(error);
-                    continue;
-                }
+            let Some(selected) = resolve_preloaded_rollout(
+                &scan,
+                home,
+                id,
+                row,
+                item,
+                cache.as_mut(),
+                (&mut dir_cache, &mut line_buf),
+                (&mut invalid, &mut requires_scan),
+            ) else {
+                continue;
             };
             if row.is_some_and(current_rollout::CurrentRollout::corroborates_index)
                 && (scan.unique_path(id).is_none()
@@ -1236,7 +1272,7 @@ impl CodexAdapter {
                 if !selected.shadowed
                     && let Some(revision) = session.observed_revision
                 {
-                    selected_files.insert(id.clone(), (session.path.clone(), revision));
+                    selected_files.insert(id.to_owned(), (session.path.clone(), revision));
                 }
             }
             if session.is_subagent {
@@ -1244,7 +1280,7 @@ impl CodexAdapter {
                 continue;
             }
             session.title = name.clone().into_title();
-            listed_names.insert(id.clone(), (sessions.len(), name));
+            listed_names.insert(id.to_owned(), (sessions.len(), name));
             sessions.push(session);
         }
         if let Some(cache) = cache {
@@ -1711,10 +1747,274 @@ impl Default for CodexAdapter {
 
 /// Reads a rollout's listing metadata, reusing the cached header while the rollout is unchanged.
 fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Option<CodexSession>> {
-    let observed =
-        ObservedRollout::read(path).context("selected Codex rollout changed during discovery")?;
+    let mut dir_cache = CanonicalDirCache::default();
+    let mut line_buf = Vec::new();
+    listed_session_buffered(path, cache, &mut dir_cache, &mut line_buf)
+}
+
+enum FastMetadataResult {
+    Session(Box<CodexSession>),
+    Ignored,
+    Fallback,
+}
+
+#[derive(Deserialize)]
+struct FastGit<'a> {
+    #[serde(borrow)]
+    branch: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    branch_name: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    commit_hash: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    repository_url: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct FastThreadSource<'a> {
+    #[serde(borrow)]
+    agent_role: Option<Cow<'a, str>>,
+}
+
+#[derive(Default, Eq, PartialEq)]
+enum FieldPresence {
+    #[default]
+    Missing,
+    Present,
+}
+
+impl FieldPresence {
+    fn is_present(&self) -> bool {
+        *self == Self::Present
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldPresence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self::Present)
+    }
+}
+
+#[derive(Deserialize)]
+struct FastSourceObject {
+    #[serde(default)]
+    subagent: FieldPresence,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FastSource {
+    Object(FastSourceObject),
+    Other(serde::de::IgnoredAny),
+}
+
+#[derive(Deserialize)]
+struct FastPayload<'a> {
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    forked_from_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    git: Option<FastGit<'a>>,
+    #[serde(borrow)]
+    cli_version: Option<Cow<'a, str>>,
+    #[serde(default)]
+    history_mode: FieldPresence,
+    #[serde(default)]
+    history_base: FieldPresence,
+    #[serde(default)]
+    attached_thread: FieldPresence,
+    #[serde(default)]
+    subagent_history_start_ordinal: FieldPresence,
+    #[serde(borrow)]
+    agent_role: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    agent_path: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    thread_source: Option<FastThreadSource<'a>>,
+    source: Option<FastSource>,
+}
+
+#[derive(Deserialize)]
+struct FastHeader<'a> {
+    #[serde(rename = "type", borrow)]
+    record_type: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default)]
+    ordinal: FieldPresence,
+    #[serde(borrow)]
+    payload: Option<FastPayload<'a>>,
+}
+
+fn nonempty_cow(value: Option<Cow<'_, str>>) -> Option<Cow<'_, str>> {
+    value.filter(|text| !text.is_empty())
+}
+
+enum RolloutCacheUpdate {
+    Hit(PathBuf, RolloutStamp),
+    Parsed(PathBuf, RolloutStamp, Option<Box<RolloutHeader>>),
+}
+
+struct ResolvedRollout {
+    selected: Option<SelectedRollout>,
+    invalid: InvalidHeaders,
+    updates: Vec<RolloutCacheUpdate>,
+}
+
+enum ParallelRollout {
+    Deferred,
+    Error(anyhow::Error),
+    Resolved(Box<ResolvedRollout>),
+}
+
+fn preload_rollouts<'a>(
+    scan: &'a CodexFileScan,
+    legacy: &'a LegacyPaths<'_>,
+    rows: &HashMap<String, current_rollout::CurrentRollout>,
+    cache_ref: Option<&RolloutCache>,
+) -> Vec<(&'a str, ParallelRollout)> {
+    let tasks: Vec<(&'a str, bool)> = scan
+        .thread_ids(legacy)
+        .map(|id| (id.as_str(), rows.contains_key(id)))
+        .collect();
+    let results = sample_files_concurrently(&tasks, |chunk| {
+        let mut dir_cache = CanonicalDirCache::default();
+        let mut line_buf = Vec::with_capacity(4096);
+        let mut out = Vec::with_capacity(chunk.len());
+        for &(id, has_row) in chunk {
+            if has_row {
+                out.push(ParallelRollout::Deferred);
+                continue;
+            }
+            if ambiguous_generations(scan, id) && !scan.canonical_generations(id) {
+                out.push(ParallelRollout::Error(CurrentRolloutUnavailable.into()));
+                continue;
+            }
+            let mut local_invalid = InvalidHeaders::default();
+            let mut updates = Vec::new();
+            let selected = select_rollout(
+                scan.paths(id),
+                |path| {
+                    listed_session_readonly(
+                        path,
+                        cache_ref,
+                        &mut dir_cache,
+                        &mut line_buf,
+                        &mut updates,
+                    )
+                },
+                &mut local_invalid,
+            );
+            out.push(ParallelRollout::Resolved(Box::new(ResolvedRollout {
+                selected,
+                invalid: local_invalid,
+                updates,
+            })));
+        }
+        out
+    });
+    tasks.into_iter().map(|(id, _)| id).zip(results).collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Applies one preloaded worker result with shared scan buffers and cache."
+)]
+fn resolve_preloaded_rollout(
+    scan: &CodexFileScan,
+    home: &Path,
+    id: &str,
+    row: Option<&current_rollout::CurrentRollout>,
+    item: ParallelRollout,
+    cache: Option<&mut RolloutCache>,
+    (dir_cache, line_buf): (&mut CanonicalDirCache, &mut Vec<u8>),
+    (invalid, requires_scan): (&mut InvalidHeaders, &mut bool),
+) -> Option<SelectedRollout> {
+    let result = match item {
+        ParallelRollout::Resolved(resolved) => {
+            if let Some(cache) = cache {
+                for update in resolved.updates {
+                    match update {
+                        RolloutCacheUpdate::Hit(path, stamp) => cache.record_hit(&path, stamp),
+                        RolloutCacheUpdate::Parsed(path, stamp, header) => {
+                            cache.insert(&path, stamp, header.map(|header| *header));
+                        }
+                    }
+                }
+            }
+            invalid.unreadable += resolved.invalid.unreadable;
+            invalid.without_metadata += resolved.invalid.without_metadata;
+            if invalid.first_error.is_none() {
+                invalid.first_error = resolved.invalid.first_error;
+            }
+            Ok(resolved.selected)
+        }
+        ParallelRollout::Error(error) => Err(error),
+        ParallelRollout::Deferred => {
+            scan.listed_rollout_buffered(home, id, row, cache, dir_cache, line_buf, invalid)
+        }
+    };
+    match result {
+        Ok(selected) => selected,
+        Err(error) => {
+            *requires_scan = true;
+            invalid.unreadable += 1;
+            invalid.first_error.get_or_insert(error);
+            None
+        }
+    }
+}
+
+fn listed_session_readonly(
+    path: &Path,
+    cache: Option<&RolloutCache>,
+    dir_cache: &mut CanonicalDirCache,
+    line_buf: &mut Vec<u8>,
+    updates: &mut Vec<RolloutCacheUpdate>,
+) -> Result<Option<CodexSession>> {
+    let (observed, raw_stat) = dir_cache
+        .read_observed(path)
+        .context("selected Codex rollout changed during discovery")?;
     let (Some(cache), Some(stamp)) = (cache, observed.stamp) else {
-        return CodexSession::parse_with_observation(path, observed);
+        return CodexSession::parse_with_observation_buffered(path, observed, raw_stat, line_buf);
+    };
+    if let Some(cached) = cache.lookup(path, stamp) {
+        updates.push(RolloutCacheUpdate::Hit(path.to_path_buf(), stamp));
+        return Ok(cached
+            .header
+            .clone()
+            .map(|header| CodexSession::from_header(path, header, observed)));
+    }
+    let session =
+        CodexSession::parse_with_observation_buffered(path, observed, raw_stat, line_buf)?;
+    updates.push(RolloutCacheUpdate::Parsed(
+        path.to_path_buf(),
+        stamp,
+        session.as_ref().map(|s| Box::new(s.header())),
+    ));
+    Ok(session)
+}
+
+fn listed_session_buffered(
+    path: &Path,
+    cache: Option<&mut RolloutCache>,
+    dir_cache: &mut CanonicalDirCache,
+    line_buf: &mut Vec<u8>,
+) -> Result<Option<CodexSession>> {
+    let (observed, raw_stat) = dir_cache
+        .read_observed(path)
+        .context("selected Codex rollout changed during discovery")?;
+    let (Some(cache), Some(stamp)) = (cache, observed.stamp) else {
+        return CodexSession::parse_with_observation_buffered(path, observed, raw_stat, line_buf);
     };
     if let Some(cached) = cache.get(path, stamp) {
         return Ok(cached
@@ -1722,7 +2022,8 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
             .clone()
             .map(|header| CodexSession::from_header(path, header, observed)));
     }
-    let session = CodexSession::parse_with_observation(path, observed)?;
+    let session =
+        CodexSession::parse_with_observation_buffered(path, observed, raw_stat, line_buf)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
     Ok(session)
 }
@@ -1791,7 +2092,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
 }
 
 fn ranked_rollouts(files: &[PathBuf], active: &Path) -> HashMap<String, Vec<usize>> {
-    let mut candidates = HashMap::<String, Vec<usize>>::new();
+    let mut candidates = HashMap::<String, Vec<usize>>::with_capacity(files.len());
     for (i, path) in files.iter().enumerate() {
         let Some(id) = path_uuid(path) else {
             continue;
@@ -1805,6 +2106,9 @@ fn ranked_rollouts(files: &[PathBuf], active: &Path) -> HashMap<String, Vec<usiz
 }
 
 fn sort_rollout_indices(indices: &mut [usize], files: &[PathBuf], active: &Path) {
+    if indices.len() <= 1 {
+        return;
+    }
     if indices
         .iter()
         .all(|&i| current_rollout::canonical_name(&files[i]))
@@ -2191,14 +2495,147 @@ impl CodexSession {
     }
 
     fn parse_with_observation(path: &Path, observed: ObservedRollout) -> Result<Option<Self>> {
+        let mut line_buf = Vec::new();
+        Self::parse_with_observation_buffered(path, observed, None, &mut line_buf)
+    }
+
+    fn parse_with_observation_buffered(
+        path: &Path,
+        observed: ObservedRollout,
+        raw_stat: Option<RawRolloutStat>,
+        line_buf: &mut Vec<u8>,
+    ) -> Result<Option<Self>> {
+        if rollout_file::read_first_plain_line(path, line_buf)? {
+            let unchanged = raw_stat.map_or_else(
+                || CodexAdapter::index_file_revision(path) == Some(observed.revision),
+                |stat| stat.still_matches(path),
+            );
+            anyhow::ensure!(
+                unchanged,
+                "selected Codex rollout changed during header lookup"
+            );
+            match Self::parse_metadata_line_fast(path, line_buf, observed) {
+                FastMetadataResult::Session(parsed) => return Ok(Some(*parsed)),
+                FastMetadataResult::Ignored => return Ok(None),
+                FastMetadataResult::Fallback => {}
+            }
+            if let Ok(record) = serde_json::from_slice::<Value>(line_buf) {
+                return Ok(Self::parse_metadata_record(
+                    path.to_path_buf(),
+                    &record,
+                    observed,
+                ));
+            }
+        }
         let records = rollout_file::header(path)?;
+        let unchanged = raw_stat.map_or_else(
+            || CodexAdapter::index_file_revision(path) == Some(observed.revision),
+            |stat| stat.still_matches(path),
+        );
         anyhow::ensure!(
-            CodexAdapter::index_file_revision(path) == Some(observed.revision),
+            unchanged,
             "selected Codex rollout changed during header lookup"
         );
         Ok(records
             .first()
             .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, observed)))
+    }
+
+    /// Parses standard legacy `session_meta` headers without building a `serde_json::Value` tree.
+    /// Returns `Fallback` to use the full `Value` parser for paginated/special headers or
+    /// non-standard JSON shapes.
+    fn parse_metadata_line_fast(
+        path: &Path,
+        line: &[u8],
+        observed: ObservedRollout,
+    ) -> FastMetadataResult {
+        let Ok(header) = serde_json::from_slice::<FastHeader<'_>>(line) else {
+            return FastMetadataResult::Fallback;
+        };
+        if header.record_type.as_deref() != Some("session_meta") {
+            return FastMetadataResult::Ignored;
+        }
+        if header.ordinal.is_present() {
+            return FastMetadataResult::Fallback;
+        }
+        let Some(payload) = header.payload else {
+            return FastMetadataResult::Fallback;
+        };
+        if payload.history_mode.is_present()
+            || payload.history_base.is_present()
+            || payload.attached_thread.is_present()
+            || payload.subagent_history_start_ordinal.is_present()
+        {
+            return FastMetadataResult::Fallback;
+        }
+        let Some(id) = nonempty_cow(payload.id).or_else(|| nonempty_cow(payload.session_id)) else {
+            return FastMetadataResult::Ignored;
+        };
+        if Uuid::parse_str(&id).is_err() {
+            return FastMetadataResult::Ignored;
+        }
+        if current_rollout::ids(path).is_some_and(|(thread, _)| thread != id.as_ref())
+            && current_rollout::canonical_name(path)
+        {
+            return FastMetadataResult::Ignored;
+        }
+        let created_at = header.timestamp.as_deref().and_then(|raw| {
+            DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+        });
+        let git = payload.git.map_or_else(GitState::default, |git| {
+            let branch = nonempty_cow(git.branch)
+                .or_else(|| nonempty_cow(git.branch_name))
+                .map(Cow::into_owned);
+            let head = nonempty_cow(git.commit_hash)
+                .filter(|head| {
+                    matches!(head.len(), 40 | 64)
+                        && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(|head| head.to_ascii_lowercase());
+            let remote_fingerprint = nonempty_cow(git.repository_url)
+                .filter(|url| !url.is_empty())
+                .map(|url| omnis_core::fingerprint(url.as_bytes()));
+            GitState {
+                branch,
+                head,
+                remote_fingerprint,
+                ..GitState::default()
+            }
+        });
+        let is_subagent = nonempty_cow(payload.agent_role).is_some()
+            || nonempty_cow(payload.agent_path).is_some()
+            || payload
+                .thread_source
+                .and_then(|source| nonempty_cow(source.agent_role))
+                .is_some()
+            || matches!(
+                payload.source,
+                Some(FastSource::Object(FastSourceObject {
+                    subagent: FieldPresence::Present
+                }))
+            );
+        FastMetadataResult::Session(Box::new(Self {
+            history_base: HistoryBase::None,
+            subagent_history_start: None,
+            id: id.into_owned(),
+            forked_from_id: nonempty_cow(payload.forked_from_id)
+                .and_then(|id| Uuid::parse_str(&id).ok()),
+            title: None,
+            path: path.to_path_buf(),
+            observed_revision: Some(observed.revision),
+            stamp: observed.stamp,
+            project_path: nonempty_cow(payload.cwd)
+                .map(|cwd| PathBuf::from(cwd.into_owned()))
+                .filter(|path| path.is_absolute()),
+            git,
+            cli_version: nonempty_cow(payload.cli_version).map(Cow::into_owned),
+            history_mode: CodexHistoryMode::Legacy,
+            is_subagent,
+            created_at,
+            updated_at: observed.modified,
+        }))
     }
 
     fn parse_metadata_record(
@@ -8369,6 +8806,45 @@ mod tests {
             prop_assert_eq!(
                 contains_workspace_marker(&path, b"thread_rolled_back", chunk).expect("chunked scan"),
                 naive_rollback_marker(&bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn fast_metadata_parser_matches_value_parser_for_null_fields_and_cli_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "019f0000-0000-7000-8000-000000000099";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+        let cases = [
+            json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp/ws", "source": "cli"}}),
+            json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp/ws", "history_mode": Value::Null}}),
+            json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp/ws", "source": {"subagent": Value::Null}}}),
+            json!({"type": "session_meta", "payload": {"id": "   ", "session_id": id, "cwd": "/tmp/ws"}}),
+            json!({"type": "session_meta", "payload": {"id": id, "agent_role": " "}}),
+        ];
+        let mut dir_cache = CanonicalDirCache::default();
+        let mut line_buf = Vec::new();
+        for case in cases {
+            let line = format!("{case}\n");
+            fs::write(&path, &line).expect("write rollout");
+            let (observed, raw_stat) = dir_cache.read_observed(&path).expect("observe rollout");
+            let fast = CodexSession::parse_with_observation_buffered(
+                &path,
+                observed,
+                raw_stat,
+                &mut line_buf,
+            )
+            .expect("buffered parse");
+            let reference = CodexSession::parse_metadata_record(path.clone(), &case, observed);
+            assert_eq!(
+                fast.as_ref()
+                    .map(|s| (&s.id, s.history_mode, s.is_subagent)),
+                reference
+                    .as_ref()
+                    .map(|s| (&s.id, s.history_mode, s.is_subagent)),
+                "mismatch for {case}"
             );
         }
     }

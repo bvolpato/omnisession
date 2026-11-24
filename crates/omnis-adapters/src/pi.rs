@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
@@ -11,6 +12,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -23,8 +25,8 @@ use crate::{
         EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles,
         json_lines_preview_file_with_suffix, nested_files, nested_files_matching,
         omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, read_json_line_at, sort_sessions, string_at, validate_provider,
-        visit_json_lines_with_offsets,
+        provider_root, read_raw_line_at, sort_sessions, string_at, validate_provider,
+        visit_bounded_line_bytes_with_offsets,
     },
 };
 
@@ -692,6 +694,272 @@ struct PiTopologyEntry {
     location: JsonLineLocation,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PiTimestamp<'a> {
+    Str(#[serde(borrow)] Cow<'a, str>),
+    Int(i64),
+    Other(serde::de::IgnoredAny),
+}
+
+impl PiTimestamp<'_> {
+    fn parse(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Str(value) => DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc)),
+            Self::Int(raw) => {
+                if raw.unsigned_abs() >= 100_000_000_000 {
+                    DateTime::from_timestamp_millis(*raw)
+                } else {
+                    DateTime::from_timestamp(*raw, 0)
+                }
+            }
+            Self::Other(_) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiIndexLine<'a> {
+    #[serde(rename = "type", borrow)]
+    entry_type: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    parent_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    first_kept_entry_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<PiTimestamp<'a>>,
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    title: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct PiFastMessageEntry<'a> {
+    #[serde(rename = "type", borrow)]
+    entry_type: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<PiTimestamp<'a>>,
+    #[serde(borrow)]
+    message: Option<PiFastMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiFastMessage<'a> {
+    #[serde(borrow)]
+    role: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    model_id: Option<Cow<'a, str>>,
+    usage: Option<PiFastUsage>,
+    #[serde(borrow)]
+    content: Option<PiFastContent<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiFastUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PiFastContent<'a> {
+    Text(#[serde(borrow)] Cow<'a, str>),
+    Blocks(#[serde(borrow)] Vec<PiFastContentBlock<'a>>),
+}
+
+#[derive(Deserialize)]
+struct PiFastContentBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    text: Option<Cow<'a, str>>,
+}
+
+fn text_payload(text: String) -> Value {
+    let mut map = serde_json::Map::with_capacity(1);
+    map.insert("text".to_owned(), Value::String(text));
+    Value::Object(map)
+}
+
+fn try_emit_fast_message(builder: &mut EventBuilder, line: &[u8]) -> bool {
+    let Ok(entry) = serde_json::from_slice::<PiFastMessageEntry<'_>>(line) else {
+        return false;
+    };
+    if entry.entry_type.as_deref() != Some("message") {
+        return false;
+    }
+    let Some(message) = entry.message else {
+        return false;
+    };
+    let timestamp = entry.timestamp.as_ref().and_then(PiTimestamp::parse);
+    match message.role.as_deref() {
+        Some("user") => {
+            emit_fast_user_message(builder, message.content, timestamp);
+            true
+        }
+        Some("assistant") => try_emit_fast_assistant_message(builder, &message, timestamp),
+        _ => false,
+    }
+}
+
+fn emit_fast_user_message(
+    builder: &mut EventBuilder,
+    content: Option<PiFastContent<'_>>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    match content {
+        Some(PiFastContent::Text(text)) => {
+            if !text.is_empty() {
+                builder.push(
+                    EventKind::MessageUser,
+                    text_payload(text.into_owned()),
+                    timestamp,
+                    ReplayPolicy::Contextual,
+                    Some("message".to_owned()),
+                    None,
+                );
+            }
+        }
+        Some(PiFastContent::Blocks(blocks)) => {
+            let mut emitted = false;
+            let mut images = 0_usize;
+            for block in blocks {
+                match block.kind.as_deref() {
+                    Some("text") => {
+                        if let Some(text) = block.text
+                            && !text.is_empty()
+                        {
+                            emitted = true;
+                            builder.push(
+                                EventKind::MessageUser,
+                                text_payload(text.into_owned()),
+                                timestamp,
+                                ReplayPolicy::Contextual,
+                                Some("message".to_owned()),
+                                None,
+                            );
+                        }
+                    }
+                    Some("image") => images += 1,
+                    _ => {}
+                }
+            }
+            if !emitted && images > 0 {
+                builder.push(
+                    EventKind::MessageUser,
+                    text_payload(omitted_images_text(images)),
+                    timestamp,
+                    ReplayPolicy::Contextual,
+                    Some("message".to_owned()),
+                    None,
+                );
+            }
+        }
+        None => {}
+    }
+}
+
+fn try_emit_fast_assistant_message(
+    builder: &mut EventBuilder,
+    message: &PiFastMessage<'_>,
+    timestamp: Option<DateTime<Utc>>,
+) -> bool {
+    let blocks = match &message.content {
+        Some(PiFastContent::Blocks(blocks)) => {
+            if blocks
+                .iter()
+                .any(|block| !matches!(block.kind.as_deref(), Some("text" | "thinking")))
+            {
+                return false;
+            }
+            Some(blocks.as_slice())
+        }
+        Some(PiFastContent::Text(_)) => return false,
+        None => None,
+    };
+    let model = message
+        .model
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            message
+                .model_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        });
+    let total_tokens = message
+        .usage
+        .as_ref()
+        .map(|usage| {
+            [
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+            ]
+            .into_iter()
+            .flatten()
+            .fold(0_u64, u64::saturating_add)
+        })
+        .filter(|tokens| *tokens > 0);
+    if model.is_some() || total_tokens.is_some() {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({
+                "model": model,
+                "total_tokens": total_tokens,
+                "token_usage": "incremental",
+            }),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.session_metadata".to_owned()),
+            None,
+        );
+    }
+    if let Some(blocks) = blocks {
+        for block in blocks {
+            match block.kind.as_deref() {
+                Some("text") => {
+                    if let Some(text) = block.text.as_deref()
+                        && !text.is_empty()
+                    {
+                        builder.push(
+                            EventKind::MessageAssistant,
+                            text_payload(text.to_owned()),
+                            timestamp,
+                            ReplayPolicy::Contextual,
+                            Some("message".to_owned()),
+                            None,
+                        );
+                    }
+                }
+                Some("thinking") => builder.push(
+                    EventKind::ProviderEvent,
+                    json!({ "type": "pi_reasoning_omitted" }),
+                    timestamp,
+                    ReplayPolicy::HistoricalOnly,
+                    Some("message".to_owned()),
+                    None,
+                ),
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 #[derive(Default)]
 struct PiTranscriptIndex {
     header: HeaderState,
@@ -702,6 +970,59 @@ struct PiTranscriptIndex {
 }
 
 impl PiTranscriptIndex {
+    fn observe_fast(
+        &mut self,
+        provider: Provider,
+        location: JsonLineLocation,
+        record: PiIndexLine<'_>,
+    ) {
+        if let Some(timestamp) = record.timestamp.as_ref().and_then(PiTimestamp::parse) {
+            self.latest_timestamp = Some(
+                self.latest_timestamp
+                    .take()
+                    .map_or(timestamp, |latest| latest.max(timestamp)),
+            );
+        }
+        let entry_type = record.entry_type.as_deref();
+        if provider != Provider::OhMyPi
+            && matches!(
+                entry_type,
+                Some("session_info" | "title" | "title_change" | "session")
+            )
+            && let Some(title) = record
+                .name
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .or_else(|| record.title.as_deref().filter(|value| !value.is_empty()))
+        {
+            self.latest_title = Some(title.to_owned());
+        }
+        if entry_type == Some("session") {
+            return;
+        }
+        let Some(id) = record.id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let kind = match entry_type {
+            Some("compaction") => BranchEntryKind::Compaction,
+            Some("reset_boundary") if provider == Provider::OhMyPi => BranchEntryKind::Reset,
+            _ => BranchEntryKind::Other,
+        };
+        let id = id.into_owned();
+        self.by_id.insert(
+            id.clone(),
+            PiTopologyEntry {
+                parent_id: record.parent_id.map(Cow::into_owned),
+                kind,
+                first_kept_entry_id: (kind == BranchEntryKind::Compaction)
+                    .then(|| record.first_kept_entry_id.map(Cow::into_owned))
+                    .flatten(),
+                location,
+            },
+        );
+        self.leaf = Some(id);
+    }
+
     fn observe(&mut self, provider: Provider, location: JsonLineLocation, record: &Value) {
         let first_record = matches!(&self.header, HeaderState::Empty);
         let header = match &self.header {
@@ -824,7 +1145,7 @@ impl SelectedPiFile {
         let metadata = file.metadata()?;
         let observed = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)
             .context("Pi session path is not a regular file")?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
         let header = read_header(
             &mut reader,
             provider,
@@ -868,16 +1189,32 @@ impl SelectedPiFile {
 
     fn full_snapshot(&mut self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let mut index = PiTranscriptIndex::default();
+        let estimated_entries = usize::try_from(self.length / 256)
+            .unwrap_or(65_536)
+            .min(65_536);
+        index.by_id.reserve(estimated_entries);
         let mut parsed_suffix = 0..0;
-        let oversized_records = visit_json_lines_with_offsets(
+        let oversized_records = visit_bounded_line_bytes_with_offsets(
             &mut self.reader,
             MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
-            |location, record| {
-                if location.offset != parsed_suffix.end {
-                    parsed_suffix.start = location.offset;
+            |location, line| {
+                if matches!(index.header, HeaderState::Parsed(_))
+                    && let Ok(record) = serde_json::from_slice::<PiIndexLine<'_>>(line)
+                {
+                    if location.offset != parsed_suffix.end {
+                        parsed_suffix.start = location.offset;
+                    }
+                    parsed_suffix.end = location.offset + location.length;
+                    index.observe_fast(session.provider, location, record);
+                    return Ok(());
                 }
-                parsed_suffix.end = location.offset + location.length;
-                index.observe(session.provider, location, &record);
+                if let Ok(record) = serde_json::from_slice::<Value>(line) {
+                    if location.offset != parsed_suffix.end {
+                        parsed_suffix.start = location.offset;
+                    }
+                    parsed_suffix.end = location.offset + location.length;
+                    index.observe(session.provider, location, &record);
+                }
                 Ok(())
             },
         )?;
@@ -920,16 +1257,22 @@ impl SelectedPiFile {
         };
         drop(index);
         let mut builder = EventBuilder::new(session.provider, &session.id);
+        builder.reserve(locations.len());
         builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
         let mut record_line = Vec::new();
         let mut read_position = self.reader.stream_position()?;
         for (location, role) in locations {
-            let entry = read_json_line_at(
+            read_raw_line_at(
                 &mut self.reader,
                 location,
                 &mut read_position,
                 &mut record_line,
             )?;
+            if try_emit_fast_message(&mut builder, &record_line) {
+                continue;
+            }
+            let entry: Value = serde_json::from_slice(&record_line)
+                .context("provider record changed while rereading transcript")?;
             if session.provider == Provider::OhMyPi
                 && let Some(name) = omp_branch_title(&entry)
             {

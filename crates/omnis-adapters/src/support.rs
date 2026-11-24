@@ -1579,25 +1579,6 @@ pub(crate) struct JsonLineLocation {
     pub(crate) terminated: bool,
 }
 
-/// Visits records from an already-open transcript and reports their source locations.
-///
-/// The caller can seek within the same file handle to reread only selected records after it has
-/// collected compact index metadata. The regular file, file-size, record-count, and line-size
-/// limits match `visit_json_lines_with_tail`.
-pub(crate) fn visit_json_lines_with_offsets(
-    reader: &mut BufReader<File>,
-    file_limit: u64,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
-) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(
-        reader,
-        JsonLinesLimits::streamed(file_limit),
-        JsonLineTail::SkipMalformed,
-        |loc, record, _| visit(loc, record),
-    )
-    .map(|skips| skips.oversized)
-}
-
 /// Reports nonblank lines and their source positions. The caller bounds the state it retains.
 pub(crate) fn visit_streamed_json_records_with_offsets(
     reader: &mut BufReader<File>,
@@ -1635,13 +1616,76 @@ pub(crate) fn visit_streamed_json_records_with_offsets(
     Ok(oversized)
 }
 
-/// Rereads one previously visited record from the same open transcript handle.
-pub(crate) fn read_json_line_at(
+/// Visits each bounded non-oversized raw JSONL line with its byte location.
+pub(crate) fn visit_bounded_line_bytes_with_offsets(
+    reader: &mut BufReader<File>,
+    file_limit: u64,
+    mut visit: impl FnMut(JsonLineLocation, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    let limits = JsonLinesLimits::streamed(file_limit);
+    let metadata = reader.get_ref().metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    if metadata.len() > limits.file_bytes {
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let mut line = Vec::new();
+    let mut records = 0_usize;
+    let mut oversized = 0_usize;
+    let mut offset = 0_u64;
+    loop {
+        if records >= limits.records {
+            if !reader.fill_buf()?.is_empty() {
+                return Err(TranscriptReadLimit("provider file exceeds safe record limit").into());
+            }
+            break;
+        }
+        let line_offset = offset;
+        let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
+        let Some((line_kind, read)) = read_bounded_line_with_budget(
+            reader,
+            limits.line_bytes,
+            remaining_file_bytes,
+            &mut line,
+        )?
+        else {
+            break;
+        };
+        records += 1;
+        offset = offset
+            .checked_add(read)
+            .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+        match line_kind {
+            BoundedLine::Oversized => oversized += 1,
+            BoundedLine::Complete => visit(
+                JsonLineLocation {
+                    offset: line_offset,
+                    length: read,
+                    terminated: line.ends_with(b"\n"),
+                },
+                &line,
+            )?,
+        }
+    }
+    if offset < metadata.len() {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "provider transcript changed during the read",
+        )
+        .into());
+    }
+    Ok(oversized)
+}
+
+/// Rereads one previously visited record's raw bytes from the same open transcript handle.
+pub(crate) fn read_raw_line_at(
     reader: &mut BufReader<File>,
     location: JsonLineLocation,
     current_position: &mut u64,
     line: &mut Vec<u8>,
-) -> Result<Value> {
+) -> Result<()> {
     if location.length > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
         return Err(anyhow!("provider record exceeds safe line limit"));
     }
@@ -1657,6 +1701,17 @@ pub(crate) fn read_json_line_at(
         .offset
         .checked_add(location.length)
         .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+    Ok(())
+}
+
+/// Rereads one previously visited record from the same open transcript handle.
+pub(crate) fn read_json_line_at(
+    reader: &mut BufReader<File>,
+    location: JsonLineLocation,
+    current_position: &mut u64,
+    line: &mut Vec<u8>,
+) -> Result<Value> {
+    read_raw_line_at(reader, location, current_position, line)?;
     serde_json::from_slice(line).context("provider record changed while rereading transcript")
 }
 
@@ -1810,7 +1865,7 @@ pub(crate) fn visit_json_lines_with_gaps(
     let mut previous = 0;
     let file = File::open(path)?;
     visit_json_lines_with_offsets_and_limits(
-        &mut BufReader::new(file),
+        &mut BufReader::with_capacity(64 * 1024, file),
         JsonLinesLimits::streamed(file_limit),
         JsonLineTail::SkipMalformed,
         |_, record, skips| {
@@ -1829,7 +1884,7 @@ fn visit_json_lines_with_limits(
 ) -> Result<usize> {
     let file = File::open(path)?;
     visit_json_lines_with_offsets_and_limits(
-        &mut BufReader::new(file),
+        &mut BufReader::with_capacity(64 * 1024, file),
         limits,
         tail,
         |_, record, _| visit(record),
@@ -3154,6 +3209,10 @@ impl EventBuilder {
             codex_saved_users: None,
             codex_saved_assistant: false,
         }
+    }
+
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.events.reserve(additional);
     }
 
     pub(crate) fn empty_with_same_plan(&self) -> Self {

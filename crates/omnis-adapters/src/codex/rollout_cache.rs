@@ -150,6 +150,132 @@ pub(super) fn default_path(codex_home: &Path) -> Option<PathBuf> {
     )
 }
 
+/// Cached directory canonicalizations for bulk rollout discovery on case-sensitive Linux paths.
+#[derive(Default)]
+pub(super) struct CanonicalDirCache {
+    #[cfg(target_os = "linux")]
+    parents: HashMap<PathBuf, (u64, u64)>,
+}
+
+/// Raw Linux stat tuple used to verify a non-symlink file and its parent directory did not change
+/// without re-canonicalizing on every file.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct RawRolloutStat {
+    #[cfg(target_os = "linux")]
+    parent_identity: (u64, u64),
+    #[cfg(target_os = "linux")]
+    dev: u64,
+    #[cfg(target_os = "linux")]
+    ino: u64,
+    #[cfg(target_os = "linux")]
+    len: u64,
+    #[cfg(target_os = "linux")]
+    mtime: (i64, i64),
+    #[cfg(target_os = "linux")]
+    ctime: (i64, i64),
+}
+
+impl RawRolloutStat {
+    #[cfg(target_os = "linux")]
+    fn from_metadata(parent_identity: (u64, u64), metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            parent_identity,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    pub(super) fn still_matches(self, path: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let parent_matches = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .and_then(|parent| fs::symlink_metadata(parent).ok())
+                .is_some_and(|meta| {
+                    !meta.file_type().is_symlink()
+                        && meta.is_dir()
+                        && (meta.dev(), meta.ino()) == self.parent_identity
+                });
+            parent_matches
+                && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    !metadata.file_type().is_symlink()
+                        && metadata.is_file()
+                        && Self::from_metadata(self.parent_identity, &metadata) == self
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, path);
+            false
+        }
+    }
+}
+
+impl CanonicalDirCache {
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    pub(super) fn read_observed(
+        &mut self,
+        path: &Path,
+    ) -> Option<(ObservedRollout, Option<RawRolloutStat>)> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            super::rollout_file::jsonl_file_name(path)?;
+            if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
+                && !parent.as_os_str().is_empty()
+                && let Ok(parent_meta) = fs::symlink_metadata(parent)
+                && !parent_meta.file_type().is_symlink()
+                && parent_meta.is_dir()
+            {
+                let parent_identity = (parent_meta.dev(), parent_meta.ino());
+                let parent_canonical = match self.parents.get(parent) {
+                    Some(&cached) if cached == parent_identity => true,
+                    _ => match fs::canonicalize(parent) {
+                        Ok(canonical) if canonical == parent => {
+                            self.parents.insert(parent.to_path_buf(), parent_identity);
+                            true
+                        }
+                        _ => false,
+                    },
+                };
+                if parent_canonical
+                    && let Ok(metadata) = fs::symlink_metadata(path)
+                    && !metadata.file_type().is_symlink()
+                    && metadata.is_file()
+                {
+                    let canonical = parent.join(file_name);
+                    let source = crate::source_file::ObservedSourceFile::from_metadata(
+                        &canonical, &metadata,
+                    )?;
+                    let mut stamp = RolloutStamp::new(&metadata);
+                    if let Some(stamp) = &mut stamp {
+                        stamp.file_id = source.revision.file;
+                    }
+                    return Some((
+                        ObservedRollout {
+                            physical_identity: source.physical_identity,
+                            modified: source.modified,
+                            revision: source.revision,
+                            stamp,
+                        },
+                        Some(RawRolloutStat::from_metadata(parent_identity, &metadata)),
+                    ));
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = self;
+        ObservedRollout::read(path).map(|observed| (observed, None))
+    }
+}
+
 /// File identity and metadata captured together for a selected rollout.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ObservedRollout {
@@ -317,6 +443,29 @@ impl RolloutCache {
             current: HashMap::new(),
             parsed: false,
         })
+    }
+
+    /// Read-only lookup for parallel discovery workers.
+    pub(super) fn lookup(&self, rollout: &Path, stamp: RolloutStamp) -> Option<&CachedRollout> {
+        let key = rollout.to_str()?;
+        self.current
+            .get(key)
+            .or_else(|| self.previous.get(key))
+            .filter(|cached| cached.stamp == stamp)
+    }
+
+    /// Promotes a read-only cache hit from `previous` into `current`.
+    pub(super) fn record_hit(&mut self, rollout: &Path, stamp: RolloutStamp) {
+        let Some(key) = rollout.to_str() else {
+            return;
+        };
+        if let Some(cached) = self
+            .previous
+            .remove(key)
+            .filter(|cached| cached.stamp == stamp)
+        {
+            self.current.entry(key.to_owned()).or_insert(cached);
+        }
     }
 
     /// Returns the cached entry while the rollout's stamp is unchanged.

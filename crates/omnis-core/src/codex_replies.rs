@@ -86,26 +86,41 @@ fn reply_array<'a>(
 pub(super) fn previous_spellings<'a>(
     snapshot: &CanonicalSnapshot,
     event: &'a OmniEvent,
-) -> impl Iterator<Item = &'a str> {
-    let versions = versions(snapshot, event)
-        .into_iter()
-        .flatten()
-        .filter_map(|version| {
-            position(&version["position"])?;
-            version["text"].as_str()
-        });
+) -> Option<impl Iterator<Item = &'a str>> {
+    if snapshot.session.provider != Provider::Codex
+        || event.source.provider != Provider::Codex
+        || event.kind != EventKind::MessageAssistant
+        || event.replay_policy != ReplayPolicy::Contextual
+        || event.source.raw_record_type.as_deref() != Some("event_msg.item_completed")
+    {
+        return None;
+    }
+    let restored = restored_codex_answer(snapshot, event);
+    let versions_slice = versions(snapshot, event);
+    let positioned_slice = positioned_spellings(snapshot, event);
+    if restored.is_none() && versions_slice.is_none() && positioned_slice.is_none() {
+        return None;
+    }
+    let versions = versions_slice.into_iter().flatten().filter_map(|version| {
+        position(&version["position"])?;
+        version["text"].as_str()
+    });
     let mut seen = HashSet::new();
     let current = event.payload["text"].as_str();
-    restored_codex_answer(snapshot, event)
-        .into_iter()
-        .chain(versions)
-        .chain(
-            positioned_spellings(snapshot, event)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str),
-        )
-        .filter(move |text| Some(*text) != current && !text.trim().is_empty() && seen.insert(*text))
+    Some(
+        restored
+            .into_iter()
+            .chain(versions)
+            .chain(
+                positioned_slice
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .filter(move |text| {
+                Some(*text) != current && !text.trim().is_empty() && seen.insert(*text)
+            }),
+    )
 }
 
 fn position(value: &Value) -> Option<(u64, bool, u64, u64)> {
