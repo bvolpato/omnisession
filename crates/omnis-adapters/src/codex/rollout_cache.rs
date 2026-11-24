@@ -189,6 +189,7 @@ impl RawRolloutStat {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
     pub(super) fn still_matches(self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -211,13 +212,14 @@ impl RawRolloutStat {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = path;
+            let _ = (self, path);
             false
         }
     }
 }
 
 impl CanonicalDirCache {
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
     pub(super) fn read_observed(
         &mut self,
         path: &Path,
