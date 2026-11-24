@@ -19,8 +19,8 @@ directories.workspace = true
 hex.workspace = true
 lz4_flex.workspace = true
 memchr.workspace = true
-omnis-core = { package = "omnisession-core", version = "0.10.4", path = "../omnis-core" }
-omnis-ir = { package = "omnisession-ir", version = "0.10.4", path = "../omnis-ir" }
+omnis-core = { package = "omnisession-core", version = "0.10.5", path = "../omnis-core" }
+omnis-ir = { package = "omnisession-ir", version = "0.10.5", path = "../omnis-ir" }
 rusqlite = { workspace = true, features = ["functions"] }
 serde.workspace = true
 serde_json.workspace = true

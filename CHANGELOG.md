@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.5 - 2026-11-24
+
+### Changed
+
+- Speed up core secret redaction, search document projection, and trajectory import with a single Teddy-prefiltered alternation for rare credential passes, candidate-indexed credential-flag redaction, zero-allocation terminal sanitization and sensitive-key checks, and borrowed event text extraction. ([#308](https://github.com/bvolpato/omnisession/pull/308))
+- Speed up SQLite store opening, indexing writes, and full-text search by skipping redundant DDL on current stores after verifying schema version, migrations, FTS5 automerge config, and repair tables; enabling `PRAGMA synchronous = NORMAL` once WAL mode is confirmed; pruning empty auxiliary joins per search snapshot; locking FTS5-first join order with a planner hint for automatic eligibility indexing; materializing multi-clause rankings once; and skipping snippet extraction when callers discard snippets. ([#308](https://github.com/bvolpato/omnisession/pull/308))
+- Speed up Codex, Pi, and Oh My Pi discovery and transcript reads by parallelizing non-SQLite Codex rollout header discovery, adding parent-verified Linux directory canonicalization caching and borrowed `session_meta` parsing, adding borrowed two-pass JSONL indexing and message emission for Pi and Oh My Pi, and using 64 KiB read buffers for streamed JSONL transcripts. ([#308](https://github.com/bvolpato/omnisession/pull/308))
+
 ## 0.10.4 - 2026-11-22
 
 ### Added
