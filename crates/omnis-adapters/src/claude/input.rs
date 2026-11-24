@@ -71,7 +71,7 @@ impl InputCoverage {
         ends_at_eof: bool,
         mut visit: impl FnMut(Value) -> Result<bool>,
     ) -> Result<u64> {
-        let mut reader = BufReader::new(reader.take(length));
+        let mut reader = BufReader::with_capacity(64 * 1024, reader.take(length));
         let mut remaining = length;
         let mut line = Vec::new();
         while let Some((kind, bytes)) = read_bounded_line_with_budget(

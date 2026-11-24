@@ -306,37 +306,184 @@ fn visible_trajectory_sql() -> String {
     )
 }
 
+const SCHEMA_READY_PREFIX: &str = "schema_ready:";
+/// Bump whenever an in-place migration, trigger, index, or FTS config change is added without
+/// incrementing `STORE_FORMAT`, so existing stores run `initialize_schema()` once on open.
+const SCHEMA_READY_REVISION: u32 = 1;
+
+/// Which optional tables contain rows in the active search read transaction.
+///
+/// Checking these once with indexed `EXISTS` probes lets full-text search omit empty
+/// joins and subqueries instead of probing them per matching chunk.
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent O(1) presence flags for optional search auxiliary tables."
+)]
+struct SearchTableState {
+    has_pi: bool,
+    has_antigravity_gaps: bool,
+    has_gap_projections: bool,
+    has_physical_gaps: bool,
+    has_failures: bool,
+    has_codex_workspace_obs: bool,
+    has_primary_legacy_updates: bool,
+    has_conflict_catalog: bool,
+    has_codex_trajectories: bool,
+}
+
+impl SearchTableState {
+    fn read(connection: &Connection) -> Result<Self> {
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT
+                     EXISTS(SELECT 1 FROM main.session_trajectories WHERE provider IN ('pi','omp')),
+                     EXISTS(SELECT 1 FROM main.antigravity_search_gaps),
+                     EXISTS(SELECT 1 FROM main.antigravity_gap_projections),
+                     EXISTS(SELECT 1 FROM main.physical_database_body_reads),
+                     EXISTS(SELECT 1 FROM main.trajectory_index_failures),
+                     EXISTS(SELECT 1 FROM main.codex_workspace_observations),
+                     EXISTS(SELECT 1 FROM main.primary_legacy_chunk_updates),
+                     EXISTS(SELECT 1 FROM main.session_index WHERE provider IN ('codex','grok','pi','omp')),
+                     EXISTS(SELECT 1 FROM main.session_trajectories WHERE provider = 'codex')",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_row([], |row| {
+                Ok(Self {
+                    has_pi: row.get(0)?,
+                    has_antigravity_gaps: row.get(1)?,
+                    has_gap_projections: row.get(2)?,
+                    has_physical_gaps: row.get(3)?,
+                    has_failures: row.get(4)?,
+                    has_codex_workspace_obs: row.get(5)?,
+                    has_primary_legacy_updates: row.get(6)?,
+                    has_conflict_catalog: row.get(7)?,
+                    has_codex_trajectories: row.get(8)?,
+                })
+            })
+            .map_err(database_error)
+    }
+
+    fn trajectory_source_sql(self) -> &'static str {
+        if self.has_pi {
+            "visible_trajectories"
+        } else {
+            "main.session_trajectories"
+        }
+    }
+
+    fn direct_trajectory_filter_sql(self) -> String {
+        if self.has_pi {
+            visible_trajectory_sql()
+        } else if self.has_codex_trajectories {
+            format!(
+                "trajectories.pi_workspace = ''
+                 AND (trajectories.provider <> 'codex'
+                      OR (trajectories.origin = 'native'
+                          AND trajectories.codex_workspace_current
+                          AND trajectories.codex_home = (SELECT home FROM current_codex_home)
+                          AND trajectories.document_version >= {}))",
+                omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION
+            )
+        } else {
+            "trajectories.pi_workspace = ''".to_owned()
+        }
+    }
+}
+
 /// Joins full-text matches to their eligible trajectories. A clause that does not read chunk
 /// text takes each trajectory from [`CHUNK_OWNER_INDEX`].
-fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
+fn trajectory_candidate_chunks_sql(
+    clause: &TrajectoryClause,
+    has_eligibility: bool,
+    state: SearchTableState,
+) -> String {
     let chunk_source = if clause.exact_phrase.is_some() {
         // The exact phrase check reads the chunk text, so the row is needed anyway.
         "session_trajectory_chunk_rows AS chunks".to_owned()
     } else {
         format!("session_trajectory_chunk_rows AS chunks INDEXED BY {CHUNK_OWNER_INDEX}")
     };
+    let trajectory_source = state.trajectory_source_sql();
+    let trajectory_filter = state.direct_trajectory_filter_sql();
+    let legacy_filter = if state.has_primary_legacy_updates {
+        format!(
+            " AND (chunks.chunk_index < {FIRST_PRIMARY_LEGACY_CHUNK} OR NOT EXISTS (
+                SELECT 1 FROM primary_legacy_chunk_updates WHERE trajectory_id=trajectories.id))"
+        )
+    } else {
+        String::new()
+    };
+    let gap_joins = if state.has_antigravity_gaps || state.has_gap_projections {
+        format!(
+            " {SEARCH_GAP_JOIN}
+              LEFT JOIN antigravity_gap_projections all_projections ON all_projections.trajectory_id=trajectories.id"
+        )
+    } else {
+        String::new()
+    };
+    let projection_filter = if state.has_gap_projections {
+        format!(
+            " AND (all_projections.trajectory_id IS NULL OR
+                  ((chunks.chunk_index>=all_projections.first_chunk AND chunks.chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK})=(active_projection.trajectory_id IS NOT NULL)))"
+        )
+    } else {
+        String::new()
+    };
+    let catalog_view = if state.has_codex_workspace_obs {
+        "observed_session_index"
+    } else {
+        "scoped_session_index"
+    };
+    let catalog_check = if state.has_conflict_catalog || state.has_codex_workspace_obs {
+        if has_eligibility {
+            format!(
+                " AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
+                     SELECT 1 FROM {catalog_view} AS catalog WHERE {CONFLICTING_TRAJECTORY_CATALOG}))"
+            )
+        } else {
+            format!(
+                " AND NOT EXISTS (
+                     SELECT 1 FROM {catalog_view} AS catalog WHERE {CONFLICTING_TRAJECTORY_CATALOG})"
+            )
+        }
+    } else {
+        String::new()
+    };
+    let failure_check = if state.has_failures {
+        format!(
+            " AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed
+                             WHERE {CONFLICTING_TRAJECTORY_FAILURE})"
+        )
+    } else {
+        String::new()
+    };
+    let active_contents = if state.has_antigravity_gaps || state.has_gap_projections {
+        SEARCH_ACTIVE_CONTENTS
+    } else {
+        "trajectories.source_contents_id"
+    };
+    let eligibility_join = if has_eligibility {
+        format!(
+            " CROSS JOIN eligible
+                  ON eligible.provider = trajectories.provider
+                 AND eligible.session_id = trajectories.session_id
+                 AND (eligible.file IS NULL OR (eligible.file = hex(trajectories.source_file_id)
+                      AND eligible.contents = hex({active_contents})))"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "FROM session_trajectory_chunks_fts
-         INNER JOIN {chunk_source}
+         CROSS JOIN {chunk_source}
              ON chunks.id = session_trajectory_chunks_fts.rowid
-         INNER JOIN visible_trajectories AS trajectories
-             ON trajectories.id = chunks.trajectory_id AND {visible}
-            AND (chunks.chunk_index < {FIRST_PRIMARY_LEGACY_CHUNK} OR NOT EXISTS (
-                SELECT 1 FROM primary_legacy_chunk_updates WHERE trajectory_id=trajectories.id))
-         {SEARCH_GAP_JOIN}
-         LEFT JOIN antigravity_gap_projections all_projections ON all_projections.trajectory_id=trajectories.id
-         INNER JOIN eligible
-             ON eligible.provider = trajectories.provider
-            AND eligible.session_id = trajectories.session_id
-            AND (eligible.file IS NULL OR (eligible.file = hex(trajectories.source_file_id)
-                 AND eligible.contents = hex({SEARCH_ACTIVE_CONTENTS})))
-            AND (all_projections.trajectory_id IS NULL OR
-                 ((chunks.chunk_index>=all_projections.first_chunk AND chunks.chunk_index<{FIRST_PRIMARY_LEGACY_CHUNK})=(active_projection.trajectory_id IS NOT NULL)))
-            AND (nullif(eligible.file, '') IS NOT NULL OR NOT EXISTS (
-                 SELECT 1 FROM observed_session_index AS catalog WHERE {CONFLICTING_TRAJECTORY_CATALOG}))
-            AND NOT EXISTS (SELECT 1 FROM scoped_trajectory_failures AS failed
-                            WHERE {CONFLICTING_TRAJECTORY_FAILURE})",
-        visible = visible_trajectory_sql(),
+         CROSS JOIN {trajectory_source} AS trajectories
+             ON trajectories.id = chunks.trajectory_id AND {trajectory_filter}{legacy_filter}
+         {gap_joins}
+         {eligibility_join}
+         WHERE session_trajectory_chunks_fts MATCH ?{{param}}{{exact}}{projection_filter}{catalog_check}{failure_check}",
     )
 }
 
@@ -2577,19 +2724,27 @@ impl Store {
         connection
             .busy_handler(Some(retry_busy_database))
             .map_err(database_error)?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(database_error)?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(database_error)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         connection
-            .pragma_update(None, "cache_size", PAGE_CACHE_KIBIBYTES)
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA cache_size = {PAGE_CACHE_KIBIBYTES};
+                 PRAGMA temp_store = MEMORY;"
+            ))
             .map_err(database_error)?;
-        connection
-            .pragma_update(None, "temp_store", "MEMORY")
+        let mut journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(database_error)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            journal_mode = connection
+                .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+                .map_err(database_error)?;
+        }
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(database_error)?;
+        }
         #[cfg(all(unix, target_pointer_width = "64"))]
         let _ = connection.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
 
@@ -2597,14 +2752,21 @@ impl Store {
             connection: RefCell::new(connection),
             codex_home: active_codex_home(),
         };
-        store.initialize_schema()?;
         let state_root = path
             .parent()
             .filter(|root| !root.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        codex_legacy_home::migrate(&mut store.connection.borrow_mut(), state_root)?;
-        initialize_trajectory_scope(&store.connection.borrow(), store.codex_home.as_deref())?;
-        initialize_catalog_home(&store.connection.borrow())?;
+        if !store.schema_is_current()? {
+            store.initialize_schema()?;
+            codex_legacy_home::migrate(&mut store.connection.borrow_mut(), state_root)?;
+            store.record_schema_ready()?;
+        }
+        {
+            let connection = store.connection.borrow();
+            codex_workspace::install_display_upgrade_trigger(&connection)?;
+            initialize_trajectory_scope(&connection, store.codex_home.as_deref())?;
+            initialize_catalog_home(&connection)?;
+        }
         set_private_file(path)?;
         for suffix in ["-wal", "-shm"] {
             let mut auxiliary = path.as_os_str().to_os_string();
@@ -6014,8 +6176,12 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SessionRef>> {
-        self.search_session_trajectory_matches(query, limit)
-            .map(|matches| matches.into_iter().map(|item| item.session).collect())
+        self.read_trajectory_search(|snapshot| {
+            snapshot.search_session_trajectory_page_with_eligibility(
+                query, limit, None, None, None, false,
+            )
+        })
+        .map(|page| page.matches.into_iter().map(|item| item.session).collect())
     }
 
     /// Finds ranked session matches with bounded redacted context around matched terms.
@@ -6049,7 +6215,9 @@ impl Store {
         limit: usize,
     ) -> Result<SessionTrajectorySearchPage> {
         self.read_trajectory_search(|snapshot| {
-            snapshot.search_session_trajectory_page_with_eligibility(query, limit, None, None, None)
+            snapshot.search_session_trajectory_page_with_eligibility(
+                query, limit, None, None, None, true,
+            )
         })
     }
 
@@ -6105,6 +6273,78 @@ impl Store {
         read(&TrajectorySearchSnapshot {
             connection: &transaction,
         })
+    }
+
+    fn schema_is_current(&self) -> Result<bool> {
+        let connection = self.connection.borrow();
+        let stored_format: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(database_error)?;
+        if stored_format > STORE_FORMAT {
+            return Err(StoreError::NewerStoreFormat {
+                found: stored_format,
+                supported: STORE_FORMAT,
+            });
+        }
+        if stored_format != STORE_FORMAT {
+            return Ok(false);
+        }
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .map_err(database_error)?;
+        let marker_prefix = format!(
+            "{SCHEMA_READY_PREFIX}{STORE_FORMAT}:{SCHEMA_READY_REVISION}:{FTS_AUTOMERGE_SEGMENTS}:{schema_version}:"
+        );
+        Ok(connection
+            .query_row(
+                "SELECT EXISTS(
+                        SELECT 1 FROM store_migrations
+                        WHERE name = ?1 || (SELECT count(*) FROM session_trajectory_migrations)
+                    )
+                    AND EXISTS(
+                        SELECT 1 FROM session_trajectory_chunks_fts_config
+                        WHERE k = 'automerge' AND v = ?2
+                    )
+                    AND NOT EXISTS(SELECT 1 FROM antigravity_gap_projections)
+                    AND NOT EXISTS(SELECT 1 FROM primary_legacy_chunk_updates)
+                    AND NOT EXISTS(SELECT 1 FROM scoped_native_chunk_updates)
+                    AND NOT EXISTS(SELECT 1 FROM session_trajectories WHERE redacted_text <> '')
+                    AND NOT EXISTS(
+                        SELECT 1 FROM session_trajectories
+                        WHERE projected_byte_count IS NULL AND source_complete = 0
+                          AND truncation_strategy = 'source_incomplete'
+                          AND ((provider = 'antigravity' AND document_version = 10)
+                            OR (provider = 'antigravity-desktop' AND document_version = 8))
+                    )",
+                params![marker_prefix, FTS_AUTOMERGE_SEGMENTS],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false))
+    }
+
+    fn record_schema_ready(&self) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let schema_version: i64 = transaction
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .map_err(database_error)?;
+        let marker_prefix = format!(
+            "{SCHEMA_READY_PREFIX}{STORE_FORMAT}:{SCHEMA_READY_REVISION}:{FTS_AUTOMERGE_SEGMENTS}:{schema_version}:"
+        );
+        transaction
+            .execute(
+                "DELETE FROM store_migrations WHERE name LIKE 'schema_ready:%'",
+                [],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO store_migrations(name)
+                 SELECT ?1 || (SELECT count(*) FROM session_trajectory_migrations)",
+                [marker_prefix],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)
     }
 
     /// Creates or upgrades the schema required by this store.
@@ -8072,6 +8312,7 @@ impl TrajectorySearchSnapshot<'_> {
             Some(&eligibility_json),
             scoped_json.as_deref(),
             (!aliases.is_empty()).then_some(aliases),
+            true,
         )
     }
     fn search_session_trajectory_page_with_eligibility(
@@ -8081,6 +8322,7 @@ impl TrajectorySearchSnapshot<'_> {
         eligibility_json: Option<&str>,
         scoped_json: Option<&str>,
         aliases: Option<&[&CachedDatabaseAliasSource]>,
+        include_snippets: bool,
     ) -> Result<SessionTrajectorySearchPage> {
         let clauses = trajectory_clauses(query);
         if clauses.is_empty() || limit == 0 {
@@ -8088,14 +8330,23 @@ impl TrajectorySearchSnapshot<'_> {
         }
         let limit = limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT);
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let statement_sql =
-            trajectory_search_page_sql(&clauses, scoped_json.is_some(), aliases.is_some());
+        let connection = self.connection;
+        let state = SearchTableState::read(connection)?;
+        let has_eligibility = eligibility_json.is_some();
+        let statement_sql = trajectory_search_page_sql(
+            &clauses,
+            has_eligibility,
+            scoped_json.is_some(),
+            aliases.is_some(),
+            state,
+        );
         let mut parameters = clauses
             .iter()
             .map(|clause| SqlValue::Text(clause.match_expression.clone()))
             .collect::<Vec<_>>();
-        parameters
-            .push(eligibility_json.map_or(SqlValue::Null, |json| SqlValue::Text(json.to_owned())));
+        if let Some(json) = eligibility_json {
+            parameters.push(SqlValue::Text(json.to_owned()));
+        }
         parameters.push(SqlValue::Integer(query_limit));
         parameters.extend(
             clauses
@@ -8114,8 +8365,9 @@ impl TrajectorySearchSnapshot<'_> {
                 serde_json::to_string(&aliases).map_err(|_| StoreError::CorruptStore)?,
             ));
         }
-        let connection = self.connection;
-        let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
+        let mut statement = connection
+            .prepare_cached(&statement_sql)
+            .map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
                 let provider = row
@@ -8151,7 +8403,11 @@ impl TrajectorySearchSnapshot<'_> {
             .map_err(|_| StoreError::CorruptStore)?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
-        let matches = with_trajectory_excerpts(connection, &clauses, rows)?;
+        let matches = if include_snippets {
+            with_trajectory_excerpts(connection, &clauses, rows)?
+        } else {
+            rows.into_iter().map(|(item, _, _)| item).collect()
+        };
         Ok(SessionTrajectorySearchPage { matches, has_more })
     }
 }
@@ -8171,6 +8427,14 @@ fn reject_symlink(path: &Path) -> Result<()> {
 fn set_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    let mode = fs::metadata(path)
+        .map_err(|_| filesystem_error())?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if mode == 0o700 {
+        return Ok(());
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| filesystem_error())
 }
 
@@ -8187,6 +8451,14 @@ fn set_private_directory(path: &Path) -> Result<()> {
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    let mode = fs::metadata(path)
+        .map_err(|_| filesystem_error())?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if mode == 0o600 {
+        return Ok(());
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| filesystem_error())
 }
 
@@ -8255,17 +8527,21 @@ fn empty_trajectory_search_page() -> SessionTrajectorySearchPage {
 
 /// Builds one ranked page statement.
 ///
-/// Parameters are `?1..?N` FTS expressions, `?N+1` eligibility JSON, `?N+2` limit, then one folded
-/// phrase per exact clause, in clause order. Rows end with the snippet's chunk ID and clause index.
-/// Exact clauses filter candidate chunks with [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet
-/// empty for the caller to cut around the phrase.
+/// Parameters are `?1..?N` FTS expressions, optional eligibility JSON when `has_eligibility` is
+/// set, limit, then one folded phrase per exact clause, in clause order. Rows end with the
+/// snippet's chunk ID and clause index. Exact clauses filter candidate chunks with
+/// [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet empty for the caller to cut around the
+/// phrase.
 fn trajectory_search_page_sql(
     clauses: &[TrajectoryClause],
+    has_eligibility: bool,
     scoped: bool,
     projected: bool,
+    state: SearchTableState,
 ) -> String {
-    let eligibility_parameter = clauses.len() + 1;
-    let limit_parameter = clauses.len() + 2;
+    debug_assert!(has_eligibility || (!scoped && !projected));
+    let eligibility_parameter = has_eligibility.then_some(clauses.len() + 1);
+    let limit_parameter = clauses.len() + if has_eligibility { 2 } else { 1 };
     let mut exact_parameter = limit_parameter;
     let exact_filters = clauses
         .iter()
@@ -8277,7 +8553,7 @@ fn trajectory_search_page_sql(
             format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
         })
         .collect::<Vec<_>>();
-    let mut eligible = trajectory_search_eligibility_sql(eligibility_parameter, projected);
+    let mut eligible = trajectory_search_eligibility_sql(eligibility_parameter, projected, state);
     let documents = if projected {
         let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
         let parameter = exact_parameter + 2;
@@ -8329,8 +8605,10 @@ fn trajectory_search_page_sql(
             clause,
             &exact_filters[0],
             limit_parameter,
+            has_eligibility,
             scoped,
             documents,
+            state,
         )
     } else {
         multi_clause_page_sql(
@@ -8338,46 +8616,81 @@ fn trajectory_search_page_sql(
             clauses,
             &exact_filters,
             limit_parameter,
+            has_eligibility,
             scoped,
             documents,
+            state,
         )
     }
 }
 
-fn trajectory_search_eligibility_sql(eligibility_parameter: usize, projected: bool) -> String {
-    let primary = if projected {
-        "direct_primary"
+fn trajectory_search_eligibility_sql(
+    eligibility_parameter: Option<usize>,
+    projected: bool,
+    state: SearchTableState,
+) -> String {
+    let mut sql = String::from("WITH ");
+    if let Some(parameter) = eligibility_parameter {
+        let primary = if projected {
+            "direct_primary"
+        } else {
+            "eligible"
+        };
+        // The dead `UNION ALL ... WHERE 0` arm keeps SQLite from assuming `json_each` has only
+        // a handful of rows, so it builds a bloom filter and automatic covering index on `eligible`
+        // instead of scanning it linearly per FTS5 hit.
+        write!(
+            sql,
+            "{primary}(provider, session_id, file, contents) AS MATERIALIZED (
+                 SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                        json_extract(value, '$[2]'), json_extract(value, '$[3]')
+                 FROM json_each(?{parameter})
+                 UNION ALL
+                 SELECT provider, session_id, NULL, NULL FROM session_trajectories WHERE 0
+             ),"
+        )
+        .expect("writing SQL into a string cannot fail");
+    }
+    if state.has_physical_gaps {
+        sql.push_str(
+            " physical_gaps(id) AS (
+                  SELECT t.id FROM physical_database_body_reads w
+                  JOIN session_trajectories t ON (t.provider,t.session_id,t.source_file_id,t.source_contents_id,t.content_hash)
+                       =(w.provider,w.session_id,w.source_file,w.source_contents,w.content_hash)
+                  JOIN native_search_document_homes h ON h.trajectory_id=t.id AND h.verification=1
+                       AND (h.source_home,h.source_file)=(w.source_home,w.source_file)
+                  WHERE w.incomplete_contents=w.observed_contents
+                  UNION ALL
+                  SELECT -s.id FROM physical_database_body_reads w JOIN scoped_native_documents s
+                       USING(provider,session_id,source_home,source_file,source_contents)
+                  WHERE w.incomplete_contents=w.observed_contents
+              ),",
+        );
+    }
+    let trajectory_source = state.trajectory_source_sql();
+    let (coverage_columns, gap_join) = if state.has_antigravity_gaps || state.has_gap_projections {
+        (SEARCH_COVERAGE_COLUMNS, SEARCH_GAP_JOIN)
     } else {
-        "eligible"
+        (
+            "trajectories.source_complete, trajectories.complete, trajectories.indexed_byte_count, trajectories.source_byte_count, trajectories.truncation_strategy",
+            "",
+        )
     };
-    format!(
-        "WITH {primary}(provider, session_id, file, contents) AS (
-             SELECT provider, session_id, NULL, NULL FROM visible_trajectories
-             WHERE ?{eligibility_parameter} IS NULL
-             UNION ALL
-             SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
-                    json_extract(value, '$[2]'), json_extract(value, '$[3]')
-             FROM json_each(?{eligibility_parameter})
-             WHERE ?{eligibility_parameter} IS NOT NULL
-         ),
-         physical_gaps(id) AS (
-             SELECT t.id FROM physical_database_body_reads w
-             JOIN session_trajectories t ON (t.provider,t.session_id,t.source_file_id,t.source_contents_id,t.content_hash)
-                  =(w.provider,w.session_id,w.source_file,w.source_contents,w.content_hash)
-             JOIN native_search_document_homes h ON h.trajectory_id=t.id AND h.verification=1
-                  AND (h.source_home,h.source_file)=(w.source_home,w.source_file)
-             WHERE w.incomplete_contents=w.observed_contents
-             UNION ALL
-             SELECT -s.id FROM physical_database_body_reads w JOIN scoped_native_documents s
-                  USING(provider,session_id,source_home,source_file,source_contents)
-             WHERE w.incomplete_contents=w.observed_contents
-         ),
-         current_primary(id,provider,session_id,source_complete,complete,indexed_byte_count,source_byte_count,truncation_strategy,source_updated_at) AS (
-             SELECT trajectories.id, trajectories.provider, trajectories.session_id,
-                    {SEARCH_COVERAGE_COLUMNS}, trajectories.source_updated_at
-             FROM visible_trajectories trajectories {SEARCH_GAP_JOIN}
-         ),"
+    let extra_where = if state.has_pi {
+        String::new()
+    } else {
+        format!(" WHERE {}", state.direct_trajectory_filter_sql())
+    };
+    write!(
+        sql,
+        " current_primary(id,provider,session_id,source_complete,complete,indexed_byte_count,source_byte_count,truncation_strategy,source_updated_at) AS (
+              SELECT trajectories.id, trajectories.provider, trajectories.session_id,
+                     {coverage_columns}, trajectories.source_updated_at
+              FROM {trajectory_source} trajectories {gap_join}{extra_where}
+          ),"
     )
+    .expect("writing SQL into a string cannot fail");
+    sql
 }
 
 // Excerpts tokenize whole chunks, so they are built for delivered rows only. FTS5 snippet() can
@@ -8388,6 +8701,9 @@ fn with_trajectory_excerpts(
     clauses: &[TrajectoryClause],
     rows: Vec<(SessionTrajectoryMatch, i64, i64)>,
 ) -> Result<Vec<SessionTrajectoryMatch>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut delivered = Vec::with_capacity(rows.len());
     for (trajectory_match, chunk_id, clause_index) in rows {
         let (clause_index, clause) = usize::try_from(clause_index)
@@ -8396,27 +8712,37 @@ fn with_trajectory_excerpts(
             .ok_or(StoreError::CorruptStore)?;
         delivered.push((trajectory_match, chunk_id, clause_index, clause));
     }
-    // One full-text scan per clause, because a MATCH per row re-seeks every index segment.
-    let mut fts_snippet = connection
-        .prepare(&format!(
-            "SELECT rowid, {FTS_SNIPPET} FROM session_trajectory_chunks_fts
-             WHERE session_trajectory_chunks_fts MATCH ?1
-               AND +rowid IN (SELECT value FROM json_each(?2))"
-        ))
-        .map_err(database_error)?;
     let mut fts_snippets = std::collections::HashMap::new();
+    let mut fts_snippet = clauses
+        .iter()
+        .any(|clause| clause.exact_phrase.is_none())
+        .then(|| {
+            connection.prepare_cached(&format!(
+                "SELECT rowid, {FTS_SNIPPET} FROM session_trajectory_chunks_fts
+                 WHERE session_trajectory_chunks_fts MATCH ?1
+                   AND +rowid IN (SELECT value FROM json_each(?2))"
+            ))
+        })
+        .transpose()
+        .map_err(database_error)?;
     for (clause_index, clause) in clauses.iter().enumerate() {
+        if clause.exact_phrase.is_some() {
+            continue;
+        }
         let chunk_ids = delivered
             .iter()
             .filter(|(_, _, index, _)| *index == clause_index)
             .map(|(_, chunk_id, _, _)| *chunk_id)
             .collect::<Vec<_>>();
-        if clause.exact_phrase.is_some() || chunk_ids.is_empty() {
+        if chunk_ids.is_empty() {
             continue;
         }
+        let Some(statement) = fts_snippet.as_mut() else {
+            continue;
+        };
         let chunk_ids = serde_json::to_string(&chunk_ids)
             .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
-        let mut snippets = fts_snippet
+        let mut snippets = statement
             .query(rusqlite::params![clause.match_expression, chunk_ids])
             .map_err(database_error)?;
         while let Some(row) = snippets.next().map_err(database_error)? {
@@ -8429,8 +8755,9 @@ fn with_trajectory_excerpts(
         .iter()
         .any(|clause| clause.exact_phrase.is_some())
         .then(|| {
-            connection
-                .prepare("SELECT stored_text FROM session_trajectory_chunk_rows WHERE id = ?1 UNION ALL SELECT stored_text FROM scoped_native_chunk_rows WHERE id = -?1")
+            connection.prepare_cached(
+                "SELECT stored_text FROM session_trajectory_chunk_rows WHERE id = ?1 UNION ALL SELECT stored_text FROM scoped_native_chunk_rows WHERE id = -?1",
+            )
         })
         .transpose()
         .map_err(database_error)?;
@@ -8460,6 +8787,10 @@ const PHYSICAL_COVERAGE_COLUMNS: &str = "trajectories.source_complete AND loss.i
     trajectories.complete AND loss.id IS NULL, trajectories.indexed_byte_count, trajectories.source_byte_count,
     CASE WHEN loss.id IS NULL THEN trajectories.truncation_strategy ELSE 'source_incomplete' END";
 
+const DIRECT_COVERAGE_COLUMNS: &str = "trajectories.source_complete,
+    trajectories.complete, trajectories.indexed_byte_count, trajectories.source_byte_count,
+    trajectories.truncation_strategy";
+
 const SEARCH_GAP_JOIN: &str = "LEFT JOIN antigravity_search_gaps gap
     ON gap.trajectory_id=trajectories.id AND gap.source_file=trajectories.source_file_id
     AND gap.indexed_contents=trajectories.source_contents_id AND gap.indexed_hash=trajectories.content_hash
@@ -8478,14 +8809,17 @@ fn matching_chunks_sql(
     clause: &TrajectoryClause,
     parameter: usize,
     exact_filter: &str,
+    has_eligibility: bool,
     scoped: bool,
+    state: SearchTableState,
 ) -> String {
-    let primary = trajectory_candidate_chunks_sql(clause);
+    let primary = trajectory_candidate_chunks_sql(clause, has_eligibility, state)
+        .replace("{param}", &parameter.to_string())
+        .replace("{exact}", exact_filter);
     let mut sql = format!(
         "SELECT chunks.id AS chunk_id, chunks.trajectory_id, chunks.chunk_index,
                 session_trajectory_chunks_fts.rank AS match_rank
-         {primary}
-         WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
+         {primary}"
     );
     if scoped {
         write!(sql,
@@ -8500,15 +8834,19 @@ fn matching_chunks_sql(
     sql
 }
 
+#[allow(clippy::too_many_arguments)]
 fn single_clause_page_sql(
     mut sql: String,
     clause: &TrajectoryClause,
     exact_filter: &str,
     limit_parameter: usize,
+    has_eligibility: bool,
     scoped: bool,
     documents: &str,
+    state: SearchTableState,
 ) -> String {
-    let candidates = matching_chunks_sql(clause, 1, exact_filter, scoped);
+    let candidates = matching_chunks_sql(clause, 1, exact_filter, has_eligibility, scoped, state);
+    let (coverage_cols, loss_join) = physical_coverage_sql(state.has_physical_gaps, "id");
     write!(
         sql,
         "ranked_chunks AS (
@@ -8520,11 +8858,11 @@ fn single_clause_page_sql(
              FROM ({candidates})
          )
          SELECT trajectories.provider, trajectories.session_id,
-                {PHYSICAL_COVERAGE_COLUMNS}, ranked_chunks.chunk_id, 0
+                {coverage_cols}, ranked_chunks.chunk_id, 0
          FROM ranked_chunks
          INNER JOIN {documents} AS trajectories
              ON trajectories.id = ranked_chunks.trajectory_id
-         LEFT JOIN physical_gaps loss ON loss.id=trajectories.id
+         {loss_join}
          WHERE chunk_rank = 1
          ORDER BY match_rank, trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id
@@ -8534,13 +8872,27 @@ fn single_clause_page_sql(
     sql
 }
 
+fn physical_coverage_sql(has_physical_gaps: bool, id_column: &str) -> (&'static str, String) {
+    if has_physical_gaps {
+        (
+            PHYSICAL_COVERAGE_COLUMNS,
+            format!("LEFT JOIN physical_gaps loss ON loss.id=trajectories.{id_column}"),
+        )
+    } else {
+        (DIRECT_COVERAGE_COLUMNS, String::new())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn multi_clause_page_sql(
     mut sql: String,
     clauses: &[TrajectoryClause],
     exact_filters: &[String],
     limit_parameter: usize,
+    has_eligibility: bool,
     scoped: bool,
     documents: &str,
+    state: SearchTableState,
 ) -> String {
     let clause_count = clauses.len();
     sql.push_str(
@@ -8561,7 +8913,14 @@ fn multi_clause_page_sql(
         }
         let parameter = clause_index + 1;
         let exact_clause = i32::from(clause.exact_phrase.is_some());
-        let candidates = matching_chunks_sql(clause, parameter, exact_filter, scoped);
+        let candidates = matching_chunks_sql(
+            clause,
+            parameter,
+            exact_filter,
+            has_eligibility,
+            scoped,
+            state,
+        );
         write!(
             sql,
             "SELECT trajectory_id, {projection}, chunk_id, {clause_index}, match_rank, {exact_clause}
@@ -8569,27 +8928,36 @@ fn multi_clause_page_sql(
         )
         .expect("writing SQL into a string cannot fail");
     }
+    let (coverage_cols, loss_join) =
+        physical_coverage_sql(state.has_physical_gaps, "trajectory_id");
     write!(
         sql,
         "),
-         best_clause_matches AS (
-             SELECT clause_matches.*,
-                    row_number() OVER (
-                        PARTITION BY trajectory_id, legacy_projection, clause_index
-                        ORDER BY clause_rank, chunk_id
-                    ) AS clause_rank_order
-             FROM clause_matches
+         best_clause_matches AS MATERIALIZED (
+             SELECT trajectory_id, legacy_projection, chunk_id, clause_index, clause_rank, exact_clause
+             FROM (
+                 SELECT clause_matches.*,
+                        row_number() OVER (
+                            PARTITION BY trajectory_id, legacy_projection, clause_index
+                            ORDER BY clause_rank, chunk_id
+                        ) AS clause_rank_order
+                 FROM clause_matches
+             )
+             WHERE clause_rank_order = 1
          ),
          qualified_projections AS (
              SELECT trajectory_id, legacy_projection, sum(clause_rank) AS trajectory_rank,
                     row_number() OVER (PARTITION BY trajectory_id ORDER BY sum(clause_rank), legacy_projection) AS projection_rank
              FROM best_clause_matches
-             WHERE clause_rank_order = 1
              GROUP BY trajectory_id, legacy_projection
              HAVING count(*) = {clause_count}
          ),
-         ranked_trajectories AS (
-             SELECT qualified_projections.trajectory_id, qualified_projections.legacy_projection, trajectories.provider,
+         ranked_trajectories AS MATERIALIZED (
+             SELECT qualified_projections.trajectory_id, qualified_projections.legacy_projection,
+                    trajectories.provider, trajectories.session_id,
+                    trajectories.source_complete, trajectories.complete,
+                    trajectories.indexed_byte_count, trajectories.source_byte_count,
+                    trajectories.truncation_strategy, trajectories.source_updated_at,
                     qualified_projections.trajectory_rank
              FROM qualified_projections
              INNER JOIN {documents} AS trajectories
@@ -8607,19 +8975,17 @@ fn multi_clause_page_sql(
                         ORDER BY exact_clause DESC, clause_rank, clause_index, chunk_id
                     ) AS snippet_rank
              FROM best_clause_matches
-             WHERE clause_rank_order = 1 AND (trajectory_id, legacy_projection) IN (SELECT trajectory_id, legacy_projection FROM ranked_trajectories)
+             WHERE (trajectory_id, legacy_projection) IN (SELECT trajectory_id, legacy_projection FROM ranked_trajectories)
          )
          SELECT trajectories.provider, trajectories.session_id,
-                {PHYSICAL_COVERAGE_COLUMNS},
+                {coverage_cols},
                 best_snippets.chunk_id, best_snippets.clause_index
-         FROM ranked_trajectories
+         FROM ranked_trajectories AS trajectories
          INNER JOIN best_snippets
-             ON best_snippets.trajectory_id = ranked_trajectories.trajectory_id
+             ON best_snippets.trajectory_id = trajectories.trajectory_id
             AND best_snippets.snippet_rank = 1
-         INNER JOIN {documents} AS trajectories
-             ON trajectories.id = ranked_trajectories.trajectory_id AND trajectories.provider=ranked_trajectories.provider
-         LEFT JOIN physical_gaps loss ON loss.id=trajectories.id
-         ORDER BY ranked_trajectories.trajectory_rank,
+         {loss_join}
+         ORDER BY trajectories.trajectory_rank,
                   trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id"
     )
@@ -24232,5 +24598,29 @@ mod tests {
                 .unwrap(),
             vec![session]
         );
+    }
+
+    #[test]
+    fn reopened_current_store_installs_codex_display_upgrade_trigger() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("store.sqlite3");
+        {
+            let store = Store::open(&path).unwrap();
+            assert!(store.schema_is_current().unwrap());
+        }
+        let reopened = Store::open(&path).unwrap();
+        let has_trigger: bool = reopened
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_temp_master
+                     WHERE type = 'trigger' AND name = 'refresh_codex_display_workspace'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_trigger);
     }
 }

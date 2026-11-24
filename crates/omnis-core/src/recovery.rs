@@ -218,10 +218,12 @@ pub fn write_recovery_handoff(
         } else {
             continue;
         };
-        for active in super::codex_replies::previous_spellings(snapshot, event) {
-            block.clear();
-            quote_untrusted(&mut block, &redact_secrets(active));
-            writeln!(output, "### Restored Codex reply (Assistant)\n\n{block}")?;
+        if let Some(previous) = super::codex_replies::previous_spellings(snapshot, event) {
+            for active in previous {
+                block.clear();
+                quote_untrusted(&mut block, &redact_secrets(active));
+                writeln!(output, "### Restored Codex reply (Assistant)\n\n{block}")?;
+            }
         }
         block.clear();
         quote_untrusted(&mut block, &text);
