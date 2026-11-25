@@ -223,9 +223,25 @@ pub(crate) fn temporary_home() -> std::io::Result<tempfile::TempDir> {
     tempfile::tempdir()
 }
 
+/// Lets Codex authentication commands find the login keychain, which macOS locates through HOME.
+/// Without the link, macOS shows a "Keychain Not Found" dialog and each import asks for a login.
+#[cfg(target_os = "macos")]
+fn link_login_keychains(home: &Path, source_home: &Path) {
+    let keychains = home.join("Library/Keychains");
+    let library = source_home.join("Library");
+    if keychains.is_absolute() && keychains.is_dir() && fs::create_dir_all(&library).is_ok() {
+        // The import can still succeed without the link when Codex has its own credentials.
+        let _ = std::os::unix::fs::symlink(keychains, library.join("Keychains"));
+    }
+}
+
 pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<SessionRef> {
     ensure_supported(binary)?;
     let source_home = temporary_home().context("creating isolated Codex import source")?;
+    #[cfg(target_os = "macos")]
+    if let Some(home) = env::var_os("HOME").filter(|home| !home.is_empty()) {
+        link_login_keychains(Path::new(&home), source_home.path());
+    }
     let source_path = write_external_session(source_home.path(), cwd, import)?;
     let codex_home = &import.home;
     if env::var_os("CODEX_HOME").is_none_or(|path| path.is_empty()) && !codex_home.is_dir() {
@@ -925,6 +941,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn import_home_shares_keychains_and_cleanup_keeps_them() {
+        let home = tempfile::tempdir().unwrap();
+        let keychain = home.path().join("Library/Keychains/login.keychain-db");
+        fs::create_dir_all(keychain.parent().unwrap()).unwrap();
+        fs::write(&keychain, "synthetic").unwrap();
+        let source_home = temporary_home().unwrap();
+        let linked = source_home
+            .path()
+            .join("Library/Keychains/login.keychain-db");
+
+        link_login_keychains(home.path(), source_home.path());
+        assert_eq!(fs::read_to_string(&linked).unwrap(), "synthetic");
+
+        source_home.close().unwrap();
+        assert!(!linked.exists());
+        assert_eq!(fs::read_to_string(&keychain).unwrap(), "synthetic");
+    }
 
     #[test]
     fn visible_import_marker_cannot_replace_a_missing_reply() {
