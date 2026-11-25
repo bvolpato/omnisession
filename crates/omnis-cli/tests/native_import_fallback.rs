@@ -1767,18 +1767,18 @@ fn failed_import_asks_before_falling_back_when_someone_can_answer() {
 fn forking_in_the_source_agent_does_not_inherit_the_target_mode() {
     use std::os::unix::fs::PermissionsExt;
 
-    let args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "codex"]);
+    let args = strings(&["fork", &format!("claude:{SOURCE_ID}"), "--in", "codex"]);
     let fixture = Fixture::new();
     let claude = fixture.root.join("claude-launcher");
     let log = fixture.capture.join("claude-args");
     fs::write(
         &claude,
-        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)';; --help) echo '  --dangerously-skip-permissions  Bypass all permission checks';; *) echo \"$*\" > \"$FAKE_CLAUDE_LOG\";; esac\n",
+        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)';; --help) printf '%s\\n' '  --dangerously-skip-permissions  Bypass all permission checks' '  --model <model>  Model';; *) echo \"$*\" > \"$FAKE_CLAUDE_LOG\";; esac\n",
     )
     .expect("write synthetic Claude");
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("Claude mode");
     let mut yolo = args.clone();
-    yolo.extend(strings(&["--mode", "yolo"]));
+    yolo.extend(strings(&["--mode", "yolo", "--model", "synthetic-codex"]));
     let run = fixture.run_answering(
         &yolo,
         &[
@@ -1786,7 +1786,7 @@ fn forking_in_the_source_agent_does_not_inherit_the_target_mode() {
             ("FAKE_CLAUDE_LOG", log.to_str().expect("UTF-8 path")),
             (
                 "FAKE_CODEX_HELP",
-                "  --dangerously-bypass-approvals-and-sandbox  Skip all prompts",
+                "  --dangerously-bypass-approvals-and-sandbox  Skip all prompts\n  -m, --model <MODEL>  Model",
             ),
         ],
         "f\n",
@@ -1811,7 +1811,7 @@ fn forking_in_the_source_agent_does_not_inherit_the_target_mode() {
     assert_eq!(
         fs::read_to_string(&log).expect("Claude launch").trim(),
         format!("--resume {SOURCE_ID} --fork-session"),
-        "a mode chosen for Codex must not follow the fork into Claude"
+        "a mode or model chosen for Codex must not follow the fork into Claude"
     );
     assert_eq!(fixture.launch_arguments(), None, "fork launched Codex too");
 }
@@ -1875,6 +1875,89 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
         let handoff = prompt.split('`').nth(1).expect("handoff path");
         assert!(Path::new(handoff).is_file(), "{label}: {prompt}");
     }
+}
+
+#[test]
+fn fork_model_reaches_the_launch_or_stops_before_the_import() {
+    if !tools_available() {
+        return;
+    }
+    let args = strings(&[
+        "fork",
+        &format!("claude:{SOURCE_ID}"),
+        "--in",
+        "codex",
+        "--mode",
+        "auto",
+        "--model",
+        "synthetic/model[1m]",
+    ]);
+    let auto = "      --approve-for-me  Route approval requests through automatic review";
+
+    let fixture = Fixture::new();
+    let help = format!("{auto}\n  -m, --model <MODEL>\n          Model the agent should use");
+    let run = fixture.run(&args, &[("FAKE_CODEX_HELP", &help)]);
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("Codex model: synthetic/model[1m]."),
+        "{}",
+        run.stderr
+    );
+    let arguments = fixture.launch_arguments().expect("Codex launch");
+    fixture.codex_handoff_prompt(
+        &arguments,
+        &["--approve-for-me", "--model", "synthetic/model[1m]"],
+    );
+
+    let fixture = Fixture::new();
+    let run = fixture.run(
+        &args,
+        &[
+            ("FAKE_CODEX_HELP", &help),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let arguments = fixture.launch_arguments().expect("imported Codex launch");
+    assert_eq!(
+        arguments[..3],
+        ["--approve-for-me", "--model", "synthetic/model[1m]"]
+    );
+    assert_eq!(arguments[arguments.len() - 2..], ["resume", THREAD_ID]);
+
+    // Starting with another model is the mistake that the option exists to prevent.
+    let fixture = Fixture::new();
+    let run = fixture.run(&args, &[("FAKE_CODEX_HELP", auto)]);
+    assert!(!run.status.success());
+    assert!(
+        run.stderr.contains("does not list `--model`"),
+        "{}",
+        run.stderr
+    );
+    assert!(fixture.rpc_log().is_empty());
+    assert_eq!(fixture.launch_arguments(), None);
+
+    // A repeated option can fail the launch after the import, or keep the model of the profile.
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        "[profiles.local]\nagent = 'codex'\nargs = ['-m', 'profile-model']\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut profiled = args;
+    profiled[3] = "local".to_owned();
+    let run = fixture.run(&profiled, &[("FAKE_CODEX_HELP", &help)]);
+    assert!(!run.status.success());
+    assert!(
+        run.stderr
+            .contains("launch profile `local` already sets a model"),
+        "{}",
+        run.stderr
+    );
+    assert!(fixture.rpc_log().is_empty());
 }
 
 #[cfg(unix)]
