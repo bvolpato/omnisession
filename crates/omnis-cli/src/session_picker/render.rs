@@ -1269,7 +1269,10 @@ pub(super) fn selected_detail_lines(
             );
         }
         Some(PreviewValue::Unavailable) => {
-            lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
+            lines.push(detail_line(
+                unavailable_preview_message(entry),
+                DetailStyle::Muted,
+            ));
         }
         None => lines.push(detail_line("Loading selected session…", DetailStyle::Muted)),
     }
@@ -1290,6 +1293,18 @@ pub(super) fn selected_detail_lines(
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     append_full_workspace_details(&mut lines, &location, entry, width, true);
     lines
+}
+
+fn unavailable_preview_message(entry: &PickerEntry) -> &'static str {
+    if entry.session.session.provider == Provider::Antigravity
+        && entry.session.source_path.is_none()
+        && entry.session.event_count > 0
+        && !entry.cached
+    {
+        "Preview unavailable (local Antigravity history files are missing or unreadable)"
+    } else {
+        "Preview unavailable"
+    }
 }
 
 fn session_activity_line(entry: &PickerEntry, preview: Option<&PreviewValue>) -> DetailLine {

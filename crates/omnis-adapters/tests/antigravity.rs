@@ -977,3 +977,171 @@ fn skipped_final_record_contributes_one_omission_and_search_checks_its_contents(
         }
     }
 }
+
+#[test]
+fn zero_and_stale_summary_timestamps_use_selected_history_time() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    transcript(root.path());
+    let path = root
+        .path()
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs/transcript_full.jsonl")
+        .canonicalize()
+        .unwrap();
+    let file_time: chrono::DateTime<chrono::Utc> =
+        fs::metadata(&path).unwrap().modified().unwrap().into();
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+
+    // Go's zero time.Time{} must be treated as unset, falling back to file mtime.
+    catalog
+        .execute(
+            "UPDATE conversation_summaries SET last_modified_time = '0001-01-01 00:00:00+00:00'",
+            [],
+        )
+        .unwrap();
+    let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+    assert_eq!(listed.updated_at, Some(file_time));
+    assert!(listed.updated_at_approximate);
+    let snapshot = adapter.read_session(&session).unwrap();
+    assert_eq!(snapshot.captured_at, file_time);
+    assert_eq!(
+        adapter.search_source_time(&snapshot, Some(&path)).unwrap(),
+        file_time
+    );
+
+    // Stale summary last_modified_time must not hide a newer transcript mtime.
+    catalog
+        .execute(
+            "UPDATE conversation_summaries SET last_modified_time = '2020-01-01 00:00:00+00:00'",
+            [],
+        )
+        .unwrap();
+    let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+    assert_eq!(listed.updated_at, Some(file_time));
+    assert!(listed.updated_at_approximate);
+    let snapshot = adapter.read_session(&session).unwrap();
+    assert_eq!(snapshot.captured_at, file_time);
+    assert_eq!(
+        adapter.search_source_time(&snapshot, Some(&path)).unwrap(),
+        file_time
+    );
+}
+
+#[test]
+fn preview_column_provides_fallback_title_when_title_is_empty() {
+    let root = tempdir().unwrap();
+    let db = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            step_count INTEGER NOT NULL DEFAULT 0,
+            last_modified_time DATETIME NOT NULL,
+            workspace_uris TEXT NOT NULL
+        );",
+    )
+    .unwrap();
+    let other_id = "22222222-2222-4222-8222-222222222222";
+    db.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, '', 'Line one\n  line two', 0, '2026-07-28T12:00:00Z', '[]')",
+        [SESSION_ID],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, 'Explicit title', 'Ignored preview', 0, '2026-07-28T12:00:00Z', '[]')",
+        [other_id],
+    )
+    .unwrap();
+
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let first = adapter
+        .find_native_session(SESSION_ID)
+        .unwrap()
+        .expect("untitled session");
+    let second = adapter
+        .find_native_session(other_id)
+        .unwrap()
+        .expect("titled session");
+    assert_eq!(first.title.as_deref(), Some("Line one line two"));
+    assert_eq!(second.title.as_deref(), Some("Explicit title"));
+}
+
+#[test]
+fn planner_metadata_and_error_message_records_are_preserved() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let logs = root
+        .path()
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let lines = [
+        json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-07-28T11:59:00Z",
+            "content": "<USER_REQUEST>\nProfile session\n</USER_REQUEST>"
+        }),
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-07-28T11:59:01Z",
+            "model": "gemini-synthetic-pro",
+            "input_tokens": 1000,
+            "cache_read_tokens": 500,
+            "output_tokens": 200,
+            "content": "First reply"
+        }),
+        json!({
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-07-28T11:59:02Z",
+            "model": "gemini-synthetic-pro",
+            "input_tokens": 300,
+            "cache_read_tokens": 1700,
+            "output_tokens": 100,
+            "content": "Second reply"
+        }),
+        json!({
+            "step_index": 3,
+            "type": "ERROR_MESSAGE",
+            "status": "ERROR",
+            "created_at": "2026-07-28T11:59:03Z",
+            "error": "rate limit exceeded",
+            "content": "retrying request"
+        }),
+    ];
+    fs::write(
+        logs.join("transcript_full.jsonl"),
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::Antigravity, SESSION_ID))
+        .unwrap();
+    let preview = omnis_core::session_preview(&snapshot);
+    assert_eq!(preview.model.as_deref(), Some("gemini-synthetic-pro"));
+    assert_eq!(preview.total_tokens, Some(3_800));
+    let error_event = snapshot
+        .events
+        .iter()
+        .find(|event| event.source.raw_record_type.as_deref() == Some("ERROR_MESSAGE"))
+        .expect("preserved ERROR_MESSAGE event");
+    assert_eq!(error_event.payload["error"], "rate limit exceeded");
+    assert_eq!(error_event.payload["content"], "retrying request");
+}

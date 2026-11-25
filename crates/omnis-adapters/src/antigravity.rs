@@ -373,7 +373,7 @@ impl AntigravityAdapter {
             );
             verify_empty_history_sources(self.root()?, &session.id, &path)?;
         }
-        let snapshot = summary.snapshot(session, builder);
+        let snapshot = summary.snapshot_for_source(session, builder, Some(&path));
         let unverified_database =
             database_notices(&snapshot).any(|notice| notice["native_history_unverified"] == true);
         Ok(ObservedHistory {
@@ -770,10 +770,14 @@ impl ProviderAdapter for AntigravityAdapter {
             .summaries
             .read_snapshot(root, &database, |snapshot| {
                 let catalog_wal_verified = snapshot.verify_wal().is_ok();
-                let mut statement = snapshot.connection.prepare(
-                    "SELECT conversation_id, title, step_count, last_modified_time, workspace_uris \
-                     FROM conversation_summaries",
-                )?;
+                let query = if has_preview_column(&snapshot.connection)? {
+                    "SELECT conversation_id, title, step_count, last_modified_time, \
+                     workspace_uris, preview FROM conversation_summaries"
+                } else {
+                    "SELECT conversation_id, title, step_count, last_modified_time, \
+                     workspace_uris, '' FROM conversation_summaries"
+                };
+                let mut statement = snapshot.connection.prepare(query)?;
                 let rows = statement.query_map([], summary_from_row)?;
                 let mut sessions = Vec::new();
                 for row in rows {
@@ -818,14 +822,18 @@ impl ProviderAdapter for AntigravityAdapter {
         }
         self.summaries
             .read_snapshot(root, &database, |snapshot| {
+                let query = if has_preview_column(&snapshot.connection)? {
+                    "SELECT conversation_id, title, step_count, last_modified_time, \
+                     workspace_uris, preview FROM conversation_summaries \
+                     WHERE conversation_id = ?1"
+                } else {
+                    "SELECT conversation_id, title, step_count, last_modified_time, \
+                     workspace_uris, '' FROM conversation_summaries \
+                     WHERE conversation_id = ?1"
+                };
                 let Some(summary) = snapshot
                     .connection
-                    .query_row(
-                        "SELECT conversation_id, title, step_count, last_modified_time, \
-                         workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
-                        [id],
-                        summary_from_row,
-                    )
+                    .query_row(query, [id], summary_from_row)
                     .optional()?
                 else {
                     return Ok(None);
@@ -959,24 +967,30 @@ impl ProviderAdapter for AntigravityAdapter {
     ) -> Result<DateTime<Utc>> {
         validate_provider(&snapshot.session, Provider::Antigravity)?;
         let summary = self.summary(&snapshot.session.id)?;
-        if let Some(updated) = summary.updated_at {
-            ensure!(
-                updated == snapshot.captured_at,
-                "Antigravity summary changed during search read"
-            );
-            return Ok(updated);
-        }
         let current_source = self.source(&summary)?;
         ensure!(
             source_path.is_none_or(|listed| listed == current_source),
             "Antigravity history source changed during search read"
         );
-        Ok(if Self::is_summary_catalog(&current_source) {
-            DateTime::UNIX_EPOCH
-        } else {
-            history_file_time(&current_source)
-                .context("Antigravity history file time is unavailable")?
-        })
+        if Self::is_summary_catalog(&current_source) {
+            if let Some(updated) = summary.updated_at {
+                ensure!(
+                    updated == snapshot.captured_at,
+                    "Antigravity summary changed during search read"
+                );
+                return Ok(updated);
+            }
+            return Ok(DateTime::UNIX_EPOCH);
+        }
+        let (effective, _) = summary.effective_updated_at(Some(&current_source));
+        let updated = effective.context("Antigravity history file time is unavailable")?;
+        if summary.updated_at == Some(updated) {
+            ensure!(
+                updated == snapshot.captured_at,
+                "Antigravity summary changed during search read"
+            );
+        }
+        Ok(updated)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -1049,9 +1063,10 @@ impl ProviderAdapter for AntigravityAdapter {
             return result;
         }
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
-        let mut title = summary.snapshot(
+        let mut title = summary.snapshot_for_source(
             session,
             EventBuilder::new(Provider::Antigravity, &session.id),
+            Some(path),
         );
         let mut document = SearchDocumentBuilder::default();
         let mut gaps = DamagedRecordPositions::default();
@@ -1173,13 +1188,36 @@ struct Summary {
 }
 
 impl Summary {
-    fn snapshot(&self, session: &SessionRef, events: EventBuilder) -> CanonicalSnapshot {
+    fn effective_updated_at(&self, source_path: Option<&Path>) -> (Option<DateTime<Utc>>, bool) {
+        let file_time = source_path
+            .filter(|path| !AntigravityAdapter::is_summary_catalog(path))
+            .and_then(history_file_time);
+        match (self.updated_at, file_time) {
+            // Transcript flushes regularly land milliseconds after the summary row write; only
+            // flag the timestamp as approximate when the file mtime overrides a stale summary.
+            (Some(summary_time), Some(file_time)) => (
+                Some(summary_time.max(file_time)),
+                file_time.signed_duration_since(summary_time) > chrono::Duration::seconds(60),
+            ),
+            (Some(summary_time), None) => (Some(summary_time), false),
+            (None, Some(file_time)) => (Some(file_time), true),
+            (None, None) => (None, false),
+        }
+    }
+
+    fn snapshot_for_source(
+        &self,
+        session: &SessionRef,
+        events: EventBuilder,
+        source_path: Option<&Path>,
+    ) -> CanonicalSnapshot {
+        let (updated_at, _) = self.effective_updated_at(source_path);
         events.snapshot(
             session.clone(),
             nonempty(self.title.clone()),
             self.project_path.clone(),
             None,
-            self.updated_at.unwrap_or_else(Utc::now),
+            updated_at.unwrap_or_else(Utc::now),
         )
     }
 
@@ -1188,12 +1226,8 @@ impl Summary {
         source_path: Option<PathBuf>,
         source_revision: Option<SourceRevision>,
     ) -> NativeSession {
-        let updated_at = self.updated_at.or_else(|| {
-            source_path
-                .as_deref()
-                .filter(|p| !AntigravityAdapter::is_summary_catalog(p))
-                .and_then(history_file_time)
-        });
+        let (updated_at, updated_at_approximate) =
+            self.effective_updated_at(source_path.as_deref());
         NativeSession {
             session: SessionRef::new(Provider::Antigravity, self.id.clone()),
             title: nonempty(self.title.clone()),
@@ -1201,7 +1235,7 @@ impl Summary {
             git_branch: None,
             created_at: None,
             updated_at,
-            updated_at_approximate: self.updated_at.is_none() && updated_at.is_some(),
+            updated_at_approximate,
             event_count: self.step_count.unwrap_or(0),
             source_path,
             source_revision,
@@ -1508,16 +1542,37 @@ pub(super) fn history_file_time(path: &Path) -> Option<DateTime<Utc>> {
     fs::metadata(path).ok()?.modified().ok().map(DateTime::from)
 }
 
+fn has_preview_column(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(conversation_summaries)")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row
+            .get_ref(1)?
+            .as_str()
+            .is_ok_and(|name| name.eq_ignore_ascii_case("preview"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn summary_by_id(connection: &rusqlite::Connection, id: &str) -> Result<Summary> {
+    let query = if has_preview_column(connection)? {
+        "SELECT conversation_id, title, step_count, last_modified_time, \
+         workspace_uris, preview FROM conversation_summaries WHERE conversation_id = ?1"
+    } else {
+        "SELECT conversation_id, title, step_count, last_modified_time, \
+         workspace_uris, '' FROM conversation_summaries WHERE conversation_id = ?1"
+    };
     connection
-        .query_row(
-            "SELECT conversation_id, title, step_count, last_modified_time, \
-             workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
-            [id],
-            summary_from_row,
-        )
+        .query_row(query, [id], summary_from_row)
         .optional()?
         .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
+}
+
+fn collapse_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
@@ -1526,15 +1581,27 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
         .get::<_, i64>(2)
         .ok()
         .and_then(|n| usize::try_from(n).ok());
+    let raw_title: String = row.get(1)?;
+    let title = if raw_title.trim().is_empty() {
+        row.get::<_, String>(5)
+            .ok()
+            .map(|preview| collapse_single_line(&preview))
+            .filter(|preview| !preview.is_empty())
+            .unwrap_or(raw_title)
+    } else {
+        raw_title
+    };
     Ok(Summary {
         id: row.get(0)?,
-        title: row.get(1)?,
+        title,
         step_count,
         updated_at: row
             .get::<_, String>(3)
             .ok()
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-            .map(|value| value.with_timezone(&Utc)),
+            .map(|value| value.with_timezone(&Utc))
+            // Go's zero `time.Time{}` serializes as `0001-01-01 00:00:00+00:00`.
+            .filter(|value| *value > DateTime::UNIX_EPOCH),
         project_path: workspace_path(&workspace_uris),
     })
 }
@@ -1680,6 +1747,7 @@ fn push_transcript_record(
         "VIEW_FILE" | "READ_URL_CONTENT" | "READ_RESOURCE" => {
             push_historical(builder, record_type, status, timestamp, EventKind::FileRead);
         }
+        "ERROR_MESSAGE" => push_error_message(builder, record, status, timestamp),
         "" => {}
         _ => push_historical(
             builder,
@@ -1691,12 +1759,93 @@ fn push_transcript_record(
     }
 }
 
+fn push_error_message(
+    builder: &mut EventBuilder,
+    record: &Value,
+    status: &str,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let mut payload = json!({"status": status});
+    if let Some(error) = record
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        payload["error"] = json!(error);
+    }
+    if let Some(content) = record
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        payload["content"] = json!(content);
+    }
+    builder.push(
+        EventKind::ProviderEvent,
+        payload,
+        timestamp,
+        ReplayPolicy::HistoricalOnly,
+        Some("ERROR_MESSAGE".to_owned()),
+        None,
+    );
+}
+
+fn planner_session_metadata(record: &Value) -> Option<Value> {
+    let model = record
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let input = record.get("input_tokens").and_then(Value::as_u64);
+    let cache_read = record.get("cache_read_tokens").and_then(Value::as_u64);
+    let output = record.get("output_tokens").and_then(Value::as_u64);
+    let total_tokens = (input.is_some() || cache_read.is_some() || output.is_some())
+        .then(|| {
+            input
+                .unwrap_or(0)
+                .saturating_add(cache_read.unwrap_or(0))
+                .saturating_add(output.unwrap_or(0))
+        })
+        .filter(|total| *total > 0);
+    if model.is_none() && total_tokens.is_none() {
+        return None;
+    }
+    let mut payload = serde_json::Map::new();
+    if let Some(model) = model {
+        payload.insert("model".to_owned(), json!(model));
+    }
+    if let Some(total) = total_tokens {
+        payload.insert("total_tokens".to_owned(), json!(total));
+        payload.insert("token_usage".to_owned(), json!("incremental"));
+        if let Some(value) = input {
+            payload.insert("input_tokens".to_owned(), json!(value));
+        }
+        if let Some(value) = cache_read {
+            payload.insert("cache_read_tokens".to_owned(), json!(value));
+        }
+        if let Some(value) = output {
+            payload.insert("output_tokens".to_owned(), json!(value));
+        }
+    }
+    Some(Value::Object(payload))
+}
+
 fn push_planner_response(
     builder: &mut EventBuilder,
     open_calls: &mut TranscriptCalls,
     record: &Value,
     timestamp: Option<DateTime<Utc>>,
 ) {
+    if let Some(metadata) = planner_session_metadata(record) {
+        builder.push(
+            EventKind::ProviderEvent,
+            metadata,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.session_metadata".to_owned()),
+            None,
+        );
+    }
     if let Some(text) = record.get("content").and_then(Value::as_str) {
         builder.push(
             EventKind::MessageAssistant,

@@ -156,11 +156,12 @@ fn build_with_roots(
         .map(redact_secrets)
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| format!("Imported from {}", snapshot.session));
+    let summary_preview = summary_preview_text(&native_items, &summary_title);
     let annotation = build_title_annotation(&summary_title);
     let summary = SummaryRow {
         conversation_id: id.clone(),
         title: summary_title,
-        preview: String::new(),
+        preview: summary_preview,
         step_count: database.step_count,
         last_modified_time: timestamp.clone(),
         workspace_uris: serde_json::to_string(&[workspace_uri])?,
@@ -203,6 +204,35 @@ fn build_with_roots(
         summary,
         lock_root,
     })
+}
+
+fn summary_preview_text(items: &[NativeTrajectoryItem], fallback_title: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let sanitize = |text: &str| {
+        let redacted = redact_secrets(text);
+        let safe = omnis_core::safe_terminal_line(&redacted);
+        safe.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let source = items
+        .iter()
+        .find_map(|item| match item {
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::User,
+                text,
+            } => {
+                let cleaned = sanitize(text);
+                (!cleaned.is_empty()).then_some(cleaned)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| sanitize(fallback_title));
+    let mut chars = source.chars();
+    let truncated: String = chars.by_ref().take(MAX_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated.trim_end())
+    } else {
+        truncated
+    }
 }
 
 fn workspace_git_metadata(
