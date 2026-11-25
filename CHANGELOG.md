@@ -10,6 +10,10 @@
 
 - Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.
 - Let Codex find the macOS login keychain during a native import. Previously, an authentication command of the model provider could show a "Keychain Not Found" dialog and ask for a login.
+- Read Cursor IDE conversations that store their message order in `composerConvHeaders` records, as Cursor 3.29.9 does. These conversations were read as empty. Cursor IDE tool calls with a stored result now become native tool records.
+- Read Antigravity CLI tool results and pair them with their calls. Previously the reader kept the calls without IDs and dropped the text of every result.
+- Refresh the search documents of Cursor IDE and Antigravity CLI sessions on the next indexing pass, so a search finds the recovered history.
+- Resolve a bare Pi or OMP session ID when all its catalog entries name the same file and workspace.
 
 ## 0.10.5 - 2026-11-24
 

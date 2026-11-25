@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::Path};
 use omnis_adapters::{AntigravityAdapter, LaunchTarget, ProviderAdapter, SearchSourceObservation};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -82,6 +82,87 @@ fn transcript(root: &Path) -> Vec<u8> {
         .into_bytes();
     fs::write(logs.join("transcript_full.jsonl"), &bytes).expect("transcript fixture");
     bytes
+}
+
+#[test]
+fn transcript_results_pair_with_calls_by_step() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    transcript(root.path());
+    let path = root
+        .path()
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs/transcript_full.jsonl");
+    let step = |index: u64, kind: &str, status: &str, fields: Value| {
+        let mut record = json!({"step_index": index, "type": kind, "status": status});
+        for (key, value) in fields.as_object().unwrap() {
+            record[key] = value.clone();
+        }
+        record.to_string()
+    };
+    let calls = json!({"tool_calls": [
+        {"name": "read_file", "args": {"path": "a.rs"}},
+        {"name": "run_command", "args": {"command": "build"}},
+        {"name": "edit_file", "args": {"path": "b.rs"}}
+    ]});
+    let lines = [
+        step(0, "USER_INPUT", "DONE", json!({"content": "question"})),
+        step(1, "PLANNER_RESPONSE", "DONE", calls.clone()),
+        step(2, "GENERIC", "DONE", json!({"content": "file text"})),
+        step(3, "GENERIC", "RUNNING", json!({"content": "task started"})),
+        step(5, "SYSTEM_MESSAGE", "DONE", json!({"content": "notice"})),
+        step(
+            4,
+            "GENERIC",
+            "ERROR",
+            json!({"content": "", "error": "edit failed"}),
+        ),
+        // A step without a pending call, or a result after the next response, stays metadata.
+        step(6, "GENERIC", "DONE", json!({"content": "detached"})),
+        step(7, "PLANNER_RESPONSE", "DONE", calls),
+        step(11, "PLANNER_RESPONSE", "DONE", json!({"content": "answer"})),
+        step(8, "GENERIC", "DONE", json!({"content": "late"})),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let snapshot = AntigravityAdapter::with_root(root.path())
+        .read_session(&SessionRef::new(Provider::Antigravity, SESSION_ID))
+        .unwrap();
+    let tools = omnis_core::native_trajectory_signature(&omnis_core::import_trajectory(&snapshot))
+        .into_iter()
+        .filter_map(|item| match item {
+            omnis_core::NativeTrajectoryItem::Tool {
+                name,
+                input,
+                output,
+                is_error,
+                ..
+            } => Some((name, input, output, is_error)),
+            omnis_core::NativeTrajectoryItem::Message { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let tool = |name: &str, input, output: &str, is_error| {
+        (
+            format!("hist_antigravity_{name}"),
+            input,
+            output.to_owned(),
+            is_error,
+        )
+    };
+    assert_eq!(
+        tools,
+        [
+            tool("read_file", json!({"path": "a.rs"}), "file text", false),
+            tool(
+                "run_command",
+                json!({"command": "build"}),
+                "task started",
+                false
+            ),
+            tool("edit_file", json!({"path": "b.rs"}), "edit failed", true),
+        ]
+    );
 }
 
 fn observed_revision(adapter: &AntigravityAdapter, id: &str) -> SearchSourceObservation {

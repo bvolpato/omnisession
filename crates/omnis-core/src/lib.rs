@@ -107,10 +107,10 @@ const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 59;
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity => 13,
+        Provider::Antigravity => 14,
         Provider::AntigravityDesktop => 15,
         Provider::AntigravityIde | Provider::Claude => 12,
-        Provider::OhMyPi | Provider::Pi => 11,
+        Provider::CursorIde | Provider::OhMyPi | Provider::Pi => 11,
         Provider::Codex => CODEX_SEARCH_DOCUMENT_VERSION,
         _ => SEARCH_DOCUMENT_VERSION,
     }
@@ -2705,7 +2705,9 @@ fn native_tool_part(
     payload: &Value,
     limits: ItemLimits,
 ) -> Option<TrajectoryTool> {
-    if let Some(pair) = single_event_tool_pair(payload, limits) {
+    if let Some(pair) =
+        single_event_tool_pair(payload, limits).or_else(|| cursor_ide_tool_pair(payload, limits))
+    {
         return Some(pair);
     }
     match kind {
@@ -2794,6 +2796,26 @@ fn single_event_tool_pair(payload: &Value, limits: ItemLimits) -> Option<Traject
             &[&["output"], &["content"], &["error", "message"], &["error"]],
             limits,
         )?,
+        is_error,
+    })
+}
+
+// Cursor IDE stores a finished call and its result in one bubble.
+fn cursor_ide_tool_pair(payload: &Value, limits: ItemLimits) -> Option<TrajectoryTool> {
+    let tool = payload.get("tool_former_data")?;
+    let is_error = match tool.get("status").and_then(Value::as_str)? {
+        "completed" => false,
+        "error" => true,
+        _ => return None,
+    };
+    Some(TrajectoryTool::Pair {
+        call_id: payload_string(tool, &[&["toolCallId"]])?,
+        name: payload_string(tool, &[&["name"]])?,
+        input: bounded_tool_input(
+            tool_input(tool, &[&["rawArgs"], &["params"]], limits.redact),
+            limits.tool_event,
+        )?,
+        output: tool_output(tool, &[&["result"], &["error"]], limits)?,
         is_error,
     })
 }
@@ -6094,8 +6116,12 @@ mod tests {
     }
 
     #[test]
-    fn native_antigravity_documents_upgrade_independently_of_imported_bundles() {
-        for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+    fn native_documents_upgrade_independently_of_imported_bundles() {
+        for provider in [
+            Provider::Antigravity,
+            Provider::AntigravityDesktop,
+            Provider::CursorIde,
+        ] {
             assert!(super::search_document_version(provider) > super::SEARCH_DOCUMENT_VERSION);
             assert_eq!(
                 super::imported_search_document_version(provider),
