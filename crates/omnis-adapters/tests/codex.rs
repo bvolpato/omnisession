@@ -1681,7 +1681,7 @@ fn codex_rollback_still_truncates_after_tool_event_pruning() {
         message("user", "surviving request"),
         message("user", "discarded request"),
     ];
-    records.extend((0..1_050).map(|index| json!({"type": "response_item", "payload": {
+    records.extend((0..2_100).map(|index| json!({"type": "response_item", "payload": {
         "type": "function_call_output", "call_id": index.to_string(), "output": "discarded output",
     }})));
     records.push(event("thread_rolled_back", json!({"num_turns": 1})));
@@ -1705,7 +1705,7 @@ fn codex_rollback_reports_surviving_tools_evicted_during_discarded_turn() {
         }}),
         message("user", "discarded request"),
     ];
-    records.extend((0..1_050).map(|index| json!({"type": "response_item", "payload": {
+    records.extend((0..2_100).map(|index| json!({"type": "response_item", "payload": {
         "type": "function_call_output", "call_id": index.to_string(), "output": "discarded output",
     }})));
     records.push(event("thread_rolled_back", json!({"num_turns": 1})));

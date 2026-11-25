@@ -187,7 +187,7 @@ fn an_unstamped_model_result_before_a_new_generated_turn_rolls_back_with_its_dis
     ];
     // Force both calls and their results out of the retained tool window before rollback.
     let mut pruned = rows.clone();
-    pruned.extend((0..1_050).map(|i| {
+    pruned.extend((0..2_100).map(|i| {
         let mut raw = model_result("discarded");
         raw["payload"]["call_id"] = format!("discarded-{i}").into();
         raw

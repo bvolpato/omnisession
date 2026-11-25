@@ -6,12 +6,20 @@
 
 - Pass a model to the target agent with `omni fork --model <model>`. The fork stops before any import when the agent does not list `--model`, or when the launch profile already sets a model in its arguments.
 
+### Changed
+
+- Keep up to 1,024 tool records in a native import, with at most 16,000 characters each and 786,432 characters of tool text in total. The previous limits were 256 records and 8,000 characters. The Codex reader also keeps the newest 1,024 tool records instead of 256.
+- Omit the display records that Codex saves for commands inside a completed `exec` script. The result of the script already holds what the agent received. Failed display records are still imported.
+- Replace image, audio, and document blocks in tool results with a short placeholder, and never import base64 data as text. A result with such a block can now become a native tool record.
+
 ### Fixed
 
 - Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.
 - Let Codex find the macOS login keychain during a native import. Previously, an authentication command of the model provider could show a "Keychain Not Found" dialog and ask for a login.
 - Read Cursor IDE conversations that store their message order in `composerConvHeaders` records, as Cursor 3.29.9 does. These conversations were read as empty. Cursor IDE tool calls with a stored result now become native tool records.
 - Read Antigravity CLI tool results and pair them with their calls. Previously the reader kept the calls without IDs and dropped the text of every result.
+- Keep a tool call and its result together when a documentary record is between them.
+- Skip messages that hold only whitespace in native imports. Codex and Hermes drop these messages, so their imports failed verification.
 - Refresh the search documents of Cursor IDE and Antigravity CLI sessions on the next indexing pass, so a search finds the recovered history.
 - Resolve a bare Pi or OMP session ID when all its catalog entries name the same file and workspace.
 
