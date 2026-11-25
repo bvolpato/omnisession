@@ -5,6 +5,7 @@
 ### Fixed
 
 - Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.
+- Let Codex find the macOS login keychain during a native import. Previously, an authentication command of the model provider could show a "Keychain Not Found" dialog and ask for a login.
 
 ## 0.10.5 - 2026-11-24
 
