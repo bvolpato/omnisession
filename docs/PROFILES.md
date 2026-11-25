@@ -50,6 +50,8 @@ Codex reads `$CODEX_HOME/gateway.config.toml` (by default, `~/.codex/gateway.con
 
 When you fork a session from another agent into this profile, OmniSession uses the Codex profile's `model_provider` to create the thread. The profile file must be a regular file, not a symbolic link. An explicit `-c model_provider=...` in the launch arguments takes precedence. The provider ID does not have to match either profile name. OmniSession checks the provider ID that Codex saved before it launches `resume`. It does not change existing threads.
 
+An administrator can require a model provider in the managed `requirements.toml` of Codex. Codex then ignores the provider of the profile for imports and launches. OmniSession accepts the imported thread only when Codex saved the required provider, and it prints a warning that names both providers.
+
 ## Example: a wrapper program
 
 ```toml

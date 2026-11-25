@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.
+
 ## 0.10.5 - 2026-11-24
 
 ### Changed
