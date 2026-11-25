@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -131,7 +132,7 @@ impl AntigravityAdapter {
         }
         ensure!(
             summary.step_count == Some(0),
-            "Antigravity session `{}` has no readable transcript or verified zero-step count",
+            "Antigravity lists session `{}`, but its transcript and conversation database are missing or unreadable, so there is no history to continue",
             summary.id
         );
         let canonical_root = fs::canonicalize(root)?;
@@ -300,9 +301,10 @@ impl AntigravityAdapter {
         let path = self.source(summary)?;
         let transcript = path.extension().is_some_and(|ext| ext == "jsonl");
         if transcript {
+            let mut calls = TranscriptCalls::default();
             let mut push = |record: Value| {
                 let start = builder.checkpoint();
-                push_transcript_record(&mut builder, &record);
+                push_transcript_record(&mut builder, &mut calls, &record);
                 let end = builder.checkpoint();
                 if !preview && let Some(damage) = tail.damage() {
                     damage.confirm_prefix(end);
@@ -486,8 +488,9 @@ impl PreviousSearchPrefix {
         )?;
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
         let mut document = SearchDocumentBuilder::default();
+        let mut calls = TranscriptCalls::default();
         for record in records {
-            push_transcript_record(&mut builder, &record);
+            push_transcript_record(&mut builder, &mut calls, &record);
             for event in builder.drain_events() {
                 document.push(&event);
             }
@@ -663,14 +666,15 @@ fn finish_search_document(
     document
 }
 
-fn project_search_record(
+fn project_record(
     record: &Value,
     events: &mut EventBuilder,
+    calls: &mut TranscriptCalls,
     document: &mut SearchDocumentBuilder,
     title_source: &mut CanonicalSnapshot,
 ) {
     let start = events.checkpoint();
-    push_transcript_record(events, record);
+    push_transcript_record(events, calls, record);
     for event in events.drain_events() {
         document.push_record_event(&event, start);
         capture_first_message(title_source, event);
@@ -1045,15 +1049,16 @@ impl ProviderAdapter for AntigravityAdapter {
             return result;
         }
         let mut events = EventBuilder::new(Provider::Antigravity, &session.id);
-        let mut title_source = summary.snapshot(
+        let mut title = summary.snapshot(
             session,
             EventBuilder::new(Provider::Antigravity, &session.id),
         );
         let mut document = SearchDocumentBuilder::default();
         let mut gaps = DamagedRecordPositions::default();
+        let mut calls = TranscriptCalls::default();
         let mut push = |record| {
             let before = gaps.observe(&torn, &document);
-            project_search_record(&record, &mut events, &mut document, &mut title_source);
+            project_record(&record, &mut events, &mut calls, &mut document, &mut title);
             torn.confirm_prefix(events.checkpoint());
             gaps.observe_suffix(&record, before, document.projected_byte_count());
             prefix.observe(&document);
@@ -1111,7 +1116,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 verified_prefix_end: torn.verified_prefix_end(),
                 database_aliases: std::sync::Arc::default(),
                 search_record_groups: Vec::new(),
-                snapshot: title_source,
+                snapshot: title,
                 source_complete: !limited && torn.count() == 0,
                 provider_limited: limited && prior_prefix.is_some(),
                 source_revision: native
@@ -1590,7 +1595,43 @@ pub(crate) fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
+/// Tool calls of the latest planner response that still wait for their result step.
+///
+/// Transcripts store no call IDs. Antigravity numbers every step, and the results follow their
+/// planner response in call order.
+#[derive(Default)]
+struct TranscriptCalls(BTreeMap<i64, (String, String)>);
+
+impl TranscriptCalls {
+    /// Registers a planner response's calls and returns the ID of each one.
+    fn register(&mut self, record: &Value, calls: &[Value]) -> Vec<Option<String>> {
+        self.0.clear();
+        let Some(step) = record.get("step_index").and_then(Value::as_i64) else {
+            return vec![None; calls.len()];
+        };
+        (1..)
+            .zip(calls)
+            .map(|(offset, call)| {
+                let result_step = step.checked_add(offset)?;
+                let name = call.get("name").and_then(Value::as_str)?;
+                let id = format!("step-{result_step}");
+                self.0.insert(result_step, (id.clone(), name.to_owned()));
+                Some(id)
+            })
+            .collect()
+    }
+
+    /// Returns the call that this result step completes.
+    fn complete(&mut self, record: &Value) -> Option<(String, String)> {
+        self.0.remove(&record.get("step_index")?.as_i64()?)
+    }
+}
+
+fn push_transcript_record(
+    builder: &mut EventBuilder,
+    open_calls: &mut TranscriptCalls,
+    record: &Value,
+) {
     let record_type = record.get("type").and_then(Value::as_str).unwrap_or("");
     let timestamp = parse_timestamp(record.get("created_at"));
     let status = record.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1611,33 +1652,8 @@ fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
                 );
             }
         }
-        "PLANNER_RESPONSE" => {
-            if let Some(text) = record.get("content").and_then(Value::as_str) {
-                builder.push(
-                    EventKind::MessageAssistant,
-                    json!({"text": text}),
-                    timestamp,
-                    ReplayPolicy::Contextual,
-                    Some(record_type.to_owned()),
-                    None,
-                );
-            }
-            if let Some(calls) = record.get("tool_calls").and_then(Value::as_array) {
-                for call in calls {
-                    let Some(name) = call.get("name").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    builder.push(
-                        EventKind::ToolCalled,
-                        json!({"name": name, "arguments": call.get("args").cloned().unwrap_or(Value::Null)}),
-                        timestamp,
-                        ReplayPolicy::HistoricalOnly,
-                        Some(record_type.to_owned()),
-                        None,
-                    );
-                }
-            }
-        }
+        "PLANNER_RESPONSE" => push_planner_response(builder, open_calls, record, timestamp),
+        "GENERIC" => push_generic_step(builder, open_calls, record, status, timestamp),
         "RUN_COMMAND" => push_historical(
             builder,
             record_type,
@@ -1673,6 +1689,78 @@ fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
             EventKind::ProviderEvent,
         ),
     }
+}
+
+fn push_planner_response(
+    builder: &mut EventBuilder,
+    open_calls: &mut TranscriptCalls,
+    record: &Value,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if let Some(text) = record.get("content").and_then(Value::as_str) {
+        builder.push(
+            EventKind::MessageAssistant,
+            json!({"text": text}),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("PLANNER_RESPONSE".to_owned()),
+            None,
+        );
+    }
+    let calls = record.get("tool_calls").and_then(Value::as_array);
+    let ids = open_calls.register(record, calls.map_or(&[], Vec::as_slice));
+    for (call, id) in calls.into_iter().flatten().zip(ids) {
+        let Some(name) = call.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut payload = json!({
+            "name": name,
+            "arguments": call.get("args").cloned().unwrap_or(Value::Null)
+        });
+        if let Some(id) = id {
+            payload["call_id"] = json!(id);
+        }
+        builder.push(
+            EventKind::ToolCalled,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("PLANNER_RESPONSE".to_owned()),
+            None,
+        );
+    }
+}
+
+fn push_generic_step(
+    builder: &mut EventBuilder,
+    open_calls: &mut TranscriptCalls,
+    record: &Value,
+    status: &str,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let output = ["content", "error"]
+        .iter()
+        .find_map(|key| record.get(*key)?.as_str().filter(|text| !text.is_empty()));
+    let (kind, payload) = match (output, open_calls.complete(record)) {
+        // A running step stores what the agent received, such as a background task ID.
+        (Some(output), Some((id, name))) => (
+            if matches!(status, "ERROR" | "INVALID") {
+                EventKind::ToolFailed
+            } else {
+                EventKind::ToolCompleted
+            },
+            json!({"call_id": id, "name": name, "output": output, "status": status}),
+        ),
+        _ => (EventKind::ProviderEvent, json!({"status": status})),
+    };
+    builder.push(
+        kind,
+        payload,
+        timestamp,
+        ReplayPolicy::HistoricalOnly,
+        Some("GENERIC".to_owned()),
+        None,
+    );
 }
 
 pub(crate) fn antigravity_user_request(text: &str) -> &str {

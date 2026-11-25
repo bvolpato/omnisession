@@ -2826,6 +2826,28 @@ impl Store {
             .map_err(database_error)
     }
 
+    /// Returns whether every recorded copy names the same workspace and the same file.
+    ///
+    /// Each rewrite of a session file adds a copy, and a copy from an older catalog has no file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy catalog cannot be read.
+    pub fn pi_copies_share_one_file(&self, session: &SessionRef) -> Result<bool> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT count(DISTINCT json_extract(metadata,'$.project_path'))=1
+                    AND count(DISTINCT json_extract(metadata,'$.source_path'))=1
+                    AND count(*)=count(json_extract(metadata,'$.project_path'))
+                 FROM (SELECT CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END AS metadata
+                    FROM pi_search_copies WHERE provider=?1 AND session_id=?2)",
+                params![session.provider.to_string(), session.id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     /// Resolves recorded header directories to persistent keys in one catalog query.
     ///
     /// # Errors

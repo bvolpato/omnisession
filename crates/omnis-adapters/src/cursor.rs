@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     env, fs,
     path::Path,
@@ -892,6 +893,7 @@ impl CursorIdeAdapter {
 }
 
 const MAX_CURSOR_IDE_HEADERS: usize = 100_000;
+const MAX_CURSOR_IDE_HEADER_CHUNKS: u64 = 65_536;
 const MAX_CURSOR_IDE_RECORD_SIZE: usize = 16 * 1024 * 1024;
 const MAX_CURSOR_IDE_TRAJECTORY_BYTES: usize = 128 * 1024 * 1024;
 
@@ -1196,9 +1198,14 @@ fn cursor_ide_events(
         raw_type: "cursor_ide.composer_data",
     }];
     mark_cursor_blob_json(&mut events, root_is_blob, "composer");
-    let Some(headers) = root
-        .get("fullConversationHeadersOnly")
-        .and_then(Value::as_array)
+    let mut trajectory_bytes = root_bytes.len();
+    let Some(headers) = cursor_ide_conversation_headers(
+        transaction,
+        composer_id,
+        &root,
+        &mut trajectory_bytes,
+        &mut events,
+    )?
     else {
         events.push(unsupported_cursor_ide_event(
             "missing_full_conversation_headers",
@@ -1207,17 +1214,14 @@ fn cursor_ide_events(
         ));
         return Ok(events);
     };
-    if headers.len() > MAX_CURSOR_IDE_HEADERS {
-        bail!("Cursor IDE session exceeds safe conversation-header limit");
-    }
+    events[0].payload["message_headers"] = json!(headers.len());
 
     let mut seen = BTreeSet::new();
     let mut checkpoint_ids = BTreeSet::new();
     if let Some(checkpoint_id) = string_at(&root, &[&["latestCheckpointId"]]) {
         checkpoint_ids.insert(checkpoint_id.to_owned());
     }
-    let mut trajectory_bytes = root_bytes.len();
-    for header in headers {
+    for header in headers.iter() {
         let Some(bubble_id) = header.get("bubbleId").and_then(Value::as_str) else {
             events.push(unsupported_cursor_ide_event(
                 "conversation_header_without_bubble_id",
@@ -1251,6 +1255,88 @@ fn cursor_ide_events(
     push_cursor_ide_checkpoints(transaction, composer_id, &checkpoint_ids, &mut events)?;
     push_cursor_ide_diffs(transaction, composer_id, &root, &mut events)?;
     Ok(events)
+}
+
+/// Finds the ordered conversation headers in the composer root or in its header chunks.
+///
+/// Cursor 3.29 keeps the headers in `composerConvHeaders:<composer>:<index>` records of a fixed
+/// size and leaves the list in the root empty. A root without `headerLog` still holds the list.
+fn cursor_ide_conversation_headers<'a>(
+    transaction: &Transaction<'_>,
+    composer_id: &str,
+    root: &'a Value,
+    trajectory_bytes: &mut usize,
+    events: &mut Vec<CursorIdeEvent>,
+) -> Result<Option<Cow<'a, [Value]>>> {
+    let inline = root
+        .get("fullConversationHeadersOnly")
+        .and_then(Value::as_array);
+    let log = root.get("headerLog").filter(|log| !log.is_null());
+    let Some(log) = log else {
+        if inline.is_some_and(|headers| headers.len() > MAX_CURSOR_IDE_HEADERS) {
+            bail!("Cursor IDE session exceeds safe conversation-header limit");
+        }
+        return Ok(inline.map(|headers| Cow::Borrowed(headers.as_slice())));
+    };
+    let Some((chunk_count, count)) = cursor_ide_header_log(log) else {
+        let mut marker = unsupported_cursor_ide_event("unsupported_header_log", None, None);
+        marker.payload["native_history_unverified"] = json!(true);
+        events.push(marker);
+        return Ok(inline.map(|headers| Cow::Borrowed(headers.as_slice())));
+    };
+    if count > MAX_CURSOR_IDE_HEADERS {
+        bail!("Cursor IDE session exceeds safe conversation-header limit");
+    }
+    let mut headers = Vec::<Value>::new();
+    let mut seen = BTreeSet::new();
+    for index in 0..chunk_count {
+        let key = format!("composerConvHeaders:{composer_id}:{index:06}");
+        let Some((bytes, is_blob)) = cursor_disk_value(transaction, &key)? else {
+            continue;
+        };
+        *trajectory_bytes = trajectory_bytes.saturating_add(bytes.len());
+        if *trajectory_bytes > MAX_CURSOR_IDE_TRAJECTORY_BYTES {
+            bail!("Cursor IDE session exceeds safe trajectory size limit");
+        }
+        // Cursor skips a chunk when any header in it has no bubble ID.
+        let chunk = serde_json::from_slice::<Vec<Value>>(&bytes)
+            .ok()
+            .filter(|chunk| chunk.iter().all(|header| header["bubbleId"].is_string()));
+        let Some(chunk) = chunk else {
+            events.push(unsupported_cursor_ide_event(
+                "invalid_header_chunk",
+                Some(&bytes),
+                None,
+            ));
+            continue;
+        };
+        if is_blob {
+            mark_cursor_blob_json(&mut events[..1], true, "composer");
+        }
+        headers.extend(
+            chunk
+                .into_iter()
+                .filter(|header| seen.insert(header["bubbleId"].as_str().map(str::to_owned))),
+        );
+    }
+    headers.truncate(count);
+    let missing = count - headers.len();
+    if missing > 0 {
+        let mut marker = unsupported_cursor_ide_event("missing_conversation_headers", None, None);
+        marker.payload["omitted_events"] = json!(missing);
+        events.push(marker);
+    }
+    Ok(Some(Cow::Owned(headers)))
+}
+
+/// Returns the chunk count and header count of a header log that Cursor itself would accept.
+fn cursor_ide_header_log(log: &Value) -> Option<(u64, usize)> {
+    let chunk_size = log.get("chunkSize")?.as_u64()?;
+    let chunk_count = log.get("chunkCount")?.as_u64()?;
+    let count = log.get("count")?.as_u64()?;
+    let generation = log.get("generation").is_none_or(Value::is_string);
+    (chunk_size > 0 && chunk_count <= MAX_CURSOR_IDE_HEADER_CHUNKS && generation)
+        .then_some((chunk_count, usize::try_from(count).ok()?))
 }
 
 fn decode_cursor_ide_bubble(
@@ -1379,6 +1465,7 @@ fn cursor_ide_root_metadata(root: &Value) -> Value {
         "latestCheckpointId",
         "conversationCheckpointLastUpdatedAt",
         "fullConversationHeadersOnly",
+        "headerLog",
         "codeBlockData",
     ];
     let unknown_fields = root.as_object().map_or_else(Vec::new, |object| {
@@ -1393,10 +1480,7 @@ fn cursor_ide_root_metadata(root: &Value) -> Value {
         "schema_version": root.get("_v").cloned().unwrap_or(Value::Null),
         "status": root.get("status").cloned().unwrap_or(Value::Null),
         "mode": root.get("unifiedMode").cloned().unwrap_or(Value::Null),
-        "message_headers": root
-            .get("fullConversationHeadersOnly")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len),
+        "message_headers": 0,
         "latest_checkpoint_id": root
             .get("latestCheckpointId")
             .cloned()
@@ -1460,7 +1544,15 @@ fn push_cursor_ide_bubble(
         });
     }
     if let Some(tool) = bubble.get("toolFormerData") {
-        let status = string_at(tool, &[&["status"], &["additionalData", "status"]]);
+        let mut tool = tool.clone();
+        // Cursor stores an encoded copy of the same call next to its JSON fields.
+        if let Some(binary) = tool
+            .as_object_mut()
+            .and_then(|tool| tool.remove("toolCallBinary"))
+        {
+            tool["omitted_tool_call_binary_bytes"] = json!(binary.as_str().map(str::len));
+        }
+        let status = string_at(&tool, &[&["status"], &["additionalData", "status"]]);
         let kind = if tool.get("error").is_some()
             || status.is_some_and(|status| matches!(status, "error" | "failed" | "cancelled"))
         {

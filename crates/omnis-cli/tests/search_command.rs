@@ -2615,6 +2615,62 @@ fn cached_omp_titles_from_version_eight_require_the_selected_file() {
 }
 
 #[test]
+fn a_bare_omp_id_resolves_after_its_file_is_rewritten() {
+    let fixture = Fixture::new();
+    let sessions = fixture.root.join("omp");
+    fs::create_dir(&sessions).unwrap();
+    let file = sessions.join("rewritten.jsonl");
+    let command = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMP_SESSION_DIR", &sessions)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let index = |path: &Path, text: &str| {
+        write_jsonl(
+            path,
+            &[
+                json!({"type":"session","version":3,"id":"rewritten","cwd":fixture.workspace}),
+                json!({"type":"message","id":"turn","parentId":null,"message":{"role":"user","content":text}}),
+            ],
+        );
+        let indexed = command(&["--json", "index", "--provider", "omp"]);
+        assert!(indexed.status.success(), "{indexed:?}");
+    };
+    index(&file, "Firstmarker");
+    // The new file exists before the old one goes away, so it gets another file identity.
+    let replacement = sessions.join("replacement.tmp");
+    fs::write(&replacement, fs::read(&file).unwrap()).unwrap();
+    fs::rename(&replacement, &file).unwrap();
+    index(&file, "Secondmarker");
+    let copies: i64 = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM pi_search_copies WHERE provider='omp'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(copies > 1, "the rewrite added no copy");
+
+    let shown = command(&["show", "omp:rewritten"]);
+    assert!(shown.status.success(), "{shown:?}");
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("Secondmarker"));
+
+    // Two files that hold the same ID stay ambiguous.
+    index(&sessions.join("duplicate.jsonl"), "Thirdmarker");
+    let ambiguous = command(&["show", "omp:rewritten"]);
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr)
+            .contains("multiple workspaces or files contain session `omp:rewritten`"),
+        "{ambiguous:?}"
+    );
+}
+
+#[test]
 fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     let fixture = Fixture::new();
     let indexed = fixture

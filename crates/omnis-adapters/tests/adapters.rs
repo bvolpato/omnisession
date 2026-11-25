@@ -1037,6 +1037,167 @@ fn cursor_ide_reads_a_conversation_with_an_oversized_bubble_as_an_omission() {
     assert_eq!(snapshot.events[4].kind, EventKind::ToolCompleted);
 }
 
+#[test]
+fn cursor_ide_reads_conversation_headers_from_chunks() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let connection = rusqlite::Connection::open(&database).expect("fixture database");
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let root: Value = connection
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = 'composerData:root-composer'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|value| serde_json::from_str(&value).expect("composer root"))
+        .expect("composer data fixture");
+    let headers = root["fullConversationHeadersOnly"].clone();
+    let set_log = |log: Value| {
+        let mut root = root.clone();
+        root["_v"] = 18.into();
+        root["fullConversationHeadersOnly"] = serde_json::json!([]);
+        root["headerLog"] = log;
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:root-composer'",
+                [root.to_string()],
+            )
+            .expect("chunked composer root");
+    };
+    let log = |count: usize| {
+        serde_json::json!({
+            "chunkSize": 2, "chunkCount": 2, "count": count, "generation": "generation-1"
+        })
+    };
+    for (index, chunk) in [
+        serde_json::json!([headers[0], headers[1]]),
+        // Cursor drops a header that an earlier chunk already lists.
+        serde_json::json!([headers[1], headers[2]]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("composerConvHeaders:root-composer:{index:06}"),
+                    chunk.to_string()
+                ],
+            )
+            .expect("header chunk fixture");
+    }
+
+    set_log(log(3));
+    let snapshot = adapter
+        .read_session(&session)
+        .expect("chunked conversation");
+    assert_eq!(snapshot.events[1].payload["message_headers"], 3);
+    assert_eq!(snapshot.events[2].payload["text"], "Question");
+    assert_eq!(snapshot.events[3].payload["text"], "Answer");
+    assert_eq!(snapshot.events[4].kind, EventKind::ToolCompleted);
+    assert!(!omnis_core::import_trajectory(&snapshot).truncated);
+
+    set_log(log(2));
+    let snapshot = adapter
+        .read_session(&session)
+        .expect("bounded conversation");
+    assert_eq!(snapshot.events[1].payload["message_headers"], 2);
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|event| event.kind != EventKind::ToolCompleted)
+    );
+
+    let unsupported = serde_json::json!({"chunkSize": 0, "chunkCount": 2, "count": 3});
+    connection
+        .execute(
+            "UPDATE cursorDiskKV SET value = '[{}]' WHERE key LIKE 'composerConvHeaders:%:000001'",
+            [],
+        )
+        .expect("damaged header chunk fixture");
+    for (log, reason) in [
+        (log(3), "missing_conversation_headers"),
+        (unsupported, "unsupported_header_log"),
+    ] {
+        set_log(log);
+        let snapshot = adapter
+            .read_session(&session)
+            .expect("damaged conversation");
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["reason"] == reason)
+        );
+        assert!(
+            omnis_core::import_trajectory(&snapshot).truncated,
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn cursor_ide_tool_bubbles_import_as_native_tool_records() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let connection = rusqlite::Connection::open(&database).expect("fixture database");
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let tools = |fields: Value| {
+        let mut bubble = serde_json::json!({
+            "bubbleId": "tool-1", "type": 2, "text": "", "toolFormerData": {
+                "toolCallId": "call-1", "name": "read_file", "toolCallBinary": "AAAA",
+                "rawArgs": r#"{"path":"src/lib.rs"}"#
+            }
+        });
+        for (key, value) in fields.as_object().expect("tool fields") {
+            bubble["toolFormerData"][key] = value.clone();
+        }
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'bubbleId:root-composer:tool-1'",
+                [bubble.to_string()],
+            )
+            .expect("tool bubble fixture");
+        let snapshot = CursorIdeAdapter::with_root(temporary.path())
+            .read_session(&session)
+            .expect("tool conversation");
+        assert_eq!(
+            snapshot.events[4].payload["tool_former_data"]["toolCallBinary"],
+            Value::Null
+        );
+        omnis_core::native_trajectory_signature(&omnis_core::import_trajectory(&snapshot))
+            .into_iter()
+            .filter(|item| matches!(item, omnis_core::NativeTrajectoryItem::Tool { .. }))
+            .collect::<Vec<_>>()
+    };
+    let pair = |output: &str, is_error| omnis_core::NativeTrajectoryItem::Tool {
+        call_id: String::new(),
+        name: "hist_cursor-ide_read_file".to_owned(),
+        input: serde_json::json!({"path": "src/lib.rs"}),
+        output: output.to_owned(),
+        is_error,
+    };
+    assert_eq!(
+        tools(serde_json::json!({"status": "completed", "result": "contents"})),
+        [pair("contents", false)]
+    );
+    assert_eq!(
+        tools(serde_json::json!({"status": "error", "error": "missing"})),
+        [pair("missing", true)]
+    );
+    // Without a stored result, the call stays documentary.
+    assert_eq!(tools(serde_json::json!({"status": "completed"})), []);
+    assert_eq!(
+        tools(serde_json::json!({"status": "cancelled", "result": "part"})),
+        []
+    );
+}
+
 fn create_cursor_ide_fixture(root: &Path, workspace: &Path) -> std::path::PathBuf {
     let global_storage = root.join("globalStorage");
     let workspace_storage = root.join("workspaceStorage/ws-fixture");

@@ -4505,16 +4505,18 @@ fn resolve_pi_copy(registry: &AdapterRegistry, mut session: SessionRef) -> Resul
         Err(error) => return Err(error.into()),
     };
     if !projects.is_empty() {
+        // The adapter still rejects an ID that several files on disk contain.
         if qualified.is_none()
-            && projects
+            && (projects
                 .iter()
                 .filter(|key| !key.as_os_str().is_empty())
                 .count()
                 <= 1
+                || store.pi_copies_share_one_file(&session)?)
         {
             return Ok(session);
         }
-        let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple Pi workspaces contain session `{}`; use a workspace-qualified search result",session.id))?;
+        let workspace = projects.iter().find(|path| pi_copy_selector(&session.id,path)==selector).with_context(||format!("multiple workspaces or files contain session `{session}`; use a workspace-qualified search result"))?;
         let adapter = registry.adapter(session.provider)?;
         let file = store.pi_recorded_file(&session, workspace)?;
         let object = store.pi_recorded_object(&session, workspace)?;

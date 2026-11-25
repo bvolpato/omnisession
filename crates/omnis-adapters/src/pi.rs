@@ -147,7 +147,8 @@ impl PiAdapter {
                 {
                     ensure!(
                         found.is_none(),
-                        "multiple Pi workspaces or files contain session `{id}`"
+                        "multiple workspaces or files contain session `{}:{id}`",
+                        self.provider
                     );
                     found = Some(file);
                 }
