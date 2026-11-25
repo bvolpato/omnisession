@@ -93,17 +93,6 @@ impl ImportProfile {
             }
         }
     }
-
-    pub(super) fn verify(&self, thread: &serde_json::Value) -> Result<()> {
-        if self
-            .provider
-            .as_deref()
-            .is_some_and(|id| thread["modelProvider"].as_str() != Some(id))
-        {
-            bail!("imported Codex thread does not use the selected model provider");
-        }
-        Ok(())
-    }
 }
 
 pub(super) fn require_continuation_args(args: &[String], built_in: bool) -> Result<()> {

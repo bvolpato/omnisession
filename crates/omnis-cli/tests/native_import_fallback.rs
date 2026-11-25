@@ -212,6 +212,11 @@ while IFS= read -r line; do
         *) printf '{"id":%s,"result":{"thread":{"modelProvider":"openai","turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
         esac
         ;;
+    configRequirements/read)
+        required=null
+        if [ -n "$FAKE_CODEX_REQUIRED_PROVIDER" ]; then required='{"modelProvider":"'"$FAKE_CODEX_REQUIRED_PROVIDER"'"}'; fi
+        printf '{"id":%s,"result":{"requirements":%s}}\n' "$id" "$required"
+        ;;
     thread/delete)
         if [ -n "$pending_read" ]; then printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$pending_read"; fi
         case "$FAKE_CODEX_DELETE" in
@@ -425,6 +430,11 @@ async function sendProgress() {
           ? []
           : [{ items: JSON.parse(fs.readFileSync(path.join(capture, "turn-items"), "utf8")) }];
         send({ id: request.id, result: { thread: { modelProvider: "openai", turns } } });
+        break;
+      }
+      case "configRequirements/read": {
+        const required = env.FAKE_CODEX_REQUIRED_PROVIDER;
+        send({ id: request.id, result: { requirements: required ? { modelProvider: required } : null } });
         break;
       }
       case "thread/delete":
@@ -927,11 +937,8 @@ fn archived_codex_keeps_the_submitted_recovery_file_after_a_lost_completion() {
     assert_eq!(fs::read(source).unwrap(), bytes);
 }
 
-#[test]
-fn codex_provider_mismatch_rolls_back_before_launch() {
-    if !tools_available() {
-        return;
-    }
+// The synthetic Codex saves every thread with the `openai` provider.
+fn import_with_gateway_profile(required: Option<&str>) -> (Fixture, Run) {
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("codex/work.config.toml"),
@@ -947,6 +954,8 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
     #[cfg(unix)]
     fs::set_permissions(&profile, fs::Permissions::from_mode(0o600))
         .expect("private launch profile");
+    let mut environment = vec![("FAKE_CODEX_ROLLOUT", "faithful")];
+    environment.extend(required.map(|provider| ("FAKE_CODEX_REQUIRED_PROVIDER", provider)));
     let run = fixture.run(
         &strings(&[
             "fork",
@@ -955,22 +964,56 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
             "local",
             "--materialize-only",
         ]),
-        &[("FAKE_CODEX_ROLLOUT", "faithful")],
+        &environment,
     );
-    assert!(!run.status.success());
+    (fixture, run)
+}
+
+#[test]
+fn codex_provider_mismatch_rolls_back_before_launch() {
+    if !tools_available() {
+        return;
+    }
+    // A requirement for a third provider does not explain the one that Codex saved.
+    for required in [None, Some("other")] {
+        let (fixture, run) = import_with_gateway_profile(required);
+        assert!(!run.status.success());
+        assert!(
+            run.stderr.contains(
+                "does not use the selected model provider `gateway`. Codex saved `openai`"
+            ),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/delete {THREAD_ID}"))
+        );
+        assert!(!fixture.generated_rollout().exists());
+        assert_eq!(fixture.launch_arguments(), None);
+    }
+}
+
+#[test]
+fn codex_import_accepts_the_provider_that_a_managed_requirement_sets() {
+    if !tools_available() {
+        return;
+    }
+    let (fixture, run) = import_with_gateway_profile(Some("openai"));
+    assert!(run.status.success(), "{}", run.stderr);
     assert!(
         run.stderr
-            .contains("does not use the selected model provider"),
+            .contains("sets model provider `openai`, so Codex ignores `gateway`"),
         "{}",
         run.stderr
     );
     assert!(
-        fixture
+        !fixture
             .rpc_log()
             .contains(&format!("thread/delete {THREAD_ID}"))
     );
-    assert!(!fixture.generated_rollout().exists());
-    assert_eq!(fixture.launch_arguments(), None);
+    assert!(fixture.generated_rollout().exists());
 }
 
 #[test]

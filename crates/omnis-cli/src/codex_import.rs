@@ -525,11 +525,44 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
         "thread/read",
         &json!({ "threadId": id, "includeTurns": true }),
     )?;
-    verify_read_turns(&result["thread"], import)
+    let thread = &result["thread"];
+    verify_model_provider(server, thread, import)?;
+    verify_read_turns(thread, import)
+}
+
+fn verify_model_provider(
+    server: &mut AppServer,
+    thread: &Value,
+    import: &CodexImport,
+) -> Result<()> {
+    let Some(selected) = import.profile.provider() else {
+        return Ok(());
+    };
+    let saved = thread["modelProvider"].as_str();
+    if saved == Some(selected) {
+        return Ok(());
+    }
+    let selected = crate::safe_terminal_line(selected);
+    let Some(saved) = saved else {
+        bail!(
+            "imported Codex thread does not use the selected model provider `{selected}`. Codex reported no provider"
+        );
+    };
+    // A managed requirement outranks launch arguments and profiles for every Codex process. The
+    // launch that follows the import is subject to it too.
+    let required = server.required_model_provider();
+    let saved_line = crate::safe_terminal_line(saved);
+    if required.is_ok_and(|required| required.as_deref() == Some(saved)) {
+        return crate::progress_line(&format!(
+            "warning: a managed Codex requirement sets model provider `{saved_line}`, so Codex ignores `{selected}` from the launch profile."
+        ));
+    }
+    bail!(
+        "imported Codex thread does not use the selected model provider `{selected}`. Codex saved `{saved_line}`"
+    )
 }
 
 fn verify_read_turns(thread: &Value, import: &CodexImport) -> Result<()> {
-    import.profile.verify(thread)?;
     let expected = import.expected_messages.as_slice();
     let turns = thread
         .get("turns")
@@ -748,6 +781,14 @@ impl AppServer {
             }),
         )?;
         self.send(&json!({ "method": "initialized", "params": {} }))
+    }
+
+    /// The model provider that an administrator requires, which Codex uses in place of any other.
+    fn required_model_provider(&mut self) -> Result<Option<String>> {
+        let result = self.request("configRequirements/read", &Value::Null)?;
+        Ok(result["requirements"]["modelProvider"]
+            .as_str()
+            .map(str::to_owned))
     }
 
     fn request(&mut self, method: &str, params: &Value) -> Result<Value> {
