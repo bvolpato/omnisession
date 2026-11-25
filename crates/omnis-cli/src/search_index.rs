@@ -5208,7 +5208,7 @@ mod tests {
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic toolheavy request"}]}}),
         ];
         // More tool results than the adapter retains, so a full read reports omitted events.
-        records.extend((0..300).map(|index| {
+        records.extend((0..1_100).map(|index| {
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":index.to_string(),"output":"synthetic output"}})
         }));
         let mut rollout = records

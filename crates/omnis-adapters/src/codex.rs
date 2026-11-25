@@ -96,7 +96,7 @@ use workspace_records::WorkspaceRecords;
 
 const SCAN_LIMIT: usize = 10_000;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
-const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
+const MAX_CANONICAL_TOOL_EVENTS: usize = 1_024;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
 pub(super) const MAX_CANONICAL_EVENTS: usize = 100_000;
 const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;

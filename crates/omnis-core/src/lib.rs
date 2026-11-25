@@ -54,6 +54,10 @@ const SESSION_PREVIEW_CHARACTER_LIMIT: usize = 2_000;
 const TOOL_OUTCOME_CHARACTER_LIMIT: usize = 2_000;
 const IMPORT_MESSAGE_CHARACTER_LIMIT: usize = 128_000;
 const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
+const IMPORT_TOOL_EVENT_LIMIT: usize = 1_024;
+const IMPORT_TOOL_EVENT_CHARACTER_LIMIT: usize = 16_000;
+// About 200,000 tokens at four characters each.
+const IMPORT_TOOL_HISTORY_CHARACTER_LIMIT: usize = 768 * 1024;
 const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
@@ -2470,7 +2474,7 @@ fn conversation_from_events(
             else {
                 continue;
             };
-            if is_user_harness_envelope(event, &text) {
+            if is_user_harness_envelope(event, &text) || is_blank(&text) {
                 continue;
             }
             (role, text, shortened)
@@ -2482,7 +2486,7 @@ fn conversation_from_events(
         candidates.len(),
         summary,
         history_character_limit,
-        usize::MAX,
+        ToolBudget::new(usize::MAX, usize::MAX),
         |i| (candidates[i].text.chars().count(), false),
         &mut truncated,
     );
@@ -2504,7 +2508,7 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
     import_trajectory_with_limits(
         snapshot,
         IMPORT_HISTORY_CHARACTER_LIMIT,
-        MARKDOWN_TOOL_EVENT_LIMIT,
+        IMPORT_TOOL_EVENT_LIMIT,
         SOURCE_ITEM_LIMITS,
     )
 }
@@ -2553,23 +2557,26 @@ pub fn readback_mismatch_summary(
     )
 }
 
-/// Per-item character bounds and redaction for import candidates.
+/// Character bounds and redaction for import candidates.
 #[derive(Clone, Copy)]
 struct ItemLimits {
     message: usize,
     tool_event: usize,
+    tool_history: usize,
     redact: bool,
 }
 
 const SOURCE_ITEM_LIMITS: ItemLimits = ItemLimits {
     message: IMPORT_MESSAGE_CHARACTER_LIMIT,
-    tool_event: MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+    tool_event: IMPORT_TOOL_EVENT_CHARACTER_LIMIT,
+    tool_history: IMPORT_TOOL_HISTORY_CHARACTER_LIMIT,
     redact: true,
 };
 
 const READBACK_ITEM_LIMITS: ItemLimits = ItemLimits {
     message: usize::MAX,
     tool_event: usize::MAX,
+    tool_history: usize::MAX,
     redact: false,
 };
 
@@ -2587,7 +2594,11 @@ impl ItemLimits {
 struct ImportCandidate {
     item: TrajectoryItem,
     char_len: usize,
-    documentary_tool: bool,
+}
+
+/// Target importers drop a message that holds only whitespace, so an import must not expect it back.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
 }
 
 fn fast_char_count(text: &str) -> usize {
@@ -2612,7 +2623,6 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                     tool: None,
                 },
                 char_len,
-                documentary_tool: false,
             },
             truncated,
         ));
@@ -2625,7 +2635,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 TrajectoryItemKind::Assistant
             };
             let (text, mut truncated) = bounded_message_text(event, limits.message, limits.redact)?;
-            if is_user_harness_envelope(event, &text) {
+            if is_user_harness_envelope(event, &text) || (limits.redact && is_blank(&text)) {
                 return None;
             }
             let (kind, text) =
@@ -2650,7 +2660,6 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     char_len,
-                    documentary_tool: false,
                 },
                 truncated,
             ))
@@ -2661,6 +2670,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
         | EventKind::CommandExecuted => {
             let mut payload = event.payload.clone();
             if limits.redact {
+                omit_inline_media(&mut payload);
                 redact_json_secrets(&mut payload);
             }
             let unpaired_call = event.source.provider == Provider::Claude
@@ -2691,7 +2701,6 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         },
                     },
                     char_len,
-                    documentary_tool: unpaired_call || unpaired_result,
                 },
                 truncated,
             ))
@@ -2868,16 +2877,19 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
         };
         let (output, has_content) = match value {
             Value::String(text) => (text.clone(), !text.is_empty()),
-            // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
+            // Unknown blocks can't be flattened, so the result stays documentary.
             Value::Array(blocks) if *path != ["rawOutput"] => {
                 let texts = blocks
                     .iter()
                     .map(|block| {
                         // Empty output is a real result, so block text skips the blank filter used for IDs.
-                        block.as_str().or_else(|| {
-                            payload_value(block, &[&["text"], &["content", "text"]])
-                                .and_then(Value::as_str)
-                        })
+                        block
+                            .as_str()
+                            .or_else(|| {
+                                payload_value(block, &[&["text"], &["content", "text"]])
+                                    .and_then(Value::as_str)
+                            })
+                            .or_else(|| media_placeholder(block))
                     })
                     .collect::<Option<Vec<_>>>()?;
                 (texts.join("\n"), texts.iter().any(|s| !s.is_empty()))
@@ -2890,6 +2902,46 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
         empty_output.get_or_insert(output);
     }
     empty_output.map(|output| limits.bounded_tool_text(&output))
+}
+
+const OMITTED_MEDIA: &str = "[base64 data omitted]";
+
+/// Text that stands for a media block in a native tool result.
+fn media_placeholder(block: &Value) -> Option<&'static str> {
+    match block.get("type")?.as_str()? {
+        "image" | "input_image" | "image_url" => Some("[image omitted]"),
+        "audio" | "input_audio" => Some("[audio omitted]"),
+        "document" | "input_file" => Some("[document omitted]"),
+        _ => None,
+    }
+}
+
+/// Replaces base64 payloads, which no target can read as documentary text.
+fn omit_inline_media(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let media = text.strip_prefix("data:").is_some_and(|rest| {
+                rest.bytes()
+                    .take(128)
+                    .collect::<Vec<_>>()
+                    .windows(8)
+                    .any(|window| window == b";base64,")
+            });
+            if media {
+                OMITTED_MEDIA.clone_into(text);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(omit_inline_media),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("base64")
+                && let Some(data @ Value::String(_)) = object.get_mut("data")
+            {
+                *data = OMITTED_MEDIA.into();
+            }
+            object.values_mut().for_each(omit_inline_media);
+        }
+        _ => {}
+    }
 }
 
 fn validate_native_tools(items: &mut [&mut TrajectoryItem], source: Provider) {
@@ -3011,7 +3063,11 @@ fn collect_import_candidates(
             event.kind == EventKind::CompactionCreated || positioned_codex_summary(event).is_some()
         });
     let mut candidate_remaining = history_character_limit;
-    let mut candidate_tools = 0;
+    let mut candidate_tools = ToolBudget::new(tool_event_limit, item_limits.tool_history);
+    if item_limits.redact && snapshot.session.provider == Provider::Codex {
+        let mut nested = nested_codex_display(&events).into_iter();
+        events.retain(|_| nested.next() != Some(true));
+    }
     if reverse_candidates {
         events.reverse();
     }
@@ -3023,13 +3079,12 @@ fn collect_import_candidates(
         };
         truncated |= item_truncated;
         if reverse_candidates {
-            if candidate.item.kind == TrajectoryItemKind::Tool
-                && candidate_tools >= tool_event_limit
-            {
+            let length = candidate.char_len;
+            let is_tool = candidate.item.kind == TrajectoryItemKind::Tool;
+            if is_tool && !candidate_tools.admits(length) {
                 truncated = true;
                 continue;
             }
-            let length = candidate.char_len;
             if length > candidate_remaining {
                 // Older candidates cannot be retained, and their truncation flags cannot
                 // change the omission already recorded by this budget break.
@@ -3037,7 +3092,9 @@ fn collect_import_candidates(
                 break;
             }
             candidate_remaining -= length;
-            candidate_tools += usize::from(candidate.item.kind == TrajectoryItemKind::Tool);
+            if is_tool {
+                candidate_tools.spend(length);
+            }
         } else if current_compaction
             .is_some_and(|current| std::ptr::eq(current, event.recorded_event()))
         {
@@ -3051,13 +3108,83 @@ fn collect_import_candidates(
     (candidates, truncated, latest_compaction)
 }
 
+/// Count and character budget for the newest tool records.
+struct ToolBudget {
+    events: usize,
+    characters: usize,
+}
+
+impl ToolBudget {
+    const fn new(events: usize, characters: usize) -> Self {
+        Self { events, characters }
+    }
+
+    /// The first record that does not fit ends the retained tool history, so no gap opens in it.
+    fn admits(&mut self, length: usize) -> bool {
+        if self.events == 0 || length > self.characters {
+            self.events = 0;
+            return false;
+        }
+        true
+    }
+
+    fn spend(&mut self, length: usize) {
+        self.events -= 1;
+        self.characters -= length;
+    }
+}
+
+/// Marks the display records of commands that a completed Codex `exec` script ran.
+///
+/// The result of the script already holds what the agent received, so an import of both repeats
+/// the output. A failed display record can hold an error that no result repeats, so it stays.
+fn nested_codex_display(events: &[Occurrence<'_>]) -> Vec<bool> {
+    let id = |event: &OmniEvent| payload_string(&event.payload, &[&["call_id"], &["id"]]);
+    let mut calls = HashMap::new();
+    let mut depth = vec![0_isize; events.len()];
+    for (index, event) in events.iter().enumerate() {
+        match event.kind {
+            EventKind::ToolCalled => {
+                let script =
+                    event.payload["type"] == "custom_tool_call" && event.payload["name"] == "exec";
+                if let Some(id) = id(event) {
+                    calls.insert(id, script.then_some(index));
+                }
+            }
+            EventKind::ToolCompleted | EventKind::ToolFailed => {
+                let open = id(event).and_then(|id| calls.get_mut(&id)?.take());
+                if let Some(start) = open {
+                    depth[start] += 1;
+                    depth[index] -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut open = 0;
+    events
+        .iter()
+        .zip(depth)
+        .map(|(event, change)| {
+            open += change;
+            open > 0
+                && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+                && matches!(
+                    event.kind,
+                    EventKind::CommandExecuted | EventKind::ToolCompleted
+                )
+                && id(event).is_none_or(|id| !calls.contains_key(&id))
+        })
+        .collect()
+}
+
 // Reserve the summary first, then retain the newest items that fit. Its position in a
 // Codex replacement can be between messages, so return all indices in source order.
 fn retained_import_indices(
     count: usize,
     summary: Option<usize>,
     mut remaining: usize,
-    tool_limit: usize,
+    mut tools: ToolBudget,
     item_size: impl Fn(usize) -> (usize, bool),
     truncated: &mut bool,
 ) -> (Vec<usize>, usize) {
@@ -3072,13 +3199,12 @@ fn retained_import_indices(
         }
     });
     let mut indices = Vec::new();
-    let mut tools = 0;
     for i in (0..count).rev() {
         if Some(i) == summary {
             continue;
         }
         let (length, is_tool) = item_size(i);
-        if is_tool && tools >= tool_limit {
+        if is_tool && !tools.admits(length) {
             *truncated = true;
             continue;
         }
@@ -3087,7 +3213,9 @@ fn retained_import_indices(
             break;
         }
         remaining -= length;
-        tools += usize::from(is_tool);
+        if is_tool {
+            tools.spend(length);
+        }
         indices.push(i);
     }
     indices.reverse();
@@ -3123,7 +3251,7 @@ fn import_trajectory_with_limits(
         candidates.len(),
         summary,
         history_character_limit,
-        tool_event_limit,
+        ToolBudget::new(tool_event_limit, item_limits.tool_history),
         |i| {
             let candidate = &candidates[i];
             (
@@ -3170,16 +3298,15 @@ fn import_trajectory_with_limits(
     }
     let offset = items.len();
     let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
-    let mut documentary_flags = Vec::with_capacity(indices.len());
     for i in indices {
         let candidate = candidates[i].take().expect("retained index is unique");
-        documentary_flags.push(candidate.documentary_tool);
         items.push(candidate.item);
     }
+    // A documentary record, such as a provider's display copy of a command, can sit between a
+    // call and its result.
     let mut native = items[offset..]
         .iter_mut()
-        .zip(documentary_flags)
-        .filter_map(|(item, documentary)| (!documentary).then_some(item))
+        .filter(|item| item.kind != TrajectoryItemKind::Tool || item.tool.is_some())
         .collect::<Vec<_>>();
     validate_native_tools(&mut native, snapshot.session.provider);
     let tool_events = items
@@ -6064,17 +6191,17 @@ mod tests {
 
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
-        IMPORT_MESSAGE_CHARACTER_LIMIT, IMPORT_OMISSION_NOTICE,
-        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, NativeTrajectoryItem,
-        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
-        SOURCE_ITEM_LIMITS, SearchTruncationStrategy, Sensitivity, TrajectoryItem,
-        TrajectoryItemKind, TrajectoryTool, TransferMode, bounded_text, build_fidelity_report,
-        build_native_fork_report, canonicalize_path, capture_workspace,
-        fidelity_report_for_snapshot, fingerprint, first_user_message_after, import_conversation,
-        import_conversation_with_limit, import_trajectory, import_trajectory_with_limits,
-        native_trajectory_signature, ordinary_windows_path, readback_mismatch_summary,
-        readback_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
-        session_preview, session_search_title, trajectory_search_document,
+        IMPORT_MESSAGE_CHARACTER_LIMIT, IMPORT_OMISSION_NOTICE, IMPORT_TOOL_EVENT_CHARACTER_LIMIT,
+        IMPORT_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT,
+        NativeTrajectoryItem, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
+        SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT, SOURCE_ITEM_LIMITS, SearchTruncationStrategy,
+        Sensitivity, TrajectoryItem, TrajectoryItemKind, TrajectoryTool, TransferMode,
+        bounded_text, build_fidelity_report, build_native_fork_report, canonicalize_path,
+        capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
+        import_conversation, import_conversation_with_limit, import_trajectory,
+        import_trajectory_with_limits, native_trajectory_signature, ordinary_windows_path,
+        readback_mismatch_summary, readback_trajectory, redact_secrets, render_markdown_export,
+        render_semantic_handoff, session_preview, session_search_title, trajectory_search_document,
         trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
 
@@ -8879,7 +9006,7 @@ mod tests {
     #[test]
     fn native_trajectory_preserves_messages_after_tool_limit() {
         let mut events = vec![event(0, EventKind::MessageUser, json!({"text": "start"}))];
-        events.extend((1..=MARKDOWN_TOOL_EVENT_LIMIT as u64 + 1).map(|sequence| {
+        events.extend((1..=IMPORT_TOOL_EVENT_LIMIT as u64 + 1).map(|sequence| {
             event(
                 sequence,
                 EventKind::ToolCompleted,
@@ -8887,14 +9014,14 @@ mod tests {
             )
         }));
         events.push(event(
-            MARKDOWN_TOOL_EVENT_LIMIT as u64 + 2,
+            IMPORT_TOOL_EVENT_LIMIT as u64 + 2,
             EventKind::MessageAssistant,
             json!({"text": "latest conclusion"}),
         ));
 
         let trajectory = import_trajectory(&snapshot_with_events(events));
 
-        assert_eq!(trajectory.tool_events, MARKDOWN_TOOL_EVENT_LIMIT);
+        assert_eq!(trajectory.tool_events, IMPORT_TOOL_EVENT_LIMIT);
         assert!(trajectory.truncated);
         assert!(
             trajectory
@@ -9263,34 +9390,241 @@ mod tests {
     }
 
     #[test]
-    fn native_trajectory_keeps_results_with_non_text_blocks_documentary() {
+    fn native_trajectory_replaces_media_and_keeps_unknown_blocks_documentary() {
+        let data = "iVBORw0KGgo=";
+        let url = format!("data:image/png;base64,{data}");
+        for (block, placeholder) in [
+            (
+                json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}),
+                Some("[image omitted]"),
+            ),
+            (
+                json!({"type": "input_image", "image_url": url}),
+                Some("[image omitted]"),
+            ),
+            (
+                json!({"type": "input_audio", "audio_url": url}),
+                Some("[audio omitted]"),
+            ),
+            (
+                json!({"type": "document", "source": {"type": "base64", "data": data}}),
+                Some("[document omitted]"),
+            ),
+            (json!({"type": "future", "source": url}), None),
+        ] {
+            let snapshot = snapshot_with_events(vec![
+                event(
+                    1,
+                    EventKind::ToolCalled,
+                    json!({"id": "toolu_1", "name": "Read", "input": {"path": "diagram.png"}}),
+                ),
+                event(
+                    2,
+                    EventKind::ToolCompleted,
+                    json!({"tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "image attached"}, block,
+                    ]}),
+                ),
+            ]);
+
+            let trajectory = import_trajectory(&snapshot);
+
+            assert_eq!(trajectory.tool_events, 2);
+            assert!(
+                trajectory
+                    .items
+                    .iter()
+                    .all(|item| !item.text.contains(data))
+            );
+            let outputs = super::native_trajectory_items(&trajectory)
+                .into_iter()
+                .filter_map(|item| match item {
+                    NativeTrajectoryItem::Tool { output, .. } => Some(output),
+                    NativeTrajectoryItem::Message { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = placeholder.map(|text| format!("image attached\n{text}"));
+            assert_eq!(outputs, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn codex_import_omits_display_records_inside_a_completed_call() {
+        let display = |sequence, kind, id: &str| {
+            let mut display = event(
+                sequence,
+                kind,
+                json!({"type": "CommandExecution", "id": id, "output": format!("display {id}")}),
+            );
+            display.source.raw_record_type = Some("event_msg.item_completed".to_owned());
+            display
+        };
+        let call = |sequence, id: &str| {
+            event(
+                sequence,
+                EventKind::ToolCalled,
+                json!({"type": "custom_tool_call", "call_id": id, "name": "exec", "input": "script"}),
+            )
+        };
+        let mut snapshot = snapshot_with_events(vec![
+            display(1, EventKind::CommandExecuted, "before"),
+            call(2, "outer"),
+            display(3, EventKind::CommandExecuted, "nested"),
+            display(4, EventKind::ToolFailed, "nested-failure"),
+            event(
+                5,
+                EventKind::ToolCompleted,
+                json!({"call_id": "outer", "output": "result"}),
+            ),
+            display(6, EventKind::CommandExecuted, "after"),
+            // A record with the ID of the call itself can hold its only complete output.
+            call(7, "own"),
+            display(8, EventKind::CommandExecuted, "own"),
+            event(
+                9,
+                EventKind::ToolCompleted,
+                json!({"call_id": "own", "output": "cut"}),
+            ),
+            call(10, "open"),
+            display(11, EventKind::CommandExecuted, "unfinished"),
+            // Records without IDs cannot prove that a call is complete.
+            event(
+                12,
+                EventKind::ToolCalled,
+                json!({"type": "custom_tool_call", "name": "exec", "input": "script"}),
+            ),
+            display(13, EventKind::CommandExecuted, "unidentified"),
+            event(14, EventKind::ToolCompleted, json!({"output": "loose"})),
+            // Only a script runs commands that have display records of their own.
+            event(
+                15,
+                EventKind::ToolCalled,
+                json!({"type": "function_call", "call_id": "plain", "name": "exec", "arguments": "{}"}),
+            ),
+            display(16, EventKind::CommandExecuted, "separate"),
+            event(
+                17,
+                EventKind::ToolCompleted,
+                json!({"call_id": "plain", "output": "plain"}),
+            ),
+        ]);
+        let displayed = |snapshot: &CanonicalSnapshot| {
+            import_trajectory(snapshot)
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let text = item.text.split("display ").nth(1)?;
+                    Some(text.split('"').next()?.to_owned())
+                })
+                .collect::<Vec<_>>()
+        };
+        snapshot.session.provider = Provider::Codex;
+        assert_eq!(
+            displayed(&snapshot),
+            [
+                "before",
+                "nested-failure",
+                "after",
+                "own",
+                "unfinished",
+                "unidentified",
+                "separate"
+            ]
+        );
+        snapshot.session.provider = Provider::Claude;
+        assert_eq!(displayed(&snapshot).len(), 8);
+    }
+
+    #[test]
+    fn native_trajectory_pairs_calls_around_documentary_records() {
+        let command = json!({"type": "CommandExecution", "id": "display", "command": "build"});
         let snapshot = snapshot_with_events(vec![
             event(
                 1,
                 EventKind::ToolCalled,
-                json!({"id": "toolu_1", "name": "Read", "input": {"path": "diagram.png"}}),
+                json!({"call_id": "one", "name": "exec", "input": {}}),
+            ),
+            event(2, EventKind::CommandExecuted, command.clone()),
+            event(
+                3,
+                EventKind::ToolCalled,
+                json!({"call_id": "two", "name": "exec", "input": {}}),
             ),
             event(
-                2,
+                4,
                 EventKind::ToolCompleted,
-                json!({"tool_use_id": "toolu_1", "content": [
-                    {"type": "text", "text": "image attached"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
-                ]}),
+                json!({"call_id": "one", "output": "first"}),
+            ),
+            event(5, EventKind::CommandExecuted, command),
+            event(
+                6,
+                EventKind::ToolCompleted,
+                json!({"call_id": "two", "output": "second"}),
+            ),
+            // A message between a call and its result still separates them.
+            event(
+                7,
+                EventKind::ToolCalled,
+                json!({"call_id": "three", "name": "exec", "input": {}}),
+            ),
+            event(8, EventKind::MessageAssistant, json!({"text": "progress"})),
+            event(
+                9,
+                EventKind::ToolCompleted,
+                json!({"call_id": "three", "output": "third"}),
             ),
         ]);
+        let items = super::native_trajectory_items(&import_trajectory(&snapshot));
+        let shape = items.iter().map(|item| match item {
+            NativeTrajectoryItem::Tool { output, .. } => output.as_str(),
+            NativeTrajectoryItem::Message { text, .. } => text.lines().next().unwrap(),
+        });
+        let display = "[Historical command record. Documentary context only; do not replay.]";
+        assert_eq!(
+            shape.collect::<Vec<_>>(),
+            [
+                "first",
+                display,
+                "second",
+                display,
+                "[Historical tool call. Documentary context only; do not replay.]",
+                "progress",
+                "[Historical tool result. Documentary context only; do not replay.]",
+            ]
+        );
+    }
 
+    #[test]
+    fn import_drops_messages_that_hold_only_whitespace() {
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text": "question"})),
+            event(2, EventKind::MessageAssistant, json!({"text": "\n"})),
+            event(3, EventKind::MessageUser, json!({"text": " \t\u{a0}"})),
+            event(
+                4,
+                EventKind::MessageAssistant,
+                json!({"text": "\nanswer\n"}),
+            ),
+        ]);
         let trajectory = import_trajectory(&snapshot);
-
-        assert_eq!(trajectory.tool_events, 2);
-        assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+        let texts = trajectory.items.iter().map(|item| item.text.as_str());
+        assert_eq!(texts.collect::<Vec<_>>(), ["question", "\nanswer\n"]);
+        assert!(!trajectory.truncated);
+        let conversation = super::import_conversation(&snapshot);
+        let texts = conversation.messages.iter().map(|item| item.text.as_str());
+        assert_eq!(texts.collect::<Vec<_>>(), ["question", "\nanswer\n"]);
+        // A generated session that stores such a message still differs from its import.
+        assert_eq!(
+            super::readback_trajectory(&snapshot).unwrap().items.len(),
+            4
+        );
     }
 
     #[test]
     fn readback_trajectory_compares_complete_items_but_not_omissions() {
         let output = bounded_text(
-            &"x".repeat(MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 1),
-            MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+            &"x".repeat(IMPORT_TOOL_EVENT_CHARACTER_LIMIT + 1),
+            IMPORT_TOOL_EVENT_CHARACTER_LIMIT,
         );
         let answer = bounded_text(
             &"y".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT + 1),
@@ -9399,7 +9733,7 @@ mod tests {
                 json!({
                     "type": "function_call_output",
                     "call_id": "call_a",
-                    "output": format!("{}{secret}", "x".repeat(MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT - 18)),
+                    "output": format!("{}{secret}", "x".repeat(IMPORT_TOOL_EVENT_CHARACTER_LIMIT - 18)),
                 }),
             ),
             event(
@@ -9577,10 +9911,17 @@ mod tests {
         let item_limits = super::ItemLimits {
             message: 64,
             tool_event: 512,
+            tool_history: usize::MAX,
             redact: true,
         };
         for history_limit in [256, 1_024, 4_096] {
-            for tool_limit in [0, 1, 2] {
+            for (tool_limit, tool_history) in
+                [(0, usize::MAX), (1, usize::MAX), (2, usize::MAX), (3, 200)]
+            {
+                let item_limits = super::ItemLimits {
+                    tool_history,
+                    ..item_limits
+                };
                 let actual = import_trajectory_with_limits(
                     &snapshot,
                     history_limit,
@@ -9591,6 +9932,10 @@ mod tests {
                     actual,
                     reference_import_trajectory(&snapshot, history_limit, tool_limit, item_limits)
                 );
+                if history_limit == 4_096 && tool_limit == 3 {
+                    assert_eq!(actual.tool_events, 1);
+                    assert!(actual.truncated);
+                }
                 if history_limit == 1_024 && tool_limit == 2 {
                     assert_eq!(actual.tool_events, 2);
                     assert!(native_trajectory_signature(&actual).iter().any(|item| {
@@ -9628,6 +9973,7 @@ mod tests {
         let item_limits = super::ItemLimits {
             message: 3,
             tool_event: 512,
+            tool_history: usize::MAX,
             redact: true,
         };
         let actual = import_trajectory_with_limits(&snapshot, 1_024, 0, item_limits);
