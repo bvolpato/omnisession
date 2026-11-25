@@ -1592,46 +1592,7 @@ fn read_picker_preview(
             .map(|read| (read, None));
     }
     if has_scoped_home(session.provider) {
-        let home = key
-            .native_home
-            .as_deref()
-            .context("native preview home is unavailable")?;
-        anyhow::ensure!(
-            registry.discovery_cache_home(session.provider)?.as_deref() == Some(home),
-            "native preview home changed"
-        );
-        let (mut read, source) = search_index::observe_native_read(
-            registry,
-            store,
-            session,
-            source_path,
-            key.source_revision,
-            |adapter, path| {
-                let read = if full_read {
-                    adapter.read_full_index_at(session, path)?
-                } else {
-                    adapter.index_session(session, path, 0)?
-                };
-                let time = adapter.search_source_time(&read.snapshot, path)?;
-                Ok((read, time))
-            },
-        )?;
-        let observation = source
-            .as_ref()
-            .and_then(|source| source.observation.as_ref());
-        anyhow::ensure!(
-            observation.is_some_and(|source| source.home == home),
-            "native preview source changed"
-        );
-        if let Some(source) = &source {
-            read.source_revision = source.revision();
-        }
-        read.source_complete &=
-            !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&read.snapshot)
-                && !omnis_adapters::AntigravityIdeAdapter::has_unreadable_log_records(
-                    &read.snapshot,
-                );
-        return Ok((read, source));
+        return read_scoped_home_preview(registry, store, key, source_path, full_read);
     }
     let (snapshot, source) = read_native_search_snapshot(registry, store, session, full_read)?;
     Ok((
@@ -1654,6 +1615,87 @@ fn read_picker_preview(
         },
         source,
     ))
+}
+
+fn read_scoped_home_preview(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    key: &PreviewKey,
+    source_path: Option<&Path>,
+    full_read: bool,
+) -> anyhow::Result<(IndexRead, Option<SearchSource>)> {
+    let session = &key.session;
+    let home = key
+        .native_home
+        .as_deref()
+        .context("native preview home is unavailable")?;
+    anyhow::ensure!(
+        registry.discovery_cache_home(session.provider)?.as_deref() == Some(home),
+        "native preview home changed"
+    );
+    let observed = search_index::observe_native_read(
+        registry,
+        store,
+        session,
+        source_path,
+        key.source_revision,
+        |adapter, path| {
+            let read = if full_read {
+                adapter.read_full_index_at(session, path)?
+            } else {
+                adapter.index_session(session, path, 0)?
+            };
+            let time = adapter.search_source_time(&read.snapshot, path)?;
+            Ok((read, time))
+        },
+    );
+    match observed {
+        Ok((mut read, Some(source))) => {
+            let observation = source.observation.as_ref();
+            anyhow::ensure!(
+                observation.is_some_and(|source| source.home == home),
+                "native preview source changed"
+            );
+            read.source_revision = source.revision();
+            read.source_complete &=
+                !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&read.snapshot)
+                    && !omnis_adapters::AntigravityIdeAdapter::has_unreadable_log_records(
+                        &read.snapshot,
+                    );
+            Ok((read, Some(source)))
+        }
+        Ok((mut read, None)) if session.provider == Provider::Antigravity && !full_read => {
+            // The read succeeded, but the shared catalog WAL or source changed before
+            // post-read certification. Still show the preview without writing to the index
+            // or promoting an uncertified opener title.
+            anyhow::ensure!(
+                registry.discovery_cache_home(session.provider)?.as_deref() == Some(home),
+                "native preview home changed"
+            );
+            read.source_complete = false;
+            read.verified_prefix_end = None;
+            Ok((read, None))
+        }
+        Ok((_, None)) => anyhow::bail!("native preview source changed"),
+        Err(_) if session.provider == Provider::Antigravity && !full_read => {
+            // Live or stale-cached Antigravity CLI sessions can advance between discovery
+            // and preview. Fall back to a direct bounded preview without indexing it.
+            let adapter = registry.adapter(session.provider)?;
+            anyhow::ensure!(
+                adapter.discovery_cache_home()?.as_deref() == Some(home),
+                "native preview home changed"
+            );
+            let snapshot = adapter.preview_session(session)?;
+            anyhow::ensure!(
+                adapter.discovery_cache_home()?.as_deref() == Some(home),
+                "native preview home changed"
+            );
+            let mut read = crate::complete_snapshot_read(session.provider, snapshot);
+            read.source_complete = false;
+            Ok((read, None))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn reports_incomplete_preview(event: &omnis_ir::OmniEvent) -> bool {
@@ -2865,6 +2907,111 @@ mod tests {
         assert_eq!(
             store.search_session_trajectories("middlereply", 1)?,
             [native.session]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_preview_stays_available_when_revision_is_stale_without_writing_index()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let logs = root
+            .path()
+            .join("brain")
+            .join(&id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs)?;
+        let db = rusqlite::Connection::open(root.path().join("conversation_summaries.db"))?;
+        db.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT,
+                step_count INTEGER,
+                last_modified_time TEXT,
+                workspace_uris TEXT
+            )",
+        )?;
+        db.execute(
+            "INSERT INTO conversation_summaries VALUES (?1,'Live session',2,'2026-07-28T12:00:00Z','[]')",
+            [&id],
+        )?;
+        let transcript = logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"USER_INPUT","content":"initial prompt"}"#,
+                "\n",
+                r#"{"type":"PLANNER_RESPONSE","content":"initialreplyneedle"}"#,
+                "\n",
+            ),
+        )?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::AntigravityAdapter::with_root(root.path()));
+        let store = Store::open(root.path().join("state.db"))?;
+        let stale_native = registry
+            .find_native_session(Provider::Antigravity, &id)?
+            .unwrap();
+
+        // Advance the live transcript after discovery so `stale_native.source_revision` is stale.
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"USER_INPUT","content":"initial prompt"}"#,
+                "\n",
+                r#"{"type":"PLANNER_RESPONSE","content":"initialreplyneedle"}"#,
+                "\n",
+                r#"{"type":"PLANNER_RESPONSE","content":"freshlivereplyneedle"}"#,
+                "\n",
+            ),
+        )?;
+
+        let key = PreviewKey {
+            copy_path: None,
+            copy_directory: None,
+            session: stale_native.session.clone(),
+            source: stale_native.source_revision.map(PreviewSource::File),
+            source_revision: stale_native.source_revision,
+            native_home: registry.discovery_cache_home(Provider::Antigravity)?,
+            native_summary: false,
+            catalog: None,
+            updated_at: stale_native.updated_at,
+            continuation_after: None,
+        };
+        let (sender, _updates) = mpsc::channel();
+        let (refresh, _requests) = mpsc::sync_channel(1);
+        let update = preview_update(
+            &registry,
+            Some(&store),
+            PreviewRequest {
+                key,
+                source_path: stale_native.source_path.clone(),
+                cached: true,
+                provider_name: stale_native.title.clone(),
+            },
+            &sender,
+            &refresh,
+        );
+        match update {
+            PickerUpdate::Preview {
+                value: PreviewValue::Ready { preview, .. },
+                ..
+            } => {
+                assert_eq!(
+                    preview.latest.as_ref().map(|msg| msg.text.as_str()),
+                    Some("freshlivereplyneedle")
+                );
+            }
+            other => panic!(
+                "expected ready fallback preview for stale Antigravity session, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        // Fallback preview must not write an uncertified document into the search index.
+        assert!(
+            store
+                .search_session_trajectories("freshlivereplyneedle", 1)?
+                .is_empty()
         );
         Ok(())
     }
