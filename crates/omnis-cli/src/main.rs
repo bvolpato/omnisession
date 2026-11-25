@@ -3738,6 +3738,9 @@ struct ResumeArgs {
     // Set when an interactive picker, not `--in`, chose the target.
     #[arg(skip)]
     picked_target: bool,
+    // Only `omni fork` accepts a model.
+    #[arg(skip)]
+    model: Option<String>,
     #[arg(
         value_name = "SOURCE",
         help = "Provider-qualified reference or exact session ID"
@@ -3830,6 +3833,14 @@ struct ForkArgs {
         help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
     )]
     mode: Option<launch_mode::ModeKind>,
+    #[arg(
+        long,
+        value_name = "MODEL",
+        value_parser = launch_mode::parse_model,
+        conflicts_with = "materialize_only",
+        help = "Model the target agent starts with, passed to it as `--model`; fails if the agent has no such option"
+    )]
+    model: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -5018,6 +5029,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         no_fork: true,
         allow_workspace_mismatch: false,
         picked_target: false,
+        model: None,
         mode: args.mode,
     };
     resume(registry, &resume_args, json_output, Some(&binding))
@@ -7228,6 +7240,22 @@ mod tests {
     }
 
     #[test]
+    fn fork_model_cannot_become_another_option() {
+        let parse = |model: &str| Cli::try_parse_from(["omni", "fork", "abc", model]);
+        let Commands::Fork(args) = parse("--model=synthetic/model[1m]")
+            .expect("valid model")
+            .command
+            .expect("subcommand")
+        else {
+            panic!("fork command");
+        };
+        assert_eq!(args.model.as_deref(), Some("synthetic/model[1m]"));
+        for model in ["--model=", "--model= ", "--model=--yolo", "--model=a\nb"] {
+            assert!(parse(model).is_err(), "{model:?}");
+        }
+    }
+
+    #[test]
     fn resume_accepts_interactive_source_filters() {
         let cli = Cli::try_parse_from([
             "omni", "resume", "--in", "codex", "--from", "claude", "--all",
@@ -7251,6 +7279,7 @@ mod tests {
             profile: None,
             resume_in_place: true,
             mode: None,
+            model: None,
             picked_target: false,
             picker_selection: Some(PickerSelection {
                 session: codex,
@@ -7278,6 +7307,7 @@ mod tests {
             profile: None,
             resume_in_place: false,
             mode: None,
+            model: None,
             picker_selection: None,
             picked_target: false,
         };

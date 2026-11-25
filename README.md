@@ -287,6 +287,7 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--materialize-only` creates and verifies a supported native target session without launching it.
 - `--dry-run` shows what would happen without launching.
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
+- `omni fork --model <model>` passes `--model <model>` to the target agent. The fork stops before any import if the agent does not list that option. If you choose to fork in the source agent after a failed import, OmniSession does not pass the model to that agent.
 - Transfers across different workspace roots require `--allow-workspace-mismatch`. If the old worktree has moved, this flag also lets an explicit native fork or resume use the current workspace.
 
 If an import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. This also applies to same-agent forks that OmniSession creates by importing a new session. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. For Pi and Oh My Pi, it includes earlier turns on the selected branch. An Oh My Pi `/clear` starts a new task and keeps the preceding task out of its handoff. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.

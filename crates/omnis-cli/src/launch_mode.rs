@@ -458,6 +458,43 @@ fn is_column_gap(whitespace: &str) -> bool {
 
 const MAX_CACHED_BINARIES: usize = 64;
 
+/// Accepts any model name that an agent cannot read as another option.
+pub(crate) fn parse_model(value: &str) -> std::result::Result<String, String> {
+    let model = value.trim();
+    if model.is_empty() {
+        return Err("a model name is required".to_owned());
+    }
+    if model.starts_with('-') || model.chars().any(char::is_control) {
+        return Err("a model name cannot start with `-` or contain control characters".to_owned());
+    }
+    Ok(model.to_owned())
+}
+
+/// Not a permission mode. This is the declaration that `--help` must list before `omni` passes a
+/// model.
+static MODEL_OPTION: LaunchMode = mode(ModeKind::Default, &["--model"], &["--model"]);
+
+/// Whether the launcher of `target` lists `--model` in its selected workspace and environment.
+pub(crate) fn lists_model_option(target: AgentTarget, project: &Path) -> Result<bool> {
+    let mut command = help_command(target, project)?;
+    let (help, _) = help_output(target.provider, &mut command, &MODEL_OPTION)?;
+    Ok(help_lists(&help, &MODEL_OPTION))
+}
+
+fn help_command(target: AgentTarget, project: &Path) -> Result<Command> {
+    let program = target
+        .provider
+        .command()
+        .context("agent has no command-line launcher")?;
+    let plan = target.launch(LaunchPlan {
+        program: program.to_owned(),
+        args: vec!["--help".to_owned()],
+        cwd: Some(project.to_owned()),
+        env: Vec::new(),
+    })?;
+    crate::prepare_launch_command(&plan)
+}
+
 /// Permission modes reported by the launcher in its selected workspace and environment.
 pub(crate) struct InstalledModes {
     supported: Vec<ModeKind>,
@@ -469,17 +506,7 @@ impl InstalledModes {
         project: &Path,
         requested: &'static LaunchMode,
     ) -> Result<Self> {
-        let program = target
-            .provider
-            .command()
-            .context("agent has no permission-mode launcher")?;
-        let plan = target.launch(LaunchPlan {
-            program: program.to_owned(),
-            args: vec!["--help".to_owned()],
-            cwd: Some(project.to_owned()),
-            env: Vec::new(),
-        })?;
-        let mut command = crate::prepare_launch_command(&plan)?;
+        let mut command = help_command(target, project)?;
         // A replacement program can delegate to a different runtime without changing itself.
         let cache_path = if target.overrides_program() {
             None
@@ -722,7 +749,7 @@ fn help_output(
             move |help| help_lists(help, requested),
         )
     })
-    .context("executing provider permission help")?;
+    .context("executing provider help")?;
     if !output.status.success() {
         bail!("`--help` exited with {}", output.status);
     }

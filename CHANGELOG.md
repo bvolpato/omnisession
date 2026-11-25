@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Pass a model to the target agent with `omni fork --model <model>`. The fork stops before any import when the agent does not list `--model`, or when the launch profile already sets a model in its arguments.
+
 ### Fixed
 
 - Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.

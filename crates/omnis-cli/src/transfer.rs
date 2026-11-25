@@ -264,7 +264,9 @@ fn resume_from_snapshot(
         let mode_dir = cursor_working_directory(target, &process_directory)?;
         let should_preprobe = target != Provider::CursorIde
             && may_attempt_native_import(target)
-            && (request.mode.is_some() || env::var_os("OMNI_MODE").is_some())
+            && (request.mode.is_some()
+                || request.model.is_some()
+                || env::var_os("OMNI_MODE").is_some())
             && (materialize_fork
                 || (source.provider != target
                     && cross_provider_route(target, request.picked_target)
@@ -276,13 +278,12 @@ fn resume_from_snapshot(
                         crate::version_gate::preprobe_version(&binary, target);
                     }
                 }));
-                let resolved =
-                    launch_mode_args(request.agent_target(), request.mode, &mode_dir, json_output);
+                let resolved = request.launch_option_args(&mode_dir, json_output);
                 let _ = preprobe.join();
                 resolved
             })?
         } else {
-            launch_mode_args(request.agent_target(), request.mode, &mode_dir, json_output)?
+            request.launch_option_args(&mode_dir, json_output)?
         }
     };
     let context = ResumeContext {
@@ -471,6 +472,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
             no_fork: false,
             allow_workspace_mismatch: args.allow_workspace_mismatch,
             picked_target: args.target.is_none(),
+            model: args.model.clone(),
             mode,
         },
         json_output,
@@ -778,9 +780,7 @@ fn resume_native_without_snapshot(
     }
     let (project, repository_matches) =
         native_resume_workspace(registry, request, args, workspace_prompt)?;
-    let mode_args = |directory: &Path| {
-        launch_mode_args(request.agent_target(), request.mode, directory, json_output)
-    };
+    let mode_args = |directory: &Path| request.launch_option_args(directory, json_output);
     let is_opencode_v2_fork = request.target == Provider::OpenCode
         && !request.resume_in_place
         && resolved_provider_binary(Provider::OpenCode)
@@ -1701,7 +1701,7 @@ struct ResumeContext<'a> {
     json_output: bool,
     repository_matches: bool,
     mode: ResumeMode,
-    /// Permission mode flags for the target agent, resolved once per run.
+    /// Permission mode and model flags for the target agent, resolved once per run.
     mode_args: &'a [String],
     picker_selection: Option<&'a session_picker::PickerSelection>,
     /// The launch profile that starts `target`, or `None` for the agent itself.
@@ -1874,6 +1874,49 @@ pub(super) fn launch_mode_args(
         .iter()
         .map(|arg| (*arg).to_owned())
         .collect())
+}
+
+/// Flags that start `target` with `model`. A model is an explicit choice, so an agent that cannot
+/// take it stops the run before anything is imported instead of starting with another model.
+fn launch_model_args(
+    target: AgentTarget,
+    model: &str,
+    project: &Path,
+    quiet: bool,
+) -> Result<Vec<String>> {
+    let name = provider_name(target.provider);
+    if target.provider.command().is_none() {
+        bail!("{name} takes no launch options, so OmniSession cannot pass `--model` to it");
+    }
+    // Some agents reject a repeated option, and others silently keep the last one.
+    if let Some(profile) = target
+        .profile
+        .filter(|profile| !profile.overrides_program())
+        && profile
+            .expanded_args(&launch_profile::environment)?
+            .iter()
+            .any(|arg| {
+                matches!(
+                    arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag),
+                    "--model" | "-m"
+                )
+            })
+    {
+        bail!(
+            "launch profile `{target}` already sets a model in its arguments. Remove it there, or omit `--model`"
+        );
+    }
+    if !launch_mode::lists_model_option(target, project)
+        .with_context(|| format!("checking whether {name} accepts `--model`"))?
+    {
+        bail!(
+            "`--help` of {target} does not list `--model`, so OmniSession cannot select `{model}`"
+        );
+    }
+    if !quiet {
+        progress_line(&format!("{name} model: {}.", safe_terminal_line(model)))?;
+    }
+    Ok(vec!["--model".to_owned(), model.to_owned()])
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2151,8 +2194,10 @@ fn fork_in_source(context: &ResumeContext<'_>) -> Result<()> {
         profile: None,
         resume_in_place: false,
         // The target page choice and `--mode` were made for another agent, so this one starts in
-        // its own default. A permission mode never moves to an agent it was not chosen for.
+        // its own default. A permission mode never moves to an agent it was not chosen for, and
+        // neither does a model.
         mode: None,
+        model: None,
         picker_selection: context.picker_selection.cloned().map(|mut selection| {
             selection.target = source.into();
             selection.fork = true;
@@ -3824,6 +3869,8 @@ pub(super) struct ResolvedResumeRequest {
     pub(super) resume_in_place: bool,
     /// The target page choice, else `--mode`. `None` leaves the target's default mode to apply.
     pub(super) mode: Option<ModeKind>,
+    /// The model that `omni fork --model` names for the target.
+    pub(super) model: Option<String>,
     pub(super) picker_selection: Option<session_picker::PickerSelection>,
     /// Whether an interactive picker chose `target` instead of `--in`.
     pub(super) picked_target: bool,
@@ -3835,6 +3882,16 @@ impl ResolvedResumeRequest {
             provider: self.target,
             profile: self.profile,
         }
+    }
+
+    /// Permission mode and model flags the target agent starts with, after saying what they are.
+    fn launch_option_args(&self, project: &Path, quiet: bool) -> Result<Vec<String>> {
+        let target = self.agent_target();
+        let mut args = launch_mode_args(target, self.mode, project, quiet)?;
+        if let Some(model) = &self.model {
+            args.extend(launch_model_args(target, model, project, quiet)?);
+        }
+        Ok(args)
     }
 }
 
@@ -3957,6 +4014,7 @@ fn resolve_resume_request(
         profile: target.profile,
         resume_in_place,
         mode,
+        model: args.model.clone(),
         picker_selection,
         picked_target,
     })))
@@ -4095,6 +4153,7 @@ mod tests {
             profile: source.target.profile,
             resume_in_place: true,
             mode: None,
+            model: None,
             picker_selection: picked.cloned(),
             picked_target: picked.is_some(),
         };

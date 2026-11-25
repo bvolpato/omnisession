@@ -123,6 +123,8 @@ The [permission mode](../README.md#permission-modes) flags come from the agent t
 
 If the program's help command fails, OmniSession checks again the next time a launch needs a permission mode.
 
+`omni fork --model <model>` uses the same help check. If the help does not list `--model`, or the arguments of a profile without `program` already set a model, the fork stops before the import.
+
 ## Check a profile
 
 `omni profiles` prints the file, then each profile with a summary and its state:
