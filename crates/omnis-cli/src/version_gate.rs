@@ -132,8 +132,14 @@ pub(crate) fn is_named_install(binary: &Path, canonical: &Path) -> bool {
     name(canonical.file_name())
         .zip(name(binary.file_stem()))
         .is_some_and(|(resolved, command)| {
-            resolved.starts_with(&command)
-                || resolved.starts_with(|first: char| first.is_ascii_digit())
+            let matches_command = if cfg!(windows) {
+                resolved
+                    .get(..command.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&command))
+            } else {
+                resolved.starts_with(&command)
+            };
+            matches_command || resolved.starts_with(|first: char| first.is_ascii_digit())
         })
 }
 

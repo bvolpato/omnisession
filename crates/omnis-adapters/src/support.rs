@@ -195,7 +195,7 @@ pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
         return executable(name);
     };
     let candidate = Path::new(&value);
-    if !candidate.is_absolute() || !is_executable(candidate) {
+    if !candidate.is_absolute() || !is_executable(candidate) || is_omnisession_binary(candidate) {
         return None;
     }
     let binary = fs::canonicalize(candidate).ok()?;
@@ -205,7 +205,14 @@ pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
         return None;
     }
     // A dispatcher selects its command from the name used to invoke it.
-    let dispatched = provider != Provider::CursorCli && candidate.file_name() != binary.file_name();
+    let same_name = match (
+        candidate.file_name().and_then(std::ffi::OsStr::to_str),
+        binary.file_name().and_then(std::ffi::OsStr::to_str),
+    ) {
+        (Some(left), Some(right)) if cfg!(windows) => left.eq_ignore_ascii_case(right),
+        _ => candidate.file_name() == binary.file_name(),
+    };
+    let dispatched = provider != Provider::CursorCli && !same_name;
     Some(if dispatched {
         candidate.to_owned()
     } else {

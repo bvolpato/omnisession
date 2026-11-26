@@ -244,10 +244,18 @@ fn opencode_major_version(output: &str) -> Option<u64> {
         let trimmed = line.trim();
         let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
         let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
-        version_str
-            .split('.')
-            .next()
-            .and_then(|major| major.parse::<u64>().ok())
+        let (major, rest) = version_str.split_once('.')?;
+        let minor_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if minor_len == 0 {
+            return None;
+        }
+        if !matches!(
+            rest.as_bytes().get(minor_len),
+            None | Some(b'.' | b'-' | b'+' | b' ' | b'\t')
+        ) {
+            return None;
+        }
+        major.parse::<u64>().ok()
     })
 }
 
@@ -1272,6 +1280,10 @@ mod tests {
             ("opencode v2.0.1\n", Some(2)),
             ("2.1.0-beta.1\nUpdate available\n", Some(2)),
             ("Now using node v22.3.0 (npm v10.8.1)\n2.2.0\n", Some(2)),
+            ("1. Activating environment...\n2.2.0\n", Some(2)),
+            ("42\n2.2.0\n", Some(2)),
+            ("1. Activating environment...\n", None),
+            ("42\n", None),
             ("unknown\n", None),
         ] {
             assert_eq!(super::opencode_major_version(output), major, "{output}");
