@@ -50,14 +50,20 @@ struct Observation {
 }
 
 impl Observation {
+    /// A check from further ahead than the freshness window was recorded before the system clock
+    /// moved back, so it is not recent.
+    fn is_recent(&self, fresh_since: DateTime<Utc>) -> bool {
+        let now = Utc::now();
+        let latest = now + (now - fresh_since);
+        (fresh_since.timestamp_millis()..=latest.timestamp_millis()).contains(&self.checked_at)
+    }
+
     fn state(&self, fresh_since: DateTime<Utc>) -> SessionDiscoveryState {
         match self.succeeded {
             Some(true) => SessionDiscoveryState::Published,
             Some(false) => SessionDiscoveryState::Failed,
-            None if self.checked_at < fresh_since.timestamp_millis() => {
-                SessionDiscoveryState::Expired
-            }
-            None => SessionDiscoveryState::InProgress,
+            None if self.is_recent(fresh_since) => SessionDiscoveryState::InProgress,
+            None => SessionDiscoveryState::Expired,
         }
     }
 }
@@ -106,7 +112,7 @@ fn recent_claim(
     let Some(check) = current_attempt(connection, provider, version, home)? else {
         return Ok(None);
     };
-    if !check.selected_home || check.checked_at < fresh_since.timestamp_millis() {
+    if !check.selected_home || !check.is_recent(fresh_since) {
         return Ok(None);
     }
     if check.succeeded.is_some() {
