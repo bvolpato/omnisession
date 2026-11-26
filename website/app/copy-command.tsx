@@ -28,7 +28,7 @@ async function copyText(value: string) {
   }
 }
 
-export function CopyInstallCommand({ command }: { command: string }) {
+export function CopyCommand({ command, label: name }: { command: string; label: string }) {
   const [state, setState] = useState<CopyState>("idle");
 
   async function copy() {
@@ -41,11 +41,11 @@ export function CopyInstallCommand({ command }: { command: string }) {
   }
 
   const label = state === "copied" ? "Copied" : state === "failed" ? "Try again" : "Copy";
-  const announcement = state === "copied" ? "Install command copied" : state === "failed" ? "Copy failed" : "";
+  const announcement = state === "copied" ? "Command copied" : state === "failed" ? "Copy failed" : "";
 
   return (
     <>
-      <button aria-label="Copy install command" className="copy-command" onClick={copy} type="button">
+      <button aria-label={name} className="copy-command" onClick={copy} type="button">
         <svg aria-hidden="true" viewBox="0 0 16 16">
           {state === "copied"
             ? <path d="m3.5 8.5 3 3 6-7" />

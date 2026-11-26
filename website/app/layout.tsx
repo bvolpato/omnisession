@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { JetBrains_Mono, Overpass } from "next/font/google";
 import "./globals.css";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
@@ -15,8 +15,9 @@ const socialImage = {
   type: "image/png",
 };
 
-const geistSans = Geist({ subsets: ["latin"], variable: "--font-geist-sans" });
-const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
+// Overpass descends from Highway Gothic, the road sign alphabet.
+const display = Overpass({ subsets: ["latin"], variable: "--font-display" });
+const code = JetBrains_Mono({ subsets: ["latin"], variable: "--font-code" });
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
@@ -45,14 +46,14 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   colorScheme: "dark light",
   themeColor: [
-    { media: "(prefers-color-scheme: dark)", color: "#080b15" },
-    { media: "(prefers-color-scheme: light)", color: "#f6f7fb" },
+    { media: "(prefers-color-scheme: dark)", color: "#000000" },
+    { media: "(prefers-color-scheme: light)", color: "#131412" },
   ],
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html className={`${geistSans.variable} ${geistMono.variable}`} lang="en">
+    <html className={`${display.variable} ${code.variable}`} lang="en">
       <body>{children}</body>
     </html>
   );

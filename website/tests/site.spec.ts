@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { providers } from "../app/providers.generated";
 
 const siteUrl = "https://bvolpato.github.io/omnisession/";
-const heroTitle = "Continue any session in any agent.";
+const heroTitle = "Switch agents. Keep the thread.";
 const unixCommand = "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh";
 const windowsCommand = "irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex";
 const capabilityKeys = ["read_index", "clean_start", "same_provider_resume", "cross_provider_import"] as const;
@@ -74,36 +74,20 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(page.getByRole("main")).toBeVisible();
   await expect(page.getByRole("contentinfo")).toBeVisible();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(heroTitle);
-  const releaseNotes = page.getByRole("link", { name: "Read the latest release notes" });
-  await expect(releaseNotes).toBeVisible();
-  await expect(releaseNotes).toHaveAttribute("href", "https://github.com/bvolpato/omnisession/releases/latest");
-  const demo = page.getByRole("figure", { name: /Code in Codex\. Docs in Claude\./ });
-  await expect(demo.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ })).toBeVisible();
-  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);
-  await demo.getByRole("button", { name: "Play demo" }).click();
-  await expect(demo.getByRole("button", { name: "Stop demo" })).toHaveAttribute("aria-pressed", "true");
-  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.gif$/);
-  await expect.poll(() => demo.locator("img").evaluate((element) => (element as HTMLImageElement).currentSrc)).toMatch(/\.gif$/);
-  await expect.poll(() => demo.locator("img").evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBe(1200);
-  const animatedDemo = await page.request.get("demo/fork-session_dark.gif");
-  expect(animatedDemo.ok()).toBe(true);
-  expect(animatedDemo.headers()["content-type"]).toBe("image/gif");
-  await demo.getByRole("button", { name: "Stop demo" }).click();
-  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);
 
   const sections = [
-    ["features", "Switch agents. Keep the thread."],
-    ["how-it-works", "Discover. Search. Continue."],
-    ["agents", `${providers.length} agents. One matrix.`],
+    ["map", "Change here for any agent."],
+    ["transfer", "What happens when you press Enter."],
+    ["search", "Find the one you half remember."],
     ["safety", "Your originals stay original."],
-    ["install", "Install in one line."],
-    ["faq", "Questions, answered."],
+    ["agents", `${providers.length} agents, platform by platform.`],
+    ["install", "One binary. One line."],
+    ["faq", "Questions."],
   ] as const;
   for (const [id, heading] of sections) {
     await expect(page.locator(`section#${id}`).getByRole("heading", { level: 2 })).toHaveText(heading);
   }
-  await expect(page.locator("#features article")).toHaveCount(5);
-  await expect(page.locator("#how-it-works").getByRole("listitem")).toHaveCount(3);
+  await expect(page.locator("#transfer ol").getByRole("listitem")).toHaveCount(4);
 
   const supportRows = page.getByRole("table", { name: "Agent support by platform" }).getByRole("row");
   await expect(supportRows).toHaveCount(providers.length + 1);
@@ -167,9 +151,6 @@ test("mobile layout stays within viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.goto("./");
-  const demoImage = page.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ });
-  await demoImage.scrollIntoViewIfNeeded();
-  await expect.poll(() => demoImage.evaluate((element) => (element as HTMLImageElement).currentSrc)).toMatch(/_light\.png$/);
   await expectNoPageOverflow(page);
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await expect(page.getByRole("region", { name: heroTitle }).getByRole("button", { name: "Copy install command" })).toBeVisible();
@@ -180,4 +161,63 @@ test("mobile layout stays within viewport", async ({ page }) => {
   await expect(install.getByRole("tabpanel")).toContainText("install.ps1");
   await expectNoPageOverflow(page);
   expect(runtimeErrors).toEqual([]);
+});
+
+test("picker demo searches, changes agent, and leaves Tab free", async ({ page }) => {
+  const runtimeErrors = collectRuntimeErrors(page);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("./");
+  const demo = page.getByRole("group", { name: "Interactive omni demo with invented sessions" });
+  const input = demo.getByRole("combobox");
+  await input.focus();
+  await page.keyboard.type("redis");
+  await expect(demo.getByRole("option", { selected: true })).toContainText("Share rate-limit buckets across pods with Redis");
+
+  await page.keyboard.press("Enter");
+  await expect(demo.getByText("Where should this session open?")).toBeVisible();
+  await page.keyboard.type("agy");
+  await expect(demo.getByRole("option")).toHaveCount(1);
+  await expect(demo.getByRole("option")).toContainText("Antigravity CLI");
+  await page.keyboard.press("Escape");
+  await page.keyboard.type("claude");
+  await expect(demo.getByRole("option")).toHaveCount(1);
+  await page.keyboard.press("Enter");
+  await expect(demo.getByText("Importing 54 trajectory items into Claude...")).toBeVisible();
+  await expect(demo.getByText("23 messages carried over, 31 tool records kept as history")).toBeVisible();
+
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("qwen3.8");
+  await expect(demo.getByText("Matched in conversation text")).toBeVisible();
+  await page.keyboard.press("Tab");
+  await expect(demo.getByRole("button", { name: "Play the tour" })).toBeFocused();
+  expect(runtimeErrors).toEqual([]);
+});
+
+test("picker tour plays, pauses, and stops at the first input", async ({ page }) => {
+  await page.goto("./");
+  const demo = page.getByRole("group", { name: "Interactive omni demo with invented sessions" });
+  await demo.scrollIntoViewIfNeeded();
+  await demo.getByRole("button", { name: "Pause" }).click();
+  const paused = await demo.getByRole("combobox").inputValue();
+  await page.waitForTimeout(2500);
+  await expect(demo.getByRole("combobox")).toHaveValue(paused);
+
+  await demo.getByRole("button", { name: "Play the tour" }).click();
+  await expect(demo.getByText("codex:4f7fac05… is unchanged.")).toBeVisible({ timeout: 20_000 });
+});
+
+test("route map reports the manifest route for the chosen agents", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("./");
+  const map = page.locator("section#map");
+  for (const target of providers.filter((provider) => provider.capabilities.cross_provider_import.length > 0 && provider.id !== "codex")) {
+    await map.locator(`input[name="route-to"][value="${target.id}"]`).check({ force: true });
+    await expect(map.getByRole("heading", { level: 3 })).toHaveText(`Codex to ${target.name}`);
+    await expect(map.locator(".route-sign dl")).toContainText(target.cross);
+    await expect(map.locator(".route-sign dl")).toContainText(platformScope(target.capabilities.cross_provider_import));
+  }
+  await map.locator('input[name="route-from"][value="grok"]').check({ force: true });
+  await map.locator('input[name="route-to"][value="opencode"]').check({ force: true });
+  await map.getByRole("button", { name: "Copy route command" }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("omni resume grok:<session-id> --in opencode");
 });
