@@ -5051,15 +5051,16 @@ fn redact_styled_text(input: &str) -> Cow<'_, str> {
     let mut keys = Cow::Borrowed(input);
     if key_format_regex().is_match(input) {
         keys = redact_private_keys(input);
-        if let Cow::Owned(replaced) = plain_patterns()
-            .api_key()
-            .replace_all(&keys, "${1}[REDACTED: API_KEY]")
-        {
+        if let Cow::Owned(replaced) = redact_api_keys(&keys, extended_patterns()) {
             keys = Cow::Owned(replaced);
         }
     }
+    let separator = ['\u{1a}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}']
+        .into_iter()
+        .find(|&candidate| !keys.contains(candidate));
     let mut plain = String::with_capacity(keys.len());
     let mut copied = 0;
+    let mut inserted_separator = false;
     for style in terminal_styles(&keys) {
         plain.push_str(&keys[copied..style.start]);
         copied = style.end;
@@ -5067,14 +5068,25 @@ fn redact_styled_text(input: &str) -> Cow<'_, str> {
             continue;
         }
         if style.len() == 1 || separates_text(&keys, style) {
-            // Like the escape character, this control character separates words and is not shown.
-            plain.push('\u{1a}');
+            // Keep adjacent text split during the first redaction pass without leaving control
+            // characters in the final output.
+            if let Some(separator) = separator {
+                plain.push(separator);
+                inserted_separator = true;
+            }
         }
     }
     plain.push_str(&keys[copied..]);
     let redacted = redact_plain_text(&plain);
     if keys == input && redacted == plain {
         return Cow::Borrowed(input);
+    }
+    if inserted_separator
+        && let Some(separator) = separator
+        && redacted.contains(separator)
+    {
+        let cleaned = redacted.replace(separator, "");
+        return Cow::Owned(redact_plain_text(&cleaned).into_owned());
     }
     Cow::Owned(redacted.into_owned())
 }
@@ -5583,9 +5595,18 @@ fn push_redacted_assignment(
         line,
         &input[line_end..],
     ) {
-        // A word starts after a line break, but not after the letter of an escaped one.
+        // A word starts after a line break, but not after the letter of an escaped one. Avoid
+        // rewinding onto `\t` when it would fuse with `oken` into a synthetic `token` name.
+        let fuses_tab_token = line_breaks.ends_with('t')
+            && line
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("oken"))
+            && !line
+                .as_bytes()
+                .get(4)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
         let resume = match resume {
-            Resume::AtLine => line_start - usize::from(!line_breaks.is_empty()),
+            Resume::AtLine => line_start - usize::from(!line_breaks.is_empty() && !fuses_tab_token),
             Resume::AfterLine => line_end,
         };
         output.push_str(&input[copied..resume]);
@@ -6017,7 +6038,7 @@ fn escaped_word_start_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(&format!(
-            r"(?:\\[nrtbf]|\[[0-9;]*m)(?:{API_KEY_PREFIX}|(?i:bearer|authorization|(?:set-)?cookie))"
+            r"(?:\\[nrtbf]|\[[0-9;]*m)(?:{API_KEY_PREFIX}|(?i:bearer|authorization|(?:set-)?cookie|[a-z][a-z0-9+.-]*://))"
         ))
         .expect("valid escaped-word-start regex")
     })
@@ -6347,6 +6368,8 @@ fn curl_user_regex(boundary: &str) -> Regex {
 }
 
 const CURL_USER_FLAG: &str = r"\s(?:-u[ \t]*|--user(?:[ \t]+|=))";
+const CURL_CONTINUED_USER_FLAG: &str =
+    r"(?:\s|\\\r?\n|\\\\(?:\\r)?\\n)(?:-u[ \t]*|--user(?:[ \t]+|=))";
 
 fn curl_user_value() -> String {
     format!(r#"{QUOTED_VALUE}|\\?["']?[^\s:"'\\]*:(?:{PLACEHOLDER}|[^\s"'\\]+)"#)
@@ -6359,7 +6382,7 @@ fn curl_command_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)((?:\A|[^a-z0-9_ \t]|\\[nrt]|(?-u:\b)(?:sudo|time|exec|env|nohup|do|then|else|run)[ \t])[ \t]*(?:[a-z0-9_.-]*/)*curl(?-u:\b)(?:\\\r?\n|\\\\(?:\\r)?\\n|"[^"\n]*"|'[^'\n]*'|\\"[^"\\\n]*\\"|[^\n|;&"'\\]|\\[^nr\n"'\\])*?{CURL_USER_FLAG})({})"#,
+            r#"(?i)((?:\A|[^a-z0-9_ \t]|\\[nrt]|(?-u:\b)(?:sudo|time|exec|env|nohup|do|then|else|run)[ \t])[ \t]*(?:[a-z0-9_.-]*/)*curl(?-u:\b)(?:\\\r?\n|\\\\(?:\\r)?\\n|"[^"\n]*"|'[^'\n]*'|\\"[^"\\\n]*\\"|[^\n|;&"'\\]|\\[^nr\n"'\\])*?{CURL_CONTINUED_USER_FLAG})({})"#,
             curl_user_value()
         ))
         .expect("valid curl-command regex")
@@ -6370,7 +6393,8 @@ fn curl_command_regex() -> &'static Regex {
 fn curl_user_flag_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(&format!(r"(?is)curl.*?{CURL_USER_FLAG}")).expect("valid curl-flag regex")
+        Regex::new(&format!(r"(?is)curl.*?{CURL_CONTINUED_USER_FLAG}"))
+            .expect("valid curl-flag regex")
     })
 }
 
@@ -8373,17 +8397,37 @@ mod tests {
             (
                 "\u{1b}[0 password=synthetic-incomplete-style",
                 "synthetic-incomplete-style",
-                "\u{1a}[0 password=[REDACTED: PASSWORD]",
+                "[0 password=[REDACTED: PASSWORD]",
             ),
             (
                 "\u{1b}[apikey=synthetic-unended-style",
                 "synthetic-unended-style",
-                "\u{1a}[apikey=[REDACTED: API_KEY]",
+                "[apikey=[REDACTED: API_KEY]",
             ),
             (
                 "\u{1b}[ -token synthetic-styled-flag",
                 "synthetic-styled-flag",
-                "\u{1a}[ -token [REDACTED: TOKEN]",
+                "[ -token [REDACTED: TOKEN]",
+            ),
+            (
+                "\u{1b}[31mAKIAIOSFODNN7EXAMPLE\u{1b}[0mfoo",
+                "AKIAIOSFODNN7EXAMPLE",
+                "[REDACTED: API_KEY]foo",
+            ),
+            (
+                r"\u001b[31mhttps://user:synthetic-escaped-url-pass@example.com",
+                "synthetic-escaped-url-pass",
+                r"\u001b[31mhttps://user:[REDACTED: PASSWORD]@example.com",
+            ),
+            (
+                "curl https://example.com \\\n-u admin:synthetic-unindented-curl",
+                "synthetic-unindented-curl",
+                "curl https://example.com \\\n-u admin:[REDACTED: PASSWORD]",
+            ),
+            (
+                r#"{"cmd":"curl https://example.com \\\n-u admin:synthetic-escaped-unindented"}"#,
+                "synthetic-escaped-unindented",
+                r#"{"cmd":"curl https://example.com \\\n-u admin:[REDACTED: PASSWORD]"}"#,
             ),
             (
                 "Authorization: Bearer \u{1b}[32meyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0.AbCdEfGhIjKl\u{1b}[0m",
@@ -8415,6 +8459,7 @@ mod tests {
             "if token === undefined || self.token == other.token {",
             "DB_PASSWORD=\nDB_HOST=localhost\nAPI_KEY=\nexport REGION=us-east-1",
             "POSTGRES_PASSWORD:\n  POSTGRES_DB: app",
+            r#"{"yaml":"password:\n\token: public"}"#,
             "-----BEGIN PRIVATE KEY----- starts a key. The END line closes it.",
             "src/config/a.pem:1:-----BEGIN PRIVATE KEY-----\nservices/backend/config/keys/production.pem:1:-----BEGIN PRIVATE KEY-----\n",
             "-----BEGIN PRIVATE KEY-----\nraiseInvalidKeyFormatException()",
