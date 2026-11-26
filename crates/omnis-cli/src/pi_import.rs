@@ -726,13 +726,18 @@ fn omp_session_directory_name(cwd: &Path) -> String {
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata =
-            fs::symlink_metadata(path).with_context(|| format!("reading `{}`", path.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            bail!("`{}` is not a safe directory", path.display());
+    // A dangling link has no target, but it still occupies the path.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!("`{}` is not a safe directory", path.display());
+            }
+            return Ok(());
         }
-        return Ok(());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", path.display()));
+        }
     }
     let parent = path.parent().context("Pi target directory has no parent")?;
     ensure_directory(parent)?;
@@ -903,6 +908,23 @@ mod tests {
     use super::*;
     use crate::macos_ps::ProcessTable;
     use crate::private_store_lock::test_support;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_session_root_link_is_refused() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("sessions");
+        std::os::unix::fs::symlink(temporary.path().join("missing"), &root)
+            .expect("dangling session root");
+
+        let error = ensure_directory(&root.join("workspace")).expect_err("unsafe session root");
+
+        assert!(
+            error.to_string().contains("is not a safe directory"),
+            "{error:#}"
+        );
+        assert!(!temporary.path().join("missing").exists());
+    }
 
     #[test]
     fn omp_publication_preserves_existing_title_slot_sessions_and_rollback_is_exact() {

@@ -3038,7 +3038,8 @@ impl Branch {
                 empty.insert(owner, base.len());
             }
             for pos in self.nodes[node].events.clone() {
-                if !results.filtered.contains(&pos) {
+                // A rebuilt copy shares the events of its original. A reused UUID can select both.
+                if slot[pos].is_none() && !results.filtered.contains(&pos) {
                     slot[pos] = Some(base.len());
                     base.push(pos);
                 }

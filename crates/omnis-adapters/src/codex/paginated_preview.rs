@@ -374,6 +374,14 @@ fn notice(session: &CodexSession, builder: &mut EventBuilder, omitted: usize) {
     );
 }
 
+/// Returns whether the bounded preview left out the whole conversation.
+pub(super) fn is_unavailable(builder: &EventBuilder) -> bool {
+    builder.events().first().is_some_and(|event| {
+        event.source.raw_record_type.as_deref() == Some("omnisession.preview_limit")
+            && event.payload["native_history_unverified"] == true
+    })
+}
+
 fn unavailable(session: &CodexSession, lines: Option<RolloutLines>) -> EventBuilder {
     let mut builder = session.event_builder();
     builder.push(

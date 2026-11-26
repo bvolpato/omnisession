@@ -575,3 +575,37 @@ fn history_created_at_comes_from_the_first_prompt() {
         chrono::DateTime::from_timestamp_millis(1_767_225_600_000)
     );
 }
+
+#[test]
+fn a_project_folder_can_share_its_name_with_an_artifact_folder() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    // CLAUDE_CODE_PROJECT_DIR_NAME can set the name of the project folder.
+    for (folder, id) in [("workflows", SESSION_ID), ("memory", OTHER_ID)] {
+        fs::create_dir_all(projects.join(folder).join(CUSTOM_ID).join("workflows"))
+            .expect("project directory");
+        write_jsonl(
+            &projects.join(folder).join(format!("{id}.jsonl")),
+            &[user_request("/workspace/demo")],
+        );
+    }
+    // Artifacts below a project folder stay out of discovery.
+    write_jsonl(
+        &projects
+            .join("workflows")
+            .join(CUSTOM_ID)
+            .join("workflows")
+            .join(format!("{CUSTOM_ID}.jsonl")),
+        &[user_request("/workspace/artifact")],
+    );
+
+    let mut ids: Vec<_> = ClaudeAdapter::with_root(&projects)
+        .list_sessions(None)
+        .expect("Claude discovery")
+        .into_iter()
+        .map(|session| session.session.id)
+        .collect();
+    ids.sort();
+
+    assert_eq!(ids, [SESSION_ID, OTHER_ID]);
+}

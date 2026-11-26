@@ -2494,6 +2494,91 @@ fn a_fork_keeps_its_own_rollback_boundary_after_an_open_parent_task() -> anyhow:
 }
 
 #[test]
+fn a_rollback_into_inherited_history_withdraws_the_replies_of_the_fork() -> anyhow::Result<()> {
+    let row = |ordinal: u64, kind: &str, payload: Value| json!({"timestamp":"2026-01-05T09:00:00Z","ordinal":ordinal,"type":kind,"payload":payload});
+    let exchange = |start: u64, owner: &str, name: &str| {
+        let model = |role: &str, part: &str| {
+            json!({"type":"message","role":role,"id":format!("{role}-{name}"),
+                "content":[{"type":part,"text":format!("{name} {role}")}],
+                "internal_chat_message_metadata_passthrough":{"turn_id":name}})
+        };
+        let display = |item: &str, role: &str, part: &str| {
+            json!({"type":"item_completed","thread_id":owner,"turn_id":name,"started_at_ms":1,"completed_at_ms":2,
+                "item":{"type":item,"id":format!("{role}-{name}"),
+                    "content":[{"type":part,"text":format!("{name} {role}")}]}})
+        };
+        [
+            row(
+                start,
+                "event_msg",
+                json!({"type":"task_started","turn_id":name}),
+            ),
+            row(start + 1, "response_item", model("user", "input_text")),
+            row(
+                start + 2,
+                "event_msg",
+                display("UserMessage", "user", "text"),
+            ),
+            row(
+                start + 3,
+                "event_msg",
+                display("AgentMessage", "assistant", "Text"),
+            ),
+            row(
+                start + 4,
+                "response_item",
+                model("assistant", "output_text"),
+            ),
+            row(
+                start + 5,
+                "event_msg",
+                json!({"type":"task_complete","turn_id":name}),
+            ),
+        ]
+    };
+    let mut parent = vec![header(PARENT, 0, None)];
+    parent[0]["timestamp"] = "2026-01-05T09:00:00Z".into();
+    parent.extend(exchange(1, PARENT, "inherited"));
+    for (count, expected) in [
+        (1, &["inherited", "first", "third"][..]),
+        (2, &["inherited", "third"]),
+        (3, &["third"]),
+        (9, &["third"]),
+    ] {
+        let home = tempfile::tempdir()?;
+        let stamp = "2026-01-05T09-00-00";
+        write(home.path(), "sessions", PARENT, PARENT, stamp, &parent);
+        let mut child = vec![header(CHILD, 7, Some(bookmark(PARENT, &parent)))];
+        child[0]["timestamp"] = "2026-01-05T09:00:00Z".into();
+        let rollback = |ordinal, count: u64| {
+            row(
+                ordinal,
+                "event_msg",
+                json!({"type":"thread_rolled_back","num_turns":count}),
+            )
+        };
+        child.extend(exchange(8, CHILD, "first"));
+        child.extend(exchange(14, CHILD, "second"));
+        child.push(rollback(20, count));
+        child.extend(exchange(21, CHILD, "third"));
+        // A later rollback inside the fork must not restore the earlier replies.
+        child.extend(exchange(27, CHILD, "fourth"));
+        child.push(rollback(33, 1));
+        write(home.path(), "sessions", CHILD, CHILD, stamp, &child);
+        for preview in [false, true] {
+            let conversation = omnis_core::import_conversation(&read(home.path(), preview)?);
+            let wanted: Vec<_> = expected
+                .iter()
+                .flat_map(|name| [format!("{name} user"), format!("{name} assistant")])
+                .collect();
+            let messages: Vec<_> = conversation.messages.into_iter().map(|m| m.text).collect();
+            assert_eq!(messages, wanted, "rollback of {count} turns");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_fork_inherits_published_tools_and_the_active_compaction_at_its_bookmark() {
     let home = tempfile::tempdir().unwrap();
     let stamp = "2026-01-05T09-00-00";

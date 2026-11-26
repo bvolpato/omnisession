@@ -684,7 +684,8 @@ fn stamp_interpreter(
     let mut header = [0; 512];
     let size = fs::File::open(program).ok()?.read(&mut header).ok()?;
     let Some(shebang) = header[..size].strip_prefix(b"#!") else {
-        return Some(());
+        let canonical = fs::canonicalize(program).ok()?;
+        return crate::version_gate::is_named_install(program, &canonical).then_some(());
     };
     // A profile can change the downstream runtime or settings of a script.
     if profiled {
@@ -760,6 +761,24 @@ fn help_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn help_results_of_a_dispatcher_are_not_reused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let identity = |target: &str, link: &str| {
+            let target = directory.path().join(target);
+            fs::write(&target, b"\x7fELFfake-binary").expect("write binary");
+            let link = directory.path().join(link);
+            std::os::unix::fs::symlink(target, &link).expect("link binary");
+            invocation_identity(&Command::new(link), false)
+        };
+
+        // The file of a dispatcher stays the same when the program that it selects is upgraded.
+        assert_eq!(identity("mise", "claude"), None);
+        assert!(identity("2.1.220", "claude-code").is_some());
+        assert!(identity("grok-0.2.117", "grok").is_some());
+    }
 
     #[test]
     fn omp_defaults_to_no_flags_and_auto_approve_is_not_a_safer_mode() {

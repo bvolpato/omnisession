@@ -635,7 +635,7 @@ fn read_header(
         let Some((first, last)) = first.zip(last) else {
             continue;
         };
-        if let Ok(record) = serde_json::from_slice::<Value>(&line[first..=last]) {
+        if let Ok(record) = parse_record(&line[first..=last]) {
             if provider == Provider::OhMyPi && !title_seen && record["type"] == "title" {
                 title_seen = true;
                 title = string_at(&record, &[&["title"]]).map(str::to_owned);
@@ -738,6 +738,43 @@ struct PiIndexLine<'a> {
     name: Option<Cow<'a, str>>,
     #[serde(borrow)]
     title: Option<Cow<'a, str>>,
+}
+
+/// Parses a record the way Pi reads it. `JSON.stringify` can write an unpaired surrogate escape, and
+/// Pi decodes invalid UTF-8 with replacement characters. `serde_json` refuses both.
+fn parse_record(line: &[u8]) -> serde_json::Result<Value> {
+    serde_json::from_slice(line).or_else(|error| {
+        let mut text = String::from_utf8_lossy(line).into_owned().into_bytes();
+        replace_unpaired_surrogates(&mut text);
+        serde_json::from_slice(&text).map_err(|_| error)
+    })
+}
+
+/// Rewrites each unpaired `\uD800` to `\uDFFF` escape as `\ufffd`, which has the same length.
+fn replace_unpaired_surrogates(text: &mut [u8]) {
+    fn escaped_unit(text: &[u8]) -> Option<u32> {
+        let digits = text.strip_prefix(b"\\u")?.get(..4)?;
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    }
+    let mut index = 0;
+    while let Some(found) = memchr::memchr(b'\\', &text[index..]) {
+        index += found;
+        let Some(unit) = escaped_unit(&text[index..]) else {
+            // Step over the escaped byte too, so that `\\u` is not an escape of its own.
+            index = (index + 2).min(text.len());
+            continue;
+        };
+        let paired = (0xd800..0xdc00).contains(&unit)
+            && escaped_unit(&text[index + 6..]).is_some_and(|low| (0xdc00..0xe000).contains(&low));
+        if paired {
+            index += 12;
+            continue;
+        }
+        if (0xd800..0xe000).contains(&unit) {
+            text[index + 2..index + 6].copy_from_slice(b"fffd");
+        }
+        index += 6;
+    }
 }
 
 #[derive(Deserialize)]
@@ -1209,7 +1246,7 @@ impl SelectedPiFile {
                     index.observe_fast(session.provider, location, record);
                     return Ok(());
                 }
-                if let Ok(record) = serde_json::from_slice::<Value>(line) {
+                if let Ok(record) = parse_record(line) {
                     if location.offset != parsed_suffix.end {
                         parsed_suffix.start = location.offset;
                     }
@@ -1272,8 +1309,10 @@ impl SelectedPiFile {
             if try_emit_fast_message(&mut builder, &record_line) {
                 continue;
             }
-            let entry: Value = serde_json::from_slice(&record_line)
-                .context("provider record changed while rereading transcript")?;
+            let Ok(entry) = parse_record(&record_line) else {
+                emit_unreadable_entry(&mut builder, &record_line)?;
+                continue;
+            };
             if session.provider == Provider::OhMyPi
                 && let Some(name) = omp_branch_title(&entry)
             {
@@ -1579,6 +1618,22 @@ fn emit_entry(
             None,
         ),
     }
+}
+
+/// The index skips fields that it does not need, so it can accept a record with a value that cannot
+/// be decoded. The entry keeps its place in the branch.
+fn emit_unreadable_entry(builder: &mut EventBuilder, line: &[u8]) -> Result<()> {
+    let record = serde_json::from_slice::<PiIndexLine<'_>>(line)
+        .context("provider record changed while rereading transcript")?;
+    builder.push(
+        EventKind::ProviderEvent,
+        json!({ "type": "pi_unreadable_entry" }),
+        record.timestamp.as_ref().and_then(PiTimestamp::parse),
+        ReplayPolicy::HistoricalOnly,
+        record.entry_type.map(Cow::into_owned),
+        None,
+    );
+    Ok(())
 }
 
 fn emit_message(
@@ -2982,6 +3037,57 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.events[0].kind, EventKind::CompactionCreated);
+    }
+
+    #[test]
+    fn indexed_read_keeps_records_that_only_a_lenient_parser_accepts() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path().join("sessions");
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        let lines: [&[u8]; 7] = [
+            br#"{"type":"session","version":3,"id":"session","cwd":"/workspace"}"#,
+            br#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"cut \ud83d, kept \ud83d\ude00 and \\ud83d"}}"#,
+            br#"{"type":"message","id":"b","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"low \ude00"}]}}"#,
+            b"{\"type\":\"message\",\"id\":\"c\",\"parentId\":\"b\",\"message\":{\"role\":\"user\",\"content\":\"latin \xe9\"}}",
+            &[
+                br#"{"type":"message","id":"d","parentId":"c","message":{"role":"toolResult","details":"#,
+                deep.as_bytes(),
+                b"}}",
+            ]
+            .concat(),
+            br#"{"type":"message","id":"e","parentId":"d","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            br#"{"type":"session_info","id":"f","parentId":"e","name":"title \ud83d"}"#,
+        ];
+        let directory = root.join("project");
+        fs::create_dir_all(&directory).expect("create synthetic session directory");
+        let path = directory.join("lenient.jsonl");
+        fs::write(&path, lines.join(&b'\n')).expect("write synthetic session");
+        let session = SessionRef::new(Provider::Pi, "session");
+
+        let snapshot = PiAdapter::with_root(&root)
+            .read_session_at(&session, Some(&path))
+            .expect("Pi accepts every one of these records");
+
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            [
+                "cut \u{fffd}, kept \u{1f600} and \\ud83d",
+                "latin \u{fffd}",
+                "done"
+            ]
+        );
+        assert_eq!(snapshot.title.as_deref(), Some("title \u{fffd}"));
+        let tool = &snapshot.events[1];
+        assert_eq!(tool.kind, EventKind::ToolCompleted);
+        assert_eq!(tool.payload["output"], "low \u{fffd}");
+        // A record that cannot be decoded keeps its place in the branch.
+        let unreadable = &snapshot.events[3];
+        assert_eq!(unreadable.payload["type"], "pi_unreadable_entry");
+        assert_eq!(unreadable.replay_policy, ReplayPolicy::HistoricalOnly);
     }
 
     #[test]

@@ -426,6 +426,80 @@ fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
 }
 
 #[test]
+fn typed_json_and_unrepresentable_times_survive_a_read() {
+    let temporary = tempfile::tempdir().expect("temporary Hermes root");
+    fixture(temporary.path());
+    let connection =
+        Connection::open(temporary.path().join("state.db")).expect("Hermes fixture database");
+    let typed = [
+        r#"["alpha", "beta"]"#,
+        r#"{"text": "summary", "score": 3}"#,
+        r#"{"content": "body"}"#,
+    ];
+    for (id, started_at, model_config, contents) in [
+        ("typed", 1e16, None, typed.to_vec()),
+        (
+            "imported",
+            300.0,
+            Some(r#"{"omnisession_source":"claude:source"}"#),
+            vec![r#"[{"type":"text","text":"typed parts"}]"#],
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO sessions (id, source, cwd, started_at, model_config, message_count)
+                 VALUES (?1, 'cli', '/workspace/demo', ?2, ?3, 3)",
+                params![id, started_at, model_config],
+            )
+            .expect("Hermes session");
+        for content in contents {
+            connection
+                .execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp, active)
+                     VALUES (?1, 'user', ?2, 1e16, 1)",
+                    params![id, content],
+                )
+                .expect("Hermes message");
+        }
+    }
+    let adapter = HermesAdapter::with_root(temporary.path());
+
+    let sessions = adapter.list_sessions(None).expect("Hermes discovery");
+    let listed = sessions
+        .iter()
+        .find(|session| session.session.id == "typed")
+        .expect("typed session listed");
+    assert_eq!(listed.title.as_deref(), Some(typed[0]));
+    for (id, expected) in [
+        ("typed", &typed[..]),
+        (
+            "imported",
+            &[r#"[{"type":"text","text":"typed parts"}]"#][..],
+        ),
+    ] {
+        let snapshot = adapter
+            .read_session(&SessionRef::new(Provider::Hermes, id))
+            .expect("Hermes read");
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser)
+                .map(|event| event.payload["text"].as_str().expect("user text"))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser)
+                .all(|event| event.timestamp.is_none())
+        );
+    }
+}
+
+#[test]
 fn hermes_launches_exact_native_resume_and_materializes_forks_elsewhere() {
     let adapter = HermesAdapter::with_root("/unused");
     let session = SessionRef::new(Provider::Hermes, SESSION_ID);

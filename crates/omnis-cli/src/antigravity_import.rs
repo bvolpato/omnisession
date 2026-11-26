@@ -536,20 +536,19 @@ fn delete_session_at_with_lock_root(
     delete_session_at_locked(session, root)
 }
 
-struct DeletionPayloads {
-    conversations_root: PathBuf,
-    annotations_root: PathBuf,
-    brain_root: PathBuf,
-    conversation: PathBuf,
-    staged_conversation: PathBuf,
-    annotation: PathBuf,
-    staged_annotation: PathBuf,
-    brain: PathBuf,
-    staged_brain: PathBuf,
-    staged_conversation_exists: bool,
-    staged_annotation_exists: bool,
-    staged_brain_exists: bool,
+const DELETION_PREFIX: &str = ".omnisession-delete-";
+/// `SQLite` keeps conversation content in these files next to a database that was not closed.
+const CONVERSATION_SUFFIXES: [&str; 4] = [".db", ".db-wal", ".db-shm", ".db-journal"];
+const ANNOTATION_SUFFIX: &str = ".pbtxt";
+
+struct DeletionPayload {
+    original: PathBuf,
+    staged: PathBuf,
+    directory: bool,
+    moved: bool,
 }
+
+struct DeletionPayloads(Vec<DeletionPayload>);
 
 impl DeletionPayloads {
     fn prepare(root: &Path, id: &str, summary_path: &Path) -> Result<Self> {
@@ -565,77 +564,63 @@ impl DeletionPayloads {
             &brain_root,
             summary_path,
         )?;
-        let payloads = Self {
-            conversation: conversations_root.join(format!("{id}.db")),
-            staged_conversation: conversations_root.join(format!(".omnisession-delete-{id}.db")),
-            annotation: annotations_root.join(format!("{id}.pbtxt")),
-            staged_annotation: annotations_root.join(format!(".omnisession-delete-{id}.pbtxt")),
-            brain: brain_root.join(id),
-            staged_brain: brain_root.join(format!(".omnisession-delete-{id}")),
-            conversations_root,
-            annotations_root,
-            brain_root,
-            staged_conversation_exists: false,
-            staged_annotation_exists: false,
-            staged_brain_exists: false,
+        let payload = |parent: &Path, suffix: &str, directory| DeletionPayload {
+            original: parent.join(format!("{id}{suffix}")),
+            staged: parent.join(format!("{DELETION_PREFIX}{id}{suffix}")),
+            directory,
+            moved: false,
         };
-        if path_entry_exists(&payloads.staged_conversation)?
-            || path_entry_exists(&payloads.staged_annotation)?
-            || path_entry_exists(&payloads.staged_brain)?
-        {
-            bail!("Antigravity deletion staging path already exists");
+        let payloads = CONVERSATION_SUFFIXES
+            .iter()
+            .map(|suffix| payload(&conversations_root, suffix, false))
+            .chain([
+                payload(&annotations_root, ANNOTATION_SUFFIX, false),
+                payload(&brain_root, "", true),
+            ])
+            .collect::<Vec<_>>();
+        for payload in &payloads {
+            if path_entry_exists(&payload.staged)? {
+                bail!("Antigravity deletion staging path already exists");
+            }
         }
-        validate_optional_payload(&payloads.conversation, false)?;
-        validate_optional_payload(&payloads.annotation, false)?;
-        validate_optional_payload(&payloads.brain, true)?;
-        Ok(payloads)
+        for payload in &payloads {
+            validate_optional_payload(&payload.original, payload.directory)?;
+        }
+        Ok(Self(payloads))
     }
 
     fn stage(&mut self) -> Result<()> {
-        if self.conversation.exists() {
-            fs::rename(&self.conversation, &self.staged_conversation)
-                .context("staging Antigravity conversation for deletion")?;
-            self.staged_conversation_exists = true;
-        }
-        if self.annotation.exists() {
-            fs::rename(&self.annotation, &self.staged_annotation)
-                .context("staging Antigravity conversation annotation for deletion")?;
-            self.staged_annotation_exists = true;
-        }
-        if self.brain.exists() {
-            fs::rename(&self.brain, &self.staged_brain)
-                .context("staging Antigravity transcript directory for deletion")?;
-            self.staged_brain_exists = true;
+        for payload in &mut self.0 {
+            if payload.original.exists() {
+                fs::rename(&payload.original, &payload.staged).with_context(|| {
+                    format!(
+                        "staging Antigravity {} for deletion",
+                        payload.original.display()
+                    )
+                })?;
+                payload.moved = true;
+            }
         }
         Ok(())
     }
 
     fn restore(&self) -> Result<()> {
-        if self.staged_brain_exists {
-            fs::rename(&self.staged_brain, &self.brain)
-                .context("restoring Antigravity transcript after failed deletion")?;
-        }
-        if self.staged_annotation_exists {
-            fs::rename(&self.staged_annotation, &self.annotation)
-                .context("restoring Antigravity conversation annotation after failed deletion")?;
-        }
-        if self.staged_conversation_exists {
-            fs::rename(&self.staged_conversation, &self.conversation)
-                .context("restoring Antigravity conversation after failed deletion")?;
+        for payload in self.0.iter().rev().filter(|payload| payload.moved) {
+            fs::rename(&payload.staged, &payload.original).with_context(|| {
+                format!(
+                    "restoring Antigravity {} after failed deletion",
+                    payload.original.display()
+                )
+            })?;
         }
         Ok(())
     }
 
     fn cleanup(&self) {
-        if self.staged_conversation_exists {
-            let _ =
-                remove_staged_payload(&self.staged_conversation, false, &self.conversations_root);
-        }
-        if self.staged_annotation_exists {
-            let _ = remove_staged_payload(&self.staged_annotation, false, &self.annotations_root);
-        }
-        if self.staged_brain_exists {
-            let _ = remove_staged_payload(&self.staged_brain, true, &self.brain_root);
+        for payload in self.0.iter().filter(|payload| payload.moved) {
+            if let Some(parent) = payload.staged.parent() {
+                let _ = remove_staged_payload(&payload.staged, payload.directory, parent);
+            }
         }
     }
 }
@@ -696,27 +681,19 @@ fn retry_pending_antigravity_deletions(
 ) -> Result<()> {
     let connection =
         Connection::open_with_flags(summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    retry_staged_entries(
-        &connection,
-        conversations_root,
-        ".omnisession-delete-",
-        ".db",
-        false,
-    )?;
-    retry_staged_entries(
-        &connection,
-        annotations_root,
-        ".omnisession-delete-",
-        ".pbtxt",
-        false,
-    )?;
-    retry_staged_entries(&connection, brain_root, ".omnisession-delete-", "", true)
+    // The database comes last, so a restored sidecar never meets a database that the agent created
+    // in between.
+    for suffix in CONVERSATION_SUFFIXES.iter().rev() {
+        retry_staged_entries(&connection, conversations_root, suffix, false)?;
+    }
+    retry_staged_entries(&connection, annotations_root, ANNOTATION_SUFFIX, false)?;
+    retry_staged_entries(&connection, brain_root, "", true)
 }
 
+/// Finishes an interrupted deletion. A remaining summary row shows that it was not committed.
 fn retry_staged_entries(
     connection: &Connection,
     parent: &Path,
-    prefix: &str,
     suffix: &str,
     directory: bool,
 ) -> Result<()> {
@@ -731,18 +708,28 @@ fn retry_staged_entries(
             continue;
         };
         let Some(id) = name
-            .strip_prefix(prefix)
+            .strip_prefix(DELETION_PREFIX)
             .and_then(|name| name.strip_suffix(suffix))
             .filter(|id| Uuid::parse_str(id).is_ok())
         else {
             continue;
         };
-        if summary_row(connection, id)?.is_some() {
+        let path = entry.path();
+        let committed = summary_row(connection, id)?.is_none();
+        if validate_optional_payload(&path, directory).is_err() {
             continue;
         }
-        let path = entry.path();
-        if validate_optional_payload(&path, directory).is_ok() {
+        if committed {
             let _ = remove_staged_payload(&path, directory, parent);
+            continue;
+        }
+        let original = parent.join(format!("{id}{suffix}"));
+        // SQLite would replay a staged WAL or journal over a new database of the same name.
+        let database = parent.join(format!("{id}{}", CONVERSATION_SUFFIXES[0]));
+        if !path_entry_exists(&original)? && !path_entry_exists(&database)? {
+            fs::rename(&path, &original)
+                .context("restoring Antigravity payload after an interrupted deletion")?;
+            sync_directory(parent)?;
         }
     }
     Ok(())
@@ -1593,12 +1580,14 @@ fn data_root() -> Result<PathBuf> {
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            bail!("`{}` is not a safe directory", path.display());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        // A dangling link also occupies the path.
+        Ok(_) => bail!("`{}` is not a safe directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", path.display()));
         }
-        return Ok(());
     }
     let parent = path
         .parent()
@@ -2234,6 +2223,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_dangling_profile_link_is_refused() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let root = temporary.path().join("antigravity-cli");
+        std::os::unix::fs::symlink(temporary.path().join("unmounted"), &root).unwrap();
+        let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
+        let error = materialize_store(&import).expect_err("a dangling link is not a profile");
+        assert!(format!("{error:#}").contains("is not a safe directory"));
+        assert!(!temporary.path().join("unmounted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unsupported_provider_version_does_not_create_a_fresh_profile() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2383,6 +2386,116 @@ mod tests {
             summary_row(&connection, &sibling.target.id)
                 .expect("sibling row")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn deletion_removes_the_sqlite_sidecars_of_the_selected_conversation() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        let sibling = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("sibling Antigravity import");
+        materialize_store(&selected).expect("materialize selected");
+        materialize_store(&sibling).expect("materialize sibling");
+        for import in [&selected, &sibling] {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                fs::write(
+                    import
+                        .conversations_root
+                        .join(format!("{}.db{suffix}", import.target.id)),
+                    b"synthetic conversation pages",
+                )
+                .expect("SQLite sidecar");
+            }
+        }
+
+        delete_session_at(&selected.target, temporary.path())
+            .expect("delete selected Antigravity session");
+
+        let mut remaining = fs::read_dir(&selected.conversations_root)
+            .expect("conversation entries")
+            .map(|entry| entry.expect("conversation entry").file_name())
+            .collect::<Vec<std::ffi::OsString>>();
+        remaining.sort();
+        let expected = ["", "-journal", "-shm", "-wal"]
+            .map(|suffix| std::ffi::OsString::from(format!("{}.db{suffix}", sibling.target.id)));
+        assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn deletion_resumes_after_an_interruption_before_the_summary_commit() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        let sibling = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("sibling Antigravity import");
+        for import in [&selected, &sibling] {
+            materialize_store(import).expect("materialize session");
+            // The process stopped after it staged the files. SQLite kept the summary row.
+            fs::rename(
+                &import.target_path,
+                import
+                    .conversations_root
+                    .join(format!(".omnisession-delete-{}.db", import.target.id)),
+            )
+            .expect("stage conversation");
+        }
+
+        delete_session_at(&selected.target, temporary.path())
+            .expect("delete after an interrupted deletion");
+
+        assert!(!selected.target_path.exists());
+        assert!(!selected.annotation_path.exists());
+        assert_eq!(
+            fs::read(&sibling.target_path).expect("restored sibling conversation"),
+            sibling.document
+        );
+        assert_eq!(
+            fs::read_dir(&selected.conversations_root)
+                .expect("conversation entries")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_interrupted_deletion_keeps_a_staged_wal_away_from_a_new_database() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let build = || {
+            build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+                .expect("Antigravity import")
+        };
+        let (interrupted, selected) = (build(), build());
+        materialize_store(&interrupted).expect("materialize interrupted session");
+        materialize_store(&selected).expect("materialize selected session");
+        let id = &interrupted.target.id;
+        let staged = |suffix: &str| {
+            interrupted
+                .conversations_root
+                .join(format!(".omnisession-delete-{id}{suffix}"))
+        };
+        // The agent reopened the conversation after the process stopped, and made a new database.
+        fs::write(staged(".db"), b"old database").expect("staged database");
+        fs::write(staged(".db-wal"), b"old pages").expect("staged WAL");
+
+        delete_session_at(&selected.target, temporary.path()).expect("delete another session");
+
+        let wal = interrupted.conversations_root.join(format!("{id}.db-wal"));
+        assert!(!wal.exists(), "a stale WAL joined a new database");
+        assert!(staged(".db-wal").exists());
+        assert_eq!(
+            fs::read(&interrupted.target_path).expect("new database"),
+            interrupted.document
         );
     }
 

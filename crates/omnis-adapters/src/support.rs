@@ -111,17 +111,32 @@ fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<P
     Ok(resolved)
 }
 
+/// Finds `name` on PATH with the CLI's rules for real provider binaries.
+///
+/// A file without execute permission is a last resort, so that a run reports why it failed. A
+/// relative PATH entry is made absolute, because a provider can run in another directory.
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
-    let candidate = Path::new(name);
-    if candidate.components().count() > 1 {
-        return (candidate.is_file() && !is_legacy_omnisession_alias(candidate))
-            .then(|| candidate.to_path_buf());
-    }
-
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
+    let candidates = env::split_paths(&paths)
         .flat_map(|directory| executable_candidates(&directory, name))
-        .find(|path| path.is_file() && !is_legacy_omnisession_alias(path))
+        .filter(|path| path.is_file() && !is_omnisession_binary(path))
+        .collect::<Vec<_>>();
+    let selected = candidates
+        .iter()
+        .find(|path| is_executable(path))
+        .or(candidates.first())?;
+    std::path::absolute(selected).ok()
+}
+
+/// Whether `path` is or leads to this executable or a legacy alias.
+fn is_omnisession_binary(path: &Path) -> bool {
+    is_legacy_omnisession_alias(path)
+        || fs::canonicalize(path).is_ok_and(|binary| {
+            is_legacy_omnisession_alias(&binary)
+                || env::current_exe()
+                    .and_then(fs::canonicalize)
+                    .is_ok_and(|current| current == binary)
+        })
 }
 
 /// Same PATH candidates as the CLI provider resolver.
@@ -184,12 +199,18 @@ pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
         return None;
     }
     let binary = fs::canonicalize(candidate).ok()?;
-    let current_executable = env::current_exe().and_then(fs::canonicalize).ok();
-    let is_omnisession_executable = current_executable.as_deref() == Some(binary.as_path())
-        || is_legacy_omnisession_alias(&binary);
     let names_provider =
         provider != Provider::CursorCli || cursor_agent_binary_name_matches(&binary);
-    (!is_omnisession_executable && names_provider).then_some(binary)
+    if is_omnisession_binary(&binary) || !names_provider {
+        return None;
+    }
+    // A dispatcher selects its command from the name used to invoke it.
+    let dispatched = provider != Provider::CursorCli && candidate.file_name() != binary.file_name();
+    Some(if dispatched {
+        candidate.to_owned()
+    } else {
+        binary
+    })
 }
 
 /// Same variables as the CLI provider resolver.
@@ -3896,11 +3917,30 @@ impl EventBuilder {
         }
     }
 
+    /// Codex saves a display record for each command of a script. Display records have their own
+    /// limit, so they cannot evict the model records that an import keeps.
     pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
         if let Some(preview) = &mut self.preview {
             return retain_latest_matching(&mut preview.outline, limit, |event| event.tool);
         }
-        retain_latest_matching(&mut self.events, limit, |event| is_tool_event(&event.kind))
+        let is_display = |event: &OmniEvent| {
+            is_tool_event(&event.kind)
+                && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+        };
+        let is_model = |event: &OmniEvent| is_tool_event(&event.kind) && !is_display(event);
+        let total = self.events.len();
+        if retain_latest_matching(&mut self.events, limit, is_model) > 0 {
+            // A display record from before the first retained model record describes omitted work.
+            let start = self
+                .events
+                .iter()
+                .find(|event| is_model(event))
+                .map_or(0, |event| event.sequence);
+            self.events
+                .retain(|event| event.sequence >= start || !is_display(event));
+        }
+        retain_latest_matching(&mut self.events, limit, is_display);
+        total - self.events.len()
     }
 
     /// Drops the oldest events above `limit` and returns how many were dropped.

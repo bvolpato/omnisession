@@ -500,6 +500,7 @@ pub(super) struct PaginatedRollback {
     media: media::MediaReceipts,
     generated_start: Option<(Key, u64)>,
     segment: u64,
+    segment_start: u64,
     window: u64,
     evicted: usize,
     // Text on opposite sides of a retention boundary cannot prove a shared input.
@@ -527,8 +528,9 @@ impl PaginatedRollback {
         !self.model.is_empty() || self.evicted > 0
     }
 
-    pub(super) fn segment(&mut self) {
+    pub(super) fn segment(&mut self, start: u64) {
         self.segment = self.segment.saturating_add(1);
+        self.segment_start = start;
         self.window = self.window.saturating_add(1);
         self.generated_start = None;
     }
@@ -650,7 +652,15 @@ impl PaginatedRollback {
             return None;
         }
         let first = self.model.get(self.model.len().saturating_sub(count))?;
-        (first.segment == self.segment).then_some((first.ordinal, first.order))
+        if first.segment == self.segment {
+            return Some((first.ordinal, first.order));
+        }
+        // A cut in inherited history also removes every record of the current file.
+        Some((self.segment_start, None))
+    }
+
+    pub(super) fn removes_segment(&self, boundary: Option<(u64, Option<u64>)>) -> bool {
+        self.segment > 0 && boundary == Some((self.segment_start, None))
     }
 
     /// Identify displayed owners of withdrawn raw inputs without exposing raw message text.

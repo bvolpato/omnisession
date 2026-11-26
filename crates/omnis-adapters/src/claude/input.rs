@@ -3,21 +3,21 @@
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, ReplayPolicy};
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{ClaudeTranscript, EventBuilder, copies};
 use crate::support::{
-    BoundedLine, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, MAX_PREVIEW_TAIL_SIZE, MAX_PROVIDER_RECORDS,
-    MAX_STREAMED_TRANSCRIPT_LINE_SIZE, read_bounded_line_with_budget,
+    MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, MAX_PREVIEW_TAIL_SIZE, MAX_PROVIDER_RECORDS,
+    MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
 };
 
 const PREVIEW_RECORDS: usize = 1_024;
@@ -69,42 +69,131 @@ impl InputCoverage {
         reader: impl Read,
         length: u64,
         ends_at_eof: bool,
-        mut visit: impl FnMut(Value) -> Result<bool>,
+        mut visit: impl FnMut(Scanned) -> Result<bool>,
     ) -> Result<u64> {
         let mut reader = BufReader::with_capacity(64 * 1024, reader.take(length));
         let mut remaining = length;
         let mut line = Vec::new();
-        while let Some((kind, bytes)) = read_bounded_line_with_budget(
-            &mut reader,
-            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-            remaining,
-            &mut line,
-        )? {
+        loop {
+            line.clear();
+            let mut bytes = reader
+                .by_ref()
+                .take(MAX_STREAMED_TRANSCRIPT_LINE_SIZE + 1)
+                .read_until(b'\n', &mut line)? as u64;
+            if bytes == 0 {
+                break;
+            }
+            let oversized = bytes > MAX_STREAMED_TRANSCRIPT_LINE_SIZE;
+            let mut terminated = line.ends_with(b"\n");
+            let mut bridge = None;
+            if oversized {
+                let mut rest = RestOfLine {
+                    reader: &mut reader,
+                    read: 0,
+                    terminated,
+                };
+                bridge = serde_json::from_reader::<_, OversizedRecord>(BufReader::new(
+                    line.as_slice().chain(&mut rest),
+                ))
+                .ok()
+                .and_then(OversizedRecord::into_link);
+                io::copy(&mut rest, &mut io::sink())?;
+                bytes += rest.read;
+                terminated = rest.terminated;
+            }
             remaining -= bytes;
-            let clipped = remaining == 0 && !ends_at_eof && !line.ends_with(b"\n");
+            let clipped = remaining == 0 && !ends_at_eof && !terminated;
             if clipped {
                 return Ok(length - bytes);
             }
-            match kind {
-                BoundedLine::Oversized => self.oversized += 1,
-                BoundedLine::Complete => match serde_json::from_slice(&line) {
-                    Ok(record) => {
-                        if !visit(record)? {
-                            return Ok(length - remaining);
+            let scanned = if oversized {
+                self.oversized += 1;
+                let Some(row) = bridge else { continue };
+                Scanned::Link(row)
+            } else {
+                match serde_json::from_slice(&line) {
+                    Ok(record) => Scanned::Record(record),
+                    Err(error) => {
+                        if !line.iter().all(u8::is_ascii_whitespace) {
+                            self.malformed += 1;
+                            self.incomplete_tail |= error.is_eof() && !terminated;
                         }
+                        continue;
                     }
-                    Err(error) if !line.iter().all(u8::is_ascii_whitespace) => {
-                        self.malformed += 1;
-                        self.incomplete_tail |= error.is_eof() && !line.ends_with(b"\n");
-                    }
-                    Err(_) => {}
-                },
+                }
+            };
+            if !visit(scanned)? {
+                return Ok(length - remaining);
             }
         }
         if remaining > 0 {
             bail!("Claude transcript became shorter during the read");
         }
         Ok(length)
+    }
+}
+
+enum Scanned {
+    Record(Value),
+    /// The links of a record that exceeds the line limit.
+    Link(Value),
+}
+
+/// Reads to the end of the current line and leaves the next line in `reader`.
+struct RestOfLine<'a, R> {
+    reader: &'a mut R,
+    read: u64,
+    terminated: bool,
+}
+
+impl<R: BufRead> Read for RestOfLine<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.terminated {
+            return Ok(0);
+        }
+        let available = self.reader.fill_buf()?;
+        let available = &available[..available.len().min(buffer.len())];
+        let end = memchr::memchr(b'\n', available).map_or(available.len(), |end| end + 1);
+        buffer[..end].copy_from_slice(&available[..end]);
+        self.terminated = available[..end].ends_with(b"\n");
+        self.reader.consume(end);
+        self.read += end as u64;
+        Ok(end)
+    }
+}
+
+/// The fields that connect a record to its conversation. The rest of the record is not stored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OversizedRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    uuid: Uuid,
+    // An absent field does not name a parent, so the record cannot be a link.
+    #[serde(deserialize_with = "Option::deserialize")]
+    parent_uuid: Option<Uuid>,
+    #[serde(default, deserialize_with = "present_bool")]
+    is_sidechain: Option<bool>,
+    team_name: Option<IgnoredAny>,
+    timestamp: Option<Value>,
+}
+
+impl OversizedRecord {
+    /// A record without content that keeps its children connected to its parent.
+    fn into_link(self) -> Option<Value> {
+        if self.is_sidechain == Some(true) || self.team_name.is_some() {
+            return None;
+        }
+        let transcript = super::is_transcript_record(&json!({"type": self.kind}));
+        let mut link = json!({
+            "type": if transcript { "system" } else { "progress" },
+            "uuid": self.uuid,
+            "parentUuid": self.parent_uuid,
+        });
+        if let Some(timestamp) = self.timestamp {
+            link["timestamp"] = timestamp;
+        }
+        Some(link)
     }
 }
 
@@ -423,9 +512,12 @@ fn visit(
     if preview && length > MAX_PREVIEW_TAIL_SIZE * 2 {
         coverage.sampled = true;
         let mut messages = 0;
-        let head_end = coverage.scan(&mut *file, MAX_PREVIEW_TAIL_SIZE, false, |record| {
-            observe(Observation::Record(&record));
-            messages += usize::from(record["type"] != "progress");
+        let head_end = coverage.scan(&mut *file, MAX_PREVIEW_TAIL_SIZE, false, |scanned| {
+            // A window is smaller than the line limit, so it cannot hold an oversized record.
+            if let Scanned::Record(record) = scanned {
+                observe(Observation::Record(&record));
+                messages += usize::from(record["type"] != "progress");
+            }
             Ok(messages < PREVIEW_RECORDS)
         })?;
 
@@ -437,7 +529,10 @@ fn visit(
         let mut tail = VecDeque::new();
         let mut tail_messages = 0;
         let mut tail_trimmed = false;
-        coverage.scan(reader, length - start - skipped, true, |record| {
+        coverage.scan(reader, length - start - skipped, true, |scanned| {
+            let Scanned::Record(record) = scanned else {
+                return Ok(true);
+            };
             tail_messages += usize::from(record["type"] != "progress");
             tail.push_back(record);
             while tail_messages > PREVIEW_RECORDS {
@@ -456,7 +551,17 @@ fn visit(
     } else {
         let mut records = 0;
         let mut progress_links = 0;
-        coverage.scan(file, length, true, |record| {
+        coverage.scan(file, length, true, |scanned| {
+            let record = match scanned {
+                Scanned::Record(record) => record,
+                Scanned::Link(row) => {
+                    observe(Observation::Link {
+                        row: &row,
+                        definition: None,
+                    });
+                    return Ok(true);
+                }
+            };
             if record["type"] == "progress" {
                 progress_links += physical_copies * usize::from(record["uuid"].is_string());
                 if progress_links > MAX_PROGRESS_LINKS {
