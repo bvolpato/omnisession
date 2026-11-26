@@ -11,7 +11,8 @@ Thanks for helping. OmniSession works with private coding-agent history, so corr
 Requirements:
 
 - Rust 1.89 or newer. CI also checks the 1.89.0 minimum supported version.
-- Node.js 22.13 or newer and pnpm 11.1, only for website work.
+- Node.js 22.13 or newer, only for website work and the scripts that use Node.js.
+- pnpm 11.1, only for website work.
 
 Build and run the CLI:
 
@@ -93,7 +94,7 @@ uv run scripts/benchmark-index.py /path/to/baseline/omni /path/to/candidate/omni
 
 The Hermes workload indexes 40 sessions in a 32 MiB shared database. The cached workload compares baseline `search --no-index` with candidate `search --cached` across 1,000 Claude sessions. JSON includes binary hashes and every timing sample. These are local wall-clock measurements, not a production latency guarantee.
 
-For session reads, Codex discovery, Pi and OMP branch handling, and cached search ranking, use clean baseline and candidate checkouts with the same Rust version. The probe source comes from the candidate and is copied into the baseline so both revisions run the same measurement code. These commands build both binaries into isolated target directories, then run the synthetic smoke profile:
+For session reads, Codex discovery, Pi and OMP branch handling, and cached search ranking, use a Linux machine with GNU time at `/usr/bin/time`. Use clean baseline and candidate checkouts with the same Rust version. The probe source comes from the candidate and is copied into the baseline so both revisions run the same measurement code. These commands build both binaries into isolated target directories, then run the synthetic smoke profile:
 
 ```sh
 BASELINE=/path/to/baseline-checkout

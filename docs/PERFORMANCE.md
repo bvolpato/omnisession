@@ -20,7 +20,7 @@ env CARGO_TARGET_DIR=/tmp/omni-target-candidate CARGO_PROFILE_RELEASE_DEBUG=1 \
 
 ## Compare one workload
 
-Select one or more named cases to keep the run focused. Every case creates synthetic provider data, records fixture hashes, compares stable output between binaries, and enforces wall time and memory bounds. It alternates baseline and candidate order. Reports contain raw samples and medians. They report p50 as the median and p95 using the nearest-rank method, along with binary hashes and fixture hashes. Adapter `operation_ns` excludes process startup; wall time includes process startup and CLI work. The search cases index their synthetic corpus before timing cached search.
+The benchmark driver runs on Linux only. It needs GNU time at `/usr/bin/time` to record the peak memory of each process. Select one or more named cases to keep the run focused. Every case creates synthetic provider data, records fixture hashes, compares stable output between binaries, and enforces wall time and memory bounds. It alternates baseline and candidate order. Reports contain raw samples and medians. They report p50 as the median and p95 using the nearest-rank method, along with binary hashes and fixture hashes. Adapter `operation_ns` excludes process startup; wall time includes process startup and CLI work. The search cases index their synthetic corpus before timing cached search.
 
 ```sh
 uv run scripts/benchmark-sessions.py \
@@ -34,7 +34,7 @@ uv run scripts/benchmark-sessions.py \
   --output /tmp/omni-session-benchmark.json
 ```
 
-Use `--profile release` for larger inputs. It increases transcripts to 10,000–12,000 turns, Codex discovery to 40,000 session files, and search to 10,000 sessions. Each sample launches a new CLI process. “Cold” therefore means a new process and its store startup, not a cold OS page cache; the harness does not flush system caches, and warmups can warm them. A workload called `cached` means the trajectory is already indexed. Cached-search index setup is measured separately in `search_index_setup_samples`; the search sample still includes process and database startup. Warmup runs are excluded from timing samples.
+Use `--profile release` for larger inputs. It increases the `many-short` transcripts to 30,000 turns, other transcripts to 10,000–12,000 turns, Codex discovery to 40,000 session files, and search to 10,000 sessions. Each sample launches a new CLI process. “Cold” therefore means a new process and its store startup, not a cold OS page cache; the harness does not flush system caches, and warmups can warm them. A workload called `cached` means the trajectory is already indexed. Cached-search index setup is measured separately in `search_index_setup_samples`; the search sample still includes process and database startup. Warmup runs are excluded from timing samples.
 
 The synthetic search corpus includes `benchmark archive` in each title and user message, and `Synthetic response` in each assistant message. These two cached-search selectors support comparisons of multi-term and mixed-clause ranking. Smoke uses 1,000 sessions; release uses 10,000.
 

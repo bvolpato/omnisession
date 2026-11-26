@@ -68,6 +68,11 @@ printf '%s\n' '#!/usr/bin/env sh' \
     '    : >"$CURL_STATE"' \
     '    exit 35' \
     'fi' \
+    'if [ -n "${INTERRUPT_STATE:-}" ]; then' \
+    '    printf "%s\n" attempt >>"$INTERRUPT_STATE"' \
+    '    kill -TERM "$PPID"' \
+    '    exit 23' \
+    'fi' \
     'output=' \
     'url=' \
     'while [ "$#" -gt 0 ]; do' \
@@ -229,6 +234,66 @@ HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$foreign_install_dir" FIXTUR
 cmp -s "$foreign_install_dir/omnis" "$temp_dir/foreign-expected" || fail 'installer changed foreign omnis command'
 [ -L "$foreign_install_dir/omp" ] || fail 'installer removed an alias to a foreign executable'
 [ ! -e "$temp_dir/provider-launched" ] || fail 'installer executed an untrusted provider'
+
+# The in-app updater replaces an old binary without removing its provider aliases.
+updated_home="$temp_dir/updated-home"
+updated_bin="$temp_dir/updated-bin"
+mkdir -p "$updated_home/.omnisession/shims" "$updated_bin" "$temp_dir/shared-target"
+printf '\177ELF\n%s\n' 'newer build without the old marker' >"$updated_bin/omni"
+ln -s "$updated_bin/omni" "$updated_home/.omnisession/shims/codex"
+ln -s "$updated_bin/omni" "$updated_bin/claude"
+ln -s "$provider_directory/omp" "$updated_bin/omp"
+HOME="$updated_home" OMNI_INSTALL_DIR="$updated_bin" FIXTURE_DIR="$fixture_dir" \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1
+[ ! -e "$updated_home/.omnisession/shims" ] || fail 'installer retained aliases after an in-app update'
+[ ! -L "$updated_bin/claude" ] || fail 'installer retained an install directory alias after an in-app update'
+[ -L "$updated_bin/omp" ] || fail 'installer removed an unrelated provider after an in-app update'
+
+# An existing omni link is replaced. A provider that shares its old target is not an alias.
+printf '%s\n' 'shared target' >"$temp_dir/shared-target/tool"
+rm "$updated_bin/omni"
+ln -s "$temp_dir/shared-target/tool" "$updated_bin/omni"
+ln -s "$temp_dir/shared-target/tool" "$updated_bin/codex"
+HOME="$updated_home" OMNI_INSTALL_DIR="$updated_bin" FIXTURE_DIR="$fixture_dir" \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1
+[ ! -L "$updated_bin/omni" ] || fail 'installer kept a linked omni command'
+[ -L "$updated_bin/codex" ] || fail 'installer removed a provider that does not resolve to omni'
+[ "$(cat "$temp_dir/shared-target/tool")" = 'shared target' ] || fail 'installer wrote through a linked omni command'
+
+directory_bin="$temp_dir/directory-bin"
+mkdir -p "$directory_bin/omni"
+if HOME="$home_dir" OMNI_INSTALL_DIR="$directory_bin" FIXTURE_DIR="$fixture_dir" \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1; then
+    fail 'installer reported success when omni is a directory'
+fi
+rmdir "$directory_bin/omni" || fail 'installer wrote into a directory named omni'
+
+# A piped download that stops early must not run part of the installer.
+script_lines=$(wc -l <"$project_root/install.sh")
+for script_length in "$((script_lines - 1))" "$((script_lines * 3 / 4))" "$((script_lines / 2))"; do
+    if head -n "$script_length" "$project_root/install.sh" | \
+        HOME="$home_dir" OMNI_INSTALL_DIR="$temp_dir/truncated-bin" FIXTURE_DIR="$fixture_dir" \
+            CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh >>"$output_path" 2>&1; then
+        fail 'truncated installer reported success'
+    fi
+    [ ! -e "$temp_dir/truncated-bin" ] || fail 'truncated installer changed the install directory'
+done
+
+interrupt_state="$temp_dir/interrupt-state"
+interrupt_status=0
+HOME="$home_dir" OMNI_INSTALL_DIR="$temp_dir/interrupt-bin" FIXTURE_DIR="$fixture_dir" INTERRUPT_STATE="$interrupt_state" \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1 || interrupt_status=$?
+[ "$interrupt_status" -eq 143 ] || fail "interrupted installer exited with $interrupt_status"
+[ "$(wc -l <"$interrupt_state")" -eq 1 ] || fail 'interrupted installer retried the download'
+
+nul_home="$temp_dir/nul-home"
+mkdir -p "$nul_home"
+printf 'before\000after\n' >"$nul_home/.zshrc"
+cat "$path_block" >>"$nul_home/.zshrc"
+cp "$nul_home/.zshrc" "$temp_dir/expected-nul-zshrc"
+HOME="$nul_home" OMNI_INSTALL_DIR="$temp_dir/nul-bin" FIXTURE_DIR="$fixture_dir" \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1
+cmp -s "$nul_home/.zshrc" "$temp_dir/expected-nul-zshrc" || fail 'installer changed a profile that contains a NUL byte'
 
 bad_install_dir="$temp_dir/bad-bin"
 if HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$bad_install_dir" FIXTURE_DIR="$fixture_dir" \
