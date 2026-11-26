@@ -101,20 +101,20 @@ impl NativeSessionName {
 }
 
 /// Base version of the indexed search document.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 10;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 11;
 /// Minimum readable projection for native Codex search text, titles, and workspace metadata.
 pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 58;
 // A title recheck can keep a readable conversation at the display minimum until the next index pass.
-const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 59;
+const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 60;
 
 /// Version of the searchable content produced for this provider.
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::Antigravity => 14,
-        Provider::AntigravityDesktop => 15,
-        Provider::AntigravityIde | Provider::Claude => 12,
-        Provider::CursorIde | Provider::OhMyPi | Provider::Pi => 11,
+        Provider::Antigravity => 15,
+        Provider::AntigravityDesktop => 16,
+        Provider::AntigravityIde | Provider::Claude => 13,
+        Provider::CursorIde | Provider::OhMyPi | Provider::Pi => 12,
         Provider::Codex => CODEX_SEARCH_DOCUMENT_VERSION,
         _ => SEARCH_DOCUMENT_VERSION,
     }

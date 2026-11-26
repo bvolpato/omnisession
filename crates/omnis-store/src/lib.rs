@@ -18,7 +18,8 @@ use directories::BaseDirs;
 use omnis_ir::{PortableBundle, Provider, SessionRef, SourceRevision, TransferMode};
 
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Params, Transaction, TransactionBehavior,
+    config::DbConfig,
     functions::FunctionFlags,
     params,
     types::{Type, Value as SqlValue, ValueRef},
@@ -75,6 +76,7 @@ const TRAJECTORY_PHRASE_MAX_TOKENS: usize = 64;
 
 const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 
+/// Most matches of a search that selects no sessions.
 const TRAJECTORY_SEARCH_RESULT_LIMIT: usize = 512;
 const FIRST_PRIMARY_LEGACY_CHUNK: i64 = 1 << 31;
 
@@ -96,8 +98,10 @@ pub const MAX_TRAJECTORY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// are one write batch, so larger groups would only add distinct statements to prepare.
 const TRAJECTORY_CHUNK_INSERT_ROWS: usize = 16;
 
-/// Prepared statements one connection keeps. Chunk inserts alone use one statement per row count.
-const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 2 * TRAJECTORY_CHUNK_INSERT_ROWS;
+/// Prepared statements one connection keeps. Chunk inserts alone use one statement per row count, and
+/// an index build runs dozens of other statements for each session. Preparing those again took more
+/// than a quarter of its time.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 8 * TRAJECTORY_CHUNK_INSERT_ROWS;
 
 /// Most bytes that two consecutive chunks share.
 ///
@@ -125,6 +129,12 @@ const _: () = assert!(TRAJECTORY_CHUNK_BYTE_LIMIT / 2 >= 2 * TRAJECTORY_CHUNK_MA
 /// merged segments often and spent a large part of its time on that. A higher value merges less
 /// often. Searches read a few more segments, which did not change their measured time.
 const FTS_AUTOMERGE_SEGMENTS: i64 = 8;
+
+/// Index pages that one merge step writes. Each step is one short transaction, so other processes can
+/// write between steps.
+const FTS_MERGE_PAGES: i64 = 500;
+
+const UNMERGED_DOCUMENTS_PREFIX: &str = "search_unmerged:";
 
 /// SQL function behind exact phrase checks, registered by [`register_search_functions`].
 const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
@@ -244,7 +254,16 @@ fn chunk_text<'value>(
     }
 }
 
-const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)";
+const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, char(0xFDD0), '', ' … ', 28)";
+
+/// Noncharacter that [`FTS_SNIPPET`] puts before each match.
+const FTS_SNIPPET_MATCH: char = '\u{FDD0}';
+
+/// Most characters before the first match of a snippet, where a run of whitespace counts as one.
+///
+/// A snippet holds 28 tokens, and text between tokens has no limit. Table borders, hashes, or
+/// Chinese sentences before the match otherwise push it out of the lines that show the snippet.
+const FTS_SNIPPET_LEADING_CHARACTERS: usize = 120;
 
 /// Index that maps a chunk to its trajectory without reading the chunk row.
 ///
@@ -483,7 +502,7 @@ fn trajectory_candidate_chunks_sql(
              ON trajectories.id = chunks.trajectory_id AND {trajectory_filter}{legacy_filter}
          {gap_joins}
          {eligibility_join}
-         WHERE session_trajectory_chunks_fts MATCH ?{{param}}{{exact}}{projection_filter}{catalog_check}{failure_check}",
+         WHERE session_trajectory_chunks_fts MATCH ?1{{exact}}{projection_filter}{catalog_check}{failure_check}",
     )
 }
 
@@ -923,6 +942,33 @@ impl fmt::Display for DatabaseFailure {
 }
 
 impl std::error::Error for DatabaseFailure {}
+
+/// Runs statements that the connection keeps prepared, for queries that repeat for each session.
+trait CachedStatements {
+    fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize>;
+
+    fn query_row_cached<T>(
+        &self,
+        sql: &str,
+        params: impl Params,
+        read: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>;
+}
+
+impl CachedStatements for Connection {
+    fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T>(
+        &self,
+        sql: &str,
+        params: impl Params,
+        read: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.prepare_cached(sql)?.query_row(params, read)
+    }
+}
 
 #[expect(
     clippy::needless_pass_by_value,
@@ -2672,11 +2718,10 @@ fn matches_catalog_row(connection: &Connection, metadata: &IndexedSession) -> Re
         .transpose()?;
     let event_count =
         i64::try_from(metadata.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
-    connection
-        .query_row(
+    connection.query_row_cached(
             "SELECT EXISTS (SELECT 1 FROM scoped_session_index WHERE provider = ?1 AND session_id = ?2
          AND title IS ?3 AND project_path IS ?4 AND git_branch IS ?5 AND created_at IS ?6
-         AND updated_at IS ?7 AND updated_at_approximate = ?8 AND event_count = ?9 AND source_updated_submillis IS ?10
+         AND +updated_at IS ?7 AND updated_at_approximate = ?8 AND event_count = ?9 AND source_updated_submillis IS ?10
          AND source_file_id IS ?11 AND source_contents_id IS ?12)",
             params![
                 metadata.session.provider.to_string(),
@@ -2725,6 +2770,11 @@ impl Store {
             .busy_handler(Some(retry_busy_database))
             .map_err(database_error)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+        // Without this setting, SQLite prepares a cached statement again for each new parameter that
+        // it compared with a partial index. No index here depends on a parameter.
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)
+            .map_err(database_error)?;
         connection
             .execute_batch(&format!(
                 "PRAGMA foreign_keys = ON;
@@ -3019,7 +3069,7 @@ impl Store {
             }
             let provider = session.session.provider.to_string();
             let id = &session.session.id;
-            let existing = tx.query_row("SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3 AND (coalesce('file/'||json_extract(metadata,'$.source_revision.file'),json_extract(metadata,'$.source_path')) IS ?4 OR (json_extract(metadata,'$.source_revision.file') IS NULL AND EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=?1 AND p.session_id=?2 WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2 AND t.source_revision=?5 AND t.pi_workspace=CASE WHEN p.project=pi_search_copies.project THEN '' ELSE pi_search_copies.project END))) ORDER BY json_extract(metadata,'$.source_path') IS NULL LIMIT 1",params![provider,id,session.project_path.as_deref().and_then(Path::to_str),Self::pi_file_key(session.source_revision,session.source_path.as_deref()).as_deref().and_then(Path::to_str),revision],|row|row.get::<_,String>(0)).optional().map_err(database_error)?;
+            let existing = tx.query_row_cached("SELECT project FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND json_valid(metadata) AND json_extract(metadata,'$.project_path')=?3 AND (coalesce('file/'||json_extract(metadata,'$.source_revision.file'),json_extract(metadata,'$.source_path')) IS ?4 OR (json_extract(metadata,'$.source_revision.file') IS NULL AND EXISTS(SELECT 1 FROM session_trajectories t JOIN pi_search_primary p ON p.provider=?1 AND p.session_id=?2 WHERE t.provider=?1 AND coalesce(t.pi_native_id,t.session_id)=?2 AND t.source_revision=?5 AND t.pi_workspace=CASE WHEN p.project=pi_search_copies.project THEN '' ELSE pi_search_copies.project END))) ORDER BY json_extract(metadata,'$.source_path') IS NULL LIMIT 1",params![provider,id,session.project_path.as_deref().and_then(Path::to_str),Self::pi_file_key(session.source_revision,session.source_path.as_deref()).as_deref().and_then(Path::to_str),revision],|row|row.get::<_,String>(0)).optional().map_err(database_error)?;
             let recorded = session
                 .project_path
                 .as_deref()
@@ -3029,24 +3079,121 @@ impl Store {
             let project = if let Some(key) = existing {
                 key
             } else {
-                let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3 UNION ALL SELECT 1 FROM pi_retired_keys WHERE provider=?1 AND session_id=?2 AND project=?3)",params![provider,id,recorded],|row|row.get(0)).map_err(database_error)?;
+                let occupied:bool=tx.query_row_cached("SELECT EXISTS(SELECT 1 FROM pi_search_copies WHERE provider=?1 AND session_id=?2 AND project=?3 UNION ALL SELECT 1 FROM pi_retired_keys WHERE provider=?1 AND session_id=?2 AND project=?3)",params![provider,id,recorded],|row|row.get(0)).map_err(database_error)?;
                 if occupied {
                     format!("copy/{}", Uuid::new_v4())
                 } else {
                     recorded.to_owned()
                 }
             };
-            tx.execute(
+            tx.execute_cached(
                 "INSERT OR IGNORE INTO pi_search_primary VALUES (?1,?2,CASE WHEN EXISTS (SELECT 1 FROM session_trajectories WHERE provider=?1 AND session_id=?2 AND pi_workspace='' AND (source_revision IS NULL OR source_revision IS NOT ?4)) THEN '' ELSE ?3 END)",
                 params![provider, id, project,revision],
             )
             .map_err(database_error)?;
-            tx.execute("UPDATE pi_search_primary SET project=?3 WHERE provider=?1 AND session_id=?2 AND project<>?3 AND EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND session_id=?2 AND pi_workspace='' AND source_revision=?4) AND NOT EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace=?3)",params![provider,id,project,revision]).map_err(database_error)?;
+            tx.execute_cached("UPDATE pi_search_primary SET project=?3 WHERE provider=?1 AND session_id=?2 AND project<>?3 AND EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND session_id=?2 AND pi_workspace='' AND source_revision=?4) AND NOT EXISTS(SELECT 1 FROM session_trajectories WHERE provider=?1 AND pi_native_id=?2 AND pi_workspace=?3)",params![provider,id,project,revision]).map_err(database_error)?;
             let metadata = serde_json::to_string(session).map_err(|_| StoreError::CorruptStore)?;
-            tx.execute("INSERT INTO pi_search_copies VALUES (?1,?2,?3,?4) ON CONFLICT DO UPDATE SET metadata=excluded.metadata WHERE metadata<>excluded.metadata",params![provider,id,project,metadata]).map_err(database_error)?;
-            tx.execute("INSERT OR REPLACE INTO selected_pi_copies SELECT ?1,?2,CASE WHEN project=?3 THEN '' ELSE ?3 END FROM pi_search_primary WHERE provider=?1 AND session_id=?2",params![provider,id,project]).map_err(database_error)?;
+            tx.execute_cached("INSERT INTO pi_search_copies VALUES (?1,?2,?3,?4) ON CONFLICT DO UPDATE SET metadata=excluded.metadata WHERE metadata<>excluded.metadata",params![provider,id,project,metadata]).map_err(database_error)?;
+            tx.execute_cached("INSERT OR REPLACE INTO selected_pi_copies SELECT ?1,?2,CASE WHEN project=?3 THEN '' ELSE ?3 END FROM pi_search_primary WHERE provider=?1 AND session_id=?2",params![provider,id,project]).map_err(database_error)?;
         }
         tx.commit().map_err(database_error)
+    }
+
+    /// Counts the documents in the search index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be read.
+    pub fn search_document_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT (SELECT count(*) FROM main.session_trajectories)
+                      + (SELECT count(*) FROM main.scoped_native_documents)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        usize::try_from(count).map_err(|_| StoreError::CorruptStore)
+    }
+
+    /// Merges the segments of the full-text index and drops the text that new documents replaced.
+    ///
+    /// FTS5 keeps replaced text until the segment that has it is merged. A pass that replaces every
+    /// document doubles the index, and later passes are too small to merge the old half soon. Stops
+    /// between steps when `stop` returns true, and the index is valid after each step. Returns whether
+    /// the merge finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a step cannot write to the index.
+    pub fn merge_search_index(&self, stop: &dyn Fn() -> bool) -> Result<bool> {
+        let connection = self.connection.borrow();
+        // A negative count puts all segments on one level first.
+        let mut pages = -FTS_MERGE_PAGES;
+        while !stop() {
+            let changes = connection.total_changes();
+            connection
+                .execute_cached(
+                    "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts, rank)
+                     VALUES ('merge', ?1)",
+                    [pages],
+                )
+                .map_err(database_error)?;
+            // FTS5 documents that a step with nothing left to merge makes fewer than two changes.
+            if connection.total_changes() - changes < 2 {
+                return Ok(true);
+            }
+            pages = FTS_MERGE_PAGES;
+        }
+        Ok(false)
+    }
+
+    /// Reads how many documents were replaced since the last finished merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read.
+    pub fn unmerged_search_documents(&self) -> Result<usize> {
+        let marker: Option<String> = self
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT name FROM store_migrations WHERE name >= ?1 AND name < ?1 || ':' LIMIT 1",
+                [UNMERGED_DOCUMENTS_PREFIX],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        Ok(marker
+            .and_then(|name| name.strip_prefix(UNMERGED_DOCUMENTS_PREFIX)?.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Records how many documents were replaced since the last finished merge, for later passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be written.
+    pub fn record_unmerged_search_documents(&self, count: usize) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "DELETE FROM store_migrations WHERE name >= ?1 AND name < ?1 || ':'",
+                [UNMERGED_DOCUMENTS_PREFIX],
+            )
+            .map_err(database_error)?;
+        if count != 0 {
+            transaction
+                .execute(
+                    "INSERT INTO store_migrations(name) VALUES (?1)",
+                    [format!("{UNMERGED_DOCUMENTS_PREFIX}{count}")],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
     }
 
     /// Opens `OMNISESSION_HOME` or `~/.omnisession` as state root.
@@ -6136,7 +6283,7 @@ impl Store {
             Vec::new()
         };
         let connection = self.connection.borrow();
-        let mut statement = connection.prepare(&sql).map_err(database_error)?;
+        let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
         let mut rows = statement
             .query(rusqlite::params_from_iter(scope))
             .map_err(database_error)?;
@@ -6517,6 +6664,16 @@ impl Store {
         provider: Option<Provider>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
         self.read_trajectory_search(|snapshot| snapshot.cached_sessions_with_titles(provider))
+    }
+
+    /// Reads cached sessions without their indexed titles, which need a search document read for each
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cached rows cannot be read.
+    pub fn cached_sessions(&self, provider: Option<Provider>) -> Result<Vec<IndexedSession>> {
+        self.read_trajectory_search(|snapshot| snapshot.read_cached_sessions(provider, false, None))
     }
 
     /// Retires native Grok search results whose UUID still names competing source directories.
@@ -7858,6 +8015,20 @@ impl TrajectorySearchSnapshot<'_> {
         picker: bool,
         homes: Option<[Option<&Path>; 3]>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
+        let sessions = self.read_cached_sessions(provider, picker, homes)?;
+        let mut titles = self.read_trajectory_titles(true)?;
+        if let Some(homes) = homes {
+            self.scope_native_picker_titles(homes, &sessions, &mut titles)?;
+        }
+        Ok((sessions, titles))
+    }
+
+    fn read_cached_sessions(
+        &self,
+        provider: Option<Provider>,
+        picker: bool,
+        homes: Option<[Option<&Path>; 3]>,
+    ) -> Result<Vec<IndexedSession>> {
         let title = if picker {
             "CASE WHEN catalog.provider<>'codex' OR NOT EXISTS (SELECT 1 FROM scoped_session_catalog s WHERE s.provider=catalog.provider AND s.session_id=catalog.session_id AND NOT s.name_observable) THEN catalog.title END"
         } else {
@@ -7910,16 +8081,11 @@ impl TrajectorySearchSnapshot<'_> {
             floor = omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
         );
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
-        let sessions: Vec<IndexedSession> = statement
+        statement
             .query_map(parameters, indexed_session_from_row)
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
-            .map_err(|_| StoreError::CorruptStore)?;
-        let mut titles = self.read_trajectory_titles(true)?;
-        if let Some(homes) = homes {
-            self.scope_native_picker_titles(homes, &sessions, &mut titles)?;
-        }
-        Ok((sessions, titles))
+            .map_err(|_| StoreError::CorruptStore)
     }
 
     fn scope_native_picker_titles(
@@ -8174,7 +8340,7 @@ impl TrajectorySearchSnapshot<'_> {
             indexed_titles_sql()
         );
         self.connection
-            .query_row(
+            .query_row_cached(
                 &sql,
                 params![session.provider.to_string(), session.id],
                 indexed_title_from_row,
@@ -8350,43 +8516,40 @@ impl TrajectorySearchSnapshot<'_> {
         if clauses.is_empty() || limit == 0 {
             return Ok(empty_trajectory_search_page());
         }
-        let limit = limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT);
+        // Selected sessions already bound their page.
+        let limit = if eligibility_json.is_some() {
+            limit
+        } else {
+            limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT)
+        };
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let connection = self.connection;
         let state = SearchTableState::read(connection)?;
-        let has_eligibility = eligibility_json.is_some();
-        let statement_sql = trajectory_search_page_sql(
-            &clauses,
-            has_eligibility,
-            scoped_json.is_some(),
-            aliases.is_some(),
+        let aliases = aliases
+            .map(|aliases| {
+                let aliases: Vec<_> = aliases
+                    .iter()
+                    .map(|source| (source.document_id, source.provider))
+                    .collect();
+                serde_json::to_string(&aliases).map_err(|_| StoreError::CorruptStore)
+            })
+            .transpose()?;
+        let scope = TrajectorySearchScope {
+            eligibility: eligibility_json,
+            scoped: scoped_json,
+            aliases: aliases.as_deref(),
             state,
-        );
-        let mut parameters = clauses
-            .iter()
-            .map(|clause| SqlValue::Text(clause.match_expression.clone()))
-            .collect::<Vec<_>>();
-        if let Some(json) = eligibility_json {
-            parameters.push(SqlValue::Text(json.to_owned()));
-        }
-        parameters.push(SqlValue::Integer(query_limit));
-        parameters.extend(
-            clauses
-                .iter()
-                .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
-        );
-        if let Some(json) = scoped_json {
-            parameters.push(SqlValue::Text(json.to_owned()));
-        }
-        if let Some(aliases) = aliases {
-            let aliases: Vec<_> = aliases
-                .iter()
-                .map(|source| (source.document_id, source.provider))
-                .collect();
-            parameters.push(SqlValue::Text(
-                serde_json::to_string(&aliases).map_err(|_| StoreError::CorruptStore)?,
-            ));
-        }
+        };
+        let page_clauses = if let [_] = clauses.as_slice() {
+            clauses.as_slice()
+        } else {
+            if !self.collect_clause_matches(&clauses, scope)? {
+                return Ok(empty_trajectory_search_page());
+            }
+            &[]
+        };
+        let statement_sql = trajectory_search_page_sql(&clauses, scope);
+        let parameters = scope.parameters(page_clauses, query_limit);
         let mut statement = connection
             .prepare_cached(&statement_sql)
             .map_err(database_error)?;
@@ -8431,6 +8594,36 @@ impl TrajectorySearchSnapshot<'_> {
             rows.into_iter().map(|(item, _, _)| item).collect()
         };
         Ok(SessionTrajectorySearchPage { matches, has_more })
+    }
+
+    /// Saves the best chunk of each clause for the statement that ranks a multi-word page.
+    ///
+    /// `SQLite` limits the cursors of one statement that expands common table expressions. One
+    /// statement for all clauses passed that limit at about ten words, so each clause runs on its
+    /// own. Returns whether every clause matched. The snapshot's rollback removes the rows.
+    fn collect_clause_matches(
+        &self,
+        clauses: &[TrajectoryClause],
+        scope: TrajectorySearchScope<'_>,
+    ) -> Result<bool> {
+        self.connection
+            .execute("DELETE FROM search_clause_matches", [])
+            .map_err(database_error)?;
+        for (clause_index, clause) in clauses.iter().enumerate() {
+            let parameters = scope.parameters(
+                std::slice::from_ref(clause),
+                i64::try_from(clause_index).unwrap_or(i64::MAX),
+            );
+            let matched = self
+                .connection
+                .prepare_cached(&clause_matches_sql(clause, scope))
+                .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(parameters)))
+                .map_err(database_error)?;
+            if matched == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -8547,39 +8740,74 @@ fn empty_trajectory_search_page() -> SessionTrajectorySearchPage {
     }
 }
 
-/// Builds one ranked page statement.
-///
-/// Parameters are `?1..?N` FTS expressions, optional eligibility JSON when `has_eligibility` is
-/// set, limit, then one folded phrase per exact clause, in clause order. Rows end with the
-/// snippet's chunk ID and clause index. Exact clauses filter candidate chunks with
-/// [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet empty for the caller to cut around the
-/// phrase.
-fn trajectory_search_page_sql(
-    clauses: &[TrajectoryClause],
-    has_eligibility: bool,
-    scoped: bool,
-    projected: bool,
+/// Sessions and documents that one search covers.
+#[derive(Clone, Copy)]
+struct TrajectorySearchScope<'json> {
+    eligibility: Option<&'json str>,
+    scoped: Option<&'json str>,
+    aliases: Option<&'json str>,
     state: SearchTableState,
-) -> String {
+}
+
+impl TrajectorySearchScope<'_> {
+    /// Values of the parameters that [`search_documents_sql`] numbers, in order. `bound` is the
+    /// page limit, or the clause index in [`clause_matches_sql`].
+    fn parameters(self, clauses: &[TrajectoryClause], bound: i64) -> Vec<SqlValue> {
+        let text = |json: &str| SqlValue::Text(json.to_owned());
+        clauses
+            .iter()
+            .map(|clause| SqlValue::Text(clause.match_expression.clone()))
+            .chain(self.eligibility.map(text))
+            .chain([SqlValue::Integer(bound)])
+            .chain(
+                clauses
+                    .iter()
+                    .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
+            )
+            .chain(self.scoped.map(text))
+            .chain(self.aliases.map(text))
+            .collect()
+    }
+}
+
+/// Common table expressions of one search statement.
+struct SearchDocumentsSql {
+    with: String,
+    /// Expression that lists the searched documents.
+    documents: &'static str,
+    /// Number of the limit parameter.
+    limit_parameter: usize,
+    exact_filter: String,
+}
+
+/// Builds the common table expressions of one search statement.
+///
+/// Parameters are the FTS expression of `clause` when set, optional eligibility JSON, limit, then
+/// the folded phrase of an exact clause, scoped selection JSON, and alias JSON. Exact clauses
+/// filter candidate chunks with [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet empty for the
+/// caller to cut around the phrase.
+fn search_documents_sql(
+    clause: Option<&TrajectoryClause>,
+    scope: TrajectorySearchScope<'_>,
+) -> SearchDocumentsSql {
+    let has_eligibility = scope.eligibility.is_some();
+    let (scoped, projected) = (scope.scoped.is_some(), scope.aliases.is_some());
     debug_assert!(has_eligibility || (!scoped && !projected));
-    let eligibility_parameter = has_eligibility.then_some(clauses.len() + 1);
-    let limit_parameter = clauses.len() + if has_eligibility { 2 } else { 1 };
-    let mut exact_parameter = limit_parameter;
-    let exact_filters = clauses
-        .iter()
-        .map(|clause| {
-            if clause.exact_phrase.is_none() {
-                return String::new();
-            }
-            exact_parameter += 1;
-            format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
-        })
-        .collect::<Vec<_>>();
-    let mut eligible = trajectory_search_eligibility_sql(eligibility_parameter, projected, state);
+    let first_parameter = 1 + usize::from(clause.is_some());
+    let eligibility_parameter = has_eligibility.then_some(first_parameter);
+    let limit_parameter = first_parameter + usize::from(has_eligibility);
+    let exact = clause.is_some_and(|clause| clause.exact_phrase.is_some());
+    let exact_parameter = limit_parameter + usize::from(exact);
+    let exact_filter = if exact {
+        format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
+    } else {
+        String::new()
+    };
+    let mut with = trajectory_search_eligibility_sql(eligibility_parameter, projected, scope.state);
     let documents = if projected {
         let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
         let parameter = exact_parameter + 2;
-        write!(eligible, "
+        write!(with, "
             projection AS (SELECT value ->> 0 AS id, value ->> 1 AS provider FROM json_each(?{parameter})),
             direct_scoped AS MATERIALIZED ({selected}),
             eligible(provider,session_id,file,contents) AS (
@@ -8605,7 +8833,7 @@ fn trajectory_search_page_sql(
     } else if scoped {
         let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
         write!(
-            eligible,
+            with,
             " selected_scoped AS MATERIALIZED ({selected}),
               documents AS (
                 SELECT t.id, t.provider, t.session_id, t.source_complete, t.complete, t.indexed_byte_count,
@@ -8621,28 +8849,27 @@ fn trajectory_search_page_sql(
     } else {
         "current_primary"
     };
+    SearchDocumentsSql {
+        with,
+        documents,
+        limit_parameter,
+        exact_filter,
+    }
+}
+
+/// Builds one ranked page statement.
+///
+/// A page for one clause ranks its matches directly. A page for several clauses ranks the rows
+/// that [`clause_matches_sql`] saved, so it has no clause parameters. Rows end with the snippet's
+/// chunk ID and clause index.
+fn trajectory_search_page_sql(
+    clauses: &[TrajectoryClause],
+    scope: TrajectorySearchScope<'_>,
+) -> String {
     if let [clause] = clauses {
-        single_clause_page_sql(
-            eligible,
-            clause,
-            &exact_filters[0],
-            limit_parameter,
-            has_eligibility,
-            scoped,
-            documents,
-            state,
-        )
+        single_clause_page_sql(clause, scope)
     } else {
-        multi_clause_page_sql(
-            eligible,
-            clauses,
-            &exact_filters,
-            limit_parameter,
-            has_eligibility,
-            scoped,
-            documents,
-            state,
-        )
+        multi_clause_page_sql(clauses.len(), scope)
     }
 }
 
@@ -8770,7 +8997,7 @@ fn with_trajectory_excerpts(
         while let Some(row) = snippets.next().map_err(database_error)? {
             let chunk_id = row.get::<_, i64>(0).map_err(database_error)?;
             let snippet = row.get::<_, String>(1).map_err(database_error)?;
-            fts_snippets.insert((clause_index, chunk_id), snippet);
+            fts_snippets.insert((clause_index, chunk_id), bounded_fts_snippet(&snippet));
         }
     }
     let mut stored_chunk = clauses
@@ -8829,46 +9056,38 @@ const SEARCH_COVERAGE_COLUMNS: &str = "trajectories.source_complete AND gap.traj
 /// Both chunk tables use the same FTS5 index. Scoped chunks have negative FTS row IDs.
 fn matching_chunks_sql(
     clause: &TrajectoryClause,
-    parameter: usize,
     exact_filter: &str,
-    has_eligibility: bool,
-    scoped: bool,
-    state: SearchTableState,
+    scope: TrajectorySearchScope<'_>,
 ) -> String {
-    let primary = trajectory_candidate_chunks_sql(clause, has_eligibility, state)
-        .replace("{param}", &parameter.to_string())
+    let primary = trajectory_candidate_chunks_sql(clause, scope.eligibility.is_some(), scope.state)
         .replace("{exact}", exact_filter);
     let mut sql = format!(
         "SELECT chunks.id AS chunk_id, chunks.trajectory_id, chunks.chunk_index,
                 session_trajectory_chunks_fts.rank AS match_rank
          {primary}"
     );
-    if scoped {
+    if scope.scoped.is_some() {
         write!(sql,
             " UNION ALL
               SELECT -chunks.id, -chunks.document_id, chunks.chunk_index, session_trajectory_chunks_fts.rank
               FROM session_trajectory_chunks_fts
               JOIN scoped_native_chunk_rows chunks ON chunks.id = -session_trajectory_chunks_fts.rowid
               JOIN selected_scoped e ON e.id = chunks.document_id
-              WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
+              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}"
         ).expect("writing SQL into a string cannot fail");
     }
     sql
 }
 
-#[allow(clippy::too_many_arguments)]
-fn single_clause_page_sql(
-    mut sql: String,
-    clause: &TrajectoryClause,
-    exact_filter: &str,
-    limit_parameter: usize,
-    has_eligibility: bool,
-    scoped: bool,
-    documents: &str,
-    state: SearchTableState,
-) -> String {
-    let candidates = matching_chunks_sql(clause, 1, exact_filter, has_eligibility, scoped, state);
-    let (coverage_cols, loss_join) = physical_coverage_sql(state.has_physical_gaps, "id");
+fn single_clause_page_sql(clause: &TrajectoryClause, scope: TrajectorySearchScope<'_>) -> String {
+    let SearchDocumentsSql {
+        with: mut sql,
+        documents,
+        limit_parameter,
+        exact_filter,
+    } = search_documents_sql(Some(clause), scope);
+    let candidates = matching_chunks_sql(clause, &exact_filter, scope);
+    let (coverage_cols, loss_join) = physical_coverage_sql(scope.state.has_physical_gaps, "id");
     write!(
         sql,
         "ranked_chunks AS (
@@ -8905,22 +9124,17 @@ fn physical_coverage_sql(has_physical_gaps: bool, id_column: &str) -> (&'static 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn multi_clause_page_sql(
-    mut sql: String,
-    clauses: &[TrajectoryClause],
-    exact_filters: &[String],
-    limit_parameter: usize,
-    has_eligibility: bool,
-    scoped: bool,
-    documents: &str,
-    state: SearchTableState,
-) -> String {
-    let clause_count = clauses.len();
-    sql.push_str(
-        "clause_matches(trajectory_id, legacy_projection, chunk_id, clause_index, clause_rank, exact_clause) AS (",
-    );
-    let projection = if scoped {
+/// Builds the statement that saves the best chunk of one clause for each document.
+fn clause_matches_sql(clause: &TrajectoryClause, scope: TrajectorySearchScope<'_>) -> String {
+    let SearchDocumentsSql {
+        with,
+        limit_parameter: index_parameter,
+        exact_filter,
+        ..
+    } = search_documents_sql(Some(clause), scope);
+    let candidates = matching_chunks_sql(clause, &exact_filter, scope);
+    let exact_clause = i32::from(clause.exact_phrase.is_some());
+    let projection = if scope.scoped.is_some() {
         format!(
             "CASE WHEN trajectory_id > 0 THEN chunk_index >= {FIRST_PRIMARY_LEGACY_CHUNK}
                   ELSE EXISTS (SELECT 1 FROM scoped_native_documents d WHERE d.id = -trajectory_id
@@ -8929,48 +9143,41 @@ fn multi_clause_page_sql(
     } else {
         format!("chunk_index >= {FIRST_PRIMARY_LEGACY_CHUNK}")
     };
-    for (clause_index, (clause, exact_filter)) in clauses.iter().zip(exact_filters).enumerate() {
-        if clause_index != 0 {
-            sql.push_str(" UNION ALL ");
-        }
-        let parameter = clause_index + 1;
-        let exact_clause = i32::from(clause.exact_phrase.is_some());
-        let candidates = matching_chunks_sql(
-            clause,
-            parameter,
-            exact_filter,
-            has_eligibility,
-            scoped,
-            state,
-        );
-        write!(
-            sql,
-            "SELECT trajectory_id, {projection}, chunk_id, {clause_index}, match_rank, {exact_clause}
-             FROM ({candidates})"
-        )
-        .expect("writing SQL into a string cannot fail");
-    }
+    format!(
+        "INSERT INTO search_clause_matches
+             (trajectory_id, legacy_projection, chunk_id, clause_index, clause_rank, exact_clause)
+         {with}
+         clause_matches(trajectory_id, legacy_projection, chunk_id, clause_rank) AS (
+             SELECT trajectory_id, {projection}, chunk_id, match_rank FROM ({candidates})
+         )
+         SELECT trajectory_id, legacy_projection, chunk_id, ?{index_parameter}, clause_rank, {exact_clause}
+         FROM (
+             SELECT clause_matches.*,
+                    row_number() OVER (
+                        PARTITION BY trajectory_id, legacy_projection
+                        ORDER BY clause_rank, chunk_id
+                    ) AS clause_rank_order
+             FROM clause_matches
+         )
+         WHERE clause_rank_order = 1"
+    )
+}
+
+fn multi_clause_page_sql(clause_count: usize, scope: TrajectorySearchScope<'_>) -> String {
+    let SearchDocumentsSql {
+        with: mut sql,
+        documents,
+        limit_parameter,
+        ..
+    } = search_documents_sql(None, scope);
     let (coverage_cols, loss_join) =
-        physical_coverage_sql(state.has_physical_gaps, "trajectory_id");
+        physical_coverage_sql(scope.state.has_physical_gaps, "trajectory_id");
     write!(
         sql,
-        "),
-         best_clause_matches AS MATERIALIZED (
-             SELECT trajectory_id, legacy_projection, chunk_id, clause_index, clause_rank, exact_clause
-             FROM (
-                 SELECT clause_matches.*,
-                        row_number() OVER (
-                            PARTITION BY trajectory_id, legacy_projection, clause_index
-                            ORDER BY clause_rank, chunk_id
-                        ) AS clause_rank_order
-                 FROM clause_matches
-             )
-             WHERE clause_rank_order = 1
-         ),
-         qualified_projections AS (
+        " qualified_projections AS (
              SELECT trajectory_id, legacy_projection, sum(clause_rank) AS trajectory_rank,
                     row_number() OVER (PARTITION BY trajectory_id ORDER BY sum(clause_rank), legacy_projection) AS projection_rank
-             FROM best_clause_matches
+             FROM search_clause_matches
              GROUP BY trajectory_id, legacy_projection
              HAVING count(*) = {clause_count}
          ),
@@ -8991,12 +9198,12 @@ fn multi_clause_page_sql(
              LIMIT ?{limit_parameter}
          ),
          best_snippets AS (
-             SELECT best_clause_matches.*,
+             SELECT search_clause_matches.*,
                     row_number() OVER (
-                        PARTITION BY best_clause_matches.trajectory_id
+                        PARTITION BY trajectory_id
                         ORDER BY exact_clause DESC, clause_rank, clause_index, chunk_id
                     ) AS snippet_rank
-             FROM best_clause_matches
+             FROM search_clause_matches
              WHERE (trajectory_id, legacy_projection) IN (SELECT trajectory_id, legacy_projection FROM ranked_trajectories)
          )
          SELECT trajectories.provider, trajectories.session_id,
@@ -9306,6 +9513,8 @@ fn initialize_trajectory_scope(connection: &Connection, codex_home: Option<&str>
              JOIN main.pi_search_primary p ON p.provider=c.provider AND p.session_id=c.session_id
              WHERE CASE WHEN json_valid(c.metadata) THEN json_extract(c.metadata,'$.project_path') END=i.project_path AND c.project<>p.project;
          CREATE TEMP TABLE pi_document_aliases(id INTEGER PRIMARY KEY,selector TEXT NOT NULL);
+         CREATE TEMP TABLE search_clause_matches(trajectory_id INTEGER NOT NULL, legacy_projection INTEGER NOT NULL,
+             chunk_id INTEGER NOT NULL, clause_index INTEGER NOT NULL, clause_rank REAL NOT NULL, exact_clause INTEGER NOT NULL);
          CREATE TEMP VIEW visible_trajectories AS
              SELECT t.session_id AS session_id,t.*
              FROM main.session_trajectories t
@@ -10816,7 +11025,7 @@ fn replace_trajectory_chunks(
     let trajectory_ids = serde_json::to_string(&trajectory_ids)
         .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
     transaction
-        .execute(
+        .execute_cached(
             "DELETE FROM session_trajectory_chunk_rows
              WHERE trajectory_id IN (SELECT value FROM json_each(?1)) AND chunk_index < ?2",
             params![trajectory_ids, FIRST_PRIMARY_LEGACY_CHUNK],
@@ -10834,7 +11043,7 @@ fn replace_trajectory_chunks(
 /// stored chunks. The rebuild reads every chunk, which is slow, and it only runs after damage.
 fn rebuild_full_text_index_after_unreadable_chunk(transaction: &Transaction<'_>) -> Result<()> {
     let unreadable_chunk_removed = transaction
-        .query_row("SELECT 1 FROM session_trajectory_chunk_repairs", [], |_| {
+        .query_row_cached("SELECT 1 FROM session_trajectory_chunk_repairs", [], |_| {
             Ok(())
         })
         .optional()
@@ -11840,7 +12049,7 @@ fn valid_trajectory_coverage(
 
 /// One full-text clause. A session matches when every clause matches one of its chunks.
 struct TrajectoryClause {
-    /// FTS5 phrase of letter-and-digit tokens only, so input never changes query structure.
+    /// One quoted FTS5 phrase. A term holds no double quote, so input never changes query structure.
     match_expression: String,
     /// Folded quoted phrase the matching chunk must contain.
     exact_phrase: Option<String>,
@@ -11855,35 +12064,51 @@ fn trajectory_clauses(query: &str) -> Vec<TrajectoryClause> {
 }
 
 /// A term's tokens must be adjacent, so `qwen3.8` never matches `qwen3` and `8` far apart. The last
-/// token is a prefix when the term ends in a letter or digit, which keeps type-ahead working and
-/// lets `"qwen3.8"` find `qwen3.85`, as a substring match would.
+/// token is a prefix unless ASCII punctuation follows it, which keeps type-ahead working and lets
+/// `"qwen3.8"` find `qwen3.85`, as a substring match would.
+///
+/// FTS5 splits the phrase as it splits the indexed text. It keeps some characters inside a token
+/// that are no letters or digits in Rust, such as combining accents and newer emoji.
 fn trajectory_clause(term: &SearchTerm) -> Option<TrajectoryClause> {
-    let mut phrase = String::new();
-    let mut prefix = term.text().ends_with(char::is_alphanumeric);
+    let text = term.text();
+    let (mut start, mut end) = (0, 0);
+    let mut cut = false;
     for (index, token) in term.tokens().enumerate() {
         if index == TRAJECTORY_PHRASE_MAX_TOKENS {
-            // Punctuation follows the last kept token, so it is a whole token.
-            prefix = false;
+            cut = true;
             break;
+        }
+        let offset = token.as_ptr() as usize - text.as_ptr() as usize;
+        if index == 0 {
+            // A symbol before the first word can end the previous word in the indexed text.
+            start = text[..offset]
+                .rfind(|character: char| character.is_ascii())
+                .map_or(0, |separator| separator + 1);
         }
         let bounded = utf8_prefix(token, TRAJECTORY_QUERY_MAX_TOKEN_BYTES);
-        if !phrase.is_empty() {
-            phrase.push(' ');
-        }
-        phrase.push_str(bounded);
+        end = offset + bounded.len();
         if bounded.len() < token.len() {
             // A cut token only matches as a prefix, so the phrase ends there.
-            prefix = true;
+            cut = true;
             break;
         }
     }
-    if phrase.is_empty() {
+    if end == 0 {
         return None;
     }
+    let phrase = if cut {
+        &text[start..end]
+    } else {
+        &text[start..]
+    }
+    .replace('\0', " ");
+    let prefix = cut
+        || phrase.ends_with(|character: char| {
+            !character.is_ascii() || character.is_ascii_alphanumeric()
+        });
     Some(TrajectoryClause {
         match_expression: format!("\"{phrase}\"{}", if prefix { "*" } else { "" }),
-        exact_phrase: matches!(term, SearchTerm::Exact(_))
-            .then(|| search_query::fold_text(term.text())),
+        exact_phrase: matches!(term, SearchTerm::Exact(_)).then(|| search_query::fold_text(text)),
     })
 }
 
@@ -11940,6 +12165,33 @@ fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
         Ok(CHUNK_SCRATCH
             .with_borrow_mut(|scratch| chunk_text(context.get_raw(0), scratch).is_some()))
     })
+}
+
+/// Cuts the text before the first match of an FTS5 snippet to
+/// [`FTS_SNIPPET_LEADING_CHARACTERS`], and removes the match markers.
+fn bounded_fts_snippet(snippet: &str) -> String {
+    let Some((leading, _)) = snippet.split_once(FTS_SNIPPET_MATCH) else {
+        return snippet.to_owned();
+    };
+    let (mut kept, mut spaced) = (0, false);
+    let mut start = leading.len();
+    for (index, character) in leading.char_indices().rev() {
+        kept += usize::from(!(spaced && character.is_whitespace()));
+        if kept > FTS_SNIPPET_LEADING_CHARACTERS {
+            break;
+        }
+        spaced = character.is_whitespace();
+        start = index;
+    }
+    let visible = if start == 0 {
+        snippet.to_owned()
+    } else {
+        let word = leading[start..]
+            .find(char::is_whitespace)
+            .unwrap_or_default();
+        format!(" … {}", snippet[start + word..].trim_start())
+    };
+    visible.replace(FTS_SNIPPET_MATCH, "")
 }
 
 /// Excerpt around the first occurrence of `folded_phrase`, cut at whitespace, with ` … ` where
@@ -13363,7 +13615,7 @@ fn selected_catalog_rows(
     session: &SessionRef,
 ) -> Result<(Option<ScopedCatalogRow>, Option<UntrustedCatalogRow>)> {
     let row = connection
-        .query_row(
+        .query_row_cached(
             SELECTED_CATALOG_SQL,
             params![session.provider.to_string(), session.id],
             |r| {
@@ -13399,7 +13651,7 @@ fn unscoped_catalog_name(
     connection: &Connection,
     session: &SessionRef,
 ) -> Result<Option<IndexedSession>> {
-    connection.query_row(
+    connection.query_row_cached(
         "SELECT provider,session_id,title,project_path,git_branch,created_at,updated_at,updated_at_approximate,
          event_count,source_updated_submillis,source_file_id,source_contents_id FROM raw_session_catalog
          WHERE provider='codex' AND session_id=?1 AND unscoped_name",
@@ -13674,7 +13926,7 @@ fn reconcile_ordinary_catalog_name(
     prior: Option<&ScopedCatalogRow>,
     names: CatalogNameObservations<'_>,
 ) -> Result<()> {
-    let previous_gui = transaction.execute(
+    let previous_gui = transaction.execute_cached(
         "DELETE FROM codex_gui_catalog_sources WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)",
         [&row.session.id],
     ).map_err(database_error)? != 0;
@@ -13731,7 +13983,7 @@ fn gui_name_for_revision(
     revision: SourceRevision,
 ) -> Result<bool> {
     connection
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM codex_gui_catalog_sources WHERE session_id=?1
          AND codex_home=(SELECT home FROM current_codex_home)
          AND source_file_id=?2 AND source_contents_id=?3)",
@@ -13919,7 +14171,7 @@ fn withdraw_other_home_name(
     else {
         return Ok(());
     };
-    connection.execute(
+    connection.execute_cached(
         "UPDATE session_trajectories AS d SET derived_title=NULL, derived_title_is_verified=0,
             derived_title_is_local_opener=NULL, document_version=CASE WHEN NOT ?3 THEN document_version
                  WHEN document_version>=?6 THEN ?6 ELSE 0 END
@@ -13958,7 +14210,7 @@ fn remember_provider_name(
     {
         return Ok(false);
     }
-    let inserted = connection.execute(
+    let inserted = connection.execute_cached(
         "INSERT INTO codex_pending_catalog_titles
             (trajectory_id, source_file_id, source_contents_id, title, evidence, codex_home)
          SELECT id, source_file_id, source_contents_id, derived_title, 'provider_name', (SELECT home FROM current_codex_home) FROM visible_trajectories
@@ -14003,7 +14255,7 @@ fn resolve_pending_catalog_title(
 ) -> Result<()> {
     let revision = selected.source_revision.unwrap_or_default();
     if selected.title.is_none() {
-        connection.execute(
+        connection.execute_cached(
             "UPDATE session_trajectories AS t
              SET derived_title=CASE WHEN p.evidence='unattributed' THEN t.derived_title END,
                  derived_title_is_verified=(p.evidence='unattributed' AND t.derived_title_is_verified),
@@ -14018,7 +14270,7 @@ fn resolve_pending_catalog_title(
                 omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION],
         ).map_err(database_error)?;
     }
-    connection.execute(
+    connection.execute_cached(
         "DELETE FROM codex_pending_catalog_titles WHERE trajectory_id=(SELECT id FROM visible_trajectories
          WHERE provider='codex' AND session_id=?1) AND codex_home=(SELECT home FROM current_codex_home)", [&selected.session.id],
     ).map_err(database_error)?;
@@ -14029,7 +14281,7 @@ fn pending_codex_catalog_title(
     connection: &Connection,
     session: &SessionRef,
 ) -> Result<Option<bool>> {
-    connection.query_row(
+    connection.query_row_cached(
         "SELECT t.source_file_id IS p.source_file_id AND t.source_contents_id IS p.source_contents_id
             AND t.derived_title IS p.title AND t.derived_title_is_local_opener IS NOT 1
          FROM visible_trajectories t JOIN codex_pending_catalog_titles p ON p.trajectory_id=t.id
@@ -14042,7 +14294,7 @@ fn discard_superseded_name_source(
     transaction: &Transaction<'_>,
     row: &IndexedSession,
 ) -> Result<()> {
-    transaction.execute("DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
+    transaction.execute_cached("DELETE FROM codex_name_source_prefixes WHERE session_id=?1 AND codex_home=(SELECT home FROM current_codex_home)
                 AND (?2 IS NULL OR full_name IS NOT ?2 OR source_file_id IS NOT ?3)",
                 params![row.session.id,row.title.as_deref().map(omnis_core::redact_secrets),row.source_revision.and_then(|r|r.file).map(Uuid::into_bytes)]).map_err(database_error)?;
     Ok(())
@@ -14060,7 +14312,7 @@ fn select_pending_name(
          SELECT trajectory_id,codex_home,source_file_id,source_contents_id,title,'provider_name'
          FROM ({FOREIGN_CATALOG_NAMES}) WHERE session_id=?1
          ON CONFLICT(trajectory_id) DO NOTHING")).map_err(database_error)?.execute([&session.id]).map_err(database_error)?;
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO codex_inactive_pending_names(trajectory_id,codex_home,source_file_id,source_contents_id,title,evidence)
          SELECT p.trajectory_id,p.codex_home,p.source_file_id,p.source_contents_id,p.title,p.evidence
          FROM visible_trajectories t JOIN codex_pending_catalog_titles p ON p.trajectory_id=t.id
@@ -14072,7 +14324,7 @@ fn select_pending_name(
            source_contents_id=excluded.source_contents_id,title=excluded.title,evidence=excluded.evidence",
         [&session.id],
     ).map_err(database_error)?;
-    connection.execute(
+    connection.execute_cached(
         "UPDATE session_trajectories AS t SET derived_title=NULL, derived_title_is_verified=0,
              derived_title_is_local_opener=NULL,document_version=CASE WHEN NOT ?2 THEN document_version
                  WHEN document_version>=?3 THEN ?3 ELSE 0 END
@@ -14083,15 +14335,14 @@ fn select_pending_name(
         params![session.id,recheck,omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION],
     ).map_err(database_error)?;
     connection
-        .execute(
+        .execute_cached(
             "DELETE FROM codex_pending_catalog_titles WHERE trajectory_id=(
              SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?1)
            AND (codex_home IS NULL OR codex_home IS NOT (SELECT home FROM current_codex_home))",
             [&session.id],
         )
         .map_err(database_error)?;
-    let saved = connection
-        .query_row(
+    let saved = connection.query_row_cached(
             "DELETE FROM codex_inactive_pending_names WHERE trajectory_id=(
             SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?1)
          AND codex_home=(SELECT home FROM current_codex_home)
@@ -14126,7 +14377,7 @@ fn select_pending_name(
         && revision.file == Some(Uuid::from_bytes(file))
         && revision.contents == Some(Uuid::from_bytes(contents))
     {
-        let restored = connection.execute(
+        let restored = connection.execute_cached(
             "INSERT INTO codex_pending_catalog_titles(trajectory_id,codex_home,source_file_id,source_contents_id,title,evidence)
              SELECT id,(SELECT home FROM current_codex_home),source_file_id,source_contents_id,?4,?5
              FROM visible_trajectories WHERE id=?1 AND origin='native' AND source_file_id=?2 AND source_contents_id=?3
@@ -14134,7 +14385,7 @@ fn select_pending_name(
         ).map_err(database_error)?;
         if restored != 0 {
             connection
-                .execute(
+                .execute_cached(
                     "UPDATE session_trajectories SET derived_title=?2,derived_title_is_verified=1,
                 derived_title_is_local_opener=0 WHERE id=?1",
                     params![id, title],
@@ -14475,11 +14726,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BranchHeadRestore, IndexedSession, LocalOpenerEvidence, SessionDiscoveryClaim,
-        SessionDiscoveryState, SessionTrajectoryOrigin, Store, TRAJECTORY_CHUNK_BYTE_LIMIT,
-        TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES, TRAJECTORY_PHRASE_MAX_TOKENS,
-        TRAJECTORY_QUERY_MAX_TOKEN_BYTES, TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument,
-        state_root, trajectory_clauses, utf8_chunks,
+        BranchHeadRestore, IndexedSession, LocalOpenerEvidence, SearchTableState,
+        SessionDiscoveryClaim, SessionDiscoveryState, SessionTrajectoryOrigin, Store,
+        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES,
+        TRAJECTORY_PHRASE_MAX_TOKENS, TRAJECTORY_QUERY_MAX_TOKEN_BYTES,
+        TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument, TrajectoryIndexFailure,
+        TrajectorySearchScope, clause_matches_sql, state_root, trajectory_clauses,
+        trajectory_search_page_sql, utf8_chunks,
     };
 
     use crate::search_query::SEARCH_QUERY_MAX_CHARS;
@@ -15884,6 +16137,193 @@ mod tests {
         assert!(ids("\"qwen3.8\" quantized").is_empty());
         assert!(ids("\"\"").is_empty());
         assert_eq!(ids("qwen3.8"), ["exact", "hyphen", "spaced"]);
+    }
+
+    #[test]
+    fn quoted_phrases_find_decomposed_accents_and_newer_emoji() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        // The full-text tokenizer keeps these accents and symbols inside a token.
+        let phrases = [
+            "Relato\u{301}rio re\u{301}sume\u{301} final",
+            "deploy\u{1F7E2} healthy",
+            "web \u{1F7E1} slow",
+            "branch \u{E0A0}main ready",
+        ];
+        for (index, phrase) in phrases.into_iter().enumerate() {
+            store
+                .index_search_fixture(
+                    &SessionRef::new(Provider::Claude, format!("phrase-{index}")),
+                    &format!("Synthetic start {phrase} synthetic end"),
+                    Utc::now(),
+                )
+                .expect("index phrase");
+        }
+        for (index, phrase) in phrases.into_iter().enumerate() {
+            assert_eq!(
+                store
+                    .search_session_trajectories(&format!("\"{phrase}\""), 10)
+                    .expect("phrase search"),
+                [SessionRef::new(Provider::Claude, format!("phrase-{index}"))],
+                "{phrase}"
+            );
+        }
+        for (query, phrase) in [
+            ("re\u{301}sume\u{301}", 0),
+            // The text can glue the symbol to the previous word.
+            ("\"\u{1F7E2} healthy\"", 1),
+        ] {
+            assert_eq!(
+                store
+                    .search_session_trajectories(query, 10)
+                    .expect("word search"),
+                [SessionRef::new(
+                    Provider::Claude,
+                    format!("phrase-{phrase}")
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn snippets_show_a_match_after_long_text_between_tokens() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let row = format!(
+            "\u{2502} step \u{2502} done \u{2502}\n{}\n",
+            "\u{2500}".repeat(80)
+        );
+        let sentence = "\u{4e00}\u{4e8c}\u{4e09}\u{56db}\u{4e94}".repeat(6) + "\u{ff0c}";
+        for (id, text, query) in [
+            (
+                "table",
+                format!("{0}tableneedle\n{0}", row.repeat(12)),
+                "tableneedle",
+            ),
+            (
+                "sentence",
+                format!("{0}\u{9488}\u{5934}\u{ff0c}{0}", sentence.repeat(20)),
+                "\u{9488}\u{5934}",
+            ),
+        ] {
+            let session = SessionRef::new(Provider::Claude, id);
+            store
+                .index_search_fixture(&session, &text, Utc::now())
+                .expect("index text");
+            let matches = store
+                .search_session_trajectory_matches(query, 10)
+                .expect("search");
+            assert_eq!(matches[0].session, session);
+            let snippet = &matches[0].snippet;
+            let leading = snippet.split_once(query).expect("visible match").0;
+            assert!(leading.chars().count() <= 130, "{snippet}");
+            assert!(leading.starts_with(" \u{2026} "), "{snippet}");
+            assert!(!snippet.contains('\u{FDD0}'), "{snippet}");
+        }
+    }
+
+    #[test]
+    fn a_query_with_the_most_terms_finds_its_session() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let mut store =
+            Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        select_codex_home(&mut store, temporary_directory.path());
+        let words = (0..crate::search_query::SEARCH_QUERY_MAX_TERMS)
+            .map(|index| format!("word{index:02}"))
+            .collect::<Vec<_>>();
+        let text = words.join(" ");
+        // Sessions, failures, and workspaces of these providers add tables to the search statement.
+        for provider in [Provider::Claude, Provider::Codex, Provider::Pi] {
+            let row = indexed_session(provider, "long", "Synthetic session");
+            store
+                .merge_indexed_sessions(provider, std::slice::from_ref(&row))
+                .expect("catalog");
+            store
+                .index_search_fixture(&row.session, &text, Utc::now())
+                .expect("index text");
+        }
+        let mut moved = indexed_session(Provider::Codex, "moved", "Synthetic session");
+        moved.updated_at = DateTime::from_timestamp_millis(77);
+        moved.project_path = Some(temporary_directory.path().join("moved-workspace"));
+        store
+            .record_codex_workspace(
+                &moved,
+                temporary_directory.path(),
+                &temporary_directory.path().join("rollout.jsonl"),
+                "stamp",
+            )
+            .expect("workspace");
+        store
+            .record_trajectory_index_failure(
+                &SessionRef::new(Provider::Claude, "unreadable"),
+                &TrajectoryIndexFailure {
+                    ancestor_revisions: Vec::new(),
+                    source_file: None,
+                    source_contents: None,
+                    source_updated_at: None,
+                    source_time_precise: false,
+                    native_summary: false,
+                    document_version: 1,
+                },
+            )
+            .expect("failure");
+
+        let session = SessionRef::new(Provider::Claude, "long");
+        for query in [text.clone(), format!("\"{}\"", words.join("\" \""))] {
+            assert_eq!(
+                store
+                    .search_session_trajectories(&query, 10)
+                    .expect("search all sessions")
+                    .len(),
+                3
+            );
+            let page = store
+                .search_session_trajectory_page_for_sessions(
+                    &query,
+                    10,
+                    std::slice::from_ref(&session),
+                )
+                .expect("search selected sessions");
+            assert_eq!(page.matches.len(), 1);
+            assert_eq!(page.matches[0].session, session);
+        }
+        let missing = format!("absent {}", words[..20].join(" "));
+        assert!(
+            store
+                .search_session_trajectories(&missing, 10)
+                .expect("search a missing word")
+                .is_empty()
+        );
+
+        // Every other scope of a search statement also stays below the SQLite limits.
+        let state = SearchTableState {
+            has_pi: true,
+            has_antigravity_gaps: true,
+            has_gap_projections: true,
+            has_physical_gaps: true,
+            has_failures: true,
+            has_codex_workspace_obs: true,
+            has_primary_legacy_updates: true,
+            has_conflict_catalog: true,
+            has_codex_trajectories: true,
+        };
+        let clauses = trajectory_clauses(&text);
+        let connection = store.connection.borrow();
+        for (scoped, aliases) in [(None, None), (Some("[]"), None), (Some("[]"), Some("[]"))] {
+            let scope = TrajectorySearchScope {
+                eligibility: Some("[]"),
+                scoped,
+                aliases,
+                state,
+            };
+            for sql in [
+                trajectory_search_page_sql(&clauses[..1], scope),
+                trajectory_search_page_sql(&clauses, scope),
+                clause_matches_sql(&clauses[0], scope),
+            ] {
+                connection.prepare(&sql).expect("search statement");
+            }
+        }
     }
 
     #[test]
@@ -18398,6 +18838,62 @@ mod tests {
     }
 
     #[test]
+    fn merge_drops_replaced_text_and_keeps_every_current_match() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let sessions = (0..40)
+            .map(|index| SessionRef::new(Provider::Codex, format!("merged-{index}")))
+            .collect::<Vec<_>>();
+        let written_at = Utc::now();
+        for (generation, word) in ["obsoleteneedle", "currentneedle"].into_iter().enumerate() {
+            for (index, session) in sessions.iter().enumerate() {
+                let text = format!("{word} unique{index} {}", compressible_text(8_192));
+                let time = written_at + chrono::Duration::seconds(generation.try_into().unwrap());
+                store
+                    .index_search_fixture(session, &text, time)
+                    .expect("indexed document");
+            }
+        }
+        let index_size = |store: &Store| -> (i64, i64) {
+            store
+                .connection
+                .borrow()
+                .query_row(
+                    "SELECT (SELECT count(DISTINCT segid) FROM session_trajectory_chunks_fts_idx),
+                            (SELECT sum(length(block)) FROM session_trajectory_chunks_fts_data)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("index size")
+        };
+        let (segments, bytes) = index_size(&store);
+        assert!(segments > 1);
+
+        assert!(!store.merge_search_index(&|| true).expect("stopped merge"));
+        assert_eq!(index_size(&store), (segments, bytes));
+
+        assert!(store.merge_search_index(&|| false).expect("merge"));
+        let (segments, merged_bytes) = index_size(&store);
+        assert_eq!(segments, 1);
+        assert!(merged_bytes < bytes, "{merged_bytes} of {bytes}");
+        assert_full_text_index_matches_chunks(&store);
+        assert_eq!(store.search_document_count().unwrap(), sessions.len());
+        assert!(
+            store
+                .search_session_trajectories("obsoleteneedle", 100)
+                .expect("search")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_session_trajectories("currentneedle", 100)
+                .expect("search")
+                .len(),
+            sessions.len()
+        );
+    }
+
+    #[test]
     fn damaged_chunk_does_not_block_search_or_a_new_index_pass() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
@@ -18818,6 +19314,17 @@ mod tests {
         assert_eq!(eligible.matches.len(), 1);
         assert_eq!(eligible.matches[0].session, in_scope);
         assert!(!eligible.has_more);
+
+        // A caller that selects sessions can ask for all of them.
+        let selected = (0..=TRAJECTORY_SEARCH_RESULT_LIMIT)
+            .map(|index| SessionRef::new(Provider::Claude, format!("out-of-scope-{index:03}")))
+            .chain([in_scope])
+            .collect::<Vec<_>>();
+        let all = store
+            .search_session_trajectory_page_for_sessions("eligible needle", 10_000, &selected)
+            .expect("complete eligible page");
+        assert_eq!(all.matches.len(), selected.len());
+        assert!(!all.has_more);
     }
 
     #[test]
@@ -19563,6 +20070,53 @@ mod tests {
                 .unwrap(),
             SessionDiscoveryClaim::Fresh
         );
+    }
+
+    #[test]
+    fn a_discovery_check_from_a_later_clock_does_not_stay_fresh() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("cache.sqlite3")).unwrap();
+        let provider = Provider::AntigravityDesktop;
+        let home = directory.path();
+        let fresh_since = Utc::now() - chrono::Duration::seconds(15);
+        let record_next_day = || {
+            store
+                .connection
+                .borrow()
+                .execute(
+                    "UPDATE session_index_reader_checks SET checked_at = checked_at + 86400000",
+                    [],
+                )
+                .unwrap();
+        };
+        let attempt = store
+            .mark_session_discovery_attempted(provider, 7, home)
+            .unwrap();
+        record_next_day();
+        assert_eq!(
+            store
+                .observe_session_discovery(&attempt, fresh_since)
+                .unwrap(),
+            SessionDiscoveryState::Expired
+        );
+        assert!(
+            store
+                .finish_session_discovery(&attempt, Utc::now())
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .try_begin_session_discovery(provider, 7, home, fresh_since)
+                .unwrap(),
+            SessionDiscoveryClaim::Fresh
+        );
+        record_next_day();
+        assert!(matches!(
+            store
+                .try_begin_session_discovery(provider, 7, home, fresh_since)
+                .unwrap(),
+            SessionDiscoveryClaim::Claimed(_)
+        ));
     }
 
     #[test]

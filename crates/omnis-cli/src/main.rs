@@ -2304,7 +2304,7 @@ fn cached_pi_search_sessions(
         .into_iter()
         .filter(|provider| args.provider.is_none_or(|wanted| wanted == *provider))
     {
-        indexed.extend(store.cached_sessions_with_titles(Some(provider))?.0);
+        indexed.extend(store.cached_sessions(Some(provider))?);
     }
     let copies = store.cached_all_pi_copies()?;
     let keys = copies
