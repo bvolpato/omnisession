@@ -1873,6 +1873,8 @@ struct IndexMerges {
     carried: usize,
     /// Replaced documents that make a merge worthwhile.
     interval: usize,
+    /// Stop retrying background merges for the rest of this pass after one fails.
+    merge_failed: bool,
 }
 
 impl IndexMerges {
@@ -1888,6 +1890,7 @@ impl IndexMerges {
             recorded,
             carried: recorded,
             interval: merge_interval(documents),
+            merge_failed: false,
         })
     }
 
@@ -1906,6 +1909,9 @@ impl IndexMerges {
     /// Returns true if `stop` ended a merge. A merge only saves space and time, so the pass ignores
     /// its failure, for example when another process holds the store.
     fn merge_if_due(&mut self, store: &Store, indexed: usize, stop: &dyn Fn() -> bool) -> bool {
+        if self.merge_failed {
+            return false;
+        }
         let written = self.earlier_batches + indexed;
         if self.unmerged() + (written - self.checked) < self.interval
             || self.count_replaced(store, written).is_err()
@@ -1919,7 +1925,10 @@ impl IndexMerges {
                 false
             }
             Ok(false) => true,
-            Err(_) => false,
+            Err(_) => {
+                self.merge_failed = true;
+                false
+            }
         }
     }
 
@@ -2040,12 +2049,12 @@ fn index_distinct_candidates(
                 report(progress(&summary, processed, &mut updates));
                 last_report = Instant::now();
             }
-            merges.merge_if_due(store, summary.indexed, stop);
-            true
+            summary.stopped |= merges.merge_if_due(store, summary.indexed, stop);
+            !summary.stopped
         },
     );
     batch.flush(&mut selections, store, &mut summary, &mut updates);
-    summary.stopped |= merges.merge_if_due(store, summary.indexed, stop);
+    summary.stopped = summary.stopped || merges.merge_if_due(store, summary.indexed, stop);
     report(progress(&summary, processed, &mut updates));
     Ok(summary)
 }
@@ -6056,5 +6065,30 @@ mod tests {
             .expect("drop write failure trigger");
         assert_eq!(pass(&changed, false), (1, 1, 0, 0, 4));
         assert_eq!(pass(&changed, false), (0, 0, 0, 0, 4));
+    }
+
+    #[test]
+    fn failed_search_index_merge_is_not_retried_in_the_same_pass() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let store_path = temporary.path().join("store.sqlite3");
+        let store = Store::open(&store_path).expect("synthetic store");
+        store
+            .record_unmerged_search_documents(MERGE_REPLACED_DOCUMENTS)
+            .expect("seed unmerged count");
+        let mut merges = IndexMerges::new(&store).expect("index merges");
+
+        assert!(merges.merge_if_due(&store, 0, &|| true));
+        assert!(!merges.merge_failed);
+
+        let inspector = rusqlite::Connection::open(&store_path).expect("inspector connection");
+        inspector
+            .execute_batch("DROP TABLE session_trajectory_chunks_fts;")
+            .expect("drop FTS table to force merge error");
+
+        assert!(!merges.merge_if_due(&store, 0, &|| false));
+        assert!(merges.merge_failed);
+        // Once a merge fails in this pass, later checks skip without re-running the merge or stop check.
+        assert!(!merges.merge_if_due(&store, 0, &|| true));
+        assert_eq!(merges.unmerged(), MERGE_REPLACED_DOCUMENTS);
     }
 }
