@@ -6017,6 +6017,16 @@ fn env_change_json(change: &EnvChange) -> Value {
 /// credential, as it does in a shell command. Anything unexpected hides the whole value.
 fn redacted_env_value(name: &str, value: &str) -> String {
     let value = launch_profile::hide_secret_values(value);
+    if !value.is_empty() {
+        let probe = format!("{name}=x");
+        let probed = redact_secrets(&probe);
+        if probed != probe {
+            return probed
+                .strip_prefix(&format!("{name}="))
+                .unwrap_or("[REDACTED]")
+                .to_owned();
+        }
+    }
     let redacted = redact_secrets(&format!("{name}={value}"));
     let Some(shown) = redacted.strip_prefix(&format!("{name}=")) else {
         return "[REDACTED]".to_owned();
@@ -7842,6 +7852,19 @@ mod launch_environment_tests {
             "{header}"
         );
         assert_eq!(redacted_env_value("NOTE", "[draft] text"), "[draft] text");
+        for tricky in [
+            " leading secret",
+            ",comma secret",
+            ";semicolon secret",
+            "\"quoted\" trailing secret",
+            "=operator secret",
+            "** markdown secret",
+            "curl -s secret",
+        ] {
+            let hidden = redacted_env_value("DEPLOY_PASSWORD", tricky);
+            assert_eq!(hidden, "[REDACTED: PASSWORD]", "{tricky}");
+        }
+        assert_eq!(redacted_env_value("DEPLOY_PASSWORD", ""), "");
     }
 
     #[test]

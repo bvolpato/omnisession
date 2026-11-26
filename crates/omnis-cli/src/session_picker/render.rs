@@ -1819,6 +1819,9 @@ pub(super) fn wrap_text(value: &str, width: usize, max_lines: usize) -> Vec<Stri
 
 /// Wraps at spaces, and inside words wider than `width` such as CJK text, paths, and URLs.
 fn wrap_words(value: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     let mut current = String::new();
     'words: for word in value.split_whitespace() {

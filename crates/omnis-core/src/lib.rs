@@ -767,7 +767,7 @@ fn remote_fingerprints(root: &Path) -> Result<Option<RemoteFingerprints>, Captur
     for remote in origin.chain(others) {
         // User settings such as `remote.origin.prune` list a remote that this repository does not
         // have. Git fails for it, or prints the remote's name when only its URL is missing.
-        let output = git_command(root, &["remote", "get-url", remote])
+        let output = git_command(root, &["remote", "get-url", "--", remote])
             .output()
             .map_err(CaptureError::Io)?;
         let url = trim_trailing_newlines(&output.stdout);
@@ -7327,7 +7327,7 @@ mod tests {
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\ncase \"$*\" in *\"get-url origin\"*) exit 128;; esac\nPATH='{path}' exec git \"$@\"\n"
+                "#!/bin/sh\ncase \"$*\" in *\"get-url -- origin\"*|*\"get-url origin\"*) exit 128;; esac\nPATH='{path}' exec git \"$@\"\n"
             ),
         )
         .expect("failing git command");
