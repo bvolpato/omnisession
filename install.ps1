@@ -504,7 +504,8 @@ try {
         try {
             if ($hadTarget -and [IO.File]::Exists($backup)) {
                 if ([IO.File]::Exists($target)) {
-                    [IO.File]::Replace($backup, $target, $null, $true)
+                    # PowerShell passes $null to a string parameter as an empty path.
+                    [IO.File]::Replace($backup, $target, [NullString]::Value, $true)
                 } else {
                     [IO.File]::Move($backup, $target)
                 }

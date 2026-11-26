@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
 # Install the latest OmniSession release for the current platform.
+# The braces make the shell read the whole script before it runs any command.
+{
 set -eu
 
 repository='bvolpato/omnisession'
@@ -19,7 +21,7 @@ download() {
     download_attempt=1
     while [ "$download_attempt" -le 5 ]; do
         if curl --http1.1 --fail --location --silent --show-error \
-            --connect-timeout 15 --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --speed-limit 1024 --speed-time 30 --proto '=https' --tlsv1.2 \
             --output "$download_output" "$download_url"; then
             return
         fi
@@ -60,6 +62,8 @@ remove_owned_aliases() {
 remove_old_path_block() {
     profile=$1
     [ -f "$profile" ] && [ ! -L "$profile" ] || return 0
+    # Some awk implementations drop text after a NUL byte.
+    [ "$(LC_ALL=C tr -d '\000' <"$profile" | wc -c)" = "$(wc -c <"$profile")" ] || return 0
     final_newline=0
     [ -n "$(tail -c 1 "$profile")" ] || final_newline=1
     # Only the exact generated block is owned. Edited and unpaired markers remain intact.
@@ -155,7 +159,10 @@ cleanup() {
     [ -z "$temporary_binary" ] || rm -f "$temporary_binary"
     rm -rf "$temp_dir"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 archive_name="omni-${platform}-${architecture}.tar.gz"
 release_url="https://github.com/${repository}/releases/latest/download"
@@ -202,24 +209,28 @@ tar -xzf "$archive_path" -C "$unpack_dir" || die "could not unpack $archive_name
 [ ! -L "$unpack_dir/omni" ] || die "$archive_name contains a symlinked omni"
 [ ! -L "$unpack_dir/LICENSE" ] || die "$archive_name contains a symlinked LICENSE"
 
+[ ! -d "$OMNI_INSTALL_DIR/omni" ] || die "$OMNI_INSTALL_DIR/omni is a directory"
 mkdir -p "$OMNI_INSTALL_DIR"
 temporary_binary=$(mktemp "$OMNI_INSTALL_DIR/.omni.XXXXXX") || die 'could not stage OmniSession binary'
 install -m 0755 "$unpack_dir/omni" "$temporary_binary"
 
 alias_directory="${OMNISESSION_HOME:-$HOME/.omnisession}/shims"
-for old_binary in "$OMNI_INSTALL_DIR/omni" "$OMNI_INSTALL_DIR/omnis"; do
-    if is_old_omni "$old_binary" || cmp -s "$old_binary" "$temporary_binary"; then
-        remove_owned_aliases "$old_binary" "$alias_directory"
-        remove_owned_aliases "$old_binary" "$OMNI_INSTALL_DIR"
-    fi
-done
-if [ ! -L "$alias_directory" ]; then
-    rmdir "$alias_directory" 2>/dev/null || :
+legacy_binary="$OMNI_INSTALL_DIR/omnis"
+if is_old_omni "$legacy_binary" || cmp -s "$legacy_binary" "$temporary_binary"; then
+    remove_owned_aliases "$legacy_binary" "$alias_directory"
+    remove_owned_aliases "$legacy_binary" "$OMNI_INSTALL_DIR"
 fi
 mv -f "$temporary_binary" "$OMNI_INSTALL_DIR/omni"
 temporary_binary=''
-if is_old_omni "$OMNI_INSTALL_DIR/omnis"; then
-    rm "$OMNI_INSTALL_DIR/omnis"
+# A provider alias that resolves to the installed binary runs OmniSession. The in-app updater
+# leaves these aliases in place, so do not require the previous binary to be an old build.
+remove_owned_aliases "$OMNI_INSTALL_DIR/omni" "$alias_directory"
+remove_owned_aliases "$OMNI_INSTALL_DIR/omni" "$OMNI_INSTALL_DIR"
+if [ ! -L "$alias_directory" ]; then
+    rmdir "$alias_directory" 2>/dev/null || :
+fi
+if is_old_omni "$legacy_binary"; then
+    rm "$legacy_binary"
 fi
 if [ "${OMNI_NO_MODIFY_PATH:-}" != '1' ]; then
     for profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
@@ -227,3 +238,4 @@ if [ "${OMNI_NO_MODIFY_PATH:-}" != '1' ]; then
     done
 fi
 info "Installed omni to $OMNI_INSTALL_DIR/omni"
+}

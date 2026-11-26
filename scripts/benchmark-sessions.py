@@ -542,7 +542,8 @@ def main() -> None:
         "baseline": {"probe": args.baseline_probe.resolve(strict=True), "omni": args.baseline_omni.resolve(strict=True)},
         "candidate": {"probe": args.candidate_probe.resolve(strict=True), "omni": args.candidate_omni.resolve(strict=True)},
     }
-    if not TIME.is_file():
+    # Other systems provide a different `time` program without these options.
+    if platform.system() != "Linux" or not TIME.is_file():
         parser.error("Linux /usr/bin/time is required to record per-process peak RSS")
     if args.repeats is not None and args.repeats < 1:
         parser.error("--repeats must be positive")
