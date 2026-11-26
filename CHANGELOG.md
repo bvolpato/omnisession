@@ -6,7 +6,7 @@
 
 ### Added
 
-- Add a [guide](docs/GUIDE.md) with the complete manual, and make the README a short introduction. ([#323](https://github.com/bvolpato/omnisession/pull/323))
+- Add a [guide](https://github.com/bvolpato/omnisession/blob/main/docs/GUIDE.md) with the complete manual, and make the README a short introduction. ([#323](https://github.com/bvolpato/omnisession/pull/323))
 - Replace the website homepage with a route map and a picker demo that you can use. Remove the Vizmatic demo. ([#320](https://github.com/bvolpato/omnisession/pull/320))
 
 ### Changed
