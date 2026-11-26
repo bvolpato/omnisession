@@ -7,7 +7,7 @@ export type CapabilityKey = keyof Provider["capabilities"];
 export const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
 /** CLI name, short label, and line color. Keyed by manifest ID, so a new agent fails the type check. */
-const meta: Record<AgentId, { cli: string; short: string; launch: string }> = {
+const meta: Record<AgentId, { cli: string; short: string; launch: string; aliases?: string }> = {
   codex: { cli: "codex", short: "Codex", launch: "Codex" },
   "claude-code": { cli: "claude", short: "Claude Code", launch: "Claude" },
   opencode: { cli: "opencode", short: "OpenCode", launch: "OpenCode" },
@@ -16,13 +16,13 @@ const meta: Record<AgentId, { cli: string; short: string; launch: string }> = {
   grok: { cli: "grok", short: "Grok", launch: "Grok" },
   "cursor-ide": { cli: "cursor-ide", short: "Cursor IDE", launch: "Cursor IDE" },
   "cursor-agent": { cli: "cursor-cli", short: "Cursor Agent", launch: "Cursor CLI" },
-  antigravity: { cli: "antigravity", short: "Antigravity", launch: "Antigravity CLI" },
+  antigravity: { cli: "antigravity", short: "Antigravity", launch: "Antigravity CLI", aliases: "agy" },
   hermes: { cli: "hermes", short: "Hermes", launch: "Hermes" },
   "antigravity-desktop": { cli: "antigravity-desktop", short: "Antigravity Desktop", launch: "Antigravity Desktop" },
   "antigravity-ide": { cli: "antigravity-ide", short: "Antigravity IDE", launch: "Antigravity IDE" },
 };
 
-export type Agent = Provider & { cli: string; short: string; launch: string };
+export type Agent = Provider & { cli: string; short: string; launch: string; aliases?: string };
 
 export const agents: readonly Agent[] = providers.map((provider) => ({ ...provider, ...meta[provider.id] }));
 

@@ -64,7 +64,8 @@ function words(value: string) {
 function matchKind(session: DemoSession, query: string): "meta" | "text" | null {
   const wanted = words(query.replaceAll('"', ""));
   if (wanted.length === 0) return "meta";
-  const metaText = `${session.title} ${session.project} ${session.branch} ${agentById(session.agent).cli} ${session.id}`.toLowerCase();
+  const agent = agentById(session.agent);
+  const metaText = `${session.title} ${session.project} ${session.branch} ${agent.cli} ${agent.aliases ?? ""} ${session.id}`.toLowerCase();
   if (wanted.every((word) => metaText.includes(word))) return "meta";
   const all = `${metaText} ${session.text} ${session.answer.toLowerCase()}`;
   return wanted.every((word) => all.includes(word)) ? "text" : null;
@@ -87,7 +88,7 @@ function targetChoices(session: DemoSession | null, filter: string): readonly Ta
     ...(own ? [{ agent: own, fork: false }, ...(own.same.includes("fork") ? [{ agent: own, fork: true }] : [])] : []),
     ...targets.filter((agent) => agent.id !== own?.id && (session || agent.capabilities.clean_start.length > 0)).map((agent) => ({ agent, fork: false })),
   ];
-  return choices.filter(({ agent }) => wanted.every((word) => `${agent.name} ${agent.cli} ${agent.id}`.toLowerCase().includes(word)));
+  return choices.filter(({ agent }) => wanted.every((word) => `${agent.name} ${agent.cli} ${agent.id} ${agent.aliases ?? ""}`.toLowerCase().includes(word)));
 }
 
 function selectedSession(state: State) {
@@ -104,7 +105,8 @@ function reduce(state: State, action: Action): State {
       if (state.screen === "target") return { ...state, filter: action.value, target: 0, mode: 0 };
       if (state.screen !== "browse") return state;
       const next = { ...state, query: action.value };
-      return { ...next, row: action.value === "" ? initial.row : Math.min(1, visibleSessions(next).length) };
+      const count = visibleSessions(next).length;
+      return { ...next, row: action.value === "" ? Math.min(initial.row, count) : Math.min(1, count) };
     }
     case "move":
       if (state.screen === "browse") return { ...state, row: clamp(state.row + action.by, visibleSessions(state).length) };
@@ -141,7 +143,11 @@ function reduce(state: State, action: Action): State {
       return state.screen === "done" ? initial : state;
     case "back":
       if (state.screen === "target") return state.filter ? { ...state, filter: "", target: 0, mode: 0 } : { ...state, screen: "browse" };
-      if (state.screen === "browse") return state.query ? { ...state, query: "", row: initial.row } : state;
+      if (state.screen === "browse") {
+        if (!state.query) return state;
+        const next = { ...state, query: "" };
+        return { ...next, row: Math.min(initial.row, visibleSessions(next).length) };
+      }
       return initial;
     case "step":
       return state.screen === "transfer" ? { ...state, step: state.step + 1 } : state;
@@ -236,14 +242,15 @@ export function PickerDemo() {
     return () => window.clearTimeout(timer);
   }, [auto, cursor]);
 
-  // The transfer prints one line at a time, then the agent opens.
-  useEffect(() => {
-    if (state.screen !== "transfer") return;
-    const timer = window.setTimeout(() => dispatch({ type: "step" }), state.step === 0 ? 350 : 620);
-    return () => window.clearTimeout(timer);
-  }, [state.screen, state.step]);
   const finished = state.screen === "transfer" && state.step > lines.length;
   const screen: Screen = finished ? "done" : state.screen;
+
+  // The transfer prints one line at a time, then the agent opens.
+  useEffect(() => {
+    if (state.screen !== "transfer" || finished) return;
+    const timer = window.setTimeout(() => dispatch({ type: "step" }), state.step === 0 ? 350 : 620);
+    return () => window.clearTimeout(timer);
+  }, [state.screen, state.step, finished]);
 
   useEffect(() => {
     const container = list.current;

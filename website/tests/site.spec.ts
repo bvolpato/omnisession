@@ -175,6 +175,10 @@ test("picker demo searches, changes agent, and leaves Tab free", async ({ page }
 
   await page.keyboard.press("Enter");
   await expect(demo.getByText("Where should this session open?")).toBeVisible();
+  await page.keyboard.type("agy");
+  await expect(demo.getByRole("option")).toHaveCount(1);
+  await expect(demo.getByRole("option")).toContainText("Antigravity CLI");
+  await page.keyboard.press("Escape");
   await page.keyboard.type("claude");
   await expect(demo.getByRole("option")).toHaveCount(1);
   await page.keyboard.press("Enter");
