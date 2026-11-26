@@ -45,6 +45,8 @@ pub(crate) const FULL_READ_SOURCE_BYTES: u64 = omnis_adapters::CodexAdapter::FUL
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Most threads that read and redact sessions while the calling thread writes the index.
 const MAX_PREPARE_WORKERS: usize = 8;
+/// Fewest replaced documents that make a pass merge the search index.
+const MERGE_REPLACED_DOCUMENTS: usize = 64;
 /// Prepared sessions each worker may hold ahead of the writer. This bounds memory, because one
 /// prepared session holds its whole redacted text.
 const PREPARED_AHEAD_PER_WORKER: usize = 2;
@@ -1825,9 +1827,18 @@ pub(crate) fn index_candidates(
         batches[index].push(candidate);
     }
     let mut result = IndexSummary::default();
+    let mut merges = IndexMerges::new(store)?;
     for batch in batches {
-        let indexed =
-            index_distinct_candidates(registry, store, batch, retry_failed, stop, report)?;
+        merges.earlier_batches = result.indexed;
+        let indexed = index_distinct_candidates(
+            registry,
+            store,
+            batch,
+            retry_failed,
+            stop,
+            report,
+            &mut merges,
+        )?;
         result.candidates += indexed.candidates;
         result.indexed += indexed.indexed;
         result.stale += indexed.stale;
@@ -1838,7 +1849,92 @@ pub(crate) fn index_candidates(
             break;
         }
     }
+    merges.record(store, result.indexed);
     Ok(result)
+}
+
+/// Merges the search index while passes replace documents, as an upgrade does for all of them.
+///
+/// The index keeps replaced text until a merge. Several merges in one pass let new documents reuse
+/// that space, so the store file grows less. The store keeps the count between passes, because a
+/// pass can be stopped before it replaced enough documents.
+struct IndexMerges {
+    /// Documents in the index before the pass.
+    documents: usize,
+    /// Documents that earlier batches of the pass wrote.
+    earlier_batches: usize,
+    /// Written documents at the last check.
+    checked: usize,
+    /// Replaced documents in the pass, and those that the last merge dropped.
+    replaced: usize,
+    merged: usize,
+    /// Documents that earlier passes replaced since the last merge.
+    recorded: usize,
+    carried: usize,
+    /// Replaced documents that make a merge worthwhile.
+    interval: usize,
+}
+
+impl IndexMerges {
+    fn new(store: &Store) -> Result<Self> {
+        let documents = store.search_document_count()?;
+        let recorded = store.unmerged_search_documents()?;
+        Ok(Self {
+            documents,
+            earlier_batches: 0,
+            checked: 0,
+            replaced: 0,
+            merged: 0,
+            recorded,
+            carried: recorded,
+            interval: merge_interval(documents),
+        })
+    }
+
+    const fn unmerged(&self) -> usize {
+        self.carried + self.replaced.saturating_sub(self.merged)
+    }
+
+    fn count_replaced(&mut self, store: &Store, written: usize) -> Result<()> {
+        self.checked = written;
+        let total = store.search_document_count()?;
+        self.interval = merge_interval(total);
+        self.replaced = written.saturating_sub(total.saturating_sub(self.documents));
+        Ok(())
+    }
+
+    /// Returns true if `stop` ended a merge. A merge only saves space and time, so the pass ignores
+    /// its failure, for example when another process holds the store.
+    fn merge_if_due(&mut self, store: &Store, indexed: usize, stop: &dyn Fn() -> bool) -> bool {
+        let written = self.earlier_batches + indexed;
+        if self.unmerged() + (written - self.checked) < self.interval
+            || self.count_replaced(store, written).is_err()
+            || self.unmerged() < self.interval
+        {
+            return false;
+        }
+        match store.merge_search_index(stop) {
+            Ok(true) => {
+                (self.merged, self.carried) = (self.replaced, 0);
+                false
+            }
+            Ok(false) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn record(&mut self, store: &Store, written: usize) {
+        if written != self.checked && self.count_replaced(store, written).is_err() {
+            return;
+        }
+        if self.unmerged() != self.recorded {
+            let _ = store.record_unmerged_search_documents(self.unmerged());
+        }
+    }
+}
+
+fn merge_interval(documents: usize) -> usize {
+    MERGE_REPLACED_DOCUMENTS.max(documents / 4)
 }
 
 fn index_distinct_candidates(
@@ -1848,6 +1944,7 @@ fn index_distinct_candidates(
     retry_failed: bool,
     stop: &dyn Fn() -> bool,
     report: &mut dyn FnMut(IndexProgress),
+    merges: &mut IndexMerges,
 ) -> Result<IndexSummary> {
     let Pending {
         stale,
@@ -1943,10 +2040,12 @@ fn index_distinct_candidates(
                 report(progress(&summary, processed, &mut updates));
                 last_report = Instant::now();
             }
+            merges.merge_if_due(store, summary.indexed, stop);
             true
         },
     );
     batch.flush(&mut selections, store, &mut summary, &mut updates);
+    summary.stopped |= merges.merge_if_due(store, summary.indexed, stop);
     report(progress(&summary, processed, &mut updates));
     Ok(summary)
 }
@@ -5312,6 +5411,93 @@ mod tests {
                 .expect("resumed index");
         assert!(!resumed.stopped);
         assert_eq!((resumed.stale, resumed.indexed), (2, 2));
+    }
+
+    #[test]
+    fn passes_that_replace_documents_merge_the_search_index() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let sessions = temporary.path().join("codex/sessions/2026/01/01");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&sessions).expect("codex sessions");
+        let count = MERGE_REPLACED_DOCUMENTS + 6;
+        let write = |generation: u64, files: usize| {
+            for index in 0..files {
+                let id = format!("019f0000-0000-7000-8000-{index:012}");
+                let path = sessions.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+                fs::write(
+                    &path,
+                    format!(
+                        "{}\n{}\n",
+                        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":id,"cwd":workspace}}),
+                        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("Synthetic request {index} generation{generation}")}]}}),
+                    ),
+                )
+                .expect("synthetic rollout");
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| {
+                        file.set_modified(
+                            std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + generation),
+                        )
+                    })
+                    .expect("modification time");
+            }
+        };
+        let database = temporary.path().join("store.sqlite3");
+        let store = Store::open(&database).expect("synthetic store");
+        let pass = |stop: &dyn Fn() -> bool| {
+            let mut registry = AdapterRegistry::new();
+            registry.register(CodexAdapter::with_root(temporary.path().join("codex")));
+            let (listed, _) = registry
+                .list_sessions_with_notes(Provider::Codex, None)
+                .expect("list synthetic sessions");
+            let candidates = ordered_candidates(&listed, None);
+            index_candidates(&registry, &store, candidates, false, stop, &mut |_| {})
+                .expect("index pass")
+        };
+        let segments = || -> i64 {
+            rusqlite::Connection::open(&database)
+                .and_then(|connection| {
+                    connection.query_row(
+                        "SELECT count(DISTINCT segid) FROM session_trajectory_chunks_fts_idx",
+                        [],
+                        |row| row.get(0),
+                    )
+                })
+                .expect("segments")
+        };
+
+        write(1, count);
+        assert_eq!(pass(&|| false).indexed, count);
+        assert_eq!(store.unmerged_search_documents().unwrap(), 0);
+        let built = segments();
+        assert!(built > 1, "a first build does not merge");
+
+        // The last documents after the merge stay, because they are too few.
+        write(2, count);
+        assert_eq!(pass(&|| false).indexed, count);
+        let left = store.unmerged_search_documents().unwrap();
+        assert!(left < MERGE_REPLACED_DOCUMENTS, "{left}");
+        let merged = segments();
+        assert!(merged < built, "{merged} of {built}");
+
+        // An interrupt during the merge stops the pass, and a later pass finishes the merge.
+        store.record_unmerged_search_documents(count).unwrap();
+        write(3, 1);
+        let checks = Cell::new(0);
+        let stopped = pass(&|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        });
+        assert_eq!((stopped.stale, stopped.indexed), (1, 1));
+        assert!(stopped.stopped);
+        assert_eq!(store.unmerged_search_documents().unwrap(), count + 1);
+        write(4, 1);
+        assert!(!pass(&|| false).stopped);
+        assert!(store.unmerged_search_documents().unwrap() <= 1);
+        assert!(segments() < built);
     }
 
     /// Returns an empty session for any ID as `provider`, and records which threads read.

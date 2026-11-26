@@ -2,8 +2,9 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Seek, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -19,25 +20,18 @@ const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_BINARY_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_LIST_SIZE: usize = 4 * 1024;
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const DOWNLOAD_ATTEMPTS: u32 = 5;
 
 pub fn supported() -> bool {
     artifact_name().is_some()
-        && env::current_exe()
-            .ok()
-            .and_then(|path| path.file_name().map(ToOwned::to_owned))
-            .is_some_and(|name| name == "omni")
+        && env::current_exe().is_ok_and(|executable| update_target(&executable).is_ok())
 }
 
 pub fn install(version: &str) -> Result<()> {
     validate_version(version)?;
     let artifact = artifact_name().context("this platform has no OmniSession release artifact")?;
     let current_exe = env::current_exe().context("resolving current OmniSession binary")?;
-    if current_exe.file_name().is_none_or(|name| name != "omni") {
-        bail!("current executable is not named `omni`; use the installer to update");
-    }
-    let install_dir = current_exe
-        .parent()
-        .context("current OmniSession binary has no parent directory")?;
+    let current_exe = update_target(&current_exe)?;
     let _lock = acquire_update_lock()?;
     let temporary = tempfile::tempdir().context("creating update workspace")?;
     let archive = temporary.path().join(&artifact);
@@ -64,9 +58,18 @@ pub fn install(version: &str) -> Result<()> {
     let candidate = temporary.path().join("omni");
     extract_bounded_member(&archive, "omni", &candidate, MAX_BINARY_SIZE)?;
     validate_regular_file(&candidate, "release binary")?;
-    publish_binary(&candidate, &current_exe, install_dir, version)?;
+    publish_binary(&candidate, &current_exe, version)?;
     println!("Updated OmniSession to v{version}.");
     Ok(())
+}
+
+fn update_target(executable: &Path) -> Result<PathBuf> {
+    // macOS reports the path that started the process, which can be a symlink.
+    let binary = fs::canonicalize(executable).context("resolving current OmniSession binary")?;
+    if binary.file_name().is_none_or(|name| name != "omni") {
+        bail!("current executable is not named `omni`; use the installer to update");
+    }
+    Ok(binary)
 }
 
 fn artifact_name() -> Option<String> {
@@ -128,13 +131,37 @@ fn acquire_update_lock() -> Result<File> {
 }
 
 fn download(url: &str, destination: &Path, maximum_size: u64) -> Result<()> {
+    download_with(Path::new("curl"), url, destination, maximum_size)
+}
+
+fn download_with(curl: &Path, url: &str, destination: &Path, maximum_size: u64) -> Result<()> {
     let filename = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("release asset");
     println!("Downloading {filename}...");
     let maximum_size_arg = maximum_size.to_string();
-    let status = Command::new("curl")
+    let mut attempt = 1;
+    // Retry here because `--retry-all-errors` requires curl 7.71.
+    while !run_curl(curl, url, destination, &maximum_size_arg)? {
+        if attempt == DOWNLOAD_ATTEMPTS {
+            bail!("could not download `{url}`");
+        }
+        println!("Download interrupted. Retrying ({attempt}/{DOWNLOAD_ATTEMPTS})...");
+        attempt += 1;
+        thread::sleep(Duration::from_secs(1));
+    }
+    let size = fs::metadata(destination)
+        .context("reading downloaded release asset metadata")?
+        .len();
+    if size == 0 || size > maximum_size {
+        bail!("downloaded release asset has invalid size");
+    }
+    Ok(())
+}
+
+fn run_curl(curl: &Path, url: &str, destination: &Path, maximum_size: &str) -> Result<bool> {
+    let status = Command::new(curl)
         .args([
             "--http1.1",
             "--fail",
@@ -152,27 +179,18 @@ fn download(url: &str, destination: &Path, maximum_size: u64) -> Result<()> {
             "--proto",
             "=https",
             "--tlsv1.2",
-            "--retry",
-            "4",
-            "--retry-all-errors",
             "--max-filesize",
-            &maximum_size_arg,
+            maximum_size,
             "--output",
         ])
         .arg(destination)
         .arg(url)
         .status()
         .context("starting curl for OmniSession update")?;
-    if !status.success() {
-        bail!("could not download `{url}`");
+    if status.code().is_none() {
+        bail!("download of `{url}` was interrupted");
     }
-    let size = fs::metadata(destination)
-        .context("reading downloaded release asset metadata")?
-        .len();
-    if size == 0 || size > maximum_size {
-        bail!("downloaded release asset has invalid size");
-    }
-    Ok(())
+    Ok(status.success())
 }
 
 fn verify_checksum(archive: &Path, checksums: &Path, artifact: &str) -> Result<()> {
@@ -322,7 +340,7 @@ fn verify_binary_version(binary: &Path, version: &str) -> Result<()> {
             Ok(child) => break child,
             Err(error) if is_retryable_exec_busy(&error) && retries < 5 => {
                 retries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(10));
             }
             Err(error) => return Err(error).context("starting downloaded OmniSession binary"),
         }
@@ -359,7 +377,10 @@ fn verify_binary_version(binary: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
-fn publish_binary(candidate: &Path, current: &Path, directory: &Path, version: &str) -> Result<()> {
+fn publish_binary(candidate: &Path, current: &Path, version: &str) -> Result<()> {
+    let directory = current
+        .parent()
+        .context("current OmniSession binary has no parent directory")?;
     let mut staged = tempfile::NamedTempFile::new_in(directory)
         .context("creating same-directory update file")?;
     copy_and_sync(candidate, &mut staged)?;
@@ -472,7 +493,69 @@ mod tests {
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
             .expect("new permissions");
 
-        publish_binary(&candidate, &current, directory.path(), "0.8.36").expect("publish update");
+        publish_binary(&candidate, &current, "0.8.36").expect("publish update");
         verify_binary_version(&current, "0.8.36").expect("updated binary version");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_command_updates_the_linked_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary install directory");
+        let release = directory.path().join("release");
+        fs::create_dir(&release).expect("release directory");
+        let binary = release.join("omni");
+        let candidate = directory.path().join("candidate");
+        fs::write(&binary, "#!/bin/sh\nprintf 'omni 0.8.35\\n'\n").expect("old binary");
+        fs::write(&candidate, "#!/bin/sh\nprintf 'omni 0.8.36\\n'\n").expect("new binary");
+        for path in [&binary, &candidate] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("permissions");
+        }
+        let link = directory.path().join("omni");
+        std::os::unix::fs::symlink("release/omni", &link).expect("command link");
+
+        let target = update_target(&link).expect("update target");
+        publish_binary(&candidate, &target, "0.8.36").expect("publish update");
+
+        assert!(link.is_symlink());
+        verify_binary_version(&binary, "0.8.36").expect("updated binary version");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_retries_with_options_that_old_curl_accepts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let curl = directory.path().join("curl");
+        // curl 7.61 and 7.68 reject this option with exit status 2.
+        fs::write(
+            &curl,
+            r#"#!/bin/sh
+for argument in "$@"; do
+    [ "$argument" != --retry-all-errors ] || exit 2
+done
+output=
+while [ "$#" -gt 1 ]; do
+    [ "$1" != --output ] || output=$2
+    shift
+done
+if [ ! -e "$0.failed" ]; then
+    : >"$0.failed"
+    printf partial >"$output"
+    exit 56
+fi
+printf release >"$output"
+"#,
+        )
+        .expect("curl fixture");
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).expect("permissions");
+        crate::test_support::output_after_write(Command::new(&curl).arg("--retry-all-errors"));
+        let destination = directory.path().join("SHA256SUMS");
+
+        download_with(&curl, "https://example.invalid/file", &destination, 64).expect("download");
+
+        assert_eq!(fs::read(&destination).expect("download"), b"release");
     }
 }

@@ -1,6 +1,7 @@
 use super::{
-    LegacyCodexOpenerCandidate, LocalOpenerEvidence, PreparedTrajectoryWrite, Result,
-    SelectedMetadata, SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard, database_error,
+    CachedStatements, LegacyCodexOpenerCandidate, LocalOpenerEvidence, PreparedTrajectoryWrite,
+    Result, SelectedMetadata, SessionTrajectoryOrigin, StoreError, TrajectorySourceGuard,
+    database_error,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -140,7 +141,7 @@ pub(super) fn candidate(
         return Ok(None);
     }
     connection
-        .query_row(
+        .query_row_cached(
             &format!("SELECT p.previous_title,p.requires_tool_catalog {MATCHING_PROOF} AND t.session_id=?1 AND t.source_file_id=?2"),
             params![session.id, file.into_bytes()],
             |row| {

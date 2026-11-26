@@ -10,8 +10,9 @@ use rusqlite::{Connection, OpenFlags, Transaction, params};
 use uuid::Uuid;
 
 use crate::{
-    DATABASE_FILE_NAME, PreparedTrajectoryWrite, Result, SessionTrajectoryOrigin, StoreError,
-    TrajectorySourceGuard, active_codex_home, database_error, reject_symlink, state_root,
+    CachedStatements, DATABASE_FILE_NAME, PreparedTrajectoryWrite, Result, SessionTrajectoryOrigin,
+    StoreError, TrajectorySourceGuard, active_codex_home, database_error, reject_symlink,
+    state_root,
 };
 
 const UNCERTAIN_LEGACY_SOURCE: &str =
@@ -212,7 +213,7 @@ impl CodexWorkspace {
             .contents
             .ok_or(StoreError::TrajectorySourceChanged)?
             .into_bytes();
-        let saved = transaction.execute(
+        let saved = transaction.execute_cached(
             "INSERT INTO codex_indexed_workspaces(trajectory_id,source_file_id,source_contents_id,project_path,git_branch)
              SELECT id,source_file_id,source_contents_id,?4,?5 FROM visible_trajectories
              WHERE provider='codex' AND session_id=?1 AND origin='native'
@@ -228,7 +229,7 @@ impl CodexWorkspace {
                 && write.document.origin == SessionTrajectoryOrigin::Native
                 && matches!(write.guard, TrajectorySourceGuard::Observed(_))
                 && self.source_revision == revision
-                && transaction.query_row(
+                && transaction.query_row_cached(
                     "SELECT EXISTS (
                          SELECT 1 FROM visible_trajectories t JOIN codex_indexed_workspaces w ON w.trajectory_id=t.id
                          WHERE t.provider='codex' AND t.session_id=?1 AND t.origin='native' AND t.source_complete
@@ -245,12 +246,12 @@ impl CodexWorkspace {
             }
             return Err(StoreError::TrajectorySourceChanged);
         }
-        transaction.execute(
+        transaction.execute_cached(
             "DELETE FROM codex_workspace_rechecks WHERE source_file_id=?1 AND source_contents_id=?2
              AND trajectory_id=(SELECT id FROM visible_trajectories WHERE provider='codex' AND session_id=?3)",
             params![file, contents, session.id],
         ).map_err(database_error)?;
-        transaction.execute(
+        transaction.execute_cached(
             "UPDATE session_index SET project_path=?4,git_branch=?5
              WHERE provider='codex' AND session_id=?1 AND source_file_id=?2 AND source_contents_id IS ?3
                AND codex_home=(SELECT home FROM current_codex_home)
