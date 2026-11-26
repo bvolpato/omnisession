@@ -41,12 +41,14 @@ const sourceOrder: readonly (AgentId | null)[] = [
 ];
 
 const defaultMode: Mode = ["default", "no flags", "the agent's own settings decide"];
+const alwaysAsk = "every edit and command asks";
 const acceptEdits = "edits apply without asking; commands still ask";
 const autoSummary = "safe actions run on their own; risky ones still ask";
 const yoloSummary = "nothing asks; every command runs";
 const modes: Partial<Record<AgentId, readonly Mode[]>> = {
   codex: [defaultMode, ["auto", "--approve-for-me", autoSummary], ["yolo", "--dangerously-bypass-approvals-and-sandbox", yoloSummary]],
   "claude-code": [defaultMode, ["accept-edits", "--permission-mode acceptEdits", acceptEdits], ["auto", "--permission-mode auto", autoSummary], ["yolo", "--dangerously-skip-permissions", yoloSummary]],
+  omp: [defaultMode, ["always-ask", "--approval-mode always-ask", alwaysAsk], ["accept-edits", "--approval-mode write", acceptEdits], ["yolo", "--approval-mode yolo", yoloSummary]],
   grok: [defaultMode, ["accept-edits", "--permission-mode acceptEdits", acceptEdits], ["auto", "--permission-mode auto", autoSummary], ["yolo", "--always-approve", yoloSummary]],
   "cursor-agent": [defaultMode, ["auto", "--auto-review", autoSummary], ["yolo", "--force", yoloSummary]],
   antigravity: [defaultMode, ["accept-edits", "--mode accept-edits", acceptEdits], ["auto", "--mode auto", autoSummary], ["yolo", "--dangerously-skip-permissions", yoloSummary]],
@@ -149,8 +151,16 @@ function reduce(state: State, action: Action): State {
         return { ...next, row: Math.min(initial.row, visibleSessions(next).length) };
       }
       return initial;
-    case "step":
-      return state.screen === "transfer" ? { ...state, step: state.step + 1 } : state;
+    case "step": {
+      if (state.screen !== "transfer") return state;
+      const session = selectedSession(state);
+      const choice = targetChoices(session, state.filter)[state.target] ?? null;
+      const nextStep = state.step + 1;
+      if (!choice || nextStep > transferLines(session, choice).length) {
+        return { ...state, screen: "done", step: nextStep };
+      }
+      return { ...state, step: nextStep };
+    }
     case "reset":
       return initial;
   }
@@ -242,15 +252,13 @@ export function PickerDemo() {
     return () => window.clearTimeout(timer);
   }, [auto, cursor]);
 
-  const finished = state.screen === "transfer" && state.step > lines.length;
-  const screen: Screen = finished ? "done" : state.screen;
-
   // The transfer prints one line at a time, then the agent opens.
   useEffect(() => {
-    if (state.screen !== "transfer" || finished) return;
+    if (state.screen !== "transfer") return;
     const timer = window.setTimeout(() => dispatch({ type: "step" }), state.step === 0 ? 350 : 620);
     return () => window.clearTimeout(timer);
-  }, [state.screen, state.step, finished]);
+  }, [state.screen, state.step]);
+  const screen: Screen = state.screen;
 
   useEffect(() => {
     const container = list.current;
@@ -268,7 +276,7 @@ export function PickerDemo() {
       ArrowDown: { type: "move", by: 1 },
       ArrowLeft: { type: "side", by: -1 },
       ArrowRight: { type: "side", by: 1 },
-      Enter: finished ? { type: "reset" } : { type: "enter" },
+      Enter: screen === "done" ? { type: "reset" } : { type: "enter" },
       Escape: { type: "back" },
     };
     const control: Record<string, Action> = {
@@ -318,7 +326,7 @@ export function PickerDemo() {
         </div>
 
         <input
-          aria-activedescendant={screen === "browse" ? optionId(state.row) : screen === "target" ? optionId(state.target) : undefined}
+          aria-activedescendant={screen === "browse" ? optionId(state.row) : screen === "target" && choices.length > 0 ? optionId(state.target) : undefined}
           aria-autocomplete="list"
           aria-controls="omni-demo-list"
           aria-expanded={screen === "browse" || screen === "target"}
@@ -446,7 +454,10 @@ export function PickerDemo() {
             <p className="demo-foot t-muted">
               <button onClick={() => dispatch({ type: "move", by: -1 })} tabIndex={-1} type="button">↑</button>
               <button onClick={() => dispatch({ type: "move", by: 1 })} tabIndex={-1} type="button">↓ target</button>
-              <button onClick={() => dispatch({ type: "side", by: state.mode > 0 ? -1 : 1 })} tabIndex={-1} type="button">←→ mode</button>
+              <button onClick={() => {
+                const count = choice ? (modes[choice.agent.id]?.length ?? 0) : 0;
+                dispatch({ type: "side", by: count > 0 && state.mode >= count - 1 ? -state.mode : 1 });
+              }} tabIndex={-1} type="button">←→ mode</button>
               <button onClick={() => dispatch({ type: "enter" })} tabIndex={-1} type="button">Enter open</button>
               <button onClick={() => dispatch({ type: "back" })} tabIndex={-1} type="button">Esc back</button>
             </p>

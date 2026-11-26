@@ -53,9 +53,10 @@ impl Observation {
     /// A check from further ahead than the freshness window was recorded before the system clock
     /// moved back, so it is not recent.
     fn is_recent(&self, fresh_since: DateTime<Utc>) -> bool {
-        let now = Utc::now();
-        let latest = now + (now - fresh_since);
-        (fresh_since.timestamp_millis()..=latest.timestamp_millis()).contains(&self.checked_at)
+        let now_ms = Utc::now().timestamp_millis();
+        let fresh_ms = fresh_since.timestamp_millis();
+        let latest_ms = now_ms.saturating_add(now_ms.saturating_sub(fresh_ms));
+        (fresh_ms..=latest_ms).contains(&self.checked_at)
     }
 
     fn state(&self, fresh_since: DateTime<Utc>) -> SessionDiscoveryState {
