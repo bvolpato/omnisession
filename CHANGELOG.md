@@ -1,27 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.10.6 - 2026-11-25
 
 ### Added
 
-- Pass a model to the target agent with `omni fork --model <model>`. The fork stops before any import when the agent does not list `--model`, or when the launch profile already sets a model in its arguments.
+- Pass a model to the target agent with `omni fork --model <model>`. The fork stops before any import when the agent does not list `--model`, or when the launch profile already sets a model in its arguments. ([#312](https://github.com/bvolpato/omnisession/pull/312))
+- Emit `omnisession.session_metadata` (`model` and incremental `total_tokens`) from Antigravity CLI `PLANNER_RESPONSE` transcript records, preserve `ERROR_MESSAGE` payloads as historical metadata, fall back to `conversation_summaries.preview` when a session has no explicit title, and populate a redacted, terminal-safe `preview` excerpt when materializing native Antigravity CLI imports. ([#315](https://github.com/bvolpato/omnisession/pull/315))
 
 ### Changed
 
-- Keep up to 1,024 tool records in a native import, with at most 16,000 characters each and 786,432 characters of tool text in total. The previous limits were 256 records and 8,000 characters. The Codex reader also keeps the newest 1,024 tool records instead of 256.
-- Omit the display records that Codex saves for commands inside a completed `exec` script. The result of the script already holds what the agent received. Failed display records are still imported.
-- Replace image, audio, and document blocks in tool results with a short placeholder, and never import base64 data as text. A result with such a block can now become a native tool record.
+- Keep up to 1,024 tool records in a native import, with at most 16,000 characters each and 786,432 characters of tool text in total. The previous limits were 256 records and 8,000 characters. The Codex reader also keeps the newest 1,024 tool records instead of 256. ([#314](https://github.com/bvolpato/omnisession/pull/314))
+- Omit the display records that Codex saves for commands inside a completed `exec` script. The result of the script already holds what the agent received. Failed display records are still imported. ([#314](https://github.com/bvolpato/omnisession/pull/314))
+- Replace image, audio, and document blocks in tool results with a short placeholder, and never import base64 data as text. A result with such a block can now become a native tool record. ([#314](https://github.com/bvolpato/omnisession/pull/314))
 
 ### Fixed
 
-- Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers.
-- Let Codex find the macOS login keychain during a native import. Previously, an authentication command of the model provider could show a "Keychain Not Found" dialog and ask for a login.
-- Read Cursor IDE conversations that store their message order in `composerConvHeaders` records, as Cursor 3.29.9 does. These conversations were read as empty. Cursor IDE tool calls with a stored result now become native tool records.
-- Read Antigravity CLI tool results and pair them with their calls. Previously the reader kept the calls without IDs and dropped the text of every result.
-- Keep a tool call and its result together when a documentary record is between them.
-- Skip messages that hold only whitespace in native imports. Codex and Hermes drop these messages, so their imports failed verification.
-- Refresh the search documents of Cursor IDE and Antigravity CLI sessions on the next indexing pass, so a search finds the recovered history.
-- Resolve a bare Pi or OMP session ID when all its catalog entries name the same file and workspace.
+- Accept a native Codex import when a managed Codex requirement sets the model provider, and warn that Codex ignores the provider of the launch profile. Other provider mismatches still roll back, and the error now names both providers. ([#310](https://github.com/bvolpato/omnisession/pull/310))
+- Let Codex find the macOS login keychain during a native import. Previously, an authentication command of the model provider could show a "Keychain Not Found" dialog and ask for a login. ([#311](https://github.com/bvolpato/omnisession/pull/311))
+- Read Cursor IDE conversations that store their message order in `composerConvHeaders` records, as Cursor 3.29.9 does. These conversations were read as empty. Cursor IDE tool calls with a stored result now become native tool records. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Read Antigravity CLI tool results and pair them with their calls. Previously the reader kept the calls without IDs and dropped the text of every result. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Keep a tool call and its result together when a documentary record is between them. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Skip messages that hold only whitespace in native imports. Codex and Hermes drop these messages, so their imports failed verification. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Refresh the search documents of Cursor IDE and Antigravity CLI sessions on the next indexing pass, so a search finds the recovered history. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Resolve a bare Pi or OMP session ID when all its catalog entries name the same file and workspace. ([#313](https://github.com/bvolpato/omnisession/pull/313))
+- Fix Antigravity CLI timestamps by ignoring Go zero-time (`0001-01-01 00:00:00+00:00`) sentinels and using the newer of `conversation_summaries.last_modified_time` and the selected history file's mtime across listing, reads, and search. ([#315](https://github.com/bvolpato/omnisession/pull/315))
+- Keep Antigravity CLI picker previews available when the shared `conversation_summaries.db-wal` changes or a cached/live revision advances, without writing uncertified entries to the search index, and clarify the picker message when local history files are missing or unreadable. ([#315](https://github.com/bvolpato/omnisession/pull/315))
 
 ## 0.10.5 - 2026-11-24
 
