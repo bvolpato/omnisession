@@ -1106,11 +1106,13 @@ fn start_provider_update(
     }
 }
 
+/// A time further ahead than the limit was recorded before the system clock moved back.
 pub(super) fn session_cache_is_fresh(checked_at: DateTime<Utc>) -> bool {
     Utc::now()
         .signed_duration_since(checked_at)
+        .abs()
         .to_std()
-        .map_or(true, |age| age <= SESSION_CACHE_TTL)
+        .is_ok_and(|age| age <= SESSION_CACHE_TTL)
 }
 
 pub(super) fn spawn_index_writer(
