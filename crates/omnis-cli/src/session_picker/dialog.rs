@@ -1,4 +1,4 @@
-use super::{KeyCode, KeyEvent, PathBuf, PickerAction, PickerState, SessionRef};
+use super::{KeyCode, KeyEvent, KeyModifiers, PathBuf, PickerAction, PickerState, SessionRef};
 
 pub(super) struct DeleteDialog {
     pub(super) pi_file: Option<crate::pi_import::ConfirmedPiFile>,
@@ -27,10 +27,18 @@ pub(super) enum DeletePhase {
 }
 
 pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Option<PickerAction> {
+    // Esc and the next key can arrive together, which reads as an Alt chord. It cancels like Esc.
+    let code = if key.modifiers.contains(KeyModifiers::ALT) {
+        KeyCode::Esc
+    } else {
+        key.code
+    };
+    let confirms =
+        matches!(code, KeyCode::Char('y' | 'Y')) && !key.modifiers.contains(KeyModifiers::CONTROL);
     if let Some(dialog) = &state.delete_dialog {
         return Some(match dialog.phase {
-            DeletePhase::Confirm => match key.code {
-                KeyCode::Char('y' | 'Y') => PickerAction::ConfirmDelete,
+            DeletePhase::Confirm if confirms => PickerAction::ConfirmDelete,
+            DeletePhase::Confirm => match code {
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                     state.delete_dialog = None;
                     PickerAction::Dismiss
@@ -38,7 +46,7 @@ pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Optio
                 _ => PickerAction::Continue,
             },
             DeletePhase::Deleting => PickerAction::Continue,
-            DeletePhase::Failed(_) => match key.code {
+            DeletePhase::Failed(_) => match code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
                     state.delete_dialog = None;
                     PickerAction::Dismiss
@@ -48,8 +56,10 @@ pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Optio
         });
     }
     state.update_dialog.as_ref()?;
-    Some(match key.code {
-        KeyCode::Char('y' | 'Y') => PickerAction::Update,
+    if confirms {
+        return Some(PickerAction::Update);
+    }
+    Some(match code {
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             state.update_dialog = None;
             PickerAction::Dismiss

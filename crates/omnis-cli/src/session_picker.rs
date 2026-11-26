@@ -20,8 +20,9 @@ use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute, queue,
     style::{Attribute, Print, SetAttribute},
@@ -61,15 +62,15 @@ mod workers;
 use dialog::{DeleteDialog, DeletePhase, handle_dialog_key};
 use render::{
     DetailStyle, PickerRenderState, ScreenLayout, TerminalGuard, centered_list_window,
-    display_title, populate_approximate_updated_at, present_frame, preview_continuation_title,
-    preview_title, queue_styled, screen_layout, short_id, terminal_list_row_count, truncate,
+    display_title, input_line, populate_approximate_updated_at, present_frame,
+    preview_continuation_title, preview_title, queue_styled, screen_layout, short_id,
+    terminal_list_row_count, truncate, truncate_middle,
 };
 #[cfg(test)]
 use render::{
     EmptyListContext, ListColumns, ListViewport, Rect, append_search_match, empty_list_hint,
     fit_cell, picker_frame, present_frame_to, relative_time, render_session_list,
     render_update_dialog, search_highlight_terms, selected_detail_lines, session_line,
-    truncate_middle,
 };
 #[cfg(test)]
 use workers::{
@@ -85,6 +86,8 @@ const TRAJECTORY_SEARCH_LIMIT: usize = 256;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const LINEAGE_PREVIEW_LIMIT: usize = 12;
 const PICKER_WARNING_LIMIT: usize = 64;
+const QUERY_CHARACTER_LIMIT: usize = 256;
+const WORKSPACE_CHARACTER_LIMIT: usize = 4096;
 const PAGE_ROWS: isize = 10;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(450);
@@ -461,8 +464,7 @@ impl PickerState {
         let key = self.visible_key();
         let matches = self.matching_indices();
         let indices: Arc<[usize]> = if self.query.trim().is_empty() {
-            self.lineage
-                .grouped_indices(matches, &self.entries, &self.entry_positions)
+            self.lineage.grouped_indices(matches, &self.entries)
         } else {
             matches
         }
@@ -596,7 +598,7 @@ impl PickerState {
     fn replace_lineage(&mut self, records: Vec<HandoffRecord>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         self.lineage.replace(records);
-        self.restore_selection(selected_key);
+        self.restore_selection(selected_key.as_deref());
     }
 
     #[cfg(test)]
@@ -708,8 +710,8 @@ impl PickerState {
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.query_changed();
-        self.restore_selection(selected_key);
+        self.trajectory_sources_changed();
+        self.restore_selection(selected_key.as_deref());
     }
 
     #[cfg(test)]
@@ -769,8 +771,8 @@ impl PickerState {
         self.apply_derived_titles_for(0..self.entries.len());
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.query_changed();
-        self.restore_selection(selected_key);
+        self.trajectory_sources_changed();
+        self.restore_selection(selected_key.as_deref());
     }
 
     fn apply_refreshed_codex_titles(&mut self, refreshed: workers::RefreshedCodexTitles) {
@@ -851,10 +853,10 @@ impl PickerState {
                 self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
             }
             if needs_query_refresh || workspaces_changed {
-                self.query_changed();
+                self.trajectory_sources_changed();
             }
             self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.restore_selection(selected_key);
+            self.restore_selection(selected_key.as_deref());
         }
     }
 
@@ -945,7 +947,14 @@ impl PickerState {
         }
     }
 
-    fn restore_selection(&mut self, selected_key: Option<String>) {
+    fn restore_selection(&mut self, selected_key: Option<&str>) {
+        self.reselect(selected_key);
+        if self.selected_entry().map(|entry| entry.key.as_str()) != selected_key {
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn reselect(&mut self, selected_key: Option<&str>) {
         if !self.selection_touched && self.query.trim().is_empty() {
             self.select_newest_session();
             return;
@@ -987,7 +996,7 @@ impl PickerState {
             .filter(|item| !self.deleted_sessions.contains(&item.session.to_string()))
             .map(|item| (item.session.to_string(), item))
             .collect();
-        self.restore_selection(selected_key);
+        self.restore_selection(selected_key.as_deref());
     }
 
     fn trajectory_match(&self, entry: &PickerEntry) -> Option<&SessionTrajectoryMatch> {
@@ -1063,11 +1072,15 @@ impl PickerState {
         let entry = &self.entries[index];
         if entry.cached && self.preview_key(entry) == *key {
             let selected = self.selected_entry().map(|entry| entry.key.clone());
-            self.remove_entry(&key.session, &key.search_ref().to_string(), selected);
+            self.remove_entry(
+                &key.session,
+                &key.search_ref().to_string(),
+                selected.as_deref(),
+            );
         }
     }
 
-    fn remove_entry(&mut self, session: &SessionRef, key: &str, selected: Option<String>) {
+    fn remove_entry(&mut self, session: &SessionRef, key: &str, selected: Option<&str>) {
         self.indexed_titles.remove(key);
         self.preview_titles.remove(key);
         self.entries.retain(|entry| entry.key != key);
@@ -1079,7 +1092,7 @@ impl PickerState {
         self.previews.remove_session(session);
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.query_changed();
+        self.trajectory_sources_changed();
         self.restore_selection(selected);
     }
 
@@ -1100,7 +1113,6 @@ impl PickerState {
     }
 
     fn select_newest_session(&mut self) {
-        self.detail_scroll = 0;
         let visible = self.visible_indices();
         let newest = visible
             .iter()
@@ -1168,8 +1180,8 @@ impl PickerState {
         }
         if self.apply_verified_workspaces(rows) {
             self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.query_changed();
-            self.restore_selection(selected);
+            self.trajectory_sources_changed();
+            self.restore_selection(selected.as_deref());
         }
     }
 
@@ -1267,7 +1279,7 @@ impl PickerState {
         if index_changed || preview_changed {
             self.refresh_entry_title(index);
             self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.restore_selection(selected);
+            self.restore_selection(selected.as_deref());
         }
         true
     }
@@ -1297,7 +1309,7 @@ impl PickerState {
         }
         self.refresh_entry_title(index);
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.restore_selection(selected);
+        self.restore_selection(selected.as_deref());
     }
 
     fn update_indexed_title(&mut self, index: usize, receipt: IndexedTrajectoryTitle) -> bool {
@@ -1396,7 +1408,7 @@ impl PickerState {
         {
             self.entries[index].session.source_revision = Some(revision);
             key = self.preview_key(&self.entries[index]);
-            self.query_changed();
+            self.trajectory_sources_changed();
         }
         if key
             .revision()
@@ -1508,7 +1520,7 @@ impl PickerState {
         }
         if changed {
             self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.restore_selection(selected_key);
+            self.restore_selection(selected_key.as_deref());
         }
     }
 
@@ -1541,13 +1553,13 @@ impl PickerState {
         }
         self.previews.replace_failures(failures);
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.restore_selection(selected);
+        self.restore_selection(selected.as_deref());
         self.preview_deadline = self
             .preview_window
             .iter()
             .any(|key| !self.previews.contains(key))
             .then(|| Instant::now() + PREVIEW_DEBOUNCE);
-        self.trajectory_index_changed();
+        self.trajectory_sources_changed();
     }
 
     fn resume_index_sources(&mut self, sessions: Vec<NativeSession>) {
@@ -1629,12 +1641,22 @@ impl PickerState {
             (!self.query.trim().is_empty()).then(|| Instant::now() + SEARCH_INDEX_DEBOUNCE);
     }
 
-    fn trajectory_index_changed(&mut self) {
+    /// Searches again after rows changed. Results of the running search no longer apply. Current
+    /// matches stay until the new ones arrive, so the selection does not move.
+    fn trajectory_sources_changed(&mut self) {
         if self.query.trim().is_empty() {
             return;
         }
         self.trajectory_search_generation = self.trajectory_search_generation.wrapping_add(1);
         self.trajectory_search_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+    }
+
+    /// Searches again after the index gained text. Results of the running search still apply, and
+    /// the search is not postponed, so steady indexing progress cannot hold matches back.
+    fn trajectory_index_changed(&mut self) {
+        if !self.query.trim().is_empty() && self.trajectory_search_deadline.is_none() {
+            self.trajectory_search_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        }
     }
 
     fn due_trajectory_search_request(&mut self) -> Option<TrajectorySearchRequest> {
@@ -1748,6 +1770,19 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
+    /// Row of a session that a handoff record names. Pi rows are keyed by copy, not by ID alone.
+    fn lineage_entry(&self, session: &SessionRef) -> Option<&PickerEntry> {
+        if matches!(session.provider, Provider::Pi | Provider::OhMyPi) {
+            return self
+                .entries
+                .iter()
+                .find(|entry| entry.session.session == *session);
+        }
+        self.entry_positions
+            .get(&session.to_string())
+            .and_then(|index| self.entries.get(*index))
+    }
+
     fn session_directory(&self, entry: &PickerEntry) -> Option<PathBuf> {
         let session = &entry.session;
         match self.previews.get(&self.preview_key(entry)) {
@@ -1843,12 +1878,7 @@ impl PickerState {
                 .into_iter()
                 .take(LINEAGE_PREVIEW_LIMIT)
             {
-                let key = node.session.to_string();
-                let Some(entry) = self
-                    .entry_positions
-                    .get(&key)
-                    .and_then(|index| self.entries.get(*index))
-                else {
+                let Some(entry) = self.lineage_entry(&node.session) else {
                     continue;
                 };
                 let preview_key = self.preview_key(entry);
@@ -2094,13 +2124,15 @@ impl LineageGraph {
         }
     }
 
-    fn grouped_indices(
-        &self,
-        candidates: Vec<usize>,
-        entries: &[PickerEntry],
-        positions: &HashMap<String, usize>,
-    ) -> Vec<usize> {
-        let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+    fn grouped_indices(&self, candidates: Vec<usize>, entries: &[PickerEntry]) -> Vec<usize> {
+        // Records name a session by ID. Several Pi rows can share one.
+        let mut rows = HashMap::<&SessionRef, Vec<usize>>::new();
+        for &index in &candidates {
+            let session = &entries[index].session.session;
+            if self.parents.contains_key(session) || self.children.contains_key(session) {
+                rows.entry(session).or_default().push(index);
+            }
+        }
         let mut grouped = Vec::with_capacity(candidates.len());
         let mut emitted = HashSet::with_capacity(candidates.len());
         for anchor in candidates {
@@ -2108,12 +2140,12 @@ impl LineageGraph {
                 continue;
             }
             let tree = self.tree(&entries[anchor].session.session);
-            for index in tree.into_iter().filter_map(|node| {
-                positions
-                    .get(&node.session.to_string())
-                    .copied()
-                    .filter(|index| candidate_set.contains(index))
-            }) {
+            for index in tree
+                .iter()
+                .filter_map(|node| rows.get(&node.session))
+                .flatten()
+                .copied()
+            {
                 if emitted.insert(index) {
                     grouped.push(index);
                 }
@@ -2526,6 +2558,8 @@ fn apply_derived_title(entry: &mut PickerEntry, record: &omnis_store::IndexedTit
 }
 
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
+    // The pane can grow or its text can shrink after the last scroll.
+    let current = current.min(max);
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
@@ -3150,6 +3184,12 @@ fn pick_workspace(
         }
         let key = match event::read().context("reading workspace picker input")? {
             Event::Key(key) => key,
+            Event::Paste(text) => {
+                push_pasted(&mut state.input, &text, WORKSPACE_CHARACTER_LIMIT);
+                state.message.clear();
+                needs_render = true;
+                continue;
+            }
             Event::Resize(_, _) => {
                 needs_render = true;
                 continue;
@@ -3208,7 +3248,7 @@ fn pick_workspace(
                 state.message.clear();
             }
             KeyCode::Char(character)
-                if state.input.chars().count() < 4096
+                if state.input.chars().count() < WORKSPACE_CHARACTER_LIMIT
                     && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -3414,6 +3454,13 @@ fn pick_target_for(
         }
         let key = match event {
             Event::Key(key) => key,
+            Event::Paste(text) => {
+                push_pasted(&mut filter, &text, TARGET_FILTER_CHARACTER_LIMIT);
+                (visible, selected) =
+                    filter_target_rows(&choices, &filter, selected.or(default_selected));
+                needs_render = true;
+                continue;
+            }
             Event::Resize(_, _) => {
                 needs_render = true;
                 continue;
@@ -3894,9 +3941,20 @@ fn render_target(
     filter: &str,
 ) -> Result<()> {
     let (width, height) = terminal::size().context("reading terminal size")?;
-    let width = usize::from(width).max(1);
+    let size = (usize::from(width).max(1), usize::from(height).max(1));
+    let frame = target_frame(intent, choices, visible, selected, filter, size)?;
+    present_frame(&frame).context("drawing target picker")
+}
+
+fn target_frame(
+    intent: TargetIntent<'_>,
+    choices: &[TargetRow],
+    visible: &[usize],
+    selected: Option<usize>,
+    filter: &str,
+    (width, height): (usize, usize),
+) -> Result<Vec<u8>> {
     let mut frame = Vec::new();
-    queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     let source = intent.source();
     let context = source.map_or_else(
         || "New session".to_owned(),
@@ -3911,30 +3969,43 @@ fn render_target(
     queue_styled(
         &mut frame,
         DetailStyle::Strong,
-        "OmniSession  Choose target",
+        &truncate("OmniSession  Choose target", width),
     )?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(&mut frame, DetailStyle::Muted, &truncate(&context, width))?;
-    queue!(frame, Print("\r\n\r\n"), Print(prompt), Print("\r\n"))?;
+    queue!(
+        frame,
+        Print("\r\n\r\n"),
+        Print(truncate(prompt, width)),
+        Print("\r\n")
+    )?;
+    // The line to keep on screen: the selected row, or the filter when no row matches.
+    let mut anchor = page_lines(&frame).count() - 1;
     let (filter_style, filter_line) = if filter.is_empty() {
         (
             DetailStyle::Muted,
             "Filter › type an agent name, such as grok or agy".to_owned(),
         )
     } else {
-        (DetailStyle::Normal, format!("Filter › {filter}▏"))
+        (
+            DetailStyle::Normal,
+            input_line("Filter › ", &format!("{filter}▏"), width),
+        )
     };
     queue_styled(&mut frame, filter_style, &truncate(&filter_line, width))?;
     queue!(frame, Print("\r\n\r\n"))?;
     let position =
         selected.and_then(|selected| visible.iter().position(|&index| index == selected));
-    let window = target_window(visible.len(), position, usize::from(height));
+    let window = target_window(visible.len(), position, height);
     if window.start > 0 {
         let hidden = format!("  ↑ {} more", window.start);
         queue_styled(&mut frame, DetailStyle::Muted, &truncate(&hidden, width))?;
         queue!(frame, Print("\r\n"))?;
     }
     for &index in &visible[window.clone()] {
+        if selected == Some(index) {
+            anchor = page_lines(&frame).count() - 1;
+        }
         queue_target_row(
             &mut frame,
             intent,
@@ -3976,7 +4047,19 @@ fn render_target(
             width,
         ),
     )?;
-    present_frame(&frame).context("drawing target picker")
+    // A taller page would scroll the terminal and push the selected row off the top.
+    let lines = page_lines(&frame).collect::<Vec<_>>();
+    let first = lines.len().saturating_sub(height).min(anchor);
+    let shown = lines.iter().skip(first).take(height);
+    let mut page = Vec::new();
+    queue!(page, MoveTo(0, 0), Clear(ClearType::All))?;
+    page.extend(shown.copied().collect::<Vec<_>>().join(&b"\r\n"[..]));
+    Ok(page)
+}
+
+fn page_lines(page: &[u8]) -> impl Iterator<Item = &[u8]> {
+    page.split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
 }
 
 fn render_workspace(
@@ -3986,7 +4069,17 @@ fn render_workspace(
     reason: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
-    let width = usize::from(width).max(1);
+    let frame = workspace_frame(source, original, state, reason, usize::from(width).max(1))?;
+    present_frame(&frame).context("drawing workspace picker")
+}
+
+fn workspace_frame(
+    source: &SessionRef,
+    original: Option<&Path>,
+    state: &WorkspaceInputState,
+    reason: &str,
+    width: usize,
+) -> Result<Vec<u8>> {
     let mut frame = Vec::new();
     queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     queue_styled(
@@ -4017,7 +4110,9 @@ fn render_workspace(
             } else {
                 DetailStyle::Muted
             };
-            let line = format!("{marker} {label} {}", safe_terminal_line(path));
+            let label = format!("{marker} {label} ");
+            let room = width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let line = format!("{label}{}", truncate_middle(path, room));
             queue_styled(&mut frame, style, &truncate(&line, width))?;
             queue!(frame, Print("\r\n"))?;
         }
@@ -4042,7 +4137,7 @@ fn render_workspace(
     queue_styled(
         &mut frame,
         DetailStyle::Accent,
-        &truncate(&format!("> {}", safe_terminal_line(&state.input)), width),
+        &input_line("> ", &state.input, width),
     )?;
     queue!(frame, Print("\r\n"))?;
     if !state.message.is_empty() {
@@ -4060,7 +4155,7 @@ fn render_workspace(
         "Tab complete  Enter use folder  Ctrl-U clear  Esc back  Ctrl-C cancel"
     };
     queue_styled(&mut frame, DetailStyle::Muted, &truncate(footer, width))?;
-    present_frame(&frame).context("drawing workspace picker")
+    Ok(frame)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4085,6 +4180,7 @@ fn handle_event(
             handle_key(state, *key)
         }
         Event::Mouse(mouse) => handle_mouse(state, *mouse, size, clicks),
+        Event::Paste(text) => handle_paste(state, text),
         Event::Resize(_, _) => PickerAction::Continue,
         _ => PickerAction::Ignore,
     }
@@ -4137,7 +4233,9 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
         }
         KeyCode::Char('u') if control => state.clear_query(),
         KeyCode::Char('w') if control => state.delete_query_word(),
-        KeyCode::Char(character) if state.query.chars().count() < 256 && !control && !alt => {
+        KeyCode::Char(character)
+            if state.query.chars().count() < QUERY_CHARACTER_LIMIT && !control && !alt =>
+        {
             state.query.push(character);
             state.query_changed();
             state.reset_selection();
@@ -4145,6 +4243,25 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
         _ => {}
     }
     PickerAction::Continue
+}
+
+/// Pasted text only edits the search. Its line breaks must not select a row.
+fn handle_paste(state: &mut PickerState, text: &str) -> PickerAction {
+    if state.delete_dialog.is_some() || state.update_dialog.is_some() || state.help_open {
+        return PickerAction::Ignore;
+    }
+    state.notice = None;
+    push_pasted(&mut state.query, text, QUERY_CHARACTER_LIMIT);
+    state.query_changed();
+    state.reset_selection();
+    PickerAction::Continue
+}
+
+/// Appends pasted text as one line of at most `limit` characters.
+fn push_pasted(input: &mut String, text: &str, limit: usize) {
+    let room = limit.saturating_sub(input.chars().count());
+    let line = safe_terminal_line(text.trim_matches(['\r', '\n']));
+    input.extend(line.chars().take(room));
 }
 
 fn handle_help_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
@@ -6339,6 +6456,266 @@ mod tests {
     }
 
     #[test]
+    fn small_terminals_show_the_delete_confirmation() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Fix refresh race"),
+            )],
+            current,
+            None,
+            false,
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+
+        for (width, height) in [(60, 8), (23, 24), (20, 5)] {
+            let mut render_state = PickerRenderState::default();
+            let frame = picker_frame(&state, None, &[], 0, &mut render_state, width, height)
+                .expect("small delete confirmation frame");
+            let rendered = String::from_utf8_lossy(&frame);
+            assert!(rendered.contains("y/n · delete"), "{width}x{height}");
+        }
+
+        state.delete_dialog.as_mut().expect("dialog").phase =
+            DeletePhase::Failed("agent is running".to_owned());
+        let mut render_state = PickerRenderState::default();
+        let frame = picker_frame(&state, None, &[], 0, &mut render_state, 60, 8)
+            .expect("small delete failure frame");
+        assert!(String::from_utf8_lossy(&frame).contains("delete failed: agent is running"));
+    }
+
+    #[test]
+    fn escape_followed_by_y_never_confirms_a_dialog() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        // A terminal sends Alt+Y and a quick Esc, Y as the same bytes.
+        let alt_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(handle_key(&mut state, alt_y), PickerAction::Dismiss);
+        assert!(state.delete_dialog.is_none());
+
+        state.update_dialog = Some("99.1.2".to_owned());
+        assert_eq!(handle_key(&mut state, alt_y), PickerAction::Dismiss);
+        assert!(state.update_dialog.is_none());
+    }
+
+    #[test]
+    fn provider_updates_keep_a_selected_conversation_match() {
+        let current = fixture_workspace();
+        let matched = session(Provider::Claude, "matched", current, Some("First summary"));
+        let chosen = session(Provider::Codex, "chosen", current, Some("Second summary"));
+        let mut state = PickerState::new(vec![matched, chosen], current, None, false);
+        state.enable_new_session(true);
+        for character in "quokka".chars() {
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        let page = SessionTrajectorySearchPage {
+            matches: vec![
+                trajectory_match(Provider::Claude, "matched", "quokka", true),
+                trajectory_match(Provider::Codex, "chosen", "quokka", true),
+            ],
+            has_more: false,
+        };
+        state.replace_trajectory_matches(page.clone());
+        state.move_selection(1);
+        let selected = |state: &PickerState| state.selected_entry().map(|entry| entry.key.clone());
+        assert_eq!(selected(&state).as_deref(), Some("codex:chosen"));
+        let generation = state.trajectory_search_generation;
+
+        state.replace_provider(
+            Provider::Grok,
+            vec![session(Provider::Grok, "other", current, Some("Other"))],
+            current,
+            false,
+        );
+        assert_eq!(selected(&state).as_deref(), Some("codex:chosen"));
+        // The refreshed rows get a search of their own.
+        assert_ne!(generation, state.trajectory_search_generation);
+        assert!(state.trajectory_search_deadline.is_some());
+
+        state.replace_trajectory_matches(page);
+        assert_eq!(selected(&state).as_deref(), Some("codex:chosen"));
+    }
+
+    #[test]
+    fn background_updates_keep_the_preview_scroll_of_the_selected_session() {
+        let current = fixture_workspace();
+        let native = session(Provider::Codex, "session", current, Some("Fix pagination"));
+        let mut state = PickerState::new(vec![native.clone()], current, None, false);
+        let key = state.preview_key(&state.entries[0]);
+        state.previews.insert(
+            key,
+            PreviewValue::Ready {
+                preview: Box::new(synthetic_preview("Start with cursor pagination.")),
+                continuation: None,
+                complete: false,
+                message_count_is_complete: false,
+                source_provider: Provider::Codex,
+                can_use_first_title: true,
+            },
+            &[],
+        );
+        let mut render_state = PickerRenderState::default();
+        picker_frame(&state, None, &[], 0, &mut render_state, 120, 24).expect("picker frame");
+        state.scroll_detail(2);
+        assert_eq!(state.detail_scroll, 2);
+
+        state.replace_provider(
+            Provider::Grok,
+            vec![NativeSession {
+                updated_at: native
+                    .updated_at
+                    .map(|time| time - chrono::Duration::days(1)),
+                ..session(Provider::Grok, "older", current, None)
+            }],
+            current,
+            false,
+        );
+        assert_eq!(
+            state.selected_entry().unwrap().session.session.id,
+            "session"
+        );
+        assert_eq!(state.detail_scroll, 2);
+
+        state.replace_provider(Provider::Codex, Vec::new(), current, false);
+        assert_eq!(state.selected_entry().unwrap().session.session.id, "older");
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
+    fn indexing_progress_keeps_the_results_of_a_running_search() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Summary"),
+            )],
+            current,
+            None,
+            false,
+        );
+        state.query = "quokka".to_owned();
+        state.query_changed();
+        state.trajectory_search_deadline = Some(Instant::now());
+        let request = state
+            .due_trajectory_search_request()
+            .expect("trajectory search request");
+
+        // Indexing reports every 250 ms, and a search of a large index can take longer.
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::Indexing(
+                crate::search_index::IndexProgress::default(),
+            ))
+            .expect("send progress");
+        sender
+            .send(PickerUpdate::TrajectorySearch {
+                generation: request.generation,
+                result: Ok(SessionTrajectorySearchPage {
+                    matches: vec![trajectory_match(Provider::Codex, "session", "quokka", true)],
+                    has_more: false,
+                }),
+            })
+            .expect("send trajectory matches");
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            current,
+        );
+
+        assert_eq!(state.visible_indices().len(), 1);
+        assert!(state.trajectory_search_deadline.is_some());
+    }
+
+    #[test]
+    fn help_shows_the_full_warning_text() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(Vec::new(), current, None, true);
+        state.open_help();
+        let path = r"C:\Users\tester\.codex\sessions\new".to_owned() + &"x".repeat(120);
+        let warning = format!(
+            "codex: could not read {path} {}because the last word is zebracorn",
+            "and another reason ".repeat(20)
+        );
+
+        let mut render_state = PickerRenderState::default();
+        let frame = picker_frame(
+            &state,
+            None,
+            std::slice::from_ref(&warning),
+            0,
+            &mut render_state,
+            80,
+            60,
+        )
+        .expect("help overlay frame");
+        assert!(String::from_utf8_lossy(&frame).contains("zebracorn"));
+        let text = |value: &str| {
+            value
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        };
+        let shown = render::help_lines(&state, std::slice::from_ref(&warning), 72)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<String>();
+        assert!(text(&shown).contains(&text(&warning)));
+    }
+
+    #[test]
+    fn preview_scrolls_up_at_once_after_the_pane_grows() {
+        let mut state = PickerState::new(Vec::new(), fixture_workspace(), None, false);
+        state.detail_scroll = 30;
+        state.detail_max_scroll.set(5);
+        state.scroll_detail(-1);
+        assert_eq!(state.detail_scroll, 4);
+        state.help_scroll = 30;
+        state.help_max_scroll.set(5);
+        state.scroll_help(-1);
+        assert_eq!(state.help_scroll, 4);
+    }
+
+    #[test]
+    fn long_words_wrap_instead_of_hiding_the_rest_of_a_message() {
+        let text = "漢".repeat(50);
+        let lines = render::wrap_text(&text, 20, 6);
+        assert_eq!(lines.concat(), text);
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 20)
+        );
+
+        let lines = render::wrap_text(&text, 20, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'));
+        assert_eq!(render::wrap_text("ab 漢", 1, 4), ["a", "b", "漢"]);
+    }
+
+    #[test]
     fn deleting_row_preserves_position_and_blocks_stale_refresh() {
         let current = fixture_workspace();
         let deleted = SessionRef::new(Provider::Codex, "deleted");
@@ -8154,6 +8531,145 @@ mod tests {
     }
 
     #[test]
+    fn pi_sessions_join_their_lineage_group() {
+        let current = fixture_workspace();
+        let root = SessionRef::new(Provider::Claude, "root");
+        let child = SessionRef::new(Provider::Pi, "child");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Claude, "root", current, Some("Original session")),
+                session(Provider::Grok, "unrelated", current, Some("Unrelated")),
+                session(Provider::Pi, "child", current, Some("Pi continuation")),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.replace_lineage(vec![HandoffRecord {
+            source: root.clone(),
+            target: child.clone(),
+            mode: omnis_ir::TransferMode::NativeMaterialization,
+            created_at: Utc::now(),
+        }]);
+
+        let visible = state
+            .visible_indices()
+            .iter()
+            .map(|&index| state.entries[index].session.session.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            [
+                root.clone(),
+                child.clone(),
+                SessionRef::new(Provider::Grok, "unrelated"),
+            ]
+        );
+        let mut lines = Vec::new();
+        render::append_lineage_tree(&mut lines, &state, &root, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("Pi continuation"))
+        );
+        assert!(!lines.iter().any(|line| line.text.contains("not indexed")));
+    }
+
+    #[test]
+    fn list_dates_use_the_local_day_like_the_details_pane() {
+        let start = Utc::now() - chrono::Duration::days(30);
+        for hour in 0..24 {
+            let updated_at = start + chrono::Duration::hours(hour);
+            let local = updated_at.with_timezone(&Local).format("%Y-%m-%d");
+            assert_eq!(relative_time(Some(updated_at), false), local.to_string());
+        }
+    }
+
+    #[test]
+    fn long_input_keeps_its_end_on_screen() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(Vec::new(), current, None, false);
+        state.query = "synthetic request number forty two".to_owned();
+        let mut render_state = PickerRenderState::default();
+        let frame =
+            picker_frame(&state, None, &[], 0, &mut render_state, 30, 12).expect("narrow frame");
+        assert!(String::from_utf8_lossy(&frame).contains("number forty two▏"));
+
+        let source = SessionRef::new(Provider::Claude, "source");
+        let workspace = WorkspaceInputState {
+            input: format!("/{}/typed-folder", "deep/".repeat(40)),
+            saved: Some(format!("/{}/saved-folder", "deep/".repeat(40))),
+            current: format!("/{}/current-folder", "deep/".repeat(40)),
+            message: String::new(),
+        };
+        let frame = workspace_frame(&source, None, &workspace, "Reason", 60).expect("page");
+        let page = String::from_utf8_lossy(&frame);
+        for shown in ["typed-folder", "saved-folder", "current-folder"] {
+            assert!(page.contains(shown), "{shown}");
+        }
+
+        let filter = "a filter that is wider than the terminal grok";
+        let frame = target_frame(TargetIntent::New, &[], &[], None, filter, (30, 24));
+        let page = frame.expect("target page");
+        assert!(String::from_utf8_lossy(&page).contains("terminal grok▏"));
+    }
+
+    #[test]
+    fn short_target_pages_show_the_selected_agent_and_its_mode() {
+        let source = SessionRef::new(Provider::Codex, "source");
+        let intent = TargetIntent::Resume(&source);
+        let choices = [Provider::Codex, Provider::Claude, Provider::Grok]
+            .map(|provider| TargetChoice {
+                provider,
+                profile: None,
+                fork: false,
+                mode: Some(ModeKind::Yolo),
+            })
+            .map(TargetRow::Agent);
+        for height in 4..40 {
+            let frame = target_frame(intent, &choices, &[0, 1, 2], Some(1), "", (80, height))
+                .expect("target page");
+            let page = String::from_utf8_lossy(&frame);
+            assert!(page.contains("› Claude"), "{height} rows");
+            assert!(page.contains("[yolo]"), "{height} rows");
+            assert!(page.matches("\r\n").count() < height, "{height} rows");
+        }
+    }
+
+    #[test]
+    fn pasted_text_edits_the_search_without_selecting_or_confirming() {
+        let current = fixture_workspace();
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        let mut clicks = ClickTracker::default();
+        let mut paste = |state: &mut PickerState, text: &str| {
+            let event = Event::Paste(text.to_owned());
+            handle_event(state, &event, (80, 24), &mut clicks)
+        };
+
+        assert_eq!(
+            paste(&mut state, "? fix\tthe\x1b bug\r\n\r\n"),
+            PickerAction::Continue
+        );
+        assert_eq!(state.query, "? fix the  bug");
+        paste(&mut state, " now\n");
+        assert_eq!(state.query, "? fix the  bug now");
+        assert!(!state.help_open);
+        paste(&mut state, &"x".repeat(1_000));
+        assert_eq!(state.query.chars().count(), QUERY_CHARACTER_LIMIT);
+
+        state.clear_query();
+        state.request_delete();
+        assert_eq!(paste(&mut state, "y"), PickerAction::Ignore);
+        assert!(state.delete_dialog.is_some());
+        assert!(state.query.is_empty());
+    }
+
+    #[test]
     fn session_line_indents_linked_agent() {
         let session = session(
             Provider::OpenCode,
@@ -8601,6 +9117,9 @@ mod tests {
         assert!(session_cache_is_fresh(Utc::now()));
         assert!(!session_cache_is_fresh(
             Utc::now() - chrono::Duration::seconds(16)
+        ));
+        assert!(!session_cache_is_fresh(
+            Utc::now() + chrono::Duration::minutes(5)
         ));
     }
 

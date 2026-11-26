@@ -1139,6 +1139,218 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
     successful_json(command(root, &relocated).args(["--json", "switch", "codex", "--dry-run"]));
 }
 
+#[test]
+fn an_imported_workspace_cannot_send_control_characters_to_the_terminal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let bundle = root.join("bundle.json");
+    successful_json(
+        command(root, &workspace)
+            .args(["--json", "export", &format!("claude:{SESSION_ID}"), "-o"])
+            .arg(&bundle),
+    );
+    let mut document: Value = serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
+    let id = "33333333-3333-4333-8333-333333333333";
+    document["manifest"]["bundle_id"] = json!(id);
+    document["snapshot"]["workspace"]["root"] = json!("/elsewhere/\u{1b}]0;renamed\u{7}");
+    fs::write(&bundle, document.to_string()).unwrap();
+    successful_json(
+        command(root, &workspace)
+            .args(["--json", "import"])
+            .arg(&bundle),
+    );
+    let bound = command(root, &workspace)
+        .args([
+            "task",
+            "start",
+            "imported",
+            "--from",
+            &format!("imported:{id}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(!bound.status.success());
+    let stderr = String::from_utf8_lossy(&bound.stderr);
+    assert!(stderr.contains("/elsewhere/"), "{stderr}");
+    assert!(!stderr.contains(['\u{1b}', '\u{7}']), "{stderr:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reader_that_closes_the_pipe_ends_output_without_a_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let source = format!("claude:{SESSION_ID}");
+    let run = |args: &[&str], close_stderr: bool| {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut cli = command(root, &workspace);
+        cli.env("OMNI_CLAUDE_BIN", std::env::current_exe().unwrap())
+            .args(args);
+        if close_stderr {
+            cli.stderr(writer.try_clone().unwrap());
+        }
+        let output = cli.stdout(writer).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("error:"), "{args:?}: {stderr}");
+    };
+    for args in [
+        &["list", "--provider", "claude"][..],
+        &["--json", "list", "--provider", "claude"],
+        &["show", &source],
+        &["markdown", &source],
+        &["verify", &source],
+        &["adapters"],
+        &["profiles"],
+        &["task", "status"],
+        &["inspect", &source, "--target", "claude"],
+        &["resume", &source, "--dry-run"],
+    ] {
+        run(args, false);
+    }
+    // A cached search warns on standard error, as in `omni search ... 2>&1 | head`.
+    run(
+        &["search", "synthetic", "--cached", "--provider", "claude"],
+        true,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_is_not_utf8_does_not_stop_diagnostics() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home = root.join(std::ffi::OsStr::from_bytes(b"codex-\xff"));
+    let run = |args: &[&str]| {
+        let mut cli = command(root, &workspace);
+        cli.env("CODEX_HOME", &home).args(args);
+        cli
+    };
+    let adapters = successful_json(&mut run(&["--json", "adapters"]));
+    let codex = adapters
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|adapter| adapter["provider"] == "codex")
+        .unwrap();
+    assert!(
+        codex["data_root"]
+            .as_str()
+            .unwrap()
+            .ends_with("codex-\u{fffd}")
+    );
+    assert!(run(&["adapters"]).output().unwrap().status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn importing_a_named_pipe_fails_without_waiting_for_a_writer() {
+    use wait_timeout::ChildExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let pipe = root.join("bundle.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut import = command(root, &workspace)
+        .arg("import")
+        .arg(&pipe)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = import
+        .wait_timeout(std::time::Duration::from_secs(20))
+        .unwrap();
+    if status.is_none() {
+        import.kill().unwrap();
+    }
+    let output = import.wait_with_output().unwrap();
+    assert_eq!(status.and_then(|status| status.code()), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be a regular file"));
+}
+
+/// A state directory whose database no build can open.
+fn write_unusable_state(root: &Path) {
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(state.join("store.sqlite3"), "not a database").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_agents_before_it_fails_on_unusable_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    write_unusable_state(root);
+    let run = |args: &[&str]| {
+        command(root, &workspace)
+            .env("PATH", "/usr/bin:/bin")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [&["doctor"][..], &["--json", "doctor"]] {
+        let output = run(args);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("error: opening OmniSession state")
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("claude"));
+    }
+    let report: Value = serde_json::from_slice(&run(&["--json", "doctor"]).stdout).unwrap();
+    assert!(report["selected_task"].is_null());
+}
+
+#[test]
+fn an_export_that_cannot_open_state_leaves_no_bundle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    write_unusable_state(root);
+    let bundle = root.join("bundle.json");
+    let export = || {
+        command(root, &workspace)
+            .args(["export", &format!("claude:{SESSION_ID}"), "-o"])
+            .arg(&bundle)
+            .output()
+            .unwrap()
+    };
+    assert!(!export().status.success());
+    assert!(!bundle.exists());
+    fs::remove_file(root.join("state/store.sqlite3")).unwrap();
+    let retried = export();
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn export_refuses_network_workspace_before_writing_bundle() {

@@ -153,8 +153,9 @@ impl Drop for ProbeLease {
     }
 }
 
-/// Arm cancellation only while a bounded provider process is active. Workspace lookup,
-/// local file reads, and interactive launches retain their normal signal behavior.
+/// Arm cancellation only while a bounded provider process is active. Workspace lookup and local
+/// file reads retain their normal signal behavior. During an interactive launch, the provider
+/// handles Ctrl+C and `omni` waits for it.
 pub(crate) fn with_provider_probes<T>(run: impl FnOnce() -> T) -> T {
     omnis_adapters::with_provider_probes(
         || {
@@ -247,36 +248,79 @@ pub(crate) fn wait_or_kill(child: &mut Child, timeout: Duration) -> io::Result<O
 }
 
 #[cfg(unix)]
+pub(crate) use sigint::IgnoreScope;
+
+#[cfg(unix)]
 mod sigint {
     use std::sync::{
-        Arc, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicBool, Ordering},
     };
 
     use signal_hook::{
+        SigId,
         consts::{SIGINT, SIGTERM},
-        flag,
+        flag, low_level,
     };
 
     struct Flags {
         requested: Arc<AtomicBool>,
         default_action: Arc<AtomicBool>,
+        /// The action that arms the default action for the next signal.
+        arming: Mutex<Option<SigId>>,
     }
 
-    // Actions register once per process. Unregistering them would leave SIGINT ignored, so the
-    // default action is re-armed instead.
+    impl Flags {
+        fn arming(&self) -> MutexGuard<'_, Option<SigId>> {
+            self.arming.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    // Actions register once per process. Unregistering all of them would leave SIGINT ignored, so
+    // the default action is re-armed instead.
     static FLAGS: OnceLock<Option<Flags>> = OnceLock::new();
 
     fn register(signal: i32) -> Option<Flags> {
-        let flags = Flags {
-            requested: Arc::new(AtomicBool::new(false)),
-            default_action: Arc::new(AtomicBool::new(true)),
-        };
+        let requested = Arc::new(AtomicBool::new(false));
+        let default_action = Arc::new(AtomicBool::new(true));
         // Order matters: the default action checks its flag before the next action arms it.
-        flag::register_conditional_default(signal, Arc::clone(&flags.default_action)).ok()?;
-        flag::register(signal, Arc::clone(&flags.default_action)).ok()?;
-        flag::register(signal, Arc::clone(&flags.requested)).ok()?;
-        Some(flags)
+        flag::register_conditional_default(signal, Arc::clone(&default_action)).ok()?;
+        let arming = flag::register(signal, Arc::clone(&default_action)).ok()?;
+        flag::register(signal, Arc::clone(&requested)).ok()?;
+        Some(Flags {
+            requested,
+            default_action,
+            arming: Mutex::new(Some(arming)),
+        })
+    }
+
+    /// Keeps Ctrl+C from ending `omni` until dropped.
+    pub(crate) struct IgnoreScope(&'static Flags);
+
+    impl IgnoreScope {
+        /// Keeps `omni` running while a child that shares the terminal handles Ctrl+C, so `omni`
+        /// still waits for the child and exits with its status. The child starts with the default
+        /// action, because `exec` resets signal handlers.
+        ///
+        /// Returns `None` when the handler cannot be installed; default handling remains.
+        pub(crate) fn enter() -> Option<Self> {
+            let flags = FLAGS.get_or_init(|| register(SIGINT)).as_ref()?;
+            if let Some(arming) = flags.arming().take() {
+                low_level::unregister(arming);
+            }
+            flags.default_action.store(false, Ordering::SeqCst);
+            Some(Self(flags))
+        }
+    }
+
+    impl Drop for IgnoreScope {
+        fn drop(&mut self) {
+            let mut arming = self.0.arming();
+            if arming.is_none() {
+                *arming = flag::register(SIGINT, Arc::clone(&self.0.default_action)).ok();
+            }
+            self.0.default_action.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Re-arms the default action when dropped.

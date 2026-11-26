@@ -762,20 +762,41 @@ fn remote_fingerprint(root: &Path) -> Result<Option<String>, CaptureError> {
 
 fn remote_fingerprints(root: &Path) -> Result<Option<RemoteFingerprints>, CaptureError> {
     let remotes = git_text(root, &["remote"], "listing remotes")?;
-    let remote = remotes
-        .lines()
-        .find(|remote| *remote == "origin")
-        .or_else(|| remotes.lines().next());
-    let Some(remote) = remote else {
-        return Ok(None);
-    };
+    let origin = remotes.lines().filter(|remote| *remote == "origin");
+    let others = remotes.lines().filter(|remote| *remote != "origin");
+    for remote in origin.chain(others) {
+        // User settings such as `remote.origin.prune` list a remote that this repository does not
+        // have. Git fails for it, or prints the remote's name when only its URL is missing.
+        let output = git_command(root, &["remote", "get-url", remote])
+            .output()
+            .map_err(CaptureError::Io)?;
+        let url = trim_trailing_newlines(&output.stdout);
+        let known = output.status.success() && url != remote.as_bytes();
+        if known || remote_has_url(root, remote)? {
+            if !output.status.success() {
+                return Err(CaptureError::Git {
+                    operation: "fingerprinting remote URL",
+                });
+            }
+            return Ok(Some(RemoteFingerprints::new(url)));
+        }
+    }
+    Ok(None)
+}
 
-    let url = git_bytes(
-        root,
-        &["remote", "get-url", remote],
-        "fingerprinting remote URL",
-    )?;
-    Ok(Some(RemoteFingerprints::new(trim_trailing_newlines(&url))))
+fn remote_has_url(root: &Path, remote: &str) -> Result<bool, CaptureError> {
+    let key = format!("remote.{remote}.url");
+    let output = git_command(root, &["config", "--local", "--includes", "--get", &key])
+        .output()
+        .map_err(CaptureError::Io)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        // Git reports a missing key with this exit code.
+        Some(1) => Ok(false),
+        _ => Err(CaptureError::Git {
+            operation: "finding remote URL",
+        }),
+    }
 }
 
 fn untracked_files(root: &Path) -> Result<Vec<PathBuf>, CaptureError> {
@@ -7217,6 +7238,117 @@ mod tests {
                 super::SEARCH_DOCUMENT_VERSION
             );
         }
+    }
+
+    #[test]
+    fn a_remote_without_a_url_does_not_identify_the_repository() {
+        const REPOSITORY: &str = "OMNI_TEST_REMOTE_REPOSITORY";
+        const EXPECTED: &str = "OMNI_TEST_REMOTE_EXPECTED";
+
+        // The child process reads the user settings that the test supplies.
+        if let Some(repo) = std::env::var_os(REPOSITORY) {
+            let expected = std::env::var(EXPECTED).ok();
+            assert_eq!(
+                super::workspace_remote_fingerprint(Path::new(&repo)).expect("remote fingerprint"),
+                expected.map(|url| fingerprint(url.as_bytes()))
+            );
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary repositories");
+        let settings = temp.path().join("gitconfig");
+        fs::write(&settings, "[remote \"origin\"]\n\tprune = true\n").expect("user settings");
+        let upstream = "https://example.invalid/acme/project.git";
+        for (name, commands, expected) in [
+            ("no-remote", vec![], None),
+            (
+                "other-remote",
+                vec![vec!["remote", "add", "upstream", upstream]],
+                Some(upstream),
+            ),
+            (
+                "local-settings",
+                vec![vec!["config", "remote.origin.prune", "true"]],
+                None,
+            ),
+        ] {
+            let repo = temp.path().join(name);
+            fs::create_dir(&repo).expect("repository directory");
+            git(&repo, &["init", "--initial-branch=main"]);
+            for command in commands {
+                git(&repo, &command);
+            }
+            let mut child = Command::new(std::env::current_exe().expect("test binary"));
+            child
+                .args([
+                    "--exact",
+                    "tests::a_remote_without_a_url_does_not_identify_the_repository",
+                ])
+                .env("GIT_CONFIG_GLOBAL", &settings)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(REPOSITORY, &repo);
+            if let Some(expected) = expected {
+                child.env(EXPECTED, expected);
+            }
+            let output = child.output().expect("child test");
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_remote_lookup_does_not_select_another_remote() {
+        use std::os::unix::fs::PermissionsExt;
+        const REPOSITORY: &str = "OMNI_TEST_FAILED_REMOTE_REPOSITORY";
+
+        if let Some(repo) = std::env::var_os(REPOSITORY) {
+            assert!(super::workspace_remote_fingerprint(Path::new(&repo)).is_err());
+            return;
+        }
+
+        let temp = TempDir::new().expect("temporary repository");
+        let repo = temp.path().join("repo");
+        let commands = temp.path().join("bin");
+        fs::create_dir(&repo).expect("repository directory");
+        fs::create_dir(&commands).expect("command directory");
+        git(&repo, &["init", "--initial-branch=main"]);
+        for (name, url) in [
+            ("origin", "https://example.invalid/acme/origin.git"),
+            ("upstream", "https://example.invalid/acme/upstream.git"),
+        ] {
+            git(&repo, &["remote", "add", name, url]);
+        }
+        let path = std::env::var("PATH").expect("command path");
+        let wrapper = commands.join("git");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *\"get-url origin\"*) exit 128;; esac\nPATH='{path}' exec git \"$@\"\n"
+            ),
+        )
+        .expect("failing git command");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("permissions");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::a_failed_remote_lookup_does_not_select_another_remote",
+            ])
+            .env("PATH", format!("{}:{path}", commands.display()))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(REPOSITORY, &repo)
+            .output()
+            .expect("child test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]

@@ -23,17 +23,18 @@ use super::recovery::{ImportSource, write_temp_handoff};
 use super::workspace_choice::{self, WorkspaceChoice, WorkspacePrompt};
 use super::{
     AdapterRegistry, CanonicalSnapshot, Context, DELETE_PROVIDERS, FidelityReport, ForkArgs,
-    IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result, ResumeArgs,
-    SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail, build_fidelity_report,
-    build_native_fork_report, build_native_materialization_report_for_snapshot,
-    build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
-    claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
-    cursor_ide_import, cursor_import, display_command, fidelity_report_for_snapshot, flush_stdout,
-    grok_import, hermes_import, json, launch_json, opencode_import, pi_import, print_fidelity,
-    progress_line, redact_secrets, render_semantic_handoff, resolve_session_ref,
-    resolved_provider_binary, run_launch, runnable_target_providers, safe_terminal_line,
-    self_update, session_picker, source_workspace_matches_for_session, spawn_launch,
-    transfer_repository_matches, wait_for_launch, workspace_paths_match, workspace_root,
+    IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, ProviderExit, Result,
+    ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
+    build_fidelity_report, build_native_fork_report,
+    build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
+    build_semantic_handoff_report_for_snapshot, claude_import, codex_import,
+    continuation_target_provider, current_project, cursor_ide_binary, cursor_ide_import,
+    cursor_import, display_command, fidelity_report_for_snapshot, flush_stdout, grok_import,
+    hermes_import, json, launch_json, opencode_import, pi_import, print_fidelity, progress_line,
+    redact_secrets, render_semantic_handoff, resolve_session_ref, resolved_provider_binary,
+    run_launch, runnable_target_providers, safe_terminal_line, self_update, session_picker,
+    source_workspace_matches_for_session, spawn_launch, transfer_repository_matches,
+    wait_for_launch, workspace_paths_match, workspace_root,
 };
 
 pub(super) fn resume(
@@ -847,9 +848,13 @@ fn resume_native_without_snapshot(
     flush_stdout()?;
     let tracks_native_fork = matches!(request.target, Provider::Codex | Provider::Grok);
     let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
-    run_launch(&plan)?;
-    if let Some(started_at) = fork_started_at {
-        link_native_fork(
+    let launched = run_launch(&plan);
+    // A provider can create the fork and still exit unsuccessfully, for example after Ctrl+C.
+    let started = launched
+        .as_ref()
+        .map_or_else(anyhow::Error::is::<ProviderExit>, |()| true);
+    let linked = match fork_started_at {
+        Some(started_at) if started => link_native_fork(
             registry,
             request.agent_target(),
             &request.source,
@@ -857,8 +862,11 @@ fn resume_native_without_snapshot(
             started_at,
             &report,
             task_binding,
-        )?;
-    }
+        ),
+        _ => Ok(()),
+    };
+    // The status of the provider decides the exit status.
+    launched.and(linked)?;
     if !request.resume_in_place && !tracks_native_fork && task_binding.is_some() {
         let _ = progress_line(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`.",
@@ -1513,7 +1521,8 @@ pub(super) fn verify_codex_launch(
 
 fn continuation_caller_directory(codex: bool) -> Result<PathBuf> {
     if codex {
-        return omnis_core::canonicalize_path(std::env::current_dir()?)
+        let directory = env::current_dir().context("reading current directory")?;
+        return omnis_core::canonicalize_path(directory)
             .context("resolving current working directory");
     }
     current_project()
@@ -2315,7 +2324,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
             "launch": launch_json(&plan),
             "fidelity": report,
             "handoff": handoff,
-            "handoff_path": handoff_file.as_ref().map(NamedTempFile::path),
+            "handoff_path": handoff_file.as_ref().map(|file| file.path().to_string_lossy()),
             "dry_run": context.args.dry_run,
         });
         if context.json_output {

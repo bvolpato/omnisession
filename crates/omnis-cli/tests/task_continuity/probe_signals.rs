@@ -120,6 +120,64 @@ fn cancellation_stops_resume_preparation_workers_and_preserves_normal_git_termin
     }
 }
 
+/// Handles Ctrl+C twice, as an agent that stops one task and stays open, then exits with its own status.
+const INTERRUPTIBLE_PROVIDER: &str = r#"#!/bin/sh
+[ "$1" = --resume ] || exit 1
+count=0
+trap 'count=$((count + 1)); : > "$READY.$count"' INT
+: > "$READY"
+while [ "$count" -lt 2 ]; do sleep 0.05; done
+exit 7
+"#;
+
+#[test]
+fn omni_waits_for_a_launched_provider_that_handles_ctrl_c() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let launcher = root.join("claude-interruptible");
+    fs::write(&launcher, INTERRUPTIBLE_PROVIDER).unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let ready = root.join("ready");
+    let mut omni = command(root, &workspace)
+        .args(["resume", &format!("claude:{SESSION_ID}")])
+        .env("OMNI_CLAUDE_BIN", &launcher)
+        .env("OMNI_MODE", "default")
+        .env("READY", &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_child(&omni);
+    let mut interrupted = 0;
+    for count in 0..2 {
+        let marker = match count {
+            0 => ready.clone(),
+            _ => root.join(format!("ready.{count}")),
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            break;
+        }
+        // A terminal sends Ctrl+C to the whole foreground group.
+        kill_process_group(group, Signal::INT).unwrap();
+        interrupted += 1;
+    }
+    let status = omni.wait_timeout(Duration::from_secs(20)).unwrap();
+    if status.is_none() {
+        let _ = kill_process_group(group, Signal::KILL);
+        omni.wait().unwrap();
+    }
+    assert_eq!(interrupted, 2, "the provider did not receive Ctrl+C");
+    assert_eq!(status.and_then(|status| status.code()), Some(7));
+}
+
 fn worker_dropped_fifo(release: &mut fs::File) -> bool {
     // A dying worker can hold its reader briefly after the launcher exits.
     // Omit the newline so a surviving worker waits until the fixture releases it.

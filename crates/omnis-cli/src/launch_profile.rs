@@ -288,10 +288,24 @@ pub(crate) fn parse(text: &str) -> Result<Vec<LaunchProfile>> {
 }
 
 /// The reason and the place of a syntax error, without the line of the file. The error text of the
-/// `toml` crate quotes that line, and it may hold a credential. The reason goes through
-/// redaction too, because a type error can quote the value.
+/// `toml` crate quotes that line, and it may hold a credential. A type error also quotes the value,
+/// so only the kind of that value stays. The rest of the reason goes through redaction.
 fn syntax_error(text: &str, error: &toml::de::Error) -> anyhow::Error {
-    let reason = omnis_core::redact_secrets(error.message());
+    let reason = error.message();
+    let reason = match reason
+        .strip_prefix("invalid type: ")
+        .and_then(|found| found.rsplit_once(", expected "))
+    {
+        Some((found, expected)) => {
+            let kind = found
+                .split(['"', '`'])
+                .next()
+                .unwrap_or_default()
+                .trim_end();
+            format!("invalid type: {kind}, expected {expected}")
+        }
+        None => omnis_core::redact_secrets(reason),
+    };
     let Some(span) = error.span() else {
         return anyhow!("{reason}");
     };
@@ -587,7 +601,9 @@ pub(crate) fn list(json_output: bool) -> Result<()> {
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"file": path, "profiles": profiles}))?
+            serde_json::to_string_pretty(
+                &json!({"file": path.to_string_lossy(), "profiles": profiles})
+            )?
         );
         return Ok(());
     }
@@ -1492,6 +1508,25 @@ program = "${NO_SUCH_PROGRAM_VARIABLE:-}"
         assert!(message.contains("column"), "{message}");
         assert!(!message.contains(credential), "{message}");
         assert!(!message.contains("--api-key"), "{message}");
+    }
+
+    #[test]
+    fn type_error_names_the_kind_and_never_quotes_the_value() {
+        for (value, kind) in [
+            ("args = \"plain, expected secret\"", "string"),
+            ("env = \"plain secret\"", "string"),
+            ("env = { PIN = 24681357 }", "integer"),
+        ] {
+            let text = format!("[profiles.a]\nagent = \"claude\"\n{value}\n");
+            let message = format!("{:#}", parse(&text).expect_err("wrong type"));
+            assert!(
+                message.contains(&format!("invalid type: {kind}, expected ")),
+                "{message}"
+            );
+            assert!(message.contains("line 3"), "{message}");
+            assert!(!message.contains("secret"), "{message}");
+            assert!(!message.contains("24681357"), "{message}");
+        }
     }
 
     #[test]
