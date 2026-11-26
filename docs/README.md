@@ -1,24 +1,27 @@
 # OmniSession documentation
 
-Start with the [README](../README.md) for install and everyday use. This page indexes everything else.
+Start with the [README](../README.md) for install and everyday use. The [Guide](GUIDE.md) is the complete manual. This page indexes everything.
 
 ## Guide
 
 | Topic | Section |
 | --- | --- |
 | Quick start | [README: Quick start](../README.md#quick-start) |
-| Install on Linux or macOS | [README: Linux and macOS](../README.md#linux-and-macos) |
-| Install on Windows (preview) | [README: Windows x86-64 (preview)](../README.md#windows-x86-64-preview) |
-| Build from source | [README: From source](../README.md#from-source) |
-| Check detected agents and stores | [README: Check this machine](../README.md#check-this-machine) |
-| Session picker and keys | [README: Pick a session](../README.md#pick-a-session) |
-| Search from the command line | [README: Search](../README.md#search) |
-| Continue or fork in another agent | [README: Continue or fork](../README.md#continue-or-fork) |
-| Delete a session | [README: Delete a session](../README.md#delete-a-session) |
+| Install on Linux or macOS | [Guide: Linux and macOS](GUIDE.md#linux-and-macos) |
+| Install on Windows (preview) | [Guide: Windows x86-64 (preview)](GUIDE.md#windows-x86-64-preview) |
+| Build from source | [Guide: From source](GUIDE.md#from-source) |
+| Check detected agents and stores | [Guide: Check this machine](GUIDE.md#check-this-machine) |
+| Session picker and keys | [Guide: The picker](GUIDE.md#the-picker) |
+| Search from the command line | [Guide: Search](GUIDE.md#search) |
+| Continue or fork in another agent | [Guide: Continue or fork](GUIDE.md#continue-or-fork) |
+| Permission modes | [Guide: Permission modes](GUIDE.md#permission-modes) |
+| Chat-app handoff and Markdown | [Guide: Markdown and chat handoff](GUIDE.md#markdown-and-chat-handoff) |
+| Delete a session | [Guide: Delete a session](GUIDE.md#delete-a-session) |
 | Launch profiles for gateways and wrappers | [Launch profiles](PROFILES.md) |
-| Portable bundles | [README: Portable bundles](../README.md#portable-bundles) |
-| Environment variables | [README: Configuration](../README.md#configuration) |
-| Troubleshooting | [README: FAQ](../README.md#faq) |
+| Portable bundles | [Guide: Portable bundles](GUIDE.md#portable-bundles) |
+| Environment variables | [Guide: Configuration](GUIDE.md#configuration) |
+| Notes for each agent | [Guide: Notes for each agent](GUIDE.md#notes-for-each-agent) |
+| Troubleshooting | [Guide: Troubleshooting](GUIDE.md#troubleshooting) |
 
 ## Reference
 
