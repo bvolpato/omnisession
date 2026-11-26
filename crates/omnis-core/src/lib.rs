@@ -1149,7 +1149,7 @@ fn title_opener<'a>(
 #[must_use]
 pub fn compact_search_title(title: &str) -> Option<String> {
     let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = redact_secrets(&safe_terminal_line(&compact))
+    let title = redact_secrets(&safe_terminal_line(&redact_secrets_cow(&compact)))
         .chars()
         .take(SEARCH_TITLE_CHARACTER_LIMIT)
         .collect::<String>();
@@ -1923,21 +1923,13 @@ fn search_event_text(
             Cow::Owned(search_payload_text(event.source.provider, &payload)?)
         }
     };
-    let safe_text = safe_terminal_text_cow(&raw_text);
-    let mut redacted = match redact_secrets_cow(&safe_text) {
-        Cow::Owned(owned) => Cow::Owned(owned),
-        Cow::Borrowed(_) => match safe_text {
-            Cow::Owned(owned) => Cow::Owned(owned),
-            Cow::Borrowed(_) => raw_text,
-        },
-    };
+    let mut redacted = redact_terminal_text(raw_text);
     if let Some(previous_iter) =
         snapshot.and_then(|snapshot| codex_replies::previous_spellings(snapshot, event))
     {
         let mut older = String::new();
         for previous in previous_iter {
-            let safe_previous = safe_terminal_text_cow(previous);
-            let previous = redact_secrets_cow(&safe_previous);
+            let previous = redact_terminal_text(Cow::Borrowed(previous));
             if !previous.trim().is_empty() && previous.as_ref() != redacted.as_ref() {
                 older.push_str(&previous);
                 older.push_str("\n\n");
@@ -5010,76 +5002,372 @@ pub fn redact_secrets(input: &str) -> String {
     redact_secrets_cow(input).into_owned()
 }
 
-fn rare_credential_regex() -> &'static Regex {
+// Two searches are faster than one, because one pattern with all these words is too large for the
+// fastest search of the regex engine.
+fn key_format_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(
-            r"-----BEGIN|sk-|gh[pousr]_|github_pat_|glpat-|npm_|AKIA|AIza|xox[baprs]-|eyJ|://|(?i:bearer|authorization|cookie|curl)",
-        )
-        .expect("valid rare-credential prefilter regex")
+        Regex::new(&format!("-----BEGIN|{API_KEY_PREFIX}")).expect("valid key-format prefilter")
     })
 }
 
-fn dash_regex() -> &'static Regex {
+fn header_or_command_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new("-").expect("valid dash regex"))
+    REGEX.get_or_init(|| {
+        Regex::new("(?i)bearer|authorization|cookie|curl").expect("valid header prefilter")
+    })
+}
+
+/// Checks for `@` after `://`. Most URLs have no password, and the pattern for one is slow.
+fn may_have_url_password(text: &str) -> bool {
+    memchr::memrchr(b'@', text.as_bytes())
+        .is_some_and(|at| memchr::memmem::find(&text.as_bytes()[..at], b"://").is_some())
+}
+
+/// Checks for a dash where a flag can start.
+fn may_have_flag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    memchr::memchr_iter(b'-', bytes).any(|at| {
+        let starts = at.checked_sub(1).is_none_or(|before| {
+            bytes[before].is_ascii_whitespace() || bytes[before] == 0x0b || bytes[before] >= 0x80
+        });
+        starts
+            && bytes.get(at + 1).is_some_and(|next| {
+                next.is_ascii_alphanumeric() || matches!(next, b'-' | b'_' | 0x80..)
+            })
+    })
 }
 
 fn redact_secrets_cow(input: &str) -> Cow<'_, str> {
-    let has_rare = rare_credential_regex().is_match(input);
+    if memchr::memchr(b'\x1b', input.as_bytes()).is_some() {
+        return redact_styled_text(input);
+    }
+    redact_plain_text(input)
+}
+
+/// Terminal styles can split a credential from its name. Text that has a credential loses them.
+fn redact_styled_text(input: &str) -> Cow<'_, str> {
+    // Without the style after it, a key can run into the next word.
+    let mut keys = Cow::Borrowed(input);
+    if key_format_regex().is_match(input) {
+        keys = redact_private_keys(input);
+        if let Cow::Owned(replaced) = plain_patterns()
+            .api_key()
+            .replace_all(&keys, "${1}[REDACTED: API_KEY]")
+        {
+            keys = Cow::Owned(replaced);
+        }
+    }
+    let mut plain = String::with_capacity(keys.len());
+    let mut copied = 0;
+    for style in terminal_styles(&keys) {
+        plain.push_str(&keys[copied..style.start]);
+        copied = style.end;
+        if style.len() == 1 && keys[style.end..].starts_with("[REDACTED:") {
+            continue;
+        }
+        if style.len() == 1 || separates_text(&keys, style) {
+            // Like the escape character, this control character separates words and is not shown.
+            plain.push('\u{1a}');
+        }
+    }
+    plain.push_str(&keys[copied..]);
+    let redacted = redact_plain_text(&plain);
+    if keys == input && redacted == plain {
+        return Cow::Borrowed(input);
+    }
+    Cow::Owned(redacted.into_owned())
+}
+
+/// Finds each escape character, with the rest of its style. A style has parameters, or is one that
+/// is often sent without them. No style ends with a letter that can start a credential name, because
+/// text can follow an incomplete sequence.
+fn terminal_styles(text: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let mut search = 0;
+    std::iter::from_fn(move || {
+        let start = search + memchr::memchr(b'\x1b', &text.as_bytes()[search..])?;
+        let rest = &text.as_bytes()[start + 1..];
+        search = start + 1 + terminal_style_length(rest);
+        Some(start..search)
+    })
+}
+
+/// Length of the style after an escape character, or 0.
+fn terminal_style_length(rest: &[u8]) -> usize {
+    let Some(sequence) = rest.strip_prefix(b"[") else {
+        return 0;
+    };
+    let parameters = sequence
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit() || b";:?<=>".contains(byte))
+        .count();
+    let ends = match sequence.get(parameters) {
+        Some(b'H' | b'J' | b'K' | b'm') => true,
+        Some(last) => {
+            parameters != 0
+                && matches!(last, b'D'..=b'O' | b'Q' | b'R' | b'U'..=b'Z' | b'd'..=b'o' | b'q' | b'r' | b'u'..=b'z')
+        }
+        None => false,
+    };
+    if ends { parameters + 2 } else { 0 }
+}
+
+/// Checks whether a style is the only text between a word and an API key, or between a flag and a
+/// value that starts with an operator. Without it, neither credential would be found.
+fn separates_text(text: &str, style: std::ops::Range<usize>) -> bool {
+    let (before, after) = (&text[..style.start], &text[style.end..]);
+    before.ends_with(|last: char| last.is_ascii_alphanumeric() || last == '_')
+        && matches!(
+            after.bytes().next(),
+            Some(b's' | b'g' | b'n' | b'A' | b'x' | b'e')
+        )
+        && api_key_prefix_regex().is_match(after)
+        || before.ends_with([' ', '\t']) && after.starts_with([',', ';', '&', '|', '<', '>'])
+}
+
+fn api_key_prefix_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(r"\A(?:{API_KEY_PREFIX})")).expect("valid API-key prefix regex")
+    })
+}
+
+/// Redacts untrusted text and removes its terminal controls. The first redaction needs complete
+/// terminal styles. The second finds credentials that control characters split.
+fn redact_terminal_text(input: Cow<'_, str>) -> Cow<'_, str> {
+    let input = if memchr::memchr(b'\x1b', input.as_bytes()).is_some() {
+        let mut styled = String::with_capacity(input.len());
+        let mut copied = 0;
+        for style in terminal_styles(&input) {
+            styled.push_str(&safe_terminal_text_cow(&input[copied..style.start]));
+            copied = style.end;
+            // The escape character keeps a placeholder after it apart from the text before it.
+            if style.len() > 1 || input[style.end..].starts_with("[REDACTED:") {
+                styled.push_str(&input[style]);
+            }
+        }
+        styled.push_str(&safe_terminal_text_cow(&input[copied..]));
+        Cow::Owned(redact_secrets(&styled))
+    } else {
+        input
+    };
+    let safe = match safe_terminal_text_cow(&input) {
+        Cow::Owned(owned) => Cow::Owned(owned),
+        Cow::Borrowed(_) => input,
+    };
+    match redact_secrets_cow(&safe) {
+        Cow::Owned(owned) => Cow::Owned(owned),
+        Cow::Borrowed(_) => safe,
+    }
+}
+
+fn redact_plain_text(input: &str) -> Cow<'_, str> {
+    let (current, mut hints) = redact_with(input, plain_patterns());
+    // A second run over changed text can find more, even without another hint.
+    hints.wide_name |= matches!(&current, Cow::Owned(redacted) if redacted != input);
+    // The extended patterns only add to the result, so they run on text that is already redacted.
+    if !needs_extended_patterns(&current, hints) {
+        debug_assert!(
+            !needs_extended_patterns(&current, RedactionHints::ALL)
+                || redact_with(&current, extended_patterns()).0 == current,
+            "text without hints had a credential for the extended patterns"
+        );
+        return current;
+    }
+    match redact_with(&current, extended_patterns()).0 {
+        Cow::Owned(redacted) => Cow::Owned(redacted),
+        Cow::Borrowed(_) => current,
+    }
+}
+
+/// What a redaction pass saw in text. The extended patterns do not change the result if neither hint
+/// is set.
+#[derive(Clone, Copy)]
+struct RedactionHints {
+    /// The text had a key format, a header name, `curl`, or a URL that can have a password.
+    rare: bool,
+    /// A name that looked like a credential name had a character outside ASCII before it, or the pass
+    /// changed the text.
+    wide_name: bool,
+}
+
+impl RedactionHints {
+    const ALL: Self = Self {
+        rare: true,
+        wide_name: true,
+    };
+
+    const fn or(self, other: Self) -> Self {
+        Self {
+            rare: self.rare || other.rare,
+            wide_name: self.wide_name || other.wide_name,
+        }
+    }
+}
+
+fn redact_with<'a>(
+    input: &'a str,
+    patterns: &CredentialPatterns,
+) -> (Cow<'a, str>, RedactionHints) {
+    let (current, marked, hints) = redact_once(input, patterns);
+    if !marked {
+        return (current, hints);
+    }
+    // A value after a marker can hide a name before the next value.
+    let (redacted, _, more) = redact_once(&current, patterns);
+    (Cow::Owned(redacted.into_owned()), hints.or(more))
+}
+
+/// Also reports whether a value after a marker was redacted.
+fn redact_once<'a>(
+    input: &'a str,
+    patterns: &CredentialPatterns,
+) -> (Cow<'a, str>, bool, RedactionHints) {
+    let has_key = key_format_regex().is_match(input);
+    let has_header = header_or_command_regex().is_match(input);
     let mut current = Cow::Borrowed(input);
-    if has_rare {
-        if let Cow::Owned(replaced) =
-            private_key_regex().replace_all(&current, "[REDACTED: PRIVATE_KEY]")
-        {
-            current = Cow::Owned(replaced);
-        }
-        if let Cow::Owned(replaced) = api_key_regex().replace_all(&current, "[REDACTED: API_KEY]") {
-            current = Cow::Owned(replaced);
-        }
-        if let Cow::Owned(replaced) =
-            bearer_token_regex().replace_all(&current, "Bearer [REDACTED: TOKEN]")
-        {
-            current = Cow::Owned(replaced);
-        }
-        if let Cow::Owned(replaced) =
-            authorization_regex().replace_all(&current, |captures: &regex::Captures<'_>| {
-                format!("{}{}", &captures[1], redacted_value(&captures[2], "TOKEN"))
-            })
-        {
-            current = Cow::Owned(replaced);
-        }
-        if let Cow::Owned(replaced) =
-            url_password_regex().replace_all(&current, "${1}[REDACTED: PASSWORD]@")
-        {
+    if has_key {
+        current = redact_private_keys(input);
+        if let Cow::Owned(replaced) = redact_api_keys(&current, patterns) {
             current = Cow::Owned(replaced);
         }
     }
-    if dash_regex().is_match(&current)
-        && let Cow::Owned(replaced) = replace_credential_flags(&current)
+    if has_header && let Cow::Owned(replaced) = redact_header_tokens(&current, patterns) {
+        current = Cow::Owned(replaced);
+    }
+    let has_url = may_have_url_password(&current);
+    if has_url
+        && let Cow::Owned(replaced) = patterns
+            .url_password()
+            .replace_all(&current, "${1}[REDACTED: PASSWORD]@")
     {
         current = Cow::Owned(replaced);
     }
-    if let Cow::Owned(replaced) = replace_credential_assignments(&current) {
+    if let Cow::Owned(replaced) = replace_credential_flags(&current) {
         current = Cow::Owned(replaced);
     }
-    // Cookies run after flags and assignments, which can consume a quote that ended the pair list.
-    if has_rare {
-        if let Cow::Owned(replaced) =
-            cookie_header_regex().replace_all(&current, redact_cookie_header)
+    let assignments = replace_credential_assignments(&current, &patterns.assignment);
+    let hints = RedactionHints {
+        rare: has_key || has_header || has_url,
+        wide_name: assignments.wide_name,
+    };
+    let (markers, has_separator) = (assignments.markers, assignments.has_separator);
+    if let Cow::Owned(replaced) = assignments.text {
+        current = Cow::Owned(replaced);
+    }
+    // Cookies run after flags and assignments, which can consume a quote that ended the pair list. The
+    // rest of a split placeholder would end the list too.
+    let before_marked = has_key
+        || has_header
+        || markers && memchr::memmem::find(input.as_bytes(), b"://").is_some();
+    if before_marked
+        && let Cow::Owned(replaced) = split_placeholder_regex().replace_all(&current, "$1")
+    {
+        current = Cow::Owned(replaced);
+    }
+    if has_header {
+        if let Cow::Owned(replaced) = patterns
+            .cookie_header()
+            .replace_all(&current, redact_cookie_header)
         {
             current = Cow::Owned(replaced);
         }
-        if let Cow::Owned(replaced) = curl_user_regex().replace_all(&current, redact_curl_user) {
+        if let Cow::Owned(replaced) = patterns.curl_user().replace_all(&current, redact_curl_user) {
             current = Cow::Owned(replaced);
         }
+    }
+    // The value after a marker can look like the start of a header or command, so it comes later.
+    let mut marked = false;
+    if markers
+        && let Cow::Owned(replaced) =
+            replace_credential_assignments(&current, &patterns.marked_assignment).text
+    {
+        marked = replaced != current;
+        current = Cow::Owned(replaced);
+    }
+    // A placeholder has a separator.
+    if has_separator
+        && let Cow::Owned(replaced) = split_placeholder_regex().replace_all(&current, "$1")
+    {
+        current = Cow::Owned(replaced);
+    }
+    // The text before `curl` decides whether it is a command, so this follows every other change.
+    if has_header
+        && curl_user_flag_regex().is_match(&current)
+        && let Cow::Owned(replaced) = curl_command_regex().replace_all(&current, redact_curl_user)
+    {
+        current = Cow::Owned(
+            split_placeholder_regex()
+                .replace_all(&replaced, "$1")
+                .into_owned(),
+        );
+    }
+    (current, marked, hints)
+}
+
+// The rest of a placeholder, and the text after it, when the pattern for the whole value stopped at
+// the space in that placeholder.
+fn split_placeholder_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"(\[REDACTED: [A-Z_]+\])(?: (?:PRIVATE_KEY|API_KEY|TOKEN|PASSWORD|SECRET|COOKIE)\][^\s,;"'\\]*)+"#,
+        )
+        .expect("valid split-placeholder regex")
+    })
+}
+
+fn redact_header_tokens<'a>(input: &'a str, patterns: &CredentialPatterns) -> Cow<'a, str> {
+    let mut current = patterns
+        .bearer_token()
+        .replace_all(input, "${1}Bearer [REDACTED: TOKEN]");
+    if let Cow::Owned(replaced) =
+        patterns
+            .authorization()
+            .replace_all(&current, |captures: &regex::Captures<'_>| {
+                format!("{}{}", &captures[1], redacted_value(&captures[2], "TOKEN"))
+            })
+    {
+        current = Cow::Owned(replaced);
     }
     current
 }
 
+fn redact_private_keys(input: &str) -> Cow<'_, str> {
+    let mut current = private_key_regex().replace_all(input, "[REDACTED: PRIVATE_KEY]");
+    if let Cow::Owned(replaced) = redact_cut_off_private_keys(&current) {
+        current = Cow::Owned(replaced);
+    }
+    current
+}
+
+fn redact_api_keys<'a>(input: &'a str, patterns: &CredentialPatterns) -> Cow<'a, str> {
+    patterns
+        .api_key()
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let start = &captures[1];
+            let key = &captures[0][start.len()..];
+            // A folder in a Windows path can look like an escape and a key, as in `\nsk-folder`.
+            let folder = start.starts_with('\\')
+                && key.starts_with("sk-")
+                && !key
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+            if folder {
+                captures[0].to_owned()
+            } else {
+                format!("{start}[REDACTED: API_KEY]")
+            }
+        })
+}
+
 /// Replaces every credential flag, exactly like `replace_all` with [`credential_flag_regex`].
 fn replace_credential_flags(input: &str) -> Cow<'_, str> {
-    let replaced = replace_credential_flags_at_candidates(input);
+    let replaced = if may_have_flag(input) {
+        replace_credential_flags_at_candidates(input)
+    } else {
+        Cow::Borrowed(input)
+    };
     debug_assert!(
         replaced == replace_credential_flags_in_whole_text(input),
         "candidate search and whole-text search redacted credential flags differently"
@@ -5105,7 +5393,10 @@ fn replace_credential_flags_at_candidates(input: &str) -> Cow<'_, str> {
             .next_back()
             .filter(|character| character.is_whitespace())
             .map_or(name_start, |character| name_start - character.len_utf8());
-        if !credential_flag_end_regex().is_match(&input[from..candidate.end()]) {
+        // A flag has a dash before its name, so most candidates need no regex.
+        if !input[from..candidate.start()].contains('-')
+            || !credential_flag_end_regex().is_match(&input[from..candidate.end()])
+        {
             search = candidate.start()
                 + input[candidate.start()..]
                     .chars()
@@ -5131,43 +5422,338 @@ fn replace_credential_flags_at_candidates(input: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
-/// Replaces every credential assignment, exactly like `replace_all` with
-/// [`credential_assignment_regex`].
+/// Text after its credential assignments were replaced.
+struct RedactedAssignments<'a> {
+    text: Cow<'a, str>,
+    /// A marker followed a name, and the value comes later.
+    markers: bool,
+    /// See [`RedactionHints::wide_name`].
+    wide_name: bool,
+    /// The text had a character that every separator and every placeholder has.
+    has_separator: bool,
+}
+
+/// Replaces every credential assignment, exactly like a search of the whole text.
 ///
 /// That pattern starts with an unbounded run of name characters, so the regex engine has no
 /// literal to skip ahead to and scans all text slowly. It now runs only from places where
-/// [`credential_assignment_candidate_regex`], which is fast, and
-/// [`credential_assignment_end_regex`] both match. Every assignment contains such a place.
-fn replace_credential_assignments(input: &str) -> Cow<'_, str> {
-    let replaced = replace_credential_assignments_at_candidates(input);
+/// [`AssignmentPatterns::candidate`], which is fast, finds the end of a credential name. Every
+/// assignment contains such a place.
+fn replace_credential_assignments<'a>(
+    input: &'a str,
+    patterns: &AssignmentPatterns,
+) -> RedactedAssignments<'a> {
+    if memchr::memchr2(b':', b'=', input.as_bytes()).is_none() {
+        return RedactedAssignments {
+            text: Cow::Borrowed(input),
+            markers: false,
+            wide_name: false,
+            has_separator: false,
+        };
+    }
+    let replaced = replace_credential_assignments_at_candidates(input, patterns);
     // Debug builds, which the tests use, check every input against the whole-text search. The
     // message leaves out both values, because one of them could hold an unredacted credential.
     debug_assert!(
-        replaced == replace_credential_assignments_in_whole_text(input),
+        {
+            let (text, markers) = replace_credential_assignments_in_whole_text(input, patterns);
+            replaced.text == text && replaced.markers == markers
+        },
         "candidate search and whole-text search redacted credential assignments differently"
     );
     replaced
 }
 
-/// `replace_all` with [`credential_assignment_regex`] over the whole input. This is the reference
-/// result for [`replace_credential_assignments`].
-fn replace_credential_assignments_in_whole_text(input: &str) -> Cow<'_, str> {
-    credential_assignment_regex().replace_all(input, |captures: &regex::Captures<'_>| {
-        let label = redaction_label(&captures[2]);
-        format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+/// Searches the whole input for each assignment. This is the reference result for
+/// [`replace_credential_assignments`].
+fn replace_credential_assignments_in_whole_text<'a>(
+    input: &'a str,
+    patterns: &AssignmentPatterns,
+) -> (Cow<'a, str>, bool) {
+    let mut output = String::new();
+    let mut copied = 0;
+    let mut markers = false;
+    while let Some(captures) = patterns.assignment().captures_at(input, copied) {
+        let assignment = Assignment::from_captures(&captures);
+        markers |= is_value_marker(assignment.value);
+        copied = push_redacted_assignment(&mut output, input, copied, &assignment);
+    }
+    if copied == 0 {
+        return (Cow::Borrowed(input), markers);
+    }
+    output.push_str(&input[copied..]);
+    (Cow::Owned(output), markers)
+}
+
+/// A credential name and its value.
+struct Assignment<'t> {
+    name: &'t str,
+    name_and_separator: &'t str,
+    value: &'t str,
+    value_start: usize,
+}
+
+impl<'t> Assignment<'t> {
+    fn from_captures(captures: &regex::Captures<'t>) -> Self {
+        let group = |index| captures.get(index).expect("every group is in each match");
+        Self {
+            name: group(2).as_str(),
+            name_and_separator: group(1).as_str(),
+            value: group(3).as_str(),
+            value_start: group(3).start(),
+        }
+    }
+
+    /// Finds the same match as [`AssignmentPatterns::assignment`] for a candidate whose name starts
+    /// at or after `from`. The candidate has the separator already, so only the value needs a
+    /// search. Returns `None` if a character outside ASCII can be part of the name or next to it.
+    fn at_candidate(input: &'t str, from: usize, candidate: regex::Match<'t>) -> Option<Self> {
+        let text = candidate.as_str().as_bytes();
+        let word = CREDENTIAL_LAST_WORDS.into_iter().find(|word| {
+            text.get(..word.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(word.as_bytes()))
+        })?;
+        let word_end = candidate.start() + word.len();
+        let bytes = input.as_bytes();
+        let before = from.checked_sub(1).map(|at| bytes[at]);
+        if !input[from..word_end].is_ascii() || before.is_some_and(|byte| !byte.is_ascii()) {
+            return None;
+        }
+        let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        // A name starts at the first word boundary.
+        let mut previous = before.is_some_and(is_word);
+        let start = (from..=candidate.start()).find(|&at| {
+            let current = is_word(bytes[at]);
+            let boundary = current != previous;
+            previous = current;
+            boundary
+        })?;
+        if ends_credential_name(&input[start..candidate.start()], candidate.as_str()) != Some(true)
+        {
+            return None;
+        }
+        let first = candidate.as_str().chars().next_back()?;
+        let value_start = candidate.end() - first.len_utf8();
+        Some(Self {
+            name: &input[start..word_end],
+            name_and_separator: &input[start..value_start],
+            value: assignment_value_regex()
+                .find(&input[value_start..])?
+                .as_str(),
+            value_start,
+        })
+    }
+}
+
+fn assignment_value_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(r"(?i)\A(?:{})", assignment_value_pattern()))
+            .expect("valid assignment-value regex")
     })
 }
 
-fn replace_credential_assignments_at_candidates(input: &str) -> Cow<'_, str> {
+fn assignment_value_pattern() -> String {
+    format!("{PLACEHOLDER}|{QUOTED_VALUE}|{ESCAPED_PLACEHOLDER}|{ESCAPED_LINE}|[^\\s,;]+")
+}
+
+/// Copies the text up to the end of an assignment and redacts its value. Returns where the copy
+/// ended. Text that only looks like the value stays in place.
+fn push_redacted_assignment(
+    output: &mut String,
+    input: &str,
+    copied: usize,
+    assignment: &Assignment<'_>,
+) -> usize {
+    let Assignment {
+        value, value_start, ..
+    } = *assignment;
+    if is_value_marker(value) {
+        let end = value_start + value.len();
+        output.push_str(&input[copied..end]);
+        return end;
+    }
+    let (line_breaks, line) = value.split_at(escaped_line_breaks(value));
+    let line = before_closing_quote(line_breaks, line);
+    let line_start = value_start + line_breaks.len();
+    let line_end = line_start + line.len();
+    if let Some(resume) = unassigned_text(
+        assignment.name_and_separator,
+        line_breaks,
+        line,
+        &input[line_end..],
+    ) {
+        // A word starts after a line break, but not after the letter of an escaped one.
+        let resume = match resume {
+            Resume::AtLine => line_start - usize::from(!line_breaks.is_empty()),
+            Resume::AfterLine => line_end,
+        };
+        output.push_str(&input[copied..resume]);
+        return resume;
+    }
+    output.push_str(&input[copied..line_start]);
+    output.push_str(&redacted_value(line, redaction_label(assignment.name)));
+    line_end
+}
+
+/// Matches the rest of a comparison operator, the end of a bold Markdown label, and the start of a
+/// YAML block. They stand between the name and the value. A header or command name starts its own
+/// credential.
+fn is_value_marker(value: &str) -> bool {
+    matches!(value, "**" | "=" | "==")
+        || ["cookie:", "set-cookie:", "authorization:", "curl"]
+            .iter()
+            .any(|name| value.eq_ignore_ascii_case(name))
+        || value.strip_prefix(['|', '>']).is_some_and(|block| {
+            let block = block.strip_prefix(['+', '-']).unwrap_or(block);
+            escaped_line_breaks(block) == block.len()
+        })
+}
+
+/// Length of the escaped line breaks and tabs before a value in text encoded as JSON.
+fn escaped_line_breaks(value: &str) -> usize {
+    let mut length = 0;
+    loop {
+        let escape = value[length..].trim_start_matches('\\');
+        let at = value.len() - escape.len();
+        let next = escape.bytes().next();
+        let matches = match next {
+            Some(b'n' | b'r') => true,
+            Some(b't') => length != 0,
+            _ => false,
+        };
+        if at == length || !matches {
+            return length;
+        }
+        length = at + 1;
+    }
+}
+
+/// Length of the escapes such as `\n` and `\"` at the start of text encoded as JSON, and of a quote
+/// before a placeholder.
+fn text_escapes(text: &str) -> usize {
+    let mut length = 0;
+    loop {
+        let rest = text[length..].trim_start_matches('\\');
+        let at = text.len() - rest.len();
+        if at == length {
+            let quoted = rest
+                .strip_prefix(['"', '\''])
+                .is_some_and(|inner| inner.starts_with("[REDACTED:"));
+            return length + usize::from(quoted);
+        }
+        length = at + usize::from(rest.starts_with(['"', '\'', 'n', 'r', 't']));
+    }
+}
+
+/// Cuts a line at the quote that ends the text which its line break is in. That quote has fewer
+/// escapes than the line break, and a quoted value does not start after it. Text without escaped line
+/// breaks stays whole.
+fn before_closing_quote<'a>(line_breaks: &str, line: &'a str) -> &'a str {
+    let depth = line_breaks.len() - line_breaks.trim_start_matches('\\').len();
+    line.match_indices('"')
+        .filter(|(quote, _)| {
+            line[quote + 1..]
+                .chars()
+                .next()
+                .is_none_or(|next| "}]):\\\"<`".contains(next))
+        })
+        .map(|(quote, _)| {
+            let text = line[..quote].trim_end_matches('\\');
+            (text, quote - text.len())
+        })
+        .find(|(_, escapes)| *escapes < depth)
+        .map_or(line, |(text, _)| text)
+}
+
+/// Where to continue after text that is not the value of the name before it.
+enum Resume {
+    AtLine,
+    AfterLine,
+}
+
+/// Finds text that is not the value of the name. An empty value can be followed by the setting on
+/// the next line, or by the end of the text that its line break is in. A comparison such as
+/// `token == other` has a credential only in quotes.
+fn unassigned_text(
+    name_and_separator: &str,
+    line_breaks: &str,
+    line: &str,
+    rest: &str,
+) -> Option<Resume> {
+    let separator = name_and_separator.trim_end();
+    if separator.ends_with("==") {
+        let quoted = line.trim_start_matches('\\').starts_with(['"', '\'']);
+        return (!quoted).then_some(Resume::AtLine);
+    }
+    if line_breaks.is_empty() {
+        if !name_and_separator[separator.len()..].contains('\n') {
+            return None;
+        }
+    } else if line.is_empty() {
+        return Some(Resume::AfterLine);
+    }
+    if !is_next_setting(line) {
+        return None;
+    }
+    // A setting without a value does not take the line after it.
+    let empty = line.find(['=', ':']) == Some(line.len() - 1) && ends_line(rest);
+    Some(if empty {
+        Resume::AfterLine
+    } else {
+        Resume::AtLine
+    })
+}
+
+fn ends_line(rest: &str) -> bool {
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let unescaped = rest.trim_start_matches('\\');
+    rest.is_empty()
+        || rest.starts_with(['\n', '\r', '"'])
+        || unescaped.len() < rest.len() && unescaped.starts_with(['n', 'r', '"'])
+}
+
+/// Matches an environment assignment, `export`, or a YAML key. Base64 can also end in `=`, so an
+/// empty assignment needs an underscore in its name.
+fn is_next_setting(value: &str) -> bool {
+    if value == "export" {
+        return true;
+    }
+    if let Some((name, setting)) = value.split_once('=') {
+        return name.starts_with(|first: char| first.is_ascii_uppercase())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && !setting.starts_with('=')
+            && (!setting.is_empty() || name.contains('_'));
+    }
+    value.strip_suffix(':').is_some_and(|key| {
+        key.starts_with(|first: char| first.is_ascii_alphabetic())
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
+fn replace_credential_assignments_at_candidates<'a>(
+    input: &'a str,
+    patterns: &AssignmentPatterns,
+) -> RedactedAssignments<'a> {
     let mut output = String::new();
+    let mut markers = false;
+    let mut wide_name = false;
     // End of the last assignment. The next one starts at or after it.
     let mut copied = 0;
     let mut search = 0;
-    while let Some(candidate) = credential_assignment_candidate_regex().find_at(input, search) {
+    while let Some(candidate) = patterns.candidate().find_at(input, search) {
         // An assignment that holds this candidate starts in the name characters before it, so no
         // assignment starts between `copied` and `from`.
         let from = credential_name_run_start(input, candidate.start(), copied);
-        if !credential_assignment_end_regex().is_match(&input[from..candidate.end()]) {
+        let start = &input[from..candidate.start()];
+        wide_name |= !start.is_ascii();
+        let named = ends_credential_name(start, candidate.as_str())
+            .unwrap_or_else(|| patterns.end().is_match(&input[from..candidate.end()]));
+        if !named {
             // Not a credential name. Try the next candidate after this one's first character.
             search = candidate.start()
                 + input[candidate.start()..]
@@ -5176,22 +5762,61 @@ fn replace_credential_assignments_at_candidates(input: &str) -> Cow<'_, str> {
                     .map_or(1, char::len_utf8);
             continue;
         }
-        let Some(captures) = credential_assignment_regex().captures_at(input, from) else {
+        let assignment = if let Some(assignment) = Assignment::at_candidate(input, from, candidate)
+        {
+            assignment
+        } else if let Some(captures) = patterns.assignment().captures_at(input, from) {
+            Assignment::from_captures(&captures)
+        } else {
+            // Only a name next to a character outside ASCII has no assignment.
+            wide_name = true;
             break;
         };
-        let assignment = captures.get(0).expect("group 0 is the whole match");
-        let label = redaction_label(&captures[2]);
-        output.push_str(&input[copied..assignment.start()]);
-        output.push_str(&captures[1]);
-        output.push_str(&redacted_value(&captures[3], label));
-        copied = assignment.end();
+        markers |= is_value_marker(assignment.value);
+        copied = push_redacted_assignment(&mut output, input, copied, &assignment);
         search = copied;
     }
-    if copied == 0 {
-        return Cow::Borrowed(input);
+    let text = if copied == 0 {
+        Cow::Borrowed(input)
+    } else {
+        output.push_str(&input[copied..]);
+        Cow::Owned(output)
+    };
+    RedactedAssignments {
+        text,
+        markers,
+        wide_name,
+        has_separator: true,
     }
-    output.push_str(&input[copied..]);
-    Cow::Owned(output)
+}
+
+/// Checks whether a credential name ends with the first word of `candidate`, like
+/// [`AssignmentPatterns::end`]. `start` is the name before that word. Returns `None` if a character
+/// outside ASCII can be part of the name, because that pattern then accepts more letters.
+fn ends_credential_name(start: &str, candidate: &str) -> Option<bool> {
+    let [first, second, ..] = candidate.as_bytes() else {
+        return None;
+    };
+    if !start.is_ascii() || !first.is_ascii() {
+        return None;
+    }
+    let start = start.as_bytes();
+    let before_separator = start.strip_suffix(b"_").or(start.strip_suffix(b"-"));
+    Some(match (first | 0x20, second | 0x20) {
+        (b'k', _) => {
+            let qualifier = before_separator.unwrap_or(start);
+            [&b"api"[..], b"access", b"secret", b"private"]
+                .iter()
+                .any(|word| {
+                    qualifier.len() >= word.len()
+                        && qualifier[qualifier.len() - word.len()..].eq_ignore_ascii_case(word)
+                })
+        }
+        (b'p', b'w') => before_separator
+            .and_then(<[u8]>::last)
+            .is_some_and(u8::is_ascii_alphanumeric),
+        _ => true,
+    })
 }
 
 /// Start of the run of possible credential name characters that ends at `index`, not before
@@ -5269,10 +5894,10 @@ fn sensitive_key(key: &str) -> bool {
             | b"accesstoken"
             | b"authtoken"
             | b"authorization"
+            | b"proxyauthorization"
             | b"credential"
             | b"credentials"
             | b"password"
-            | b"passwd"
             | b"privatekey"
             | b"secret"
             | b"token"
@@ -5282,11 +5907,23 @@ fn sensitive_key(key: &str) -> bool {
     ) || normalized.ends_with(b"secret")
         || normalized.ends_with(b"token")
         || normalized.ends_with(b"apikey")
+        || normalized.ends_with(b"secretkey")
         || normalized.ends_with(b"password")
+        || normalized.ends_with(b"passwd")
+        || is_prefixed_pwd(key)
         || normalized.ends_with(b"privatekey")
         || normalized.ends_with(b"accesskey")
         || normalized.ends_with(b"credential")
         || normalized.ends_with(b"credentials")
+}
+
+/// Matches keys such as `mysql_pwd`. A bare `pwd` or `OLDPWD` is the shell's working directory.
+fn is_prefixed_pwd(key: &str) -> bool {
+    matches!(
+        key.as_bytes(),
+        [.., before, b'_' | b'-', p, w, d]
+            if before.is_ascii_alphanumeric() && [*p, *w, *d].eq_ignore_ascii_case(b"pwd")
+    )
 }
 
 fn private_key_regex() -> &'static Regex {
@@ -5297,23 +5934,259 @@ fn private_key_regex() -> &'static Regex {
     })
 }
 
-fn api_key_regex() -> &'static Regex {
+fn private_key_header_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b")
-            .expect("valid API-key regex")
+        Regex::new("-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----")
+            .expect("valid private-key header regex")
     })
 }
 
-fn bearer_token_regex() -> &'static Regex {
+// One line of key data or a key header, with the quote marks or line number that a tool put before
+// it.
+fn private_key_line_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}").expect("valid bearer-token regex")
+        Regex::new(
+            r"\A(?:\s|\\+[nrt]|[>|→:])+(?:[0-9]{1,6}[\s→:|]+)?(?:Proc-Type: ?[0-9],[A-Z-]{1,20}|DEK-Info: ?[A-Z0-9-]{1,30}(?:,[0-9A-Fa-f]{0,64})?|([A-Za-z0-9+/]{20,}={0,2}))",
+        )
+        .expect("valid private-key line regex")
     })
+}
+
+/// Redacts keys that were cut off before their END line, through their last line of key data.
+fn redact_cut_off_private_keys(input: &str) -> Cow<'_, str> {
+    let mut output = String::new();
+    let mut copied = 0;
+    for header in private_key_header_regex().find_iter(input) {
+        if header.start() < copied {
+            continue;
+        }
+        let length = cut_off_key_length(&input[header.end()..]);
+        if length != 0 {
+            output.push_str(&input[copied..header.start()]);
+            output.push_str("[REDACTED: PRIVATE_KEY]");
+            copied = header.end() + length;
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(input);
+    }
+    output.push_str(&input[copied..]);
+    Cow::Owned(output)
+}
+
+fn cut_off_key_length(text: &str) -> usize {
+    let mut key = 0;
+    let mut at = 0;
+    while let Some(line) = private_key_line_regex().captures(&text[at..]) {
+        at += line[0].len();
+        let Some(data) = line.get(1) else {
+            continue;
+        };
+        if !is_key_data(data.as_str(), key == 0) || !ends_key_line(&text[at..]) {
+            break;
+        }
+        key = at;
+    }
+    key
+}
+
+/// The line after a header can be other text. Hashes have no capital letters, and names and
+/// paths of this length rarely have capitals, small letters and digits.
+fn is_key_data(line: &str, first: bool) -> bool {
+    let any = |matches: fn(&u8) -> bool| line.as_bytes().iter().any(matches);
+    any(u8::is_ascii_uppercase)
+        && any(u8::is_ascii_lowercase)
+        && (!first || line.len() >= 40 && any(|byte| byte.is_ascii_digit() || *byte == b'+'))
+}
+
+fn ends_key_line(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_none_or(|next| next.is_whitespace() || "\\\"'`<…".contains(next))
+}
+
+// A credential can follow a letter outside ASCII, because many languages put no space before it. It
+// can also follow the end of an escape in text encoded as JSON, or of a terminal style.
+const EXTENDED_START: &str = r"(?:(?-u:\b)|\\[nrtbf]|\[[0-9;]*m)";
+
+const API_KEY_PREFIX: &str = "sk-|gh[pousr]_|github_pat_|glpat-|npm_|AKIA|AIza|xox[baprs]-|eyJ";
+
+fn escaped_word_start_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?:\\[nrtbf]|\[[0-9;]*m)(?:{API_KEY_PREFIX}|(?i:bearer|authorization|(?:set-)?cookie))"
+        ))
+        .expect("valid escaped-word-start regex")
+    })
+}
+
+// The last byte of a letter outside ASCII next to text that can start or end a credential. It also
+// matches other characters, such as arrows, which are word boundaries.
+fn wide_word_regex() -> &'static regex::bytes::Regex {
+    static REGEX: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex::bytes::Regex::new(&format!(
+            r#"(?-u)[\x80-\xBF](?:{API_KEY_PREFIX}|(?i:bearer|authorization|(?:set-)?cookie|curl|[a-z][a-z0-9+.-]*://|[a-z0-9_-]*(?:{CREDENTIAL_NAME_LAST_WORD})[\\"'\s]*[:=]))|(?:{API_KEY_PREFIX})[A-Za-z0-9_.-]{{10,}}[\x80-\xFF]"#
+        ))
+        .expect("valid wide-word regex")
+    })
+}
+
+fn needs_extended_patterns(text: &str, hints: RedactionHints) -> bool {
+    if hints.rare && escaped_word_start_regex().is_match(text) {
+        return true;
+    }
+    if !(hints.rare || hints.wide_name) || text.is_ascii() {
+        return false;
+    }
+    if hints.rare || memchr::memmem::find(text.as_bytes(), b"://").is_some() {
+        return has_wide_word(text);
+    }
+    let found = has_wide_name(text);
+    debug_assert_eq!(found, has_wide_word(text), "wide-name searches differ");
+    found
+}
+
+fn has_wide_word(text: &str) -> bool {
+    wide_word_regex()
+        .find_iter(text.as_bytes())
+        .any(|found| ends_with_wide_letter(&text[..=found.start()]))
+}
+
+/// Same as [`has_wide_word`] for text without key formats, header names, commands, and URLs. It looks
+/// back from each separator, because text has few of them.
+fn has_wide_name(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let length_before = |end: usize, part: fn(&u8) -> bool| {
+        bytes[..end]
+            .iter()
+            .rev()
+            .take_while(|byte| part(byte))
+            .count()
+    };
+    memchr::memchr2_iter(b':', b'=', bytes).any(|separator| {
+        let end = separator
+            - length_before(separator, |byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'"' | b'\'' | 0x0b)
+            });
+        let start = end
+            - length_before(end, |byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+            });
+        let name = &bytes[start..end];
+        start != 0
+            && matches!(bytes[start - 1], 0x80..=0xbf)
+            && CREDENTIAL_LAST_WORDS.iter().any(|word| {
+                name.len() >= word.len()
+                    && name[name.len() - word.len()..].eq_ignore_ascii_case(word.as_bytes())
+            })
+            && ends_with_wide_letter(&text[..start])
+    })
+}
+
+/// Checks the character before a wide word. A key before a letter starts with an ASCII character.
+fn ends_with_wide_letter(text: &str) -> bool {
+    text.char_indices()
+        .next_back()
+        .is_some_and(|(at, last)| last.is_ascii() || wide_letter_regex().is_match(&text[at..]))
+}
+
+fn wide_letter_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\A\w\z").expect("valid wide-letter regex"))
+}
+
+/// Patterns that start at a word boundary. Each one is compiled when text needs it, because most
+/// commands redact only a few titles.
+struct CredentialPatterns {
+    start: &'static str,
+    boundary: &'static str,
+    api_key: OnceLock<Regex>,
+    bearer_token: OnceLock<Regex>,
+    authorization: OnceLock<Regex>,
+    url_password: OnceLock<Regex>,
+    assignment: AssignmentPatterns,
+    marked_assignment: AssignmentPatterns,
+    cookie_header: OnceLock<Regex>,
+    curl_user: OnceLock<Regex>,
+}
+
+impl CredentialPatterns {
+    const fn new(start: &'static str, boundary: &'static str) -> Self {
+        Self {
+            start,
+            boundary,
+            api_key: OnceLock::new(),
+            bearer_token: OnceLock::new(),
+            authorization: OnceLock::new(),
+            url_password: OnceLock::new(),
+            assignment: AssignmentPatterns::new(boundary, ASSIGNMENT_SEPARATOR),
+            marked_assignment: AssignmentPatterns::new(boundary, MARKED_SEPARATOR),
+            cookie_header: OnceLock::new(),
+            curl_user: OnceLock::new(),
+        }
+    }
+
+    fn api_key(&self) -> &Regex {
+        self.api_key
+            .get_or_init(|| api_key_regex(self.start, self.boundary))
+    }
+
+    fn bearer_token(&self) -> &Regex {
+        self.bearer_token
+            .get_or_init(|| bearer_token_regex(self.start))
+    }
+
+    fn authorization(&self) -> &Regex {
+        self.authorization
+            .get_or_init(|| authorization_regex(self.start))
+    }
+
+    fn url_password(&self) -> &Regex {
+        self.url_password
+            .get_or_init(|| url_password_regex(self.start))
+    }
+
+    fn cookie_header(&self) -> &Regex {
+        self.cookie_header
+            .get_or_init(|| cookie_header_regex(self.start))
+    }
+
+    fn curl_user(&self) -> &Regex {
+        self.curl_user
+            .get_or_init(|| curl_user_regex(self.boundary))
+    }
+}
+
+fn plain_patterns() -> &'static CredentialPatterns {
+    static PATTERNS: CredentialPatterns = CredentialPatterns::new(r"\b", r"\b");
+    &PATTERNS
+}
+
+fn extended_patterns() -> &'static CredentialPatterns {
+    static PATTERNS: CredentialPatterns = CredentialPatterns::new(EXTENDED_START, r"(?-u:\b)");
+    &PATTERNS
+}
+
+fn api_key_regex(start: &str, boundary: &str) -> Regex {
+    Regex::new(&format!(r"({start})(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9]{{20,}}|github_pat_[A-Za-z0-9_]{{20,}}|glpat-[A-Za-z0-9_-]{{16,}}|npm_[A-Za-z0-9]{{20,}}|AKIA[A-Z0-9]{{16}}|AIza[A-Za-z0-9_-]{{20,}}|xox[baprs]-[A-Za-z0-9-]{{10,}}|eyJ[A-Za-z0-9_-]{{10,}}\.[A-Za-z0-9_-]{{10,}}\.[A-Za-z0-9_-]{{10,}}){boundary}"))
+        .expect("valid API-key regex")
+}
+
+fn bearer_token_regex(start: &str) -> Regex {
+    Regex::new(&format!(r"(?i)({start})Bearer\s+[A-Za-z0-9._~+/-]{{12,}}"))
+        .expect("valid bearer-token regex")
 }
 
 // Placeholder left by an earlier pass, plus any text glued to it so partial matches still get redacted.
 const PLACEHOLDER: &str = r#"\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*"#;
+
+// A placeholder behind escapes such as `\n` or `\\\"`, in text that was encoded as JSON after its
+// redaction.
+const ESCAPED_PLACEHOLDER: &str = r#"(?:\\+["'nrt]?)+["']?\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*"#;
 
 // Quoted values run through the real closing quote, skipping escaped characters. `\"...\"` is a value
 // JSON-escaped a second time, so its inner escapes are doubled.
@@ -5330,42 +6203,75 @@ const CREDENTIAL_NAME: &str = r"[a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?
 // regex engine skip ahead to it.
 const CREDENTIAL_NAME_LAST_WORD: &str = r"key|secret|token|pass(?:word|wd)|pwd";
 
+const CREDENTIAL_LAST_WORDS: [&str; 6] = ["key", "secret", "token", "password", "passwd", "pwd"];
+
 // What separates a credential name from its value. Keys may be quoted, including JSON escaped
 // inside a string.
 const ASSIGNMENT_SEPARATOR: &str = r#"\\?["']?\s*(?:=>|:=|=|:)\s*"#;
 
-fn credential_assignment_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(&format!(r"(?i)\b(({CREDENTIAL_NAME})\b{ASSIGNMENT_SEPARATOR})({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;]+)"))
+// A separator and a marker that `is_value_marker` finds: the end of a bold Markdown label, or the
+// start of a YAML block.
+const MARKED_SEPARATOR: &str =
+    r#"\\?["']?\s*(?:(?:=>|:=|=|:)(?:\s*\*\*\s|\s*[|>][+-]?(?:\r?\n|(?:\\+r)?\\+n))|={2,3}\s)\s*"#;
+
+// The line after escaped line breaks. A longer match would search the same text again when that line
+// is a setting.
+const ESCAPED_LINE: &str = r"\\+[nr](?:\\+[nrt])*(?:[^\s,;\\]|\\+[^nr\s,;\\])*";
+
+struct AssignmentPatterns {
+    boundary: &'static str,
+    separator: &'static str,
+    assignment: OnceLock<Regex>,
+    candidate: OnceLock<Regex>,
+    end: OnceLock<Regex>,
+}
+
+impl AssignmentPatterns {
+    const fn new(boundary: &'static str, separator: &'static str) -> Self {
+        Self {
+            boundary,
+            separator,
+            assignment: OnceLock::new(),
+            candidate: OnceLock::new(),
+            end: OnceLock::new(),
+        }
+    }
+
+    fn assignment(&self) -> &Regex {
+        let (boundary, separator) = (self.boundary, self.separator);
+        self.assignment.get_or_init(|| {
+            // A name can start with a letter outside ASCII that folds to an ASCII letter.
+            Regex::new(&format!(
+                r"(?i)(?:\b|{boundary})(({CREDENTIAL_NAME})\b{separator})({})",
+                assignment_value_pattern()
+            ))
             .expect("valid credential-assignment regex")
-    })
-}
+        })
+    }
 
-// The last word of a credential name, the separator, and the first value character. Every match
-// of `credential_assignment_regex` contains a match of this pattern. It also matches other names,
-// such as a bare `key`, which `credential_assignment_end_regex` rejects.
-fn credential_assignment_candidate_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(&format!(
-            r"(?i)(?:{CREDENTIAL_NAME_LAST_WORD}){ASSIGNMENT_SEPARATOR}[^\s,;]"
-        ))
-        .expect("valid credential-assignment candidate regex")
-    })
-}
+    /// The last word of a credential name, the separator, and the first value character. Every match
+    /// of `assignment` contains a match of this pattern. It also matches other names, such as a bare
+    /// `key`, which `end` rejects.
+    fn candidate(&self) -> &Regex {
+        let separator = self.separator;
+        self.candidate.get_or_init(|| {
+            Regex::new(&format!(
+                r"(?i)(?:{CREDENTIAL_NAME_LAST_WORD}){separator}[^\s,;]"
+            ))
+            .expect("valid credential-assignment candidate regex")
+        })
+    }
 
-// Checks text that ends at a candidate: a whole credential name, then the separator and the first
-// value character at the end. The word boundaries are left out, because they need the text around
-// the slice. This only lets more candidates through.
-fn credential_assignment_end_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(&format!(
-            r"(?i)(?:{CREDENTIAL_NAME}){ASSIGNMENT_SEPARATOR}[^\s,;]\z"
-        ))
-        .expect("valid credential-assignment end regex")
-    })
+    /// Checks text that ends at a candidate: a whole credential name, then the separator and the
+    /// first value character at the end. The word boundaries are left out, because they need the
+    /// text around the slice. This only lets more candidates through.
+    fn end(&self) -> &Regex {
+        let separator = self.separator;
+        self.end.get_or_init(|| {
+            Regex::new(&format!(r"(?i)(?:{CREDENTIAL_NAME}){separator}[^\s,;]\z"))
+                .expect("valid credential-assignment end regex")
+        })
+    }
 }
 
 // Space-separated flags like `--password x`; `=` forms go through the assignment pattern. Values that
@@ -5373,7 +6279,7 @@ fn credential_assignment_end_regex() -> &'static Regex {
 fn credential_flag_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(&format!(r#"(?i)((?:^|\s)(--?(?:{CREDENTIAL_NAME}))[ \t]+)({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;&|<>"'-][^\s,;]*)"#))
+        Regex::new(&format!(r#"(?i)((?:^|\s)(--?(?:{CREDENTIAL_NAME}))[ \t]+)({PLACEHOLDER}|{QUOTED_VALUE}|{ESCAPED_PLACEHOLDER}|[^\s,;&|<>"'-][^\s,;]*)"#))
             .expect("valid credential-flag regex")
     })
 }
@@ -5400,29 +6306,26 @@ fn credential_flag_end_regex() -> &'static Regex {
 
 // Covers Basic, short Bearer values and schemes like `Token` or `ApiKey`. Prose such as
 // `Authorization: required` has no known scheme and stays.
-fn authorization_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(&format!(r#"(?i)\b(authorization\\?["']?\s*:\s*\\?["']?(?:bearer|basic|negotiate|ntlm|[a-z0-9-]*(?:key|token))[ \t]+)({PLACEHOLDER}|[^\s"',;\\]+)"#))
-            .expect("valid authorization regex")
-    })
+fn authorization_regex(start: &str) -> Regex {
+    Regex::new(&format!(r#"(?i)({start}authorization\\?["']?\s*:\s*\\?["']?(?:bearer|basic|negotiate|ntlm|[a-z0-9-]*(?:key|token))[ \t]+)({PLACEHOLDER}|[^\s"',;\\]+)"#))
+        .expect("valid authorization regex")
 }
 
-// One `name=value` cookie pair. Quoted values may hold spaces, `;` and escaped quotes.
+// One `name=value` cookie pair. Quoted values may hold spaces, `;` and escaped quotes. The space in a
+// placeholder does not end a value.
 fn cookie_pair_pattern() -> String {
-    format!(r#"([^\s;="'\\]+=)({PLACEHOLDER}|"(?:[^"\\]|\\(?s:.))*"|[^\s;"'\\]*)"#)
+    format!(
+        r#"([^\s;="'\\]+=)({PLACEHOLDER}|"(?:[^"\\]|\\(?s:.))*"|(?:\[REDACTED:\s+[A-Z_]+\]|[^\s;"'\\])*)"#
+    )
 }
 
 // Captures the pair list so request cookies redact every value and `Set-Cookie` keeps attributes.
-fn cookie_header_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        let pair = cookie_pair_pattern();
-        Regex::new(&format!(
-            r#"(?i)\b((set-)?cookie\\?["']?\s*:\s*\\?["']?)({pair}(?:;[ \t]*{pair})*)"#
-        ))
-        .expect("valid cookie-header regex")
-    })
+fn cookie_header_regex(start: &str) -> Regex {
+    let pair = cookie_pair_pattern();
+    Regex::new(&format!(
+        r#"(?i)({start}(set-)?cookie\\?["']?\s*:\s*\\?["']?)({pair}(?:;[ \t]*{pair})*)"#
+    ))
+    .expect("valid cookie-header regex")
 }
 
 fn cookie_pair_regex() -> &'static Regex {
@@ -5435,21 +6338,48 @@ fn cookie_pair_regex() -> &'static Regex {
 // Anchored on `curl` so unrelated `-u uid:gid` flags stay intact. Quoted arguments run through their
 // closing quote. It runs last because earlier replacements can remove the `;`, `&`, `|` or newline
 // that stops the lazy scan.
-fn curl_user_regex() -> &'static Regex {
+fn curl_user_regex(boundary: &str) -> Regex {
+    Regex::new(&format!(
+        r"(?i)({boundary}curl\b[^\n|;&]*?{CURL_USER_FLAG})({})",
+        curl_user_value()
+    ))
+    .expect("valid curl-user regex")
+}
+
+const CURL_USER_FLAG: &str = r"\s(?:-u[ \t]*|--user(?:[ \t]+|=))";
+
+fn curl_user_value() -> String {
+    format!(r#"{QUOTED_VALUE}|\\?["']?[^\s:"'\\]*:(?:{PLACEHOLDER}|[^\s"'\\]+)"#)
+}
+
+// A `curl` command that continues after a line that ends in a backslash, or that has `;`, `&` or `|`
+// in a quoted argument. The name must be the command, not the argument of an option. Line breaks can
+// be escaped in text encoded as JSON.
+fn curl_command_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(&format!(r#"(?i)(\bcurl\b[^\n|;&]*?\s(?:-u[ \t]*|--user(?:[ \t]+|=)))({QUOTED_VALUE}|\\?["']?[^\s:"'\\]*:(?:{PLACEHOLDER}|[^\s"'\\]+))"#))
-            .expect("valid curl-user regex")
+        Regex::new(&format!(
+            r#"(?i)((?:\A|[^a-z0-9_ \t]|\\[nrt]|(?-u:\b)(?:sudo|time|exec|env|nohup|do|then|else|run)[ \t])[ \t]*(?:[a-z0-9_.-]*/)*curl(?-u:\b)(?:\\\r?\n|\\\\(?:\\r)?\\n|"[^"\n]*"|'[^'\n]*'|\\"[^"\\\n]*\\"|[^\n|;&"'\\]|\\[^nr\n"'\\])*?{CURL_USER_FLAG})({})"#,
+            curl_user_value()
+        ))
+        .expect("valid curl-command regex")
+    })
+}
+
+// Most text that has `curl` has no user flag, so this fast search comes before the one above.
+fn curl_user_flag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(r"(?is)curl.*?{CURL_USER_FLAG}")).expect("valid curl-flag regex")
     })
 }
 
 // Passwords may contain unescaped `@`, so the greedy match ends at the last `@` before the path.
-fn url_password_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/?#]+@")
-            .expect("valid URL-password regex")
-    })
+fn url_password_regex(start: &str) -> Regex {
+    Regex::new(&format!(
+        r"(?i)({start}[a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/?#]+@"
+    ))
+    .expect("valid URL-password regex")
 }
 
 // Pairs are re-matched rather than split on `;`, so quoted values that contain `;` stay whole.
@@ -5487,10 +6417,17 @@ fn redacted_value<'a>(value: &'a str, label: &str) -> Cow<'a, str> {
     let quote = matching_quote(value);
     let inner = &value[quote.len()..value.len() - quote.len()];
     if inner.is_empty() || is_redaction_placeholder(inner) {
-        Cow::Borrowed(value)
-    } else {
-        Cow::Owned(format!("{quote}[REDACTED: {label}]{quote}"))
+        return Cow::Borrowed(value);
     }
+    let (escapes, text) = value.split_at(text_escapes(value));
+    if quote.is_empty() && text.starts_with("[REDACTED:") {
+        return if is_redaction_placeholder(text) {
+            Cow::Borrowed(value)
+        } else {
+            Cow::Owned(format!("{escapes}[REDACTED: {label}]"))
+        };
+    }
+    Cow::Owned(format!("{quote}[REDACTED: {label}]{quote}"))
 }
 
 fn matching_quote(value: &str) -> &'static str {
@@ -6200,9 +7137,10 @@ mod tests {
         capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
         import_conversation, import_conversation_with_limit, import_trajectory,
         import_trajectory_with_limits, native_trajectory_signature, ordinary_windows_path,
-        readback_mismatch_summary, readback_trajectory, redact_secrets, render_markdown_export,
-        render_semantic_handoff, session_preview, session_search_title, trajectory_search_document,
-        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
+        readback_mismatch_summary, readback_trajectory, redact_json_secrets, redact_secrets,
+        render_markdown_export, render_semantic_handoff, search_payload_text, session_preview,
+        session_search_title, trajectory_search_document, trajectory_search_document_with_limits,
+        workspace_paths_match, workspace_root,
     };
 
     #[test]
@@ -7322,8 +8260,171 @@ mod tests {
                 "synthetic-unterminated",
                 "Cookie: token=[REDACTED: TOKEN]; theme=[REDACTED: COOKIE]",
             ),
+            (
+                "令牌ghp_SyntheticSyntheticSynthetic01を使う",
+                "ghp_Synthetic",
+                "令牌[REDACTED: API_KEY]を使う",
+            ),
+            (
+                "接続先postgres://app:synthetic-cjk-password@db/prod",
+                "synthetic-cjk-password",
+                "接続先postgres://app:[REDACTED: PASSWORD]@db/prod",
+            ),
+            (
+                "数据库password=synthetic-cjk-assigned",
+                "synthetic-cjk-assigned",
+                "数据库password=[REDACTED: PASSWORD]",
+            ),
+            (
+                r#"{"cmd":"cat <<E\nghp_SyntheticSyntheticSynthetic01\nE"}"#,
+                "ghp_Synthetic",
+                r#"{"cmd":"cat <<E\n[REDACTED: API_KEY]\nE"}"#,
+            ),
+            (
+                r"Host: x\nAuthorization: Basic dTpw\nCookie: sid=synthetic-escaped-cookie",
+                "synthetic-escaped-cookie",
+                r"Host: x\nAuthorization: Basic [REDACTED: TOKEN]\nCookie: sid=[REDACTED: COOKIE]",
+            ),
+            (
+                r"\u001b[31mghp_SyntheticSyntheticSynthetic01\u001b[0m",
+                "ghp_Synthetic",
+                r"\u001b[31m[REDACTED: API_KEY]\u001b[0m",
+            ),
+            (
+                "curl https://example.com \\\n  -u admin:synthetic-continued-password",
+                "synthetic-continued-password",
+                "curl https://example.com \\\n  -u admin:[REDACTED: PASSWORD]",
+            ),
+            (
+                "curl 'https://example.com?a=1&b=2' -u admin:synthetic-query-password",
+                "synthetic-query-password",
+                "curl 'https://example.com?a=1&b=2' -u admin:[REDACTED: PASSWORD]",
+            ),
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nc3ludGhldGljLWtleS1kYXRhLXN5bnRoZXRpYy1rZXk=\n$ ls",
+                "c3ludGhldGlj",
+                "[REDACTED: PRIVATE_KEY]\n$ ls",
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00FF\n\nc3ludGhldGljLWtleS1kYXRhLXN5bnRoZXRpYy1rZXk=\n",
+                "c3ludGhldGlj",
+                "[REDACTED: PRIVATE_KEY]\n",
+            ),
+            (
+                "     1\t-----BEGIN RSA PRIVATE KEY-----\n     2\tc3ludGhldGljLWtleS1kYXRhLXN5bnRoZXRpYy1rZXk=\n     3\tc3ludGhldGljLWtleS1kYXRh",
+                "c3ludGhldGlj",
+                "     1\t[REDACTED: PRIVATE_KEY]",
+            ),
+            (
+                r#"if password == "synthetic-compared-password" {"#,
+                "synthetic-compared-password",
+                r#"if password == "[REDACTED: PASSWORD]" {"#,
+            ),
+            (
+                "- **Password:** synthetic-bold-password",
+                "synthetic-bold-password",
+                "- **Password:** [REDACTED: PASSWORD]",
+            ),
+            (
+                "password: |-\n  synthetic-block-password\nuser: app",
+                "synthetic-block-password",
+                "password: |-\n  [REDACTED: PASSWORD]\nuser: app",
+            ),
+            (
+                "token=漢ghp_SyntheticSyntheticSynthetic01/synthetic-value-tail",
+                "synthetic-value-tail",
+                "token=[REDACTED: TOKEN]",
+            ),
+            (
+                "DB_PASSWORD=\nAPI_KEY=synthetic-next-setting",
+                "synthetic-next-setting",
+                "DB_PASSWORD=\nAPI_KEY=[REDACTED: API_KEY]",
+            ),
+            (
+                "password=\nsynthetic-next-line==",
+                "synthetic-next-line",
+                "password=\n[REDACTED: PASSWORD]",
+            ),
+            (
+                r"TOKEN=\nDB_PASSWORD=synthetic-escaped-setting\nDB_HOST=localhost",
+                "synthetic-escaped-setting",
+                r"TOKEN=\nDB_PASSWORD=[REDACTED: PASSWORD]",
+            ),
+            (
+                "password:\napi_key: synthetic-yaml-setting",
+                "synthetic-yaml-setting",
+                "password:\napi_key: [REDACTED: API_KEY]",
+            ),
+            (
+                "POSTGRES_PASSWORD:\ncurl -u admin:synthetic-next-command https://example.com",
+                "synthetic-next-command",
+                "POSTGRES_PASSWORD:\ncurl -u admin:[REDACTED: PASSWORD] https://example.com",
+            ),
+            (
+                "**Password:** Set-Cookie: sid=synthetic-labelled-cookie",
+                "synthetic-labelled-cookie",
+                "**Password:** Set-Cookie: sid=[REDACTED: COOKIE]",
+            ),
+            (
+                "\u{1b}ghp_SyntheticSyntheticSynthetic01",
+                "ghp_Synthetic",
+                "[REDACTED: API_KEY]",
+            ),
+            (
+                "\u{1b}[0 password=synthetic-incomplete-style",
+                "synthetic-incomplete-style",
+                "\u{1a}[0 password=[REDACTED: PASSWORD]",
+            ),
+            (
+                "\u{1b}[apikey=synthetic-unended-style",
+                "synthetic-unended-style",
+                "\u{1a}[apikey=[REDACTED: API_KEY]",
+            ),
+            (
+                "\u{1b}[ -token synthetic-styled-flag",
+                "synthetic-styled-flag",
+                "\u{1a}[ -token [REDACTED: TOKEN]",
+            ),
+            (
+                "Authorization: Bearer \u{1b}[32meyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0.AbCdEfGhIjKl\u{1b}[0m",
+                "eyJ",
+                "Authorization: Bearer [REDACTED: API_KEY]",
+            ),
+            (
+                "Cookie: a=漢ghp_SyntheticSyntheticSynth01/tail; b=synthetic-glued-cookie",
+                "synthetic-glued-cookie",
+                "Cookie: a=[REDACTED: COOKIE]; b=[REDACTED: COOKIE]",
+            ),
+            (
+                "Authorization: Token 漢ghp_SyntheticSyntheticSynth01/tail",
+                "/tail",
+                "Authorization: Token [REDACTED: TOKEN]",
+            ),
+            (
+                "curl -u a:漢ghp_SyntheticSyntheticSynth01/tail https://example.com",
+                "/tail",
+                "curl -u a:[REDACTED: PASSWORD] https://example.com",
+            ),
+            (
+                r#"{"cmd":"set -e\ncurl https://example.com \\\n  -u admin:synthetic-escaped-curl"}"#,
+                "synthetic-escaped-curl",
+                r#"{"cmd":"set -e\ncurl https://example.com \\\n  -u admin:[REDACTED: PASSWORD]"}"#,
+            ),
         ];
         let benign = [
+            "if token === undefined || self.token == other.token {",
+            "DB_PASSWORD=\nDB_HOST=localhost\nAPI_KEY=\nexport REGION=us-east-1",
+            "POSTGRES_PASSWORD:\n  POSTGRES_DB: app",
+            "-----BEGIN PRIVATE KEY----- starts a key. The END line closes it.",
+            "src/config/a.pem:1:-----BEGIN PRIVATE KEY-----\nservices/backend/config/keys/production.pem:1:-----BEGIN PRIVATE KEY-----\n",
+            "-----BEGIN PRIVATE KEY-----\nraiseInvalidKeyFormatException()",
+            "-----BEGIN PRIVATE KEY-----\nb42f2ef1b42f2ef1b42f2ef1b42f2ef1b42f2ef1\n",
+            "-----BEGIN PRIVATE KEY-----\n============================================\n",
+            "curl https://example.com; docker run \"a\" -u 1000:1000 image",
+            "docker run --rm --name curl \\\n  -u 1000:1000 alpine",
+            r#"{"cmd":"set -e\ncurl -fsSL https://example.com\ndocker run -u 1000:1000 image"}"#,
+            r"C:\src\nsk-long-directory-name-here-x",
+            "task-synthetic-synthetic-name desk-synthetic-synthetic-name",
             r#"curl -u "alice" https://example.invalid"#,
             r#"Set-Cookie: sid=""; Path=/"#,
             "total_tokens=500 max_tokens: 8192 token_count: 3",
@@ -7376,7 +8477,7 @@ mod tests {
 
         use super::redact_secrets;
         use crate::{
-            replace_credential_assignments_at_candidates,
+            extended_patterns, plain_patterns, replace_credential_assignments_at_candidates,
             replace_credential_assignments_in_whole_text,
         };
 
@@ -7420,6 +8521,12 @@ mod tests {
             "x1",
             "[REDACTED: TOKEN]",
             "[REDACTED: TOKEN]tail",
+            "**",
+            "|",
+            ">",
+            "DB_HOST",
+            "host:",
+            "export",
         ];
 
         const CREDENTIAL_CONTEXTS: &[&str] = &[
@@ -7453,6 +8560,9 @@ mod tests {
             r#"Set-Cookie: sid="word {secret}"; Path=/"#,
             r#"curl -u "alice:word {secret}" https://example.invalid"#,
             "curl --user 'alice:word {secret}'",
+            "curl -s https://example.com \\\n  --user admin:{secret}",
+            "\u{1b}[34mpassword\u{1b}[0m: \u{1b}[0;32m\"{secret}\"\u{1b}[0m",
+            "**password:** {secret}",
         ];
         const PROSE_PREFIXES: &[&str] = &["", "run ", "note: ", "step 2\n", "(see below) "];
         const PROSE_SUFFIXES: &[&str] = &["", " done", "\nnext", ", then retry"];
@@ -7512,6 +8622,23 @@ mod tests {
             "é",
             "\u{17f}",
             "\u{212a}",
+            "\u{1b}[31m",
+            "\u{1b}[",
+            "[0m",
+            "**",
+            "|\n",
+            "DB_HOST=",
+            "\\\n",
+            "\\n",
+            "\\t",
+            "==",
+            "漢",
+            "ghp_SyntheticSyntheticSynthetic01",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----END PRIVATE KEY-----",
+            "\nProc-Type: 4,ENCRYPTED",
+            "\nDEK-Info: AES-128-CBC,00",
+            "\nc3ludGhldGljLWtleS1kYXRhLXN5bnRoZXRpYy1rZXk=",
         ];
         const TOKEN_COUNT_NAMES: &[&str] = &[
             "total_tokens",
@@ -7578,16 +8705,21 @@ mod tests {
                 parts in vec(select(ASSIGNMENT_PIECES), 0..24),
             ) {
                 let input = parts.concat();
-                prop_assert_eq!(
-                    replace_credential_assignments_at_candidates(&input),
-                    replace_credential_assignments_in_whole_text(&input)
-                );
+                for patterns in [plain_patterns(), extended_patterns()] {
+                    let found = replace_credential_assignments_at_candidates(&input, &patterns.assignment);
+                    prop_assert_eq!(
+                        (found.text, found.markers),
+                        replace_credential_assignments_in_whole_text(&input, &patterns.assignment)
+                    );
+                }
             }
 
             #[test]
             fn redaction_is_idempotent(parts in vec(select(FRAGMENTS), 0..32)) {
                 let redacted = redact_secrets(&parts.concat());
                 prop_assert!(redact_secrets(&redacted) == redacted, "redaction was not idempotent");
+                let encoded = redact_secrets(&serde_json::json!([redacted]).to_string());
+                prop_assert!(redact_secrets(&encoded) == encoded, "redaction was not idempotent");
             }
 
             #[test]
@@ -7757,6 +8889,239 @@ mod tests {
         assert_eq!(preview.provider_version.as_deref(), Some("1.2.3"));
         assert_eq!(preview.event_count, 3);
         assert_eq!(preview.tool_event_count, 1);
+    }
+
+    #[test]
+    fn json_fields_named_like_text_credentials_are_redacted() {
+        for key in [
+            "db_passwd",
+            "secret_key",
+            "stripeSecretKey",
+            "AWS_SECRET_KEY",
+            "mysql_pwd",
+            "x-pwd",
+            "Proxy-Authorization",
+        ] {
+            let mut value = json!({"nested": [{key: "keyed-credential-value"}]});
+            assert!(redact_json_secrets(&mut value), "{key}");
+            assert!(
+                !value.to_string().contains("keyed-credential-value"),
+                "{key} kept its value"
+            );
+        }
+        for key in ["pwd", "PWD", "OLDPWD", "secret_keys", "passwd_file", "key"] {
+            let mut value = json!({key: "/synthetic/folder"});
+            assert!(!redact_json_secrets(&mut value), "{key} lost its value");
+        }
+    }
+
+    #[test]
+    fn native_tool_inputs_redact_every_credential_name() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::ToolCalled,
+                json!({"call_id": "1", "name": "deploy", "input": {"secret_key": "keyed-credential-value"}}),
+            ),
+            event(
+                1,
+                EventKind::ToolCompleted,
+                json!({"call_id": "1", "output": "done"}),
+            ),
+        ]);
+
+        let items = format!("{:?}", import_trajectory(&snapshot).items);
+        assert!(items.contains("hist_codex_deploy"), "{items}");
+        assert!(!items.contains("keyed-credential-value"), "{items}");
+    }
+
+    #[test]
+    fn terminal_styles_do_not_hide_credentials() {
+        let key = "ghp_SyntheticSyntheticSynthetic01";
+        let styled = format!(
+            "\u{1b}[01;31m{key}\u{1b}[0m \
+             {{\u{1b}[34;1m\"password\"\u{1b}[0m: \u{1b}[0;32m\"styled-credential\"\u{1b}[0m}} \
+             DB_\u{1b}[31mTOKEN\u{1b}[m=matched-credential"
+        );
+        let snapshot = CanonicalSnapshot {
+            title: Some(styled.clone()),
+            ..snapshot_with_events(vec![
+                event(0, EventKind::MessageUser, json!({"text": styled})),
+                event(1, EventKind::ToolCompleted, json!({"output": styled})),
+            ])
+        };
+
+        for rendered in [
+            redact_secrets(&styled),
+            trajectory_search_document(&snapshot).text,
+            render_markdown_export(&snapshot),
+            render_semantic_handoff(&snapshot),
+            session_search_title(&snapshot).expect("title"),
+        ] {
+            for secret in [key, "styled-credential", "matched-credential"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert_eq!(redact_secrets(&rendered), rendered);
+        }
+        let benign = "\u{1b}[31m- removed\u{1b}[0m\n\u{1b}]8;;https://example.com\u{7}link";
+        assert_eq!(redact_secrets(benign), benign);
+    }
+
+    #[test]
+    fn text_after_an_empty_credential_survives_every_tool_rendering() {
+        for (output, expected) in [
+            (
+                "DB_PASSWORD=\nDB_HOST=localhost\nDB_PORT=5432\nAPP_NAME=demo\nREGION=us-east-1\n",
+                None,
+            ),
+            ("DB_PASSWORD=\r\nDB_HOST=localhost\r\nLAST=1\r\n", None),
+            ("API_KEY=\nAPI_URL=https://example.com\nLAST=1\n", None),
+            ("TOKEN=\n\nFOO=bar\nBAZ=1", None),
+            ("A_TOKEN=\nB_TOKEN=\n\n# notes\nlast line", None),
+            ("password:\nuser:\nhost:\n", None),
+            (
+                "set -e\ncurl -fsSL https://example.com\ndocker run -u 1000:1000 img",
+                None,
+            ),
+            (
+                "case Token:\n\tfoo()\n\tbar()",
+                Some("case Token:\n\t[REDACTED: TOKEN]\n\tbar()"),
+            ),
+            (
+                "PASSWORD=\nsynthetic-hunter\nDB_HOST=localhost\nLAST=1\n",
+                Some("PASSWORD=\n[REDACTED: PASSWORD]\nDB_HOST=localhost\nLAST=1\n"),
+            ),
+            (
+                "password: |-\n  synthetic-hunter\nuser: app\n",
+                Some("password: |-\n  [REDACTED: PASSWORD]\nuser: app\n"),
+            ),
+            (
+                "{\"content\": \"KEY_PASSWORD = \\\"x\\\"\\nCAPATH = \\\"/etc\\\"\"}",
+                Some(
+                    "{\"content\": \"KEY_PASSWORD = \\\"[REDACTED: PASSWORD]\\\"\\nCAPATH = \\\"/etc\\\"\"}",
+                ),
+            ),
+        ] {
+            let expected = expected.unwrap_or(output);
+            assert_eq!(redact_secrets(output), expected);
+            let encoded = serde_json::to_string(expected).expect("encoded text");
+            for provider in [Provider::Claude, Provider::Codex] {
+                let mut result = event(0, EventKind::ToolCompleted, json!({"output": output}));
+                result.source.provider = provider;
+                let mut snapshot = snapshot_with_events(vec![result]);
+                snapshot.session.provider = provider;
+                let search = search_payload_text(provider, &json!(expected)).expect("search text");
+                let document = trajectory_search_document(&snapshot).text;
+                assert!(document.contains(&search), "{document}");
+                let markdown = render_markdown_export(&snapshot);
+                assert!(markdown.contains(&encoded), "{markdown}");
+                let items = import_trajectory(&snapshot).items;
+                assert!(items[0].text.contains(&encoded), "{}", items[0].text);
+                for text in [document, markdown, items[0].text.clone()] {
+                    assert_eq!(redact_secrets(&text), text);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changed_text_before_a_wide_name_gets_the_second_run() {
+        for (input, expected) in [
+            (
+                "token: \\\"[REDACTED: TOKEN] password=a\"b hunter2 c\\\" 请输入token:",
+                "token: \\\"[REDACTED: TOKEN]\\\" 请输入token:",
+            ),
+            (
+                "password: x\"[REDACTED: PASSWORD]password: \\ntoken: \nhunter2 日token:",
+                "password: [REDACTED: PASSWORD] \\ntoken: \n[REDACTED: TOKEN] 日token:",
+            ),
+        ] {
+            assert_eq!(redact_secrets(input), expected);
+        }
+
+        // The escape character before a placeholder is not part of a style.
+        assert_eq!(
+            super::redact_terminal_text(
+                "\u{1b}[REDACTED: N] TOKEN]passwd:** h sk-efghijklmnop1234".into()
+            ),
+            "[REDACTED: N] [REDACTED: PASSWORD] [REDACTED: API_KEY]"
+        );
+    }
+
+    #[test]
+    fn redaction_of_partly_redacted_values_is_stable() {
+        let key = "ghp_SyntheticSyntheticSynthetic01";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0.AbCdEfGhIjKl";
+        for (input, expected) in [
+            // The rest of a split placeholder does not end a cookie list.
+            (
+                format!("Cookie: token=ab/{key}; theme=dark"),
+                "Cookie: token=[REDACTED: TOKEN]; theme=[REDACTED: COOKIE]",
+            ),
+            (
+                format!("Cookie: token=v1.{jwt}; theme=dark"),
+                "Cookie: token=[REDACTED: TOKEN]; theme=[REDACTED: COOKIE]",
+            ),
+            (
+                "p@ssSet-Cookie: --token=&[REDACTED: TOKEN]; Path=/".to_owned(),
+                "p@ssSet-Cookie: --token=[REDACTED: TOKEN]; Path=[REDACTED: COOKIE]",
+            ),
+            // A quote after an escaped line break stays with its placeholder.
+            (
+                r#"{"o": "password:\n\t\t'hunter2',\n\tuser: 1"}"#.to_owned(),
+                r#"{"o": "password:\n\t\t'[REDACTED: PASSWORD]',\n\tuser: 1"}"#,
+            ),
+            (
+                r"API_KEY=\n'x'".to_owned(),
+                r"API_KEY=\n'[REDACTED: API_KEY]'",
+            ),
+            // The opening quote of a value does not end the text around it.
+            (
+                r#"{'o': 'password:\n\t"hunter2",\n'}"#.to_owned(),
+                r#"{'o': 'password:\n\t[REDACTED: PASSWORD]",\n'}"#,
+            ),
+            (
+                r#"password:\n"hunter2""#.to_owned(),
+                r#"password:\n[REDACTED: PASSWORD]""#,
+            ),
+        ] {
+            let redacted = redact_secrets(&input);
+            assert_eq!(redacted, expected);
+            assert_eq!(redact_secrets(&redacted), redacted);
+            let encoded = redact_secrets(&json!({"o": redacted}).to_string());
+            assert_eq!(redact_secrets(&encoded), encoded);
+        }
+    }
+
+    #[test]
+    fn cut_off_private_keys_take_linear_time() {
+        let data = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        for unit in [
+            format!("-----BEGIN PRIVATE KEY-----\n{}\n", "A".repeat(32)),
+            format!("-----BEGIN PRIVATE KEY-----\n{data}\n"),
+            format!("-----BEGIN PRIVATE KEY-----\\n{data}\\n"),
+            format!("-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n{data}\n"),
+            "-----BEGIN PRIVATE KEY----- Proc-Type:".to_owned(),
+        ] {
+            let elapsed = |bytes: usize| {
+                let input = unit.repeat(bytes / unit.len());
+                (0..3)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        std::hint::black_box(redact_secrets(&input));
+                        start.elapsed()
+                    })
+                    .min()
+                    .expect("timed run")
+            };
+            // Quadratic work takes 256 times as long.
+            let (small, large) = (elapsed(20_000), elapsed(320_000));
+            assert!(
+                large < small * 80,
+                "{small:?} became {large:?} for {:?}",
+                &unit[..40]
+            );
+        }
     }
 
     #[test]

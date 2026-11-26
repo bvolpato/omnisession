@@ -1164,6 +1164,7 @@ version = "0.10.6"
 dependencies = [
  "chrono",
  "hex",
+ "memchr",
  "omnisession-ir",
  "proptest",
  "regex",
