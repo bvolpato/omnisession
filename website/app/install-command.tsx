@@ -2,46 +2,46 @@
 
 import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
 
-import { CopyInstallCommand } from "./copy-install-command";
+import { CopyCommand } from "./copy-command";
 
-const windowsSetupUrl = "https://github.com/bvolpato/omnisession#install";
+const windowsSetupUrl = "https://github.com/bvolpato/omnisession/blob/main/docs/GUIDE.md#windows-x86-64-preview";
 
 const installers = {
   unix: {
     command: "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh",
     label: "macOS / Linux",
     prompt: "$",
-    hint: "Verifies the release checksum, installs omni, and leaves provider commands unchanged.",
   },
   windows: {
     command: "irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex",
     label: "Windows x86-64 preview",
     prompt: "PS>",
-    hint: "Verifies the release checksum and installs omni. Provider commands remain native.",
   },
 } as const;
 
 type Platform = keyof typeof installers;
 const platforms = Object.keys(installers) as Platform[];
 
-const detailedNotes: Record<Platform, ReactNode> = {
+const notes: Record<Platform, ReactNode> = {
   unix: (
     <>
-      Verifies the release checksum and installs <code>omni</code>; fresh installs leave shell profiles unchanged and keep provider commands native. Add its install directory to <code>PATH</code> if needed. If OmniSession updated itself from 0.8.x, rerun this installer once; the in-app updater replaces only <code>omni</code>. The installer removes old OmniSession aliases and the exact generated PATH block; <code>OMNI_NO_MODIFY_PATH=1</code> leaves profiles untouched, so the old block may remain. Inside WSL, use this installer too.
+      Verifies the release checksum, then installs <code>omni</code> into <code>~/.local/bin</code>. Fresh installs leave shell profiles unchanged and
+      keep provider commands native, so add that directory to <code>PATH</code> if needed. Use this installer inside WSL too.
     </>
   ),
   windows: (
     <>
-      Native Windows <span className="nowrap">x86-64</span> preview. The installer verifies the release checksum, installs <code>omni</code>, and adds its install directory to <code>PATH</code>; provider commands remain native. If OmniSession updated itself from 0.8.x, rerun this installer once to remove aliases from earlier versions; the in-app updater replaces only <code>omni</code>. Restart your shell after PATH
-      changes. <a href={windowsSetupUrl}>Windows setup ↗</a>
+      Verifies the release checksum, installs <code>omni</code>, and adds its directory to <code>PATH</code>; provider commands remain native.
+      Restart your shell afterwards. <a href={windowsSetupUrl}>Windows setup</a>
     </>
   ),
 };
 
+/** The compact block shows one command for the hero; the full block adds platform tabs and notes. */
 export function InstallCommand({ variant = "full" }: { variant?: "compact" | "full" }) {
   const [platform, setPlatform] = useState<Platform>("unix");
   const baseId = useId();
-  const installer = installers[platform];
+  const installer = installers[variant === "compact" ? "unix" : platform];
   const tabId = (id: Platform) => `${baseId}-tab-${id}`;
   const panelId = `${baseId}-panel`;
 
@@ -57,15 +57,27 @@ export function InstallCommand({ variant = "full" }: { variant?: "compact" | "fu
             ? platforms.length - 1
             : null;
 
-    if (nextIndex === null) return;
+    const next = nextIndex === null ? undefined : platforms[nextIndex];
+    if (!next) return;
     event.preventDefault();
-    const next = platforms[nextIndex];
     setPlatform(next);
     document.getElementById(tabId(next))?.focus();
   }
 
+  if (variant === "compact") {
+    return (
+      <div className="install-block install-compact">
+        <div className="install-command">
+          <span aria-hidden="true" className="install-prompt">{installer.prompt}</span>
+          <code>{installer.command}</code>
+          <CopyCommand command={installer.command} label="Copy install command" />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className={`install-block install-${variant}`}>
+    <div className="install-block install-full">
       <div aria-label="Installation platform" className="install-tabs" role="tablist">
         {platforms.map((id) => (
           <button
@@ -86,9 +98,9 @@ export function InstallCommand({ variant = "full" }: { variant?: "compact" | "fu
       <div aria-labelledby={tabId(platform)} className="install-command" id={panelId} role="tabpanel">
         <span aria-hidden="true" className="install-prompt">{installer.prompt}</span>
         <code>{installer.command}</code>
-        <CopyInstallCommand command={installer.command} key={platform} />
+        <CopyCommand command={installer.command} key={platform} label="Copy install command" />
       </div>
-      <p className="install-note">{variant === "full" ? detailedNotes[platform] : installer.hint}</p>
+      <p className="install-note">{notes[platform]}</p>
     </div>
   );
 }
